@@ -414,6 +414,48 @@ impl Engine {
             return Ok(None);
         }
         let device_ptr = device_memory.device_ptr();
+        if crate::engine_prepared_transaction::prepared_index_route_required() {
+            if let Some(index) = crate::engine_prepared_transaction::prepared_pinned_device_index(
+                table_name,
+                shard_id,
+                key_id,
+                device_memory,
+                row_count,
+                gc_boundary,
+            ) {
+                #[cfg(test)]
+                crate::engine_prepared_transaction::PREPARED_PINNED_INDEX_HITS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let published_row_count = index
+                    .published_row_count
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let published_has_postings = index
+                    .published_has_postings
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                return Ok(Some((
+                    index.device_index,
+                    index.table_mask,
+                    index.hash_shift,
+                    published_row_count,
+                    published_has_postings,
+                )));
+            }
+            // A transaction-private overlay is bounded by the admitted mutation envelope and has
+            // no global cache entry. It may build a transient index. A base-snapshot miss is a
+            // proof/use failure and must decline without consulting or rebuilding the mutable
+            // global cache.
+            if !self.prepared_index_source_is_private_overlay(
+                table_name,
+                shard_id,
+                device_memory,
+                row_count,
+            ) {
+                #[cfg(test)]
+                crate::engine_prepared_transaction::PREPARED_BASE_INDEX_MISSES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
+        }
         let cache_key = (table_name.to_string(), shard_id, key_id);
         // Fast path: a valid cached device index -> return it (or None if it declined at build).
         {
@@ -569,6 +611,13 @@ impl Engine {
             .lane_diag_rebuilds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row_count = build_row_count;
+        #[cfg(test)]
+        if crate::engine_prepared_transaction::prepared_index_route_required() {
+            crate::engine_prepared_transaction::PREPARED_PRIVATE_INDEX_REBUILD_ROWS
+                .fetch_add(row_count as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::engine_prepared_transaction::PREPARED_PRIVATE_INDEX_REBUILD_MAX_ROWS
+                .fetch_max(row_count as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let row_count_u64 = row_count as u64;
         if row_count == 0 || row_count_u64 >= u32::MAX as u64 {
             return Ok(None);
@@ -687,9 +736,13 @@ impl Engine {
         let entry = CachedShardPkDeviceIndex {
             resident_device_ptr: device_ptr,
             row_count,
+            published_row_count: Arc::new(std::sync::atomic::AtomicUsize::new(row_count)),
             gc_boundary,
             duplicate_tolerant,
             has_postings: index_status.created_posting,
+            published_has_postings: Arc::new(std::sync::atomic::AtomicBool::new(
+                index_status.created_posting,
+            )),
             _resident_guard: Arc::clone(&build_memory),
             device_index,
             table_mask,

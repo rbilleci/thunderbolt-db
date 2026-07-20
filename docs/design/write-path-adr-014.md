@@ -12,6 +12,14 @@ References to those IDs below are historical graduation labels, not open work. T
 destructive recovery campaign completed under historical **DUR-002**; current sequencing is owned only by
 `../PLAN.md`.
 
+**Convergence refinement, 2026-07-19:** ADR-015 in `../DECISIONS.md` supersedes this document only where the frozen
+design assigns independent live physical WAL ranges/frontiers to intent lanes. The product owner selected one live
+canonical sequence, WAL, transaction-status, apply-order, checkpoint, and publication authority. Optimized lanes
+are preparation/batching strategies and fresh traffic creates no `.lane-*` files; the old format is replay-only
+input for offline one-way migration. The physical-fragmentation discussion and retained-review item 9 below remain
+historical design rationale, not a license to restore a second live authority. All other ADR-014 identity, MVCC,
+transaction, isolation, publication, and recovery contracts remain binding.
+
 **Decision scope:** relational row/version identity, transaction/isolation semantics, mutation representation,
 index visibility, deterministic conflict control, latency/throughput adaptation, publication, GC,
 checkpoint/recovery, and transition from the current write representations.
@@ -1384,8 +1392,9 @@ The acceptance review paid particular attention to these choices; implementation
 6. deadline/size-aware waves and bounded coalescers rather than global-population-only batching;
 7. per-stage credit and cut-lag accounting that keeps ticket-released resources charged until publication;
 8. automatic, hysteretic, foreground-yielding index/GC/STRATA maintenance and pre-WAL overload behavior;
-9. canonical lane-local physical WAL coordinates, global `commit_seq` mapping, and a non-circular typed statement/
-   transaction outcome marker rather than treating fragments as commit sequences;
+9. one canonical physical WAL coordinate, global `commit_seq` mapping, and a non-circular typed statement/
+   transaction outcome marker rather than treating fragments or optimized lanes as commit sequences (ADR-015
+   supersedes the frozen lane-local physical-coordinate choice);
 10. cut-exact checkpoint projection, checkpointed claim/status reconciliation, durable typed catalog/system
     transitions, and reachability-safe activation;
 11. one atomic `{visible_next, database_root, publication_epoch}` publication and a restartable fresh-context recovery

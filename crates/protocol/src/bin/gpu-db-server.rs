@@ -9,10 +9,10 @@ use gpu_db_protocol::{
     is_copy_statement, parse_copy_from_stdin, parse_copy_to_stdout_table, CopyOptions,
 };
 use gpu_db_protocol::{
-    parse_command, AclRelationKind, ColumnDefault, Command, CopyFormat, CopyParseError,
-    DatabasePrivilege, FunctionPrivilege, ParseError, PublicationTarget, SchemaPrivilege,
-    SelectFilter, SelectFilterOp, SelectProjection, SqlValue, TablePrivilege, TablespacePrivilege,
-    SUPPORTED_SQL_TYPES,
+    parse_command, split_simple_query, AclRelationKind, ColumnDefault, Command, CopyFormat,
+    CopyParseError, DatabasePrivilege, FunctionPrivilege, ParseError, PublicationTarget,
+    SchemaPrivilege, SelectFilter, SelectFilterOp, SelectProjection, SqlValue, TablePrivilege,
+    TablespacePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -1313,90 +1313,6 @@ fn run_simple_query(
     write_ready_for_query(stream, session.in_transaction)
 }
 
-fn split_simple_query(query: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    let mut start = 0;
-    let mut in_string = false;
-    let mut in_quoted_identifier = false;
-    let mut in_line_comment = false;
-    let mut block_comment_depth = 0usize;
-    let mut previous_char: Option<char> = None;
-    let mut chars = query.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        if in_line_comment {
-            if ch == '\n' {
-                in_line_comment = false;
-            }
-            previous_char = Some(ch);
-            continue;
-        }
-        if block_comment_depth > 0 {
-            if previous_char == Some('/') && ch == '*' {
-                block_comment_depth = block_comment_depth.saturating_add(1);
-                previous_char = None;
-                continue;
-            }
-            if previous_char == Some('*') && ch == '/' {
-                block_comment_depth = block_comment_depth.saturating_sub(1);
-                previous_char = None;
-                continue;
-            }
-            previous_char = Some(ch);
-            continue;
-        }
-        match ch {
-            '"' if in_quoted_identifier => {
-                if matches!(chars.peek(), Some((_, '"'))) {
-                    chars.next();
-                } else {
-                    in_quoted_identifier = false;
-                }
-            }
-            '"' if !in_string => in_quoted_identifier = true,
-            '\'' if in_string => {
-                if matches!(chars.peek(), Some((_, '\''))) {
-                    chars.next();
-                } else {
-                    in_string = false;
-                }
-            }
-            '\'' if !in_quoted_identifier => in_string = true,
-            '-' if !in_string
-                && !in_quoted_identifier
-                && matches!(chars.peek(), Some((_, '-'))) =>
-            {
-                chars.next();
-                in_line_comment = true;
-                previous_char = None;
-                continue;
-            }
-            '/' if !in_string
-                && !in_quoted_identifier
-                && matches!(chars.peek(), Some((_, '*'))) =>
-            {
-                chars.next();
-                block_comment_depth = 1;
-                previous_char = None;
-                continue;
-            }
-            ';' if !in_string && !in_quoted_identifier => {
-                let statement = query[start..idx].trim();
-                if !statement.is_empty() {
-                    statements.push(statement);
-                }
-                start = idx + ch.len_utf8();
-            }
-            _ => {}
-        }
-        previous_char = Some(ch);
-    }
-    let statement = query[start..].trim();
-    if !statement.is_empty() {
-        statements.push(statement);
-    }
-    statements
-}
-
 fn execute_statement(
     stream: &mut dyn ReadWrite,
     session: &mut Session,
@@ -1455,7 +1371,7 @@ fn execute_statement(
         Err(_) => {}
         Ok(
             command @ (Command::SetRole { .. }
-            | Command::Begin
+            | Command::Begin { .. }
             | Command::Commit { .. }
             | Command::Rollback { .. }
             | Command::ResetAll),
@@ -1571,7 +1487,7 @@ fn execute_statement(
             | Command::DeleteKv { .. }
             | Command::GetKv { .. } => {}
             Command::SetRole { .. }
-            | Command::Begin
+            | Command::Begin { .. }
             | Command::Commit { .. }
             | Command::Rollback { .. }
             | Command::ResetAll => {
@@ -1666,6 +1582,9 @@ fn execute_statement(
             }
             Command::Select(_) => {
                 unreachable!("simple-query SELECT commands are routed by the preceding parse arm")
+            }
+            Command::SelectLiteral(_) => {
+                return execute_session_compat_fallback(stream, session, &canonical)
             }
         },
     }

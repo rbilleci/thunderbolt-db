@@ -14,6 +14,228 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 SQLx/simple-query compatibility — accepted 2026-07-20
+
+- The unchanged supported SQLx smoke now targets `gpu-db-engine-server`; the legacy protocol-crate copy is deleted
+  and the application-driver runner names the canonical test. Bounded `SELECT 1 AS one` and typed NULL literals use
+  a transient GPU relation and terminal device result path. Permanent raw-pgwire tests distinguish NULL from zero
+  and empty text, while invalid-device sabotage fails loudly rather than fabricating a host result.
+- Blocking and async/batching-on simple Query share one lifecycle. Each idle multi-statement segment is atomic;
+  COMMIT/ROLLBACK divide segments; a suffix receives a fresh implicit transaction; and an exact later BEGIN
+  retroactively supplies that segment's isolation/access/deferrable characteristics. Empty/comment-only Query closes
+  a pending extended implicit cycle. SERIALIZABLE and DEFERRABLE fail pre-effect, READ ONLY remains effective, and
+  explicit failures retain PostgreSQL ReadyForQuery status until standalone rollback.
+- The shared SQL scanner handles escape strings, identifier-adjacent dollar tokens, dollar quotes, CR line comments,
+  nested/unterminated block comments, and comments as token whitespace without changing the exact `ParsedCommand`
+  source retained for WAL/replay identity. Multi-statement Query performs a side-effect-free parse plus zero-arity
+  Bind of every executable span before any synthetic BEGIN or facade submission, so a later syntax/unbound-parameter
+  error cannot follow an already-published explicit COMMIT. Catalog/constraint errors remain execution-ordered.
+- Gates pass SQL **49**, canonical server **29/4 ignored**, pgwire **3/1 ignored**, SQLx **1**, and legacy protocol
+  **71 + 127 + 1 tokio-postgres**, plus workspace all-target check, strict affected all-target Clippy, scoped
+  rustfmt, diff, and source-size checks. The typed-NULL GPU proof passed three sequential and two overlapping direct
+  test-binary runs with no CUDA 700/716/717; invalid-device sabotage passed. Production server roots are **1,463**
+  and **1,051** lines and test owners are **1,713** and **1,259**. The PLAN-owned
+  `engine_dml_concurrent.rs` remains **2,070** lines and must be reduced before PRODUCT-001 closes.
+- Five independent rejection rounds exposed lexical boundaries, comment execution, segment publication, pending-
+  cycle cleanup, typed-NULL/sabotage evidence, a Layer-2 regression signal, discarded BEGIN modes, and missing
+  whole-message parse precedence. Every finding was repaired; the sixth fresh read-only re-audit verdict is
+  **ACCEPT**. The final report card records **230.786M/s, p50 157us** in-L2 and **199.406M/s, p50 202us** out-of-L2,
+  Layer-1 rooflines **1,477.5/1,438.3 GB/s**, GROUP BY **1,674.9M elements/s**, and a **2,049.8s + 0.0s residency**
+  48M-row build. No second facade, server, WAL claimant, or publication owner was introduced.
+
+## PRODUCT-001 transaction-private Parse/Describe — accepted 2026-07-20
+
+- Effect-free Parse, statement Describe, portal Describe, Bind validation, and prepared Execute now resolve through
+  the connection's `SharedSession`. An active transaction uses the engine's stable statement lock and the same READ
+  COMMITTED refresh or REPEATABLE READ retention as execution, then describes against its private catalog overlay.
+  A creator can therefore `BEGIN; CREATE TABLE; Parse/Describe INSERT or SELECT; Bind/Execute` and read its writes;
+  another connection receives `42P01` until the one COMMIT publication. Rollback invalidates the cached private
+  shape, while commit lets the same prepared owner revalidate against the published catalog.
+- Prepared DML targeting the transaction's exact staged `CREATE TABLE` validates its dependency closure against the
+  private overlay because the relation intentionally does not exist in the published descriptor generation. The
+  exception matches only that exact INSERT/UPDATE/DELETE target; DML on every published table retains the prior
+  generation-pinned dependency proof and stale-catalog rejection.
+- `SharedSession` now retains its creating `SharedEngine` identity. Every session-taking prepare, describe,
+  revalidate, submit, batching, and close boundary rejects a foreign session before effects, including colliding
+  numeric transaction IDs. New facade description work returns failed-transaction precedence; pgwire's permitted
+  rowless Describe emits only its already-cached metadata without refreshing an aborted transaction, in both blocking
+  and async ingresses.
+- The server's inline tests moved mechanically into private `tests.rs` owners. Production roots are now **1,176**
+  (`server/src/lib.rs`) and **1,043** lines (`server/src/extended.rs`); their test owners are **944** and **1,259**,
+  so all four satisfy `CODE_SIZE.md` without an exception. No production API, visibility, or execution owner moved.
+- Gates pass engine **497/536 ignored**, dependency **2/0**, facade **56/10 ignored**, concurrency **13/1 ignored**,
+  server **27/3 ignored**, pgwire integration **3/1 ignored**, the actual-GPU private
+  Parse/Bind/Execute/read-your-writes/commit test, and the actual-GPU published-target stale-catalog guard, plus
+  workspace all-target check, strict affected Clippy, rustfmt, and diff checks. One independent audit rejected
+  cross-engine session aliasing and failed-rowless private metadata; both were fixed. The next fresh audit rejected
+  the two source-size outliers; test extraction fixed them, and the final fresh read-only verdict is **ACCEPT**. This
+  metadata/protocol and structural slice did not touch a read kernel, residency layout, or result materialization
+  path, so the report card was not applicable.
+
+## PRODUCT-001 composite explicit transaction envelope — accepted 2026-07-20
+
+- One staged `CREATE TABLE` now composes with resolved DML in either supported order: `CREATE` followed by DML on
+  the private relation, or DML on an existing relation followed by an independent `CREATE`. Transactional reads see
+  the private catalog and their own staged row generations; observers see neither catalog nor data until the one
+  final publication. Rollback remains effect-free, and a second DDL still fails before any additional private or WAL
+  effect pending PRODUCT-001's broader ordered catalog-operation envelope.
+- COMMIT emits one typed resolved transaction record containing the catalog command, sequence post-state, allocator
+  high-water, and coalesced final row mutations. Canonical apply groups mutations by table, stamps all tombstones,
+  performs one final append/publication per table, and joins catalog plus data visibility once. Recovery consumes the
+  same record. Literal-byte v1 row-only WAL compatibility remains pinned, and replay coalesces historical
+  uncoalesced mutation chains before the same table-batched publisher.
+- Every persistent GPU allocation is closed before WAL from the final record rather than statement-private
+  intermediates: transaction-created payload/row identities/compound indexes, existing-table first tombstone
+  sidecars, in-place append growth, and rollover payload/sidecars/mandatory indexes. Active transaction snapshots
+  register exact retained payload, sidecar, row-id, and index allocations, so same-table replacement or cache purge
+  cannot hide live bytes from admission.
+- Previously enrolled named indexes are restored before WAL. A short table-scoped lifecycle latch protects only the
+  affected relations through canonical apply: their old-generation purge requests are superseded by a successful
+  final publication or drained on failure, while unrelated-table purges remain immediate. A deterministic compound
+  PK/UNIQUE sabotage removes coverage before COMMIT and again after WAL durability, proves both mandatory device
+  allocations remain available through apply, and verifies one live/recovered result without wedging service.
+- `engine_transaction_delta.rs` was reduced from 2,025 to **1,758** lines by moving exact publication accounting into
+  the existing 765-line `engine_transaction_delta/gpu_accounting.rs` owner. Gates pass all **13** ignored GPU
+  composite tests, retained payload/index accounting sabotage, named-index publication/mutation lock ordering,
+  engine **495 passed / 536 ignored**, dependency **2/0**, GPU-required integration **2/2 ignored**, strict
+  all-target engine Clippy, rustfmt, and diff checks. Four independent audit rounds rejected retained-generation,
+  exact-rollover/index geometry, old-WAL fixture, named-index lifecycle, and source-size defects; every finding was
+  fixed and the fifth fresh read-only audit verdict is **ACCEPT**.
+- The final standard report card records production point reads at **217.840M/s, p50 175us** in-L2 and
+  **185.692M/s, p50 226us** out-of-L2. Layer-1 rooflines are **1,485.3/1,449.8 GB/s**, scalar COUNT is
+  **1,344.3/1,455.8 GB/s**, ordered project-compare is **184.3/469.1 GB/s**, and GROUP BY is **1,674.2M
+  elements/s**. The 48M-row fixture built in **2,052.8s** with **0.0s** final residency work.
+
+## PRODUCT-001 transaction-private CREATE TABLE foundation — accepted 2026-07-20
+
+- One database-local `CREATE TABLE` can be staged in an explicit transaction or an extended implicit transaction.
+  Its cloned catalog generation, empty shard entry, and exact parsed source remain transaction-private: the creator
+  can bind and execute an empty projection or scalar aggregate, while another session cannot observe the relation.
+  Sync/COMMIT joins the existing explicit-transaction claimant and publishes one canonical WAL record; rollback,
+  failed-session cleanup, stale prepared execution, read-only mode, and a second DDL reject or discard before a
+  catalog/WAL effect. Recovery replays the one durable record. The accepted composite envelope recorded above now
+  carries one CREATE plus DML through the same private generation and atomic publication.
+- Private CREATE validation retains the catalog latch from exact base comparison through `apply_create_table`, so
+  domain, sequence, and default helpers cannot bind a newer published catalog. A deterministic `pinned_type`/concurrent
+  `DROP DOMAIN` test proves the competing DDL cannot cross the latch while the private table resolves its column.
+  The post-durable apply injection is engine-local, and a durable-but-uninstalled CREATE wedges service until replay.
+- The current foundation intentionally compares the full catalog snapshot at refresh/commit. Because ordinary commits
+  advance its generation stamp, an unrelated intervening mutation conservatively returns a retryable serialization
+  error before this CREATE claims WAL. PRODUCT-001 still owns narrowing that conflict, multiple transactional DDL,
+  and broader DDL compatibility; transaction-private Parse/Describe is now accepted above.
+- Focused evidence passes eight ordinary engine catalog tests, one actual-GPU reverse DML→DDL test, three facade
+  private/failed/commit tests, and the raw extended implicit commit/rollback test. Full gates pass engine **495/521
+  ignored**, dependency **2/0**, facade **51/10**, concurrency **13/1**, server **24/2**, and pgwire **3/1**, plus
+  affected all-target check, strict engine/facade/server Clippy, rustfmt, and diff checks. The canonical result-path
+  card records **230.923M/s at p50 158us** in-L2 and **200.434M/s at p50 199us** out-of-L2; the 48M-row fixture built
+  in **1,730.5s** with zero late residency work. The auditor's isolated Layer-1 rerun records **1,436.3/1,441.5
+  GB/s** in/out-L2 rooflines, **349.5/155.3 GB/s** gather, and **1,675.3M elements/s** GROUP BY. The first independent
+  audit returned **REJECT** for the catalog-latch race and missing adversarial/docs evidence; every finding was fixed
+  and the final read-only re-audit verdict is **ACCEPT**.
+
+## PRODUCT-001 Describe-time catalog revalidation — accepted 2026-07-20
+
+- Statement and portal Describe now clone their opaque prepared owner, re-run engine catalog description through
+  `SharedEngine`, and only then encode cached ParameterDescription/RowDescription/NoData. Parse and Bind remain
+  effect-free; validation neither allocates a transaction identity nor mutates the session or publishes work.
+- A changed inferred parameter type rejects with `42804`; a changed result shape rejects with `0A000`; missing
+  statements/portals and failed-transaction row results retain `26000`, `34000`, and `25P02` precedence. Unchanged
+  rowless statements/portals remain describable in a failed transaction.
+- Blocking and async raw-pgwire tests prove a drop/recreate type change emits ErrorResponse plus ReadyForQuery rather
+  than stale metadata. Facade passes **50/10 ignored** and server **24/2 ignored**; server all-target check, strict
+  facade/server Clippy, rustfmt, and diff checks pass. The independent audit first rejected missing parameter-drift
+  and revalidated-precedence coverage; both were added and the re-audit verdict is **ACCEPT**.
+
+## PRODUCT-001 public facade execution unification — accepted 2026-07-20
+
+- `SharedEngine::submit(&mut SharedSession, SubmissionRequest)` is the sole public facade execution method. Typed
+  variants carry text, bound prepared ASTs, optional point-read batching, session-close rollback, and deterministic
+  instrumentation without creating separate mutation or transaction authorities. Effect-free prepare/describe and
+  neutral status/diagnostic reads remain separate.
+- The production `EngineFacade`, `SessionId`, borrowed-engine/stateless/shared-session/batched/prepared free
+  execution functions, public hook functions, and old sequential server statement loop are deleted. Blocking,
+  sequential-acceptance, and async engine-backed ingresses share one `SharedEngine` connection handler and private
+  helpers that invoke `submit`.
+- A `PointLookupBatcher` is identity-bound to its exact `SharedEngine`; its enqueue method is crate-private and a
+  foreign batcher rejects before classification/effect, while transaction control still bypasses irrelevant batcher
+  identity so failed-session ROLLBACK works. Instrumented DML/SELECT require an idle session, active errors enter
+  failed-transaction state, failed sessions return `InFailedTransaction`, non-DML validates before transaction-id
+  allocation, and hooks cannot run on rejection. Session close clears local ownership only after canonical rollback
+  admission succeeds.
+- A static sabotage guard scans facade, prepared, and batcher sources and forbids restoration of every deleted public
+  entry or public enqueue. CPU gates pass: facade **50/10 ignored**, concurrency **13/1 ignored**, server **21/2
+  ignored**, and pgwire roundtrip **3/1 ignored**; workspace all-target check, strict facade/server Clippy, rustfmt,
+  and diff checks pass. The independent audit found cross-engine batching, instrumented session bypass, batch-control
+  ordering, and weak static-guard defects; every finding was fixed and its final verdict is **ACCEPT**.
+
+## PRODUCT-001 typed serving admission foundation — accepted 2026-07-19
+
+- The serving/write inventory now names both pgwire binaries, both P8 product-like adapters, every public engine
+  mutation/COPY/transaction/recovery family, the physical commit/publication owners, and the exact compatibility
+  consumers that must migrate before deletion.
+- `ParsedCommand` owns the exact SQL source together with its typed AST. All canonical facade variants and the
+  engine-backed server carry that one owner through session/batch classification and execution; mutation/control
+  reaches `Engine::submit_transaction` without reparsing or a loose `(Command, text)` pair. Optional deterministic
+  test instrumentation travels through that same method rather than an old write API.
+- Stateless facade entries now reject transaction control pre-effect. Session-owned BEGIN/DML/COMMIT preserves the
+  existing private GPU overlay, read-your-writes, one atomic transaction record/publication, and AND CHAIN identity
+  transfer. Legacy `GET`, bounded function SELECT, and `currval` use a separate parsed compatibility-read boundary
+  that preserves leader/poison/metrics behavior without representation repair, sequence claim, or WAL.
+- The engine still privately delegates to classic concurrent, explicit-overlay, and serialized strategies; this
+  slice did not add or claim a new WAL, durability, recovery, or publication owner. Their consolidation, typed
+  resource/transaction envelopes, mixed intent/general ordering, and old public API deletion remain PRODUCT-001.
+- Gates pass: workspace all-target check; strict Clippy for SQL/engine/facade plus server lib/bin/tests (the unchanged
+  P8 protocol-boundary example retains three pre-existing all-target Clippy findings); engine **470/501**, facade
+  **44/9**, server pgwire **3/1**, and concurrency **13/1** CPU/ignored results; three sequential and two overlapping
+  GPU HAZARD runs with no CUDA 700/716/717; scoped rustfmt, source-size, and diff checks. The independent audit first
+  rejected five concrete bypass/compatibility issues; all were fixed and its re-audit verdict is **ACCEPT**.
+
+## PRODUCT-001 General atomic resource envelope — accepted 2026-07-19
+
+- `TransactionResources` predeclares operations, mutations, post-image plus canonical logical-intent bytes,
+  maintained-index fanout, unique touched tables, cold dependency accesses, and result bytes. Parsed programs are
+  deliberately `General`: they support more than 32 operations and cannot issue W1/T8/T32. The accepted bounded
+  subset is a one-row INSERT or unique-index-covered one-row SELECT/UPDATE/DELETE; direct, outgoing-FK, reverse-FK,
+  repeated-cold, and unique-table closure is resolved and checked before global row-id, sequence, or WAL claims.
+- A predeclared program marks its transaction identity program-owned before publishing the active snapshot and holds
+  one statement guard from staging through terminal publication. Ordinary SELECT, DML, COMMIT, and ROLLBACK reject
+  that owner and revalidate after the guard, so no same-ID caller can publish a prefix or orphan staged work. A
+  deterministic pause immediately after registration proves concurrent same-ID COMMIT and DML fail while the exact
+  declared program commits once.
+- Transaction characteristics are typed. The currently accepted predeclared mode is repeatable-read/read-write; its
+  canonical WAL header records repeatable-read, read-only DML and unsupported isolation/deferrable requests fail
+  before `BEGIN`, and staged reads observe earlier writes. Engine-owned prepared W1/T8/T32 and PostgreSQL READ
+  COMMITTED semantics remain PRODUCT-001 rather than being approximated by arbitrary SQL classification.
+- Post-WAL failure is never reported as an ordinary rollback: it wedges publication, returns an explicit
+  indeterminate outcome, and recovery owns the durable commit. Logical envelope accounting excludes immutable and
+  physical record framing while the WAL still retains its full packed bytes; unit and sabotage tests prove the
+  distinction, preclaim rejection, one atomic record/publication, read-own-writes, recovery, and General programs
+  above 32 operations.
+- Gates pass: engine **475/506**, facade **44/9**, server pgwire **3/1**, and concurrency **13/1** CPU/ignored results;
+  strict affected Clippy, scoped rustfmt, source-size, and diff-whitespace checks; three sequential and two overlapping
+  fresh GPU HAZARD runs with no CUDA 700/716/717. The independent audit rejected seven concrete accounting,
+  isolation, atomicity, and failure-boundary defects; every finding and a follow-up registration race were fixed, and
+  the final re-audit verdict is **ACCEPT**.
+
+## PRODUCT-001 contiguous publication coordinator — accepted 2026-07-19
+
+- `CommitPublicationCoordinator` is the sole live writer of the reader-visible commit boundary. Physical strategies
+  report exact durable-and-applied indices; out-of-order completions remain hidden in a ready set until every lower
+  index is complete. The former CAS-max publication method and all direct callers are gone. Snapshot installation is
+  a separate quiescent authority reset rather than a fabricated live completion.
+- Classic wave tails report each committed member, help or wait for a lower pending tail, and resolve SQL outcomes
+  only after the tail's terminal index is inside the contiguous published prefix. Every non-pipelined claimant—
+  serialized DDL/KV/DML, legacy batch, COPY/current-apply, explicit transactions, and first lane activation—waits
+  off-lock for classic-tail quiescence and re-proves it under the commit lock before sequence/WAL claim. A terminal
+  index not covered after durable apply wedges service instead of acknowledging hidden state.
+- ADR-015 subsequently superseded the temporary activation split: optimized lanes now enter the same canonical
+  sequence/WAL/status/apply/publication authority and may coexist with classic/general traffic. Historical physical-
+  lane histories are startup-only compatibility input and remain read-only until offline migration.
+- Gates pass: engine **479/506**, four deterministic publication/gap/activation tests, all 41 recovery tests, strict
+  engine Clippy, scoped rustfmt, and diff checks. Three sequential lane-recovery GPU executions plus two overlapping
+  lane/General/explicit GPU pairs pass without CUDA 700/716/717. The independent audit rejected two concrete
+  activation/terminal-coverage races; both were fixed, re-tested, and its final verdict is **ACCEPT**.
+
 ## PRODUCT-002 canonical SQL/type milestone — complete 2026-07-19
 
 - Compound primary and secondary index DDL now accepts the immutable workload schema. Every declared named index is
@@ -213,8 +435,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 ## Write path, durability, and recovery
 
-- WAL-before-visibility is enforced. The durable path includes append-only/checkpointed WAL, FUA intent lanes,
-  contiguous durable cuts, lane recovery/recycle, group commit, and fused device apply for eligible shapes.
+- WAL-before-visibility is enforced. One append-only/checkpointed canonical WAL serves every live write strategy;
+  optimized preparation lanes use group durability and fused device apply but own no separate WAL, sequence, or
+  publication frontier. Historical physical-lane files are startup-only replay input.
 - Covered typed INSERT/UPDATE/DELETE intent paths and mixed GPU read/write execution are live. Typed-index,
   transaction/GC, and host-authority-retirement acceptance are complete.
 - ADR-014 selects append/tombstone MVCC as the single logical write model: stable entity identity, immutable
@@ -318,8 +541,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   recovery; it fails against the former published-generation lookup. The canonical WAL is a SHA-256-bound,
   non-circular typed envelope with ordered operation/status fragments and an exact terminal outcome; typed AST
   replay does not parse SQL. Database/timeline/epoch identity, catalog epoch/digest lineage, operation class,
-  table count, allocator high-water, request digest, lane-local physical coordinates, and global commit range are
-  checked before apply. FUA recovery maps checked exclusive lane prefixes to the inclusive MVCC boundary, rejects
+  table count, allocator high-water, request digest, canonical WAL coordinates, and global commit range are
+  checked before apply. Historical FUA-lane recovery maps checked exclusive prefixes to the inclusive MVCC boundary, rejects
   inconsistent ranges and overflow, and persists a checksummed stable-ID abort authority before discarding an
   unacknowledged orphan. Transaction claims survive reopen and resolve same-request retry exactly; mismatched
   reuse fails closed. Classic and lane success acknowledgements both require durable-and-applied publication;
@@ -4383,6 +4606,139 @@ sections, the current source tree, `CODE_SIZE.md`, and `PLAN.md` govern present 
   workspace/facade/pgwire chain was not a valid CPU-runner gate after production CPU SELECT fallback removal.
   A local PostgreSQL 18 `psql` probe also reconfirmed that the checked-in PostgreSQL 16 golden expectations have
   rendering and behavior drift already owned by PRODUCT-002; that suite is no longer a blocking CPU CI step.
+
+## PRODUCT-001 canonical live commit authority accepted — 2026-07-19
+
+- All live serialized, batch, COPY, explicit-transaction, classic-wave, and optimized-lane mutations now claim one
+  commit sequence, append one canonical `WalBuffer`, install one terminal-status index, apply under one commit
+  authority, enter checkpoint through one quiescence boundary, and report exact durable-and-applied indices to one
+  contiguous publication coordinator. Optimized lanes are preparation/scheduling only; their former physical WAL,
+  sequence oracle, apply queue, publication bridge, and checkpoint writer are deleted.
+- Fresh optimized traffic creates no `.lane-*` files. Startup may read and repair historical physical-lane input,
+  then closes those readers; a nonempty historical prefix remains read-only pending offline migration. Empty
+  historical lane files do not create a second authority or block canonical writes.
+- Shared preterminal transaction-id admission closes exact/mismatched retry races across batch, lane, BEGIN/COPY,
+  classic, and serialized work. Checkpoint waits for both classic-wave and registered publication tails, and the
+  commit-wave driver services optimized plus classic traffic without starvation.
+- Owner gates passed workspace all-target check, strict engine Clippy, 479 ordinary engine tests with 505 GPU tests
+  ignored, 44 recovery tests, focused coordinator/admission/retry/COPY/checkpoint tests, and diff/source-size checks.
+  The complete 10-test lane GPU suite passed three sequential and two overlapping executions with zero CUDA
+  700/716/717. The independent auditor reran static ownership checks, CPU gates, and seven focused GPU lane,
+  mixed-traffic, retry, and recovery cases. Its stale-comment finding was corrected and the final verdict is
+  **ACCEPT**.
+- This closes the live commit/WAL/status/apply/checkpoint/publication authority slice, not PRODUCT-001. Public
+  server/facade entries remain plural and are owned by the next Parse/Bind/Execute and compatibility-migration
+  slices; they cannot create a second physical commit authority.
+
+## PRODUCT-001 typed prepared-command binding accepted — 2026-07-19
+
+- `gpu_db_sql::PreparedCommand` now owns a parsed command template with typed `$n` AST slots. Bind clones that
+  command and replaces values directly; zero-arity Bind also clones the already parsed owner. Facade sequential,
+  borrowed-engine, and shared-session prepared entries consume the bound `ParsedCommand` without reparsing
+  reconstructed SQL.
+- A quote/comment/dollar-quote-aware raw-parameter scan rejects `$n` at ordinary parse boundaries and rejects
+  unsupported prepared positions before parsing or effects. Nested parameter values fail cleanly, the placeholder
+  variant is non-serializable, and all storage/execution/result defenses fail loud if an unbound slot escapes.
+- Existing explicit casts render one replayable canonical cast, typed NULL remains typeless, and `numeric(p,s)` Bind
+  applies PostgreSQL-style half-up rescaling plus precision enforcement. Text rendering remains only as the
+  transitional parseable WAL/retry identity for existing SQL-text canonical records; it is not the executable path.
+- Owner gates passed SQL 43/0, facade 44/10, facade concurrency 13/1, workspace all-target check, strict SQL/facade
+  Clippy, and diff/source-size checks. Two GPU W1 prepared tests passed three sequential plus two overlapping runs
+  without CUDA 700/716/719. Independent audit initially rejected five defects (double casts, nested slots,
+  zero-arity reparse, unsupported raw parameters/DDL panic, NUMERIC typmod omission); all were fixed and the re-audit
+  returned **ACCEPT**, including an independent explicit-cast GPU W1 pass.
+- This accepts typed prepared ownership/binding only; the subsequent canonical extended-query slice below owns its
+  server lifecycle and metadata integration facts.
+
+## PRODUCT-001 canonical extended-query lifecycle accepted — 2026-07-19
+
+- `gpu_db_server::extended::ExtendedSession` is the sole engine-backed Parse/Bind/Describe/Execute/Close lifecycle
+  owner. Its dispatcher is shared by blocking shared-engine, sequential-baseline, and async ingresses; lifecycle
+  decisions no longer live in those loops. The async loop still invokes materialized response encoding on its runtime
+  task; bounded/offloaded streaming remains SCALE-001. The legacy protocol binary is unchanged.
+- Parse constructs one syntax-validated `PreparedCommand` and passes that same AST to engine description without a
+  second parse. `Engine::describe_prepared_command` infers parameter types and result columns against one committed
+  catalog generation; explicit typed trailing Parse parameters are preserved even when unused by the SQL. PostgreSQL
+  OIDs, formats, SQLSTATEs, and codecs remain in the adapter/server layer. Bind validates statement/count/format
+  precedence at PostgreSQL's boundaries: statement, parameter count, and parameter-format arity precede the aborted
+  gate; portal creation is followed by parameter decoding and only then row-result format validation. No-data
+  portals ignore result formats. Binding never executes or rebuilds SQL.
+- Statement and portal Describe, named duplicate errors, unnamed replacement, Close, Flush, extended-protocol
+  skip-until-Sync, and transaction-aware ReadyForQuery are implemented. A portal caches one execution outcome, so a
+  mutation cannot be rerun by cursor continuation; `Execute(max_rows)` emits bounded row chunks and PortalSuspended
+  until the cached result is exhausted. Missing Parse/Bind/Describe/Execute objects and malformed shapes precede the
+  failed-transaction gate; empty Parse/Execute and no-data Describe remain legal there. Unsupported formats use
+  `22023`, bad text input `22P02`, and malformed binary input `22P03` before any mutation effect.
+- An implicit engine transaction spans extended messages through Sync, so later failure rolls back all earlier staged
+  writes. Skipped Sync, explicit/simple-query COMMIT or ROLLBACK, failed implicit COMMIT cleanup, and transaction-exit
+  portal cleanup are decided by `ExtendedSession`; raw pgwire proof stages a first INSERT, triggers a later unique
+  violation, Syncs, and observes zero rows.
+- Host tests cover effect-free typed Parse/Bind/Describe, duplicate/unnamed lifecycle, cursor suspension and exact-once
+  execution, pre-effect format rejection, raw pgwire BEGIN/error-Sync/COMMIT status bytes, and `tokio-postgres` over
+  async ingress. Server tests pass **21/2 ignored**; SQL passes **43/0**, facade **46/10**, engine **483/505**, and
+  protocol framing passes with the full protocol suite at **69 passed / 2 inherited unrelated failures**. The
+  concurrent unique-owner regression passes. Workspace all-target check, strict affected engine/facade/protocol/
+  server lib-bin-test Clippy, scoped rustfmt, diff/source-size checks, and the final GPU matrix pass. The
+  all-target strict Clippy command reaches three inherited warnings in
+  `p8_engine_protocol_boundary_probe`, which remains a PRODUCT-001 deletion/migration target rather than this
+  slice's production owner.
+- The final two-test server GPU matrix covers exact prepared W1 typed binary parameters/results plus raw pgwire
+  atomic rollback when a later extended Execute fails before Sync. It passed three sequential invocations (six test
+  cases) plus two overlapping invocations (four cases) with no CUDA 700/716/719 output. The required report card
+  exited 0: in/out-L2 rooflines were
+  **1,482.1/1,440.1 GB/s**, grouped aggregation **1,675.6M elements/s**, and compact batch-65,536 point reads
+  **217.864M/s at p50 175us** in-L2 and **188.584M/s at p50 221us** out-of-L2. The 48M-row fixture built in
+  **1,628.8s** with zero late residency work. This slice changes no read kernel or residency layout.
+- PRODUCT-001 remains open. Full transactional extended DDL, remaining SQLSTATE/type-codec compatibility, old
+  server/P8 deletion, private-strategy cleanup, and final whole-tree ownership are still owned only by PLAN. Prepared
+  route/isolation, Describe-time catalog revalidation, and public facade consolidation are now accepted.
+  At this lifecycle slice's boundary extended DDL failed pre-effect with `0A000`; the later single-CREATE foundation
+  is recorded at the top of this file without closing composite DDL/DML work. Materialized async response encoding
+  and bounded streaming are explicit SCALE-001 debt. The first independent lifecycle audit returned REJECT; failed-state/object/format
+  precedence, implicit rollback cleanup, Bind SQLSTATEs, raw atomic-rollback proof, malformed Query/Sync recovery,
+  and stale evidence were corrected. The final independent adversarial re-audit verdict is **ACCEPT**.
+
+## PRODUCT-001 prepared transaction route/class and isolation proof accepted — 2026-07-20
+
+- Engine-issued typed prepared routes now derive W1/T8/T32 only as bounded scheduling classes. Indexed prepared
+  programs above 32 operations remain supported as `General`; the class is not a transaction-size limit. Every
+  program stages a private GPU generation, reads its own writes, emits one resolved binary transaction WAL record,
+  and publishes atomically through the canonical commit authority. PostgreSQL-style READ COMMITTED refreshes each
+  statement while REPEATABLE READ retains its captured snapshot; typed NULL equality returns an indexed empty/no-op
+  result rather than a missing-needle error or scan.
+- The route proof closes target, unique, outgoing-FK, inbound-FK, catalog, physical-index, and fixed-width resource
+  dependencies before admission. Named PK/unique selection is independent of table column order. PostgreSQL-valid
+  unindexed auxiliary work remains supported as `General`; it cannot borrow a fast class. An indexed prepared base
+  lookup must use its retained device allocation or fail closed—no mutable-cache rebuild, conjunct/all-slot scan, or
+  CPU relational fallback is permitted. Transaction-private overlay indexing remains bounded by the admitted
+  mutation envelope.
+- Retained pins own both the device index and the exact resident source allocation. Coverage and use require numeric
+  device address, `Arc` source identity, published extent, and GC boundary; logical route-token rotation is harmless
+  only for the same source allocation. In-place append publishes shared row-count and posting state before consulting
+  the purgeable cache, so an overlapping cache retirement cannot strand a READ COMMITTED pin. Replacement,
+  rollover, a new shard, or synthetic pointer ABA fails closed.
+- Commit-time version churn declines retryably before either O(rows) locator. Explicit validation uses tentative row
+  IDs under the canonical mutex and advances the allocator only during canonical apply; rejected unique/FK outcomes
+  leave allocator, WAL, status, and publication unchanged. Classic serial waves now read their allocator basis after
+  taking that same mutex, matching sharded waves and optimized lanes. A deterministic prepared/classic race verifies
+  distinct physical device row identities and exact high-water advancement.
+- The 15-test actual-GPU matrix covers W1/T8/T32, General above 32, RC/RR/RYW, NULL, catalog and FK closure, row-width
+  races, column-order independence, version churn, pre-WAL rejection, generation replacement, post-kernel cache
+  purge, posting publication, row-ID interleaving, and synthetic ABA. It passed sequentially and in two simultaneous
+  processes. Ordinary gates pass engine **487/520 ignored**, facade **46/10**, facade concurrency **13/1**, and
+  execution **52/75**; workspace all-target check, strict SQL/engine/facade/protocol/server all-target Clippy,
+  rustfmt, diff, and source-size checks are clean. `engine_dml_concurrent.rs` remains a PLAN-owned 2,065-line
+  PRODUCT-001 disposition and must return below 2,000 lines before the parent closes.
+- Independent audits repeatedly rejected concrete key-selection, scan-fallback, allocator, cache-publication,
+  test-vacuity, classic-wave race, and ABA holes; every finding was repaired and independently re-audited. The final
+  frozen-tree adversarial verdict is **ACCEPT**. The final report card exits 0: raw in/out-L2 rooflines are
+  **1,480.8/1,439.7 GB/s**, grouped aggregation is **1,674.9M elements/s**, and compact batch-65,536 point reads are
+  **229.397M/s at p50 158us** in-L2 and **200.834M/s at p50 200us** out-of-L2. The 48M-row fixture built in
+  **1,722.8s** with zero late residency work.
+- PRODUCT-001 remains open. The next independently audited boundary consolidates the plural public facade mutation
+  and session entrances behind one `SharedEngine` submission API while removing or privatizing superseded entries
+  in the same slice. Compatibility migration, legacy/P8 deletion, replay-only recovery surface, final source guards,
+  and the one-product-server whole-tree proof remain sequenced afterward.
 
 ## Known boundaries
 

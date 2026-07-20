@@ -41,9 +41,49 @@ use std::time::Duration;
 
 use gpu_db_engine::{Engine, RelationalResidencyWarmupPolicy};
 use gpu_db_facade::{
-    execute_concurrent_dml_with_prepared_hook, execute_on_shared_engine,
-    execute_select_with_pinned_hook, DbError, DbValue, ErrorCategory, QueryOutcome, SharedEngine,
+    DbError, DbValue, ErrorCategory, QueryOutcome, SharedEngine, SubmissionRequest,
 };
+
+fn submit_text(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
+    let mut session = shared.open_session();
+    shared
+        .submit(&mut session, SubmissionRequest::Text(sql))
+        .into_immediate()
+}
+
+fn submit_instrumented_dml(
+    shared: &SharedEngine,
+    sql: &str,
+    on_prepared: impl FnOnce() + Send + 'static,
+) -> Result<QueryOutcome, DbError> {
+    let mut session = shared.open_session();
+    shared
+        .submit(
+            &mut session,
+            SubmissionRequest::InstrumentedDml {
+                sql,
+                on_prepared: Box::new(on_prepared),
+            },
+        )
+        .into_immediate()
+}
+
+fn submit_instrumented_select(
+    shared: &SharedEngine,
+    sql: &str,
+    on_pinned: impl FnOnce(),
+) -> Result<QueryOutcome, DbError> {
+    let mut session = shared.open_session();
+    shared
+        .submit(
+            &mut session,
+            SubmissionRequest::InstrumentedSelect {
+                sql,
+                on_pinned: Box::new(on_pinned),
+            },
+        )
+        .into_immediate()
+}
 
 /// Repetitions for each deterministic concurrency test. Each repetition rebuilds fresh state and
 /// re-runs the barrier'd interleaving, so the property is asserted over many real interleavings.
@@ -103,7 +143,7 @@ fn with_deadline(secs: u64, name: &'static str, body: impl FnOnce() + Send + 'st
 }
 
 fn run(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
-    execute_on_shared_engine(shared, sql)
+    submit_text(shared, sql)
 }
 
 fn run_ok(shared: &SharedEngine, sql: &str) {
@@ -173,16 +213,11 @@ fn lost_update_two_concurrent_updates_one_commits_one_aborts() {
                         thread::spawn(move || {
                             let sql = format!("UPDATE t SET balance = {} WHERE id = 1", 200 + w);
                             let hook_barrier = Arc::clone(&barrier);
-                            execute_concurrent_dml_with_prepared_hook(
-                                &shared,
-                                1000 + w as u64,
-                                &sql,
-                                || {
-                                    // Snapshot captured + prepared; align both writers here, then
-                                    // race to commit.
-                                    hook_barrier.wait();
-                                },
-                            )
+                            submit_instrumented_dml(&shared, &sql, move || {
+                                // Snapshot captured + prepared; align both writers here, then
+                                // race to commit.
+                                hook_barrier.wait();
+                            })
                             .map(|_| ())
                             .map_err(|err| err.category)
                         })
@@ -435,15 +470,17 @@ fn concurrent_inserts_of_the_same_unique_value_one_commits_one_aborts() {
                     commits, 1,
                     "rep {rep}: exactly one concurrent unique insert must commit (outcomes: {outcomes:?})"
                 );
-                // Every loser aborted; aborts are either serialization (lost the ledger race) or
-                // engine (a committed-duplicate rejection if it lost before snapshotting) — never a
-                // silent success.
+                // Every loser aborted; aborts are either serialization (lost the ledger race), a
+                // typed unique violation, or a legacy engine-category rejection — never a silent
+                // success.
                 for outcome in &outcomes {
                     if let Err(category) = outcome {
                         assert!(
                             matches!(
                                 category,
-                                ErrorCategory::Serialization | ErrorCategory::Engine
+                                ErrorCategory::Serialization
+                                    | ErrorCategory::UniqueViolation
+                                    | ErrorCategory::Engine
                             ),
                             "rep {rep}: unique loser must be a retryable/constraint error, got {category:?}"
                         );
@@ -522,11 +559,10 @@ fn insert_child_with_concurrently_deleted_fk_parent_aborts_retryable_not_wedged(
                     let child_prepared = Arc::clone(&child_prepared);
                     let parent_deleted = Arc::clone(&parent_deleted);
                     thread::spawn(move || {
-                        execute_concurrent_dml_with_prepared_hook(
+                        submit_instrumented_dml(
                             &shared,
-                            2000,
                             "INSERT INTO child (id, pid) VALUES (10, 1)",
-                            || {
+                            move || {
                                 // Snapshot captured + FK-preflighted (parent present). Release the
                                 // deleter, then block until the parent delete has committed so our
                                 // commit-time re-resolve provably races a now-missing parent.
@@ -1134,7 +1170,7 @@ fn reader_overlapping_shape_changing_ddl_always_decodes_consistently() {
 }
 
 /// INSTRUMENTED variant of the co-pinning crux: a reader deterministically STRADDLES a shape-changing
-/// DDL commit. The reader parks (via [`execute_select_with_pinned_hook`]) in the window BETWEEN
+/// DDL commit. The reader parks (via [`submit_instrumented_select`]) in the window BETWEEN
 /// binding its catalog and pinning its data; while it is parked a writer commits an `ALTER TABLE t ADD
 /// COLUMN` (which rewrites every row, changing the part-count) AND bumps `committed_seq`. With
 /// co-pinning the reader's data pin reuses the boundary its bind selected its catalog at, so it reads
@@ -1188,7 +1224,7 @@ fn instrumented_reader_straddling_a_shape_change_decodes_at_its_pinned_generatio
                     let ddl_done = Arc::clone(&ddl_done);
                     thread::spawn(move || {
                         let outcome =
-                            execute_select_with_pinned_hook(&shared, "SELECT * FROM t", || {
+                            submit_instrumented_select(&shared, "SELECT * FROM t", || {
                                 // We are between bind (catalog selected at boundary `s`) and pin. Let the
                                 // writer commit its shape DDL, then wait for it to finish before pinning —
                                 // forcing the straddle deterministically.

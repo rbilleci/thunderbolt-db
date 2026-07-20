@@ -231,7 +231,14 @@ impl Engine {
                 let Some(device_index) = entry.device_index.clone() else {
                     continue;
                 };
-                (device_index, entry.table_mask, entry.hash_shift, key)
+                (
+                    device_index,
+                    entry.table_mask,
+                    entry.hash_shift,
+                    key,
+                    std::sync::Arc::clone(&entry.published_row_count),
+                    std::sync::Arc::clone(&entry.published_has_postings),
+                )
             };
             requests.push(gpu_db_execution::CudaResidentTypedIndexInsert {
                 index: std::sync::Arc::clone(&basis.0),
@@ -256,13 +263,22 @@ impl Engine {
                     self.read_state
                         .residency
                         .run_shard_pk_index_append_post_launch_hook();
+                    // The allocation was mutated even if a racing lifecycle purge has removed its
+                    // cache entry. Publish through the basis-owned Arcs first so every retained pin
+                    // observes the new physical extent and posting mode independently of the map.
+                    for (_, _, _, _, published_rows, published_postings) in &bases {
+                        if status.created_posting {
+                            published_postings.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        published_rows.store(new_count, std::sync::atomic::Ordering::Release);
+                    }
                     let mut cache = self
                         .read_state
                         .residency
                         .shard_pk_device_index
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    for (device_index, _, _, key) in bases {
+                    for (device_index, _, _, key, _, _) in bases {
                         let Some(entry) = cache.get_mut(&key) else {
                             continue;
                         };
@@ -272,8 +288,8 @@ impl Engine {
                                 std::sync::Arc::ptr_eq(current, &device_index)
                             })
                         {
-                            entry.row_count = new_count;
                             entry.has_postings |= status.created_posting;
+                            entry.row_count = new_count;
                         }
                     }
                 }
@@ -401,7 +417,7 @@ impl Engine {
     ) {
         {
             // Snapshot the entry basis under the lock (index Arc is cheap-cloned for the launch).
-            let (index, table_mask, hash_shift) = {
+            let (index, table_mask, hash_shift, published_rows, published_postings) = {
                 let cache = self
                     .read_state
                     .residency
@@ -417,7 +433,13 @@ impl Engine {
                 let Some(index) = entry.device_index.clone() else {
                     return; // DECLINED is monotone under appends
                 };
-                (index, entry.table_mask, entry.hash_shift)
+                (
+                    index,
+                    entry.table_mask,
+                    entry.hash_shift,
+                    std::sync::Arc::clone(&entry.published_row_count),
+                    std::sync::Arc::clone(&entry.published_has_postings),
+                )
             };
             let table_size = (table_mask as u64) + 1;
             if (new_count as u64).saturating_mul(2) > table_size {
@@ -447,6 +469,10 @@ impl Engine {
                     self.read_state
                         .residency
                         .run_shard_pk_index_append_post_launch_hook();
+                    if status.created_posting {
+                        published_postings.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    published_rows.store(new_count, std::sync::atomic::Ordering::Release);
                     let mut cache = self
                         .read_state
                         .residency
@@ -470,8 +496,8 @@ impl Engine {
                         // basis would make it look complete and create a false-negative point probe.
                         return;
                     }
-                    entry.row_count = new_count;
                     entry.has_postings |= status.created_posting;
+                    entry.row_count = new_count;
                 }
                 Err(_) => {
                     self.read_state

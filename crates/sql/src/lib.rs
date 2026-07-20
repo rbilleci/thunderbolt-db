@@ -29,10 +29,11 @@ pub use ast::{
     DropTable, DropTablespace, DropView, Insert, PrimaryKey, PublicationTarget,
     RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
     RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace,
-    RenameView, SelectFunction, SequenceCurrVal, SequenceNextVal, SequenceSetVal, TruncateTable,
+    RenameView, SelectFunction, SelectLiteral, SequenceCurrVal, SequenceNextVal, SequenceSetVal,
+    TransactionAccessMode, TransactionCharacteristics, TransactionIsolation, TruncateTable,
     UniqueConstraint, Update, UpdateAssignment,
 };
-pub use command::{parse_command, parse_command_allowing_catalog};
+pub use command::{parse_command, parse_command_allowing_catalog, split_simple_query};
 pub use copy::{
     is_copy_statement, is_supported_extended_copy, parse_copy_from_stdin, parse_copy_row,
     parse_copy_to_stdout_table, CopyColumn, CopyFormat, CopyFromStdin, CopyOptions, CopyParseError,
@@ -40,12 +41,16 @@ pub use copy::{
 };
 mod decimal;
 mod parameter;
+mod parsed;
+mod prepared;
 mod relation;
 mod scalar;
 mod select;
 
 pub use decimal::{Decimal128, NumericOverflow};
 pub use parameter::lower_sql_parameters;
+pub use parsed::ParsedCommand;
+pub use prepared::PreparedCommand;
 pub mod datetime;
 pub use scalar::{
     SqlType, SqlValue, NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE, SUPPORTED_SQL_TYPES,
@@ -141,6 +146,43 @@ fn parse_select_function(input: &str) -> Result<Command, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(Command::SelectFunction(SelectFunction { name }))
+}
+
+fn parse_select_literal(input: &str) -> Result<Command, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "SELECT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if rest.is_empty()
+        || [
+            "FROM", "WHERE", "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET",
+        ]
+        .into_iter()
+        .any(|keyword| find_keyword_outside_quotes(rest, keyword).is_some())
+        || find_char_outside_quotes(rest, ',').is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+
+    let (expression, column_name) = match find_keyword_outside_quotes(rest, "AS") {
+        Some(position) => {
+            let expression = rest[..position].trim();
+            let alias = rest[position + "AS".len()..].trim();
+            if expression.is_empty() || alias.is_empty() {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            (expression, normalize_identifier(alias)?)
+        }
+        None => (rest, "?column?".to_string()),
+    };
+    let (ty, value) = scalar::parse_typed_sql_literal(expression)?;
+    if matches!(value, SqlValue::Parameter { .. }) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(Command::SelectLiteral(SelectLiteral {
+        column_name,
+        ty,
+        value,
+    }))
 }
 
 fn parse_sequence_value_function(input: &str) -> Result<Command, ParseError> {

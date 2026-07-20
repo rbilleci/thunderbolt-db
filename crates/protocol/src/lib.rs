@@ -195,11 +195,12 @@ pub struct SessionLifecycle {
 pub enum TransactionStatus {
     Idle,
     InTransaction,
+    FailedTransaction,
 }
 
 impl TransactionStatus {
     pub fn ready_for_query_in_transaction(self) -> bool {
-        matches!(self, Self::InTransaction)
+        !matches!(self, Self::Idle)
     }
 }
 
@@ -464,9 +465,6 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             let mut parameter_format_codes = Vec::with_capacity(format_count);
             for _ in 0..format_count {
                 let format_code = read_i16(payload, &mut offset)?;
-                if !is_valid_format_code(format_code) {
-                    return Err(FrontendMessageError::InvalidBindPayload);
-                }
                 parameter_format_codes.push(format_code);
             }
 
@@ -475,12 +473,6 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 return Err(FrontendMessageError::InvalidBindPayload);
             }
             let parameter_count = parameter_count as usize;
-            if !parameter_format_codes.is_empty()
-                && parameter_format_codes.len() != 1
-                && parameter_format_codes.len() != parameter_count
-            {
-                return Err(FrontendMessageError::InvalidBindPayload);
-            }
             let mut parameters = Vec::with_capacity(parameter_count);
             for _ in 0..parameter_count {
                 let len_bytes = payload
@@ -515,9 +507,6 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             let mut result_format_codes = Vec::with_capacity(result_format_count);
             for _ in 0..result_format_count {
                 let format_code = read_i16(payload, &mut offset)?;
-                if !is_valid_format_code(format_code) {
-                    return Err(FrontendMessageError::InvalidBindPayload);
-                }
                 result_format_codes.push(format_code);
             }
 
@@ -891,6 +880,7 @@ impl ReadyLoopState {
 }
 
 pub mod backend {
+    use super::TransactionStatus;
     use std::io::{self, ErrorKind, Write};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -988,7 +978,20 @@ pub mod backend {
         }
 
         pub fn ready_for_query(&mut self, in_transaction: bool) -> io::Result<()> {
-            let status = if in_transaction { b'T' } else { b'I' };
+            let status = if in_transaction {
+                TransactionStatus::InTransaction
+            } else {
+                TransactionStatus::Idle
+            };
+            self.ready_for_query_status(status)
+        }
+
+        pub fn ready_for_query_status(&mut self, status: TransactionStatus) -> io::Result<()> {
+            let status = match status {
+                TransactionStatus::Idle => b'I',
+                TransactionStatus::InTransaction => b'T',
+                TransactionStatus::FailedTransaction => b'E',
+            };
             self.message(b'Z', &[status])
         }
 

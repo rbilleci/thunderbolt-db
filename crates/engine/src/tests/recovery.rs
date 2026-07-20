@@ -113,6 +113,7 @@ fn explicit_transaction_binary_record_is_one_atomic_recoverable_generation() {
     let inserted_row_id = e.read_state.mvcc.current_row_id();
     let record = BinaryTransactionRecord {
         allocator_high_water: inserted_row_id + 1,
+        catalog_commands: Vec::new(),
         sequence_advances: BTreeMap::new(),
         mutations: vec![
             BinaryTransactionMutation::Insert {
@@ -435,6 +436,67 @@ fn checkpoint_and_truncate_bounds_the_live_segment_and_recovers_with_checkpoint(
     let mut reopened =
         Engine::open_durable_wal_segment_with_checkpoint(&control_path, &segment_path).unwrap();
     assert_eq!(select_people_ids(&mut reopened), vec![1, 2, 3]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checkpoint_waits_for_registered_publication_tail_before_truncating() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-ckpt-tail-gate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let segment_path = dir.join("live.wal");
+    let control_path = dir.join("CONTROL");
+    let checkpoint_segment_path = dir.join("checkpoint.wal");
+
+    let engine = std::sync::Arc::new(serial_durable_engine(&segment_path));
+    engine
+        .execute_text(1, "CREATE TABLE checkpoint_tail (id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute_text(2, "INSERT INTO checkpoint_tail VALUES (1)")
+        .unwrap();
+
+    // Sabotage the off-lock completion boundary: a canonical tail is registered but deliberately
+    // withheld. Checkpoint/truncation must not capture a boundary until that tail is resolved.
+    engine.register_publication_tail();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let checkpoint = {
+        let engine = std::sync::Arc::clone(&engine);
+        let control_path = control_path.clone();
+        let checkpoint_segment_path = checkpoint_segment_path.clone();
+        std::thread::spawn(move || {
+            let result =
+                engine.checkpoint_and_truncate_durable_wal(&control_path, &checkpoint_segment_path);
+            done_tx.send(()).unwrap();
+            result
+        })
+    };
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "checkpoint must wait while a canonical publication tail is unfinished"
+    );
+    engine.finish_publication_tail();
+    let meta = checkpoint.join().unwrap().unwrap();
+    assert_eq!(meta.durable_record_count, 2);
+
+    // A suffix committed after the guarded checkpoint must recover after the checkpointed prefix.
+    engine
+        .execute_text(3, "INSERT INTO checkpoint_tail VALUES (2)")
+        .unwrap();
+    drop(engine);
+    let recovered =
+        Engine::open_durable_wal_segment_with_checkpoint(&control_path, &segment_path).unwrap();
+    assert_eq!(recovered.wal_flushed_count(), 3);
+    assert_eq!(recovered.committed_seq(), 3);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2384,12 +2446,102 @@ fn w5a_binary_records_interleave_with_text_and_survive_rotation() {
 }
 
 /// E2.5c-1 — LANES-MODE REOPEN: the on-disk lane logs (fabricated exactly as an activated 2-lane
-/// engine writes them: WalRecords with binary insert payloads at LANE-LOCAL global seqs tiling
-/// [0, N)) replay AFTER the serial log's pre-activation prefix; the reopened engine is ACTIVATED
-/// (classic writes refused fail-loud — the v1 intent-only contract survives reopen), its lane
-/// cut/oracle continue from the recovered history, and a second reopen is idempotent.
+/// engine wrote them: WalRecords with binary insert payloads at LANE-LOCAL global seqs tiling
+/// [0, N)) replay AFTER the serial log's pre-activation prefix. This historical format reopens
+/// read-only until the compatibility migration rewrites it into the canonical WAL; it must never
+/// become a second live claimant. A second reopen remains idempotent.
 #[test]
-fn lanes_reopen_replays_serial_then_lane_merge_and_guards_classic_writes() {
+fn legacy_lane_suffix_cannot_repeat_a_serial_transaction_identity() {
+    let path = test_wal_path("lanes-cross-chunk-duplicate-txn");
+    let row_id = {
+        let e = serial_durable_engine(&path);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO t VALUES (1, 10)").unwrap();
+        e.read_state.mvcc.current_row_id()
+    };
+    {
+        let set = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, 1 << 20).expect("create lanes");
+        let values = vec![SqlValue::Int4(2), SqlValue::Int4(20)];
+        let payload =
+            crate::wal_binary::try_encode_binary_insert("t", &[(row_id, values.as_slice())])
+                .expect("binary encode");
+        // Transaction 2 already owns the serial INSERT. A separately replayed historical lane
+        // chunk must not apply another mutation and overwrite that terminal identity.
+        let duplicate = canonical_test_lane_record(&path, 1, 0, 2, payload);
+        set.append(1, 0, &[duplicate]).expect("append duplicate");
+        set.wait_durable(1).expect("lane record durable");
+    }
+
+    let error = match Engine::open_durable_wal_segment(&path) {
+        Ok(_) => panic!("cross-chunk duplicate transaction identity must reject recovery"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("repeats terminal transaction claim 2"),
+        "{error}"
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+    cleanup_lane_files(&path);
+}
+
+#[test]
+fn empty_historical_lane_files_do_not_create_a_second_live_authority() {
+    let path = test_wal_path("empty-legacy-lanes");
+    {
+        let e = serial_durable_engine(&path);
+        e.execute_text(1, "SET before=reopen").unwrap();
+    }
+    {
+        // Older lanes-mode construction eagerly created these files even when no lane record was
+        // ever accepted. Their mere presence must not make the database read-only or resurrect
+        // the retired physical WAL append path.
+        let _empty = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, 1 << 20)
+            .expect("create empty historical lane files");
+    }
+
+    let mut reopened = Engine::open_durable_wal_segment(&path).expect("empty lanes reopen");
+    let canonical_before = reopened.durable_wal_records().len();
+    assert!(
+        !reopened
+            .intent_lanes
+            .as_ref()
+            .expect("legacy lane metadata")
+            .legacy_recovery_read_only
+    );
+    reopened
+        .execute_text(2, "SET after=reopen")
+        .expect("canonical serialized writes remain live");
+    reopened
+        .enqueue_set_text(3, "SET batched=canonical", std::time::Instant::now())
+        .expect("canonical batch admission remains live");
+    reopened.flush_admin().expect("canonical batch flush");
+    assert_eq!(reopened.get("after").as_deref(), Some("reopen"));
+    assert_eq!(reopened.get("batched").as_deref(), Some("canonical"));
+    assert_eq!(reopened.durable_wal_records().len(), canonical_before + 2);
+    assert!(
+        !reopened
+            .intent_lanes
+            .as_ref()
+            .expect("legacy lane metadata")
+            .legacy_recovery_read_only
+    );
+    drop(reopened);
+
+    let again = Engine::open_durable_wal_segment(&path).expect("canonical suffix reopens");
+    assert_eq!(again.get("after").as_deref(), Some("reopen"));
+    assert_eq!(again.get("batched").as_deref(), Some("canonical"));
+    drop(again);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+    cleanup_lane_files(&path);
+}
+
+#[test]
+fn legacy_lanes_reopen_replays_merge_and_is_read_only_until_migration() {
     let path = test_wal_path("lanes-reopen");
     // Serial pre-activation history (pinned to the serial backend, env-proof): DDL + 2 rows.
     let row_base = {
@@ -2438,7 +2590,7 @@ fn lanes_reopen_replays_serial_then_lane_merge_and_guards_classic_writes() {
             .rows
             .into_boxed()
     };
-    let reopened = Engine::open_durable_wal_segment(&path).expect("lanes reopen must succeed");
+    let mut reopened = Engine::open_durable_wal_segment(&path).expect("lanes reopen must succeed");
     let rows = select_all(&reopened);
     assert_eq!(
         rows,
@@ -2452,18 +2604,35 @@ fn lanes_reopen_replays_serial_then_lane_merge_and_guards_classic_writes() {
         ],
         "serial prefix then lane merge, in global seq order"
     );
-    // The reopened lane state continues the recovered history: durable/applied cuts at 4
-    // (lane-local), so the reopened set's next claims can never collide with recovered seqs.
-    let stats = reopened.intent_lane_stats().expect("lanes state installed");
-    assert_eq!(stats.7, 4, "lane durable cut continues at the merge end");
-    assert_eq!(stats.8, 4, "applied cut pre-seeded to the merge end");
-    // v1 contract survives reopen: classic DML is refused fail-loud.
+    assert!(
+        reopened
+            .intent_lanes
+            .as_ref()
+            .expect("legacy lanes installed")
+            .legacy_recovery_read_only
+    );
+    reopened
+        .execute_text(8, "BEGIN")
+        .expect("legacy history remains readable through an explicit transaction");
+    reopened
+        .execute_text(8, "COMMIT")
+        .expect("a no-delta COMMIT must remain valid on a read-only legacy history");
+    let wal_before_refusal = reopened.durable_wal_records().len();
+    let seq_before_refusal = reopened.committed_seq();
+    let enqueue_error = reopened
+        .enqueue_set_text(9, "SET legacy=blocked", std::time::Instant::now())
+        .expect_err("legacy read-only history must reject batched mutation admission");
+    assert!(enqueue_error.to_string().contains("open read-only"));
+    assert_eq!(reopened.pending_batch_len(), 0);
+    assert_eq!(reopened.durable_wal_records().len(), wal_before_refusal);
+    assert_eq!(reopened.committed_seq(), seq_before_refusal);
+    // Historical lane files remain a replay-only compatibility seam, never a live write path.
     let err = reopened
         .execute_text(9, "INSERT INTO t VALUES (7, 70)")
-        .expect_err("classic write after lanes activation must be refused");
+        .expect_err("legacy lane history must be read-only before migration");
     assert!(
-        err.to_string().contains("intent lanes are ACTIVE"),
-        "expected the intent-only refusal, got: {err}"
+        err.to_string().contains("open read-only"),
+        "expected the legacy-migration refusal, got: {err}"
     );
     drop(reopened);
     // Idempotent second reopen (nothing new was committed).
@@ -2620,12 +2789,11 @@ fn cleanup_lane_files(path: &std::path::Path) {
     }
 }
 
-/// E2.5c-2 — LANES CHECKPOINT + TRUNCATION arc: checkpoint an activated lanes database
-/// (checkpoint segment embeds serial ++ lane merge; sidecar records the split + baseline),
-/// verify rolled-away lane segments are PHYSICALLY pruned, then fabricate a post-checkpoint
-/// lane suffix and prove the auto-open replays checkpoint-then-suffix with row parity.
+/// Replay-only compatibility for an already-existing historical lanes checkpoint: the fixture
+/// creates the retired checkpoint and suffix at the WAL layer, then engine startup consumes them
+/// without retaining a runtime writer/maintenance owner for the old format.
 #[test]
-fn lanes_checkpoint_truncates_prunes_and_reopens_with_suffix() {
+fn historical_lanes_checkpoint_and_suffix_are_replay_only() {
     let path = test_wal_path("lanes-ckpt");
     let row_base = {
         let e = serial_durable_engine(&path);
@@ -2687,25 +2855,25 @@ fn lanes_checkpoint_truncates_prunes_and_reopens_with_suffix() {
             ref other => panic!("count returned {other:?}"),
         }
     };
+    // Historical fixture construction only: production has no corresponding checkpoint writer.
+    // Persist serial ++ lanes[0,24), commit its sidecar, then emulate the already-completed old
+    // pruning operation before asking the engine to consume the artifact.
+    let serial_records = gpu_db_wal::read_wal_segment(&path).unwrap();
+    let lane_prefix = gpu_db_wal::recover_lanes_from(&path, 2, 0).unwrap();
+    assert_eq!(lane_prefix.len(), 24);
+    let mut checkpoint_records = serial_records.clone();
+    checkpoint_records.extend(lane_prefix);
+    gpu_db_wal::write_lanes_checkpoint(&path, serial_records.len() as u64, 24, &checkpoint_records)
+        .unwrap();
     {
-        let reopened = Engine::open_durable_wal_segment(&path).expect("lanes reopen");
-        assert_eq!(counted(&reopened), 25, "1 serial + 24 lane rows");
-        let cut = reopened
-            .checkpoint_intent_lanes()
-            .expect("lanes checkpoint");
-        assert_eq!(cut, 24, "baseline = the cross-lane durable cut");
-        let after = lane_file_count();
-        assert!(
-            after < before,
-            "rolled-away lane segments must be pruned: {before} -> {after}"
-        );
-        // Idempotent re-checkpoint at the same cut (early-returns; the committed
-        // checkpoint is untouched).
-        assert_eq!(
-            reopened.checkpoint_intent_lanes().expect("re-checkpoint"),
-            24
-        );
+        let set = gpu_db_wal::FuaWalLaneSet::reopen_from(&path, 2, 2, tiny, 0).unwrap();
+        set.truncate_segments_below(24).unwrap();
     }
+    let after = lane_file_count();
+    assert!(
+        after < before,
+        "historical fixture pruning premise: {before} -> {after}"
+    );
     // Post-checkpoint lane SUFFIX (fabricated continuation commits above the baseline).
     {
         let set = gpu_db_wal::FuaWalLaneSet::reopen_from(&path, 2, 2, tiny, 24)
@@ -2720,8 +2888,8 @@ fn lanes_checkpoint_truncates_prunes_and_reopens_with_suffix() {
         }
         set.wait_durable(30).expect("suffix durable");
     }
-    // AUTO open (exercises the lanes routing past the serial checkpoint-open): replays the
-    // checkpoint, then the lane suffix; the reopened engine is intent-only.
+    // AUTO open (exercises the legacy-lanes routing past the serial checkpoint-open): replays the
+    // checkpoint, then the lane suffix; the historical format remains read-only until migration.
     let again = Engine::open_durable_wal_segment_auto(&path).expect("auto reopen");
     assert_eq!(
         counted(&again),
@@ -2730,11 +2898,15 @@ fn lanes_checkpoint_truncates_prunes_and_reopens_with_suffix() {
     );
     let err = again
         .execute_text(9, "INSERT INTO t VALUES (7, 70)")
-        .expect_err("classic write refused after checkpointed reopen");
-    assert!(err.to_string().contains("intent lanes are ACTIVE"), "{err}");
-    let stats = again.intent_lane_stats().expect("lanes installed");
-    assert_eq!(stats.7, 30, "durable cut continues above the checkpoint");
-    assert_eq!(stats.8, 30, "applied cut continues above the checkpoint");
+        .expect_err("legacy lane history must be read-only after checkpointed reopen");
+    assert!(err.to_string().contains("open read-only"), "{err}");
+    assert!(
+        again
+            .intent_lanes
+            .as_ref()
+            .expect("legacy lanes installed")
+            .legacy_recovery_read_only
+    );
     drop(again);
     // AUDIT (repeat-checkpoint crash window): a NEW generation segment written but whose
     // sidecar commit never happened must be IGNORED — the sidecar is the single commit point,

@@ -2,9 +2,16 @@
 
 use super::*;
 
+fn begin(characteristics: TransactionCharacteristics) -> Command {
+    Command::Begin { characteristics }
+}
+
 #[test]
 fn parses_transaction_control_commands_case_insensitively() {
-    assert_eq!(parse_command("begin").unwrap(), Command::Begin);
+    assert_eq!(
+        parse_command("begin").unwrap(),
+        begin(TransactionCharacteristics::default())
+    );
     assert_eq!(
         parse_command("COMMIT").unwrap(),
         Command::Commit { chain: false }
@@ -25,105 +32,94 @@ fn parses_transaction_control_commands_case_insensitively() {
 
 #[test]
 fn parses_transaction_control_work_and_transaction_aliases() {
-    assert_eq!(parse_command("BEGIN WORK").unwrap(), Command::Begin);
-    assert_eq!(parse_command("BEGIN TRANSACTION").unwrap(), Command::Begin);
-    assert_eq!(parse_command("BEGIN READ ONLY").unwrap(), Command::Begin);
-    assert_eq!(parse_command("BEGIN READ WRITE").unwrap(), Command::Begin);
-    assert_eq!(
-        parse_command("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN ISOLATION LEVEL READ COMMITTED").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(parse_command("BEGIN DEFERRABLE").unwrap(), Command::Begin);
-    assert_eq!(
-        parse_command("BEGIN NOT DEFERRABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN TRANSACTION READ ONLY").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN WORK READ WRITE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN READ WRITE, ISOLATION LEVEL SERIALIZABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN READ ONLY , DEFERRABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN READ ONLY DEFERRABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN READ WRITE ISOLATION LEVEL SERIALIZABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
-    assert_eq!(
-        parse_command("BEGIN TRANSACTION, READ ONLY").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("BEGIN WORK, READ WRITE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START TRANSACTION READ ONLY").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START TRANSACTION, READ ONLY").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(parse_command("START WORK").unwrap(), Command::Begin);
-    assert_eq!(
-        parse_command("START WORK, READ WRITE, DEFERRABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START WORK ISOLATION LEVEL READ COMMITTED").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START WORK, ISOLATION LEVEL REPEATABLE READ, NOT DEFERRABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START TRANSACTION DEFERRABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START TRANSACTION READ ONLY DEFERRABLE").unwrap(),
-        Command::Begin
-    );
-    assert_eq!(
-        parse_command("START WORK READ WRITE").unwrap(),
-        Command::Begin
-    );
+    let default = TransactionCharacteristics::default();
+    let read_only = TransactionCharacteristics {
+        access: TransactionAccessMode::ReadOnly,
+        ..default
+    };
+    let serializable = TransactionCharacteristics {
+        isolation: TransactionIsolation::Serializable,
+        ..default
+    };
+    let repeatable_read = TransactionCharacteristics::REPEATABLE_READ_WRITE;
+    let read_uncommitted = TransactionCharacteristics {
+        isolation: TransactionIsolation::ReadUncommitted,
+        ..default
+    };
+    let deferrable = TransactionCharacteristics {
+        deferrable: true,
+        ..default
+    };
+    for (sql, expected) in [
+        ("BEGIN WORK", default),
+        ("BEGIN TRANSACTION", default),
+        ("BEGIN READ ONLY", read_only),
+        ("BEGIN READ WRITE", default),
+        ("BEGIN ISOLATION LEVEL SERIALIZABLE", serializable),
+        ("BEGIN ISOLATION LEVEL REPEATABLE READ", repeatable_read),
+        ("BEGIN ISOLATION LEVEL READ COMMITTED", default),
+        ("BEGIN ISOLATION LEVEL READ UNCOMMITTED", read_uncommitted),
+        ("BEGIN DEFERRABLE", deferrable),
+        ("BEGIN NOT DEFERRABLE", default),
+        ("BEGIN TRANSACTION READ ONLY", read_only),
+        ("BEGIN WORK READ WRITE", default),
+        (
+            "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            serializable,
+        ),
+        (
+            "BEGIN READ WRITE, ISOLATION LEVEL SERIALIZABLE",
+            serializable,
+        ),
+        (
+            "BEGIN READ ONLY , DEFERRABLE",
+            TransactionCharacteristics {
+                access: TransactionAccessMode::ReadOnly,
+                deferrable: true,
+                ..default
+            },
+        ),
+        (
+            "BEGIN READ ONLY DEFERRABLE",
+            TransactionCharacteristics {
+                access: TransactionAccessMode::ReadOnly,
+                deferrable: true,
+                ..default
+            },
+        ),
+        (
+            "BEGIN READ WRITE ISOLATION LEVEL SERIALIZABLE",
+            serializable,
+        ),
+        ("START TRANSACTION", default),
+        ("BEGIN TRANSACTION, READ ONLY", read_only),
+        ("BEGIN WORK, READ WRITE", default),
+        ("START TRANSACTION READ ONLY", read_only),
+        ("START TRANSACTION, READ ONLY", read_only),
+        (
+            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            repeatable_read,
+        ),
+        ("START WORK", default),
+        ("START WORK, READ WRITE, DEFERRABLE", deferrable),
+        ("START WORK ISOLATION LEVEL READ COMMITTED", default),
+        (
+            "START WORK, ISOLATION LEVEL REPEATABLE READ, NOT DEFERRABLE",
+            repeatable_read,
+        ),
+        ("START TRANSACTION DEFERRABLE", deferrable),
+        (
+            "START TRANSACTION READ ONLY DEFERRABLE",
+            TransactionCharacteristics {
+                access: TransactionAccessMode::ReadOnly,
+                deferrable: true,
+                ..default
+            },
+        ),
+        ("START WORK READ WRITE", default),
+    ] {
+        assert_eq!(parse_command(sql).unwrap(), begin(expected), "{sql}");
+    }
     assert_eq!(
         parse_command("COMMIT WORK").unwrap(),
         Command::Commit { chain: false }
@@ -240,19 +236,31 @@ fn parses_transaction_control_work_and_transaction_aliases() {
 
 #[test]
 fn parses_begin_mode_lists_with_mixed_order_and_delimiters() {
+    let default = TransactionCharacteristics::default();
     assert_eq!(
         parse_command("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, NOT DEFERRABLE")
             .unwrap(),
-        Command::Begin
+        begin(TransactionCharacteristics {
+            isolation: TransactionIsolation::Serializable,
+            access: TransactionAccessMode::ReadOnly,
+            deferrable: false,
+        })
     );
     assert_eq!(
         parse_command("BEGIN READ WRITE ISOLATION LEVEL READ COMMITTED DEFERRABLE").unwrap(),
-        Command::Begin
+        begin(TransactionCharacteristics {
+            deferrable: true,
+            ..default
+        })
     );
     assert_eq!(
         parse_command("START WORK, NOT DEFERRABLE, ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .unwrap(),
-        Command::Begin
+        begin(TransactionCharacteristics {
+            isolation: TransactionIsolation::RepeatableRead,
+            access: TransactionAccessMode::ReadOnly,
+            deferrable: false,
+        })
     );
 }
 

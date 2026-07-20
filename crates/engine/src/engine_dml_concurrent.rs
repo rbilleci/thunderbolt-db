@@ -6,6 +6,7 @@
 //! execute_read_text entry points, and the read-pin helper.
 
 use super::*;
+use crate::engine_mutation_admission::validate_transaction_characteristics;
 
 mod lane;
 mod lane_apply;
@@ -96,7 +97,8 @@ fn wave_tail_pipeline_depth() -> u64 {
 /// SHARED fsyncs (the group covers everything appended while the previous flush was in flight),
 /// so the fsync count per commit drops toward 1/N. Correctness does not depend on finish order:
 /// a tail's durability wait covers all EARLIER WAL positions (prefix durability) and
-/// `publish_committed_seq` is a CAS-max, so concurrent claimers may finish tails out of order.
+/// The publication coordinator joins exact ready indices, so concurrent claimers may finish tails
+/// out of order without exposing a gap.
 /// The bound caps applied-but-unpublished state at N waves (restart recovery replays the durable
 /// prefix; nothing unpublished was ever acked).
 const WAVE_TAIL_PIPELINE_DEPTH_DEFAULT: u64 = 8;
@@ -187,7 +189,6 @@ impl Engine {
         }
 
         if let Some(lanes) = &self.intent_lanes {
-            lanes.apply_poisoned.store(true, AtomicOrdering::Release);
             let mut intents = Vec::new();
             for queue in &lanes.queues {
                 intents.extend(
@@ -204,40 +205,6 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .drain(..),
             );
-            // Lane publishers install an ApplyRequest and its LaneSettle while holding these in
-            // this same order. Holding both sets across the drain prevents an active pump from
-            // publishing one half after the other half was already swept.
-            let mut apply_queue = lanes
-                .apply_queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut settle_queues = lanes
-                .settle
-                .iter()
-                .map(|queue| {
-                    queue
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                })
-                .collect::<Vec<_>>();
-            for queue in &mut settle_queues {
-                for entry in queue.drain(..) {
-                    intents.extend(entry.winners);
-                    intents.extend(entry.async_winners);
-                }
-            }
-            for request in apply_queue.drain(..) {
-                request.slot.failed.store(true, AtomicOrdering::Release);
-                request.slot.done.store(true, AtomicOrdering::Release);
-                let mut inflight = lanes.inflight_slots[request.lane]
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for slot in request.unique_slots {
-                    inflight.remove(&slot);
-                }
-            }
-            drop(settle_queues);
-            drop(apply_queue);
             for request in lanes
                 .validate_queue
                 .lock()
@@ -294,6 +261,10 @@ impl Engine {
         let Ok(cmd) = parse_command(text) else {
             return false;
         };
+        self.is_concurrent_dml_command(&cmd)
+    }
+
+    pub(crate) fn is_concurrent_dml_command(&self, cmd: &Command) -> bool {
         let table_name = match &cmd {
             Command::Insert(insert) => &insert.table,
             Command::Update(update) => &update.table,
@@ -346,23 +317,41 @@ impl Engine {
     /// shard map loads one residency publication observation; both descriptor kinds own the device
     /// allocations they describe. Cached device indexes are lifetime-pinned as optional accelerators
     /// and remain subject to their existing buffer-identity validation before execution.
-    pub(crate) fn capture_transaction_snapshot(&self, boundary: Index) -> Arc<TransactionSnapshot> {
-        self.capture_read_snapshot(boundary, false)
+    pub(crate) fn capture_transaction_snapshot(
+        &self,
+        boundary: Index,
+        characteristics: TransactionCharacteristics,
+    ) -> Arc<TransactionSnapshot> {
+        self.capture_read_snapshot(boundary, false, characteristics)
     }
 
     /// Capture an autocommit statement generation. It has the same descriptor ownership guarantees
     /// as an explicit transaction but need not retain global index resources beyond the one read.
     pub(crate) fn capture_statement_snapshot(&self, boundary: Index) -> Arc<TransactionSnapshot> {
-        self.capture_read_snapshot(boundary, true)
+        self.capture_read_snapshot(
+            boundary,
+            true,
+            TransactionCharacteristics::READ_COMMITTED_READ_WRITE,
+        )
     }
 
     fn capture_read_snapshot(
         &self,
         boundary: Index,
         statement_owned: bool,
+        characteristics: TransactionCharacteristics,
     ) -> Arc<TransactionSnapshot> {
         let catalog = self.read_state.catalog_as_of(boundary);
         let table_versions = self.read_state.mvcc.capture_table_versions();
+        let retained_gpu_account = Arc::clone(&self.transaction_retained_gpu_allocations);
+        // Explicit snapshot capture and budget accounting both acquire lifetime-registry first.
+        // Replacement/purge publishers do not need this lock, but no budget observer can pass it
+        // between our descriptor/cache clone and exact allocation registration below.
+        let mut retained_gpu_tracked = (!statement_owned).then(|| {
+            retained_gpu_account
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let (
             resident_snapshots,
             resident_shards,
@@ -434,7 +423,40 @@ impl Engine {
                     .map(|bloom| Arc::clone(&bloom.device)),
             );
         }
+        let mut resident_gpu_resources = resident_index_resources.clone();
+        if !statement_owned {
+            resident_gpu_resources.extend(
+                resident_snapshots
+                    .values()
+                    .filter_map(|entry| entry.device_memory.as_ref().cloned()),
+            );
+            resident_gpu_resources.extend(resident_shards.values().flatten().flat_map(|shard| {
+                [
+                    shard.device_memory.as_ref(),
+                    shard.deleted_by_region.as_ref(),
+                    shard.created_by_region.as_ref(),
+                    shard.row_id_region.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+            }));
+        }
+        let resident_gpu_charge = if let Some(tracked) = retained_gpu_tracked.as_deref_mut() {
+            Arc::new(TransactionRetainedGpuCharge::register_locked(
+                Arc::clone(&retained_gpu_account),
+                &resident_gpu_resources,
+                tracked,
+            ))
+        } else {
+            Arc::new(TransactionRetainedGpuCharge::empty(Arc::clone(
+                &retained_gpu_account,
+            )))
+        };
+        drop(retained_gpu_tracked);
         Arc::new(TransactionSnapshot {
+            characteristics,
             boundary,
             next_row_id: self.read_state.mvcc.current_row_id(),
             catalog,
@@ -443,7 +465,7 @@ impl Engine {
             resident_shards: Arc::clone(&resident_shards),
             device_authoritative_tables,
             chunk_authoritative_tables,
-            delta: std::sync::Mutex::new(TransactionDeltaState {
+            delta: Arc::new(std::sync::Mutex::new(TransactionDeltaState {
                 generation: 0,
                 resident_shards: Arc::clone(&resident_shards),
                 streaming_cold_chunks: Arc::clone(&streaming_cold_chunks),
@@ -451,11 +473,19 @@ impl Engine {
                 write_set: WriteSet::default(),
                 next_row_id: self.read_state.mvcc.current_row_id(),
                 sequence_state: BTreeMap::new(),
+                catalog_command: None,
+                catalog_base: None,
+                catalog_overlay: None,
                 private_gpu_bytes_by_gpu: BTreeMap::new(),
-            }),
-            statement_lock: std::sync::Mutex::new(()),
+                commit_gpu_bytes_by_gpu: BTreeMap::new(),
+            })),
+            statement_lock: Arc::new(std::sync::Mutex::new(())),
+            program_owned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            data_snapshot_acquired: Arc::new(std::sync::atomic::AtomicBool::new(statement_owned)),
+            base_streaming_cold_chunks: streaming_cold_chunks,
             private_gpu_account: Arc::clone(&self.transaction_private_gpu_bytes),
             _resident_index_resources: resident_index_resources,
+            _resident_gpu_charge: resident_gpu_charge,
         })
     }
 
@@ -463,9 +493,46 @@ impl Engine {
     /// catalog, table versions, and resident GPU resource descriptors. Its scalar boundary remains
     /// in the same space used by conflict-ledger pruning and MVCC GC. Lock order is `commit` ->
     /// residency publishers/caches -> `active_snapshots`.
-    pub(crate) fn begin_transaction_context(&self, txn_id: TxnId) -> Result<(), TxnError> {
+    pub(crate) fn begin_transaction_context(
+        &self,
+        txn_id: TxnId,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<(), ExecuteError> {
+        let characteristics = validate_transaction_characteristics(characteristics)?;
+        self.begin_transaction_context_with_owner(txn_id, false, characteristics)
+            .map_err(ExecuteError::Txn)
+    }
+
+    pub(crate) fn begin_predeclared_transaction_context(
+        &self,
+        txn_id: TxnId,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<(), ExecuteError> {
+        let characteristics = validate_transaction_characteristics(characteristics)?;
+        self.begin_transaction_context_with_owner(txn_id, true, characteristics)
+            .map_err(ExecuteError::Txn)
+    }
+
+    fn begin_transaction_context_with_owner(
+        &self,
+        txn_id: TxnId,
+        program_owned: bool,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<(), TxnError> {
         let mut commit = self.commit_state();
-        let snapshot = self.capture_transaction_snapshot(self.committed_seq());
+        if commit.transaction_status.contains_key(&txn_id)
+            || self
+                .pending_transaction_claims
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&txn_id)
+        {
+            return Err(TxnError::AlreadyExists(txn_id));
+        }
+        let snapshot = self.capture_transaction_snapshot(self.committed_seq(), characteristics);
+        snapshot
+            .program_owned
+            .store(program_owned, AtomicOrdering::Release);
         let txn = commit.txn_manager.begin_with_id(txn_id)?;
         self.active_snapshots
             .lock()
@@ -484,6 +551,15 @@ impl Engine {
         chain: bool,
     ) -> Result<Option<TxnId>, TxnError> {
         let mut commit = self.commit_state();
+        let characteristics = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .transaction_snapshot_handle(txn_id)
+            .map_or(
+                TransactionCharacteristics::READ_COMMITTED_READ_WRITE,
+                |snapshot| snapshot.characteristics,
+            );
         if committed {
             commit.txn_manager.commit(txn_id)?;
         } else {
@@ -491,10 +567,10 @@ impl Engine {
         }
 
         let successor = if chain {
-            let next = commit.txn_manager.begin()?;
+            let next_id = self.begin_unclaimed_transaction(&mut commit)?;
             Some((
-                next.id,
-                self.capture_transaction_snapshot(self.committed_seq()),
+                next_id,
+                self.capture_transaction_snapshot(self.committed_seq(), characteristics),
             ))
         } else {
             None
@@ -598,6 +674,9 @@ impl Engine {
             .collect();
         crate::write_path::WriteDelta {
             write_set: delta.write_set.clone(),
+            read_snapshot: snapshot.commit_seq,
+            catalog_dependencies: delta.catalog_dependencies.clone(),
+            foreign_key_dependencies: delta.foreign_key_dependencies.clone(),
             rows_consumed: delta.rows_consumed,
             mutation: crate::write_path::PreparedMutation::Insert {
                 table: table.clone(),
@@ -633,6 +712,7 @@ impl Engine {
         write_set: WriteSet,
         read_snapshot: Index,
         prepared_catalog_seq: Index,
+        expected_catalog_version: Option<Index>,
         offlock_delta: Option<crate::write_path::WriteDelta>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
         let item = CommitWaveItem {
@@ -640,6 +720,7 @@ impl Engine {
             cmd,
             payload: std::sync::Arc::from(text.as_bytes()),
             prepared_catalog_seq,
+            expected_catalog_version,
             offlock_delta,
             binary_wal_template: None,
             write_set,
@@ -683,6 +764,7 @@ impl Engine {
             cmd,
             payload: std::sync::Arc::from(text.as_bytes()),
             prepared_catalog_seq,
+            expected_catalog_version: None,
             offlock_delta,
             binary_wal_template,
             write_set,
@@ -697,19 +779,6 @@ impl Engine {
         &self,
         item: CommitWaveItem,
     ) -> Result<(), ExecuteError> {
-        // Lanes-mode seq-collision guard: the classic sequencer must not run
-        // concurrently with activated lanes (oracle vs repl seqs). Blocking
-        // classic-shaped items are refused post-activation like all classic
-        // writes; the lean submit path is the lanes-mode entry.
-        if let Some(lanes) = &self.intent_lanes {
-            if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(ExecuteError::Engine(EngineError::Durability(
-                    "intent lanes are ACTIVE: blocking classic-path commits are refused \
-                     (submit_covered_insert_intent is the lanes-mode write entry)"
-                        .to_string(),
-                )));
-            }
-        }
         let outcome = self.enqueue_commit_wave_item(item)?;
         if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
             return result.map(|_| ());
@@ -724,9 +793,9 @@ impl Engine {
         &self,
         item: CommitWaveItem,
     ) -> Result<CommitWaveOutcome, ExecuteError> {
-        // E2.5b-2 lean path: lanes-mode intents enter via build_lane_intent in
-        // submit_covered_insert_intent (LaneIntent queues); classic-shaped
-        // items always take the classic queue (pre-activation only).
+        // Optimized lane intents enter via `build_lane_intent`; classic-shaped items use this
+        // queue. Both sequence through the canonical commit state and publication coordinator,
+        // so they may remain live concurrently.
         self.enqueue_commit_wave_item(item)
     }
 
@@ -762,8 +831,9 @@ impl Engine {
         if self.ensure_commit_path_available().is_err() {
             return false;
         }
-        // E2.5b-2: in lanes mode a pump call advances one lane's pipeline (round-robin);
-        // the classic wave machinery below still services pre-activation traffic.
+        // In lanes mode a pump call first advances one preparation lane (round-robin), then the same
+        // call can advance canonical classic-wave work. Neither strategy owns sequence/WAL state.
+        let mut did_work = false;
         if let Some(lanes) = &self.intent_lanes {
             let lanes = std::sync::Arc::clone(lanes);
             self.maybe_resize_lanes(&lanes);
@@ -771,9 +841,7 @@ impl Engine {
                 .pump_cursor
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % lanes.lane_count as u64) as usize;
-            if self.drive_intent_lane(lane) {
-                return true;
-            }
+            did_work |= self.drive_intent_lane(lane);
         }
         // Prefer claiming a pending tail (cheap, unblocks acks) before taking sequencer duty.
         if self.try_finish_pending_wave_tail() {
@@ -782,7 +850,7 @@ impl Engine {
         let promote = {
             let mut queue = match self.commit_wave.queue.try_lock() {
                 Ok(queue) => queue,
-                Err(_) => return false,
+                Err(_) => return did_work,
             };
             if !queue.sequencer_active && !queue.items.is_empty() && queue.wedged.is_none() {
                 queue.sequencer_active = true;
@@ -799,7 +867,7 @@ impl Engine {
             self.run_commit_wave_sequencer(&sentinel);
             return true;
         }
-        false
+        did_work
     }
 
     /// If no sequencer is running, promote THIS thread to drain+sequence waves until `own_outcome`
@@ -899,6 +967,13 @@ impl Engine {
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_simulated_wave_tail_change(&self) {
+        let queue = self.lock_commit_wave_queue();
+        self.commit_wave.cv.notify_all();
+        drop(queue);
     }
 
     /// The promoted sequencer: drain-and-commit WAVES until this thread's own item is done (then
@@ -1178,13 +1253,64 @@ impl Engine {
             drop(tail); // armed: fail outcomes; a wedged service publishes no later visibility
             return;
         }
-        self.publish_committed_seq(tail.last_seq);
+        let last_committed_seq = tail.committed.last().map(|(_, seq, _)| *seq);
+        if let Err(error) =
+            self.publish_ready_indices(tail.committed.iter().map(|(_, commit_seq, _)| *commit_seq))
+        {
+            self.wedge_commit_path();
+            let mut queue = self.lock_commit_wave_queue();
+            queue.wedged.get_or_insert_with(|| error.to_string());
+            drop(queue);
+            drop(tail);
+            return;
+        }
+        // A later wave may finish its physical durability tail before an earlier wave. Reporting
+        // readiness does not itself mean this tail is publication-covered: the coordinator holds
+        // it behind the gap. Drive any lower pending tail, or wait for its owner, before resolving
+        // this wave's SQL outcomes.
+        if let Some(last_committed_seq) = last_committed_seq {
+            if let Err(error) = self.wait_until_publication_covers(last_committed_seq) {
+                self.wedge_commit_path();
+                let mut queue = self.lock_commit_wave_queue();
+                queue.wedged.get_or_insert_with(|| error.to_string());
+                drop(queue);
+                drop(tail);
+                return;
+            }
+        }
         for (position, _seq, rows) in &tail.committed {
             self.metrics.inc_commit();
             tail.batch[*position].set_outcome(Ok(*rows));
         }
         tail.armed = false;
         completion.clean = true;
+    }
+
+    fn wait_until_publication_covers(&self, commit_seq: Index) -> Result<(), EngineError> {
+        loop {
+            if self.committed_seq() >= commit_seq {
+                return Ok(());
+            }
+            self.ensure_commit_path_available()?;
+            // Pending tails are ordered by sequencing handoff. Helping here closes the liveness
+            // case where this thread claimed a later tail while the lower tail has no scheduled
+            // owner at this instant.
+            if self.try_finish_pending_wave_tail() {
+                continue;
+            }
+            let queue = self.lock_commit_wave_queue();
+            if let Some(error) = &queue.wedged {
+                return Err(EngineError::Durability(error.clone()));
+            }
+            if self.committed_seq() >= commit_seq {
+                return Ok(());
+            }
+            let (_queue, _) = self
+                .commit_wave
+                .cv
+                .wait_timeout(queue, std::time::Duration::from_millis(1))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
     }
 
     /// W2 — claim and finish the pending pipeline tail if one is waiting. Called from the waiter
@@ -1485,7 +1611,51 @@ impl Engine {
         text: &str,
         timestamp_micros: u64,
     ) -> Result<(), ExecuteError> {
-        let result = self.execute_text_at_timestamp_micros_inner(txn_id, text, timestamp_micros);
+        let command = parse_command(text)?;
+        self.execute_parsed_text_at_timestamp_micros(txn_id, command, text, timestamp_micros, None)
+    }
+
+    pub(crate) fn execute_parsed_text(
+        &self,
+        txn_id: u64,
+        command: Command,
+        text: &str,
+    ) -> Result<(), ExecuteError> {
+        self.execute_parsed_text_with_catalog(txn_id, command, text, None)
+    }
+
+    pub(crate) fn execute_parsed_text_with_catalog(
+        &self,
+        txn_id: u64,
+        command: Command,
+        text: &str,
+        expected_catalog_version: Option<Index>,
+    ) -> Result<(), ExecuteError> {
+        let timestamp_micros = self.next_commit_timestamp_micros();
+        self.execute_parsed_text_at_timestamp_micros(
+            txn_id,
+            command,
+            text,
+            timestamp_micros,
+            expected_catalog_version,
+        )
+    }
+
+    fn execute_parsed_text_at_timestamp_micros(
+        &self,
+        txn_id: u64,
+        command: Command,
+        text: &str,
+        timestamp_micros: u64,
+        expected_catalog_version: Option<Index>,
+    ) -> Result<(), ExecuteError> {
+        let result = self.execute_parsed_text_at_timestamp_micros_inner(
+            txn_id,
+            command,
+            text,
+            timestamp_micros,
+            expected_catalog_version,
+        );
         // VACUUM #5: run a commit-parked auto-vacuum now — the commit lock + catalog latch are
         // released, so `vacuum_table` can take them fresh (the in-commit trigger would deadlock).
         let parked = self
@@ -1513,31 +1683,35 @@ impl Engine {
         result
     }
 
-    fn execute_text_at_timestamp_micros_inner(
+    fn execute_parsed_text_at_timestamp_micros_inner(
         &self,
         txn_id: u64,
+        cmd: Command,
         text: &str,
         timestamp_micros: u64,
+        expected_catalog_version: Option<Index>,
     ) -> Result<(), ExecuteError> {
         if self.is_commit_path_poisoned() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "commit path is wedged; restart recovery required".to_string(),
             )));
         }
-        let cmd = parse_command(text)?;
         if command_has_returning(&cmd) {
             return Err(discarded_returning_error());
         }
-        if self.transaction_snapshot_handle(txn_id).is_some() {
+        if let Some(snapshot) = self.transaction_snapshot_handle(txn_id) {
+            self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
             if matches!(
                 &cmd,
                 Command::Insert(_) | Command::Update(_) | Command::Delete(_)
             ) {
-                return self.execute_dml_in_transaction(txn_id, text);
+                return self
+                    .execute_parsed_dml_in_transaction_with_result(txn_id, cmd)
+                    .map(|_| ());
             }
             if !matches!(
                 &cmd,
-                Command::Begin | Command::Commit { .. } | Command::Rollback { .. }
+                Command::Begin { .. } | Command::Commit { .. } | Command::Rollback { .. }
             ) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "command is not supported inside an active transaction; it was not executed"
@@ -1554,8 +1728,9 @@ impl Engine {
                 | Command::Update(_)
                 | Command::Delete(_)
                 | Command::Select(_)
+                | Command::SelectLiteral(_)
                 | Command::CreateTable(_)
-                | Command::Begin
+                | Command::Begin { .. }
                 | Command::Commit { .. }
                 | Command::Rollback { .. }
         );
@@ -1662,18 +1837,20 @@ impl Engine {
                 self.preflight_unique_index_constraints(&cmd, txn_id)?;
                 match self.route_command(&cmd) {
                     RouteDecision::Gpu(_) | RouteDecision::Cpu => {
-                        self.commit_mutation_at(
+                        self.commit_mutation_at_with_catalog(
                             txn_id,
                             std::sync::Arc::from(text.as_bytes()),
                             timestamp_micros,
+                            expected_catalog_version,
                         )?;
                     }
                     RouteDecision::CpuFallback { reason, .. } => {
                         self.metrics.inc_gpu_fallback(reason);
-                        self.commit_mutation_at(
+                        self.commit_mutation_at_with_catalog(
                             txn_id,
                             std::sync::Arc::from(text.as_bytes()),
                             timestamp_micros,
+                            expected_catalog_version,
                         )?;
                     }
                 }
@@ -1693,18 +1870,20 @@ impl Engine {
                 validate_bootstrap_drop_extension(&drop).map_err(ExecuteError::Engine)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Begin => {
-                self.begin_transaction_context(txn_id)?;
+            Command::Begin { characteristics } => {
+                self.begin_transaction_context(txn_id, characteristics)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Commit { chain } => {
                 let snapshot = self
                     .transaction_snapshot_handle(txn_id)
                     .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+                self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
                 let _statement = snapshot
                     .statement_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
                 self.ensure_commit_path_available()
                     .map_err(ExecuteError::Engine)?;
                 if snapshot.transaction_delta_is_empty() {
@@ -1718,10 +1897,12 @@ impl Engine {
                 let snapshot = self
                     .transaction_snapshot_handle(txn_id)
                     .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+                self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
                 let _statement = snapshot
                     .statement_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
                 self.ensure_commit_path_available()
                     .map_err(ExecuteError::Engine)?;
                 self.finish_transaction_context(txn_id, false, chain)?;
@@ -1736,7 +1917,10 @@ impl Engine {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
-            Command::Select(_) | Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
+            Command::Select(_)
+            | Command::SelectFunction(_)
+            | Command::SelectLiteral(_)
+            | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -1761,7 +1945,7 @@ impl Engine {
                 }
                 Ok(self.get(&key))
             }
-            Command::Begin => Err(ExecuteError::NonReadCommand("BEGIN")),
+            Command::Begin { .. } => Err(ExecuteError::NonReadCommand("BEGIN")),
             Command::Commit { .. } => Err(ExecuteError::NonReadCommand("COMMIT")),
             Command::Rollback { .. } => Err(ExecuteError::NonReadCommand("ROLLBACK")),
             Command::Flush => Err(ExecuteError::NonReadCommand("FLUSH")),
@@ -1852,9 +2036,10 @@ impl Engine {
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
             Command::Delete(_) => Err(ExecuteError::NonReadCommand("DELETE")),
             Command::Update(_) => Err(ExecuteError::NonReadCommand("UPDATE")),
-            Command::Select(_) | Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
-                Err(ExecuteError::NonReadCommand("SELECT"))
-            }
+            Command::Select(_)
+            | Command::SelectFunction(_)
+            | Command::SelectLiteral(_)
+            | Command::SequenceCurrVal(_) => Err(ExecuteError::NonReadCommand("SELECT")),
         }
     }
 

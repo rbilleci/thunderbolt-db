@@ -6,7 +6,9 @@ use super::{find_matching_paren, Decimal128, ParseError};
 /// (`precision`/`scale`); every variant's payload is `Copy`, so `SqlType` stays
 /// `Copy` exactly like the original `Int4`/`Text`-only enum (the ~60 `== SqlType::Int4`
 /// guards and by-value passes are unaffected by the widening).
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum SqlType {
     /// PostgreSQL `smallint` (int2) — stored widened to i32 in the int4 device section (so it reuses
     /// the int4 compare path); arithmetic (int16-bounds overflow) is a follow-on.
@@ -124,6 +126,16 @@ pub enum SqlValue {
     Uuid([u8; 16]),
     /// A `smallint` (int2) as i16. Widens to int4 for comparison (PG's numeric tower).
     Int2(i16),
+    /// A typed-AST parameter slot owned only by [`crate::PreparedCommand`]. Ordinary
+    /// [`crate::ParsedCommand`] construction rejects commands that still contain this variant,
+    /// and binding replaces every occurrence before the command can cross engine admission.
+    #[serde(skip)]
+    Parameter {
+        /// PostgreSQL's one-based `$n` index.
+        index: usize,
+        /// An explicit SQL cast attached to the placeholder, when present.
+        cast: Option<SqlType>,
+    },
 }
 
 /// Parse a PostgreSQL boolean *value* literal (for a `bool` column / `::bool` cast).
@@ -227,6 +239,23 @@ fn parse_numeric_typmod(typmod: Option<&str>) -> Option<SqlType> {
 
 pub(super) fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
     let (s, cast) = split_supported_sql_value_cast(input.trim())?;
+    if let Some(digits) = s.strip_prefix('$') {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseError::InvalidParameterReference);
+        }
+        let index = digits
+            .parse::<usize>()
+            .map_err(|_| ParseError::InvalidParameterReference)?;
+        if index == 0 {
+            return Err(ParseError::InvalidParameterReference);
+        }
+        return Ok(SqlValue::Parameter { index, cast });
+    }
+    // NULL remains typeless even with an explicit cast; the cast supplies only its eventual SQL
+    // type. This also keeps a bound `$n::type` NULL canonical source parseable for recovery.
+    if s.eq_ignore_ascii_case("NULL") {
+        return Ok(SqlValue::Null);
+    }
     if s.starts_with('\'') {
         if !s.ends_with('\'') || s.len() < 2 {
             return Err(ParseError::InvalidRelationalSql);
@@ -246,6 +275,34 @@ pub(super) fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
         Some(ty) => parse_typed_value_from_str(s, ty),
         None => parse_inferred_unquoted_literal(s),
     }
+}
+
+/// Parse a bounded scalar projection and retain the type that PostgreSQL exposes in RowDescription.
+/// Unlike storage literals, a projected NULL must have a concrete output type; PostgreSQL resolves
+/// an otherwise-unknown top-level NULL to text, while an explicit cast owns the type.
+pub(super) fn parse_typed_sql_literal(input: &str) -> Result<(SqlType, SqlValue), ParseError> {
+    let (_, cast) = split_supported_sql_value_cast(input.trim())?;
+    let value = parse_sql_value(input)?;
+    let ty = match (cast, &value) {
+        (Some(ty), _) => ty,
+        (None, SqlValue::Null | SqlValue::Text(_)) => SqlType::Text,
+        (None, SqlValue::Int2(_)) => SqlType::Int2,
+        (None, SqlValue::Int4(_)) => SqlType::Int4,
+        (None, SqlValue::Int8(_)) => SqlType::Int8,
+        (None, SqlValue::Numeric(value)) => SqlType::Numeric {
+            precision: NUMERIC_DEFAULT_PRECISION,
+            scale: value.scale,
+        },
+        (None, SqlValue::Bool(_)) => SqlType::Bool,
+        (None, SqlValue::Date(_)) => SqlType::Date,
+        (None, SqlValue::Timestamp(_)) => SqlType::Timestamp,
+        (None, SqlValue::Uuid(_)) => SqlType::Uuid,
+        (None, SqlValue::Parameter { cast: Some(ty), .. }) => *ty,
+        (None, SqlValue::Parameter { cast: None, .. }) => {
+            return Err(ParseError::InvalidRelationalSql)
+        }
+    };
+    Ok((ty, value))
 }
 
 /// Parse `text` into a specific [`SqlType`] (used for an explicit `::type` cast and

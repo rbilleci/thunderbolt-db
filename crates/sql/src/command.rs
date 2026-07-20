@@ -2,8 +2,191 @@
 
 use super::{
     normalize_identifier, parse_relational_command, strip_keyword_prefix_case_insensitive, Command,
-    ParseError,
+    ParseError, TransactionAccessMode, TransactionCharacteristics, TransactionIsolation,
 };
+use crate::parameter::{
+    dollar_quote_delimiter, is_escape_string_prefix, is_identifier_continuation_byte,
+};
+
+/// Split a PostgreSQL simple-query message at top-level semicolons.
+///
+/// Semicolons inside strings, quoted identifiers, dollar-quoted bodies, line comments, or nested
+/// block comments are never treated as boundaries. PostgreSQL treats comments as whitespace, so
+/// leading/trailing comments are excluded from each returned statement and comment-only segments
+/// are omitted; comments between SQL tokens remain in the slice. An unterminated block comment is
+/// retained as executable text so command parsing reports a syntax error instead of silently
+/// accepting it as trivia. Callers emit one EmptyQueryResponse only when the whole message has no
+/// statement.
+pub fn split_simple_query(query: &str) -> Vec<&str> {
+    let mut statements = Vec::new();
+    let mut statement_code_start = None;
+    let mut statement_code_end = 0usize;
+    let mut index = 0usize;
+    let mut in_single_quote = false;
+    let mut single_quote_backslash_escapes = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut block_comment_depth = 0usize;
+    let mut block_comment_start = None;
+    let mut dollar_delimiter: Option<&str> = None;
+
+    while index < query.len() {
+        if let Some(delimiter) = dollar_delimiter {
+            if query[index..].starts_with(delimiter) {
+                index += delimiter.len();
+                dollar_delimiter = None;
+            } else {
+                index += query[index..]
+                    .chars()
+                    .next()
+                    .expect("index is inside query")
+                    .len_utf8();
+            }
+            statement_code_end = index;
+            continue;
+        }
+        let bytes = query.as_bytes();
+        if in_line_comment {
+            if matches!(bytes[index], b'\r' | b'\n') {
+                in_line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment_depth > 0 {
+            if bytes[index..].starts_with(b"/*") {
+                block_comment_depth += 1;
+                index += 2;
+            } else if bytes[index..].starts_with(b"*/") {
+                block_comment_depth -= 1;
+                index += 2;
+                if block_comment_depth == 0 {
+                    block_comment_start = None;
+                }
+            } else {
+                index += query[index..]
+                    .chars()
+                    .next()
+                    .expect("index is inside query")
+                    .len_utf8();
+            }
+            continue;
+        }
+        if in_single_quote {
+            if bytes[index] == b'\\'
+                && single_quote_backslash_escapes
+                && bytes.get(index + 1).is_some()
+            {
+                index += 1;
+                index += query[index..]
+                    .chars()
+                    .next()
+                    .expect("backslash has a following character")
+                    .len_utf8();
+            } else if bytes[index] == b'\'' {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                } else {
+                    in_single_quote = false;
+                    single_quote_backslash_escapes = false;
+                    index += 1;
+                }
+            } else {
+                index += query[index..]
+                    .chars()
+                    .next()
+                    .expect("index is inside query")
+                    .len_utf8();
+            }
+            statement_code_end = index;
+            continue;
+        }
+        if in_double_quote {
+            if bytes[index] == b'"' {
+                if bytes.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                } else {
+                    in_double_quote = false;
+                    index += 1;
+                }
+            } else {
+                index += query[index..]
+                    .chars()
+                    .next()
+                    .expect("index is inside query")
+                    .len_utf8();
+            }
+            statement_code_end = index;
+            continue;
+        }
+
+        if bytes[index..].starts_with(b"--") {
+            in_line_comment = true;
+            index += 2;
+        } else if bytes[index..].starts_with(b"/*") {
+            block_comment_depth = 1;
+            block_comment_start = Some(index);
+            index += 2;
+        } else if bytes[index] == b'\'' {
+            statement_code_start.get_or_insert(index);
+            in_single_quote = true;
+            single_quote_backslash_escapes = is_escape_string_prefix(query, index);
+            index += 1;
+            statement_code_end = index;
+        } else if bytes[index] == b'"' {
+            statement_code_start.get_or_insert(index);
+            in_double_quote = true;
+            index += 1;
+            statement_code_end = index;
+        } else if bytes[index] == b'$'
+            && !(index > 0 && is_identifier_continuation_byte(bytes[index - 1]))
+        {
+            if let Some((delimiter, after_start)) = dollar_quote_delimiter(query, index) {
+                statement_code_start.get_or_insert(index);
+                dollar_delimiter = Some(delimiter);
+                index = after_start;
+                statement_code_end = index;
+            } else {
+                statement_code_start.get_or_insert(index);
+                index += 1;
+                statement_code_end = index;
+            }
+        } else if bytes[index] == b';' {
+            if let Some(start) = statement_code_start.take() {
+                statements.push(&query[start..statement_code_end]);
+            }
+            index += 1;
+            statement_code_end = index;
+        } else {
+            let start = index;
+            let ch_len = query[index..]
+                .chars()
+                .next()
+                .expect("index is inside query")
+                .len_utf8();
+            index += ch_len;
+            if !query[start..index]
+                .chars()
+                .next()
+                .expect("one character was consumed")
+                .is_whitespace()
+            {
+                statement_code_start.get_or_insert(start);
+                statement_code_end = index;
+            }
+        }
+    }
+
+    if block_comment_depth > 0 {
+        let invalid_start = block_comment_start.expect("an open block comment records its start");
+        statement_code_start.get_or_insert(invalid_start);
+        statement_code_end = query.len();
+    }
+    if let Some(start) = statement_code_start {
+        statements.push(&query[start..statement_code_end]);
+    }
+    statements
+}
 
 fn parse_transaction_chain_suffix(tokens: &[&str]) -> Option<bool> {
     if tokens.is_empty() {
@@ -616,37 +799,6 @@ fn parse_set_role_command(tail: &str) -> Result<Command, ParseError> {
     Err(ParseError::InvalidSet)
 }
 
-fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
-    matches!(
-        tokens,
-        [isolation, level, serializable]
-            if isolation.eq_ignore_ascii_case("ISOLATION")
-                && level.eq_ignore_ascii_case("LEVEL")
-                && serializable.eq_ignore_ascii_case("SERIALIZABLE")
-    ) || matches!(
-        tokens,
-        [isolation, level, repeatable, read]
-            if isolation.eq_ignore_ascii_case("ISOLATION")
-                && level.eq_ignore_ascii_case("LEVEL")
-                && repeatable.eq_ignore_ascii_case("REPEATABLE")
-                && read.eq_ignore_ascii_case("READ")
-    ) || matches!(
-        tokens,
-        [isolation, level, read, committed]
-            if isolation.eq_ignore_ascii_case("ISOLATION")
-                && level.eq_ignore_ascii_case("LEVEL")
-                && read.eq_ignore_ascii_case("READ")
-                && committed.eq_ignore_ascii_case("COMMITTED")
-    ) || matches!(
-        tokens,
-        [isolation, level, read, uncommitted]
-            if isolation.eq_ignore_ascii_case("ISOLATION")
-                && level.eq_ignore_ascii_case("LEVEL")
-                && read.eq_ignore_ascii_case("READ")
-                && uncommitted.eq_ignore_ascii_case("UNCOMMITTED")
-    )
-}
-
 fn is_deferrable_suffix(tokens: &[&str]) -> bool {
     matches!(
         tokens,
@@ -659,21 +811,70 @@ fn is_deferrable_suffix(tokens: &[&str]) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BeginModeKind {
-    AccessMode,
-    IsolationLevel,
-    Deferrable,
+enum BeginMode {
+    Access(TransactionAccessMode),
+    Isolation(TransactionIsolation),
+    Deferrable(bool),
 }
 
-fn parse_begin_mode(tokens: &[String]) -> Option<(usize, BeginModeKind)> {
+fn parse_begin_mode(tokens: &[String]) -> Option<(usize, BeginMode)> {
     let refs: Vec<_> = tokens.iter().map(String::as_str).collect();
 
-    if refs.len() >= 4 && is_isolation_level_suffix(&refs[..4]) {
-        return Some((4, BeginModeKind::IsolationLevel));
+    if refs.len() >= 4
+        && matches!(
+            &refs[..4],
+            [isolation, level, repeatable, read]
+                if isolation.eq_ignore_ascii_case("ISOLATION")
+                    && level.eq_ignore_ascii_case("LEVEL")
+                    && repeatable.eq_ignore_ascii_case("REPEATABLE")
+                    && read.eq_ignore_ascii_case("READ")
+        )
+    {
+        return Some((
+            4,
+            BeginMode::Isolation(TransactionIsolation::RepeatableRead),
+        ));
     }
 
-    if refs.len() >= 3 && is_isolation_level_suffix(&refs[..3]) {
-        return Some((3, BeginModeKind::IsolationLevel));
+    if refs.len() >= 3 {
+        let isolation = match &refs[..3] {
+            [isolation, level, serializable]
+                if isolation.eq_ignore_ascii_case("ISOLATION")
+                    && level.eq_ignore_ascii_case("LEVEL")
+                    && serializable.eq_ignore_ascii_case("SERIALIZABLE") =>
+            {
+                Some(TransactionIsolation::Serializable)
+            }
+            _ => None,
+        };
+        if let Some(isolation) = isolation {
+            return Some((3, BeginMode::Isolation(isolation)));
+        }
+    }
+
+    if refs.len() >= 4 {
+        let isolation = match &refs[..4] {
+            [isolation, level, read, committed]
+                if isolation.eq_ignore_ascii_case("ISOLATION")
+                    && level.eq_ignore_ascii_case("LEVEL")
+                    && read.eq_ignore_ascii_case("READ")
+                    && committed.eq_ignore_ascii_case("COMMITTED") =>
+            {
+                Some(TransactionIsolation::ReadCommitted)
+            }
+            [isolation, level, read, uncommitted]
+                if isolation.eq_ignore_ascii_case("ISOLATION")
+                    && level.eq_ignore_ascii_case("LEVEL")
+                    && read.eq_ignore_ascii_case("READ")
+                    && uncommitted.eq_ignore_ascii_case("UNCOMMITTED") =>
+            {
+                Some(TransactionIsolation::ReadUncommitted)
+            }
+            _ => None,
+        };
+        if let Some(isolation) = isolation {
+            return Some((4, BeginMode::Isolation(isolation)));
+        }
     }
 
     if refs.len() >= 2 {
@@ -687,7 +888,14 @@ fn parse_begin_mode(tokens: &[String]) -> Option<(usize, BeginModeKind)> {
             [read, write]
                 if read.eq_ignore_ascii_case("READ") && write.eq_ignore_ascii_case("WRITE")
         ) {
-            return Some((2, BeginModeKind::AccessMode));
+            return Some((
+                2,
+                BeginMode::Access(if two[1].eq_ignore_ascii_case("ONLY") {
+                    TransactionAccessMode::ReadOnly
+                } else {
+                    TransactionAccessMode::ReadWrite
+                }),
+            ));
         }
 
         if matches!(
@@ -695,12 +903,12 @@ fn parse_begin_mode(tokens: &[String]) -> Option<(usize, BeginModeKind)> {
             [not, deferrable]
                 if not.eq_ignore_ascii_case("NOT") && deferrable.eq_ignore_ascii_case("DEFERRABLE")
         ) {
-            return Some((2, BeginModeKind::Deferrable));
+            return Some((2, BeginMode::Deferrable(false)));
         }
     }
 
     if !refs.is_empty() && is_deferrable_suffix(&refs[..1]) {
-        return Some((1, BeginModeKind::Deferrable));
+        return Some((1, BeginMode::Deferrable(true)));
     }
 
     None
@@ -720,48 +928,60 @@ fn normalize_begin_tokens(input: &str) -> Vec<String> {
     normalized.split_whitespace().map(str::to_owned).collect()
 }
 
-fn is_begin_mode_list(tokens: &[String]) -> bool {
+fn parse_begin_mode_list(tokens: &[String]) -> Option<TransactionCharacteristics> {
     if tokens.is_empty() {
-        return false;
+        return None;
     }
 
     let mut idx = 0;
+    let mut characteristics = TransactionCharacteristics::default();
     let mut seen_access_mode = false;
     let mut seen_isolation_level = false;
     let mut seen_deferrable = false;
 
     while idx < tokens.len() {
         if tokens[idx] == "," {
-            return false;
+            return None;
         }
 
-        let Some((consumed, kind)) = parse_begin_mode(&tokens[idx..]) else {
-            return false;
-        };
+        let (consumed, mode) = parse_begin_mode(&tokens[idx..])?;
 
-        match kind {
-            BeginModeKind::AccessMode if seen_access_mode => return false,
-            BeginModeKind::IsolationLevel if seen_isolation_level => return false,
-            BeginModeKind::Deferrable if seen_deferrable => return false,
-            BeginModeKind::AccessMode => seen_access_mode = true,
-            BeginModeKind::IsolationLevel => seen_isolation_level = true,
-            BeginModeKind::Deferrable => seen_deferrable = true,
+        match mode {
+            BeginMode::Access(_) if seen_access_mode => return None,
+            BeginMode::Isolation(_) if seen_isolation_level => return None,
+            BeginMode::Deferrable(_) if seen_deferrable => return None,
+            BeginMode::Access(access) => {
+                seen_access_mode = true;
+                characteristics.access = access;
+            }
+            BeginMode::Isolation(isolation) => {
+                seen_isolation_level = true;
+                characteristics.isolation = isolation;
+            }
+            BeginMode::Deferrable(deferrable) => {
+                seen_deferrable = true;
+                characteristics.deferrable = deferrable;
+            }
         }
 
         idx += consumed;
         if idx == tokens.len() {
-            return true;
+            return Some(characteristics);
         }
 
         if tokens[idx] == "," {
             idx += 1;
             if idx == tokens.len() || tokens[idx] == "," {
-                return false;
+                return None;
             }
         }
     }
 
-    true
+    Some(characteristics)
+}
+
+fn is_begin_mode_list(tokens: &[String]) -> bool {
+    parse_begin_mode_list(tokens).is_some()
 }
 
 fn strip_single_leading_comma(tokens: &[String]) -> Option<&[String]> {
@@ -771,51 +991,50 @@ fn strip_single_leading_comma(tokens: &[String]) -> Option<&[String]> {
     }
 }
 
-fn is_begin_with_optional_mode(input: &str) -> bool {
+fn parse_begin_characteristics(input: &str) -> Option<TransactionCharacteristics> {
     let tokens = normalize_begin_tokens(input);
-    let Some((first, rest)) = tokens.split_first() else {
-        return false;
-    };
+    let (first, rest) = tokens.split_first()?;
 
     if first.eq_ignore_ascii_case("BEGIN") {
         return match rest {
-            [] => true,
-            [second] if second.eq_ignore_ascii_case("TRANSACTION") => true,
-            [second] if second.eq_ignore_ascii_case("WORK") => true,
-            mode if is_begin_mode_list(mode) => true,
+            [] => Some(TransactionCharacteristics::default()),
+            [second] if second.eq_ignore_ascii_case("TRANSACTION") => {
+                Some(TransactionCharacteristics::default())
+            }
+            [second] if second.eq_ignore_ascii_case("WORK") => {
+                Some(TransactionCharacteristics::default())
+            }
             [second, mode @ ..]
                 if second.eq_ignore_ascii_case("TRANSACTION")
                     || second.eq_ignore_ascii_case("WORK") =>
             {
-                if is_begin_mode_list(mode) {
-                    true
-                } else {
-                    strip_single_leading_comma(mode).is_some_and(is_begin_mode_list)
-                }
+                parse_begin_mode_list(mode)
+                    .or_else(|| strip_single_leading_comma(mode).and_then(parse_begin_mode_list))
             }
-            _ => false,
+            mode => parse_begin_mode_list(mode),
         };
     }
 
     if first.eq_ignore_ascii_case("START") {
         return match rest {
-            [second] if second.eq_ignore_ascii_case("TRANSACTION") => true,
-            [second] if second.eq_ignore_ascii_case("WORK") => true,
+            [second] if second.eq_ignore_ascii_case("TRANSACTION") => {
+                Some(TransactionCharacteristics::default())
+            }
+            [second] if second.eq_ignore_ascii_case("WORK") => {
+                Some(TransactionCharacteristics::default())
+            }
             [second, mode @ ..]
                 if second.eq_ignore_ascii_case("TRANSACTION")
                     || second.eq_ignore_ascii_case("WORK") =>
             {
-                if is_begin_mode_list(mode) {
-                    true
-                } else {
-                    strip_single_leading_comma(mode).is_some_and(is_begin_mode_list)
-                }
+                parse_begin_mode_list(mode)
+                    .or_else(|| strip_single_leading_comma(mode).and_then(parse_begin_mode_list))
             }
-            _ => false,
+            _ => None,
         };
     }
 
-    false
+    None
 }
 
 /// Parse a single SQL command (the strict, public entry). A SELECT whose FROM target is a
@@ -823,17 +1042,40 @@ fn is_begin_with_optional_mode(input: &str) -> bool {
 /// the legacy compatibility server relies on this (catalog queries fail to parse and route
 /// to its compatibility layer). The engine uses [`parse_command_allowing_catalog`] instead.
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
-    parse_command_inner(input, false)
+    let command = parse_command_inner(input, false)?;
+    // Let the command grammar own malformed quote/syntax diagnostics first. The lexical scan is
+    // a defensive backstop for parameter references in positions that a successfully parsed AST
+    // does not retain; AST-owned value slots are checked immediately below as well.
+    if crate::parameter::sql_parameter_arity(input)? > 0 {
+        return Err(ParseError::InvalidParameterReference);
+    }
+    if crate::prepared::command_parameter_count(&command) > 0 {
+        return Err(ParseError::InvalidParameterReference);
+    }
+    Ok(command)
 }
 
 /// Like [`parse_command`] but carries a `pg_catalog.`/`information_schema.` qualifier on a
 /// SELECT's FROM target through to the parsed `Select`, for the engine's native catalog
 /// support (Phase-3 M2). Behaves identically to [`parse_command`] for every other command.
 pub fn parse_command_allowing_catalog(input: &str) -> Result<Command, ParseError> {
-    parse_command_inner(input, true)
+    let command = parse_command_inner(input, true)?;
+    if crate::parameter::sql_parameter_arity(input)? > 0 {
+        return Err(ParseError::InvalidParameterReference);
+    }
+    if crate::prepared::command_parameter_count(&command) > 0 {
+        return Err(ParseError::InvalidParameterReference);
+    }
+    Ok(command)
+}
+
+pub(crate) fn parse_prepared_command(input: &str) -> Result<Command, ParseError> {
+    parse_command_inner(input, false)
 }
 
 fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Command, ParseError> {
+    let normalized = crate::parameter::normalize_sql_comments(input)?;
+    let input = normalized.as_ref();
     let mut s = input.trim_end();
     if s.is_empty() {
         return Err(ParseError::Empty);
@@ -848,8 +1090,8 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
         return Err(ParseError::Empty);
     }
 
-    if is_begin_with_optional_mode(s) {
-        return Ok(Command::Begin);
+    if let Some(characteristics) = parse_begin_characteristics(s) {
+        return Ok(Command::Begin { characteristics });
     }
     if let Some(chain) = parse_transaction_control_chain(s, "COMMIT")
         .or_else(|| parse_transaction_control_chain(s, "END"))
@@ -956,4 +1198,102 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
     }
 
     Err(ParseError::Unsupported(s.to_string()))
+}
+
+#[cfg(test)]
+mod transaction_characteristic_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_read_committed_isolation_is_not_silently_accepted() {
+        assert!(parse_command("BEGIN ISOLATION LEVEL COMMITTED").is_err());
+        assert!(parse_command("START TRANSACTION ISOLATION LEVEL COMMITTED").is_err());
+    }
+
+    #[test]
+    fn simple_query_splitter_preserves_quoted_and_commented_semicolons() {
+        assert_eq!(
+            split_simple_query(
+                "SELECT ';'; SELECT \"semi;colon\"; /* outer; /* inner; */ */ SELECT 3;"
+            ),
+            vec!["SELECT ';'", "SELECT \"semi;colon\"", "SELECT 3"]
+        );
+        assert_eq!(
+            split_simple_query("CREATE FUNCTION f() AS $body$SELECT ';';$body$; SELECT 1"),
+            vec!["CREATE FUNCTION f() AS $body$SELECT ';';$body$", "SELECT 1"]
+        );
+    }
+
+    #[test]
+    fn simple_query_splitter_matches_postgres_escape_identifier_and_cr_boundaries() {
+        assert_eq!(
+            split_simple_query(
+                r"CREATE TABLE prefix (id int4); NOTIFY chan, E'x\'; COMMIT; y'; INSERT INTO missing VALUES (1)"
+            ),
+            vec![
+                "CREATE TABLE prefix (id int4)",
+                r"NOTIFY chan, E'x\'; COMMIT; y'",
+                "INSERT INTO missing VALUES (1)"
+            ]
+        );
+        assert_eq!(
+            split_simple_query("SELECT foo$tag$; COMMIT; SELECT bar$tag$; SELECT 1"),
+            vec!["SELECT foo$tag$", "COMMIT", "SELECT bar$tag$", "SELECT 1"]
+        );
+        assert_eq!(
+            split_simple_query("SELECT 1 -- comment\r; COMMIT; SELECT 2"),
+            vec!["SELECT 1", "COMMIT", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn simple_query_splitter_treats_postgres_comments_as_boundary_trivia() {
+        assert!(split_simple_query(" /* comment only */ -- and line only\r").is_empty());
+        assert_eq!(
+            split_simple_query(
+                "-- leading line\r/* outer /* nested */ done */ BEGIN; \
+                 COMMIT /* trailing block */; -- trailing line"
+            ),
+            vec!["BEGIN", "COMMIT"]
+        );
+        assert_eq!(
+            split_simple_query("/* leading */ SELECT/* interior */ 1 -- trailing\n; /* tail */"),
+            vec!["SELECT/* interior */ 1"]
+        );
+        assert_eq!(
+            split_simple_query("CREATE TABLE comment_rollback (id int4); /* unterminated COMMIT;"),
+            vec![
+                "CREATE TABLE comment_rollback (id int4)",
+                "/* unterminated COMMIT;"
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_comments_are_token_separators_for_command_parsing() {
+        assert!(matches!(
+            parse_command("SELECT/* interior */ 1 AS one").unwrap(),
+            Command::SelectLiteral(crate::SelectLiteral {
+                column_name,
+                ty: crate::SqlType::Int4,
+                value: crate::SqlValue::Int4(1),
+            }) if column_name == "one"
+        ));
+        assert!(matches!(
+            parse_command("SELECT 1/* outer /* nested */ done */ AS one").unwrap(),
+            Command::SelectLiteral(crate::SelectLiteral {
+                column_name,
+                ty: crate::SqlType::Int4,
+                value: crate::SqlValue::Int4(1),
+            }) if column_name == "one"
+        ));
+        assert!(matches!(
+            parse_command("CREATE/* interior */ TABLE comment_spacing (id int4)").unwrap(),
+            Command::CreateTable(_)
+        ));
+        let source = "CREATE/* retained WAL source */ TABLE comment_source (id int4)";
+        let parsed = crate::ParsedCommand::parse(source).unwrap();
+        assert_eq!(parsed.source(), source);
+        assert!(parse_command("SELECT 1 /* unterminated").is_err());
+    }
 }

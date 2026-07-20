@@ -31,6 +31,14 @@ impl DecodedTransactionMutation {
     }
 }
 
+#[derive(Default)]
+struct TransactionTableMutationBatch {
+    old_rows: Vec<Vec<SqlValue>>,
+    old_row_ids: Vec<u64>,
+    new_rows: Vec<Vec<SqlValue>>,
+    new_row_ids: Vec<u64>,
+}
+
 impl Engine {
     pub(crate) fn coalesce_transaction_mutations(
         mutations: Vec<BinaryTransactionMutation>,
@@ -168,6 +176,7 @@ impl Engine {
         cat: &DdlCatalogState,
         applied: &[AppliedRowMutation],
         publish_index: Index,
+        transaction_created_tables: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>, EngineError> {
         // Chunk-authoritative tables are transaction-wide COW: build every mutation against one
         // captured entry per table and publish the complete replacement map once. They must never
@@ -177,23 +186,72 @@ impl Engine {
             .iter()
             .map(|table| (table.clone(), true))
             .collect();
+        // A relation created by this same atomic transaction has no globally-published base shard.
+        // Its coalesced final mutation chain can only contain INSERTs (private insert→update folds
+        // to one final INSERT; insert→delete vanishes). Build and install that first device
+        // generation directly from the resolved record, which gives live apply and recovery the
+        // identical GPU-native path.
+        let current_shards = self.read_residency_shards();
+        let mut new_tables = BTreeMap::<String, (Vec<Vec<SqlValue>>, Vec<u64>)>::new();
+        for mutation in applied {
+            let table_name = Self::applied_mutation_table(mutation);
+            if !transaction_created_tables.contains(&table_name) {
+                continue;
+            }
+            if current_shards
+                .get(&table_name)
+                .is_some_and(|shards| !shards.is_empty())
+            {
+                continue;
+            }
+            match mutation {
+                AppliedRowMutation::Insert {
+                    rows, row_ids, ..
+                } => {
+                    let entry = new_tables.entry(table_name).or_default();
+                    entry.0.extend(rows.iter().cloned());
+                    entry.1.extend(row_ids.iter().copied());
+                }
+                AppliedRowMutation::Update { .. } | AppliedRowMutation::Delete { .. } => {
+                    return Err(EngineError::Durability(format!(
+                        "transaction WAL mutates relation \"{table_name}\" without a published or create-owned base generation"
+                    )))
+                }
+            }
+        }
+        let mut freshly_installed = BTreeSet::new();
+        for (table_name, (rows, row_ids)) in new_tables {
+            let table = cat.relational_catalog.get(&table_name).ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "transaction WAL lost create-owned relation \"{table_name}\" before residency publication"
+                ))
+            })?;
+            self.install_resolved_transaction_table_residency(
+                cat,
+                table,
+                &rows,
+                &row_ids,
+                publish_index,
+            )?;
+            status.insert(table_name.clone(), true);
+            freshly_installed.insert(table_name);
+        }
+        // The WAL record has already coalesced each logical entity to its final mutation. Build one
+        // table batch from that record, stamp all old versions first, then append all final images
+        // once. This is both the atomic publication shape and the exact geometry reserved before
+        // WAL: statement-by-statement rollover is not a second transaction write path.
+        let mut batches = BTreeMap::<String, TransactionTableMutationBatch>::new();
         for mutation in applied {
             let table = Self::applied_mutation_table(mutation);
-            if cold_maintained.contains(&table) {
+            if cold_maintained.contains(&table) || freshly_installed.contains(&table) {
                 continue;
             }
-            let entry = status.entry(table.clone()).or_insert(true);
-            if !*entry {
-                continue;
-            }
-            *entry = match mutation {
-                AppliedRowMutation::Insert { rows, row_ids, .. } => self
-                    .try_append_resident_int4_open_shard(
-                        &table,
-                        rows,
-                        crate::engine_residency::AppendCreatedBy::InsertUniform(publish_index),
-                        Some(row_ids),
-                    ),
+            let batch = batches.entry(table.clone()).or_default();
+            match mutation {
+                AppliedRowMutation::Insert { rows, row_ids, .. } => {
+                    batch.new_rows.extend(rows.iter().cloned());
+                    batch.new_row_ids.extend(row_ids.iter().copied());
+                }
                 AppliedRowMutation::Delete {
                     rows, write_set, ..
                 } => {
@@ -201,17 +259,17 @@ impl Engine {
                     let row_ids = write_set
                         .rows
                         .iter()
-                        .filter_map(|key| {
+                        .map(|key| {
                             crate::engine_residency::parse_relational_row_id(&key.row_key, &prefix)
                         })
-                        .collect::<Vec<_>>();
-                    self.try_tombstone_transaction_rows_by_identity(
-                        cat,
-                        &table,
-                        rows,
-                        &row_ids,
-                        publish_index,
-                    )
+                        .collect::<Option<Vec<_>>>();
+                    let Some(row_ids) = row_ids else {
+                        return Err(EngineError::Durability(format!(
+                            "transaction WAL delete lost an entity identity for relation \"{table}\""
+                        )));
+                    };
+                    batch.old_rows.extend(rows.iter().cloned());
+                    batch.old_row_ids.extend(row_ids);
                 }
                 AppliedRowMutation::Update {
                     old_rows,
@@ -219,28 +277,38 @@ impl Engine {
                     row_ids,
                     ..
                 } => {
-                    if old_rows.is_empty() {
-                        new_rows.is_empty()
-                    } else {
-                        row_ids.as_ref().is_some_and(|row_ids| {
-                            self.try_tombstone_transaction_rows_by_identity(
-                                cat,
-                                &table,
-                                old_rows,
-                                row_ids,
-                                publish_index,
-                            ) && self.try_append_resident_int4_open_shard(
-                                &table,
-                                new_rows,
-                                crate::engine_residency::AppendCreatedBy::UpdateNewVersion(
-                                    publish_index,
-                                ),
-                                Some(row_ids),
-                            )
-                        })
-                    }
+                    let Some(row_ids) = row_ids else {
+                        return Err(EngineError::Durability(format!(
+                            "transaction WAL update lost entity identities for relation \"{table}\""
+                        )));
+                    };
+                    batch.old_rows.extend(old_rows.iter().cloned());
+                    batch.old_row_ids.extend(row_ids.iter().copied());
+                    batch.new_rows.extend(new_rows.iter().cloned());
+                    batch.new_row_ids.extend(row_ids.iter().copied());
                 }
-            };
+            }
+        }
+        for (table, batch) in batches {
+            let arity_ok = batch.old_rows.len() == batch.old_row_ids.len()
+                && batch.new_rows.len() == batch.new_row_ids.len();
+            let tombstoned = arity_ok
+                && (batch.old_rows.is_empty()
+                    || self.try_tombstone_transaction_rows_by_identity(
+                        cat,
+                        &table,
+                        &batch.old_rows,
+                        &batch.old_row_ids,
+                        publish_index,
+                    ));
+            let appended = batch.new_rows.is_empty()
+                || self.try_append_resident_int4_open_shard(
+                    &table,
+                    &batch.new_rows,
+                    crate::engine_residency::AppendCreatedBy::InsertUniform(publish_index),
+                    Some(&batch.new_row_ids),
+                );
+            status.insert(table, tombstoned && appended);
         }
 
         let mut maintained = BTreeSet::new();
@@ -263,6 +331,73 @@ impl Engine {
             }
         }
         Ok(maintained)
+    }
+
+    fn install_resolved_transaction_table_residency(
+        &self,
+        cat: &DdlCatalogState,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+        row_ids: &[u64],
+        publish_index: Index,
+    ) -> Result<(), EngineError> {
+        let mut private_map = BTreeMap::from([(table.name.clone(), Vec::new())]);
+        let mut reservation = crate::engine_transaction_delta::TransactionGpuReservation::new(self);
+        self.append_transaction_delta_shard(
+            table,
+            rows,
+            row_ids,
+            &mut private_map,
+            &mut reservation,
+        )
+        .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        let shards = private_map.remove(&table.name).ok_or_else(|| {
+            EngineError::ApplyFailed(format!(
+                "resolved transaction lost new relation \"{}\" device generation",
+                table.name
+            ))
+        })?;
+        let device_memory = shards
+            .iter()
+            .filter_map(|shard| {
+                shard
+                    .device_memory
+                    .as_ref()
+                    .map(|memory| (shard.shard_id, Arc::clone(memory)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        cat.relational_resident_cache.install_shards(
+            table.name.clone(),
+            shards,
+            device_memory,
+            &self.read_state.residency,
+        );
+        // The installed allocation is now counted by the global resident maps. Remove the
+        // temporary pre-allocation charge before the mandatory named-index budget transaction.
+        drop(reservation);
+        // A transaction-created relation's declared PK/UNIQUE indexes are part of its first
+        // canonical device generation, not optional cache warm-up. Commit reserved their exact
+        // bytes before WAL; live apply and recovery must therefore publish complete coverage even
+        // though this new OID had no prior explicit enrollment marker.
+        if !table.indexes.is_empty() {
+            let current = self.read_residency_shards();
+            let shards = current.get(&table.name).ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "resolved transaction lost new relation \"{}\" before index publication",
+                    table.name
+                ))
+            })?;
+            self.publish_relational_resident_indexes_for_generation(
+                table,
+                shards,
+                publish_index,
+                true,
+                false,
+                true,
+            )
+            .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Transaction commit already carries exact stable entity identities, so it need not fall back
@@ -296,9 +431,34 @@ impl Engine {
         row_ids: &[u64],
         commit_seq: Index,
     ) -> bool {
-        if rows.len() != row_ids.len() {
+        let Some(locations) =
+            self.locate_transaction_rows_by_identity(table, rows, row_ids, commit_seq)
+        else {
             return false;
+        };
+        for (shard_id, slots) in locations {
+            if !self.tombstone_resident_shard_slots(&table.name, shard_id, &slots, commit_seq) {
+                return false;
+            }
         }
+        self.add_tombstone_churn(&table.name, rows.len() as u64);
+        true
+    }
+
+    /// Resolve the exact physical versions for a coalesced transaction without mutating them.
+    /// COMMIT preflight and canonical apply share this resolver, so first-delete sidecar sizing is
+    /// based on the same shard identities that publication will stamp after durability.
+    pub(crate) fn locate_transaction_rows_by_identity(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+        row_ids: &[u64],
+        visibility: Index,
+    ) -> Option<BTreeMap<u32, Vec<u32>>> {
+        if rows.len() != row_ids.len() {
+            return None;
+        }
+        let mut locations = BTreeMap::<u32, Vec<u32>>::new();
         for (row, expected_row_id) in rows.iter().zip(row_ids) {
             let filters = row
                 .iter()
@@ -322,18 +482,10 @@ impl Engine {
                         .enumerate()
                         .map(|(idx, value)| (idx, value.clone()))
                         .collect::<Vec<_>>();
-                    let Some(predicate) =
-                        crate::engine_dml_prepare::device_structural_tuple_predicate(
-                            table, &key_cols,
-                        )
-                    else {
-                        return false;
-                    };
-                    let Some(hits) = self.locate_resident_delete_slots_detailed(table, &predicate)
-                    else {
-                        return false;
-                    };
-                    hits
+                    let predicate = crate::engine_dml_prepare::device_structural_tuple_predicate(
+                        table, &key_cols,
+                    )?;
+                    self.locate_resident_delete_slots_detailed(table, &predicate)?
                 }
             };
             let mut matched = Vec::new();
@@ -341,24 +493,21 @@ impl Engine {
                 if self.hit_entity_id(&hit) != Some(*expected_row_id) {
                     continue;
                 }
-                match self.materialize_resident_row_via_hit(table, &hit, commit_seq) {
+                match self.materialize_resident_row_via_hit(table, &hit, visibility) {
                     Some(Some(observed)) if observed.as_slice() == row.as_slice() => {
                         matched.push((hit.shard_id, hit.slot));
                     }
                     Some(Some(_)) | Some(None) => {}
-                    None => return false,
+                    None => return None,
                 }
             }
             if matched.len() != 1 {
-                return false;
+                return None;
             }
             let (shard_id, slot) = matched[0];
-            if !self.tombstone_resident_shard_slots(&table.name, shard_id, &[slot], commit_seq) {
-                return false;
-            }
+            locations.entry(shard_id).or_default().push(slot);
         }
-        self.add_tombstone_churn(&table.name, rows.len() as u64);
-        true
+        Some(locations)
     }
 
     pub(crate) fn apply_binary_transaction_record(
@@ -369,20 +518,53 @@ impl Engine {
     ) -> Result<Vec<AppliedRowMutation>, EngineError> {
         let BinaryTransactionRecord {
             allocator_high_water,
+            catalog_commands,
             sequence_advances,
             mutations,
         } = record;
 
+        if catalog_commands.len() > 1 {
+            return Err(EngineError::Durability(
+                "transaction WAL v1 contains more than one catalog operation".to_string(),
+            ));
+        }
+
         // Decode and bind the complete record before touching any globally published state. This
         // makes malformed replay/live records all-or-nothing and leaves only infallible assignment
         // plus prevalidated COW publication after the staging pass.
+        let mut next_catalog = cat.clone();
+        for command in catalog_commands {
+            match command {
+                Command::CreateTable(create) => {
+                    self.apply_create_table(&mut next_catalog, create)?
+                }
+                _ => {
+                    return Err(EngineError::Durability(
+                        "transaction WAL record contains an unsupported catalog operation"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
         for sequence_name in sequence_advances.keys() {
-            if !cat.relational_sequences.contains_key(sequence_name) {
+            if !next_catalog
+                .relational_sequences
+                .contains_key(sequence_name)
+            {
                 return Err(EngineError::Durability(format!(
                     "transaction WAL record advances unknown sequence \"{sequence_name}\""
                 )));
             }
         }
+        // Early v1 row-transaction WAL could contain statement-order intermediate versions. The
+        // current claimant writes a coalesced record, but replay must preserve those durable bytes.
+        // Normalize both forms to the same final entity mutations before decode/publication so the
+        // table-batched canonical path remains the sole device publisher.
+        let mutations = Self::coalesce_transaction_mutations(mutations).map_err(|error| {
+            EngineError::Durability(format!(
+                "transaction WAL version chain could not be coalesced: {error}"
+            ))
+        })?;
         let mut decoded = Vec::with_capacity(mutations.len());
         for mutation in mutations {
             let (table_name, row_id) = match &mutation {
@@ -392,7 +574,7 @@ impl Engine {
                     (table.clone(), *row_id)
                 }
             };
-            let table = cat
+            let table = next_catalog
                 .relational_catalog
                 .get(&table_name)
                 .ok_or_else(|| {
@@ -456,6 +638,9 @@ impl Engine {
             }
         }
 
+        // The full catalog+row decode has succeeded. Install the catalog working generation once;
+        // row publication remains private to the enclosing commit until its one visibility join.
+        *cat = next_catalog;
         let mut applied = Vec::with_capacity(decoded.len());
         let mut device_authoritative_commits = 0u64;
         let mut class_skips = 0u64;

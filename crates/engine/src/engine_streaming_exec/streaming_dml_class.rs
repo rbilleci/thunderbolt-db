@@ -1123,7 +1123,7 @@ impl Engine {
     }
 
     /// The CLASS-PATH install: the general install's strict `committed_seq == build` proof cannot
-    /// hold here — the tail append runs INSIDE the apply, BEFORE `publish_committed_seq` (the
+    /// hold here — the tail append runs INSIDE the apply, BEFORE the publication join (the
     /// boundary is the commit being applied). Settledness comes from the structure instead: the
     /// caller holds the COMMIT LOCK, class tables are serial-path-only (no lock-free lane
     /// publishes touch them), and the FROZEN generation is verified pointer-current (a class

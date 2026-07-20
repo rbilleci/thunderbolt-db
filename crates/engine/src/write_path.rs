@@ -73,6 +73,10 @@ pub(crate) fn pack_unique_slot_id(table_oid: u32, column_id: u32) -> u64 {
 /// collect into a `BTreeSet` (the keys are `Ord`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WriteSet {
+    /// Relations changed by this write. Row/unique keys may both be empty (for example an INSERT
+    /// into a heap without indexes), so the relation footprint must be carried independently for
+    /// FK dependency history and publication auditing.
+    pub(crate) tables: BTreeSet<String>,
     pub(crate) rows: Vec<RowWriteKey>,
     pub(crate) unique_slots: Vec<UniqueIndexSlotKey>,
     /// E2.2(a) — the integer-keyed projection of the i32 unique slots (see [`IntUniqueSlotKey`]).
@@ -83,6 +87,7 @@ pub(crate) struct WriteSet {
 
 impl WriteSet {
     pub(crate) fn extend_deduplicated(&mut self, other: &Self) {
+        self.tables.extend(other.tables.iter().cloned());
         self.rows.extend(other.rows.iter().cloned());
         self.rows.sort();
         self.rows.dedup();
@@ -274,6 +279,17 @@ pub(crate) struct WriteDelta {
     // prepared write-set against commits since the snapshot, AND recorded into the ledger after a
     // successful commit.
     pub(crate) write_set: WriteSet,
+    /// Exact publication visible when this mutation was prepared. READ COMMITTED may rebase the
+    /// transaction overlay onto later publications, but doing so must never advance an earlier
+    /// mutation's first-committer-wins validation floor.
+    pub(crate) read_snapshot: Index,
+    /// Exact catalog objects used to bind and validate this statement. READ COMMITTED may advance
+    /// past unrelated DDL, but it must reject ALTER or same-name DROP/recreate of any object that
+    /// an already-staged mutation depended on.
+    pub(crate) catalog_dependencies: BTreeMap<String, RelationalTable>,
+    /// Related parent/child relations read by FK preflight. Their mutation history is validated at
+    /// this delta's exact `read_snapshot`, preventing a later RC statement from hiding an ABA race.
+    pub(crate) foreign_key_dependencies: BTreeSet<String>,
     pub(crate) rows_consumed: u64,
     pub(crate) mutation: PreparedMutation,
 }
@@ -298,6 +314,7 @@ impl WriteDelta {
 #[derive(Debug, Default)]
 pub(crate) struct RecentCommitsLedger {
     pub(crate) rows: BTreeMap<RowWriteKey, Index>,
+    pub(crate) tables: BTreeMap<String, Index>,
     #[cfg(test)]
     pub(crate) unique_slots: BTreeMap<UniqueIndexSlotKey, Index>,
     /// Driverless parity twin for the allocation-free i32 slot projection.
@@ -323,6 +340,12 @@ impl RecentCommitsLedger {
             .any(|key| self.rows.get(key).is_some_and(|&seq| seq > read_snapshot))
     }
 
+    pub(crate) fn table_changed_after(&self, table: &str, read_snapshot: Index) -> bool {
+        self.tables
+            .get(table)
+            .is_some_and(|&commit_seq| commit_seq > read_snapshot)
+    }
+
     #[cfg(test)]
     pub(crate) fn conflicts_unique(&self, write_set: &WriteSet, read_snapshot: Index) -> bool {
         write_set.unique_slots.iter().any(|key| {
@@ -339,6 +362,9 @@ impl RecentCommitsLedger {
     /// Record committed row identities. Test builds additionally maintain the driverless unique
     /// parity maps; production unique conflict history is read from resident version stamps.
     pub(crate) fn record(&mut self, write_set: &WriteSet, commit_seq: Index) {
+        for table in &write_set.tables {
+            self.tables.insert(table.clone(), commit_seq);
+        }
         for key in &write_set.rows {
             self.rows.insert(key.clone(), commit_seq);
         }
@@ -356,6 +382,7 @@ impl RecentCommitsLedger {
     /// Drop entries written at or before `boundary` (no active snapshot reads before it, so they can
     /// never win a future conflict). Keeps the ledger bounded by the active-snapshot window.
     pub(crate) fn prune_below(&mut self, boundary: Index) {
+        self.tables.retain(|_, &mut seq| seq > boundary);
         self.rows.retain(|_, &mut seq| seq > boundary);
         #[cfg(test)]
         {
@@ -366,7 +393,7 @@ impl RecentCommitsLedger {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.rows.len() + self.unique_slots.len() + self.unique_slots_i32.len()
+        self.tables.len() + self.rows.len() + self.unique_slots.len() + self.unique_slots_i32.len()
     }
 }
 
@@ -377,6 +404,7 @@ impl RecentCommitsLedger {
 /// these owned generations remain alive and cannot be paired with newer state.
 #[derive(Debug)]
 pub(crate) struct TransactionSnapshot {
+    pub(crate) characteristics: TransactionCharacteristics,
     pub(crate) boundary: Index,
     /// Row-identity allocator boundary captured with the transaction generation. INSERT prepare
     /// must not derive provisional identities from a newer allocator observation; the private
@@ -395,12 +423,22 @@ pub(crate) struct TransactionSnapshot {
     /// replaces this state atomically with a new immutable shard map: retained base shards carry
     /// private tombstone sidecars and INSERT/UPDATE post-images live in dense private shards.
     /// SELECT and later DML clone the published map, so no reader can observe half a statement.
-    pub(crate) delta: std::sync::Mutex<TransactionDeltaState>,
+    pub(crate) delta: Arc<std::sync::Mutex<TransactionDeltaState>>,
     /// One explicit transaction is a sequential statement stream. Holding this guard for the full
     /// SELECT/DML/terminal-control operation prevents a DML replacement from retiring the exact
     /// GPU charge of a superseded private generation while a same-transaction reader still pins
     /// that generation's device allocations.
-    pub(crate) statement_lock: std::sync::Mutex<()>,
+    pub(crate) statement_lock: Arc<std::sync::Mutex<()>>,
+    /// Set before a predeclared program's snapshot becomes discoverable. Ordinary same-id entries
+    /// reject this token; only the program's private statement-locked helpers may proceed.
+    pub(crate) program_owned: Arc<std::sync::atomic::AtomicBool>,
+    /// False until the first data/catalog statement chooses the transaction snapshot. PostgreSQL
+    /// REPEATABLE READ is lazy at BEGIN; READ COMMITTED replaces the captured base every statement.
+    pub(crate) data_snapshot_acquired: Arc<std::sync::atomic::AtomicBool>,
+    /// The globally published cold generation captured with the base. The private delta owns a
+    /// derived replacement; READ COMMITTED rebase restarts from this exact immutable map.
+    pub(crate) base_streaming_cold_chunks:
+        Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>>,
     /// Engine-wide charge table shared with every transaction snapshot. Sequential statement
     /// ownership makes the delta state's current-generation charge exact; `Drop` releases that
     /// final charge when the transaction snapshot's last retained handle disappears.
@@ -410,6 +448,73 @@ pub(crate) struct TransactionSnapshot {
     /// this vector prevents a captured valid index allocation from being reclaimed underneath the
     /// transaction merely because the current-generation cache was purged.
     pub(crate) _resident_index_resources: Vec<Arc<CudaResidentDeviceMemory>>,
+    /// Accounting twin for every payload, sidecar, and index allocation retained by this snapshot.
+    /// The shared registry is keyed by exact device allocation identity, so a current allocation is
+    /// charged once and remains charged after same-table replacement/cache purge until the final
+    /// transaction generation releases its guard.
+    pub(crate) _resident_gpu_charge: Arc<TransactionRetainedGpuCharge>,
+}
+
+pub(crate) type TransactionRetainedGpuAccount = BTreeMap<(u16, u64), (u64, usize)>;
+
+#[derive(Debug)]
+pub(crate) struct TransactionRetainedGpuCharge {
+    account: Arc<std::sync::Mutex<TransactionRetainedGpuAccount>>,
+    allocations: Vec<(u16, u64)>,
+}
+
+impl TransactionRetainedGpuCharge {
+    pub(crate) fn empty(account: Arc<std::sync::Mutex<TransactionRetainedGpuAccount>>) -> Self {
+        Self {
+            account,
+            allocations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn register_locked(
+        account: Arc<std::sync::Mutex<TransactionRetainedGpuAccount>>,
+        resources: &[Arc<CudaResidentDeviceMemory>],
+        tracked: &mut TransactionRetainedGpuAccount,
+    ) -> Self {
+        let allocations = resources
+            .iter()
+            .map(|memory| {
+                (
+                    (memory.metadata().gpu_id, memory.device_ptr()),
+                    memory.metadata().allocated_bytes,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (identity, bytes) in &allocations {
+            let entry = tracked.entry(*identity).or_insert((*bytes, 0));
+            debug_assert_eq!(entry.0, *bytes);
+            entry.1 = entry.1.saturating_add(1);
+        }
+        Self {
+            account,
+            allocations: allocations.into_keys().collect(),
+        }
+    }
+}
+
+impl Drop for TransactionRetainedGpuCharge {
+    fn drop(&mut self) {
+        let mut tracked = self
+            .account
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for identity in &self.allocations {
+            let remove = if let Some((_, owners)) = tracked.get_mut(identity) {
+                *owners = owners.saturating_sub(1);
+                *owners == 0
+            } else {
+                false
+            };
+            if remove {
+                tracked.remove(identity);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -428,22 +533,47 @@ pub(crate) struct TransactionDeltaState {
     /// statement seeds its pure `nextval` scratch here, so values advance across private statements
     /// without mutating the published catalog before COMMIT.
     pub(crate) sequence_state: BTreeMap<String, (i64, bool)>,
+    /// One staged database-local CREATE TABLE plus the exact base and private catalog generations
+    /// it was validated against. The typed command joins resolved DML in the existing canonical
+    /// transaction envelope; multiple DDL statements remain fail-closed pending ordered expansion.
+    pub(crate) catalog_command: Option<StagedCatalogCommand>,
+    pub(crate) catalog_base: Option<Arc<CatalogSnapshot>>,
+    pub(crate) catalog_overlay: Option<Arc<CatalogSnapshot>>,
     pub(crate) private_gpu_bytes_by_gpu: BTreeMap<u16, u64>,
+    /// Capacity held for mandatory named indexes that canonical apply must build when a
+    /// transaction-created table first becomes globally resident. Unlike `private_gpu_bytes`,
+    /// these bytes have no private allocation yet; they close deterministic post-WAL budget
+    /// failure without publishing transaction-private indexes globally.
+    pub(crate) commit_gpu_bytes_by_gpu: BTreeMap<u16, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedCatalogCommand {
+    pub(crate) command: Command,
 }
 
 impl Drop for TransactionSnapshot {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.delta) != 1 {
+            return;
+        }
         let charged = self
             .delta
-            .get_mut()
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .private_gpu_bytes_by_gpu
+            .clone();
+        let commit_charged = self
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .commit_gpu_bytes_by_gpu
             .clone();
         let mut account = self
             .private_gpu_account
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (gpu_id, bytes) in charged {
+        for (gpu_id, bytes) in charged.into_iter().chain(commit_charged) {
             let slot = account.entry(gpu_id).or_default();
             *slot = slot.saturating_sub(bytes);
             if *slot == 0 {
@@ -477,11 +607,20 @@ impl TransactionSnapshot {
     }
 
     pub(crate) fn transaction_delta_is_empty(&self) -> bool {
+        let delta = self
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        delta.deltas.is_empty() && delta.catalog_command.is_none()
+    }
+
+    pub(crate) fn transaction_catalog(&self) -> Arc<CatalogSnapshot> {
         self.delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .deltas
-            .is_empty()
+            .catalog_overlay
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.catalog))
     }
 }
 
@@ -499,6 +638,10 @@ pub(crate) struct ActiveSnapshots {
     /// map beside the ordered multiset makes duplicate registration/removal exact while `counts`
     /// continues to fold statement-local and transaction-held references into one GC boundary.
     pub(crate) transactions: BTreeMap<TxnId, Arc<TransactionSnapshot>>,
+    /// GC/ledger-retention floor owned by each explicit transaction. It is moved to the lazy first
+    /// statement snapshot, then retained at the minimum statement boundary for the transaction's
+    /// remaining lifetime even when READ COMMITTED installs a newer statement base.
+    pub(crate) transaction_floors: BTreeMap<TxnId, Index>,
 }
 
 impl ActiveSnapshots {
@@ -522,12 +665,14 @@ impl ActiveSnapshots {
     ) {
         let boundary = snapshot.boundary;
         let previous = self.transactions.insert(txn_id, snapshot);
+        let previous_floor = self.transaction_floors.insert(txn_id, boundary);
         debug_assert!(
             previous.is_none(),
             "transaction {txn_id} registered more than one active snapshot"
         );
+        debug_assert!(previous_floor.is_none());
         if let Some(previous) = previous {
-            self.deregister(previous.boundary);
+            self.deregister(previous_floor.unwrap_or(previous.boundary));
         }
         self.register(boundary);
     }
@@ -537,7 +682,11 @@ impl ActiveSnapshots {
         txn_id: TxnId,
     ) -> Option<Arc<TransactionSnapshot>> {
         let snapshot = self.transactions.remove(&txn_id)?;
-        self.deregister(snapshot.boundary);
+        let floor = self
+            .transaction_floors
+            .remove(&txn_id)
+            .unwrap_or(snapshot.boundary);
+        self.deregister(floor);
         Some(snapshot)
     }
 
@@ -553,6 +702,39 @@ impl ActiveSnapshots {
         txn_id: TxnId,
     ) -> Option<Arc<TransactionSnapshot>> {
         self.transactions.get(&txn_id).cloned()
+    }
+
+    pub(crate) fn replace_transaction_snapshot(
+        &mut self,
+        txn_id: TxnId,
+        expected: &Arc<TransactionSnapshot>,
+        replacement: Arc<TransactionSnapshot>,
+        advance_lazy_floor: bool,
+    ) -> Result<(), ExecuteError> {
+        let current = self
+            .transactions
+            .get(&txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotActive(txn_id)))?;
+        if !Arc::ptr_eq(current, expected) {
+            return Err(ExecuteError::Txn(TxnError::NotActive(txn_id)));
+        }
+        let old_floor = self
+            .transaction_floors
+            .get(&txn_id)
+            .copied()
+            .unwrap_or(current.boundary);
+        let new_floor = if advance_lazy_floor {
+            replacement.boundary
+        } else {
+            old_floor.min(replacement.boundary)
+        };
+        self.transactions.insert(txn_id, replacement);
+        self.transaction_floors.insert(txn_id, new_floor);
+        if old_floor != new_floor {
+            self.deregister(old_floor);
+            self.register(new_floor);
+        }
+        Ok(())
     }
 
     /// The oldest active read snapshot, or `None` when no transaction is in flight.

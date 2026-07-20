@@ -71,6 +71,8 @@ mod predicate_mask;
 mod predicate_typed_lowering;
 
 mod resident_dml;
+#[cfg(test)]
+pub(crate) use resident_dml::{RESIDENT_ALL_SLOT_SCAN_PROBES, RESIDENT_CONJUNCT_SLOT_SCAN_PROBES};
 
 pub(crate) use crate::engine_result_sort::gpu_sort_permutation;
 

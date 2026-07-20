@@ -14,6 +14,8 @@ struct PendingCopy {
     rows: Vec<Vec<SqlValue>>,
 }
 
+type BackendMessage<'a> = (u8, &'a [u8]);
+
 struct EngineBackedSession {
     engine: Engine,
     next_txn_id: u64,
@@ -152,6 +154,9 @@ fn sql_value_text(value: &SqlValue) -> String {
         SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value),
         SqlValue::Timestamp(value) => gpu_db_protocol::datetime::format_timestamp(*value),
         SqlValue::Uuid(value) => gpu_db_protocol::uuid::format_uuid(value),
+        SqlValue::Parameter { .. } => {
+            unreachable!("probe results never contain unbound prepared parameters")
+        }
     }
 }
 
@@ -183,7 +188,7 @@ fn copy_data_frame(line: &str) -> Vec<u8> {
     frontend_frame(b'd', line.as_bytes())
 }
 
-fn backend_messages(output: &[u8]) -> Result<Vec<(u8, &[u8])>, Box<dyn Error>> {
+fn backend_messages(output: &[u8]) -> Result<Vec<BackendMessage<'_>>, Box<dyn Error>> {
     let mut messages = Vec::new();
     let mut offset = 0_usize;
     while offset < output.len() {
@@ -477,7 +482,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("copy_stream_lifecycle_probe=true");
     println!(
         "backend_startup_messages_written={}",
-        backend_tags.iter().any(|tag| *tag == b'R')
+        backend_tags.contains(&b'R')
     );
     println!(
         "backend_copy_in_response_written={}",
@@ -485,7 +490,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "backend_row_description_written={}",
-        backend_tags.iter().any(|tag| *tag == b'T')
+        backend_tags.contains(&b'T')
     );
     println!(
         "backend_data_row_written={}",

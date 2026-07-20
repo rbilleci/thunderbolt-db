@@ -47,6 +47,13 @@ Server consolidation and dependency inversion are **PRODUCT-001**.
 - PostgreSQL grammar is parsed into a bounded SQL model and lowered to typed `ResidentExpr` execution.
 - Hot supported routes may use strict prepared templates/route IDs; an unproven fast parser must reject rather than
   guess.
+- The canonical pgwire server's sync, sequential-baseline, and async ingresses share one extended-query dispatcher.
+  Parse owns one typed command and resolves neutral parameter/result metadata against one committed engine catalog
+  snapshot without reparsing; Bind is effect-free direct AST binding; a portal executes at most once and cursor
+  suspension drains its cached result. One implicit engine transaction spans an extended cycle through Sync, and
+  the dispatcher owns failed-state precedence, skip/recovery, portal lifetime, and transaction-exit cleanup. Wire
+  OIDs, formats, SQLSTATEs, framing, and codecs remain above the facade. Describe-time catalog revalidation and
+  transactional extended DDL are PRODUCT-001 migration work; bounded response streaming is SCALE-001.
 - User-relation and catalog joins execute as GPU operators.
 - Catalog, information-schema, materialized-view, and bounded literal-function rows are currently synthesized as
   host control-plane metadata, uploaded as transient device relations, and projected/filtered on the GPU.
@@ -239,17 +246,20 @@ the checked exclusive prefix after the durability/apply join; its derived inclus
 inclusive sequence is required. A marker-durable but unpublished commit/no-op is pending. An early response can only
 be an explicitly bounded non-commit ticket; synchronous SQL success waits for publication-covered terminal status.
 
-The canonical durable envelope separates lane-local physical coordinates from global logical `commit_seq`. An
+ADR-015 refines the durable envelope to one live canonical physical log and global logical `commit_seq`. An
 outcome-free pre-apply header, typed ordered fragments/leaves/root, and final commit/no-op/abort marker use
 non-circular digests. They carry enough row/catalog/reset/rewrite/sequence/allocator/claim/status semantics for GPU
 replay to reproduce and compare the named result without a host relational mirror. A stable claimed transaction ID
 and statement/digest chain make same-ID retry exact; mismatched retry fails closed, and unclaimed pre-WAL rejection
-has no exactly-once promise.
+has no exactly-once promise. Optimized lane identifiers are diagnostics only; they are not WAL addresses,
+durability frontiers, or recovery authorities.
 
 ### Built
 
-- WAL-before-visibility, append/checkpoint recovery, checksums/torn-tail rejection, FUA intent lanes, contiguous
-  durable cuts, lane recycle/reopen, group commit, and cold-artifact recovery contracts.
+- WAL-before-visibility, one canonical WAL/checkpoint source, checksums/torn-tail rejection, contiguous
+  publication, group commit, and cold-artifact recovery contracts. Optimized preparation lanes share that source;
+  fresh traffic creates no physical lane WAL. Retired `.lane-*` files are replay-only compatibility input and a
+  nonempty historical reopen stays read-only until offline one-way migration.
 - Recovery suppresses intermediate admission/elision and publishes resident state only after replay settles.
 
 ### Accepted recovery contract
@@ -261,7 +271,7 @@ has no exactly-once promise.
 - Immutable content-addressed artifacts are synced and directory-synced before a generation manifest; one verified
   active-pointer rename is the durable activation point. Reachability GC preserves the active generation, a verified
   predecessor, backup/PITR/replication pins, transaction status/response pins, and in-flight readers.
-- Recovery verifies pointer/manifest/lineage and every lane/range/outcome, selects the newest checkpoint with a
+- Recovery verifies pointer/manifest/lineage and every canonical range/outcome, selects the newest checkpoint with a
   complete suffix, reconciles incomplete and later orphan claims, stages encoded bytes, and uses a fresh GPU context
   to decode/replay typed operators into one unpublished database root. Service begins only after one atomic
   publication-object install. Corruption, missing authority, an unknown committed format, or exhausted retry/RTO
@@ -319,7 +329,7 @@ Connection/runtime scale is **SCALE-001**. Security, packaging, observability, a
 - **Planner to executor:** typed expression/route plus snapshot and device-source handles.
 - **Residency:** immutable generation descriptor owning all resources required by a read.
 - **Transaction to durability:** claimed typed user envelope, ordered statement/outcome vector, declared resources
-  and dependency floors, lane-local physical range, and global logical commit mapping.
+  and dependency floors, one canonical WAL range, and global logical commit mapping.
 - **Publication:** one atomically acquired `{visible_next, database_root, publication_epoch}` owner covering exact
   data/catalog/index/status authority.
 - **Recovery:** C-projected checkpoint/manifest/artifact authority plus ordered typed WAL/status suffix and fresh-

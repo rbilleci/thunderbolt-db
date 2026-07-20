@@ -1441,8 +1441,8 @@ fn split_simple_query_preserves_semicolons_inside_sql_comments() {
              EXECUTE lookup(1);"
         ),
         vec![
-            "/* comment ; /* nested ; */ done */ PREPARE lookup(int4) AS SELECT id FROM people WHERE id = $1",
-            "-- comment ; before execute\nEXECUTE lookup(1)"
+            "PREPARE lookup(int4) AS SELECT id FROM people WHERE id = $1",
+            "EXECUTE lookup(1)"
         ]
     );
 }

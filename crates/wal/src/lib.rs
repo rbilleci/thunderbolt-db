@@ -58,11 +58,11 @@ pub use checkpoint::{
 
 mod canonical;
 pub use canonical::{
-    canonical_request_digest, decode_canonical_envelope, decode_canonical_record_payload,
-    encode_canonical_envelope, pack_canonical_record_payload, CanonicalDigest, CanonicalEnvelope,
-    CanonicalFragment, CanonicalFragmentKind, CanonicalIdentity, CanonicalIsolation,
-    CanonicalOutcome, CanonicalOutcomeKind, CanonicalPhysicalRange, CanonicalPreApplyHeader,
-    EncodedCanonicalEnvelope,
+    canonical_logical_intent_outcome_bytes, canonical_request_digest, decode_canonical_envelope,
+    decode_canonical_record_payload, encode_canonical_envelope, pack_canonical_record_payload,
+    CanonicalDigest, CanonicalEnvelope, CanonicalFragment, CanonicalFragmentKind,
+    CanonicalIdentity, CanonicalIsolation, CanonicalOutcome, CanonicalOutcomeKind,
+    CanonicalPhysicalRange, CanonicalPreApplyHeader, EncodedCanonicalEnvelope,
 };
 
 mod identity;

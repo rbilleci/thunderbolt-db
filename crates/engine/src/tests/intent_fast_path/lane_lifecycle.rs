@@ -2,8 +2,7 @@ use crate::{tests::test_wal_path, CoveredInsertRoute, Engine, ExecuteError};
 use gpu_db_sql::SqlValue;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Commit ONE covered-insert intent via the submit/poll surface — the lanes-mode write entry
-/// (the blocking classic-shaped path is refused once the lanes activate).
+/// Commit one covered-insert intent through the optimized submit/poll surface.
 fn commit_intent_via_submit(
     engine: &Engine,
     txn_ids: &AtomicU64,
@@ -92,8 +91,8 @@ fn visible_entity_id(engine: &Engine, key: i32) -> u64 {
 /// The full E2.1 arc on real hardware: warm a PK'd int4 table into elision,
 /// prepare the covered route, drive concurrent intents through the fast path
 /// (wave-batched device PK validation + device open-shard apply + W5a binary
-/// WAL records + FUA fence-pool durability), verify duplicate-key semantics,
-/// then CRASH (drop) and reopen from the FUA log — the replayed store must be
+/// WAL records + canonical durability), verify duplicate-key semantics,
+/// then CRASH (drop) and reopen from the canonical log — the replayed store must be
 /// row-identical to the pre-crash store.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
@@ -148,9 +147,8 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     }
     assert!(warmed, "table never entered elision on a GPU box");
 
-    // The covered route + concurrent intents through the fast path. In LANES mode the
-    // submit/poll surface is the write entry (the blocking classic-shaped path is refused
-    // once the lanes activate); serial mode keeps the blocking path.
+    // The covered route + concurrent intents through the fast path. The preparation-lane optimizer
+    // and classic/general writers share canonical transaction authority.
     // Effective mode (env OR the E2.5c-3 default): lanes >= 2 routes intents through the
     // lane pipeline, so this test must pick the matching write surface.
     let lanes_mode = crate::engine_intent_lanes::intent_lane_count() >= 2;
@@ -179,6 +177,20 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
                 }
             });
         }
+        // Adversarial mixed traffic: the classic wave path interleaves with optimized intent
+        // lanes. Both must draw from one replicator/WAL order and remain row-identical on replay.
+        let engine = &engine;
+        let txn_ids = &txn_ids;
+        scope.spawn(move || {
+            for i in 0..100_i32 {
+                engine
+                    .execute_dml_concurrent(
+                        txn_ids.fetch_add(1, Ordering::Relaxed),
+                        &format!("INSERT INTO t VALUES ({}, {})", 500_000 + i, i),
+                    )
+                    .expect("mixed classic writer");
+            }
+        });
     });
 
     if lanes_mode {
@@ -192,15 +204,35 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
                 break;
             }
         }
-        let durable_cut = engine.intent_lane_stats().unwrap().7;
+        let durable_records = engine.durable_wal_records().len();
         let mut retry = engine
             .submit_covered_insert_intent(RETRY_TXN, &route, &RETRY_ROW)
             .expect("same-id same-digest retry");
         assert_eq!(engine.poll_intent(&mut retry).unwrap().unwrap(), 1);
         assert_eq!(
-            engine.intent_lane_stats().unwrap().7,
-            durable_cut,
-            "terminal retry must not append another lane record"
+            engine.durable_wal_records().len(),
+            durable_records,
+            "terminal retry must not append another canonical record"
+        );
+        let cross_path_exact = engine
+            .execute_dml_concurrent_with_result(RETRY_TXN, "INSERT INTO t VALUES (2000000, 77)")
+            .expect("classic retry of the same logical lane request must resolve terminal status");
+        assert_eq!(cross_path_exact.rows_affected, 1);
+        assert_eq!(engine.durable_wal_records().len(), durable_records);
+        let cross_path_wal_len = engine.durable_wal_records().len();
+        let cross_path_mismatch = engine
+            .execute_dml_concurrent(RETRY_TXN, "INSERT INTO t VALUES (2000001, 77)")
+            .expect_err("classic traffic must honor the lane's canonical transaction identity");
+        assert!(
+            cross_path_mismatch
+                .to_string()
+                .contains("claimed by a different request"),
+            "{cross_path_mismatch}"
+        );
+        assert_eq!(
+            engine.durable_wal_records().len(),
+            cross_path_wal_len,
+            "a cross-path stable-id mismatch must not append a second canonical record"
         );
         let mismatch =
             match engine.submit_covered_insert_intent(RETRY_TXN, &route, &[RETRY_ROW[0] + 1, 77]) {
@@ -242,7 +274,7 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     assert!(err.to_string().contains("expects 2 params"), "{err}");
 
     let before = select_all_rows(&engine);
-    assert_eq!(before.len(), 400 + warm_count(&before));
+    assert_eq!(before.len(), 500 + warm_count(&before));
     // E2.5c 2M+ push (b) non-vacuity: with the fused apply flag on, the merged applies must
     // have run through the FUSED device pass (row parity alone cannot prove which kernel
     // produced the state).
@@ -251,16 +283,22 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         "fused apply is always on but no fused pass ever ran"
     );
     assert!(engine.wal_unflushed_count() == 0);
+    assert_eq!(
+        gpu_db_wal::discover_lane_count(&path).unwrap(),
+        None,
+        "fresh canonical optimized traffic must never create retired .lane-* WAL files"
+    );
     drop(engine); // crash
 
-    // E2.5c-1: lanes-mode reopen REPLAYS serial-then-lanes and CONTINUES appending. In lanes
-    // mode this test additionally proves the reopened engine accepts new intent commits (the
+    // Canonical reopen replays one WAL and continues appending. In lanes mode this test
+    // additionally proves the reopened engine accepts new intent commits (the
     // route's elision re-entry arm re-admits the recovered table) and that a SECOND reopen
     // replays the post-reopen commits too.
     // Disk-authoritative FUA reopen: replay the frame log (binary row-op
     // records decode+install; no SQL re-parse for covered inserts) and verify
     // the store is row-identical.
     let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    assert_eq!(gpu_db_wal::discover_lane_count(&path).unwrap(), None);
     let after = select_all_rows(&recovered);
     assert_eq!(before, after, "replayed store must be row-identical");
     // The recovered engine serves the same table from a valid residency
@@ -270,17 +308,14 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         .expect("populate residency after recovery");
     assert!(snapshot.is_valid());
     if lanes_mode {
-        // The v1 intent-only contract survives reopen: classic DML refused fail-loud.
-        let err = recovered
+        // The preparation-lane optimizer does not change the product contract: a classic write
+        // continues in the same canonical sequence/WAL after reopen.
+        recovered
             .execute_dml_concurrent(
                 txn_ids.fetch_add(1, Ordering::Relaxed),
                 "INSERT INTO t VALUES (900000, 0)",
             )
-            .expect_err("classic write after lanes reopen must be refused");
-        assert!(
-            err.to_string().contains("intent lanes are ACTIVE"),
-            "expected the intent-only refusal, got: {err}"
-        );
+            .expect("classic write after optimized intent traffic must remain supported");
         // CONTINUE APPENDING: re-arm the runtime flags, re-prepare the route (the E2.5c-1
         // elision re-entry admits the recovered table with real device backing), and commit
         // fresh intents through the reopened lane set.
@@ -290,7 +325,7 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         let route = recovered
             .prepare_covered_insert_route("t")
             .expect("route re-prepares after reopen (elision re-entry)");
-        let cut_before_retry = recovered.intent_lane_stats().unwrap().7;
+        let wal_before_retry = recovered.durable_wal_records().len();
         let mut recovered_retry = recovered
             .submit_covered_insert_intent(RETRY_TXN, &route, &RETRY_ROW)
             .expect("recovered same-id retry");
@@ -302,9 +337,9 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
             1
         );
         assert_eq!(
-            recovered.intent_lane_stats().unwrap().7,
-            cut_before_retry,
-            "recovered terminal retry must not append another lane record"
+            recovered.durable_wal_records().len(),
+            wal_before_retry,
+            "recovered terminal retry must not append another canonical record"
         );
         for i in 0..50_i32 {
             commit_intent_via_submit(&recovered, &txn_ids, &route, &[10_000 + i, i])
@@ -322,32 +357,18 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         let mid = select_all_rows(&recovered);
         assert_eq!(
             mid.len(),
-            before.len() + 50,
-            "50 post-reopen commits visible"
+            before.len() + 51,
+            "one classic plus 50 optimized post-reopen commits visible"
         );
         drop(recovered);
-        // SECOND reopen: the post-reopen lane commits replay above the first history.
+        // SECOND reopen: post-reopen optimized commits replay above the first history.
         let recovered_again = Engine::open_durable_wal_segment(&path).unwrap();
         let after_again = select_all_rows(&recovered_again);
         assert_eq!(
             mid, after_again,
             "second reopen must be row-identical including post-reopen lane commits"
         );
-        // E2.5c-2: LANES CHECKPOINT on the live recovered engine, then a THIRD reopen through
-        // the checkpoint path (sidecar commit + checkpoint-then-suffix replay) with row parity.
-        let baseline = recovered_again
-            .checkpoint_intent_lanes()
-            .expect("lanes checkpoint on the recovered engine");
         drop(recovered_again);
-        let recovered_from_checkpoint = Engine::open_durable_wal_segment_auto(&path).unwrap();
-        assert_eq!(
-            mid,
-            select_all_rows(&recovered_from_checkpoint),
-            "checkpointed reopen must be row-identical"
-        );
-        drop(recovered_from_checkpoint);
-        let _ = std::fs::remove_file(gpu_db_wal::lanes_checkpoint_sidecar_path(&path));
-        let _ = std::fs::remove_file(gpu_db_wal::lanes_checkpoint_segment_path(&path, baseline));
     } else {
         drop(recovered);
     }
@@ -372,6 +393,9 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
 /// E2.2 — warm a PK'd int4 table into elision and return the prepared covered route (shared setup
 /// for the driver-multiplexed submit/poll semantics test). Returns `None` on a driverless box.
 fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<CoveredInsertRoute> {
+    if engine.intent_lanes.is_none() {
+        engine.attach_test_intent_lanes(test_wal_path("warm-intent-lanes"), 4);
+    }
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -402,50 +426,23 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
     panic!("table never entered elision on a GPU box");
 }
 
-/// First-activation handoff: force a classic writer to pass the optimistic lanes guard and pause
-/// before `commit_state`, activate lanes under that lock, then resume it. The reciprocal under-lock
-/// guard must reject it without consuming a serial sequence or appending WAL. Without that second
-/// check this deterministically creates overlapping serial/lane sequence ownership.
+/// Merely enabling the physical intent optimizer must not change the product write contract:
+/// classic/general mutations continue through the same canonical sequence and WAL.
 #[test]
-fn intent_lane_activation_rejects_prechecked_classic_writer_under_commit_lock() {
+fn configured_intent_lanes_do_not_reject_classic_writers() {
     let mut engine = Engine::new_local_test_engine();
-    engine.attach_test_intent_lanes(test_wal_path("lane-activation-handoff"), 4);
-    let engine = std::sync::Arc::new(engine);
-    let lanes = engine
-        .intent_lanes
-        .as_ref()
-        .map(std::sync::Arc::clone)
-        .expect("test lane set must be installed");
+    engine.attach_test_intent_lanes(test_wal_path("lane-classic-shared-authority"), 4);
     let before_next = engine.commit_state().repl.peek_next_index();
     let before_wal = engine.wal_buffered_count();
-    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-    engine.set_intent_lanes_classic_prelock_hook(
-        std::sync::Arc::clone(&reached),
-        std::sync::Arc::clone(&resume),
-    );
-    let classic = {
-        let engine = std::sync::Arc::clone(&engine);
-        std::thread::spawn(move || {
-            engine.commit_mutation_at(77, std::sync::Arc::from(&b"SET overlap value"[..]), 1)
-        })
-    };
-    reached.wait();
-    engine.ensure_intent_lanes_activated(&lanes).unwrap();
-    resume.wait();
-    let error = classic
-        .join()
-        .unwrap()
-        .expect_err("the prechecked classic writer must lose the activation handoff")
-        .to_string();
-    assert!(error.contains("intent lanes are ACTIVE"), "{error}");
-    assert_eq!(engine.commit_state().repl.peek_next_index(), before_next);
-    assert_eq!(engine.wal_buffered_count(), before_wal);
+    let token = engine
+        .commit_mutation_at(77, std::sync::Arc::from(&b"SET overlap=value"[..]), 1)
+        .expect("configured lanes must not reject a canonical classic write");
+    assert_eq!(token.index, before_next);
     assert_eq!(
-        lanes.seq_oracle.load(Ordering::Acquire),
-        before_next,
-        "activation reserves the next serial index but consumes no lane sequence"
+        engine.commit_state().repl.peek_next_index(),
+        before_next + 1
     );
+    assert_eq!(engine.wal_buffered_count(), before_wal + 1);
 }
 
 /// The engine-wide fail-stop drains lane ingress, not only the classic wave queue. This is a pure
@@ -477,9 +474,7 @@ fn central_commit_wedge_drains_queued_lane_intents() {
             outcome: std::sync::Arc::clone(&outcome),
             request_digest: [0; 32],
             transaction_claims: None,
-            commit_seq: None,
             outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),
-            synchronous: true,
             rows_affected: 1,
             rows_affected_cell: None,
         });
@@ -497,197 +492,6 @@ fn central_commit_wedge_drains_queued_lane_intents() {
     let _ = gpu_db_wal::remove_stale_lane_files(&path);
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(&path);
-}
-
-/// First activation must recheck the sticky wedge under the commit lock. The driver has already
-/// removed this item from ingress when it pauses, so the central drain cannot see it; activation
-/// owns the obligation to fail that local batch without claiming a sequence or appending lane WAL.
-#[test]
-fn lane_activation_fails_locally_drained_batch_if_commit_path_wedges_while_waiting() {
-    let path = test_wal_path("lane-activation-wedge-handoff");
-    let mut engine = Engine::new_local_test_engine();
-    engine.attach_test_intent_lanes(path.clone(), 4);
-    let lanes = engine
-        .intent_lanes
-        .as_ref()
-        .map(std::sync::Arc::clone)
-        .expect("test lane set must be installed");
-    let outcome = crate::engine_dml_concurrent::new_pending_outcome();
-    lanes.outstanding.fetch_add(1, Ordering::Relaxed);
-    lanes.queues[0]
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push_back(crate::engine_dml_concurrent::LaneIntent {
-            op: crate::engine_dml_concurrent::LaneOpKind::Insert,
-            txn_id: 8,
-            slot: (0, 8),
-            read_snapshot: 0,
-            prepared_catalog_seq: 0,
-            filter_idx: 0,
-            row_id_offset: 0,
-            table: std::sync::Arc::from("t"),
-            template: std::sync::Arc::from(&b""[..]),
-            values: Vec::new(),
-            outcome: std::sync::Arc::clone(&outcome),
-            request_digest: [0; 32],
-            transaction_claims: None,
-            commit_seq: None,
-            outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),
-            synchronous: true,
-            rows_affected: 1,
-            rows_affected_cell: None,
-        });
-
-    let before_seq = lanes.seq_oracle.load(Ordering::Acquire);
-    let before_wal = engine.wal_buffered_count();
-    let engine = std::sync::Arc::new(engine);
-    // Force activation to wait after the driver drains ingress. Holding this lock also models the
-    // classic post-durable failure whose apply/publish error installs the wedge before unlocking.
-    let commit = engine.commit_state();
-    let driver = {
-        let engine = std::sync::Arc::clone(&engine);
-        std::thread::spawn(move || engine.drive_intent_lane(0))
-    };
-    let mut drained = false;
-    for _ in 0..1_000_000 {
-        if lanes.queues[0]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty()
-        {
-            drained = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(drained, "the driver did not drain lane ingress");
-    engine.wedge_commit_path();
-    drop(commit);
-
-    assert!(
-        driver.join().unwrap(),
-        "the drained batch was failed locally"
-    );
-    let error = outcome
-        .take_if_done()
-        .expect("the locally drained intent must settle")
-        .unwrap_err();
-    assert!(error.to_string().contains("restart recovery"), "{error}");
-    assert_eq!(lanes.outstanding.load(Ordering::Relaxed), 0);
-    assert!(!lanes.activated.load(Ordering::Acquire));
-    assert_eq!(lanes.seq_oracle.load(Ordering::Acquire), before_seq);
-    assert_eq!(engine.wal_buffered_count(), before_wal);
-
-    drop(engine);
-    let _ = gpu_db_wal::remove_stale_lane_files(&path);
-    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
-    let _ = std::fs::remove_file(&path);
-}
-
-/// Publication-epoch non-vacuity: queue a publisher but hold its device apply, then pause a stale
-/// same-key validator after its old device probe and before bridge arbitration. Apply publishes the
-/// key and removes the publisher bridge in that exact gap. The epoch change must make validation
-/// retry and serialize the stale contender. Removing the epoch comparison admits both inserts.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_lane_probe_retries_across_publication_and_bridge_removal() {
-    let path = test_wal_path("lane-publication-epoch");
-    let mut engine = Engine::new_local_test_engine();
-    engine.attach_test_intent_lanes(path.clone(), 4);
-    let txn_ids = AtomicU64::new(100);
-    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
-        return;
-    };
-    let lanes = engine
-        .intent_lanes
-        .as_ref()
-        .map(std::sync::Arc::clone)
-        .expect("test lane set must be installed");
-    let engine = std::sync::Arc::new(engine);
-    const KEY: i32 = 765_432;
-    let lane = lanes.lane_for_pk(KEY);
-
-    // Validate/claim the publisher and leave it queued behind the held apply lock. Its in-flight
-    // slot now bridges the still-absent device key.
-    let mut publisher = engine
-        .submit_covered_insert_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &route, &[KEY, 1])
-        .unwrap();
-    let device_guard = lanes
-        .device_apply_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert!(engine.drive_intent_lane(lane));
-    assert_eq!(
-        lanes
-            .apply_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len(),
-        1,
-        "publisher must be claimed but not device-applied"
-    );
-    drop(device_guard);
-
-    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-    engine.set_lane_probe_publication_hook(
-        std::sync::Arc::clone(&reached),
-        std::sync::Arc::clone(&resume),
-    );
-    let mut stale = engine
-        .submit_covered_insert_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &route, &[KEY, 2])
-        .unwrap();
-    let epoch_before = lanes.device_publication_epoch.load(Ordering::Acquire);
-    let validator = {
-        let engine = std::sync::Arc::clone(&engine);
-        std::thread::spawn(move || engine.drive_intent_lane(lane))
-    };
-
-    // The stale probe has completed while the publisher is absent. Publish it and remove its
-    // bridge before allowing the validator to acquire `inflight_slots`.
-    reached.wait();
-    assert!(engine.drive_lane_apply_once_for_test(&lanes));
-    assert!(
-        lanes.device_publication_epoch.load(Ordering::Acquire) > epoch_before,
-        "the forced apply must cross the publication epoch"
-    );
-    assert!(
-        lanes.inflight_slots[lane]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty(),
-        "publisher bridge must be removed before stale arbitration resumes"
-    );
-    resume.wait();
-    assert!(validator.join().unwrap());
-
-    let stale_error = engine
-        .poll_intent(&mut stale)
-        .expect("stale contender must resolve during the forced validation")
-        .expect_err("the retried device history verdict must reject the stale contender")
-        .to_string();
-    assert!(
-        stale_error.contains("write-write conflict"),
-        "{stale_error}"
-    );
-
-    let mut publisher_result = None;
-    for _ in 0..10_000_000 {
-        engine.drive_commit_wave();
-        if let Some(result) = engine.poll_intent(&mut publisher) {
-            publisher_result = Some(result);
-            break;
-        }
-    }
-    assert_eq!(
-        publisher_result.expect("publisher never settled").unwrap(),
-        1
-    );
-    drop(lanes);
-    drop(engine);
-    let _ = gpu_db_wal::remove_stale_lane_files(&path);
-    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
-    let _ = std::fs::remove_file(path);
 }
 
 /// E2.2(c) + (a) — the driver-multiplexed submit/poll API and bounded arbitration
@@ -799,6 +603,95 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
             .contains("duplicate key value violates unique index"),
         "committed-dup must raise 23505: {err}"
     );
+
+    // SAME-ADMISSION transaction identity: before any pump, one request owns the shared
+    // admission-to-WAL reservation. Neither an exact concurrent retry nor a mismatched request
+    // may become a second queued transaction.
+    let pending_txn = txn_ids.fetch_add(1, Ordering::Relaxed);
+    let mut pending = engine
+        .submit_covered_insert_intent(pending_txn, &route, &[550_000, 1])
+        .expect("first transaction-id claimant");
+    let exact_pending =
+        match engine.submit_covered_insert_intent(pending_txn, &route, &[550_000, 1]) {
+            Err(error) => error,
+            Ok(_) => panic!("an exact concurrent retry must not queue a second transaction"),
+        };
+    assert!(exact_pending.to_string().contains("already pending"));
+    let mismatch_pending =
+        match engine.submit_covered_insert_intent(pending_txn, &route, &[550_001, 1]) {
+            Err(error) => error,
+            Ok(_) => panic!("a mismatched concurrent retry must not queue a second transaction"),
+        };
+    assert!(mismatch_pending.to_string().contains("different request"));
+    let wal_before_pending = engine.wal_buffered_count();
+    loop {
+        engine.drive_commit_wave();
+        if let Some(result) = engine.poll_intent(&mut pending) {
+            assert_eq!(result.unwrap(), 1);
+            break;
+        }
+    }
+    assert_eq!(
+        engine.wal_buffered_count(),
+        wal_before_pending + 1,
+        "one admitted transaction identity produces exactly one canonical WAL record"
+    );
+
+    // Sustained optimized traffic cannot starve a classic async ticket. A driver call advances
+    // one lane and then services the classic queue; the classic result must resolve in a bounded
+    // number of calls while optimized work is still outstanding.
+    let mut backlog: Vec<_> = (0..2048_i32)
+        .map(|i| {
+            engine
+                .submit_covered_insert_intent(
+                    txn_ids.fetch_add(1, Ordering::Relaxed),
+                    &route,
+                    &[600_000 + i, i],
+                )
+                .expect("submit optimized backlog")
+        })
+        .collect();
+    let classic_text = "INSERT INTO t VALUES (700000, 9)";
+    let classic = engine.make_covered_insert_wave_item(
+        txn_ids.fetch_add(1, Ordering::Relaxed),
+        gpu_db_sql::parse_command(classic_text).unwrap(),
+        classic_text,
+        crate::write_path::WriteSet::default(),
+        engine.committed_seq(),
+        engine.catalog_snapshot().commit_seq,
+        None,
+        None,
+    );
+    let classic_outcome = engine.submit_commit_wave_item(classic).unwrap();
+    let mut classic_result = None;
+    for _ in 0..4 {
+        engine.drive_commit_wave();
+        if let Some(result) = classic_outcome.take_if_done() {
+            classic_result = Some(result);
+            break;
+        }
+    }
+    assert_eq!(classic_result.unwrap().unwrap(), 1);
+    assert!(
+        engine
+            .intent_lanes
+            .as_ref()
+            .unwrap()
+            .outstanding
+            .load(Ordering::Acquire)
+            > 0,
+        "classic completion must be demonstrated while optimized backlog remains"
+    );
+    let mut reaped = 0usize;
+    while reaped < backlog.len() {
+        engine.drive_commit_wave();
+        for ticket in backlog.iter_mut() {
+            if let Some(result) = engine.poll_intent(ticket) {
+                result.unwrap();
+                reaped += 1;
+            }
+        }
+    }
 }
 
 /// E2.4a VARIANT 1 — SAME-PK single-winner ACROSS SHARD WORKERS. A LARGE homogeneous-intent wave
@@ -1078,7 +971,7 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
     assert!(warmed, "table never entered elision on a GPU box");
     let route = engine.prepare_covered_insert_route("t").unwrap();
 
-    // MIXED WAVES: alternate strict and async intents; every one must ack Ok.
+    // MIXED SETTINGS: both compatibility values retain the same strict acknowledgement gate.
     let mut tickets: Vec<_> = (0..200_i32)
         .map(|i| {
             let mode = if i % 2 == 0 {
@@ -1102,15 +995,15 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
         engine.drive_commit_wave();
         for ticket in tickets.iter_mut() {
             if let Some(result) = engine.poll_intent(ticket) {
-                result.expect("distinct-PK intent commits in both modes");
+                result.expect("distinct-PK intent commits under both settings");
                 reaped += 1;
             }
         }
         spins += 1;
-        assert!(spins < 10_000_000, "mixed sync/async batch never drained");
+        assert!(spins < 10_000_000, "mixed-setting batch never drained");
     }
 
-    // ENGINE-DEFAULT flip: plain submits now run async; they must still ack.
+    // The default compatibility setter accepts Off, while plain submits remain strict.
     engine.set_synchronous_commit_default(crate::SynchronousCommit::Off);
     let mut tickets: Vec<_> = (1000..1100_i32)
         .map(|i| {
@@ -1120,7 +1013,7 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
                     &route,
                     &[i, i + 1],
                 )
-                .expect("submit intent (async default)")
+                .expect("submit intent after compatibility setting")
         })
         .collect();
     let mut reaped = 0usize;
@@ -1129,16 +1022,15 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
         engine.drive_commit_wave();
         for ticket in tickets.iter_mut() {
             if let Some(result) = engine.poll_intent(ticket) {
-                result.expect("async-default intent commits");
+                result.expect("default intent commits strictly");
                 reaped += 1;
             }
         }
         spins += 1;
-        assert!(spins < 10_000_000, "async-default batch never drained");
+        assert!(spins < 10_000_000, "default batch never drained");
     }
 
-    // CLEAN DRAIN + REOPEN: every acked row (async included) recovers — the
-    // async loss window exists only under power failure, never a clean stop.
+    // REOPEN: every acknowledged row recovers because both settings are strict.
     drop(engine);
     let recovered = Engine::open_durable_wal_segment(&path).expect("reopen recovers");
     let count = recovered

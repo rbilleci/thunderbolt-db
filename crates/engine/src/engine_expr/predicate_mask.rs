@@ -141,72 +141,9 @@ impl Engine {
         if row_count == 0 || (predicate.is_none() && visibility.is_none()) {
             return Ok(None);
         }
-        let mut program = Vec::new();
-        let mut needles = Vec::new();
-        let elem = if let Some(predicate) = predicate {
-            validate_temporal_predicate_types(predicate, table)?;
-            let mut columns = Vec::new();
-            collect_expr_columns(predicate, &mut columns);
-            if expr_mentions_numeric(predicate, table) {
-                if columns.iter().any(|&column| {
-                    !matches!(
-                        table.columns.get(column).map(|column| column.ty),
-                        Some(SqlType::Numeric { .. })
-                    )
-                }) {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "mixed numeric/non-numeric resident predicate is not yet supported by device lowering"
-                            .to_string(),
-                    )));
-                }
-                compile_numeric_predicate_program(predicate, table, descriptor, &mut program)?;
-                ResidentElemType::I128
-            } else {
-                compile_predicate_program(
-                    predicate,
-                    table,
-                    descriptor,
-                    &mut program,
-                    &mut needles,
-                )?;
-                predicate_vm_elem_type(predicate, table)
-                    .or_else(|| mixed_width_i32_elem(predicate, table))
-                    .or_else(|| {
-                        (!columns.is_empty()
-                            && columns.iter().all(|&column| {
-                                matches!(
-                                    table.columns.get(column).map(|column| column.ty),
-                                    Some(SqlType::Int8 | SqlType::Timestamp)
-                                )
-                            }))
-                        .then_some(ResidentElemType::I64)
-                    })
-                    .or_else(|| {
-                        (!columns.is_empty()
-                            && columns.iter().all(|&column| {
-                                matches!(
-                                    table.columns.get(column).map(|column| column.ty),
-                                    Some(
-                                        SqlType::Int2
-                                            | SqlType::Int4
-                                            | SqlType::Date
-                                            | SqlType::Text
-                                            | SqlType::Bool
-                                            | SqlType::Uuid
-                                    )
-                                )
-                            }))
-                        .then_some(ResidentElemType::I32)
-                    })
-                    .ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(
-                            "resident predicate uses incompatible device element widths"
-                                .to_string(),
-                        ))
-                    })?
-            }
-        } else {
-            ResidentElemType::I64
+        let (mut program, needles, elem) = match predicate {
+            Some(predicate) => compile_resident_predicate(predicate, table, descriptor)?,
+            None => (Vec::new(), Vec::new(), ResidentElemType::I64),
         };
         if let Some(visibility) = visibility {
             visibility.push_conjuncts(&mut program, predicate.is_some());
@@ -221,4 +158,105 @@ impl Engine {
             .map(Some)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
     }
+
+    /// Exact predicate verdict over a bounded index candidate set. This is the collision-recheck
+    /// terminal for prepared point routes: the index supplies addresses, while the fixed-width
+    /// typed predicate runs at those addresses on the GPU.
+    pub(crate) fn resident_predicate_device_filter_at_indices(
+        &self,
+        predicate: &ResidentExpr,
+        table: &RelationalTable,
+        descriptor: &RelationalResidencySnapshot,
+        memory: &CudaResidentDeviceMemory,
+        indices: &[u32],
+    ) -> Result<Vec<u32>, ExecuteError> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (program, needles, elem) = compile_resident_predicate(predicate, table, descriptor)?;
+        if !needles.is_empty() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "indexed candidate predicates currently require fixed-width device operands"
+                    .to_string(),
+            )));
+        }
+        let row_count = u32::try_from(descriptor.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident candidate source exceeds u32 device coordinates".to_string(),
+            ))
+        })?;
+        memory
+            .run_expr_predicate_filter_at_indices(&program, row_count, indices, elem)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
+    }
+}
+
+type CompiledResidentPredicate = (
+    Vec<gpu_db_execution::ExprStep>,
+    Vec<Vec<u8>>,
+    ResidentElemType,
+);
+
+fn compile_resident_predicate(
+    predicate: &ResidentExpr,
+    table: &RelationalTable,
+    descriptor: &RelationalResidencySnapshot,
+) -> Result<CompiledResidentPredicate, ExecuteError> {
+    validate_temporal_predicate_types(predicate, table)?;
+    let mut program = Vec::new();
+    let mut needles = Vec::new();
+    let mut columns = Vec::new();
+    collect_expr_columns(predicate, &mut columns);
+    let elem = if expr_mentions_numeric(predicate, table) {
+        if columns.iter().any(|&column| {
+            !matches!(
+                table.columns.get(column).map(|column| column.ty),
+                Some(SqlType::Numeric { .. })
+            )
+        }) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "mixed numeric/non-numeric resident predicate is not yet supported by device lowering"
+                    .to_string(),
+            )));
+        }
+        compile_numeric_predicate_program(predicate, table, descriptor, &mut program)?;
+        ResidentElemType::I128
+    } else {
+        compile_predicate_program(predicate, table, descriptor, &mut program, &mut needles)?;
+        predicate_vm_elem_type(predicate, table)
+            .or_else(|| mixed_width_i32_elem(predicate, table))
+            .or_else(|| {
+                (!columns.is_empty()
+                    && columns.iter().all(|&column| {
+                        matches!(
+                            table.columns.get(column).map(|column| column.ty),
+                            Some(SqlType::Int8 | SqlType::Timestamp)
+                        )
+                    }))
+                .then_some(ResidentElemType::I64)
+            })
+            .or_else(|| {
+                (!columns.is_empty()
+                    && columns.iter().all(|&column| {
+                        matches!(
+                            table.columns.get(column).map(|column| column.ty),
+                            Some(
+                                SqlType::Int2
+                                    | SqlType::Int4
+                                    | SqlType::Date
+                                    | SqlType::Text
+                                    | SqlType::Bool
+                                    | SqlType::Uuid
+                            )
+                        )
+                    }))
+                .then_some(ResidentElemType::I32)
+            })
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident predicate uses incompatible device element widths".to_string(),
+                ))
+            })?
+    };
+    Ok((program, needles, elem))
 }

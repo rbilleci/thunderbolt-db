@@ -1,8 +1,8 @@
 //! Commit-wave and lane item ownership shared by the concurrent DML subpaths.
 
 use super::{
-    AtomicOrdering, AtomicU64, Command, Engine, EngineError, ExecuteError, Index, Mutex,
-    RelationalSelectResult, SqlValue, WriteSet,
+    AtomicOrdering, AtomicU64, Command, Engine, ExecuteError, Index, Mutex, RelationalSelectResult,
+    SqlValue, WriteSet,
 };
 use std::sync::Arc;
 
@@ -40,6 +40,10 @@ pub(crate) struct CommitWaveItem {
     /// silently bypass the new constraint; any DDL bumps the stamp and forces the
     /// always-correct Full re-validation instead.
     pub(super) prepared_catalog_seq: Index,
+    /// Catalog generation revalidated for a protocol-neutral prepared execution. Unlike
+    /// `prepared_catalog_seq` (the off-lock optimizer stamp), this is a correctness precondition:
+    /// a mismatch must fail before WAL/apply rather than re-resolve under a changed row type.
+    pub(super) expected_catalog_version: Option<Index>,
     /// DELTA-REUSE (B): the OFF-LOCK-prepared insert delta, carried forward for reuse-eligible
     /// items (elided, FK-free, no nextval). The under-lock re-resolve then only RE-KEYS it at the
     /// wave's `next_row_id` (`rekey_offlock_insert_delta`) instead of re-running the full
@@ -136,35 +140,28 @@ pub(crate) struct LaneIntent {
     pub(crate) template: Arc<[u8]>,
     pub(crate) values: Vec<SqlValue>,
     pub(crate) outcome: CommitWaveOutcome,
-    /// Stable request identity and shared lane status authority. Installed at ingress before the
-    /// item can claim a sequence; successful settlement publishes the terminal response here.
+    /// Stable request identity plus the one shared admission-to-WAL reservation registry used by
+    /// every queued write strategy. Durable terminal status belongs to the canonical
+    /// `CommitState` transaction index.
     pub(crate) request_digest: gpu_db_wal::CanonicalDigest,
-    pub(crate) transaction_claims: Option<
-        Arc<
-            Mutex<std::collections::HashMap<u64, crate::engine_intent_lanes::LaneTransactionClaim>>,
-        >,
-    >,
-    pub(crate) commit_seq: Option<Index>,
+    pub(crate) transaction_claims:
+        Option<Arc<Mutex<std::collections::HashMap<u64, gpu_db_wal::CanonicalDigest>>>>,
     /// Live-population decrement handle (see `IntentLaneState::outstanding`);
     /// None outside lanes mode.
     pub(crate) outstanding: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// PostgreSQL `synchronous_commit` model: true (default) acks at the
-    /// STRICT gate (durable AND applied); false acks at the APPLIED cut
-    /// (async commit — bounded loss on power failure, consistency preserved).
-    pub(crate) synchronous: bool,
     /// U1: the rows-affected count a settled Ok reports for INSERT intents (always 1).
     pub(crate) rows_affected: u64,
     /// U1/U2 WAL-first: a DELETE's (and UPDATE's) rows-affected is resolved at APPLY (the locate
     /// moved off the pump critical path), so the outcome comes from this shared cell the apply
     /// writes (0 or 1). `None` for inserts — they use `rows_affected`. Shared with the delete's
-    /// `LaneTombstone.rows_affected` / the update's `LaneUpdate.rows_affected`; the settle reads it
-    /// after the applied cut covers the wave.
+    /// `LaneTombstone.rows_affected` / the update's `LaneUpdate.rows_affected`; completion reads it
+    /// after canonical device apply succeeds.
     pub(crate) rows_affected_cell: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl LaneIntent {
     /// The rows-affected an Ok outcome reports: a delete reads its apply-resolved cell; an
-    /// insert (no cell) uses the fixed `rows_affected` (1). Read at settle, after apply.
+    /// insert (no cell) uses the fixed `rows_affected` (1). Read at completion, after apply.
     pub(crate) fn resolved_rows_affected(&self) -> u64 {
         match &self.rows_affected_cell {
             Some(cell) => cell.load(AtomicOrdering::Acquire),
@@ -185,35 +182,11 @@ impl LaneIntent {
             let mut claims = claims
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match &result {
-                Ok(affected_rows) => {
-                    if let Some(commit_seq) = self.commit_seq {
-                        claims.insert(
-                            self.txn_id,
-                            crate::engine_intent_lanes::LaneTransactionClaim {
-                                request_digest: self.request_digest,
-                                state: crate::engine_intent_lanes::LaneTransactionClaimState::Terminal {
-                                    commit_seq,
-                                    affected_rows: *affected_rows,
-                                },
-                            },
-                        );
-                    }
-                }
-                Err(_) if self.commit_seq.is_none() => {
-                    if claims.get(&self.txn_id).is_some_and(|claim| {
-                        claim.request_digest == self.request_digest
-                            && claim.state
-                                == crate::engine_intent_lanes::LaneTransactionClaimState::Pending
-                    }) {
-                        claims.remove(&self.txn_id);
-                    }
-                }
-                Err(_) => {
-                    // A sequence was assigned. Failure from here is indeterminate until restart
-                    // reconciles durable authority; never delete the stable-ID pin and permit a
-                    // duplicate append in the live process.
-                }
+            if claims
+                .get(&self.txn_id)
+                .is_some_and(|claim| *claim == self.request_digest)
+            {
+                claims.remove(&self.txn_id);
             }
         }
         *outcome = Some(result);
@@ -256,7 +229,7 @@ impl CommitWaveItem {
 /// signal for the depth-1 durability pipeline.
 pub(crate) struct CommitWaveState {
     pub(super) queue: Mutex<CommitWaveQueue>,
-    pub(super) cv: std::sync::Condvar,
+    pub(crate) cv: std::sync::Condvar,
     /// W2/W2b — the DURABILITY PIPELINE (depth [`WAVE_TAIL_PIPELINE_DEPTH`]): sequenced waves
     /// whose group-fsync wait, `committed_seq` publish, and outcome acks have NOT yet run. The
     /// sequencer pushes tails here and immediately drains/sequences the NEXT wave under the
@@ -264,7 +237,8 @@ pub(crate) struct CommitWaveState {
     /// them — the waves' own blocked waiters (they are spinning on their outcomes anyway) or the
     /// sequencer as the fallback claimer at the capacity gate. Finish order is UNCONSTRAINED:
     /// a tail's durability wait covers all earlier WAL positions (prefix frontier) and the
-    /// publish is a CAS-max, so concurrent out-of-order finishing is safe. This is what lets
+    /// publication joins exact ready indices into one contiguous prefix, so concurrent out-of-order
+    /// finishing is safe without exposing a gap. This is what lets
     /// wave N+1's serial sequencing overlap wave N's fdatasync, and lets consecutive waves'
     /// records coalesce into SHARED fsyncs via the WAL's group-flush protocol.
     /// Liveness: a pending tail always has ≥1 live claimer — its members' outcomes are unset
@@ -334,7 +308,8 @@ impl Engine {
 /// sequencer's critical path. The deltas are applied and the WAL records appended (that is what
 /// lets the next wave's re-resolves see them); nothing is client-visible until `finish` runs the
 /// group-durability wait and publishes `committed_seq` (WAL-before-visibility per tail; the
-/// CAS-max publish makes out-of-order tail completion safe). `armed` keeps the wedge-don't-strand policy:
+/// the publication join holds out-of-order completion behind gaps). `armed` keeps the
+/// wedge-don't-strand policy:
 /// a tail dropped unfinished (claimer panic, pipeline abandonment) fails every still-unset
 /// outcome and wedges the queue, exactly like `CommitWaveBatchGuard` does for the in-section
 /// half of the wave.
@@ -344,7 +319,6 @@ pub(super) struct CommitWaveTail {
     /// durable-commit point, in wave order (aborted items' outcomes were already set in-section).
     /// `rows_affected` is the applied delta's exact row count — the Ok payload of the ack (U1).
     pub(super) committed: Vec<(usize, Index, u64)>,
-    pub(super) last_seq: Index,
     pub(super) last_position: usize,
     pub(super) armed: bool,
 }
@@ -360,11 +334,11 @@ impl Drop for CommitWaveTail {
         // unwind-safe completion guard.
         for item in &self.batch {
             if !item.outcome.done.load(AtomicOrdering::Acquire) {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                item.set_outcome(Err(ExecuteError::Indeterminate(
                     "the concurrent commit path is wedged pending restart recovery: the \
-                     commit-wave durability tail died before completing"
+                     commit-wave durability tail died after sequence/WAL assignment"
                         .to_string(),
-                ))));
+                )));
             }
         }
     }

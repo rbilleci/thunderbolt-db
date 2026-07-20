@@ -100,14 +100,33 @@ impl Engine {
         let snapshot = self
             .transaction_snapshot_handle(txn_id)
             .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
-        let _statement = snapshot
-            .statement_lock
+        self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
+        let statement_lock = Arc::clone(&snapshot.statement_lock);
+        let _statement = statement_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
+        self.execute_relational_select_in_transaction_statement_locked(
+            txn_id,
+            &snapshot,
+            select,
+            on_statement_locked,
+        )
+    }
+
+    pub(crate) fn execute_relational_select_in_transaction_statement_locked(
+        &self,
+        txn_id: TxnId,
+        snapshot: &Arc<TransactionSnapshot>,
+        select: &Select,
+        on_statement_locked: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        self.ensure_transaction_snapshot_current(txn_id, snapshot)?;
         on_statement_locked();
-        let _scope = self.enter_transaction_read(Arc::clone(&snapshot));
+        let _scope = self.enter_transaction_read(Arc::clone(snapshot));
         self.execute_relational_select(select)
     }
 
@@ -320,27 +339,23 @@ impl Engine {
                 );
             }
         }
-        // A table that existed but had never published a data or residency generation at BEGIN is
-        // exactly empty in the transaction snapshot. If a later first INSERT admits it, using the
-        // current GPU buffer would pair old visibility with new bytes. Execute the empty generation
-        // as a zero-row transient GPU relation instead: fail-free, device-native, and independent of
-        // the later allocation. Non-empty captured tables continue through their retained resident
-        // source below (or fail loud if that old generation had no GPU representation).
+        // A table visible in the transaction catalog but without a data or residency generation is
+        // exactly empty. This includes a transaction-private CREATE TABLE: its catalog overlay is
+        // visible to this statement even though COMMIT has not published an MVCC table generation.
+        // If a later private INSERT admits an existing empty table, the transaction shard map is no
+        // longer empty and this shortcut must not hide read-own-writes. Execute only the genuinely
+        // empty generation as a zero-row transient GPU relation; non-empty captured/private tables
+        // continue through their retained resident source below (or fail loud when unavailable).
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            let transaction_shards = snapshot.transaction_shards();
             let captured_empty_without_residency = snapshot.boundary == s
                 && !snapshot.table_versions.contains_key(&select.table)
                 && !snapshot.resident_snapshots.contains_key(&select.table)
-                && snapshot
-                    .resident_shards
+                && transaction_shards
                     .get(&select.table)
                     .is_none_or(|shards| shards.is_empty());
             if captured_empty_without_residency {
-                if let Some(table) = snapshot
-                    .catalog
-                    .relational_catalog
-                    .get(&select.table)
-                    .cloned()
-                {
+                if let Some(table) = catalog.relational_catalog.get(&select.table).cloned() {
                     on_pinned();
                     return self.execute_transient_rows_via_general(select, table, Vec::new(), s);
                 }
@@ -630,21 +645,66 @@ impl Engine {
         // A bounded SQL function body is a typed literal. Parsing it is control-plane work;
         // returning it is relational execution. Upload the literal as a one-row transient
         // relation and run the same device projection used by catalog/materialized-view rows.
+        self.execute_typed_scalar_via_gpu(
+            function.name.clone(),
+            function.return_type,
+            value,
+            function.schema.clone(),
+            format!("__gpu_function_{}", function.oid),
+            function.oid,
+            1,
+            self.committed_seq(),
+        )
+    }
+
+    /// Execute a bounded no-`FROM` literal through the canonical GPU projection/result path.
+    /// Literal parsing and type resolution are control-plane work; the returned row is read from
+    /// the transient device relation, never constructed as a host relational result.
+    pub fn execute_relational_literal(
+        &self,
+        literal: &SelectLiteral,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        self.execute_typed_scalar_via_gpu(
+            literal.column_name.clone(),
+            literal.ty,
+            literal.value.clone(),
+            "pg_catalog".to_string(),
+            "__gpu_scalar_literal".to_string(),
+            0,
+            0,
+            self.committed_seq(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_typed_scalar_via_gpu(
+        &self,
+        column_name: String,
+        ty: SqlType,
+        value: SqlValue,
+        schema: String,
+        relation_name: String,
+        relation_oid: u32,
+        attnum: i16,
+        boundary: Index,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         let column = RelationalColumn {
             id: 0,
-            table_oid: function.oid,
-            attnum: 1,
-            name: function.name.clone(),
-            ty: function.return_type,
+            table_oid: relation_oid,
+            attnum,
+            name: column_name,
+            ty,
             domain: None,
             default: None,
-            type_oid: function.return_type.postgres_oid(),
-            type_size: function.return_type.type_size(),
+            type_oid: ty.postgres_oid(),
+            type_size: ty.type_size(),
         };
         let table = RelationalTable {
-            schema: function.schema.clone(),
-            name: format!("__gpu_function_{}", function.oid),
-            oid: function.oid,
+            schema,
+            name: relation_name,
+            oid: relation_oid,
             columns: vec![column],
             indexes: Vec::new(),
             check_constraints: Vec::new(),
@@ -664,12 +724,7 @@ impl Engine {
             limit: None,
             offset: None,
         };
-        self.execute_transient_rows_via_general(
-            &select,
-            table,
-            vec![vec![value]],
-            self.committed_seq(),
-        )
+        self.execute_transient_rows_via_general(&select, table, vec![vec![value]], boundary)
     }
 
     pub fn execute_relational_select_with_cuda_driver_probe(

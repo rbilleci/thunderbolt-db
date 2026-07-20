@@ -22,6 +22,5 @@ gpu_db_sql = { path = "../sql" }
 [dev-dependencies]
 bytes = "1"
 futures-util = "0.3"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"

@@ -23,9 +23,28 @@ use std::time::{Duration, Instant};
 
 use gpu_db_engine::Engine;
 use gpu_db_facade::{
-    execute_on_shared_engine, execute_on_shared_engine_batched, BatchedDispatch, DbValue,
-    PointLookupBatcher, QueryOutcome, SharedEngine,
+    DbError, DbValue, PointLookupBatcher, QueryOutcome, SharedEngine, SubmissionDispatch,
+    SubmissionRequest,
 };
+
+fn submit_text(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
+    let mut session = shared.open_session();
+    shared
+        .submit(&mut session, SubmissionRequest::Text(sql))
+        .into_immediate()
+}
+
+fn submit_batched_text(
+    shared: &SharedEngine,
+    batcher: &PointLookupBatcher,
+    sql: &str,
+) -> SubmissionDispatch {
+    let mut session = shared.open_session();
+    shared.submit(
+        &mut session,
+        SubmissionRequest::BatchedText { sql, batcher },
+    )
+}
 
 fn env_usize(key: &str, default: usize) -> usize {
     env::var(key)
@@ -107,7 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     let shared = Arc::new(SharedEngine::from_engine(engine));
-    execute_on_shared_engine(
+    submit_text(
         &shared,
         "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)",
     )?;
@@ -117,7 +136,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             (id as i64 * 7).to_string()
         };
-        execute_on_shared_engine(
+        submit_text(
             &shared,
             &format!("INSERT INTO accounts (id, balance) VALUES ({id}, {balance})"),
         )?;
@@ -142,9 +161,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     for turn in 0..warmup {
         let id = (turn % rows) as i32;
         let sql = format!("SELECT id FROM accounts WHERE id = {id}");
-        match execute_on_shared_engine_batched(&shared, &batcher, &sql) {
-            BatchedDispatch::Batched(receiver) => warmup_receivers.push((id, receiver)),
-            BatchedDispatch::Immediate(_) => {
+        match submit_batched_text(&shared, &batcher, &sql) {
+            SubmissionDispatch::Batched(receiver) => warmup_receivers.push((id, receiver)),
+            SubmissionDispatch::Immediate(_) => {
                 return Err(
                     format!("warmup point read id={id} bypassed the production batcher").into(),
                 )
@@ -207,7 +226,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let result = (|| {
                     for offset in 0..writes_per {
                         let id = WRITE_BASE + writer * WRITE_KEY_STRIDE + offset;
-                        execute_on_shared_engine(
+                        submit_text(
                             &shared,
                             &format!(
                                 "INSERT INTO accounts (id, balance) VALUES ({id}, {})",
@@ -264,12 +283,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for warm_turn in 0..reader_warmup {
                     let id = ((reader + warm_turn) % rows) as i32;
                     let sql = format!("SELECT id FROM accounts WHERE id = {id}");
-                    let outcome = match execute_on_shared_engine_batched(&shared, &batcher, &sql) {
-                        BatchedDispatch::Batched(receiver) => receiver
+                    let outcome = match submit_batched_text(&shared, &batcher, &sql) {
+                        SubmissionDispatch::Batched(receiver) => receiver
                             .blocking_recv()
                             .expect("batcher stayed alive during reader warmup")
                             .expect("reader warmup succeeded"),
-                        BatchedDispatch::Immediate(_) => {
+                        SubmissionDispatch::Immediate(_) => {
                             panic!("reader warmup bypassed the production batcher")
                         }
                     };
@@ -284,12 +303,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let id = (state % rows as u64) as i32;
                     let sql = format!("SELECT id FROM accounts WHERE id = {id}");
                     let started = Instant::now();
-                    let result = match execute_on_shared_engine_batched(&shared, &batcher, &sql) {
-                        BatchedDispatch::Batched(receiver) => receiver
+                    let result = match submit_batched_text(&shared, &batcher, &sql) {
+                        SubmissionDispatch::Batched(receiver) => receiver
                             .blocking_recv()
                             .map_err(|_| "point-lookup batcher stopped".to_owned())?
                             .map_err(|err| format!("batched read id={id}: {err:?}"))?,
-                        BatchedDispatch::Immediate(_) => {
+                        SubmissionDispatch::Immediate(_) => {
                             return Err(format!(
                                 "resident point read id={id} bypassed the production batcher"
                             ));

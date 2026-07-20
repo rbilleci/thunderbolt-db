@@ -18,10 +18,10 @@
 //! and each intent execution builds the wave item DIRECTLY — no parse, no
 //! `prepare_insert` — and rides the UNMODIFIED commit-wave machinery: the
 //! sequencer's batched device PK validation, the delta-reuse re-key, the W5a
-//! binary WAL record (whole wave coalesced into one FUA frame by the group
-//! flush), the wave-batched device open-shard append (one HtoD + created_by /
+//! binary WAL record (the whole wave enters one canonical WAL append), the
+//! wave-batched device open-shard append (one HtoD + created_by /
 //! row-id stamps + device PK-index insert per flush), and the pipelined
-//! durability tail (ack = durable cut covering the wave + publish).
+//! completion tail (ack = canonical durability + device apply + contiguous publication).
 //!
 //! SAFETY ENVELOPE: eligibility is re-checked at EXECUTE time against the live
 //! catalog generation. Any drift (DDL, de-elision, table dropped) falls back to
@@ -36,8 +36,8 @@ use super::*;
 /// Commit durability mode for a single intent — the PostgreSQL
 /// `synchronous_commit` model, per statement.
 ///
-/// * `On` (the default): the ack waits for the wave's WAL frames to be
-///   FUA-durable AND device-applied — a returned `Ok` survives power failure.
+/// * `On` (the default): the ack waits for canonical WAL durability, device apply, and contiguous
+///   publication — a returned `Ok` survives power failure.
 /// * `Off` is accepted as a compatibility setting but currently behaves exactly like `On`.
 ///   ADR-014 forbids acknowledging an intent before its terminal marker is durable and applied;
 ///   a future unstable-visible/async contract requires a separate accepted design.
@@ -161,17 +161,10 @@ impl CoveredUpdateRoute {
 }
 
 impl Engine {
-    /// Set the engine-wide DEFAULT commit mode (the pg server-default analog;
-    /// per-statement overrides via
-    /// [`Engine::submit_covered_insert_intent_with_commit`] always win).
-    /// No-op on a non-lanes engine (the classic path is always strict).
+    /// PostgreSQL-compatibility setting surface. ADR-014 currently provides only strict RPO-0
+    /// acknowledgement, so both modes are accepted and intentionally share the same gate.
     pub fn set_synchronous_commit_default(&self, mode: SynchronousCommit) {
-        if let Some(lanes) = &self.intent_lanes {
-            let _ = mode;
-            lanes
-                .synchronous_commit_default
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        let _ = mode;
     }
 
     /// Prepare a covered-INSERT route for `table`: the E2.1 intent fast path's
@@ -229,15 +222,10 @@ impl Engine {
             return Err(route_err("binary WAL records are disabled"));
         }
         if !self.insert_unique_wave_batchable(&catalog, table) {
-            // E2.5c-1 ELISION RE-ENTRY: a REOPENED lanes-mode engine is intent-only (classic
-            // writes are refused once activated), so the classic warm-up that normally enters
-            // elision lazily can never run again — without this arm a recovered database could
-            // not prepare any route and would be permanently read-only. When the elision flags
-            // are live and the table is eligible, admit it with REAL device backing (populate
-            // first; a driverless box falls through to the error below) and enter elision here;
-            // the PK-index cache self-heals on first probe (rebuild-on-miss). A fresh engine
-            // whose caller prepares before warming benefits identically — the arm is the same
-            // lazy entry the wave append performs, hoisted to the explicit opt-in surface.
+            // Route preparation may be the first device-residency touch after startup. When the
+            // elision flags are live and the table is eligible, admit it with real device backing
+            // (a driverless box falls through to the error below) and enter elision here;
+            // the PK-index cache self-heals on first probe (rebuild-on-miss).
             let reentered = self.auto_admit_on_commit_enabled()
                 && !self.table_device_authoritative(table_name)
                 && self.table_device_authority_eligible(&catalog, table_name)
@@ -297,13 +285,6 @@ impl Engine {
         // header (tag/ver/op) + table-len prefix + row-count. Encoding uses the bare `table.name`
         // (the delta mutation's table string), matching the sequencer's binary-record input.
         let binary_row_id_offset = (3 + 2 + table.name.len() + 4) as u32;
-        // E2.5c-3: route preparation is the explicit intent-path opt-in, so materialize the
-        // LAZY lane WAL backing here — off the hot path — instead of on the first wave (the
-        // N x 2 segment prewrite is seconds at production segment sizes; a first-wave stall
-        // that long would poison the latency profile). Fails loudly like any other route error.
-        if let Some(lanes) = &self.intent_lanes {
-            lanes.wal().map_err(ExecuteError::Engine)?;
-        }
         Ok(CoveredInsertRoute {
             table: table.name.clone(),
             catalog_seq: catalog.commit_seq,
@@ -321,8 +302,8 @@ impl Engine {
     /// [`Engine::execute_dml_concurrent`] — duplicate keys raise the same
     /// 23505 `ApplyFailed`, SI conflicts the same retryable `Serialization` —
     /// but the hot path skips SQL parse and `prepare_insert` entirely and
-    /// enqueues the wave item directly. Returns once the intent's wave is
-    /// DURABLE (WAL frame under the durable cut) and published.
+    /// enqueues the wave item directly. Returns once the canonical transaction
+    /// is durable, device-applied, and contiguously published.
     ///
     /// On any eligibility drift (DDL since the route's prepare, de-elision,
     /// column-count mismatch against a re-created table) this transparently
@@ -388,6 +369,7 @@ impl Engine {
                         route.binary_row_id_offset,
                     )
                 })?;
+        let logical_request = route.synthesize_text(params);
         Some(crate::engine_dml_concurrent::LaneIntent {
             op: crate::engine_dml_concurrent::LaneOpKind::Insert,
             txn_id,
@@ -400,11 +382,9 @@ impl Engine {
             template,
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
-            request_digest: [0; 32],
+            request_digest: gpu_db_wal::canonical_request_digest(logical_request.as_bytes()),
             transaction_claims: None,
-            commit_seq: None,
             outstanding: None,
-            synchronous: true,
             rows_affected: 1,
             rows_affected_cell: None,
         })
@@ -417,16 +397,7 @@ impl Engine {
         route: &CoveredInsertRoute,
         params: &[i32],
     ) -> Result<IntentTicket, ExecuteError> {
-        let mode = if self.intent_lanes.as_ref().is_some_and(|lanes| {
-            !lanes
-                .synchronous_commit_default
-                .load(std::sync::atomic::Ordering::Relaxed)
-        }) {
-            SynchronousCommit::Off
-        } else {
-            SynchronousCommit::On
-        };
-        self.submit_covered_insert_intent_with_commit(txn_id, route, params, mode)
+        self.submit_covered_insert_intent_with_commit(txn_id, route, params, SynchronousCommit::On)
     }
 
     /// Submit with an EXPLICIT per-statement commit mode — the PostgreSQL
@@ -438,7 +409,7 @@ impl Engine {
         txn_id: u64,
         route: &CoveredInsertRoute,
         params: &[i32],
-        mode: SynchronousCommit,
+        _mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
         self.check_intent_params(route, params)?;
         // LEAN LANE PATH: in lanes mode, build the compact LaneIntent and push
@@ -449,9 +420,7 @@ impl Engine {
             let snapshot_hold =
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
             if let Some(mut intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
-                let _ = mode;
-                intent.synchronous = true;
-                let retry = match self.claim_lane_intent(lanes, &mut intent) {
+                let retry = match self.claim_lane_intent(&mut intent) {
                     Ok(retry) => retry,
                     Err(error) => {
                         self.deregister_active_snapshot(read_snapshot);
@@ -582,16 +551,7 @@ impl Engine {
         route: &CoveredDeleteRoute,
         pk: i32,
     ) -> Result<IntentTicket, ExecuteError> {
-        let mode = if self.intent_lanes.as_ref().is_some_and(|lanes| {
-            !lanes
-                .synchronous_commit_default
-                .load(std::sync::atomic::Ordering::Relaxed)
-        }) {
-            SynchronousCommit::Off
-        } else {
-            SynchronousCommit::On
-        };
-        self.submit_covered_delete_intent_with_commit(txn_id, route, pk, mode)
+        self.submit_covered_delete_intent_with_commit(txn_id, route, pk, SynchronousCommit::On)
     }
 
     /// U1: submit a covered DELETE with an explicit commit mode. Lanes-mode only: there is no
@@ -603,9 +563,11 @@ impl Engine {
         txn_id: u64,
         route: &CoveredDeleteRoute,
         pk: i32,
-        mode: SynchronousCommit,
+        _mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
         self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
@@ -621,9 +583,7 @@ impl Engine {
         let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
         match self.build_lane_delete_intent(txn_id, route, pk, read_snapshot) {
             Some(mut intent) => {
-                let _ = mode;
-                intent.synchronous = true;
-                let retry = match self.claim_lane_intent(lanes, &mut intent) {
+                let retry = match self.claim_lane_intent(&mut intent) {
                     Ok(retry) => retry,
                     Err(error) => {
                         self.deregister_active_snapshot(read_snapshot);
@@ -690,13 +650,11 @@ impl Engine {
             template: std::sync::Arc::from(record.as_slice()),
             values: Vec::new(),
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
-            request_digest: [0; 32],
+            request_digest: gpu_db_wal::canonical_request_digest(record.as_slice()),
             transaction_claims: None,
-            commit_seq: None,
             outstanding: None,
-            synchronous: true,
             // WAL-FIRST: the delete's rows-affected (0 or 1) is resolved at APPLY (the locate
-            // moved off the pump critical path); this cell carries it back to the settle. Init 0
+            // moved off the pump critical path); this cell carries it back to completion. Init 0
             // = "no visible row" (a safe default a never-applied delete would report).
             rows_affected: 0,
             rows_affected_cell: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
@@ -761,16 +719,12 @@ impl Engine {
         route: &CoveredUpdateRoute,
         new_values: &[i32],
     ) -> Result<IntentTicket, ExecuteError> {
-        let mode = if self.intent_lanes.as_ref().is_some_and(|lanes| {
-            !lanes
-                .synchronous_commit_default
-                .load(std::sync::atomic::Ordering::Relaxed)
-        }) {
-            SynchronousCommit::Off
-        } else {
-            SynchronousCommit::On
-        };
-        self.submit_covered_update_intent_with_commit(txn_id, route, new_values, mode)
+        self.submit_covered_update_intent_with_commit(
+            txn_id,
+            route,
+            new_values,
+            SynchronousCommit::On,
+        )
     }
 
     /// U2: submit a covered UPDATE with an explicit commit mode. Lanes-mode only: there is no
@@ -782,9 +736,11 @@ impl Engine {
         txn_id: u64,
         route: &CoveredUpdateRoute,
         new_values: &[i32],
-        mode: SynchronousCommit,
+        _mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
         self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
@@ -808,9 +764,7 @@ impl Engine {
         let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
         match self.build_lane_update_intent(txn_id, route, new_values, read_snapshot) {
             Some(mut intent) => {
-                let _ = mode;
-                intent.synchronous = true;
-                let retry = match self.claim_lane_intent(lanes, &mut intent) {
+                let retry = match self.claim_lane_intent(&mut intent) {
                     Ok(retry) => retry,
                     Err(error) => {
                         self.deregister_active_snapshot(read_snapshot);
@@ -895,13 +849,11 @@ impl Engine {
             template: std::sync::Arc::from(record.as_slice()),
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
-            request_digest: [0; 32],
+            request_digest: gpu_db_wal::canonical_request_digest(record.as_slice()),
             transaction_claims: None,
-            commit_seq: None,
             outstanding: None,
-            synchronous: true,
             // WAL-FIRST: the update's rows-affected (0 or 1) is resolved at APPLY (the locate moved
-            // off the pump critical path); this cell carries it back to the settle. Init 0 = "no
+            // off the pump critical path); this cell carries it back to completion. Init 0 = "no
             // visible row" (a safe default a never-applied update would report).
             rows_affected: 0,
             rows_affected_cell: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
@@ -931,50 +883,50 @@ impl Engine {
 
     fn claim_lane_intent(
         &self,
-        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
         intent: &mut crate::engine_dml_concurrent::LaneIntent,
     ) -> Result<Option<u64>, ExecuteError> {
-        let request_digest = gpu_db_wal::canonical_request_digest(&intent.template);
-        // Before the activation fence, classic commits and lane submissions share the same stable
-        // transaction-id namespace. Import the still-mutable serial prefix while holding its
-        // commit lock; once ACTIVE is published no classic writer can extend that prefix.
-        if !lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
-            let commit = self.commit_state();
-            for record in commit.wal.flushed_records() {
-                let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)
-                    .map_err(ExecuteError::Engine)?
-                else {
-                    continue;
-                };
-                lanes
-                    .install_recovered_transaction(
-                        record.txn_id,
-                        envelope.header.request_digest,
-                        envelope.header.commit_seq,
-                        envelope.outcome.affected_rows,
-                    )
-                    .map_err(ExecuteError::Engine)?;
-            }
+        if self.transaction_snapshot_handle(intent.txn_id).is_some() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "transaction id {} is active and cannot be claimed by an autocommit intent",
+                intent.txn_id
+            ))));
         }
-        match lanes
-            .claim_transaction(intent.txn_id, request_digest)
+        let request_digest = intent.request_digest;
+        // Terminal resolution plus pending reservation is one linearizable admission boundary:
+        // hold the canonical commit lock while inserting into the one registry shared with batch
+        // admission, BEGIN, COPY, classic waves, and serialized writers.
+        let commit = self.commit_state();
+        if let Some((token, affected_rows)) = commit
+            .resolve_transaction_retry_digest_outcome(intent.txn_id, request_digest)
             .map_err(ExecuteError::Engine)?
         {
-            crate::engine_intent_lanes::LaneClaimResolution::New => {
-                intent.request_digest = request_digest;
-                intent.transaction_claims = Some(std::sync::Arc::clone(&lanes.transaction_claims));
-                Ok(None)
+            if self.committed_seq() < token.index {
+                return Err(ExecuteError::Indeterminate(format!(
+                    "transaction id {} has canonical commit sequence {} but publication has not reached it; retry after recovery/publication",
+                    intent.txn_id, token.index
+                )));
             }
-            crate::engine_intent_lanes::LaneClaimResolution::Pending => {
-                Err(ExecuteError::Engine(EngineError::Durability(format!(
-                    "transaction id {} is durably pending/indeterminate",
-                    intent.txn_id
-                ))))
-            }
-            crate::engine_intent_lanes::LaneClaimResolution::Terminal(affected_rows) => {
-                Ok(Some(affected_rows))
-            }
+            return Ok(Some(affected_rows));
         }
+        if let Some(state) = commit.txn_manager.state(intent.txn_id) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "transaction id {} is already owned by transaction state {state:?}",
+                intent.txn_id
+            ))));
+        }
+        let reserved = self
+            .reserve_pending_transaction_claim(intent.txn_id, request_digest)
+            .map_err(ExecuteError::Engine)?;
+        if !reserved {
+            return Err(ExecuteError::Indeterminate(format!(
+                "transaction id {} is already pending in canonical mutation admission",
+                intent.txn_id
+            )));
+        }
+        drop(commit);
+        intent.request_digest = request_digest;
+        intent.transaction_claims = Some(std::sync::Arc::clone(&self.pending_transaction_claims));
+        Ok(None)
     }
 
     fn check_intent_params(
@@ -983,6 +935,8 @@ impl Engine {
         params: &[i32],
     ) -> Result<(), ExecuteError> {
         self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if params.len() != route.column_count {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -1035,6 +989,7 @@ impl Engine {
         // E2.2(a): build the ALLOCATION-FREE integer conflict slots from the route's precomputed
         // (slot_id, column_index) list — no String format, no (table, column) clone.
         let mut write_set = WriteSet::default();
+        write_set.tables.insert(route.table.clone());
         for &(slot_id, column_idx) in &route.unique_i32_slots {
             write_set
                 .unique_slots_i32
@@ -1044,6 +999,12 @@ impl Engine {
         let row_key = relational_row_key(&route.table, snapshot.next_row_id);
         let delta = WriteDelta {
             write_set: write_set.clone(),
+            read_snapshot,
+            catalog_dependencies: table
+                .cloned()
+                .map(|table| BTreeMap::from([(route.table.clone(), table)]))
+                .unwrap_or_default(),
+            foreign_key_dependencies: BTreeSet::new(),
             rows_consumed: 1,
             mutation: PreparedMutation::Insert {
                 table: route.table.clone(),

@@ -12,6 +12,9 @@ use std::io;
 fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
     use gpu_db_protocol::Decimal128;
     match (left, right) {
+        (SqlValue::Parameter { .. }, _) | (_, SqlValue::Parameter { .. }) => {
+            unreachable!("legacy execution never receives an unbound prepared parameter")
+        }
         // NULL sorts lowest in this internal total order (this server does not produce NULL
         // values; the arm only keeps the comparator total now that SqlValue has a Null variant).
         (SqlValue::Null, SqlValue::Null) => std::cmp::Ordering::Equal,
@@ -1195,7 +1198,8 @@ fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => Err(ErrorField {
+        | SqlValue::Uuid(_)
+        | SqlValue::Parameter { .. } => Err(ErrorField {
             code: "0A000",
             message: aggregate_int4_error_message(aggregate),
             position: None,
@@ -1255,6 +1259,9 @@ pub(super) fn format_sql_value(value: &SqlValue) -> String {
         SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value),
         SqlValue::Timestamp(value) => gpu_db_protocol::datetime::format_timestamp(*value),
         SqlValue::Uuid(value) => gpu_db_protocol::uuid::format_uuid(value),
+        SqlValue::Parameter { .. } => {
+            unreachable!("legacy result rendering never receives an unbound prepared parameter")
+        }
     }
 }
 

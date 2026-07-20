@@ -76,13 +76,44 @@ impl Engine {
             rows: row_count,
             ..RelationalCopyAdmissionProfile::default()
         };
+        let render_started = Instant::now();
+        let sql = render_relational_insert(&insert).map_err(ExecuteError::Engine)?;
+        profile.render_sql_wal_payload_micros = render_started.elapsed().as_micros();
+        let payload: std::sync::Arc<[u8]> = sql.into_bytes().into();
+        let request_digest = gpu_db_wal::canonical_request_digest(&payload);
+        let commit = self.commit_state();
+        match commit.resolve_transaction_retry_digest_outcome(txn_id, request_digest) {
+            Ok(Some((token, affected_rows))) if self.committed_seq() >= token.index => {
+                let affected_rows = usize::try_from(affected_rows).map_err(|_| {
+                    ExecuteError::Engine(EngineError::Durability(
+                        "recorded COPY affected-row count exceeds usize".to_string(),
+                    ))
+                })?;
+                return Ok((affected_rows, profile));
+            }
+            Ok(Some((token, _))) => {
+                return Err(ExecuteError::Indeterminate(format!(
+                    "COPY transaction {txn_id} has canonical commit sequence {} but publication has not reached it",
+                    token.index
+                )));
+            }
+            Err(error) => return Err(ExecuteError::Engine(error)),
+            Ok(None) => {}
+        }
+        match self.resolve_pending_transaction_claim(txn_id, request_digest) {
+            Ok(true) => {
+                return Err(ExecuteError::Indeterminate(format!(
+                    "COPY transaction {txn_id} is pending in canonical mutation admission"
+                )));
+            }
+            Err(error) => return Err(ExecuteError::Engine(error)),
+            Ok(false) => {}
+        }
+        drop(commit);
         let unique_preflight_started = Instant::now();
         self.preflight_unique_index_constraints(&Command::Insert(insert.clone()), txn_id)
             .map_err(ExecuteError::Engine)?;
         profile.unique_preflight_micros += unique_preflight_started.elapsed().as_micros();
-        let render_started = Instant::now();
-        let sql = render_relational_insert(&insert).map_err(ExecuteError::Engine)?;
-        profile.render_sql_wal_payload_micros = render_started.elapsed().as_micros();
         let timestamp_micros = self.next_commit_timestamp_micros();
         let mut apply_profile = RelationalCopyAdmissionProfile::default();
         let mut current_apply_total_micros = 0;
@@ -90,7 +121,7 @@ impl Engine {
         let (_token, residency_invalidation_micros) = self
             .commit_mutation_at_with_current_apply(
                 txn_id,
-                sql.into_bytes().into(),
+                payload,
                 timestamp_micros,
                 |engine, cat, commit_seq| {
                     let apply_started = Instant::now();

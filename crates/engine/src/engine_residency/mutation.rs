@@ -147,7 +147,7 @@ impl Engine {
         // in-place append keeps the SAME device_ptr, so a cached index built over [0, old_row_count) would
         // be a stale HIT that reports the just-appended keys as not-found (a lost-from-reads committed
         // INSERT). Drop the table's entry so the next probe rebuilds over the new row_count. This runs
-        // before the caller's publish_committed_seq, so a reader that observes the new committed_seq can
+        // before the caller's publication join, so a reader that observes the new committed_seq can
         // never bind the stale index. (In-flight probes pinned the prior index's own Arc; removing the
         // map entry only prevents NEW binds — the buffer frees once no submission holds it.)
         self.read_state
@@ -161,6 +161,159 @@ impl Engine {
             .open_shard_append_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Size every new device allocation the canonical explicit-transaction append will retain.
+    /// The caller runs under the serialized commit boundary and reserves this geometry before WAL;
+    /// [`Self::try_append_to_resident_open_shard`] then performs the same one-batch append. Existing
+    /// payload/index headroom costs zero, while first-use version sidecars and rollover generations
+    /// are charged in full.
+    pub(crate) fn transaction_resident_append_allocation_bytes(
+        &self,
+        table: &RelationalTable,
+        new_rows: &[Vec<SqlValue>],
+    ) -> Result<(u16, u64), ExecuteError> {
+        if new_rows.is_empty() {
+            return Ok((self.planner.default_gpu_id(), 0));
+        }
+        let pressured_gpus = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .clone();
+        let (
+            capacity,
+            row_count,
+            gpu_id,
+            int4_appendable,
+            valid,
+            int4_columns,
+            int8_columns,
+            numeric_columns,
+            bool_columns,
+            text_columns,
+            null_columns,
+            created_by_present,
+            row_ids_present,
+        ) = {
+            let shards = self.read_state.residency.shards.load();
+            let open = shards
+                .get(&table.name)
+                .and_then(|table_shards| table_shards.last())
+                .ok_or_else(|| {
+                    ExecuteError::Serialization(format!(
+                        "relation \"{}\" lost its open resident shard before transaction publication",
+                        table.name
+                    ))
+                })?;
+            (
+                open.capacity,
+                open.row_count,
+                open.gpu_id,
+                open.int4_appendable,
+                open.is_valid(pressured_gpus.contains(&open.gpu_id)),
+                open.resident_device_int4_columns.len(),
+                open.resident_device_int8_columns.len(),
+                open.resident_device_numeric_columns.len(),
+                open.resident_device_bool_columns.len(),
+                open.resident_device_text_columns.len(),
+                open.resident_device_null_columns.len(),
+                open.created_by_region.is_some(),
+                open.row_id_region.is_some(),
+            )
+        };
+        if !int4_appendable || !valid {
+            return Err(ExecuteError::Serialization(format!(
+                "relation \"{}\" cannot retain its open GPU shard for transaction publication",
+                table.name
+            )));
+        }
+        if int4_columns + int8_columns + numeric_columns + bool_columns + text_columns
+            != table.columns.len()
+        {
+            return Err(ExecuteError::Serialization(format!(
+                "relation \"{}\" resident layout changed before transaction publication",
+                table.name
+            )));
+        }
+        let k = new_rows.len();
+        let batch_has_null = new_rows
+            .iter()
+            .any(|row| row.iter().any(|value| matches!(value, SqlValue::Null)));
+        if text_columns == 0
+            && null_columns == 0
+            && !batch_has_null
+            && row_count.checked_add(k).is_some_and(|end| end <= capacity)
+        {
+            if !row_ids_present {
+                return Err(ExecuteError::Serialization(format!(
+                    "relation \"{}\" lost its resident entity-identity region before transaction publication",
+                    table.name
+                )));
+            }
+            let bytes = if created_by_present {
+                0
+            } else {
+                (capacity as u64).checked_mul(8).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "transaction created-by reservation overflowed".to_string(),
+                    ))
+                })?
+            };
+            return Ok((gpu_id, bytes));
+        }
+
+        let names = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let types = table
+            .columns
+            .iter()
+            .map(|column| column.ty)
+            .collect::<Vec<_>>();
+        let has_text = types.iter().any(|ty| matches!(ty, SqlType::Text));
+        let new_capacity = if has_text || batch_has_null {
+            k
+        } else if self.relational_residency_budget_bytes(gpu_id).is_some() {
+            k.saturating_mul(2).next_power_of_two()
+        } else {
+            self.shard_size_target()
+                .max(k.saturating_mul(2).next_power_of_two())
+        };
+        let (payload, ..) =
+            build_relational_device_payload_with_capacity(&names, &types, new_rows, new_capacity)
+                .map_err(|error| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "transaction publication payload sizing failed for relation \"{}\": {error}",
+                    table.name
+                )))
+            })?;
+        let named_index_bytes = if self.relational_named_index_publication_required(table) {
+            estimated_named_index_bytes_for_shard(table, k, new_capacity).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has unsupported mandatory index allocation geometry",
+                    table.name
+                )))
+            })?
+        } else {
+            0
+        };
+        let bytes = (payload.len() as u64)
+            .checked_add((new_capacity as u64).checked_mul(16).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transaction rollover sidecar reservation overflowed".to_string(),
+                ))
+            })?)
+            .and_then(|bytes| bytes.checked_add(named_index_bytes))
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transaction rollover reservation overflowed".to_string(),
+                ))
+            })?;
+        Ok((gpu_id, bytes))
     }
 
     /// S-d2b: append a committed INSERT's applied rows IN PLACE into the resident table's OPEN shard's
@@ -1137,10 +1290,22 @@ impl Engine {
         let mut index_arg: Option<gpu_db_execution::CudaWriteIndex> = None;
         let mut index_col: Option<usize> = None;
         let mut index_owner: Option<Arc<CudaResidentDeviceMemory>> = None;
+        let mut index_publication: Option<(
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicBool>,
+        )> = None;
         {
             let new_count = row_count + k;
             let device_ptr = shard_device_memory.device_ptr();
-            let mut live: Vec<(usize, Arc<CudaResidentDeviceMemory>, u32, u32)> = Vec::new();
+            type FusedIndexBasis = (
+                usize,
+                Arc<CudaResidentDeviceMemory>,
+                u32,
+                u32,
+                Arc<std::sync::atomic::AtomicUsize>,
+                Arc<std::sync::atomic::AtomicBool>,
+            );
+            let mut live: Vec<FusedIndexBasis> = Vec::new();
             {
                 let cache = self
                     .read_state
@@ -1159,13 +1324,27 @@ impl Engine {
                     let Some(index) = entry.device_index.clone() else {
                         continue; // DECLINED is monotone under appends
                     };
-                    live.push((col_idx, index, entry.table_mask, entry.hash_shift));
+                    live.push((
+                        col_idx,
+                        index,
+                        entry.table_mask,
+                        entry.hash_shift,
+                        Arc::clone(&entry.published_row_count),
+                        Arc::clone(&entry.published_has_postings),
+                    ));
                 }
             }
             match live.len() {
                 0 => {}
                 1 => {
-                    let (col_idx, index, table_mask, hash_shift) = live.pop().expect("len 1");
+                    let (
+                        col_idx,
+                        index,
+                        table_mask,
+                        hash_shift,
+                        published_rows,
+                        published_postings,
+                    ) = live.pop().expect("len 1");
                     let table_size = (table_mask as u64) + 1;
                     if (new_count as u64).saturating_mul(2) > table_size {
                         // Past the builder's load rule -> drop so the next probe rebuilds at
@@ -1174,6 +1353,7 @@ impl Engine {
                             .residency
                             .purge_shard_pk_index_for_table(table);
                     } else {
+                        index_publication = Some((published_rows, published_postings));
                         index_owner = Some(Arc::clone(&index));
                         index_arg = Some(gpu_db_execution::CudaWriteIndex {
                             memory: index,
@@ -1233,6 +1413,17 @@ impl Engine {
                             .residency
                             .purge_shard_pk_index_for_table(table);
                     } else {
+                        // The fused kernel already mutated the allocation. Publish through the
+                        // basis-owned Arcs before consulting the replaceable cache entry, so a
+                        // concurrent purge cannot strand retained prepared pins on stale metadata.
+                        if let Some((published_rows, published_postings)) = &index_publication {
+                            if status.created_posting {
+                                published_postings
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            published_rows
+                                .store(row_count + k, std::sync::atomic::Ordering::Release);
+                        }
                         // Post-launch entry update, mirroring the unfused path: advance the basis,
                         // while preserving the same allocation/accounting owner.
                         let mut cache = self
@@ -1251,8 +1442,8 @@ impl Engine {
                                         .is_some_and(|launched| Arc::ptr_eq(current, launched))
                                 })
                             {
-                                entry.row_count = row_count + k;
                                 entry.has_postings |= status.created_posting;
+                                entry.row_count = row_count + k;
                             }
                         }
                     }

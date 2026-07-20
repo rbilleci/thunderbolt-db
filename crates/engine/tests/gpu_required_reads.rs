@@ -1,6 +1,6 @@
 use gpu_db_engine::Engine;
 use gpu_db_execution::DeviceTarget;
-use gpu_db_sql::{parse_command, Command, SelectFunction, SqlValue};
+use gpu_db_sql::{parse_command, Command, SelectFunction, SelectLiteral, SqlType, SqlValue};
 
 #[test]
 fn production_constructor_enables_strata_auto_admission_by_default() {
@@ -63,4 +63,21 @@ fn production_bounded_function_result_is_materialized_by_the_gpu() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(42)]]);
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn production_literal_projection_is_materialized_by_the_gpu() {
+    let engine = Engine::new_local();
+    let result = engine
+        .execute_relational_literal(&SelectLiteral {
+            column_name: "one".to_string(),
+            ty: SqlType::Int4,
+            value: SqlValue::Int4(1),
+        })
+        .unwrap();
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.columns[0].name, "one");
+    assert_eq!(result.rows, vec![vec![SqlValue::Int4(1)]]);
 }

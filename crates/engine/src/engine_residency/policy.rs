@@ -349,7 +349,7 @@ impl Engine {
             !index.unique || index_all_key_columns_foldable(table, index)
         })
             // CHECK constraints DO NOT block elision (ADR-006): CHECK validation is ROW-LOCAL —
-            // `validate_check_constraints_for_rows` evaluates the NEW values only (host-held
+            // the device CHECK validator evaluates the NEW values only (typed intent values
             // control-plane literals / device-materialized update images), never the tuple store; and
             // ALTER ADD CHECK's existing-row validation scans via the elision-safe-by-construction
             // DDL row-validator (which rehydrates first). The device-history re-resolve proof

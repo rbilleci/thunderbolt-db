@@ -5,7 +5,7 @@
 //! `SharedEngine`, executed two ways across a concurrency sweep —
 //! `serialized` (every write holds one global lock for its whole duration — the
 //! single-writer model the engine ran on before Stage 4) vs `concurrent` (every write
-//! goes through `execute_on_shared_engine`, off-lock prepare + a short commit critical
+//! goes through `SharedEngine::submit`, off-lock prepare + a short commit critical
 //! section, no engine write lock). The only difference is the global lock, so the qps gap
 //! is exactly the serialization Stage 4 removed.
 //!
@@ -33,7 +33,14 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use gpu_db_facade::{execute_on_shared_engine, ErrorCategory, SharedEngine};
+use gpu_db_facade::{DbError, ErrorCategory, QueryOutcome, SharedEngine, SubmissionRequest};
+
+fn submit_text(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
+    let mut session = shared.open_session();
+    shared
+        .submit(&mut session, SubmissionRequest::Text(sql))
+        .into_immediate()
+}
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
@@ -58,7 +65,7 @@ fn median_f64(values: &mut [f64]) -> f64 {
 }
 
 fn run_ok(shared: &SharedEngine, sql: &str) {
-    if let Err(err) = execute_on_shared_engine(shared, sql) {
+    if let Err(err) = submit_text(shared, sql) {
         panic!("{sql:?} setup failed: {err:?}");
     }
 }
@@ -94,9 +101,9 @@ fn run_cell(
                     let started = Instant::now();
                     let res = if serialize {
                         let _guard = serial_lock.lock().unwrap();
-                        execute_on_shared_engine(&shared, &sql)
+                        submit_text(&shared, &sql)
                     } else {
-                        execute_on_shared_engine(&shared, &sql)
+                        submit_text(&shared, &sql)
                     };
                     latencies.push(started.elapsed().as_micros() as u64);
                     match res {

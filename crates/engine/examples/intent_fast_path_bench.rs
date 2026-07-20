@@ -138,8 +138,9 @@ fn run_arm(
     // This decouples the single-writer sequencer from ingress/ack so the sequencer stays hot on
     // one core instead of the role bouncing across every driver (the measured per-item inflation
     // 0.89 -> 2.7us). `0` (default) keeps the self-pumping driver loop unchanged.
-    // GPU_DB_BENCH_ASYNC_COMMIT=1: drive the pg-style ASYNC COMMIT mode
-    // (ack at the applied cut; WAL fence pipelined behind the ack).
+    // GPU_DB_BENCH_ASYNC_COMMIT=1 selects the PostgreSQL-compatible Off setting. ADR-015 keeps
+    // both settings on the same strict canonical durability/apply/publication acknowledgement
+    // gate until a separate unstable-visible contract is designed and accepted.
     let commit_mode = if std::env::var("GPU_DB_BENCH_ASYNC_COMMIT").as_deref() == Ok("1") {
         gpu_db_engine::SynchronousCommit::Off
     } else {
@@ -532,21 +533,20 @@ fn run_arm(
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        // Per-second STAGE deltas (see the sampler above): one row per second, per-wave
-        // microseconds for each pipeline stage + fence latency — the dip in tps/s above lines
-        // up with the stage column that inflated in the same row.
+        // Per-second stage deltas: one row per second, per-wave microseconds for the live
+        // preparation/apply stages.
         if let Some(sampler) = sampler {
             let rows = sampler.join().expect("stage sampler panicked");
             eprintln!(
                 "    [stages/s:  sec |  waves |  items | us/wave: validate publish apply | \
-                 drain conflict patch settle | fence us/frame | acklag us/wave]"
+                 drain conflict patch]"
             );
             for (sec, pair) in rows.windows(2).enumerate() {
                 let d = pair[1].delta(&pair[0]);
                 let per_wave = |ns: u64| ns as f64 / 1000.0 / d.waves.max(1) as f64;
                 eprintln!(
                     "    [stages/s: {:>4} | {:>6} | {:>6} | {:>8.0} {:>7.0} {:>5.0} | {:>5.0} \
-                     {:>8.0} {:>5.0} {:>6.0} | {:>14.0} | {:>14.0}]",
+                     {:>8.0} {:>5.0}]",
                     sec,
                     d.waves,
                     d.items,
@@ -556,9 +556,6 @@ fn run_arm(
                     per_wave(d.drain_ns),
                     per_wave(d.conflict_ns),
                     per_wave(d.patch_ns),
-                    per_wave(d.settle_ns),
-                    d.fence_ns as f64 / 1000.0 / d.fence_frames.max(1) as f64,
-                    d.acklag_ns as f64 / 1000.0 / d.settled_waves.max(1) as f64,
                 );
             }
         }
@@ -613,12 +610,12 @@ fn run_arm(
             items as f64 / waves.max(1) as f64,
             nanos as f64 / items.max(1) as f64 / 1e3,
         );
-        if let Some((lw, li, val, claim, enc, publ, apply, durable, applied, rb)) =
+        if let Some((lw, li, val, claim, enc, publ, apply, wal_records, published, rb)) =
             engine.intent_lane_stats()
         {
             if lw > 0 {
                 eprintln!(
-                    "    [lanes: waves {lw}  items/wave {:.1}  us/wave: validate {:.1} claim {:.1} encode {:.1} publish {:.1} device-apply {:.1}  cuts: durable {durable} applied {applied}  pk-rebuilds {rb}]",
+                    "    [lanes: waves {lw}  items/wave {:.1}  us/wave: validate {:.1} claim {:.1} encode {:.1} publish {:.1} device-apply {:.1}  canonical: durable-records {wal_records} published-seq {published}  pk-rebuilds {rb}]",
                     li as f64 / lw as f64,
                     val as f64 / lw as f64 / 1e3,
                     claim as f64 / lw as f64 / 1e3,
@@ -634,30 +631,12 @@ fn run_arm(
                         resize_ns as f64 / 1e6,
                     );
                 }
-                if let Some((lag_ns, lag_waves)) = engine.intent_lane_acklag_stats() {
-                    if lag_waves > 0 {
-                        eprintln!(
-                            "    [publish->settle: {:.1} us/wave over {lag_waves} settled waves]",
-                            lag_ns as f64 / lag_waves as f64 / 1e3,
-                        );
-                    }
-                }
-                if let Some((fence_ns, frames)) = engine.intent_lane_fence_stats() {
-                    if frames > 0 {
-                        eprintln!(
-                            "    [fence: {:.1} us/frame over {frames} frames]",
-                            fence_ns as f64 / frames as f64 / 1e3,
-                        );
-                    }
-                }
-                if let Some((drain, conflict, patch, settle)) = engine.intent_lane_hostpass_stats()
-                {
+                if let Some((drain, conflict, patch)) = engine.intent_lane_hostpass_stats() {
                     eprintln!(
-                        "    [pump host us/wave: drain {:.1} conflict {:.1} patch {:.1} settle {:.1}]",
+                        "    [pump host us/wave: drain {:.1} conflict {:.1} patch {:.1}]",
                         drain as f64 / lw as f64 / 1e3,
                         conflict as f64 / lw as f64 / 1e3,
                         patch as f64 / lw as f64 / 1e3,
-                        settle as f64 / lw as f64 / 1e3,
                     );
                 }
                 if let Some((vbusy, vlaunch, abusy, alaunch)) = engine.intent_lane_leader_stats() {
@@ -705,16 +684,13 @@ fn run_arm(
     {
         let (payload_and_regions, indexes) =
             engine.probe_relational_resident_table_byte_components("t", 0);
-        let frames = engine
-            .intent_lane_fence_stats()
-            .map_or(0, |(_, frames)| frames);
-        let physical_wal_bytes = frames.saturating_mul(4096);
+        let physical_wal_bytes = engine.wal_durable_segment_bytes();
         let appended_versions = total
             .saturating_add(warmed)
             .saturating_sub(total_deletes as usize);
         eprintln!(
             "    [footprint: payload+regions {payload_and_regions}B  device-index {indexes}B  \
-             appended-versions {appended_versions}  FUA-frames {frames}  physical-WAL {physical_wal_bytes}B ({:.1}B/op)]",
+             appended-versions {appended_versions}  canonical-physical-WAL {physical_wal_bytes}B ({:.1}B/op)]",
             physical_wal_bytes as f64 / total.max(1) as f64,
         );
     }
@@ -821,11 +797,6 @@ struct StageSnap {
     drain_ns: u64,
     conflict_ns: u64,
     patch_ns: u64,
-    settle_ns: u64,
-    fence_ns: u64,
-    fence_frames: u64,
-    acklag_ns: u64,
-    settled_waves: u64,
 }
 
 impl StageSnap {
@@ -841,11 +812,6 @@ impl StageSnap {
             drain_ns: self.drain_ns.saturating_sub(prev.drain_ns),
             conflict_ns: self.conflict_ns.saturating_sub(prev.conflict_ns),
             patch_ns: self.patch_ns.saturating_sub(prev.patch_ns),
-            settle_ns: self.settle_ns.saturating_sub(prev.settle_ns),
-            fence_ns: self.fence_ns.saturating_sub(prev.fence_ns),
-            fence_frames: self.fence_frames.saturating_sub(prev.fence_frames),
-            acklag_ns: self.acklag_ns.saturating_sub(prev.acklag_ns),
-            settled_waves: self.settled_waves.saturating_sub(prev.settled_waves),
         }
     }
 }
@@ -859,19 +825,10 @@ fn stage_snap(engine: &gpu_db_engine::Engine) -> StageSnap {
         snap.publish_ns = stats.5;
         snap.apply_ns = stats.6;
     }
-    if let Some((drain, conflict, patch, settle)) = engine.intent_lane_hostpass_stats() {
+    if let Some((drain, conflict, patch)) = engine.intent_lane_hostpass_stats() {
         snap.drain_ns = drain;
         snap.conflict_ns = conflict;
         snap.patch_ns = patch;
-        snap.settle_ns = settle;
-    }
-    if let Some((ns, frames)) = engine.intent_lane_fence_stats() {
-        snap.fence_ns = ns;
-        snap.fence_frames = frames;
-    }
-    if let Some((ns, settled)) = engine.intent_lane_acklag_stats() {
-        snap.acklag_ns = ns;
-        snap.settled_waves = settled;
     }
     snap
 }

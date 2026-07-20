@@ -21,6 +21,226 @@ pub struct CudaVersionConflictVerdict {
 }
 
 impl CudaResidentDeviceMemory {
+    /// Bounded-index counterpart of [`Self::predicate_mask_version_conflict`]. `indices` are
+    /// already exact-key-approved device coordinates; the kernel dereferences only those
+    /// coordinates and returns one four-byte conflict bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn candidate_indices_version_conflict(
+        &self,
+        indices: &[u32],
+        source_row_count: u32,
+        created_by: Option<(&CudaResidentDeviceMemory, u64)>,
+        created_default: u64,
+        deleted_by: Option<(&CudaResidentDeviceMemory, u64)>,
+        deleted_default: u64,
+        deleted_live: u64,
+        read_snapshot: u64,
+    ) -> Result<CudaVersionConflictVerdict, CudaRuntimeProbeError> {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+        const VERDICT_BYTES: usize = std::mem::size_of::<u32>();
+        const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_candidate_indices_version_conflict(
+    .param .u64 indices_ptr,
+    .param .u32 candidate_count,
+    .param .u64 created_ptr,
+    .param .u64 created_default,
+    .param .u64 deleted_ptr,
+    .param .u64 deleted_default,
+    .param .u64 deleted_live,
+    .param .u64 read_snapshot,
+    .param .u64 verdict_ptr
+)
+{
+    .reg .pred %p<7>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<24>;
+    ld.param.u64 %rd1, [indices_ptr];
+    ld.param.u32 %r1, [candidate_count];
+    ld.param.u64 %rd2, [created_ptr];
+    ld.param.u64 %rd3, [created_default];
+    ld.param.u64 %rd4, [deleted_ptr];
+    ld.param.u64 %rd5, [deleted_default];
+    ld.param.u64 %rd6, [deleted_live];
+    ld.param.u64 %rd7, [read_snapshot];
+    ld.param.u64 %rd8, [verdict_ptr];
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mad.lo.u32 %r5, %r3, %r4, %r2;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra DONE;
+    mul.wide.u32 %rd9, %r5, 4;
+    add.u64 %rd10, %rd1, %rd9;
+    ld.global.u32 %r6, [%rd10];
+    mov.u64 %rd11, %rd3;
+    setp.eq.u64 %p2, %rd2, 0;
+    @%p2 bra CREATED_READY;
+    mul.wide.u32 %rd12, %r6, 8;
+    add.u64 %rd13, %rd2, %rd12;
+    ld.global.u64 %rd11, [%rd13];
+CREATED_READY:
+    setp.gt.u64 %p3, %rd11, %rd7;
+    @%p3 bra CONFLICT;
+    mov.u64 %rd14, %rd5;
+    setp.eq.u64 %p4, %rd4, 0;
+    @%p4 bra DELETED_READY;
+    mul.wide.u32 %rd15, %r6, 8;
+    add.u64 %rd16, %rd4, %rd15;
+    ld.global.u64 %rd14, [%rd16];
+DELETED_READY:
+    setp.eq.u64 %p5, %rd14, %rd6;
+    @%p5 bra DONE;
+    setp.gt.u64 %p6, %rd14, %rd7;
+    @!%p6 bra DONE;
+CONFLICT:
+    mov.u32 %r7, 1;
+    atom.global.exch.b32 %r8, [%rd8], %r7;
+DONE:
+    ret;
+}
+"#;
+
+        if source_row_count == 0 || indices.iter().any(|index| *index >= source_row_count) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(indices.len()));
+        }
+        let primary = self.primary_arc();
+        let source_bytes = u64::from(source_row_count)
+            .checked_mul(std::mem::size_of::<u64>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let source_ptr = |source: Option<(&CudaResidentDeviceMemory, u64)>| {
+            let Some((memory, offset)) = source else {
+                return Ok(0_u64);
+            };
+            if !Arc::ptr_eq(&primary, &memory.primary_arc())
+                || offset
+                    .checked_add(source_bytes)
+                    .is_none_or(|end| end > memory.metadata().allocated_bytes)
+            {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+            }
+            memory
+                .device_ptr()
+                .checked_add(offset)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))
+        };
+        let created_ptr = source_ptr(created_by)?;
+        let deleted_ptr = source_ptr(deleted_by)?;
+        primary.set_current()?;
+        let memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let memcpy_dtoh = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let launch = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let index_bytes = indices
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(indices.len()))?;
+        let index_device = primary.lease_device_buffer_owned(index_bytes.max(1))?;
+        let verdict = primary.lease_device_buffer_owned(VERDICT_BYTES)?;
+        let zero = 0_u32;
+        check_cuda(unsafe {
+            memcpy_htod(
+                verdict.ptr,
+                (&zero as *const u32).cast::<c_void>(),
+                VERDICT_BYTES,
+            )
+        })?;
+        if !indices.is_empty() {
+            check_cuda(unsafe {
+                memcpy_htod(
+                    index_device.ptr,
+                    indices.as_ptr().cast::<c_void>(),
+                    index_bytes,
+                )
+            })?;
+            let mut ptx = PTX.to_vec();
+            ptx.push(0);
+            let function =
+                primary.cached_function(c"gpu_db_candidate_indices_version_conflict", &ptx)?;
+            let mut a0 = index_device.ptr;
+            let mut a1 = u32::try_from(indices.len())
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(indices.len()))?;
+            let mut a2 = created_ptr;
+            let mut a3 = created_default;
+            let mut a4 = deleted_ptr;
+            let mut a5 = deleted_default;
+            let mut a6 = deleted_live;
+            let mut a7 = read_snapshot;
+            let mut a8 = verdict.ptr;
+            let mut args = [
+                (&mut a0 as *mut u64).cast(),
+                (&mut a1 as *mut u32).cast(),
+                (&mut a2 as *mut u64).cast(),
+                (&mut a3 as *mut u64).cast(),
+                (&mut a4 as *mut u64).cast(),
+                (&mut a5 as *mut u64).cast(),
+                (&mut a6 as *mut u64).cast(),
+                (&mut a7 as *mut u64).cast(),
+                (&mut a8 as *mut u64).cast(),
+            ];
+            check_cuda(unsafe {
+                launch(
+                    function,
+                    a1.div_ceil(256).clamp(1, 65_535),
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    std::ptr::null_mut(),
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            })?;
+        }
+        let mut host_verdict = 0_u32;
+        check_cuda(unsafe {
+            memcpy_dtoh(
+                (&mut host_verdict as *mut u32).cast::<c_void>(),
+                verdict.ptr,
+                VERDICT_BYTES,
+            )
+        })?;
+        Ok(CudaVersionConflictVerdict {
+            conflict: host_verdict == 1,
+            readback_bytes: VERDICT_BYTES,
+        })
+    }
+
     /// Return whether a predicate-matching physical version has a real create/delete stamp newer
     /// than `read_snapshot`. Version sources may be separate resident allocations (hot shards) or
     /// byte ranges in `self` (cold chunks). An absent source uses its supplied uniform default.

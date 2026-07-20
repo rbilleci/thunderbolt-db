@@ -4,7 +4,7 @@ use gpu_db_sql::{parse_command, Command, SqlValue};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// CPU-ENGINE RETIREMENT (ADR-006, structural): a CHECK-constrained table now ELIDES — CHECK
-/// validation is ROW-LOCAL (`validate_check_constraints_for_rows` evaluates the NEW values only,
+/// validation is ROW-LOCAL (the device CHECK validator evaluates the NEW values only,
 /// never the tuple store), so the stale-host-store invariant is unaffected. Pins the full lifecycle:
 /// the table elides; a violating INSERT on the ELIDED table errors (and changes nothing); valid DML
 /// lands on-device; a violating UPDATE (new image from the device materialize) errors; and ALTER ADD

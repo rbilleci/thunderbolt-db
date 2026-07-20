@@ -358,7 +358,7 @@ impl Engine {
                     self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
                     return Ok(());
                 }
-                Command::Begin => {}
+                Command::Begin { .. } => {}
                 _ => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "command is not supported inside an active transaction; it was not executed"
@@ -435,20 +435,72 @@ impl Engine {
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => {
+                self.legacy_lane_history_write_guard()
+                    .map_err(ExecuteError::Engine)?;
                 if self.repl_role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
+                let payload: std::sync::Arc<[u8]> = std::sync::Arc::from(text.as_bytes());
+                let request_digest = gpu_db_wal::canonical_request_digest(&payload);
+                let commit = self.commit_state();
+                if let Some((token, _)) = commit
+                    .resolve_transaction_retry_digest_outcome(txn_id, request_digest)
+                    .map_err(ExecuteError::Engine)?
+                {
+                    if self.committed_seq() < token.index {
+                        return Err(ExecuteError::Indeterminate(format!(
+                            "transaction id {txn_id} has canonical commit sequence {} but publication has not reached it",
+                            token.index
+                        )));
+                    }
+                    return Ok(());
+                }
+                if self
+                    .resolve_pending_transaction_claim(txn_id, request_digest)
+                    .map_err(ExecuteError::Engine)?
+                {
+                    return Ok(());
+                }
+                drop(commit);
                 self.preflight_unique_index_constraints(&cmd, txn_id)?;
                 if self.command_requires_immediate_unique_index_commit(&cmd) {
                     self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
-                    self.commit_mutation(txn_id, std::sync::Arc::from(text.as_bytes()))?;
+                    self.commit_mutation(txn_id, payload)?;
                     return Ok(());
                 }
 
                 match self.route_command(&cmd) {
                     RouteDecision::Gpu(_) => {
-                        let queue_cap = self.batcher().max_items();
-                        let pending = self.batcher().len();
+                        // The queue-only API returns before commit, so reserve its stable identity
+                        // in the canonical commit authority atomically with queue insertion.
+                        // BEGIN and every other writer inspect this map under the same lock.
+                        let commit = self.commit_state();
+                        if let Some((token, _)) = commit
+                            .resolve_transaction_retry_digest_outcome(txn_id, request_digest)
+                            .map_err(ExecuteError::Engine)?
+                        {
+                            if self.committed_seq() < token.index {
+                                return Err(ExecuteError::Indeterminate(format!(
+                                    "transaction id {txn_id} has canonical commit sequence {} but publication has not reached it",
+                                    token.index
+                                )));
+                            }
+                            return Ok(());
+                        }
+                        if self
+                            .resolve_pending_transaction_claim(txn_id, request_digest)
+                            .map_err(ExecuteError::Engine)?
+                        {
+                            return Ok(());
+                        }
+                        if let Some(state) = commit.txn_manager.state(txn_id) {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "transaction id {txn_id} is already owned by transaction state {state:?}"
+                            ))));
+                        }
+                        let mut batcher = self.batcher();
+                        let queue_cap = batcher.max_items();
+                        let pending = batcher.len();
                         if pending >= queue_cap {
                             self.metrics.inc_fallback(FallbackReason::GpuQueueSaturated);
                             return Err(ExecuteError::Engine(
@@ -458,14 +510,13 @@ impl Engine {
                                 },
                             ));
                         }
-
-                        let maybe_batch = self.batcher().enqueue(
-                            PendingMutation {
-                                txn_id,
-                                payload: std::sync::Arc::from(text.as_bytes()),
-                            },
-                            now,
-                        );
+                        let reserved = self
+                            .reserve_pending_transaction_claim(txn_id, request_digest)
+                            .map_err(ExecuteError::Engine)?;
+                        debug_assert!(reserved, "pending retry was handled before admission");
+                        let maybe_batch = batcher.enqueue(PendingMutation { txn_id, payload }, now);
+                        drop(batcher);
+                        drop(commit);
                         if let Some(batch) = maybe_batch {
                             self.metrics.observe_pending_batch_len(batch.items.len());
                             self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
@@ -475,10 +526,10 @@ impl Engine {
                     }
                     RouteDecision::CpuFallback { reason, .. } => {
                         self.metrics.inc_gpu_fallback(reason);
-                        self.commit_mutation(txn_id, std::sync::Arc::from(text.as_bytes()))?;
+                        self.commit_mutation(txn_id, payload)?;
                     }
                     RouteDecision::Cpu => {
-                        self.commit_mutation(txn_id, std::sync::Arc::from(text.as_bytes()))?;
+                        self.commit_mutation(txn_id, payload)?;
                     }
                 }
             }
@@ -497,16 +548,16 @@ impl Engine {
                 validate_bootstrap_drop_extension(&drop).map_err(ExecuteError::Engine)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Begin => {
-                self.begin_transaction_context(txn_id)?;
+            Command::Begin { characteristics } => {
+                self.begin_transaction_context(txn_id, characteristics)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Commit { chain } => {
-                self.finish_transaction_context(txn_id, true, chain)?;
+                self.commit_explicit_transaction(txn_id, chain)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Rollback { chain } => {
-                self.finish_transaction_context(txn_id, false, chain)?;
+                self.rollback_explicit_transaction(txn_id, chain)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { key } => {
@@ -518,7 +569,10 @@ impl Engine {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
-            Command::Select(_) | Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
+            Command::Select(_)
+            | Command::SelectFunction(_)
+            | Command::SelectLiteral(_)
+            | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -590,9 +644,14 @@ impl Engine {
             .map(|p| (p.item.txn_id, p.item.payload.clone()))
             .collect();
         if let Err(failure) = self.commit_mutation_batch(&batch) {
-            if failure.rolled_back {
+            if failure.requeue {
                 self.batcher().requeue_front(items);
                 self.metrics.observe_pending_batch_len(self.batcher().len());
+            } else {
+                for item in &items {
+                    let digest = gpu_db_wal::canonical_request_digest(&item.item.payload);
+                    self.release_pending_transaction_claim(item.item.txn_id, digest);
+                }
             }
             return Err(failure.error);
         }

@@ -37,7 +37,7 @@ require_python314
 cargo test -p gpu_db_protocol --test tokio_postgres_smoke -- --color never
 echo "application_driver_smoke_tokio_postgres=passed"
 
-cargo test -p gpu_db_protocol --test sqlx_smoke -- --color never
+cargo test -p gpu_db_server --test sqlx_smoke -- --color never
 echo "application_driver_smoke_sqlx=passed"
 
 tests/compat/node-postgres/run.sh

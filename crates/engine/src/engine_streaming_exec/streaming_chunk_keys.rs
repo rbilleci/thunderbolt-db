@@ -917,18 +917,13 @@ impl Engine {
     /// comparison. PostgreSQL-distinct NULL-bearing tuples require no comparison and are omitted.
     /// Survivor coordinates feed the device threshold kernel, whose status bit is the final verdict
     /// readback. This is deliberately bounded until the device exact tuple-hash/group operator replaces it.
-    fn validate_class_new_rows_unique_on_device(
+    pub(crate) fn validate_new_rows_unique_on_device(
         &self,
         table: &RelationalTable,
         new_rows: &[Vec<SqlValue>],
     ) -> Option<Result<(), EngineError>> {
-        if new_rows.len() < 2 {
+        if new_rows.len() < 2 || !table.indexes.iter().any(|index| index.unique) {
             return Some(Ok(()));
-        }
-        if new_rows.len() > CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS {
-            return Some(Err(EngineError::ApplyFailed(format!(
-                "device exact unique batch limit is {CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS} rows"
-            ))));
         }
         let (snapshot, memory) = self
             .build_transient_relation_residency(table, new_rows)
@@ -971,7 +966,7 @@ impl Engine {
                     .unique_coordinate_threshold_reached(&candidates, &[], 2)
                     .ok()?;
                 if duplicate {
-                    return Some(Err(EngineError::ApplyFailed(format!(
+                    return Some(Err(EngineError::UniqueViolation(format!(
                         "duplicate key value violates unique index \"{}\"",
                         index.name
                     ))));
@@ -1025,7 +1020,12 @@ impl Engine {
         if keyed.is_empty() {
             return Some(Ok(()));
         }
-        if let Err(err) = self.validate_class_new_rows_unique_on_device(table, new_rows)? {
+        if new_rows.len() > CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS {
+            return Some(Err(EngineError::ApplyFailed(format!(
+                "device exact unique batch limit is {CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS} rows"
+            ))));
+        }
+        if let Err(err) = self.validate_new_rows_unique_on_device(table, new_rows)? {
             return Some(Err(err));
         }
         let entry = self
@@ -1092,7 +1092,7 @@ impl Engine {
                         .residency
                         .chunk_class_unique_probe_conflicts
                         .fetch_add(1, Ordering::Relaxed);
-                    return Some(Err(EngineError::ApplyFailed(format!(
+                    return Some(Err(EngineError::UniqueViolation(format!(
                         "duplicate key value violates unique index \"{index_name}\""
                     ))));
                 }

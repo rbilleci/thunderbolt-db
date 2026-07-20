@@ -227,6 +227,58 @@ fn relational_copy_rows_commit_through_engine_wal_mvcc() {
 }
 
 #[test]
+fn relational_copy_retry_is_exact_and_mismatch_is_rejected_without_a_second_commit() {
+    let mut engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(1, "CREATE TABLE copy_retry (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    let copy = gpu_db_sql::parse_copy_from_stdin(
+        "COPY copy_retry (id, name) FROM STDIN WITH (FORMAT csv)",
+    )
+    .unwrap();
+    let rows = vec![
+        vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+        vec![SqlValue::Int4(2), SqlValue::Text("Grace".to_string())],
+    ];
+
+    assert_eq!(
+        engine
+            .execute_relational_copy_rows(77, &copy, rows.clone())
+            .unwrap(),
+        2
+    );
+    let committed_after_first = engine.committed_seq();
+    let wal_after_first = engine.wal_buffered_count();
+
+    assert_eq!(
+        engine
+            .execute_relational_copy_rows(77, &copy, rows)
+            .unwrap(),
+        2,
+        "an exact transaction retry returns its durable affected-row outcome"
+    );
+    assert_eq!(engine.committed_seq(), committed_after_first);
+    assert_eq!(engine.wal_buffered_count(), wal_after_first);
+
+    let mismatch = engine
+        .execute_relational_copy_rows(
+            77,
+            &copy,
+            vec![vec![
+                SqlValue::Int4(3),
+                SqlValue::Text("different request".to_string()),
+            ]],
+        )
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("different request"),
+        "same transaction id with a different COPY payload must be rejected exactly: {mismatch}"
+    );
+    assert_eq!(engine.committed_seq(), committed_after_first);
+    assert_eq!(engine.wal_buffered_count(), wal_after_first);
+}
+
+#[test]
 fn relational_copy_ingests_null_marker_and_selects_back_null() {
     // M3 (doc 21) Slice G: the COPY NULL marker ingests as a SQL NULL. TEXT format: the unquoted `\N`.
     // CSV format: an UNQUOTED empty field (a QUOTED empty field is the empty STRING, not NULL).

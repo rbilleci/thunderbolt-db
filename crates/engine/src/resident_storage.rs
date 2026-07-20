@@ -39,6 +39,10 @@ pub(crate) struct WaveResidentIndex {
 pub(crate) struct CachedShardPkDeviceIndex {
     pub(crate) resident_device_ptr: u64,
     pub(crate) row_count: usize,
+    /// Monotone physical extent published into this allocation. Retained prepared-route pins share
+    /// this counter with the mutable cache entry so an in-place append cannot leave them probing an
+    /// obsolete extent after the cache entry is replaced or purged.
+    pub(crate) published_row_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Rows deleted at or below this boundary were omitted when the index was built. A cached index
     /// can serve a reader only when this boundary is no newer than the reader's pinned snapshot.
     pub(crate) gc_boundary: Index,
@@ -49,6 +53,8 @@ pub(crate) struct CachedShardPkDeviceIndex {
     /// Monotone device verdict: this allocation contains at least one multi-row posting chain.
     /// Certified-false indexes may use the original low-register singleton read kernel.
     pub(crate) has_postings: bool,
+    /// Shared monotone posting verdict paired with `published_row_count` for retained pins.
+    pub(crate) published_has_postings: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) _resident_guard: Arc<CudaResidentDeviceMemory>,
     pub(crate) device_index: Option<Arc<CudaResidentDeviceMemory>>,
     pub(crate) table_mask: u32,
@@ -496,8 +502,8 @@ impl MvccData {
     }
 
     /// Advance the relational row-id allocator to at least `high_water`. Explicit transactions
-    /// claim their final identity block before WAL encoding; replay has not. A monotonic max makes
-    /// applying the same resolved transaction record correct in both worlds.
+    /// encode their final identity block under the canonical commit mutex and advance it during
+    /// apply; replay consumes the same high-water. A monotonic max makes both worlds idempotent.
     pub(crate) fn advance_row_id_to_at_least(&self, high_water: u64) {
         self.next_row_id
             .fetch_max(high_water, AtomicOrdering::Relaxed);
@@ -773,6 +779,39 @@ impl Engine {
             .transaction_snapshot_handle(txn_id)
     }
 
+    /// Revalidate a snapshot after acquiring its statement-ownership guard. A waiter may have
+    /// cloned the old handle just before another thread committed and deregistered it; proceeding
+    /// with that stale `Arc` would stage work into an orphaned private generation.
+    pub(crate) fn ensure_transaction_snapshot_current(
+        &self,
+        txn_id: TxnId,
+        expected: &Arc<TransactionSnapshot>,
+    ) -> Result<(), ExecuteError> {
+        let current = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotActive(txn_id)))?;
+        if !Arc::ptr_eq(&current, expected) {
+            return Err(ExecuteError::Txn(TxnError::NotActive(txn_id)));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_transaction_not_program_owned(
+        &self,
+        txn_id: TxnId,
+        snapshot: &Arc<TransactionSnapshot>,
+    ) -> Result<(), ExecuteError> {
+        if snapshot
+            .program_owned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ExecuteError::Unsupported(format!(
+                "transaction {txn_id} is exclusively owned by an atomic predeclared program"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn current_transaction_read_snapshot(&self) -> Option<Arc<TransactionSnapshot>> {
         TRANSACTION_READ_SNAPSHOT.with(|current| current.borrow().clone())
     }
@@ -790,7 +829,7 @@ impl Engine {
                 boundary, snapshot.boundary,
                 "transaction-scoped catalog read attempted to rebind its boundary"
             );
-            return Arc::clone(&snapshot.catalog);
+            return snapshot.transaction_catalog();
         }
         self.read_state.catalog_as_of(boundary)
     }
@@ -926,7 +965,7 @@ impl RelationalReadPin {
 /// blocker #2), the route telemetry to [`RouteTelemetry`]. What remains here is purely the
 /// admission-time accounting the read path never consults: per-GPU residency budgets and the last
 /// admission decision per table.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RelationalResidentCache {
     pub(crate) budget_bytes_by_gpu: BTreeMap<u16, u64>,
     pub(crate) last_decisions: BTreeMap<String, RelationalResidentCacheDecision>,

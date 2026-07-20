@@ -536,6 +536,9 @@ fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
             gpu_db_protocol::datetime::format_timestamp(*value).len() as u64
         }
         SqlValue::Uuid(_) => 36, // canonical hyphenated text length
+        SqlValue::Parameter { .. } => {
+            unreachable!("legacy storage never receives an unbound prepared parameter")
+        }
     }
 }
 

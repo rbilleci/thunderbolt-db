@@ -7,10 +7,11 @@ impl Engine {
     /// result-bearing twin is the only API that accepts `RETURNING`; unit APIs fail before work
     /// rather than silently discard rows.
     pub fn execute_dml_concurrent(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
-        if parse_command(text).is_ok_and(|command| command_has_returning(&command)) {
+        let command = parse_command(text)?;
+        if command_has_returning(&command) {
             return Err(discarded_returning_error());
         }
-        self.execute_dml_concurrent_with_result(txn_id, text)
+        self.execute_parsed_dml_concurrent_with_result(txn_id, command, text)
             .map(|_| ())
     }
 
@@ -19,12 +20,47 @@ impl Engine {
         txn_id: u64,
         text: &str,
     ) -> Result<DmlExecutionResult, ExecuteError> {
-        self.intent_lanes_write_guard()
+        let command = parse_command(text)?;
+        self.execute_parsed_dml_concurrent_with_result(txn_id, command, text)
+    }
+
+    pub(crate) fn execute_parsed_dml_concurrent_with_result(
+        &self,
+        txn_id: u64,
+        command: Command,
+        text: &str,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.execute_parsed_dml_concurrent_with_catalog(txn_id, command, text, None)
+    }
+
+    pub(crate) fn execute_parsed_dml_concurrent_with_catalog(
+        &self,
+        txn_id: u64,
+        command: Command,
+        text: &str,
+        expected_catalog_version: Option<u64>,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.transaction_snapshot_handle(txn_id).is_some() {
-            return self.execute_dml_in_transaction_with_result(txn_id, text);
+            if let Some(expected) = expected_catalog_version {
+                let snapshot = self
+                    .transaction_snapshot_handle(txn_id)
+                    .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+                crate::engine_mutation_admission::validate_prepared_catalog_version(
+                    expected,
+                    snapshot.catalog.commit_seq,
+                )?;
+            }
+            return self.execute_parsed_dml_in_transaction_with_result(txn_id, command);
         }
-        self.execute_dml_concurrent_instrumented_with_result(txn_id, text, || {})
+        self.execute_parsed_dml_concurrent_instrumented_with_catalog(
+            txn_id,
+            command,
+            text,
+            expected_catalog_version,
+            || {},
+        )
     }
 
     /// Hooked unit-result compatibility API used by deterministic SI conflict tests.
@@ -34,19 +70,45 @@ impl Engine {
         text: &str,
         on_prepared: impl FnOnce(),
     ) -> Result<(), ExecuteError> {
-        if parse_command(text).is_ok_and(|command| command_has_returning(&command)) {
+        let command = parse_command(text)?;
+        if command_has_returning(&command) {
             return Err(discarded_returning_error());
         }
-        self.execute_dml_concurrent_instrumented_with_result(txn_id, text, on_prepared)
-            .map(|_| ())
+        self.execute_parsed_dml_concurrent_instrumented_with_result(
+            txn_id,
+            command,
+            text,
+            on_prepared,
+        )
+        .map(|_| ())
     }
 
-    fn execute_dml_concurrent_instrumented_with_result(
+    pub(crate) fn execute_parsed_dml_concurrent_instrumented_with_result(
         &self,
         txn_id: u64,
+        cmd: Command,
         text: &str,
         on_prepared: impl FnOnce(),
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.execute_parsed_dml_concurrent_instrumented_with_catalog(
+            txn_id,
+            cmd,
+            text,
+            None,
+            on_prepared,
+        )
+    }
+
+    pub(crate) fn execute_parsed_dml_concurrent_instrumented_with_catalog(
+        &self,
+        txn_id: u64,
+        cmd: Command,
+        text: &str,
+        expected_catalog_version: Option<u64>,
+        on_prepared: impl FnOnce(),
+    ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.legacy_lane_history_write_guard()
+            .map_err(ExecuteError::Engine)?;
         if self.is_commit_path_poisoned() {
             return Err(ExecuteError::Engine(EngineError::Durability(
                 "commit path is wedged; restart recovery required".to_string(),
@@ -58,10 +120,46 @@ impl Engine {
                     .to_string(),
             )));
         }
-        let cmd = parse_command(text)?;
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
+        // Stable transaction identity resolves before any state-sensitive device preparation.
+        // Otherwise an exact INSERT retry observes its already-inserted key and fabricates 23505
+        // instead of returning the recorded terminal outcome.
+        let request_digest = gpu_db_wal::canonical_request_digest(text.as_bytes());
+        let commit = self.commit_state();
+        match commit.resolve_transaction_retry_digest_outcome(txn_id, request_digest) {
+            Ok(Some((token, affected_rows))) if self.committed_seq() >= token.index => {
+                if command_has_returning(&cmd) {
+                    return Err(ExecuteError::Unsupported(
+                        "terminal retry of DML RETURNING is fail-closed until canonical status persists the returned frame"
+                            .to_string(),
+                    ));
+                }
+                return Ok(DmlExecutionResult {
+                    rows_affected: affected_rows,
+                    returning: None,
+                });
+            }
+            Ok(Some((token, _))) => {
+                return Err(ExecuteError::Indeterminate(format!(
+                    "transaction id {txn_id} has canonical commit sequence {} but publication has not reached it",
+                    token.index
+                )));
+            }
+            Err(error) => return Err(ExecuteError::Engine(error)),
+            Ok(None) => {}
+        }
+        match self.resolve_pending_transaction_claim(txn_id, request_digest) {
+            Ok(true) => {
+                return Err(ExecuteError::Indeterminate(format!(
+                    "transaction id {txn_id} is pending in canonical mutation admission"
+                )));
+            }
+            Err(error) => return Err(ExecuteError::Engine(error)),
+            Ok(false) => {}
+        }
+        drop(commit);
         self.ensure_dml_device_generation(&cmd)?;
         let transaction_snapshot = self.transaction_snapshot_handle(txn_id);
         let read_snapshot = transaction_snapshot
@@ -114,6 +212,7 @@ impl Engine {
             write_set,
             read_snapshot,
             prepared_catalog_seq,
+            expected_catalog_version,
             Some(prepared),
         )
     }

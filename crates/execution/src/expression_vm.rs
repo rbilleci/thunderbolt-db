@@ -499,6 +499,50 @@ pub(super) fn run_resident_arith_program_at_indices<'r>(
     )
 }
 
+/// Execute a fixed-width boolean predicate over a bounded device coordinate list. Column loads
+/// dereference `indices[i]`; comparison and mask steps therefore scale with candidate count rather
+/// than source row count. Variable-width/bitmap/constant-mask steps have different coordinate ABIs
+/// and are rejected before CUDA until they gain indexed kernels.
+pub(super) fn run_resident_predicate_program_at_indices<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    indices_ptr: u64,
+    candidate_count: u64,
+    source_row_count: u64,
+    elem: ResidentElemType,
+) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
+    if indices_ptr == 0
+        || candidate_count == 0
+        || candidate_count > source_row_count
+        || program.iter().any(|step| {
+            !matches!(
+                step,
+                ExprStep::LoadColumn { .. }
+                    | ExprStep::LoadColumnI64 { .. }
+                    | ExprStep::BufferBinary { .. }
+                    | ExprStep::ScalarBinary { .. }
+                    | ExprStep::ScalarBinaryI64 { .. }
+                    | ExprStep::CompareScalar { .. }
+                    | ExprStep::CompareScalarI64 { .. }
+                    | ExprStep::CompareScalarI128 { .. }
+                    | ExprStep::CompareBuffers { .. }
+                    | ExprStep::MaskBinary { .. }
+            )
+        })
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    run_resident_arith_program_impl(
+        resident,
+        program,
+        &[],
+        candidate_count,
+        elem,
+        ExprTerminal::Mask,
+        Some((indices_ptr, source_row_count)),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_resident_arith_program_impl<'r>(
     resident: &'r CudaResidentDeviceMemory,

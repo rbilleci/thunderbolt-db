@@ -96,7 +96,17 @@ fn transaction_select_retains_old_gpu_boundary_across_in_place_update() {
         .unwrap();
     e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
         .unwrap();
-    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_text(90, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+
+    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let first = e
+        .execute_relational_select_in_transaction(90, &select)
+        .unwrap();
+    assert_eq!(first.rows.row(0)[0], SqlValue::Int4(100));
 
     let captured = e.transaction_snapshot_handle(90).unwrap();
     let old_memory = captured.resident_shards["accounts"][0]
@@ -117,10 +127,6 @@ fn transaction_select_retains_old_gpu_boundary_across_in_place_update() {
         "normal UPDATE must maintain the authoritative allocation in place"
     );
 
-    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
-        Command::Select(select) => select,
-        other => panic!("expected SELECT, got {other:?}"),
-    };
     let old = e
         .execute_relational_select_in_transaction(90, &select)
         .unwrap();
@@ -150,7 +156,17 @@ fn transaction_dml_prepare_uses_retained_gpu_generation_for_conflict_verdict() {
         "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL)",
     )
     .unwrap();
-    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_text(90, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+
+    let pin = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let first = e
+        .execute_relational_select_in_transaction(90, &pin)
+        .unwrap();
+    assert_eq!(first.rows.row(0)[0], SqlValue::Int4(100));
 
     let captured = e.transaction_snapshot_handle(90).unwrap();
     let old_memory = captured.resident_shards["accounts"][0]
@@ -916,6 +932,18 @@ fn transaction_atomic_commit_rechecks_conflicts_after_last_staged_statement() {
             .is_some(),
         "the current device generation must support a physical identity scan before COMMIT"
     );
+    let staged = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select_in_transaction(90, &staged)
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Int4(200)],
+        "READ COMMITTED statement refresh must rebase and retain the transaction's own write"
+    );
     let err = e.execute_text(90, "COMMIT").unwrap_err();
     assert!(
         matches!(&err, ExecuteError::Serialization(message) if message.contains("write-write conflict")),
@@ -993,24 +1021,38 @@ fn transaction_foreign_keys_use_private_and_current_device_generations() {
         vec![vec![SqlValue::Int4(30), SqlValue::Int4(3)]]
     );
 
-    // Provider deleted after BEGIN: the child prepared against the retained generation, but the
-    // current-device provider stamp rejects COMMIT before another WAL record is appended.
+    // Provider ABA after the child statement: READ COMMITTED advances on a later statement and
+    // current state once again contains the provider. The exact FK dependency floor must still
+    // reject the delete+reinsert history before another WAL record is appended.
     e.execute_text(91, "BEGIN").unwrap();
     e.execute_dml_concurrent(91, "INSERT INTO children (id, parent_id) VALUES (40, 2)")
         .unwrap();
     e.execute_dml_concurrent(10, "DELETE FROM parents WHERE id = 2")
         .unwrap();
+    e.execute_dml_concurrent(13, "INSERT INTO parents (id) VALUES (2)")
+        .unwrap();
+    let refresh = match parse_command("SELECT id FROM children WHERE id = 40").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select_in_transaction(91, &refresh)
+            .unwrap()
+            .rows
+            .row(0)[0],
+        SqlValue::Int4(40)
+    );
     let wal_after_provider_delete = e.durable_wal_records().len();
     let outbound = e.execute_text(91, "COMMIT").unwrap_err();
     assert!(
-        matches!(&outbound, ExecuteError::Serialization(message) if message.contains("device foreign-key conflict")),
-        "expected current-device provider conflict, got {outbound:?}"
+        matches!(&outbound, ExecuteError::Serialization(message) if message.contains("foreign-key dependency relation \"parents\" changed")),
+        "expected exact-floor provider-history conflict, got {outbound:?}"
     );
     assert_eq!(e.durable_wal_records().len(), wal_after_provider_delete);
     e.execute_text(91, "ROLLBACK").unwrap();
 
-    // Child inserted after BEGIN: the parent delete prepared against an empty retained child set,
-    // then the current-device child stamp rejects the orphaning commit.
+    // Child ABA after the parent-delete statement: current state is empty again, so only the
+    // retained dependency floor can prove the intervening insert+delete race.
     e.execute_dml_concurrent(11, "INSERT INTO parents (id) VALUES (4)")
         .unwrap();
     e.execute_text(92, "BEGIN").unwrap();
@@ -1018,11 +1060,24 @@ fn transaction_foreign_keys_use_private_and_current_device_generations() {
         .unwrap();
     e.execute_dml_concurrent(12, "INSERT INTO children (id, parent_id) VALUES (50, 4)")
         .unwrap();
+    e.execute_dml_concurrent(14, "DELETE FROM children WHERE id = 50")
+        .unwrap();
+    let refresh = match parse_command("SELECT id FROM parents WHERE id = 4").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert!(
+        e.execute_relational_select_in_transaction(92, &refresh)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "the transaction must continue to read its private parent delete after RC rebase"
+    );
     let wal_after_child_insert = e.durable_wal_records().len();
     let inbound = e.execute_text(92, "COMMIT").unwrap_err();
     assert!(
-        matches!(&inbound, ExecuteError::Serialization(message) if message.contains("device foreign-key conflict")),
-        "expected current-device child conflict, got {inbound:?}"
+        matches!(&inbound, ExecuteError::Serialization(message) if message.contains("foreign-key dependency relation \"children\" changed")),
+        "expected exact-floor child-history conflict, got {inbound:?}"
     );
     assert_eq!(e.durable_wal_records().len(), wal_after_child_insert);
     e.execute_text(92, "ROLLBACK").unwrap();
@@ -1197,13 +1252,14 @@ fn transaction_commit_fails_closed_when_waited_classic_tail_wedges() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn transaction_first_touch_of_later_admitted_table_executes_empty_generation_on_gpu() {
+fn repeatable_read_first_data_statement_is_lazy_and_uses_current_generation() {
     let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
         .unwrap();
-    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_text(90, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
     e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 200)")
         .unwrap();
 
@@ -1211,10 +1267,10 @@ fn transaction_first_touch_of_later_admitted_table_executes_empty_generation_on_
         Command::Select(select) => select,
         other => panic!("expected SELECT, got {other:?}"),
     };
-    let old = e
+    let first = e
         .execute_relational_select_in_transaction(90, &select)
         .unwrap();
-    assert!(old.rows.is_empty());
+    assert_eq!(first.rows.row(0)[0], SqlValue::Int4(200));
     let current = e.execute_relational_select(&select).unwrap();
     assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
     e.execute_text(90, "ROLLBACK").unwrap();
@@ -1312,11 +1368,7 @@ fn sv5_sql_update_tombstones_old_appends_new_with_exact_visibility() {
         Some(50),
         "a row in a different shard untouched"
     );
-    assert_eq!(
-        count(&e),
-        200,
-        "COUNT unchanged (old hidden + new visible)"
-    );
+    assert_eq!(count(&e), 200, "COUNT unchanged (old hidden + new visible)");
 
     // An int4-UNCHANGED update (same-value: id=5 already has balance 5*10=50) still routes: tombstone-OLD
     // FIRST locates the old slot on the buffer BEFORE the identical-int4 new row is appended (count 1), so
@@ -1360,7 +1412,7 @@ fn sv5_sql_update_tombstones_old_appends_new_with_exact_visibility() {
 }
 
 /// SV6 (`created_by` SI flip-gate) — the DOUBLE-READ differential, deterministic torn-window form.
-/// The SV5 incremental UPDATE appends the new version + bumps `row_count` BEFORE `publish_committed_seq`,
+/// The SV5 incremental UPDATE appends the new version + bumps `row_count` BEFORE the publication join,
 /// and a lock-free reader binds `read_txn_id = committed_seq()` THEN loads shards — so a reader that
 /// observes `committed_seq = C-1` while the shards ALREADY carry the appended row is the torn window the
 /// SV5 audit flagged (P2). This test constructs that window EXACTLY: it applies the incremental UPDATE at
@@ -1434,7 +1486,7 @@ fn sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice() {
 
         // Apply the incremental UPDATE (tombstone-old + append-new) at commit_seq C0+1 WITHOUT
         // publishing — exactly the state a concurrent reader can observe between the residency
-        // maintenance and `publish_committed_seq` inside a real commit.
+        // maintenance and the publication join inside a real commit.
         {
             let id_130 = device_row_id_for(&e, "accounts", 130);
             let guard = e.ddl_catalog();
@@ -1496,7 +1548,7 @@ fn sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice() {
         );
 
         // Publish the commit: a reader at C sees exactly the NEW image, once.
-        e.publish_committed_seq(c0 + 1);
+        e.publish_ready_index(c0 + 1).unwrap();
         let rows = sel("SELECT id, balance FROM accounts WHERE id = 130");
         assert_eq!(rows.len(), 1, "post-publish: exactly one row");
         assert_eq!(
@@ -1747,7 +1799,7 @@ fn sv6_created_by_gate_on_index_routes_hides_moved_key_from_older_snapshot() {
     );
 
     // (c) Publish -> a reader at C sees the move: 999 visible, 130 gone (both routes).
-    e.publish_committed_seq(c0 + 1);
+    e.publish_ready_index(c0 + 1).unwrap();
     let rows = sel("SELECT id, balance FROM accounts WHERE id = 999");
     assert_eq!(rows.len(), 1, "post-publish: the moved-to key is visible");
     assert_eq!(rows.row(0), &[SqlValue::Int4(999), SqlValue::Int4(1300)]);

@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(crate) static RESIDENT_EXACT_KEY_FULL_SCAN_PROBES: AtomicU64 = AtomicU64::new(0);
+
 const DELETED_BY_LIVE: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 
 impl Engine {
@@ -154,7 +157,7 @@ impl Engine {
                 continue;
             }
             self.ensure_commit_path_available()?;
-            self.intent_lanes_write_guard()?;
+            self.legacy_lane_history_write_guard()?;
             let mut catalog = self.ddl_catalog();
             self.ensure_dml_device_generation_with_catalog(command, &mut catalog)?;
             drop(commit);
@@ -238,6 +241,9 @@ impl Engine {
         rows: &[&[SqlValue]],
         read_snapshot: Index,
     ) -> Option<bool> {
+        if crate::engine_prepared_transaction::prepared_index_route_required() {
+            return self.prepared_unique_rows_conflict(table, rows, read_snapshot);
+        }
         let cold = self.table_chunk_authoritative(&table.name).is_some();
         for index in table.indexes.iter().filter(|index| index.unique) {
             let positions = crate::engine_residency::index_key_column_positions(table, index)?;
@@ -280,6 +286,85 @@ impl Engine {
         Some(false)
     }
 
+    fn prepared_unique_rows_conflict(
+        &self,
+        table: &RelationalTable,
+        rows: &[&[SqlValue]],
+        read_snapshot: Index,
+    ) -> Option<bool> {
+        if let Some(history_floor) = self.zero_row_resident_generation_boundary(table) {
+            return (history_floor <= read_snapshot).then_some(false);
+        }
+        let current_shards = self.read_residency_shards();
+        let table_shards = current_shards.get(&table.name)?;
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            let positions = crate::engine_residency::index_key_column_positions(table, index)?;
+            let mut distinct = BTreeSet::<Vec<SqlValue>>::new();
+            for row in rows {
+                let key = positions
+                    .iter()
+                    .map(|position| row.get(*position).cloned())
+                    .collect::<Option<Vec<_>>>()?;
+                if key.iter().any(|value| matches!(value, SqlValue::Null))
+                    || !distinct.insert(key.clone())
+                {
+                    continue;
+                }
+                let group = positions
+                    .iter()
+                    .copied()
+                    .zip(key)
+                    .map(|(column, value)| (column, SelectFilterOp::Eq, value))
+                    .collect::<Vec<_>>();
+                let candidates = self.prepared_exact_index_candidates(table, &group).ok()?;
+                let mut by_shard: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                for hit in candidates {
+                    by_shard.entry(hit.shard_id).or_default().push(hit.slot);
+                }
+                for shard in table_shards {
+                    let slots = by_shard.remove(&shard.shard_id).unwrap_or_default();
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    let memory = shard.device_memory.as_ref()?;
+                    let verdict = memory
+                        .candidate_indices_version_conflict(
+                            &slots,
+                            u32::try_from(shard.row_count).ok()?,
+                            shard.created_by_region.as_deref().map(|memory| (memory, 0)),
+                            0,
+                            shard.deleted_by_region.as_deref().map(|memory| (memory, 0)),
+                            DELETED_BY_LIVE,
+                            DELETED_BY_LIVE,
+                            read_snapshot,
+                        )
+                        .ok()?;
+                    if verdict.readback_bytes != std::mem::size_of::<u32>() {
+                        return None;
+                    }
+                    if verdict.conflict {
+                        self.read_state
+                            .residency
+                            .dml_device_validate_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Some(true);
+                    }
+                }
+            }
+        }
+        if table_shards
+            .iter()
+            .any(|shard| shard.history_floor_index > read_snapshot)
+        {
+            return None;
+        }
+        self.read_state
+            .residency
+            .dml_device_validate_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(false)
+    }
+
     fn resident_exact_key_write_conflict(
         &self,
         table: &RelationalTable,
@@ -287,6 +372,8 @@ impl Engine {
         row: &[SqlValue],
         read_snapshot: Index,
     ) -> Option<bool> {
+        #[cfg(test)]
+        RESIDENT_EXACT_KEY_FULL_SCAN_PROBES.fetch_add(1, AtomicOrdering::Relaxed);
         if let Some(history_floor) = self.zero_row_resident_generation_boundary(table) {
             if history_floor <= read_snapshot {
                 self.read_state

@@ -365,6 +365,172 @@ fn admin_flush_without_pending_queue_is_noop() {
 }
 
 #[test]
+fn batched_transaction_identity_is_idempotent_fail_closed_and_recoverable() {
+    let mut engine = Engine::with_batching(16, Duration::from_secs(60));
+    let now = Instant::now();
+    engine.enqueue_set_text(7, "SET a=1", now).unwrap();
+    engine
+        .enqueue_set_text(7, "SET a=1", now)
+        .expect("an exact pending retry is idempotent");
+    assert_eq!(engine.pending_batch_len(), 1);
+    let pending_mismatch = engine
+        .enqueue_set_text(7, "SET a=2", now)
+        .expect_err("one pending identity cannot own two requests");
+    assert!(pending_mismatch.to_string().contains("different request"));
+    assert_eq!(engine.pending_batch_len(), 1);
+
+    engine.flush_admin().unwrap();
+    let wal_len = engine.durable_wal_records().len();
+    engine
+        .enqueue_set_text(7, "SET a=1", now)
+        .expect("an exact terminal retry is idempotent");
+    assert_eq!(engine.pending_batch_len(), 0);
+    assert_eq!(engine.durable_wal_records().len(), wal_len);
+    let terminal_mismatch = engine
+        .enqueue_set_text(7, "SET a=3", now)
+        .expect_err("one terminal identity cannot own two requests");
+    assert!(terminal_mismatch
+        .to_string()
+        .contains("claimed by a different request"));
+    assert_eq!(engine.pending_batch_len(), 0);
+
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert_eq!(recovered.get("a").as_deref(), Some("1"));
+}
+
+#[test]
+fn semantic_batch_claim_failure_does_not_requeue_or_poison_later_writes() {
+    let mut engine = Engine::with_batching(16, Duration::from_secs(60));
+    let now = Instant::now();
+    engine.enqueue_set_text(9, "SET queued=old", now).unwrap();
+    engine
+        .enqueue_set_text(10, "SET dropped=reserved", now)
+        .unwrap();
+    let pending_error = engine
+        .commit_mutation(9, std::sync::Arc::from(&b"SET queued=winner"[..]))
+        .expect_err("a direct writer cannot steal a pending canonical batch identity");
+    assert!(pending_error.to_string().contains("pending"));
+    assert!(engine.durable_wal_records().is_empty());
+
+    // Sabotage the reservation to model the exact stale-queue state this defense is meant to
+    // clean up: one queued identity loses to another path while an unrelated queued identity is
+    // still reserved. A permanent flush failure must release both dropped reservations.
+    engine
+        .pending_transaction_claims
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&9);
+    engine
+        .commit_mutation(9, std::sync::Arc::from(&b"SET queued=winner"[..]))
+        .unwrap();
+    let error = engine
+        .flush_admin()
+        .expect_err("the stale pending payload must lose its stable identity");
+    assert!(error.to_string().contains("different request"), "{error}");
+    assert_eq!(engine.pending_batch_len(), 0, "semantic loser is discarded");
+
+    engine
+        .commit_mutation(10, std::sync::Arc::from(&b"SET later=ok"[..]))
+        .expect("the unrelated dropped reservation must be released");
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert_eq!(recovered.get("queued").as_deref(), Some("winner"));
+    assert_eq!(recovered.get("later").as_deref(), Some("ok"));
+}
+
+#[test]
+fn batch_live_and_recovered_terminal_status_keep_exact_affected_rows() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(1, "CREATE TABLE exact_batch (id INT PRIMARY KEY)")
+        .unwrap();
+    let payload: std::sync::Arc<[u8]> =
+        std::sync::Arc::from(&b"INSERT INTO exact_batch VALUES (1)"[..]);
+    engine
+        .commit_mutation_batch(&[(2, std::sync::Arc::clone(&payload))])
+        .unwrap_or_else(|failure| panic!("batch commit failed: {}", failure.error));
+    let digest = gpu_db_wal::canonical_request_digest(&payload);
+    let (_, live_rows) = engine
+        .commit_state()
+        .resolve_transaction_retry_digest_outcome(2, digest)
+        .unwrap()
+        .expect("live terminal status");
+    assert_eq!(live_rows, 1);
+
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    let (_, recovered_rows) = recovered
+        .commit_state()
+        .resolve_transaction_retry_digest_outcome(2, digest)
+        .unwrap()
+        .expect("recovered terminal status");
+    assert_eq!(recovered_rows, 1);
+}
+
+#[test]
+fn begin_and_autocommit_share_one_linearizable_transaction_identity() {
+    let engine = std::sync::Arc::new(Engine::new_local_test_engine());
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    engine.set_commit_prelock_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let writer = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || {
+            engine.commit_mutation(42, std::sync::Arc::from(&b"SET race=writer"[..]))
+        })
+    };
+    reached.wait();
+    engine.execute_text(42, "BEGIN").unwrap();
+    resume.wait();
+    let error = writer
+        .join()
+        .unwrap()
+        .expect_err("BEGIN won the commit-lock order and must retain identity 42");
+    assert!(error.to_string().contains("is active"), "{error}");
+    assert!(engine.durable_wal_records().is_empty());
+    engine.execute_text(42, "ROLLBACK").unwrap();
+    let rolled_back_reuse = engine
+        .commit_mutation(42, std::sync::Arc::from(&b"SET race=reuse"[..]))
+        .expect_err("a rolled-back explicit identity remains one-shot");
+    assert!(rolled_back_reuse
+        .to_string()
+        .contains("transaction state Aborted"));
+
+    engine
+        .commit_mutation(43, std::sync::Arc::from(&b"SET first=autocommit"[..]))
+        .unwrap();
+    let begin_error = engine
+        .execute_text(43, "BEGIN")
+        .expect_err("autocommit won first; BEGIN must reject the terminal identity");
+    assert!(begin_error.to_string().contains("already exists"));
+
+    let mut queued = Engine::with_batching(16, Duration::from_secs(60));
+    queued
+        .enqueue_set_text(44, "SET queued=owner", Instant::now())
+        .unwrap();
+    let queued_begin = queued
+        .execute_text(44, "BEGIN")
+        .expect_err("a canonical pending batch reservation must block BEGIN");
+    assert!(queued_begin.to_string().contains("already exists"));
+    let queued_direct = queued
+        .commit_mutation(44, std::sync::Arc::from(&b"SET queued=thief"[..]))
+        .expect_err("a direct writer must not steal a pending batch reservation");
+    assert!(queued_direct.to_string().contains("different request"));
+    queued.flush_admin().unwrap();
+    assert_eq!(queued.get("queued").as_deref(), Some("owner"));
+
+    queued.execute_text(45, "BEGIN").unwrap();
+    let active_enqueue = queued
+        .enqueue_set_text(45, "SET active=thief", Instant::now())
+        .expect_err("an active transaction must block queue reservation");
+    assert!(active_enqueue
+        .to_string()
+        .contains("not supported inside an active transaction"));
+    queued.execute_text(45, "ROLLBACK").unwrap();
+}
+
+#[test]
 fn batching_config_reflects_engine_settings() {
     let e = Engine::with_batching(7, Duration::from_millis(42));
     assert_eq!(e.batching_config(), (7, Duration::from_millis(42)));
@@ -1569,7 +1735,8 @@ fn explicit_transaction_snapshot_lives_from_begin_through_terminal_control() {
 
     e.execute_text(1, "SET acct:1=open").unwrap();
     assert_eq!(e.committed_seq(), 1);
-    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_text(90, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
     {
         let active = e
             .active_snapshots
@@ -1613,17 +1780,25 @@ fn explicit_transaction_select_reads_captured_catalog_and_table_generation() {
     let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
         .unwrap();
-    e.execute_text(90, "BEGIN").unwrap();
-
-    // The table had no data cell at BEGIN. A later first write publishes one, but the transaction's
-    // generation bundle deliberately records the table as empty rather than loading that newer cell
-    // on first touch.
-    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 200)")
+    e.execute_text(90, "BEGIN ISOLATION LEVEL REPEATABLE READ")
         .unwrap();
+
     let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
         Command::Select(select) => select,
         other => panic!("expected SELECT, got {other:?}"),
     };
+    assert!(
+        e.execute_relational_select_in_transaction(90, &select)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "the first data statement establishes the lazy REPEATABLE READ snapshot"
+    );
+
+    // A later write publishes a row, but the transaction retains the empty generation established
+    // by its first data statement.
+    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 200)")
+        .unwrap();
     let old = e
         .execute_relational_select_in_transaction(90, &select)
         .unwrap();
@@ -1647,10 +1822,23 @@ fn explicit_transaction_dml_prepare_and_conflict_check_use_begin_generation() {
         .unwrap();
     e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
         .unwrap();
-    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_text(90, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
 
-    // A later writer replaces the row after BEGIN and publishes a newer device identity/version
-    // stamp.
+    let first = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select_in_transaction(90, &first)
+            .unwrap()
+            .rows
+            .row(0)[0],
+        SqlValue::Int4(100)
+    );
+
+    // A later writer replaces the row after the first RR statement and publishes a newer device
+    // identity/version stamp.
     e.execute_dml_concurrent(3, "UPDATE accounts SET balance = 200 WHERE id = 1")
         .unwrap();
 
@@ -1695,7 +1883,18 @@ fn explicit_transaction_unique_validation_uses_current_device_generation() {
     .unwrap();
     e.execute_text(2, "INSERT INTO accounts (id, tenant_key) VALUES (1, 10)")
         .unwrap();
-    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_text(90, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+
+    let first = match parse_command("SELECT id FROM accounts WHERE tenant_key = 20").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert!(e
+        .execute_relational_select_in_transaction(90, &first)
+        .unwrap()
+        .rows
+        .is_empty());
 
     e.execute_dml_concurrent(3, "INSERT INTO accounts (id, tenant_key) VALUES (2, 20)")
         .unwrap();
@@ -1887,10 +2086,16 @@ fn start_alias_and_work_aliases_drive_transaction_state_transitions() {
     e.execute_text(73, "COMMIT WORK").unwrap();
     assert_eq!(e.active_txn_count(), 0);
 
-    e.execute_text(74, "START WORK, READ WRITE, DEFERRABLE")
+    e.execute_text(74, "START WORK, ISOLATION LEVEL READ COMMITTED, READ WRITE")
         .unwrap();
     assert_eq!(e.active_txn_count(), 1);
     e.execute_text(74, "ROLLBACK TRANSACTION").unwrap();
+    assert_eq!(e.active_txn_count(), 0);
+
+    let err = e
+        .execute_text(79, "START WORK, READ WRITE, DEFERRABLE")
+        .unwrap_err();
+    assert!(matches!(err, ExecuteError::Unsupported(_)));
     assert_eq!(e.active_txn_count(), 0);
 }
 
@@ -1935,10 +2140,20 @@ fn enqueue_start_alias_and_work_aliases_drive_transaction_state_transitions() {
     e.enqueue_set_text(93, "COMMIT WORK", t0).unwrap();
     assert_eq!(e.active_txn_count(), 0);
 
-    e.enqueue_set_text(94, "START WORK, READ WRITE, DEFERRABLE", t0)
-        .unwrap();
+    e.enqueue_set_text(
+        94,
+        "START WORK, ISOLATION LEVEL READ COMMITTED, READ WRITE",
+        t0,
+    )
+    .unwrap();
     assert_eq!(e.active_txn_count(), 1);
     e.enqueue_set_text(94, "ROLLBACK TRANSACTION", t0).unwrap();
+    assert_eq!(e.active_txn_count(), 0);
+
+    let err = e
+        .enqueue_set_text(99, "START WORK, READ WRITE, DEFERRABLE", t0)
+        .unwrap_err();
+    assert!(matches!(err, ExecuteError::Unsupported(_)));
     assert_eq!(e.active_txn_count(), 0);
 }
 

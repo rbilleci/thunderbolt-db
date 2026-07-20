@@ -12,7 +12,7 @@
 //! TEMPLATE each, reused across all needles), and so distinct engine submits. The template is the
 //! needle-invariant plan, so the expensive plan/bind runs once per shape, not per request (Tier 1,
 //! DECISIONS ADR-008). The async ingress, instead of a
-//! `spawn_blocking(execute_on_shared_engine)` per query, hands a batchable
+//! one `SharedEngine::submit` per query, hands a batchable
 //! `SELECT` to [`PointLookupBatcher::enqueue`] and `await`s the returned
 //! `oneshot` while holding no semaphore permit (it is parked, not running).
 //!
@@ -179,6 +179,7 @@ pub struct PointLookupBatcher {
     tx: Option<Sender<PointLookupRequest>>,
     coalescer: Option<JoinHandle<()>>,
     activity: Arc<PointLookupBatcherActivity>,
+    engine_identity: Arc<()>,
 }
 
 impl PointLookupBatcher {
@@ -203,6 +204,7 @@ impl PointLookupBatcher {
         max_wait: Duration,
         batch_size_observer: Option<Sender<usize>>,
     ) -> Self {
+        let engine_identity = Arc::clone(&engine.identity);
         let (tx, rx) = mpsc::channel::<PointLookupRequest>();
         let activity = Arc::new(PointLookupBatcherActivity::default());
         let coalescer_activity = Arc::clone(&activity);
@@ -223,7 +225,12 @@ impl PointLookupBatcher {
             tx: Some(tx),
             coalescer: Some(coalescer),
             activity,
+            engine_identity,
         }
+    }
+
+    pub(crate) fn is_bound_to(&self, engine: &SharedEngine) -> bool {
+        Arc::ptr_eq(&self.engine_identity, &engine.identity)
     }
 
     /// Test-only: like [`Self::with_triggers`] but every flushed batch's size is
@@ -243,10 +250,10 @@ impl PointLookupBatcher {
     /// caller `await`s. The caller is responsible for having classified `select`
     /// as batchable (a single-predicate int4-equality projection — single-column,
     /// multi-column, or mixed int4/text — on a resident, valid-generation table) —
-    /// see [`crate::execute_on_shared_engine_batched`]. If the coalescer
+    /// see [`crate::SubmissionRequest::BatchedText`]. If the coalescer
     /// has already shut down, the returned receiver resolves immediately to an
     /// error (the sender drops), so callers never hang.
-    pub fn enqueue(
+    pub(crate) fn enqueue(
         &self,
         select: Select,
         needle: i32,
@@ -503,7 +510,7 @@ fn run_batch(
     // shared `&Engine` (no façade lock — the "one read-lock per batch" invariant is now "one pinned
     // generation per batch", enforced by the engine's `&self` job APIs). A committer that panicked
     // mid-commit poisons the engine's commit_mutex: fail every waiter loud rather than serve
-    // possibly-torn state (mirrors `execute_on_shared_engine`).
+    // possibly-torn state (mirrors the canonical submission read path).
     let engine_ref: &Engine = match engine.read_engine() {
         Ok(engine_ref) => engine_ref,
         Err(()) => {
@@ -814,11 +821,30 @@ fn map_execute_error_local(err: ExecuteError) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{execute_on_shared_engine, execute_on_shared_engine_batched, BatchedDispatch};
+    use crate::{SubmissionDispatch, SubmissionRequest};
     use gpu_db_sql::{parse_command, Command};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::TryRecvError;
     use std::sync::Barrier;
+
+    fn submit_text(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
+        let mut session = shared.open_session();
+        shared
+            .submit(&mut session, SubmissionRequest::Text(sql))
+            .into_immediate()
+    }
+
+    fn submit_batched_text(
+        shared: &SharedEngine,
+        batcher: &PointLookupBatcher,
+        sql: &str,
+    ) -> SubmissionDispatch {
+        let mut session = shared.open_session();
+        shared.submit(
+            &mut session,
+            SubmissionRequest::BatchedText { sql, batcher },
+        )
+    }
 
     fn select(sql: &str) -> Select {
         match parse_command(sql).unwrap() {
@@ -854,8 +880,8 @@ mod tests {
         let shared = Arc::new(SharedEngine::new());
         // Keep optional warmup disabled; durable DML still establishes mandatory device authority.
         shared.engine.set_auto_admit_on_commit(false);
-        execute_on_shared_engine(&shared, "CREATE TABLE t (id INT)").unwrap();
-        execute_on_shared_engine(&shared, "INSERT INTO t (id) VALUES (1)").unwrap();
+        submit_text(&shared, "CREATE TABLE t (id INT)").unwrap();
+        submit_text(&shared, "INSERT INTO t (id) VALUES (1)").unwrap();
         shared
     }
 
@@ -982,8 +1008,8 @@ mod tests {
         let got_1 = recv_within(r1, Duration::from_secs(5)).unwrap().unwrap();
 
         // Per-query reference via the unchanged path.
-        let ref_2 = execute_on_shared_engine(&shared, "SELECT id FROM t WHERE id = 2").unwrap();
-        let ref_1 = execute_on_shared_engine(&shared, "SELECT id FROM t WHERE id = 1").unwrap();
+        let ref_2 = submit_text(&shared, "SELECT id FROM t WHERE id = 2").unwrap();
+        let ref_1 = submit_text(&shared, "SELECT id FROM t WHERE id = 1").unwrap();
 
         assert_eq!(got_2a, ref_2, "batched needle=2 must match per-query");
         assert_eq!(got_2b, ref_2, "duplicate needle=2 must get the same result");
@@ -1035,9 +1061,9 @@ mod tests {
         let sql = |k: i32| format!("SELECT id, balance FROM accounts WHERE id = {k}");
         let mut rxs = Vec::new();
         for &k in &needles {
-            match execute_on_shared_engine_batched(&shared, &batcher, &sql(k)) {
-                BatchedDispatch::Batched(rx) => rxs.push(rx),
-                BatchedDispatch::Immediate(_) => panic!(
+            match submit_batched_text(&shared, &batcher, &sql(k)) {
+                SubmissionDispatch::Batched(rx) => rxs.push(rx),
+                SubmissionDispatch::Immediate(_) => panic!(
                     "shard-resident int4 point lookup + flag ON must BATCH, not take the immediate path"
                 ),
             }
@@ -1060,31 +1086,30 @@ mod tests {
             "positive control: the batcher records a served sharded group"
         );
         for (i, &k) in needles.iter().enumerate() {
-            let want = execute_on_shared_engine(&shared, &sql(k)).unwrap();
+            let want = submit_text(&shared, &sql(k)).unwrap();
             assert_eq!(got[i], want, "wired batched == per-query for id={k}");
         }
 
         // A duplicate int4 key remains batch-correct. The device gather may serve it directly or
         // decline to the per-query GPU executor; either route must return every matching row.
-        execute_on_shared_engine(&shared, "CREATE TABLE dup (id INT, balance INT)").unwrap();
-        execute_on_shared_engine(
+        submit_text(&shared, "CREATE TABLE dup (id INT, balance INT)").unwrap();
+        submit_text(
             &shared,
             "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)",
         )
         .unwrap();
         if shared.read_engine().unwrap().resident_shard_count("dup") > 0 {
             let want_dup =
-                execute_on_shared_engine(&shared, "SELECT id, balance FROM dup WHERE id = 1")
-                    .unwrap();
-            let got_dup = match execute_on_shared_engine_batched(
+                submit_text(&shared, "SELECT id, balance FROM dup WHERE id = 1").unwrap();
+            let got_dup = match submit_batched_text(
                 &shared,
                 &batcher,
                 "SELECT id, balance FROM dup WHERE id = 1",
             ) {
-                BatchedDispatch::Batched(rx) => recv_within(rx, Duration::from_secs(5))
+                SubmissionDispatch::Batched(rx) => recv_within(rx, Duration::from_secs(5))
                     .expect("answered")
                     .expect("ok"),
-                BatchedDispatch::Immediate(_) => {
+                SubmissionDispatch::Immediate(_) => {
                     panic!("resident duplicate-key shape must enter the batcher before its gather declines")
                 }
             };
@@ -1118,7 +1143,7 @@ mod tests {
         engine.set_shard_batched_point_read_enabled(true);
         engine.set_auto_admit_on_commit(true);
         let shared = Arc::new(SharedEngine::from_engine(engine));
-        execute_on_shared_engine(
+        submit_text(
             &shared,
             "CREATE TABLE mix (id INT PRIMARY KEY, balance INT)",
         )
@@ -1129,7 +1154,7 @@ mod tests {
             } else {
                 (id * 7).to_string()
             };
-            execute_on_shared_engine(
+            submit_text(
                 &shared,
                 &format!("INSERT INTO mix (id, balance) VALUES ({id}, {balance})"),
             )
@@ -1169,12 +1194,12 @@ mod tests {
                 loop {
                     let id = turn % 100;
                     let sql = format!("SELECT id FROM mix WHERE id = {id}");
-                    let outcome = match execute_on_shared_engine_batched(&shared, &batcher, &sql) {
-                        BatchedDispatch::Batched(receiver) => receiver
+                    let outcome = match submit_batched_text(&shared, &batcher, &sql) {
+                        SubmissionDispatch::Batched(receiver) => receiver
                             .blocking_recv()
                             .expect("batcher stayed alive")
                             .expect("batched read succeeded"),
-                        BatchedDispatch::Immediate(_) => {
+                        SubmissionDispatch::Immediate(_) => {
                             panic!("resident mixed read bypassed the production batcher")
                         }
                     };
@@ -1214,7 +1239,7 @@ mod tests {
                     .sharded_gpu_probe_batches;
                 for offset in 0..20usize {
                     let id = 10_000 + offset;
-                    execute_on_shared_engine(
+                    submit_text(
                         &shared,
                         &format!("INSERT INTO mix (id, balance) VALUES ({id}, {})", id * 3),
                     )
@@ -1323,13 +1348,13 @@ mod tests {
             "SELECT id, label FROM m WHERE id = 2",
             "SELECT id, label FROM m WHERE id = 3",
         ] {
-            let outcome = match execute_on_shared_engine_batched(&shared, &batcher, sql) {
-                BatchedDispatch::Immediate(result) => result.unwrap(),
-                BatchedDispatch::Batched(_) => {
+            let outcome = match submit_batched_text(&shared, &batcher, sql) {
+                SubmissionDispatch::Immediate(result) => result.unwrap(),
+                SubmissionDispatch::Batched(_) => {
                     panic!("mixed int4+text point lookup must route to per-query, not the batcher: {sql}")
                 }
             };
-            let reference = execute_on_shared_engine(&shared, sql).unwrap();
+            let reference = submit_text(&shared, sql).unwrap();
             assert_eq!(
                 outcome, reference,
                 "mixed int4+text must match per-query: {sql}"

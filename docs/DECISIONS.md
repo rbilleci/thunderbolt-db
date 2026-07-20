@@ -4,6 +4,33 @@ Accepted decisions that are expensive to reverse. This file records rules and ra
 chronology or future sequencing. The full pre-unification record is archived at
 `archive/decisions/DECISIONS-full-pre-unification-2026-07-12.md`. Current work lives only in `PLAN.md`.
 
+## ADR-015 — One live canonical commit and WAL authority
+
+- **Status:** Accepted, 2026-07-19, as the PRODUCT-001 convergence refinement requested by the
+  product owner. It supersedes ADR-014 only where that design assigned live physical WAL ranges
+  to independent intent lanes; the append/tombstone, identity, transaction, isolation,
+  publication, and recovery semantics remain binding.
+- **Decision:** Every live database-local logical mutation uses one global sequence claimant, one
+  canonical `WalBuffer`, one durable transaction-status index, one apply order, and one contiguous
+  publication coordinator. Optimized intent lanes are preparation/batching strategies only. A
+  lane identifier may remain diagnostic metadata in a canonical record, but it is not a physical
+  address, sequence oracle, durability frontier, recovery source, or publication authority.
+  Fresh traffic never creates or appends `.lane-*` WAL files.
+- **Completion law:** Canonically accepted optimized apply is synchronous under the commit mutex;
+  group durability and publication may finish off-lock only through a registered tail that blocks
+  conflicting claim/checkpoint boundaries until resolved. Terminal status and exact retry identity
+  use the same canonical index for optimized, classic, serialized, COPY, batch, and explicit work.
+- **Legacy rule:** Retired physical-lane files are replay-only compatibility input. Empty remnants
+  do not create another authority. A nonempty historical database remains read-only until an
+  offline, one-way migration rewrites its recovered prefix into canonical WAL; live canonical and
+  historical physical-lane suffixes are never mixed.
+- **Reason:** Multiple physical WAL/sequence/publication owners made mixed PostgreSQL traffic,
+  exact retry, checkpointing, and recovery order depend on strategy selection. A single durable
+  authority removes that product ambiguity without giving up lane-parallel GPU preparation.
+- **Consequence:** Lower write strategies may remain private implementation helpers while
+  PRODUCT-001 migrates callers, but none may own a second log/order/publication path. Server and
+  facade entry-point deletion remains PRODUCT-001 work in `PLAN.md`.
+
 ## ADR-014 — Canonical GPU-native append/tombstone write model
 
 - **Status:** Accepted, 2026-07-16. The exact reviewed target/workload snapshot is `c9628766`; the final independent

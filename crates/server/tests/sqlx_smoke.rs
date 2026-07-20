@@ -25,13 +25,13 @@ fn free_local_port() -> u16 {
 
 fn start_server() -> ServerGuard {
     let port = free_local_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gpu-db-server"))
-        .args(["--listen", &format!("127.0.0.1:{port}")])
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gpu-db-engine-server"))
+        .arg(format!("127.0.0.1:{port}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn gpu-db-server");
+        .expect("spawn gpu-db-engine-server");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -42,7 +42,7 @@ fn start_server() -> ServerGuard {
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("gpu-db-server did not start listening on 127.0.0.1:{port}");
+    panic!("gpu-db-engine-server did not start listening on 127.0.0.1:{port}");
 }
 
 fn connect_options(port: u16) -> PgConnectOptions {
@@ -66,6 +66,10 @@ async fn sqlx_supported_subset_smoke_with_unsupported_recovery(
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.try_get::<i32, _>("one")?, 1);
+    let null_row = sqlx::raw_sql("SELECT NULL::int4 AS missing")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(null_row.try_get::<Option<i32>, _>("missing")?, None);
 
     sqlx::raw_sql(
         "CREATE TABLE sqlx_people (id INT, name TEXT);

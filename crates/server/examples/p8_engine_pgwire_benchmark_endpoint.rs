@@ -326,13 +326,14 @@ impl EndpointState {
                 // Hot retained-read paths below still call the engine directly via
                 // the documented transitional path until they are migrated.
                 let txn_id = self.take_txn_id();
-                let outcome = gpu_db_facade::execute_on_engine(&mut self.engine, txn_id, sql)
-                    .map_err(|err| err.to_string())?;
+                self.engine.execute_text(txn_id, sql)?;
                 let mut writer = BackendWriter::new(output);
-                writer
-                    .command_complete(&gpu_db_facade::pg_adapter::command_complete_tag(&outcome))?;
+                writer.command_complete("CREATE TABLE")?;
                 writer.ready_for_query(false)?;
-                self.fact("create_table_through_facade", true)?;
+                self.fact(
+                    "create_table_through_inventoried_direct_engine_endpoint",
+                    true,
+                )?;
             }
             Command::Select(select) => {
                 let emit_select_phase = self.select_fact_detail.emits_phase();

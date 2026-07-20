@@ -312,7 +312,7 @@ pub(crate) fn percent_decode_lossy(input: &str) -> String {
 /// ever obtain `&ReadState` through the shared `Arc` and never alias the same byte mutably. The
 /// engine `RwLock`'s remaining job is purely the **catalog latch** (DDL / KV / sequential-INSERT
 /// mutual exclusion); the read state below is published to lock-free readers via the
-/// `committed_seq`-last release-store discipline (see `publish_committed_seq`).
+/// `committed_seq`-last release-store discipline (owned by the commit publication coordinator).
 ///
 /// Stage 1 holds the already-lock-free fields (`mvcc`, `committed_seq`, the resident device-memory
 /// maps, route telemetry). The catalog (Stage 2) and the resident snapshot/shard metadata
@@ -501,6 +501,41 @@ pub(crate) struct PointIndexMutationGuard {
     epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[derive(Debug, Default)]
+struct TransactionNamedIndexLifecycle {
+    publication_active: bool,
+    protected_tables: BTreeSet<String>,
+    deferred_purges: BTreeSet<String>,
+}
+
+/// A composite transaction has restored every enrolled index before WAL and is carrying that
+/// exact coverage through canonical apply. Cache retirement that races this interval is deferred;
+/// the final guard releases and performs those purges only after device publication finishes.
+pub(crate) struct TransactionNamedIndexPublicationGuard<'a> {
+    residency: &'a ResidencyReadState,
+    finished: bool,
+}
+
+impl TransactionNamedIndexPublicationGuard<'_> {
+    /// Linearize a successful canonical generation publication. Purges deferred while the old
+    /// generation was authoritative are superseded by this new publication; dropping without
+    /// completion instead applies them to clean up an aborted preflight or failed apply.
+    pub(crate) fn complete(mut self) {
+        self.residency
+            .finish_transaction_named_index_publication(true);
+        self.finished = true;
+    }
+}
+
+impl Drop for TransactionNamedIndexPublicationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.residency
+                .finish_transaction_named_index_publication(false);
+        }
+    }
+}
+
 impl Drop for PointIndexMutationGuard {
     fn drop(&mut self) {
         let prior = self
@@ -594,6 +629,11 @@ pub(crate) struct ResidencyReadState {
     pub(crate) live_compound_point_route_bytes: Arc<Mutex<BTreeMap<(u16, String), u64>>>,
     /// Serializes rare route-cache COW publications and retirement purges; cache-hit reads stay lock-free.
     pub(crate) sharded_point_route_publish_lock: Mutex<()>,
+    /// Linearizes destructive named/shard-index cache retirement with the pre-WAL-to-apply interval
+    /// of a composite transaction. It is a short state latch, not a lock held across WAL: active
+    /// publication marks one serialized writer and purgers defer only its affected table names,
+    /// avoiding budget/route lock inversion while preserving mandatory coverage through the durable cut.
+    transaction_named_index_lifecycle: Mutex<TransactionNamedIndexLifecycle>,
     /// PERF-001: count of batches that reused an exact-generation GPU-resident shard descriptor plan.
     /// A nonzero value proves the hot route avoided per-batch shard enumeration and descriptor upload;
     /// generation replacement/purge still forces a miss and rebuild.
@@ -729,8 +769,6 @@ pub(crate) struct ResidencyReadState {
     pub(crate) streaming_cold_patches: std::sync::atomic::AtomicU64,
     /// STRATA 6c-1: dirty chunks rebuilt across all patches (a one-row write should rebuild ONE).
     pub(crate) streaming_cold_chunks_rebuilt: std::sync::atomic::AtomicU64,
-    /// P1 (sealed-shards-primary): cold-tier tables written into the durable checkpoint artifact.
-    pub(crate) streaming_cold_checkpointed: std::sync::atomic::AtomicU64,
     /// P1 (sealed-shards-primary): cold-tier tables restored from the checkpoint artifact at reopen
     /// (the warm-start signal — the first streaming read after recovery replays bytes, no scan).
     pub(crate) streaming_cold_restored: std::sync::atomic::AtomicU64,
@@ -822,6 +860,50 @@ pub(crate) struct ResidencyReadState {
 }
 
 impl ResidencyReadState {
+    pub(crate) fn begin_transaction_named_index_publication(
+        &self,
+        protected_tables: BTreeSet<String>,
+    ) -> TransactionNamedIndexPublicationGuard<'_> {
+        let mut lifecycle = self
+            .transaction_named_index_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(
+            !lifecycle.publication_active,
+            "the serialized commit authority permits one named-index publication"
+        );
+        lifecycle.publication_active = true;
+        lifecycle.protected_tables = protected_tables;
+        drop(lifecycle);
+        TransactionNamedIndexPublicationGuard {
+            residency: self,
+            finished: false,
+        }
+    }
+
+    fn finish_transaction_named_index_publication(&self, publication_succeeded: bool) {
+        let mut lifecycle = self
+            .transaction_named_index_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(lifecycle.publication_active);
+        lifecycle.publication_active = false;
+        lifecycle.protected_tables.clear();
+        let deferred = std::mem::take(&mut lifecycle.deferred_purges);
+        if publication_succeeded {
+            // Each deferred request observed the generation that canonical apply just replaced.
+            // The new publication is the later linearized owner, so replaying those requests would
+            // incorrectly purge its freshly built coverage.
+            return;
+        }
+        // Keep the lifecycle latch until cleanup completes. A new transaction therefore begins
+        // either before a purge request (and defers it) or after its full route/cache retirement;
+        // it can never capture the half-purged interval.
+        for table in deferred {
+            self.purge_shard_pk_index_for_table_inner(&table);
+        }
+    }
+
     pub(crate) fn point_index_mutation_epoch(
         &self,
         table: &str,
@@ -875,6 +957,20 @@ impl ResidencyReadState {
     /// Drop every cached device PK index for `table` at residency-retire sites so the cache does
     /// not retain a stale shard buffer or device allocation across a generation replacement.
     pub(crate) fn purge_shard_pk_index_for_table(&self, table: &str) {
+        let mut lifecycle = self
+            .transaction_named_index_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifecycle.publication_active && lifecycle.protected_tables.contains(table) {
+            lifecycle.deferred_purges.insert(table.to_string());
+            return;
+        }
+        // Keep the state latch across the physical purge so a transaction cannot increment the
+        // active counter between the zero observation and cache removal.
+        self.purge_shard_pk_index_for_table_inner(table);
+    }
+
+    fn purge_shard_pk_index_for_table_inner(&self, table: &str) {
         // Route -> index is the global ownership order. Retire cached plans while their indexes remain
         // map-accounted, drop this method's old-map guard, and only then remove the index entries. Prepared
         // route publication holds the same route lock through its under-lock index-identity validation, so a

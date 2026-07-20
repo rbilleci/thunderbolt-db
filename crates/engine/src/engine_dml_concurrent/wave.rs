@@ -17,6 +17,20 @@ type ShardedPostValidationHook = (
 );
 
 #[cfg(test)]
+type SerialPreCommitLockHook = (
+    usize,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn serial_pre_commit_lock_hook() -> &'static std::sync::Mutex<Option<SerialPreCommitLockHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<SerialPreCommitLockHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
 fn sharded_post_validation_hook() -> &'static std::sync::Mutex<Option<ShardedPostValidationHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ShardedPostValidationHook>>> =
         std::sync::OnceLock::new();
@@ -121,9 +135,9 @@ impl Drop for CommitWaveBatchGuard<'_> {
         drop(queue);
         for item in self.items.iter().chain(stranded.iter()) {
             if !item.outcome.done.load(AtomicOrdering::Acquire) {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(format!(
+                item.set_outcome(Err(ExecuteError::Indeterminate(format!(
                     "the concurrent commit path is wedged pending restart recovery: {reason}"
-                )))));
+                ))));
             }
         }
         self.engine.commit_wave.cv.notify_all();
@@ -132,6 +146,18 @@ impl Drop for CommitWaveBatchGuard<'_> {
 }
 
 impl Engine {
+    #[cfg(test)]
+    pub(crate) fn set_serial_pre_commit_lock_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *serial_pre_commit_lock_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((self as *const Self as usize, reached, resume));
+    }
+
     #[cfg(test)]
     pub(crate) fn set_sharded_post_validation_hook(
         &self,
@@ -425,10 +451,29 @@ impl Engine {
         let wall_clock = current_timestamp_micros();
         let mut wave_tail: Option<(Index, usize)> = None;
         let mut committed: Vec<(usize, Index, u64)> = Vec::with_capacity(batch.len());
-        // The virtual row-id cursor assigns device-native INSERT identities in wave order.
-        let mut next_row_id = self.read_state.mvcc.current_row_id();
+
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut hook = serial_pre_commit_lock_hook()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                hook.as_ref()
+                    .is_some_and(|(engine, _, _)| *engine == self as *const Self as usize)
+                    .then(|| hook.take())
+                    .flatten()
+            };
+            if let Some((_, reached, resume)) = hook {
+                reached.wait();
+                resume.wait();
+            }
+        }
 
         let mut commit = self.commit_state();
+        // The virtual row-id cursor assigns device-native INSERT identities in wave order. Read it
+        // only after taking the canonical commit mutex: explicit transactions, classic waves,
+        // sharded waves, and optimized lanes all advance the same allocator under this cut.
+        let mut next_row_id = self.read_state.mvcc.current_row_id();
         if let Err(error) = self.ensure_commit_path_available() {
             let message = error.to_string();
             for item in &batch {
@@ -439,7 +484,7 @@ impl Engine {
             std::mem::forget(guard);
             return None;
         }
-        if let Err(error) = self.intent_lanes_write_guard() {
+        if let Err(error) = self.legacy_lane_history_write_guard() {
             let message = error.to_string();
             for item in &batch {
                 item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
@@ -517,12 +562,67 @@ impl Engine {
             if let Some(ref mut t) = _hp {
                 *t = Instant::now();
             }
+            let request_digest = gpu_db_wal::canonical_request_digest(&batch[position].payload);
+            match commit
+                .resolve_transaction_retry_digest_outcome(batch[position].txn_id, request_digest)
+            {
+                Ok(Some((token, affected_rows))) if self.committed_seq() >= token.index => {
+                    batch[position].set_outcome(Ok(affected_rows));
+                    continue;
+                }
+                Ok(Some(_)) => {
+                    batch[position].set_outcome(Err(ExecuteError::Indeterminate(format!(
+                        "transaction id {} is committed but not yet publication-covered",
+                        batch[position].txn_id
+                    ))));
+                    continue;
+                }
+                Err(error) => {
+                    batch[position].set_outcome(Err(ExecuteError::Engine(error)));
+                    continue;
+                }
+                Ok(None) => {}
+            }
+            match self.resolve_pending_transaction_claim(batch[position].txn_id, request_digest) {
+                Ok(true) => {
+                    batch[position].set_outcome(Err(ExecuteError::Indeterminate(format!(
+                        "transaction id {} is pending in canonical mutation admission",
+                        batch[position].txn_id
+                    ))));
+                    continue;
+                }
+                Err(error) => {
+                    batch[position].set_outcome(Err(ExecuteError::Engine(error)));
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            if let Some(expected) = batch[position].expected_catalog_version {
+                if let Err(error) =
+                    crate::engine_mutation_admission::validate_prepared_catalog_version(
+                        expected,
+                        wave_catalog_seq,
+                    )
+                {
+                    batch[position].set_outcome(Err(error));
+                    continue;
+                }
+            }
+            if let Some(state) = commit.txn_manager.state(batch[position].txn_id) {
+                batch[position].set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    format!(
+                        "transaction id {} is already owned by transaction state {state:?}",
+                        batch[position].txn_id
+                    ),
+                ))));
+                continue;
+            }
             // M1 design B: a deferred INSERT whose PK value already exists (wave-batch verdict)
             // aborts here — the same 23505 the off-lock validation would have raised.
             if let Some(err) = wave_unique_verdicts.violations.get(&position) {
-                batch[position].set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    err.clone(),
-                ))));
+                batch[position].set_outcome(Err(ExecuteError::Engine(
+                    EngineError::UniqueViolation(err.clone()),
+                )));
                 continue;
             }
             if wave_unique_verdicts.declined.contains(&position) {
@@ -679,11 +779,17 @@ impl Engine {
                     batch[position].set_outcome(Err(ExecuteError::Engine(err)));
                     continue;
                 }
-                commit.record_transaction_status_digest(
+                if let Err(error) = commit.record_transaction_status_digest_outcome(
                     batch[position].txn_id,
                     gpu_db_wal::canonical_request_digest(&batch[position].payload),
                     token.index,
-                );
+                    1,
+                ) {
+                    commit.repl.rollback_unapplied_from(commit_seq);
+                    commit.wal.truncate(wal_len_before);
+                    batch[position].set_outcome(Err(ExecuteError::Engine(error)));
+                    continue;
+                }
                 let timestamp_micros =
                     wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
                 commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
@@ -891,11 +997,17 @@ impl Engine {
                 item.set_outcome(Err(ExecuteError::Engine(err)));
                 continue;
             }
-            commit.record_transaction_status_digest(
+            if let Err(error) = commit.record_transaction_status_digest_outcome(
                 item.txn_id,
                 gpu_db_wal::canonical_request_digest(&item.payload),
                 token.index,
-            );
+                item_rows,
+            ) {
+                commit.repl.rollback_unapplied_from(commit_seq);
+                commit.wal.truncate(wal_len_before);
+                item.set_outcome(Err(ExecuteError::Engine(error)));
+                continue;
+            }
             let timestamp_micros =
                 wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
             commit.record_commit_timestamp(item.txn_id, timestamp_micros);
@@ -1077,7 +1189,7 @@ impl Engine {
         // === leave the commit critical section BEFORE the fsync (D3b group commit) ===
         drop(commit);
 
-        let Some((last_seq, last_position)) = wave_tail else {
+        let Some((_last_seq, last_position)) = wave_tail else {
             // Every item aborted pre-durable; outcomes are already set.
             std::mem::forget(guard);
             return None;
@@ -1091,7 +1203,6 @@ impl Engine {
         Some(CommitWaveTail {
             batch,
             committed,
-            last_seq,
             last_position,
             armed: true,
         })
@@ -1287,7 +1398,7 @@ impl Engine {
             std::mem::forget(guard);
             return None;
         }
-        if let Err(error) = self.intent_lanes_write_guard() {
+        if let Err(error) = self.legacy_lane_history_write_guard() {
             let message = error.to_string();
             for item in &batch {
                 item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
@@ -1314,6 +1425,93 @@ impl Engine {
                 .filter(|(_, item)| item.prepared_catalog_seq != serialized_catalog_seq)
                 .map(|(position, _)| position),
         );
+        // The durable map is populated only after winner sequencing below, so arbitrate transaction
+        // identities within this candidate wave as well. Lowest position owns a new identity;
+        // later exact duplicates remain pending on that owner, while payload mismatch fails loud.
+        let mut wave_transaction_claims = BTreeMap::new();
+        for (position, item) in batch.iter().enumerate() {
+            let request_digest = gpu_db_wal::canonical_request_digest(&item.payload);
+            match commit.resolve_transaction_retry_digest_outcome(item.txn_id, request_digest) {
+                Ok(Some((token, affected_rows))) if self.committed_seq() >= token.index => {
+                    item.set_outcome(Ok(affected_rows));
+                    wave_history_conflicts.insert(position);
+                }
+                Ok(Some(_)) => {
+                    item.set_outcome(Err(ExecuteError::Indeterminate(format!(
+                        "transaction id {} is committed but not yet publication-covered",
+                        item.txn_id
+                    ))));
+                    wave_history_conflicts.insert(position);
+                }
+                Err(error) => {
+                    item.set_outcome(Err(ExecuteError::Engine(error)));
+                    wave_history_conflicts.insert(position);
+                }
+                Ok(None) => {
+                    if let Some(expected) = item.expected_catalog_version {
+                        if let Err(error) =
+                            crate::engine_mutation_admission::validate_prepared_catalog_version(
+                                expected,
+                                serialized_catalog_seq,
+                            )
+                        {
+                            item.set_outcome(Err(error));
+                            wave_history_conflicts.insert(position);
+                            continue;
+                        }
+                    }
+                    match self.resolve_pending_transaction_claim(item.txn_id, request_digest) {
+                        Ok(true) => {
+                            item.set_outcome(Err(ExecuteError::Indeterminate(format!(
+                                "transaction id {} is pending in canonical mutation admission",
+                                item.txn_id
+                            ))));
+                            wave_history_conflicts.insert(position);
+                            continue;
+                        }
+                        Err(error) => {
+                            item.set_outcome(Err(ExecuteError::Engine(error)));
+                            wave_history_conflicts.insert(position);
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
+                    if let Some(state) = commit.txn_manager.state(item.txn_id) {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            format!(
+                                "transaction id {} is already owned by transaction state {state:?}",
+                                item.txn_id
+                            ),
+                        ))));
+                        wave_history_conflicts.insert(position);
+                        continue;
+                    }
+                    match wave_transaction_claims.entry(item.txn_id) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(request_digest);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if *entry.get() == request_digest =>
+                        {
+                            item.set_outcome(Err(ExecuteError::Indeterminate(format!(
+                                "transaction id {} is already pending earlier in this commit wave",
+                                item.txn_id
+                            ))));
+                            wave_history_conflicts.insert(position);
+                        }
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                                format!(
+                                    "transaction id {} is already claimed earlier in this commit wave by a different request",
+                                    item.txn_id
+                                ),
+                            ))));
+                            wave_history_conflicts.insert(position);
+                        }
+                    }
+                }
+            }
+        }
         #[cfg(test)]
         {
             let hook = {
@@ -1434,11 +1632,17 @@ impl Engine {
                         winners.into_iter().enumerate()
                     {
                         let commit_seq = first_seq + offset as u64;
-                        commit.record_transaction_status_digest(
-                            batch[position].txn_id,
-                            gpu_db_wal::canonical_request_digest(&batch[position].payload),
-                            commit_seq,
-                        );
+                        if commit
+                            .record_transaction_status_digest_outcome(
+                                batch[position].txn_id,
+                                gpu_db_wal::canonical_request_digest(&batch[position].payload),
+                                commit_seq,
+                                1,
+                            )
+                            .is_err()
+                        {
+                            return None;
+                        }
                         commit.record_commit_timestamp(
                             batch[position].txn_id,
                             base_timestamp_micros + offset as u64,
@@ -1503,7 +1707,7 @@ impl Engine {
         // === leave the commit critical section BEFORE the fsync (D3b group commit) ===
         drop(commit);
 
-        let Some((last_seq, last_position)) = wave_tail else {
+        let Some((_last_seq, last_position)) = wave_tail else {
             // Every item aborted pre-durable; outcomes are already set.
             std::mem::forget(guard);
             return None;
@@ -1513,7 +1717,6 @@ impl Engine {
         Some(CommitWaveTail {
             batch,
             committed,
-            last_seq,
             last_position,
             armed: true,
         })
@@ -1557,7 +1760,7 @@ impl Engine {
                             let item = &batch[pos];
                             let verdict = if let Some(msg) = unique_violations.get(&pos) {
                                 // Committed-dup: the same 23505 the serial device-locate verdict raises.
-                                ShardVerdict::Abort(ExecuteError::Engine(EngineError::ApplyFailed(
+                                ShardVerdict::Abort(ExecuteError::Engine(EngineError::UniqueViolation(
                                     msg.clone(),
                                 )))
                             } else if history_conflicts.contains(&pos) {

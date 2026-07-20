@@ -65,18 +65,20 @@ pub fn decode_parameter(
     value: Option<&[u8]>,
 ) -> Result<DbValue, PgValueCodecError> {
     let logical_type = logical_type_from_oid(oid)?;
+    if !matches!(format, 0 | 1) {
+        return Err(PgValueCodecError::UnsupportedFormat(format));
+    }
+    // NULL has no payload to decode. Once its declared OID and format code are valid, every
+    // supported logical type can bind it even when that type's non-NULL codec is not implemented.
+    let Some(value) = value else {
+        return Ok(DbValue::Null);
+    };
     if !matches!(
         logical_type,
         LogicalType::Int2 | LogicalType::Int4 | LogicalType::Int8 | LogicalType::Uuid
     ) {
         return Err(PgValueCodecError::UnsupportedParameterType(logical_type));
     }
-    if !matches!(format, 0 | 1) {
-        return Err(PgValueCodecError::UnsupportedFormat(format));
-    }
-    let Some(value) = value else {
-        return Ok(DbValue::Null);
-    };
     match format {
         0 => decode_text_parameter(logical_type, value),
         1 => decode_binary_parameter(logical_type, value),
@@ -252,8 +254,8 @@ fn decode_binary_parameter(
 }
 
 /// Encode one neutral result value in PostgreSQL text (0) or binary (1) format. SQL NULL is
-/// represented out-of-band as `None`. The binary contract is intentionally bounded to the canonical
-/// BENCH integer/UUID result vocabulary.
+/// represented out-of-band as `None`. PostgreSQL's binary `text` representation is the raw UTF-8
+/// payload, so it shares the neutral string bytes without a second wire-specific value path.
 pub fn encode_result_value(
     value: &DbValue,
     format: i16,
@@ -270,6 +272,7 @@ pub fn encode_result_value(
             DbValue::Int2(value) => Ok(Some(value.to_be_bytes().to_vec())),
             DbValue::Int4(value) => Ok(Some(value.to_be_bytes().to_vec())),
             DbValue::Int8(value) => Ok(Some(value.to_be_bytes().to_vec())),
+            DbValue::Text(value) => Ok(Some(value.as_bytes().to_vec())),
             DbValue::Uuid(value) => Ok(Some(value.to_vec())),
             other => Err(PgValueCodecError::UnsupportedBinaryResult(
                 logical_type_for_value(other),
@@ -346,6 +349,14 @@ pub fn error_sqlstate(category: ErrorCategory) -> &'static str {
     match category {
         ErrorCategory::Syntax => "42601",
         ErrorCategory::Unsupported => "0A000",
+        ErrorCategory::UndefinedRelation => "42P01",
+        ErrorCategory::UndefinedColumn => "42703",
+        ErrorCategory::IndeterminateDatatype => "42P18",
+        ErrorCategory::DatatypeMismatch => "42804",
+        ErrorCategory::InvalidRequest => "08P01",
+        ErrorCategory::ResourceExhausted => "53000",
+        ErrorCategory::InFailedTransaction => "25P02",
+        ErrorCategory::UniqueViolation => "23505",
         ErrorCategory::Engine => "XX000",
         ErrorCategory::Internal => "XX000",
         // Class 40 — Transaction Rollback; 40001 serialization_failure is the retryable code
@@ -465,11 +476,13 @@ mod tests {
                 LogicalType::Text
             ))
         );
+        for oid in [16, 25, 1082, 1114, 1700] {
+            assert_eq!(decode_parameter(oid, 0, None).unwrap(), DbValue::Null);
+            assert_eq!(decode_parameter(oid, 1, None).unwrap(), DbValue::Null);
+        }
         assert_eq!(
-            encode_result_value(&DbValue::Text("x".to_string()), 1),
-            Err(PgValueCodecError::UnsupportedBinaryResult(
-                LogicalType::Text
-            ))
+            encode_result_value(&DbValue::Text("Ada".to_string()), 1).unwrap(),
+            Some(b"Ada".to_vec())
         );
         assert_eq!(encode_result_value(&DbValue::Null, 1).unwrap(), None);
         assert_eq!(
@@ -517,6 +530,7 @@ mod tests {
     fn maps_neutral_error_categories_to_sqlstate() {
         assert_eq!(error_sqlstate(ErrorCategory::Syntax), "42601");
         assert_eq!(error_sqlstate(ErrorCategory::Unsupported), "0A000");
+        assert_eq!(error_sqlstate(ErrorCategory::UniqueViolation), "23505");
         assert_eq!(error_sqlstate(ErrorCategory::Engine), "XX000");
     }
 

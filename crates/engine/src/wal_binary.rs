@@ -16,7 +16,9 @@
 //!
 //! v1 (W5a) began with the covered single-table INSERT class; W5b added UPDATE/DELETE, and R3-003
 //! added one resolved explicit-transaction operation carrying ordered row mutations plus atomic
-//! sequence post-state. Unsupported autocommit shapes remain SQL text.
+//! sequence post-state. PRODUCT-001 extends that same operation with typed transaction-owned
+//! catalog mutations; old row-only records remain byte-for-byte v1 compatible. Unsupported
+//! autocommit shapes remain SQL text.
 
 use super::*;
 
@@ -39,6 +41,9 @@ const OP_UPDATE_BY_KEY: u8 = 3;
 /// R3-003: one explicit transaction's ordered, resolved row mutations. Every operation carries
 /// stable entity identity plus the row image(s), so replay never re-evaluates SQL predicates.
 const OP_TRANSACTION: u8 = 4;
+/// PRODUCT-001: the same resolved explicit transaction, prefixed by typed catalog mutations. A
+/// distinct opcode preserves the exact v1 row-only layout and lets old durable records replay.
+const OP_COMPOSITE_TRANSACTION: u8 = 5;
 
 const TXN_INSERT: u8 = 1;
 const TXN_UPDATE: u8 = 2;
@@ -99,6 +104,10 @@ pub(crate) enum BinaryTransactionMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BinaryTransactionRecord {
     pub(crate) allocator_high_water: u64,
+    /// Typed catalog operations applied before the resolved final row mutations at the one atomic
+    /// publication boundary. The first compatibility slice admits one `CREATE TABLE`; retaining a
+    /// vector makes the durable format ready for ordered catalog expansion without SQL replay.
+    pub(crate) catalog_commands: Vec<Command>,
     /// Final catalog post-state for each sequence consumed by a transaction-private default.
     /// Entries are sorted by name (`BTreeMap`) for deterministic WAL bytes.
     pub(crate) sequence_advances: BTreeMap<String, (i64, bool)>,
@@ -117,7 +126,8 @@ pub(crate) enum BinaryWalRecord {
 /// `None`; callers must fail the transaction rather than fall back to statement SQL records, which
 /// would lose atomicity and predicate-resolution identity.
 pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) -> Option<Vec<u8>> {
-    if record.sequence_advances.len() > u32::MAX as usize
+    if record.catalog_commands.len() > 1
+        || record.sequence_advances.len() > u32::MAX as usize
         || record.mutations.len() > u32::MAX as usize
     {
         return None;
@@ -125,7 +135,25 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     let mut out = Vec::with_capacity(32 + record.mutations.len() * 96);
     out.push(WAL_BINARY_TAG);
     out.push(WAL_BINARY_VERSION);
-    out.push(OP_TRANSACTION);
+    out.push(if record.catalog_commands.is_empty() {
+        OP_TRANSACTION
+    } else {
+        OP_COMPOSITE_TRANSACTION
+    });
+    if !record.catalog_commands.is_empty() {
+        out.extend_from_slice(&(record.catalog_commands.len() as u32).to_le_bytes());
+        for command in &record.catalog_commands {
+            if !matches!(command, Command::CreateTable(_)) {
+                return None;
+            }
+            let encoded = serde_json::to_vec(command).ok()?;
+            if encoded.len() > u32::MAX as usize {
+                return None;
+            }
+            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            out.extend_from_slice(&encoded);
+        }
+    }
     out.extend_from_slice(&record.allocator_high_water.to_le_bytes());
     out.extend_from_slice(&(record.sequence_advances.len() as u32).to_le_bytes());
     for (sequence, (last_value, is_called)) in &record.sequence_advances {
@@ -265,7 +293,7 @@ pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, En
     let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
     match payload.get(2) {
         Some(&OP_INSERT) => decode_binary_insert(payload).map(BinaryWalRecord::Insert),
-        Some(&OP_TRANSACTION) => {
+        Some(&OP_TRANSACTION) | Some(&OP_COMPOSITE_TRANSACTION) => {
             decode_binary_transaction(payload).map(BinaryWalRecord::Transaction)
         }
         Some(&OP_UPDATE_BY_KEY) => {
@@ -366,8 +394,32 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
     if take(1)?[0] != WAL_BINARY_VERSION {
         return Err(fail("unsupported version"));
     }
-    if take(1)?[0] != OP_TRANSACTION {
+    let op = take(1)?[0];
+    if !matches!(op, OP_TRANSACTION | OP_COMPOSITE_TRANSACTION) {
         return Err(fail("op dispatch mismatch"));
+    }
+    let mut catalog_commands = Vec::new();
+    if op == OP_COMPOSITE_TRANSACTION {
+        let command_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+        if command_count != 1 {
+            return Err(fail(
+                "composite transaction v1 requires exactly one catalog command",
+            ));
+        }
+        catalog_commands.reserve(command_count.min(1024));
+        for _ in 0..command_count {
+            let len = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            let bytes = take(len)?;
+            let command: Command = serde_json::from_slice(bytes)
+                .map_err(|error| fail(&format!("typed catalog command decode failed: {error}")))?;
+            if !matches!(command, Command::CreateTable(_)) {
+                return Err(fail("unsupported composite catalog command"));
+            }
+            if serde_json::to_vec(&command).ok().as_deref() != Some(bytes) {
+                return Err(fail("non-canonical typed catalog command"));
+            }
+            catalog_commands.push(command);
+        }
     }
     let allocator_high_water = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
     let sequence_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
@@ -431,6 +483,7 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
     }
     Ok(BinaryTransactionRecord {
         allocator_high_water,
+        catalog_commands,
         sequence_advances,
         mutations,
     })
@@ -560,6 +613,81 @@ mod tests {
         let mut skewed = payload.clone();
         skewed[1] = 99; // version
         assert!(decode_binary_insert(&skewed).is_err());
+    }
+
+    #[test]
+    fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips() {
+        let mut sequence_advances = BTreeMap::new();
+        sequence_advances.insert("s".to_string(), (5, true));
+        let row_only = BinaryTransactionRecord {
+            allocator_high_water: 9,
+            catalog_commands: Vec::new(),
+            sequence_advances,
+            mutations: vec![BinaryTransactionMutation::Insert {
+                table: "t".to_string(),
+                row_id: 8,
+                row_encoded: "i:42".to_string(),
+            }],
+        };
+        let old_payload = try_encode_binary_transaction(&row_only).unwrap();
+        // Literal bytes captured from the pre-composite v1 row-transaction framing. Deliberately
+        // do not use codec constants here: the fixture must detect an opcode/tag/version drift as
+        // well as sequence and row-mutation layout drift.
+        let pre_composite_fixture = vec![
+            255, 1, 4, // tag, version, row-only transaction opcode
+            9, 0, 0, 0, 0, 0, 0, 0, // allocator high-water
+            1, 0, 0, 0, // one sequence advance
+            1, 0, b's', // sequence name
+            5, 0, 0, 0, 0, 0, 0, 0, 1, // sequence post-state + is_called
+            1, 0, 0, 0, // one mutation
+            1, // INSERT
+            1, 0, b't', // table name
+            8, 0, 0, 0, 0, 0, 0, 0, // stable row identity
+            4, 0, 0, 0, b'i', b':', b'4', b'2', // encoded row image
+        ];
+        assert_eq!(old_payload, pre_composite_fixture);
+        assert_eq!(
+            old_payload[..3],
+            [WAL_BINARY_TAG, WAL_BINARY_VERSION, OP_TRANSACTION]
+        );
+        assert!(matches!(
+            decode_binary_record(&old_payload).unwrap(),
+            BinaryWalRecord::Transaction(decoded) if decoded == row_only
+        ));
+
+        let command = parse_command("CREATE TABLE composite_codec (id int4)").unwrap();
+        let composite = BinaryTransactionRecord {
+            allocator_high_water: 8,
+            catalog_commands: vec![command],
+            sequence_advances: BTreeMap::new(),
+            mutations: vec![BinaryTransactionMutation::Insert {
+                table: "composite_codec".to_string(),
+                row_id: 7,
+                row_encoded: encode_relational_row(&[SqlValue::Int4(1)]),
+            }],
+        };
+        let payload = try_encode_binary_transaction(&composite).unwrap();
+        assert_eq!(
+            payload[..3],
+            [WAL_BINARY_TAG, WAL_BINARY_VERSION, OP_COMPOSITE_TRANSACTION]
+        );
+        assert!(matches!(
+            decode_binary_record(&payload).unwrap(),
+            BinaryWalRecord::Transaction(decoded) if decoded == composite
+        ));
+        assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+
+        let two_commands = BinaryTransactionRecord {
+            catalog_commands: vec![
+                parse_command("CREATE TABLE composite_codec_a (id int4)").unwrap(),
+                parse_command("CREATE TABLE composite_codec_b (id int4)").unwrap(),
+            ],
+            ..composite
+        };
+        assert!(try_encode_binary_transaction(&two_commands).is_none());
+        let mut malformed = payload;
+        malformed[3..7].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(decode_binary_record(&malformed).is_err());
     }
 }
 

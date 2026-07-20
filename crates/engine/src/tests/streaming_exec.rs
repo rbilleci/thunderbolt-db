@@ -1251,7 +1251,7 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     let recovered = std::sync::Arc::new(recovered);
     let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
     let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-    recovered.set_intent_lanes_classic_prelock_hook(
+    recovered.set_commit_prelock_hook(
         std::sync::Arc::clone(&reached),
         std::sync::Arc::clone(&resume),
     );

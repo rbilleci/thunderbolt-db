@@ -90,7 +90,8 @@ mod resident_text;
 pub use resident_scalar::CudaI32Stats;
 mod expression_vm;
 use expression_vm::{
-    run_resident_arith_program, run_resident_arith_program_at_indices, ExprTerminal,
+    run_resident_arith_program, run_resident_arith_program_at_indices,
+    run_resident_predicate_program_at_indices, ExprTerminal,
 };
 pub use expression_vm::{ExprStep, ResidentElemType};
 mod expression_filter;

@@ -5,11 +5,14 @@
 //! engine_write_apply (which installs the WriteDelta under the commit lock).
 
 use super::*;
+use crate::engine_expr_ir::{ResidentBinaryOp, ResidentExpr};
 
 mod contracts;
 pub(crate) use contracts::{device_structural_tuple_predicate, device_structural_tuple_predicates};
 mod device_tuple;
 mod unique_conflict;
+#[cfg(test)]
+pub(crate) use unique_conflict::RESIDENT_EXACT_KEY_FULL_SCAN_PROBES;
 
 use contracts::device_eq_scan_literal;
 pub(crate) use contracts::{
@@ -217,6 +220,7 @@ impl Engine {
             inserted_rows.push((row_key, values));
         }
         let mut write_set = WriteSet::default();
+        write_set.tables.insert(insert.table.clone());
         for (_row_key, values) in &inserted_rows {
             // An INSERT claims a FRESH, unique row id at install time (`apply_delta` reserves the
             // tuple id + advances `relational_next_row_id` under the commit lock), so its row slot
@@ -230,8 +234,13 @@ impl Engine {
             write_set.add_unique_slots(table, values);
         }
 
+        let (catalog_dependencies, foreign_key_dependencies) =
+            transaction_dml_dependencies(&catalog, table);
         Ok(WriteDelta {
             write_set,
+            read_snapshot: snapshot.commit_seq,
+            catalog_dependencies,
+            foreign_key_dependencies,
             rows_consumed,
             mutation: PreparedMutation::Insert {
                 table: insert.table.clone(),
@@ -310,6 +319,7 @@ impl Engine {
         }
 
         let mut write_set = WriteSet::default();
+        write_set.tables.insert(delete.table.clone());
         let mut tuple_ids = Vec::with_capacity(deletes.len());
         // SV4b: surface the resolved row images (catalog order) so the commit path can locate + tombstone
         // them on the resident GPU shard in place. Already decoded above for the filter/FK scan -- clone here.
@@ -326,8 +336,13 @@ impl Engine {
             write_set.add_unique_slots(table, row);
         }
 
+        let (catalog_dependencies, foreign_key_dependencies) =
+            transaction_dml_dependencies(&catalog, table);
         Ok(WriteDelta {
             write_set,
+            read_snapshot: snapshot.commit_seq,
+            catalog_dependencies,
+            foreign_key_dependencies,
             rows_consumed: 0,
             mutation: PreparedMutation::Delete {
                 table: delete.table.clone(),
@@ -340,10 +355,10 @@ impl Engine {
 
     /// Pick the device index probe key used by transaction conflict/history bookkeeping for one
     /// Eq-predicate group. Mutation resolution itself uses the exact typed predicate scan below.
-    /// Preference: a fingerprint-backed unique index (compound or single wider/text) whose EVERY key
-    /// column is Eq-covered -> `(FLAG | ordinal, fingerprint)`, byte-matching the device-built index;
-    /// else the FIRST raw i32-section Eq -> `(col_idx, needle)`. The caller's full `filter_groups`
-    /// callers retain an exact device predicate because the fingerprint is only an address hint.
+    /// Preference: a named unique index whose EVERY key column is Eq-covered, byte-matching the
+    /// device-built index. Compatibility callers may finally use the first raw i32-section Eq as a
+    /// scan-address hint; an engine-prepared route never may, because its proof pins named indexes
+    /// only and must not manufacture an undeclared cache build from column order.
     pub(crate) fn dml_device_probe_key(
         &self,
         table: &RelationalTable,
@@ -399,8 +414,40 @@ impl Engine {
                 ));
             }
         }
+        // A raw single-column named index stores its i32-section needle directly. Resolve this
+        // before the compatibility fallback so `(payload INT, id INT PRIMARY KEY)` probes `id`,
+        // regardless of physical column order.
+        for (ord, index) in table.indexes.iter().enumerate().filter(|(_, index)| {
+            index.unique && !crate::engine_residency::index_uses_fingerprint(table, index)
+        }) {
+            let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
+            else {
+                continue;
+            };
+            let [position] = positions.as_slice() else {
+                continue;
+            };
+            let Some((_, value)) = eqs.iter().find(|(idx, _)| idx == position) else {
+                continue;
+            };
+            let Some(needle) = table
+                .columns
+                .get(*position)
+                .and_then(|column| crate::engine_residency::i32_section_needle(column.ty, value))
+            else {
+                continue;
+            };
+            let Some(key_id) = crate::engine_residency::index_probe_key_id(table, index, ord)
+            else {
+                continue;
+            };
+            return Some((key_id, needle));
+        }
+        if crate::engine_prepared_transaction::prepared_index_route_required() {
+            return None;
+        }
         // Single-column key fallback: the first i32-section Eq -> `(col_idx, raw i32 needle)` (a
-        // single-column key stores the raw i32; byte-identical to the prior behavior).
+        // compatibility scan hint stores the raw i32; byte-identical to the prior behavior).
         eqs.iter().find_map(|(idx, value)| {
             table
                 .columns
@@ -447,30 +494,45 @@ impl Engine {
         visibility: StorageVisibility,
         assignments: Option<&[BoundUpdateAssignment]>,
     ) -> Result<Option<DmlResolvedUpdate>, EngineError> {
-        // Lower the WHERE to the typed ResidentExpr DNF. Predicate-free DML uses a device-generated
-        // all-slots range; it never constructs an O(rows) host identity vector.
-        let predicate = if filter_groups.is_empty() {
-            None
-        } else {
-            Some(
-                dml_filter_groups_to_device_predicate(table, filter_groups).ok_or_else(|| {
-                    EngineError::ApplyFailed(format!(
-                        "device DML predicate is unsupported for relation \"{}\"",
-                        table.name
-                    ))
-                })?,
-            )
-        };
         // Evaluate the predicate ON-DEVICE per shard -> matching slots WITH each slot's generation-consistent
         // buffer + version regions + descriptor captured from ONE `shards.load()` (the W0-guarded detailed
         // locate), so slot + buffer + regions never straddle a concurrent re-admit (prepare runs off-lock).
         // The slots are visibility-BLIND physical positions; the materialize step applies SV3b/SV6 visibility.
-        let hits = match predicate.as_ref() {
-            Some(predicate) => self.locate_resident_delete_slots_detailed(table, predicate),
-            None => self.locate_resident_all_slots_detailed(table),
-        };
-        let Some(hits) = hits else {
-            return Ok(None);
+        let require_index = crate::engine_prepared_transaction::prepared_index_route_required();
+        let hits = if require_index {
+            let [group] = filter_groups else {
+                return Err(EngineError::ApplyFailed(format!(
+                    "engine-prepared device index route for relation \"{}\" requires one unique-key predicate group",
+                    table.name
+                )));
+            };
+            self.prepared_exact_index_hits(table, group, visibility)?
+        } else {
+            // Lower the WHERE to the typed ResidentExpr DNF only for the general scan route.
+            // Prepared equality with a typed NULL has an indexed empty verdict and deliberately
+            // bypasses this lowering, whose scalar comparison vocabulary has no NULL needle.
+            let predicate = if filter_groups.is_empty() {
+                None
+            } else {
+                Some(
+                    dml_filter_groups_to_device_predicate(table, filter_groups).ok_or_else(
+                        || {
+                            EngineError::ApplyFailed(format!(
+                                "device DML predicate is unsupported for relation \"{}\"",
+                                table.name
+                            ))
+                        },
+                    )?,
+                )
+            };
+            let hits = match predicate.as_ref() {
+                Some(predicate) => self.locate_resident_delete_slots_detailed(table, predicate),
+                None => self.locate_resident_all_slots_detailed(table),
+            };
+            let Some(hits) = hits else {
+                return Ok(None);
+            };
+            hits
         };
         let mut matches: Vec<DmlResolvedMatch> = Vec::new();
         let mut old_rows: Vec<(u64, Vec<SqlValue>)> = Vec::new();
@@ -522,6 +584,153 @@ impl Engine {
             matches,
             old_rows.into_iter().map(|(_, row)| row).collect(),
         )))
+    }
+
+    /// Resolve a named-index candidate set through an exact fixed-width GPU predicate and GPU MVCC
+    /// visibility at those same coordinates. The host only maps device-approved coordinates back to
+    /// generation-pinned hit descriptors; it never compares key values or decides visibility.
+    pub(crate) fn prepared_exact_index_hits(
+        &self,
+        table: &RelationalTable,
+        group: &[(usize, SelectFilterOp, SqlValue)],
+        visibility: StorageVisibility,
+    ) -> Result<Vec<crate::engine_retained_read::ShardPkHit>, EngineError> {
+        let candidates = self.prepared_exact_index_candidates(table, group)?;
+        let mut by_shard: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (position, hit) in candidates.iter().enumerate() {
+            by_shard.entry(hit.shard_id).or_default().push(position);
+        }
+        let mut approved = BTreeSet::new();
+        for (shard_id, positions) in by_shard {
+            let first = &candidates[positions[0]];
+            let mut slots = positions
+                .iter()
+                .map(|position| candidates[*position].slot)
+                .collect::<Vec<_>>();
+            for (region, cmp) in [(&first.deleted_by, 3_u32), (&first.created_by, 2_u32)] {
+                let Some(region) = region else {
+                    continue;
+                };
+                slots = region
+                    .run_expr_predicate_filter_at_indices(
+                        &[
+                            gpu_db_execution::ExprStep::LoadColumnI64 { byte_offset: 0 },
+                            gpu_db_execution::ExprStep::CompareScalarI64 {
+                                cmp,
+                                scalar: i64::try_from(visibility.read_txn_id).map_err(|_| {
+                                    EngineError::ApplyFailed(
+                                        "transaction visibility exceeds signed device sequence"
+                                            .to_string(),
+                                    )
+                                })?,
+                                scalar_on_left: false,
+                            },
+                        ],
+                        u32::try_from(first.descriptor.row_count).map_err(|_| {
+                            EngineError::ApplyFailed(
+                                "resident candidate source exceeds u32 device coordinates"
+                                    .to_string(),
+                            )
+                        })?,
+                        &slots,
+                        gpu_db_execution::ResidentElemType::I32,
+                    )
+                    .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+            }
+            approved.extend(slots.into_iter().map(|slot| (shard_id, slot)));
+        }
+        let hits = candidates
+            .into_iter()
+            .filter(|hit| approved.contains(&(hit.shard_id, hit.slot)))
+            .collect::<Vec<_>>();
+        self.read_state
+            .residency
+            .dml_device_resolve_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(hits)
+    }
+
+    /// Exact-key candidates without a visibility filter, used by write-conflict history. The named
+    /// index bounds the addresses and the typed GPU predicate rejects fingerprint collisions.
+    pub(crate) fn prepared_exact_index_candidates(
+        &self,
+        table: &RelationalTable,
+        group: &[(usize, SelectFilterOp, SqlValue)],
+    ) -> Result<Vec<crate::engine_retained_read::ShardPkHit>, EngineError> {
+        let (key_id, needle) = match crate::engine_prepared_transaction::prepared_index_probe(
+            table, group,
+        ) {
+            Some(crate::engine_prepared_transaction::PreparedIndexProbe::Empty) => {
+                return Ok(Vec::new());
+            }
+            Some(crate::engine_prepared_transaction::PreparedIndexProbe::Key {
+                key_id,
+                needle,
+            }) => (key_id, needle),
+            None => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "engine-prepared device index route for relation \"{}\" has no exact named-index probe",
+                    table.name
+                )));
+            }
+        };
+        let mut candidates = self
+            .locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "engine-prepared device index route for relation \"{}\" declined",
+                    table.name
+                ))
+            })?;
+        // A transaction-held snapshot may safely reuse a newer superset index over the same pinned
+        // source allocation. Remove coordinates beyond that snapshot's descriptor row count before
+        // any typed load; this is address-range validation, while value equality and visibility
+        // remain GPU verdicts below.
+        candidates.retain(|hit| (hit.slot as usize) < hit.descriptor.row_count);
+        let predicate = dml_filter_groups_to_device_predicate(table, &[group.to_vec()])
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "engine-prepared exact predicate for relation \"{}\" is unsupported",
+                    table.name
+                ))
+            })?;
+        let mut by_shard: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (position, hit) in candidates.iter().enumerate() {
+            by_shard.entry(hit.shard_id).or_default().push(position);
+        }
+        let mut approved = BTreeSet::new();
+        for (shard_id, positions) in by_shard {
+            let first = &candidates[positions[0]];
+            if positions.iter().any(|position| {
+                let hit = &candidates[*position];
+                hit.device_memory.device_ptr() != first.device_memory.device_ptr()
+                    || hit.descriptor.row_count != first.descriptor.row_count
+            }) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "engine-prepared candidate generation for relation \"{}\" is torn",
+                    table.name
+                )));
+            }
+            let slots = positions
+                .iter()
+                .map(|position| candidates[*position].slot)
+                .collect::<Vec<_>>();
+            let slots = self
+                .resident_predicate_device_filter_at_indices(
+                    &predicate,
+                    table,
+                    &first.descriptor,
+                    &first.device_memory,
+                    &slots,
+                )
+                .map_err(prepared_candidate_execute_error)?;
+            approved.extend(slots.into_iter().map(|slot| (shard_id, slot)));
+        }
+        let hits = candidates
+            .into_iter()
+            .filter(|hit| approved.contains(&(hit.shard_id, hit.slot)))
+            .collect::<Vec<_>>();
+        Ok(hits)
     }
 
     /// Apply a bound UPDATE assignment set against one pinned device source. Literal assignment
@@ -858,6 +1067,22 @@ impl Engine {
         value: &SqlValue,
         exclude_keys: Option<&BTreeSet<String>>,
     ) -> Option<bool> {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            if !snapshot
+                .catalog
+                .relational_catalog
+                .contains_key(&table.name)
+                && snapshot
+                    .transaction_shards()
+                    .get(&table.name)
+                    .is_some_and(Vec::is_empty)
+            {
+                // A private CREATE owns an exact empty device relation before its first INSERT.
+                // No published or host relation can contain a conflicting key, and later private
+                // statements replace the empty vector with real GPU shards before probing here.
+                return Some(false);
+            }
+        }
         if self.table_chunk_authoritative(&table.name).is_some() {
             if self.current_transaction_read_snapshot().is_none() {
                 visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
@@ -869,6 +1094,16 @@ impl Engine {
                 value,
                 exclude_keys,
             );
+        }
+        if crate::engine_prepared_transaction::prepared_index_route_required() {
+            let hits = self
+                .prepared_exact_index_hits(
+                    table,
+                    &[(column_idx, SelectFilterOp::Eq, value.clone())],
+                    visibility,
+                )
+                .ok()?;
+            return self.prepared_index_hit_exists(table, &hits, exclude_keys);
         }
         // R3-004: use the exact typed predicate for every resident probe. Fingerprint indexes are
         // addressing accelerators, not authorities; bypassing them here removes the host tuple
@@ -922,6 +1157,38 @@ impl Engine {
             .dml_device_validate_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(answer)
+    }
+
+    pub(crate) fn prepared_index_hit_exists(
+        &self,
+        table: &RelationalTable,
+        hits: &[crate::engine_retained_read::ShardPkHit],
+        exclude_keys: Option<&BTreeSet<String>>,
+    ) -> Option<bool> {
+        for hit in hits {
+            let region = hit.row_id.as_ref()?;
+            let halves = region
+                .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
+                .ok()?;
+            let (lo, hi) = (*halves.first()?, *halves.get(1)?);
+            let row_id = (lo as u32 as u64) | ((hi as u32 as u64) << 32);
+            if row_id == u64::MAX {
+                return None;
+            }
+            let key = relational_row_key(&table.name, row_id);
+            if !exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
+                self.read_state
+                    .residency
+                    .dml_device_validate_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(true);
+            }
+        }
+        self.read_state
+            .residency
+            .dml_device_validate_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(false)
     }
 
     /// Device-authoritative structural equality probe. A decline fails loud; it never dispatches
@@ -997,6 +1264,100 @@ impl Engine {
         )))
     }
 
+    /// Evaluate row-local CHECK violations over a transient device relation. The predicate is the
+    /// exact logical complement of the stored CHECK comparison; SQL NULLs satisfy CHECK because
+    /// the device validity mask excludes them from both the comparison and its complement. The
+    /// compacted candidate coordinates are only marshaled into the device threshold primitive;
+    /// its one status bit is the constraint verdict.
+    fn validate_check_constraints_on_device(
+        &self,
+        table: &RelationalTable,
+        new_images: &[Vec<SqlValue>],
+    ) -> Result<(), EngineError> {
+        if new_images.is_empty() || table.check_constraints.is_empty() {
+            return Ok(());
+        }
+        let (snapshot, memory) = self
+            .build_transient_relation_residency(table, new_images)
+            .map_err(|error| {
+                EngineError::ApplyFailed(format!(
+                    "device CHECK relation build failed for \"{}\": {error}",
+                    table.name
+                ))
+            })?;
+        for constraint in &table.check_constraints {
+            let column = relational_column_index(table, &constraint.column)
+                .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+            let predicate = dml_filter_groups_to_device_predicate(
+                table,
+                &[vec![(column, constraint.op, constraint.value.clone())]],
+            )
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "device CHECK predicate unavailable for constraint \"{}\"",
+                    constraint.name
+                ))
+            })?;
+            let ResidentExpr::Binary { op, lhs, rhs } = predicate else {
+                return Err(EngineError::ApplyFailed(format!(
+                    "device CHECK predicate shape unavailable for constraint \"{}\"",
+                    constraint.name
+                )));
+            };
+            let violation_op = match op {
+                ResidentBinaryOp::Eq => ResidentBinaryOp::Ne,
+                ResidentBinaryOp::Lt => ResidentBinaryOp::Ge,
+                ResidentBinaryOp::Le => ResidentBinaryOp::Gt,
+                ResidentBinaryOp::Gt => ResidentBinaryOp::Le,
+                ResidentBinaryOp::Ge => ResidentBinaryOp::Lt,
+                _ => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "device CHECK operator unavailable for constraint \"{}\"",
+                        constraint.name
+                    )))
+                }
+            };
+            let violation = ResidentExpr::Binary {
+                op: violation_op,
+                lhs,
+                rhs,
+            };
+            let candidates = self
+                .lower_resident_predicate(
+                    &violation,
+                    table,
+                    &snapshot,
+                    &memory,
+                    new_images.len() as u64,
+                    None,
+                )
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "device CHECK evaluation failed for constraint \"{}\": {error}",
+                        constraint.name
+                    ))
+                })?
+                .into_iter()
+                .map(u64::from)
+                .collect::<Vec<_>>();
+            let violated = memory
+                .unique_coordinate_threshold_reached(&candidates, &[], 1)
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "device CHECK verdict failed for constraint \"{}\": {error}",
+                        constraint.name
+                    ))
+                })?;
+            if violated {
+                return Err(EngineError::ApplyFailed(format!(
+                    "new row for relation \"{}\" violates check constraint \"{}\"",
+                    table.name, constraint.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Device-native constraint validation restricted to what the statement can affect: untouched
     /// survivors were valid before it, so only new images (unique/CHECK/outbound FK) and removed
     /// provider values (inbound FK) need work. Exact typed device probes replace related-table
@@ -1018,8 +1379,19 @@ impl Engine {
     ) -> Result<(), EngineError> {
         // 0. PK NOT NULL (PG 23502): checked FIRST, before unique — byte-identical to the scan arm.
         Self::validate_primary_key_not_null(table, new_images.iter().map(Vec::as_slice))?;
-        // 1. UNIQUE: in-batch duplicates among the new images (the scan validator's BTreeSet pass,
-        //    NULLs collide) + each new value vs the UNTOUCHED visible rows via the index.
+        // 1. UNIQUE: the transient device relation owns the exact within-statement tuple verdict.
+        // The ordinary/general path deliberately has no row-count compatibility cap; the bounded
+        // chunk class applies its own latency-class cap before calling the same GPU primitive.
+        match self.validate_new_rows_unique_on_device(table, new_images) {
+            Some(result) => result?,
+            None => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "device in-batch unique verdict unavailable for relation \"{}\"",
+                    table.name
+                )))
+            }
+        }
+        // Each new value is then checked against the UNTOUCHED visible device generation.
         for (ord, index) in table.indexes.iter().enumerate().filter(|(_, i)| i.unique) {
             // COMPOUND KEYS: validate the ORDERED key TUPLE (single-column keys resolve `[column_idx]`,
             // byte-identical to the prior path). In-batch tuple dedup + each new tuple vs untouched
@@ -1031,51 +1403,47 @@ impl Engine {
             let fingerprint_backed = crate::engine_residency::index_uses_fingerprint(table, index);
             let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)
                 .unwrap_or(positions[0]);
-            let mut seen: BTreeSet<Vec<SqlValue>> = BTreeSet::new();
             for row in new_images {
-                let tuple_key: Vec<SqlValue> = positions.iter().map(|&i| row[i].clone()).collect();
-                if tuple_key
+                if positions
                     .iter()
-                    .any(|value| matches!(value, SqlValue::Null))
+                    .any(|&position| matches!(row[position], SqlValue::Null))
                 {
                     continue;
                 }
-                let conflict = !seen.insert(tuple_key) || {
-                    if fingerprint_backed {
-                        let key_cols: Vec<(usize, SqlValue)> =
-                            positions.iter().map(|&i| (i, row[i].clone())).collect();
-                        let fingerprint = crate::engine_residency::compound_index_row_fingerprint(
-                            table, index, row,
-                        );
-                        self.visible_row_with_tuple(
-                            table,
-                            visibility,
-                            key_id,
-                            fingerprint,
-                            &key_cols,
-                            Some(touched_keys),
-                        )?
-                    } else {
-                        self.visible_row_with_value(
-                            table,
-                            visibility,
-                            key_id,
-                            &row[positions[0]],
-                            Some(touched_keys),
-                        )?
-                    }
+                let conflict = if fingerprint_backed {
+                    let key_cols: Vec<(usize, SqlValue)> =
+                        positions.iter().map(|&i| (i, row[i].clone())).collect();
+                    let fingerprint =
+                        crate::engine_residency::compound_index_row_fingerprint(table, index, row);
+                    self.visible_row_with_tuple(
+                        table,
+                        visibility,
+                        key_id,
+                        fingerprint,
+                        &key_cols,
+                        Some(touched_keys),
+                    )?
+                } else {
+                    self.visible_row_with_value(
+                        table,
+                        visibility,
+                        key_id,
+                        &row[positions[0]],
+                        Some(touched_keys),
+                    )?
                 };
                 if conflict {
-                    return Err(EngineError::ApplyFailed(format!(
+                    return Err(EngineError::UniqueViolation(format!(
                         "duplicate key value violates unique index \"{}\"",
                         index.name
                     )));
                 }
             }
         }
-        // 2. CHECK: per-row on the new images (survivors passed at their own write; ADD CHECK
-        //    validates existing rows at DDL time — the invariant the restriction rests on).
-        Self::validate_check_constraints_for_rows(table, new_images)?;
+        // 2. CHECK: a transient device relation evaluates the complement predicate and the device
+        // threshold bit decides whether any non-NULL row violates it. Survivors passed at their own
+        // write; ADD CHECK validates existing rows at DDL time.
+        self.validate_check_constraints_on_device(table, new_images)?;
         // 3. OUTBOUND FK (this table is the child): each new image's FK value must have a visible
         //    provider. For a self-FK, another new image in this statement may provide it.
         for foreign_key in &table.foreign_keys {
@@ -1304,6 +1672,7 @@ impl Engine {
         }
 
         let mut write_set = WriteSet::default();
+        write_set.tables.insert(update.table.clone());
         for (_, key, row) in &updates {
             // An UPDATE tombstones the old version and installs a new one at the SAME row key,
             // so the row slot is written once.
@@ -1322,8 +1691,13 @@ impl Engine {
         write_set.unique_slots.dedup();
 
         // `updates` is already `(tuple_id, row_key, new_values)` — exactly the install shape.
+        let (catalog_dependencies, foreign_key_dependencies) =
+            transaction_dml_dependencies(&catalog, table);
         Ok(WriteDelta {
             write_set,
+            read_snapshot: snapshot.commit_seq,
+            catalog_dependencies,
+            foreign_key_dependencies,
             rows_consumed: 0,
             mutation: PreparedMutation::Update {
                 table: update.table.clone(),
@@ -1332,5 +1706,45 @@ impl Engine {
                 class_epoch,
             },
         })
+    }
+}
+
+fn transaction_dml_dependencies(
+    catalog: &CatalogSnapshot,
+    target: &RelationalTable,
+) -> (BTreeMap<String, RelationalTable>, BTreeSet<String>) {
+    let mut names = BTreeSet::from([target.name.clone()]);
+    let mut foreign_key_dependencies = BTreeSet::new();
+    for foreign_key in &target.foreign_keys {
+        names.insert(foreign_key.referenced_table.clone());
+        foreign_key_dependencies.insert(foreign_key.referenced_table.clone());
+    }
+    for candidate in catalog.relational_catalog.values() {
+        if candidate
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| foreign_key.referenced_table == target.name)
+        {
+            names.insert(candidate.name.clone());
+            foreign_key_dependencies.insert(candidate.name.clone());
+        }
+    }
+    let catalog_dependencies = names
+        .into_iter()
+        .filter_map(|name| {
+            catalog
+                .relational_catalog
+                .get(&name)
+                .cloned()
+                .map(|table| (name, table))
+        })
+        .collect();
+    (catalog_dependencies, foreign_key_dependencies)
+}
+
+fn prepared_candidate_execute_error(error: ExecuteError) -> EngineError {
+    match error {
+        ExecuteError::Engine(error) => error,
+        other => EngineError::ApplyFailed(other.to_string()),
     }
 }

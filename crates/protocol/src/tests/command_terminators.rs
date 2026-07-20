@@ -4,8 +4,18 @@ use super::*;
 
 #[test]
 fn accepts_optional_statement_terminator() {
-    assert_eq!(parse_command("BEGIN;").unwrap(), Command::Begin);
-    assert_eq!(parse_command("START WORK;").unwrap(), Command::Begin);
+    assert_eq!(
+        parse_command("BEGIN;").unwrap(),
+        Command::Begin {
+            characteristics: TransactionCharacteristics::default(),
+        }
+    );
+    assert_eq!(
+        parse_command("START WORK;").unwrap(),
+        Command::Begin {
+            characteristics: TransactionCharacteristics::default(),
+        }
+    );
     assert_eq!(
         parse_command("END AND CHAIN;").unwrap(),
         Command::Commit { chain: true }
@@ -124,7 +134,12 @@ fn accepts_optional_statement_terminator() {
 
 #[test]
 fn accepts_repeated_statement_terminators() {
-    assert_eq!(parse_command("BEGIN;;").unwrap(), Command::Begin);
+    assert_eq!(
+        parse_command("BEGIN;;").unwrap(),
+        Command::Begin {
+            characteristics: TransactionCharacteristics::default(),
+        }
+    );
     assert_eq!(
         parse_command("SET balance = 42; ; \n").unwrap(),
         Command::SetKv {

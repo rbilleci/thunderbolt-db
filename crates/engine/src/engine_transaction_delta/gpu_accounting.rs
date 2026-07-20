@@ -2,19 +2,26 @@
 
 use super::*;
 
+#[derive(Default)]
+struct TransactionPublicationImages {
+    old_rows: Vec<Vec<SqlValue>>,
+    old_row_ids: Vec<u64>,
+    new_rows: Vec<Vec<SqlValue>>,
+}
+
 /// Exact pre-allocation charge for device objects created while building one transaction-private
 /// generation. Reservations enter the engine-wide budget account before CUDA allocation. A failed
 /// statement releases them on drop; a successful publish transfers them to the transaction's
 /// current generation account. The transaction statement lock excludes same-transaction readers
 /// while replacement charges are reconciled, and transaction teardown releases the final account.
-pub(super) struct TransactionGpuReservation<'a> {
+pub(crate) struct TransactionGpuReservation<'a> {
     engine: &'a Engine,
     bytes_by_gpu: BTreeMap<u16, u64>,
     transferred: bool,
 }
 
 impl<'a> TransactionGpuReservation<'a> {
-    pub(super) fn new(engine: &'a Engine) -> Self {
+    pub(crate) fn new(engine: &'a Engine) -> Self {
         Self {
             engine,
             bytes_by_gpu: BTreeMap::new(),
@@ -22,7 +29,7 @@ impl<'a> TransactionGpuReservation<'a> {
         }
     }
 
-    pub(super) fn reserve(&mut self, gpu_id: u16, bytes: u64) -> Result<(), ExecuteError> {
+    pub(crate) fn reserve(&mut self, gpu_id: u16, bytes: u64) -> Result<(), ExecuteError> {
         if bytes == 0 {
             return Ok(());
         }
@@ -63,7 +70,7 @@ impl<'a> TransactionGpuReservation<'a> {
     /// allocation is the exact `allocated_bytes` later retained by the private generation. The
     /// current driver allocates exactly the requested region; failing closed here prevents a
     /// future padded/pooled allocator from silently retaining more device memory than was admitted.
-    pub(super) fn verify_allocation(
+    pub(crate) fn verify_allocation(
         &self,
         gpu_id: u16,
         reserved_bytes: u64,
@@ -166,6 +173,354 @@ impl Drop for TransactionGpuReservation<'_> {
     }
 }
 
+impl Engine {
+    fn reconcile_transaction_commit_gpu_reservation(
+        &self,
+        current: &mut BTreeMap<u16, u64>,
+        replacement: &BTreeMap<u16, u64>,
+    ) -> Result<(), ExecuteError> {
+        let _budget_guard = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for gpu_id in current
+            .keys()
+            .chain(replacement.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            let old = current.get(&gpu_id).copied().unwrap_or(0);
+            let new = replacement.get(&gpu_id).copied().unwrap_or(0);
+            let accounted_without_old = self
+                .relational_resident_bytes_for_gpu(gpu_id)
+                .saturating_sub(old);
+            if self
+                .relational_residency_budget_bytes(gpu_id)
+                .is_some_and(|budget| accounted_without_old.saturating_add(new) > budget)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "transaction commit requires {new} additional bytes for canonical GPU publication on GPU {gpu_id}, exceeding the residency budget"
+                ))));
+            }
+        }
+        let mut account = self
+            .transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (gpu_id, bytes) in current.iter() {
+            let slot = account.entry(*gpu_id).or_default();
+            *slot = slot.saturating_sub(*bytes);
+        }
+        for (gpu_id, bytes) in replacement {
+            let slot = account.entry(*gpu_id).or_default();
+            *slot = slot.saturating_add(*bytes);
+        }
+        account.retain(|_, bytes| *bytes != 0);
+        *current = replacement.clone();
+        Ok(())
+    }
+
+    /// Restore any previously enrolled existing-table indexes before WAL. The lifecycle guard
+    /// acquired by the caller defers destructive purges until canonical apply completes, so this
+    /// proof cannot disappear in the durability interval. Empty generations need no restoration:
+    /// rollover publication will build the first non-empty shard from its exact reserved geometry.
+    fn restore_transaction_named_indexes_before_wal(
+        &self,
+        transaction_catalog: &CatalogSnapshot,
+        record: &BinaryTransactionRecord,
+    ) -> Result<(), ExecuteError> {
+        let created_tables = record
+            .catalog_commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::CreateTable(create) => Some(create.table.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let appended_tables = record
+            .mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                BinaryTransactionMutation::Insert { table, .. }
+                | BinaryTransactionMutation::Update { table, .. } => Some(table.as_str()),
+                BinaryTransactionMutation::Delete { .. } => None,
+            })
+            .filter(|table| !created_tables.contains(table))
+            .collect::<BTreeSet<_>>();
+        let current_shards = self.read_residency_shards();
+        for table_name in appended_tables {
+            let table = transaction_catalog
+                .relational_catalog
+                .get(table_name)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "transaction index restoration targets unknown relation \"{table_name}\""
+                    )))
+                })?;
+            if self.table_chunk_authoritative(table_name).is_some()
+                || !self.relational_named_index_publication_required(table)
+            {
+                continue;
+            }
+            let shards = current_shards.get(table_name).ok_or_else(|| {
+                ExecuteError::Serialization(format!(
+                    "relation \"{table_name}\" lost its resident shards before index restoration"
+                ))
+            })?;
+            if shards.iter().all(|shard| shard.row_count == 0) {
+                continue;
+            }
+            self.publish_relational_resident_indexes_for_generation(
+                table,
+                shards,
+                self.committed_seq(),
+                false,
+                false,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Compute the exact allocations retained by canonical publication of the final coalesced WAL
+    /// record. Statement-private intermediate versions are deliberately absent: their allocation
+    /// charges become temporary publication credit after durability, but they never define the
+    /// final index or rollover geometry.
+    fn transaction_canonical_publication_gpu_bytes(
+        &self,
+        snapshot: &TransactionSnapshot,
+        transaction_catalog: &CatalogSnapshot,
+        record: &BinaryTransactionRecord,
+    ) -> Result<BTreeMap<u16, u64>, ExecuteError> {
+        let created_tables = record
+            .catalog_commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::CreateTable(create) => Some(create.table.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut by_table = BTreeMap::<String, TransactionPublicationImages>::new();
+        for mutation in &record.mutations {
+            let (table_name, row_id) = match mutation {
+                BinaryTransactionMutation::Insert { table, row_id, .. }
+                | BinaryTransactionMutation::Update { table, row_id, .. }
+                | BinaryTransactionMutation::Delete { table, row_id, .. } => (table, *row_id),
+            };
+            let table = transaction_catalog
+                .relational_catalog
+                .get(table_name)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "transaction publication targets unknown relation \"{table_name}\""
+                    )))
+                })?;
+            let images = by_table.entry(table_name.clone()).or_default();
+            match mutation {
+                BinaryTransactionMutation::Insert { row_encoded, .. } => {
+                    images.new_rows.push(
+                        decode_relational_row(row_encoded, &table.columns).map_err(|error| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "transaction publication insert image decode failed for \"{table_name}\": {error}"
+                            )))
+                        })?,
+                    );
+                }
+                BinaryTransactionMutation::Update {
+                    old_row_encoded,
+                    new_row_encoded,
+                    ..
+                } => {
+                    images.old_rows.push(
+                        decode_relational_row(old_row_encoded, &table.columns).map_err(|error| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "transaction publication old update image decode failed for \"{table_name}\": {error}"
+                            )))
+                        })?,
+                    );
+                    images.old_row_ids.push(row_id);
+                    images.new_rows.push(
+                        decode_relational_row(new_row_encoded, &table.columns).map_err(|error| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "transaction publication new update image decode failed for \"{table_name}\": {error}"
+                            )))
+                        })?,
+                    );
+                }
+                BinaryTransactionMutation::Delete {
+                    old_row_encoded, ..
+                } => {
+                    images.old_rows.push(
+                        decode_relational_row(old_row_encoded, &table.columns).map_err(|error| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "transaction publication delete image decode failed for \"{table_name}\": {error}"
+                            )))
+                        })?,
+                    );
+                    images.old_row_ids.push(row_id);
+                }
+            }
+        }
+
+        let private_shards = snapshot.transaction_shards();
+        let current_shards = self.read_residency_shards();
+        let mut bytes_by_gpu = BTreeMap::<u16, u64>::new();
+        let mut add = |gpu_id: u16, bytes: u64| -> Result<(), ExecuteError> {
+            let slot = bytes_by_gpu.entry(gpu_id).or_default();
+            *slot = slot.checked_add(bytes).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transaction canonical publication reservation overflowed".to_string(),
+                ))
+            })?;
+            Ok(())
+        };
+        for (table_name, images) in by_table {
+            let table = transaction_catalog
+                .relational_catalog
+                .get(&table_name)
+                .expect("publication image table was resolved above");
+            if self.table_chunk_authoritative(&table_name).is_some() {
+                continue;
+            }
+            if created_tables.contains(&table_name) {
+                if !images.old_rows.is_empty() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "transaction-created relation \"{table_name}\" has a non-insert final mutation"
+                    ))));
+                }
+                if images.new_rows.is_empty() {
+                    continue;
+                }
+                let gpu_id = private_shards
+                    .get(&table_name)
+                    .and_then(|shards| shards.first())
+                    .map(|shard| shard.gpu_id)
+                    .unwrap_or_else(|| self.planner.default_gpu_id());
+                let names = table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>();
+                let types = table
+                    .columns
+                    .iter()
+                    .map(|column| column.ty)
+                    .collect::<Vec<_>>();
+                let (payload, ..) = crate::engine_residency::build_relational_device_payload(
+                    &names,
+                    &types,
+                    &images.new_rows,
+                )?;
+                let row_count = images.new_rows.len();
+                let index_bytes = crate::engine_residency::estimated_named_index_bytes_for_shard(
+                    table, row_count, row_count,
+                )
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{table_name}\" has unsupported mandatory index allocation geometry"
+                    )))
+                })?;
+                let bytes = (payload.len() as u64)
+                    .checked_add((row_count as u64).checked_mul(8).ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transaction-created row identity reservation overflowed".to_string(),
+                        ))
+                    })?)
+                    .and_then(|bytes| bytes.checked_add(index_bytes))
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transaction-created publication reservation overflowed".to_string(),
+                        ))
+                    })?;
+                add(gpu_id, bytes)?;
+                continue;
+            }
+
+            if !images.old_rows.is_empty() {
+                let locations = self
+                    .locate_transaction_rows_by_identity(
+                        table,
+                        &images.old_rows,
+                        &images.old_row_ids,
+                        self.committed_seq(),
+                    )
+                    .ok_or_else(|| {
+                        ExecuteError::Serialization(format!(
+                            "relation \"{table_name}\" changed before transaction publication preflight"
+                        ))
+                    })?;
+                let table_shards = current_shards.get(&table_name).ok_or_else(|| {
+                    ExecuteError::Serialization(format!(
+                        "relation \"{table_name}\" lost its resident shards before transaction publication"
+                    ))
+                })?;
+                for shard_id in locations.keys() {
+                    let shard = table_shards
+                        .iter()
+                        .find(|shard| shard.shard_id == *shard_id)
+                        .ok_or_else(|| {
+                            ExecuteError::Serialization(format!(
+                                "relation \"{table_name}\" changed shard identity before transaction publication"
+                            ))
+                        })?;
+                    if shard.deleted_by_region.is_none() {
+                        add(
+                            shard.gpu_id,
+                            (shard.capacity as u64).checked_mul(8).ok_or_else(|| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "transaction deleted-by reservation overflowed".to_string(),
+                                ))
+                            })?,
+                        )?;
+                    }
+                }
+            }
+            if !images.new_rows.is_empty() {
+                let (gpu_id, bytes) =
+                    self.transaction_resident_append_allocation_bytes(table, &images.new_rows)?;
+                add(gpu_id, bytes)?;
+            }
+        }
+        Ok(bytes_by_gpu)
+    }
+
+    pub(super) fn reserve_transaction_canonical_publication(
+        &self,
+        snapshot: &TransactionSnapshot,
+        transaction_catalog: &CatalogSnapshot,
+        record: &BinaryTransactionRecord,
+    ) -> Result<(), ExecuteError> {
+        self.restore_transaction_named_indexes_before_wal(transaction_catalog, record)?;
+        let required = self.transaction_canonical_publication_gpu_bytes(
+            snapshot,
+            transaction_catalog,
+            record,
+        )?;
+        let mut delta = snapshot
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let additional = required
+            .into_iter()
+            .filter_map(|(gpu_id, bytes)| {
+                let private = delta
+                    .private_gpu_bytes_by_gpu
+                    .get(&gpu_id)
+                    .copied()
+                    .unwrap_or(0);
+                let extra = bytes.saturating_sub(private);
+                (extra != 0).then_some((gpu_id, extra))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.reconcile_transaction_commit_gpu_reservation(
+            &mut delta.commit_gpu_bytes_by_gpu,
+            &additional,
+        )
+    }
+}
+
 /// Exact device allocations retained only by the transaction generation. The captured base
 /// shard map defines globally-accounted identities; any distinct payload/sidecar/row-id pointer
 /// reachable from the replacement is private. Pointer dedup prevents structural sharing from
@@ -258,7 +613,7 @@ impl Engine {
         Ok(Arc::new(memory))
     }
 
-    pub(super) fn append_transaction_delta_shard(
+    pub(crate) fn append_transaction_delta_shard(
         &self,
         table: &RelationalTable,
         rows: &[Vec<SqlValue>],
@@ -363,7 +718,23 @@ impl Engine {
             // globally visible physical history.
             history_floor_index: 0,
             capacity: rows.len(),
-            int4_appendable: false,
+            // Private generations never mutate a shard in place, but the exact same descriptor
+            // builder also installs a newly-created table during canonical replay. Mark supported
+            // layouts append/rollover-capable so the next committed INSERT stays GPU-native.
+            int4_appendable: table.columns.iter().all(|column| {
+                matches!(
+                    column.ty,
+                    SqlType::Int2
+                        | SqlType::Int4
+                        | SqlType::Date
+                        | SqlType::Int8
+                        | SqlType::Timestamp
+                        | SqlType::Numeric { .. }
+                        | SqlType::Uuid
+                        | SqlType::Bool
+                        | SqlType::Text
+                )
+            }),
             resident_device_int4_column_stats: int4_stats,
             resident_bytes: payload.len() as u64,
             allocated_bytes,

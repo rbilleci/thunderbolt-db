@@ -5,18 +5,78 @@ use super::{
     SchemaPrivileges, Select, SelectFilter, SqlType, SqlValue, TablespacePrivileges,
 };
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionIsolation {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionAccessMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionCharacteristics {
+    pub isolation: TransactionIsolation,
+    pub access: TransactionAccessMode,
+    pub deferrable: bool,
+}
+
+impl Default for TransactionCharacteristics {
+    fn default() -> Self {
+        Self {
+            isolation: TransactionIsolation::ReadCommitted,
+            access: TransactionAccessMode::ReadWrite,
+            deferrable: false,
+        }
+    }
+}
+
+impl TransactionCharacteristics {
+    pub const READ_COMMITTED_READ_WRITE: Self = Self {
+        isolation: TransactionIsolation::ReadCommitted,
+        access: TransactionAccessMode::ReadWrite,
+        deferrable: false,
+    };
+
+    pub const REPEATABLE_READ_WRITE: Self = Self {
+        isolation: TransactionIsolation::RepeatableRead,
+        access: TransactionAccessMode::ReadWrite,
+        deferrable: false,
+    };
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Begin,
-    Commit { chain: bool },
-    Rollback { chain: bool },
+    Begin {
+        characteristics: TransactionCharacteristics,
+    },
+    Commit {
+        chain: bool,
+    },
+    Rollback {
+        chain: bool,
+    },
     Flush,
     ResetAll,
-    SetRole { role: Option<String> },
-    SetKv { key: String, value: String },
-    DeleteKv { key: String },
-    GetKv { key: String },
+    SetRole {
+        role: Option<String>,
+    },
+    SetKv {
+        key: String,
+        value: String,
+    },
+    DeleteKv {
+        key: String,
+    },
+    GetKv {
+        key: String,
+    },
     CreateSchema(CreateSchema),
     DropSchema(DropSchema),
     CreateDatabase(CreateDatabase),
@@ -87,6 +147,7 @@ pub enum Command {
     Delete(Delete),
     Update(Update),
     Select(Select),
+    SelectLiteral(SelectLiteral),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -319,6 +380,17 @@ pub struct DropFunction {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SelectFunction {
     pub name: String,
+}
+
+/// One bounded, no-`FROM` scalar projection such as `SELECT 1 AS one`.
+///
+/// The parser resolves the literal's PostgreSQL type up front, so execution can materialize one
+/// typed transient relation on the GPU without carrying SQL text or wire metadata into the engine.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SelectLiteral {
+    pub column_name: String,
+    pub ty: SqlType,
+    pub value: SqlValue,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

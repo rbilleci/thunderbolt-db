@@ -30,7 +30,7 @@ pub(super) fn try_execute_session_command(
             }
             Some(write_command_complete(stream, "SET"))
         }
-        Command::Begin => {
+        Command::Begin { .. } => {
             session.in_transaction = true;
             Some(write_command_complete(stream, "BEGIN"))
         }

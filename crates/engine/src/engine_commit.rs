@@ -8,11 +8,11 @@
 
 use super::*;
 
-/// Failure from [`Engine::commit_mutation_batch`]. `rolled_back` distinguishes a clean pre-durable
-/// abort (WAL truncated + proposals rolled back — every item may be requeued and retried) from a
-/// post-fsync failure (the batch's records are durable; retrying would append duplicates).
+/// Failure from [`Engine::commit_mutation_batch`]. `requeue` is true only for a clean transient
+/// pre-durable abort; semantic claim failures and post-fsync uncertainty must not poison the queue
+/// with an item that can never validly retry.
 pub(crate) struct BatchCommitFailure {
-    pub(crate) rolled_back: bool,
+    pub(crate) requeue: bool,
     pub(crate) error: EngineError,
 }
 
@@ -51,8 +51,16 @@ impl Engine {
         txn_id: u64,
         payload: std::sync::Arc<[u8]>,
     ) -> Result<CommitToken, EngineError> {
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            return Err(EngineError::ApplyFailed(format!(
+                "transaction id {txn_id} is active and cannot be claimed by an autocommit write"
+            )));
+        }
         Self::reject_discarded_returning_payload(&payload)?;
         self.ensure_commit_path_available()?;
+        self.legacy_lane_history_write_guard()?;
+        #[cfg(test)]
+        self.run_commit_prelock_hook();
         let timestamp_micros = self.next_commit_timestamp_micros();
         self.commit_mutation_at(txn_id, payload, timestamp_micros)
     }
@@ -85,9 +93,23 @@ impl Engine {
         payload: std::sync::Arc<[u8]>,
         timestamp_micros: u64,
     ) -> Result<CommitToken, EngineError> {
+        self.commit_mutation_at_with_catalog(txn_id, payload, timestamp_micros, None)
+    }
+
+    pub(crate) fn commit_mutation_at_with_catalog(
+        &self,
+        txn_id: u64,
+        payload: std::sync::Arc<[u8]>,
+        timestamp_micros: u64,
+        expected_catalog_version: Option<Index>,
+    ) -> Result<CommitToken, EngineError> {
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            return Err(EngineError::ApplyFailed(format!(
+                "transaction id {txn_id} is active and cannot be claimed by an autocommit write"
+            )));
+        }
         Self::reject_discarded_returning_payload(&payload)?;
         self.ensure_commit_path_available()?;
-        self.intent_lanes_write_guard()?;
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
@@ -104,38 +126,32 @@ impl Engine {
         // subsequent apply must bind after every earlier wave's durability publication and
         // residency maintenance. Wait off-lock, then prove the same condition again while owning
         // the publication lock so a newly applied wave cannot occupy the acquisition gap.
-        let serialized_relational_dml = matches!(
-            Self::decode_engine_command(&payload),
-            Ok(Some(
-                Command::Insert(_) | Command::Delete(_) | Command::Update(_)
-            ))
-        );
-        let mut commit = if serialized_relational_dml {
-            loop {
-                if !self.wait_wave_tail_quiescence() {
-                    return Err(self.commit_path_unavailable_error());
-                }
-                let commit = self.commit_state();
-                let applied = self.commit_wave.tails_applied.load(AtomicOrdering::Acquire);
-                let finished = self
-                    .commit_wave
-                    .tails_finished
-                    .load(AtomicOrdering::Acquire);
-                if applied == finished {
-                    break commit;
-                }
-                drop(commit);
-            }
-        } else {
-            self.commit_state()
-        };
+        let mut commit = self.commit_state_after_wave_quiescence()?;
         self.ensure_commit_path_available()?;
-        // Reciprocal activation fence: a classic writer may have passed the optimistic guard while
-        // the first lane was waiting to acquire this lock. Activation publishes under this same
-        // lock, so rechecking here makes the handoff linearizable.
-        self.intent_lanes_write_guard()?;
+        self.legacy_lane_history_write_guard()?;
         if let Some(token) = commit.resolve_transaction_retry(txn_id, &payload)? {
             return Ok(token);
+        }
+        if let Some(expected) = expected_catalog_version {
+            let actual = self.catalog_snapshot().commit_seq;
+            if expected != actual {
+                return Err(EngineError::ApplyFailed(format!(
+                    "prepared command catalog changed before execution (expected generation {expected}, current generation {actual}); re-Parse is required"
+                )));
+            }
+        }
+        if self.resolve_pending_transaction_claim(
+            txn_id,
+            gpu_db_wal::canonical_request_digest(&payload),
+        )? {
+            return Err(EngineError::Durability(format!(
+                "transaction id {txn_id} is pending in canonical mutation admission"
+            )));
+        }
+        if let Some(state) = commit.txn_manager.state(txn_id) {
+            return Err(EngineError::ApplyFailed(format!(
+                "transaction id {txn_id} is already owned by transaction state {state:?}"
+            )));
         }
         self.preflight_serialized_dml_under_commit_lock(&payload)?;
         let token = {
@@ -177,10 +193,23 @@ impl Engine {
                 commit.wal.truncate(wal_len_before);
                 return Err(err);
             }
-            commit
-                .repl
-                .wait_committed(token, Duration::from_millis(0))?;
-            commit.record_transaction_status(txn_id, &payload, token.index);
+            if let Err(error) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
+                self.wedge_commit_path();
+                return Err(EngineError::Durability(format!(
+                    "transaction {txn_id} WAL is durable but replication confirmation failed: {error}; outcome is indeterminate until restart recovery"
+                )));
+            }
+            if let Err(error) = commit.record_transaction_status_digest_outcome(
+                txn_id,
+                gpu_db_wal::canonical_request_digest(&payload),
+                token.index,
+                affected_rows,
+            ) {
+                self.wedge_commit_path();
+                return Err(EngineError::Durability(format!(
+                    "transaction {txn_id} WAL is durable but terminal status installation failed: {error}; outcome is indeterminate until restart recovery"
+                )));
+            }
             // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in
             // the WAL record and keyed here for PITR lookups. Intentionally DECOUPLED from the MVCC
             // version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
@@ -206,62 +235,138 @@ impl Engine {
     /// instead of k. WAL-before-visibility is unchanged: nothing is applied or published until
     /// the group fsync has succeeded.
     ///
-    /// Failure semantics:
-    /// - `rolled_back: true` — the failure happened BEFORE anything was durable (propose or the
-    ///   group fsync): the WAL tail is truncated and the proposals rolled back; the caller may
-    ///   safely requeue and retry every item (none of them committed).
-    /// - `rolled_back: false` — the failure happened AFTER the group fsync: the batch's records
-    ///   are already durable and MUST NOT be retried (a retry would append duplicate records; a
-    ///   restart replays the durable log as the source of truth).
+    /// Failure semantics: `requeue` is set only when the whole group cleanly rolled back before
+    /// durability and the failure is transient. Semantic transaction-identity rejection is clean
+    /// but non-retryable; post-fsync failures are indeterminate and fail-stop service.
     pub(crate) fn commit_mutation_batch(
         &self,
         items: &[(TxnId, std::sync::Arc<[u8]>)],
     ) -> Result<(), BatchCommitFailure> {
-        let Some((last_txn_id, _)) = items.last() else {
+        if items.is_empty() {
             return Ok(());
-        };
-        let last_txn_id = *last_txn_id;
+        }
         if let Err(error) = self.ensure_commit_path_available() {
             return Err(BatchCommitFailure {
-                rolled_back: true,
+                requeue: true,
                 error,
             });
         }
-        // AUDIT F4: the batch committer is a serial-WAL appender + repl
-        // proposer like commit_mutation_at — same lanes-activation guard, or
-        // its repl seqs would collide with oracle-claimed lane seqs.
-        if let Err(error) = self.intent_lanes_write_guard() {
+        if let Err(error) = self.legacy_lane_history_write_guard() {
             return Err(BatchCommitFailure {
-                rolled_back: true,
+                requeue: false,
                 error,
             });
         }
         if self.repl_role() != Role::Leader {
             return Err(BatchCommitFailure {
-                rolled_back: true,
+                requeue: true,
                 error: EngineError::NotLeader,
             });
         }
         let wall_clock = current_timestamp_micros();
 
-        let mut commit = self.commit_state();
+        let mut commit = match self.commit_state_after_wave_quiescence() {
+            Ok(commit) => commit,
+            Err(error) => {
+                return Err(BatchCommitFailure {
+                    requeue: true,
+                    error,
+                });
+            }
+        };
         if let Err(error) = self.ensure_commit_path_available() {
             return Err(BatchCommitFailure {
-                rolled_back: true,
+                requeue: true,
                 error,
             });
         }
-        if let Err(error) = self.intent_lanes_write_guard() {
+        if let Err(error) = self.legacy_lane_history_write_guard() {
             return Err(BatchCommitFailure {
-                rolled_back: true,
+                requeue: false,
                 error,
             });
         }
+        // Resolve the global transaction authority before any proposal. Exact retries (whether
+        // from an earlier commit or duplicated inside this flush group) are already complete and
+        // are omitted; a stable-id mismatch rejects the whole still-clean group.
+        let mut batch_claims = std::collections::HashMap::new();
+        let mut admitted = Vec::with_capacity(items.len());
+        for (txn_id, payload) in items {
+            let request_digest = gpu_db_wal::canonical_request_digest(payload);
+            match commit.resolve_transaction_retry_digest_outcome(*txn_id, request_digest) {
+                Ok(Some((token, _))) if self.committed_seq() >= token.index => {
+                    self.release_pending_transaction_claim(*txn_id, request_digest);
+                    continue;
+                }
+                Ok(Some((token, _))) => {
+                    return Err(BatchCommitFailure {
+                        requeue: false,
+                        error: EngineError::Durability(format!(
+                            "transaction id {txn_id} has canonical commit sequence {} but publication has not reached it",
+                            token.index
+                        )),
+                    });
+                }
+                Err(error) => {
+                    return Err(BatchCommitFailure {
+                        requeue: false,
+                        error,
+                    });
+                }
+                Ok(None) => {
+                    match self.resolve_pending_transaction_claim(*txn_id, request_digest) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            return Err(BatchCommitFailure {
+                                requeue: false,
+                                error,
+                            });
+                        }
+                    }
+                    if let Some(state) = commit.txn_manager.state(*txn_id) {
+                        return Err(BatchCommitFailure {
+                            requeue: false,
+                            error: EngineError::ApplyFailed(format!(
+                                "transaction id {txn_id} is already owned by transaction state {state:?}"
+                            )),
+                        });
+                    }
+                    match batch_claims.entry(*txn_id) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(request_digest);
+                            admitted.push((*txn_id, std::sync::Arc::clone(payload)));
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry)
+                            if *entry.get() == request_digest => {}
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            return Err(BatchCommitFailure {
+                                requeue: false,
+                                error: EngineError::Durability(format!(
+                                    "transaction id {txn_id} appears more than once in one batch with different requests"
+                                )),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let Some((last_txn_id, _)) = admitted.last() else {
+            return Ok(());
+        };
+        let last_txn_id = *last_txn_id;
+        let exact_outcomes: Vec<u64> = admitted
+            .iter()
+            .map(|(_, payload)| Self::canonical_affected_rows(payload))
+            .collect::<Result<_, _>>()
+            .map_err(|error| BatchCommitFailure {
+                requeue: false,
+                error,
+            })?;
         let last_index = {
             let wal_len_before = commit.wal.len();
             let mut first_index: Option<Index> = None;
             let mut last_index = 0;
-            for (txn_id, payload) in items {
+            for (txn_id, payload) in &admitted {
                 match commit.repl.propose(payload.clone()) {
                     Ok(token) => {
                         first_index.get_or_insert(token.index);
@@ -275,7 +380,7 @@ impl Engine {
                                 );
                                 commit.wal.truncate(wal_len_before);
                                 return Err(BatchCommitFailure {
-                                    rolled_back: true,
+                                    requeue: true,
                                     error,
                                 });
                             }
@@ -287,7 +392,7 @@ impl Engine {
                         }
                         commit.wal.truncate(wal_len_before);
                         return Err(BatchCommitFailure {
-                            rolled_back: true,
+                            requeue: true,
                             error,
                         });
                     }
@@ -300,7 +405,7 @@ impl Engine {
                     .rollback_unapplied_from(first_index.expect("non-empty batch proposed"));
                 commit.wal.truncate(wal_len_before);
                 return Err(BatchCommitFailure {
-                    rolled_back: true,
+                    requeue: true,
                     error,
                 });
             }
@@ -310,22 +415,36 @@ impl Engine {
             {
                 // The records are already fsync-durable; surface the replication failure without
                 // pretending the batch can be cleanly retried.
+                self.wedge_commit_path();
                 return Err(BatchCommitFailure {
-                    rolled_back: false,
+                    requeue: false,
                     error,
                 });
             }
             // Per-item strictly-monotonic commit timestamps (same formula as
             // `next_commit_timestamp_micros`, inlined because the commit_mutex is already held).
             let batch_first_index = first_index.expect("non-empty batch proposed");
-            for (offset, (txn_id, payload)) in items.iter().enumerate() {
+            for (offset, ((txn_id, payload), affected_rows)) in
+                admitted.iter().zip(exact_outcomes).enumerate()
+            {
                 let timestamp_micros =
                     wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
                 commit.record_commit_timestamp(*txn_id, timestamp_micros);
-                commit.record_transaction_status(
+                if let Err(error) = commit.record_transaction_status_digest_outcome(
                     *txn_id,
-                    payload,
+                    gpu_db_wal::canonical_request_digest(payload),
                     batch_first_index + offset as u64,
+                    affected_rows,
+                ) {
+                    self.wedge_commit_path();
+                    return Err(BatchCommitFailure {
+                        requeue: false,
+                        error,
+                    });
+                }
+                self.release_pending_transaction_claim(
+                    *txn_id,
+                    gpu_db_wal::canonical_request_digest(payload),
                 );
             }
             last_index
@@ -334,11 +453,11 @@ impl Engine {
         if let Err(error) = self.apply_and_publish_committed(&mut commit, last_txn_id, last_index) {
             self.wedge_commit_path();
             return Err(BatchCommitFailure {
-                rolled_back: false,
+                requeue: false,
                 error,
             });
         }
-        for _ in items {
+        for _ in &admitted {
             self.metrics.inc_commit();
         }
         Ok(())
@@ -485,7 +604,12 @@ impl Engine {
                     }
                     let working = Self::catalog_snapshot_from_working(cat, e.index);
                     let entry_maintained = self.with_apply_catalog(Some(working), || {
-                        self.try_maintain_transaction_residency(cat, &applied_entry, e.index)
+                        self.try_maintain_transaction_residency(
+                            cat,
+                            &applied_entry,
+                            e.index,
+                            &BTreeSet::new(),
+                        )
                     })?;
                     if let Some(table) = touched.difference(&entry_maintained).next() {
                         self.wedge_commit_path();
@@ -496,10 +620,18 @@ impl Engine {
                     }
                     maintained.extend(touched);
                 }
-                let affected_rows = applied_entry
-                    .iter()
-                    .map(AppliedRowMutation::rows_affected)
-                    .sum();
+                let affected_rows = if atomic_transaction {
+                    // Pre-coalescing v1 transaction WAL counted statement-order mutation records
+                    // in its durable outcome marker. Canonical apply normalizes those records to
+                    // final entity images, but retry/recovery status must remain byte-compatible
+                    // with the marker carried by the original payload.
+                    Self::canonical_affected_rows(&e.payload)?
+                } else {
+                    applied_entry
+                        .iter()
+                        .map(AppliedRowMutation::rows_affected)
+                        .sum()
+                };
                 commit.last_applied_outcome = Some((e.index, affected_rows));
                 working_catalog_changed |= Self::entry_mutates_working_catalog(e, cat);
                 for m in applied_entry {
@@ -569,8 +701,23 @@ impl Engine {
                 // already applied above and do not require a generation rewrite.
                 true
             } else if atomic_transaction {
-                maintained =
-                    self.try_maintain_transaction_residency(cat, &applied, publish_index)?;
+                let transaction_created_tables = match decode_binary_record(&to_apply[0].payload) {
+                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => record
+                        .catalog_commands
+                        .into_iter()
+                        .filter_map(|command| match command {
+                            Command::CreateTable(create) => Some(create.table),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => BTreeSet::new(),
+                };
+                maintained = self.try_maintain_transaction_residency(
+                    cat,
+                    &applied,
+                    publish_index,
+                    &transaction_created_tables,
+                )?;
                 let touched = applied
                     .iter()
                     .map(Self::applied_mutation_table)
@@ -867,7 +1014,8 @@ impl Engine {
             self.publish_catalog_snapshot(cat, publish_index, prune_below);
             (handled, maintained)
         };
-        self.publish_committed_seq(publish_index);
+        let visible = self.publish_ready_indices(to_apply.iter().map(|entry| entry.index))?;
+        self.require_publication_coverage(visible, publish_index)?;
         // STRATA read-cache policy remains independently configurable. R3-004 establishes mandatory
         // device write generations in DML preflight; this post-publish refresh is only the broader
         // read-residency policy for unhandled DDL/global invalidation.
@@ -924,20 +1072,39 @@ impl Engine {
             Index,
         ) -> Result<Option<crate::engine_dml_prepare::AppliedInsert>, EngineError>,
     {
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            return Err(EngineError::ApplyFailed(format!(
+                "transaction id {txn_id} is active and cannot be claimed by a COPY/current-apply write"
+            )));
+        }
+        self.legacy_lane_history_write_guard()?;
         self.ensure_commit_path_available()?;
-        self.intent_lanes_write_guard()?;
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
 
         // A.4 unification: `&self`, the whole critical section under the commit_mutex (held in
         // `commit`); the catalog latch is acquired INSIDE (fixed lock order).
-        let mut commit = self.commit_state();
+        let mut commit = self.commit_state_after_wave_quiescence()?;
+        self.legacy_lane_history_write_guard()?;
         self.ensure_commit_path_available()?;
-        self.intent_lanes_write_guard()?;
         if let Some(token) = commit.resolve_transaction_retry(txn_id, &payload)? {
             return Ok((token, 0));
         }
+        if self.resolve_pending_transaction_claim(
+            txn_id,
+            gpu_db_wal::canonical_request_digest(&payload),
+        )? {
+            return Err(EngineError::Durability(format!(
+                "transaction id {txn_id} is pending in canonical mutation admission"
+            )));
+        }
+        if let Some(state) = commit.txn_manager.state(txn_id) {
+            return Err(EngineError::ApplyFailed(format!(
+                "transaction id {txn_id} is already owned by transaction state {state:?}"
+            )));
+        }
+        let affected_rows = Self::canonical_affected_rows(&payload)?;
         let token = {
             let wal_len_before = commit.wal.len();
             let token = match commit.repl.propose(payload.clone()) {
@@ -960,10 +1127,23 @@ impl Engine {
                 commit.wal.truncate(wal_len_before);
                 return Err(err);
             }
-            commit
-                .repl
-                .wait_committed(token, Duration::from_millis(0))?;
-            commit.record_transaction_status(txn_id, &payload, token.index);
+            if let Err(error) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
+                self.wedge_commit_path();
+                return Err(EngineError::Durability(format!(
+                    "COPY/current-apply transaction {txn_id} WAL is durable but replication confirmation failed: {error}; outcome is indeterminate until restart recovery"
+                )));
+            }
+            if let Err(error) = commit.record_transaction_status_digest_outcome(
+                txn_id,
+                gpu_db_wal::canonical_request_digest(&payload),
+                token.index,
+                affected_rows,
+            ) {
+                self.wedge_commit_path();
+                return Err(EngineError::Durability(format!(
+                    "COPY/current-apply transaction {txn_id} WAL is durable but terminal status installation failed: {error}; outcome is indeterminate until restart recovery"
+                )));
+            }
             // `txn_id` is the durable transaction identity (decoupled from the MVCC `commit_seq`).
             commit.record_commit_timestamp(txn_id, timestamp_micros);
             token
@@ -1086,7 +1266,8 @@ impl Engine {
             let prune_below = self.catalog_prune_boundary(token.index);
             self.publish_catalog_snapshot(cat, token.index, prune_below);
         }
-        self.publish_committed_seq(token.index);
+        let visible = self.publish_ready_indices(to_apply.iter().map(|entry| entry.index))?;
+        self.require_publication_coverage(visible, token.index)?;
         {
             let precise_scope = Self::residency_invalidation_scope(&to_apply);
             let tables = if self.auto_admit_on_commit_enabled() {
@@ -1347,12 +1528,10 @@ impl Engine {
                         record.table
                     )));
                 }
-                // NOTE (audit CRITICAL): do NOT assert `current_row_id() == new_row_id`. The pump
-                // claims the row-id block (`claim_row_id_block`) and the seq block
-                // (`seq_oracle.fetch_add`) as SEPARATE lock-free fetch_adds with no lock spanning
-                // them, and lanes pump CONCURRENTLY — so global row-id order is NOT global seq
-                // order (a lower-seq wave can hold a higher row-id base). Replay walks records in
-                // seq order, so the allocator position need not equal a given record's claimed id.
+                // Do not assert `current_row_id() == new_row_id`: merged concurrent preparation
+                // may reserve row identities in a different order than canonical commit ranges.
+                // Replay walks records in commit order, so its allocator position need not equal
+                // a particular record's pre-reserved id.
                 // Correctness does NOT need it: the update reuses its resolved stable entity id and
                 // advances the legacy allocator by exactly 1 (both branches), so the final high-water
                 // remains base + (row-consuming records) regardless of order. An assert here would
@@ -1406,9 +1585,13 @@ impl Engine {
                 let entity_id = entity_ids[0];
                 let row_key = relational_row_key(&record.table, entity_id);
                 let mut write_set = WriteSet::default();
+                write_set.tables.insert(record.table.clone());
                 write_set.add_unique_slots(&table, &new_values);
                 let delta = WriteDelta {
                     write_set: write_set.clone(),
+                    read_snapshot: entry.index,
+                    catalog_dependencies: BTreeMap::from([(record.table.clone(), table.clone())]),
+                    foreign_key_dependencies: BTreeSet::new(),
                     rows_consumed: 1,
                     mutation: PreparedMutation::Insert {
                         table: record.table.clone(),
@@ -1444,6 +1627,7 @@ impl Engine {
             .clone();
         let commit_seq = entry.index;
         let mut write_set = WriteSet::default();
+        write_set.tables.insert(record.table.clone());
         let mut inserted_rows = Vec::with_capacity(record.rows.len());
         let mut rows = Vec::with_capacity(record.rows.len());
         let mut row_ids = Vec::with_capacity(record.rows.len());
@@ -1465,6 +1649,9 @@ impl Engine {
         }
         let delta = WriteDelta {
             write_set: write_set.clone(),
+            read_snapshot: commit_seq,
+            catalog_dependencies: BTreeMap::from([(record.table.clone(), table.clone())]),
+            foreign_key_dependencies: BTreeSet::new(),
             rows_consumed: record.rows.len() as u64,
             mutation: PreparedMutation::Insert {
                 table: record.table.clone(),
@@ -1609,7 +1796,7 @@ impl Engine {
             Command::CreateFunction(create) => self.apply_create_function(cat, create)?,
             Command::RenameFunction(rename) => self.apply_rename_function(cat, rename)?,
             Command::DropFunction(drop) => self.apply_drop_function(cat, drop)?,
-            Command::SelectFunction(_) => {}
+            Command::SelectFunction(_) | Command::SelectLiteral(_) => {}
             Command::CreateSequence(create) => self.apply_create_sequence(cat, create)?,
             Command::CreateDomain(create) => self.apply_create_domain(cat, create)?,
             Command::SequenceNextVal(nextval) => {

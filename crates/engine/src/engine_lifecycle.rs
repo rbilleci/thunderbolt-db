@@ -8,6 +8,28 @@
 
 use super::*;
 
+thread_local! {
+    /// GPU bytes already admitted by an explicit transaction and retained as an account credit
+    /// while canonical apply replaces private allocations with globally published ones. Other
+    /// threads see the charge normally; only the publication owner subtracts it from budget reads.
+    static TRANSACTION_COMMIT_GPU_CREDIT:
+        std::cell::RefCell<Vec<BTreeMap<u16, u64>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct TransactionCommitGpuCreditGuard;
+
+impl Drop for TransactionCommitGpuCreditGuard {
+    fn drop(&mut self) {
+        TRANSACTION_COMMIT_GPU_CREDIT.with(|credits| {
+            let popped = credits.borrow_mut().pop();
+            debug_assert!(
+                popped.is_some(),
+                "transaction commit GPU credit must balance"
+            );
+        });
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static RECOVERY_CONTEXT_LOSS_INJECTIONS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -15,6 +37,45 @@ thread_local! {
 }
 
 impl Engine {
+    pub(crate) fn with_transaction_commit_gpu_credit<T>(
+        &self,
+        credit: &BTreeMap<u16, u64>,
+        apply: impl FnOnce() -> T,
+    ) -> T {
+        TRANSACTION_COMMIT_GPU_CREDIT.with(|credits| credits.borrow_mut().push(credit.clone()));
+        let _guard = TransactionCommitGpuCreditGuard;
+        apply()
+    }
+
+    pub(crate) fn release_transaction_commit_gpu_credit(&self, credit: &BTreeMap<u16, u64>) {
+        let _budget_guard = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut account = self
+            .transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (gpu_id, bytes) in credit {
+            let slot = account.entry(*gpu_id).or_default();
+            *slot = slot.saturating_sub(*bytes);
+        }
+        account.retain(|_, bytes| *bytes != 0);
+    }
+
+    fn active_transaction_commit_gpu_credit(gpu_id: u16) -> u64 {
+        TRANSACTION_COMMIT_GPU_CREDIT.with(|credits| {
+            credits
+                .borrow()
+                .iter()
+                .filter_map(|credit| credit.get(&gpu_id))
+                .copied()
+                .sum()
+        })
+    }
+
     pub fn new_local() -> Self {
         Self::with_planner_config(PlannerConfig::default())
     }
@@ -30,24 +91,17 @@ impl Engine {
         engine
     }
 
-    /// Install a small lazy-backed lane set without constructing a durable production engine.
-    /// Race regressions use this to make lane activation non-vacuous while keeping their WAL
-    /// footprint bounded; the lane files are still real and exercise the production pipeline.
+    /// Install optimized preparation lanes without constructing a durable production engine.
     #[cfg(test)]
     pub(crate) fn attach_test_intent_lanes(
         &mut self,
-        lane_base: std::path::PathBuf,
+        _lane_base: std::path::PathBuf,
         lane_count: usize,
     ) {
         assert!(lane_count >= 2, "tests need at least two intent lanes");
         assert!(self.intent_lanes.is_none(), "test lanes already attached");
         self.intent_lanes = Some(std::sync::Arc::new(
-            crate::engine_intent_lanes::IntentLaneState::fresh(
-                lane_count,
-                2,
-                lane_base,
-                4 * 1024 * 1024,
-            ),
+            crate::engine_intent_lanes::IntentLaneState::fresh(lane_count),
         ));
     }
 
@@ -297,9 +351,16 @@ impl Engine {
                 sm: KvStateMachine::default(),
                 txn_manager: TxnManager::default(),
             }),
+            commit_publication: Default::default(),
+            pending_transaction_claims: Arc::new(Mutex::new(HashMap::new())),
             commit_path_wedged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_transaction_post_durable_apply: AtomicBool::new(false),
+            #[cfg(test)]
+            transaction_post_durable_hook: Mutex::new(None),
             active_snapshots: std::sync::Arc::new(Mutex::new(ActiveSnapshots::default())),
             transaction_private_gpu_bytes: Arc::new(Mutex::new(BTreeMap::new())),
+            transaction_retained_gpu_allocations: Arc::new(Mutex::new(BTreeMap::new())),
             group_flush: GroupFlushState::default(),
             intent_lanes: None,
             // Mirrors LocalReplicator::leader() below.
@@ -328,6 +389,14 @@ impl Engine {
                 relational_next_column_id: FIRST_USER_COLUMN_ID,
             }),
             metrics: RuntimeMetrics::default(),
+            prepared_transaction_class_admissions: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            prepared_transaction_service:
+                crate::engine_prepared_transaction::PreparedTransactionServiceController::default(),
             batcher: Mutex::new(DualTriggerBatcher::new(64, Duration::from_millis(1))),
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
@@ -576,24 +645,18 @@ impl Engine {
         };
         engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
         engine.commit_state_mut().wal = wal;
-        // E2.5b-2 stage 2 — construct the N-lane intent pipeline when opted in. The lane set is
-        // its own on-disk log (`<base>.lane-<L>.fua.<id>`), independent of the serial WalBuffer
-        // above: pre-activation writes (DDL, warm-up) land in the serial log; once the first lane
-        // seq block is claimed the engine is intent-only (fail-loud guard). Recovery replays the
-        // serial log, then the lane merge over the disjoint higher seq range.
+        // Construct optional optimized preparation lanes. They share the canonical WalBuffer
+        // above and never create a physical `.lane-*` log.
         #[cfg(unix)]
         engine
             .attach_fresh_intent_lanes(&lane_base_path, true)
-            .expect("failed to create intent WAL lanes (GPU_DB_INTENT_LANES)");
+            .expect("failed to attach optimized intent lanes (GPU_DB_INTENT_LANES)");
         engine
     }
 
-    /// Construct a FRESH N-lane intent pipeline at `lane_base_path` when lanes are enabled
-    /// (`GPU_DB_INTENT_LANES`, default ON — E2.5c-3). Used by the durable constructor AND the
-    /// non-lanes reopen paths (a reopened database accepts lane intents exactly like a fresh
-    /// one; activation then seeds `base_seq` from the recovered commit index). The WAL backing
-    /// is LAZY (created on the first lane wave), so a default-ON engine that never takes the
-    /// intent path pays nothing.
+    /// Construct fresh optimized preparation lanes when enabled. `lane_base_path` is used only to
+    /// remove stale files from the retired format or reject a stranded historical checkpoint;
+    /// the live strategy has no separate WAL backing.
     ///
     /// `fresh` = fresh-database semantics: STALE lane files from a previous database life at
     /// this path are clobbered NOW (leaving them would make the next reopen misread this
@@ -621,15 +684,8 @@ impl Engine {
         if lane_count < 2 {
             return Ok(());
         }
-        let fence_lanes = engine_intent_lanes::intent_lane_fences();
-        let lane_segment_bytes = engine_intent_lanes::intent_lane_segment_bytes();
         self.intent_lanes = Some(std::sync::Arc::new(
-            engine_intent_lanes::IntentLaneState::fresh(
-                lane_count,
-                fence_lanes,
-                lane_base_path.to_path_buf(),
-                lane_segment_bytes,
-            ),
+            engine_intent_lanes::IntentLaneState::fresh(lane_count),
         ));
         Ok(())
     }
@@ -773,14 +829,10 @@ impl Engine {
         Ok(engine)
     }
 
-    /// E2.5c-1 — reopen a LANES-MODE durable database: replay the serial log's pre-activation
-    /// prefix, then the lane merge ([`gpu_db_wal::recover_lanes`], explicit global seqs), REPAIR
-    /// any never-acknowledged orphan frames a crash-mid-wave stranded above the cross-lane cut
-    /// (they would collide with the reopened set's fresh claims of the same seqs), and continue
-    /// appending: the serial WAL reopens for durability bookkeeping (classic writes stay refused
-    /// once activated — the v1 intent-only contract survives reopen) and the lane set reopens
-    /// with the activation latch, `base_seq`, the seq oracle, and the applied cut pre-seeded
-    /// from the recovered history.
+    /// Reopen the retired physical-lane format: replay its frozen serial prefix plus lane merge,
+    /// repair unacknowledged orphan frames, and install a read-only compatibility backing. Empty
+    /// old lane files do not trigger read-only mode. Nonempty histories must be migrated into the
+    /// canonical WAL before new writes are admitted.
     ///
     /// DISK-AUTHORITATIVE: the lane count and per-lane segment capacity come from the on-disk
     /// set (env must not silently reshape an existing database); `GPU_DB_INTENT_LANE_SEGMENT_BYTES`
@@ -855,7 +907,7 @@ impl Engine {
             .unwrap_or_else(|| serial_records.clone());
         identity_records.extend_from_slice(&lane_records);
         engine.bind_durable_identity_for_recovery(segment_path, &identity_records)?;
-        let reconciled_statuses = engine.install_reconciled_transaction_statuses(segment_path)?;
+        engine.install_reconciled_transaction_statuses(segment_path)?;
         let initial_index = engine.commit_state().repl.peek_next_index();
         let serial_count = if let Some(checkpoint) = &lanes_checkpoint {
             // CHECKPOINT REPLAY: the checkpoint segment holds serial ++ lanes[0, lane_cut)
@@ -964,86 +1016,11 @@ impl Engine {
         engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
         engine.commit_state_mut().wal = wal;
 
-        // Reopen the lane set over the repaired logs and pre-seed the lane state from the
-        // recovered history: the lane-local cut continues at `lane_record_count`, the oracle at
-        // the next global seq, and (when any lane record exists) the activation latch stays
-        // latched — the intent-only contract survives reopen. A lanes database that never
-        // activated (lane files exist from construction, zero lane records) reopens
-        // UNACTIVATED and seeds normally on its first wave.
-        let fence_lanes = engine_intent_lanes::intent_lane_fences();
-        let lane_segment_bytes = match std::env::var("GPU_DB_INTENT_LANE_SEGMENT_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-        {
-            Some(explicit) => explicit,
-            None => gpu_db_wal::lane_segment_capacity_bytes(segment_path)?
-                .map(|capacity| capacity as usize)
-                .unwrap_or_else(engine_intent_lanes::intent_lane_segment_bytes),
-        };
-        let wal_lanes = gpu_db_wal::FuaWalLaneSet::reopen_from(
-            segment_path,
-            lane_count,
-            fence_lanes,
-            lane_segment_bytes,
-            baseline,
-        )?;
-        let state = engine_intent_lanes::IntentLaneState::with_backing(
-            lane_count,
-            fence_lanes,
-            wal_lanes,
-            lane_segment_bytes,
-        );
-        state
-            .canonical_identity
-            .set(engine.commit_state().canonical_identity)
-            .map_err(|_| {
-                EngineError::Durability(
-                    "reopened intent-lane canonical identity was initialized twice".to_string(),
-                )
-            })?;
-        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
-            engine.commit_state().canonical_identity,
-            identity_records.last(),
-        )?;
-        state
-            .canonical_catalog_digest
-            .set(catalog_digest)
-            .map_err(|_| {
-                EngineError::Durability(
-                    "reopened intent-lane catalog binding was initialized twice".to_string(),
-                )
-            })?;
-        state
-            .canonical_catalog_epoch
-            .store(catalog_epoch, std::sync::atomic::Ordering::Release);
-        for record in &identity_records {
-            let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)?
-            else {
-                continue;
-            };
-            state.install_recovered_transaction(
-                record.txn_id,
-                envelope.header.request_digest,
-                envelope.header.commit_seq,
-                envelope.outcome.affected_rows,
-            )?;
-        }
-        for status in reconciled_statuses {
-            state.install_recovered_aborted_transaction(status.txn_id, status.request_digest)?;
-        }
-        if lane_record_count > 0 {
-            use std::sync::atomic::Ordering;
-            state.base_seq.store(base_seq, Ordering::Release);
-            state.seq_oracle.store(expected_next_seq, Ordering::Release);
-            *state.applied.lock().unwrap_or_else(|p| p.into_inner()) =
-                engine_intent_lanes::SeqCut::with_base(lane_record_count);
-            state
-                .applied_mirror
-                .store(lane_record_count, Ordering::Release);
-            // Latch LAST (matches the activation ordering law: state first, latch last).
-            state.activated.store(true, Ordering::Release);
-        }
+        // Startup closes the retired physical reader after replay. Empty remnants do not impose
+        // read-only mode; a nonempty prefix retains only a fixed diagnostic/write guard until an
+        // offline migration rewrites it into canonical WAL.
+        let state =
+            engine_intent_lanes::IntentLaneState::with_history(lane_count, lane_record_count);
         engine.intent_lanes = Some(std::sync::Arc::new(state));
         engine.finish_recovery_replay()?;
         Ok(engine)
@@ -1247,7 +1224,21 @@ impl Engine {
     }
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
+        // Lifetime registry first: explicit snapshot capture uses registry -> descriptor/cache.
+        // Holding it across the current-map scan makes replacement/purge and capture/accounting
+        // linearizable even though publishers themselves never need this read-side registry lock.
+        let retained_gpu = self
+            .transaction_retained_gpu_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current_allocation_identities = BTreeSet::new();
         let snapshots = self.read_state.residency.snapshots.load();
+        current_allocation_identities.extend(snapshots.values().filter_map(|entry| {
+            entry
+                .device_memory
+                .as_ref()
+                .map(|memory| (memory.metadata().gpu_id, memory.device_ptr()))
+        }));
         let snapshot_bytes: u64 = snapshots
             .values()
             .filter(|entry| entry.descriptor.gpu_id == gpu_id)
@@ -1273,11 +1264,19 @@ impl Engine {
             })
         })
         .sum::<u64>();
-        let shard_bytes: u64 = self
-            .read_state
-            .residency
-            .shards
-            .load()
+        let shards = self.read_state.residency.shards.load();
+        current_allocation_identities.extend(shards.values().flatten().flat_map(|shard| {
+            [
+                shard.device_memory.as_ref(),
+                shard.deleted_by_region.as_ref(),
+                shard.created_by_region.as_ref(),
+                shard.row_id_region.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|memory| (memory.metadata().gpu_id, memory.device_ptr()))
+        }));
+        let shard_bytes: u64 = shards
             .values()
             .flatten()
             .filter(|shard| shard.gpu_id == gpu_id)
@@ -1294,28 +1293,90 @@ impl Engine {
                 shard.allocated_bytes.saturating_add(regions)
             })
             .sum();
-        let single_indexes = self
-            .read_state
-            .residency
-            .wave_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .filter_map(|index| index.index_memory.as_ref())
-            .filter(|memory| memory.metadata().gpu_id == gpu_id)
-            .map(|memory| memory.metadata().allocated_bytes)
+        let mut device_index_allocations = BTreeMap::new();
+        {
+            let cache = self
+                .read_state
+                .residency
+                .wave_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for memory in cache
+                .values()
+                .filter_map(|index| index.index_memory.as_ref())
+            {
+                device_index_allocations.insert(
+                    (memory.metadata().gpu_id, memory.device_ptr()),
+                    memory.metadata().allocated_bytes,
+                );
+                current_allocation_identities
+                    .insert((memory.metadata().gpu_id, memory.device_ptr()));
+            }
+        }
+        {
+            let cache = self
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for memory in cache
+                .values()
+                .filter_map(|index| index.device_index.as_ref())
+            {
+                device_index_allocations.insert(
+                    (memory.metadata().gpu_id, memory.device_ptr()),
+                    memory.metadata().allocated_bytes,
+                );
+                current_allocation_identities
+                    .insert((memory.metadata().gpu_id, memory.device_ptr()));
+            }
+        }
+        {
+            let cache = self
+                .read_state
+                .residency
+                .chunk_key_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for index in cache.values() {
+                device_index_allocations.insert(
+                    (index.device.metadata().gpu_id, index.device.device_ptr()),
+                    index.device.metadata().allocated_bytes,
+                );
+                current_allocation_identities
+                    .insert((index.device.metadata().gpu_id, index.device.device_ptr()));
+            }
+        }
+        {
+            let cache = self
+                .read_state
+                .residency
+                .chunk_key_bloom
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for bloom in cache.values() {
+                device_index_allocations.insert(
+                    (bloom.device.metadata().gpu_id, bloom.device.device_ptr()),
+                    bloom.device.metadata().allocated_bytes,
+                );
+                current_allocation_identities
+                    .insert((bloom.device.metadata().gpu_id, bloom.device.device_ptr()));
+            }
+        }
+        let device_index_bytes = device_index_allocations
+            .into_iter()
+            .filter(|((device, _), _)| *device == gpu_id)
+            .map(|(_, bytes)| bytes)
             .sum::<u64>();
-        let shard_indexes = self
-            .read_state
-            .residency
-            .shard_pk_device_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .filter_map(|index| index.device_index.as_ref())
-            .filter(|memory| memory.metadata().gpu_id == gpu_id)
-            .map(|memory| memory.metadata().allocated_bytes)
+        let retained_orphan_bytes = retained_gpu
+            .iter()
+            .filter(|((device, ptr), _)| {
+                *device == gpu_id && !current_allocation_identities.contains(&(*device, *ptr))
+            })
+            .map(|(_, (bytes, _owners))| *bytes)
             .sum::<u64>();
+        drop(retained_gpu);
         let route_descriptors = self
             .read_state
             .residency
@@ -1336,11 +1397,12 @@ impl Engine {
         snapshot_bytes
             .saturating_add(snapshot_sidecar_bytes)
             .saturating_add(shard_bytes)
-            .saturating_add(single_indexes)
-            .saturating_add(shard_indexes)
+            .saturating_add(device_index_bytes)
+            .saturating_add(retained_orphan_bytes)
             .saturating_add(route_descriptors)
             .saturating_add(live_compound_routes)
             .saturating_add(private_bytes)
+            .saturating_sub(Self::active_transaction_commit_gpu_credit(gpu_id))
     }
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {

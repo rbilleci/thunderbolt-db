@@ -27,9 +27,27 @@ use std::time::{Duration, Instant};
 
 use gpu_db_engine::Engine;
 use gpu_db_facade::{
-    execute_on_shared_engine, execute_on_shared_engine_batched, BatchedDispatch,
-    PointLookupBatcher, SharedEngine,
+    DbError, PointLookupBatcher, QueryOutcome, SharedEngine, SubmissionDispatch, SubmissionRequest,
 };
+
+fn submit_text(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
+    let mut session = shared.open_session();
+    shared
+        .submit(&mut session, SubmissionRequest::Text(sql))
+        .into_immediate()
+}
+
+fn submit_batched_text(
+    shared: &SharedEngine,
+    batcher: &PointLookupBatcher,
+    sql: &str,
+) -> SubmissionDispatch {
+    let mut session = shared.open_session();
+    shared.submit(
+        &mut session,
+        SubmissionRequest::BatchedText { sql, batcher },
+    )
+}
 
 fn pct(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
@@ -98,16 +116,16 @@ fn run(
                 let sql = format!("SELECT id FROM accounts WHERE id = {id}");
                 let s = Instant::now();
                 match &batcher {
-                    Some(b) => match execute_on_shared_engine_batched(&shared, b, &sql) {
-                        BatchedDispatch::Immediate(r) => {
+                    Some(b) => match submit_batched_text(&shared, b, &sql) {
+                        SubmissionDispatch::Immediate(r) => {
                             r.unwrap();
                         }
-                        BatchedDispatch::Batched(rx) => {
+                        SubmissionDispatch::Batched(rx) => {
                             rx.blocking_recv().unwrap().unwrap();
                         }
                     },
                     None => {
-                        execute_on_shared_engine(&shared, &sql).unwrap();
+                        submit_text(&shared, &sql).unwrap();
                     }
                 }
                 lat.push(s.elapsed().as_micros() as u64);

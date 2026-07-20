@@ -4,7 +4,7 @@ use super::*;
 
 impl Engine {
     /// STRATA S-B: commit-triggered admission for non-authoritative bootstrap/repair tables. Runs
-    /// after `publish_committed_seq` while the commit mutex is held. Device-authoritative DML tables
+    /// after the publication-coordinator join while the commit mutex is held. Device-authoritative DML tables
     /// are already maintained in place and never depend on this best-effort helper; a missing route
     /// for them fails loudly instead of selecting a host execution tier.
     pub(crate) fn auto_admit_resident_tables(&self, tables: &std::collections::BTreeSet<String>) {

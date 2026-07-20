@@ -2083,7 +2083,7 @@ fn status_and_telemetry_surface_relational_residency_state() {
 #[test]
 fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
     // D3 (ADR-013 pre1) GATE — the pinned double-read differential. An in-place INSERT append lands
-    // on the device (stamps + row_count) BEFORE `publish_committed_seq`; pre-D3 the appended slots
+    // on the device (stamps + row_count) BEFORE the publication join; pre-D3 the appended slots
     // were BORN-VISIBLE, so a reader pinned at the pre-commit boundary saw a decided-but-unpublished
     // insert (a phantom between two reads of one pinned statement). This test freezes exactly that
     // mid-commit state by driving the append primitive directly (no publish), then asserts every

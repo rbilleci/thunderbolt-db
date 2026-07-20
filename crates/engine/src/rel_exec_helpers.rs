@@ -279,6 +279,9 @@ pub(crate) fn relational_index_value(value: &SqlValue) -> String {
         SqlValue::Date(value) => format!("date:{value}"),
         SqlValue::Timestamp(value) => format!("ts:{value}"),
         SqlValue::Uuid(bytes) => format!("uuid:{}", gpu_db_sql::uuid::format_uuid(bytes)),
+        SqlValue::Parameter { .. } => {
+            unreachable!("value indexes never contain unbound prepared parameters")
+        }
     }
 }
 
@@ -349,6 +352,9 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
         // M3 (doc 21): a NULL cell (e.g. a COPY `\N` field) renders as the SQL NULL keyword; the
         // re-parsed INSERT recognizes the unquoted `NULL` literal and stores a SqlValue::Null.
         SqlValue::Null => Ok("NULL".to_string()),
+        SqlValue::Parameter { .. } => Err(EngineError::ApplyFailed(
+            "COPY rendering received an unbound prepared parameter".to_string(),
+        )),
     }
 }
 
@@ -368,6 +374,9 @@ pub(crate) fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
         SqlValue::Date(_) => 4,
         SqlValue::Timestamp(_) => 8,
         SqlValue::Uuid(_) => 16,
+        SqlValue::Parameter { .. } => {
+            unreachable!("resident rows never contain unbound prepared parameters")
+        }
     }
 }
 
@@ -728,6 +737,9 @@ pub(crate) fn synthesize_catalog_relation(
 
 pub(crate) fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
     match (left, right) {
+        (SqlValue::Parameter { .. }, _) | (_, SqlValue::Parameter { .. }) => {
+            unreachable!("execution never receives an unbound prepared parameter")
+        }
         // NULL sorts lowest in this INTERNAL total order (value-index/dedup only). SQL 3VL —
         // where a comparison to NULL is UNKNOWN, never an ordering — is enforced one level up in
         // `select_filter_matches` (which excludes any row whose operand is NULL); this arm only
@@ -1856,7 +1868,8 @@ pub(crate) fn int4_aggregate_value(
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+        | SqlValue::Uuid(_)
+        | SqlValue::Parameter { .. } => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             aggregate_int4_error_message(aggregate).to_string(),
         ))),
     }

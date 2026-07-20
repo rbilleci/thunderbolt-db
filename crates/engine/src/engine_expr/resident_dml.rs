@@ -11,6 +11,13 @@ use crate::Engine;
 use gpu_db_sql::SqlValue;
 use gpu_db_types::Index;
 
+#[cfg(test)]
+pub(crate) static RESIDENT_CONJUNCT_SLOT_SCAN_PROBES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static RESIDENT_ALL_SLOT_SCAN_PROBES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 enum DetailedLocateAttempt {
     Complete(Vec<crate::engine_retained_read::ShardPkHit>),
     Declined,
@@ -122,6 +129,8 @@ impl Engine {
         table: &RelationalTable,
         conjuncts: &[ResidentExpr],
     ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
+        #[cfg(test)]
+        RESIDENT_CONJUNCT_SLOT_SCAN_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.locate_resident_slots_detailed(table, None, Some(conjuncts))
     }
 
@@ -131,6 +140,8 @@ impl Engine {
         &self,
         table: &RelationalTable,
     ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
+        #[cfg(test)]
+        RESIDENT_ALL_SLOT_SCAN_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.locate_resident_slots_detailed(table, None, None)
     }
 
@@ -433,7 +444,7 @@ impl Engine {
     /// reconstructs the device generation. Runs under commit_mutex + catalog latch.
     ///
     /// **SI (SV6 — the audit-flagged P2 flip-gate, FIXED):** the append + `row_count` bump happen BEFORE
-    /// `publish_committed_seq`, and lock-free reads bind `read_txn_id = committed_seq()` then load `shards`
+    /// the publication-coordinator join, and lock-free reads bind `read_txn_id = committed_seq()` then load `shards`
     /// separately -- so a concurrent reader that observes `committed_seq = C-1` can observe the shards with
     /// the appended row already present. The appended NEW version is therefore STAMPED
     /// `created_by = commit_seq` (a per-shard on-demand i64 region mirroring `deleted_by`, written while the
@@ -493,7 +504,7 @@ impl Engine {
             return false;
         }
         // 2. Append the NEW image to the open shard, stamped `created_by = commit_seq` (SV6 — the P2
-        //    flip-gate fix): the append + row_count bump land BEFORE `publish_committed_seq`, so a
+        //    flip-gate fix): the append + row_count bump land BEFORE the publication join, so a
         //    concurrent reader bound to `committed_seq = C-1` can observe the appended slots; the stamp +
         //    the read path's `created_by <= read_txn_id` device conjunct hide the new version from that
         //    reader (it sees exactly the OLD version, still live at its snapshot). If this fails after

@@ -137,6 +137,7 @@ fn active_snapshots_track_oldest_boundary() {
     active.register_transaction(
         41,
         Arc::new(TransactionSnapshot {
+            characteristics: TransactionCharacteristics::REPEATABLE_READ_WRITE,
             boundary: 6,
             next_row_id: 1,
             catalog: Arc::new(CatalogSnapshot::default()),
@@ -145,7 +146,7 @@ fn active_snapshots_track_oldest_boundary() {
             resident_shards: Arc::new(BTreeMap::new()),
             device_authoritative_tables: Arc::new(BTreeSet::new()),
             chunk_authoritative_tables: Arc::new(BTreeMap::new()),
-            delta: std::sync::Mutex::new(TransactionDeltaState {
+            delta: Arc::new(std::sync::Mutex::new(TransactionDeltaState {
                 generation: 0,
                 resident_shards: Arc::new(BTreeMap::new()),
                 streaming_cold_chunks: Arc::new(BTreeMap::new()),
@@ -153,11 +154,21 @@ fn active_snapshots_track_oldest_boundary() {
                 write_set: WriteSet::default(),
                 next_row_id: 1,
                 sequence_state: BTreeMap::new(),
+                catalog_command: None,
+                catalog_base: None,
+                catalog_overlay: None,
                 private_gpu_bytes_by_gpu: BTreeMap::new(),
-            }),
-            statement_lock: std::sync::Mutex::new(()),
+                commit_gpu_bytes_by_gpu: BTreeMap::new(),
+            })),
+            statement_lock: Arc::new(std::sync::Mutex::new(())),
+            program_owned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            data_snapshot_acquired: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            base_streaming_cold_chunks: Arc::new(BTreeMap::new()),
             private_gpu_account: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             _resident_index_resources: Vec::new(),
+            _resident_gpu_charge: Arc::new(TransactionRetainedGpuCharge::empty(Arc::new(
+                std::sync::Mutex::new(BTreeMap::new()),
+            ))),
         }),
     );
     assert_eq!(active.transaction_snapshot(41), Some(6));
@@ -805,7 +816,7 @@ fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
     // A duplicate unique insert through the wave still fails with the REAL constraint error.
     let dup = engine.execute_dml_concurrent(9_000_000, "INSERT INTO uniq (id, v) VALUES (0, 0)");
     assert!(
-        matches!(&dup, Err(ExecuteError::Engine(EngineError::ApplyFailed(msg))) if msg.contains("duplicate key"))
+        matches!(&dup, Err(ExecuteError::Engine(EngineError::UniqueViolation(msg))) if msg.contains("duplicate key"))
             || matches!(&dup, Err(ExecuteError::Serialization(msg)) if msg.contains("duplicate key")),
         "expected a duplicate-key failure, got {dup:?}"
     );

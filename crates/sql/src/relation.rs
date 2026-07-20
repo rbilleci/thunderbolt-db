@@ -12,15 +12,16 @@ use super::{
     parse_refresh_materialized_view, parse_rename_database, parse_rename_function,
     parse_rename_materialized_view, parse_rename_role, parse_rename_sequence,
     parse_rename_tablespace, parse_rename_view, parse_select, parse_select_filter,
-    parse_select_filter_groups, parse_select_function, parse_sequence_regclass_arg,
-    parse_sequence_value_function, parse_sql_value, parse_supported_sql_type_name,
-    parse_typed_value_from_str, split_csv, strip_keyword_prefix_case_insensitive,
-    strip_keyword_suffix_case_insensitive, AddCheckConstraint, AddColumn, AddForeignKey,
-    AddPrimaryKey, AddUniqueConstraint, AlterColumnDefault, CheckConstraint, ColumnDef,
-    ColumnDefault, Command, CreateIndex, CreateSchema, CreateTable, Delete, DropColumn,
-    DropConstraint, DropIndex, DropSchema, DropTable, Insert, ParseError, PrimaryKey, RenameColumn,
-    RenameConstraint, RenameIndex, RenameTable, SelectFilter, SelectFilterOp, SqlType, SqlValue,
-    TruncateTable, UniqueConstraint, Update, UpdateAssignment,
+    parse_select_filter_groups, parse_select_function, parse_select_literal,
+    parse_sequence_regclass_arg, parse_sequence_value_function, parse_sql_value,
+    parse_supported_sql_type_name, parse_typed_value_from_str, split_csv,
+    strip_keyword_prefix_case_insensitive, strip_keyword_suffix_case_insensitive,
+    AddCheckConstraint, AddColumn, AddForeignKey, AddPrimaryKey, AddUniqueConstraint,
+    AlterColumnDefault, CheckConstraint, ColumnDef, ColumnDefault, Command, CreateIndex,
+    CreateSchema, CreateTable, Delete, DropColumn, DropConstraint, DropIndex, DropSchema,
+    DropTable, Insert, ParseError, PrimaryKey, RenameColumn, RenameConstraint, RenameIndex,
+    RenameTable, SelectFilter, SelectFilterOp, SqlType, SqlValue, TruncateTable, UniqueConstraint,
+    Update, UpdateAssignment,
 };
 
 pub(super) fn parse_relational_command(
@@ -253,6 +254,9 @@ pub(super) fn parse_relational_command(
         }
         if let Ok(function_command) = parse_select_function(input) {
             return Some(Ok(function_command));
+        }
+        if let Ok(literal_command) = parse_select_literal(input) {
+            return Some(Ok(literal_command));
         }
         return Some(parse_select(input, allow_catalog_schemas).map(Command::Select));
     }
@@ -689,7 +693,7 @@ fn parse_typed_column_default(
         // "NULL" and mis-parse it as e.g. the text value 'NULL').
         ColumnDefault::Literal(SqlValue::Null) => Ok(ColumnDefault::Literal(SqlValue::Null)),
         ColumnDefault::Literal(value) => {
-            let rendered = render_default_literal_for_coercion(&value);
+            let rendered = render_default_literal_for_coercion(&value)?;
             let coerced = parse_typed_value_from_str(&rendered, ty)?;
             Ok(ColumnDefault::Literal(coerced))
         }
@@ -701,8 +705,8 @@ fn parse_typed_column_default(
 
 /// Render an inferred default literal back to the textual form `parse_typed_value_from_str`
 /// expects, so it can be re-parsed at the column's declared type.
-fn render_default_literal_for_coercion(value: &SqlValue) -> String {
-    match value {
+fn render_default_literal_for_coercion(value: &SqlValue) -> Result<String, ParseError> {
+    Ok(match value {
         SqlValue::Null => "NULL".to_string(),
         SqlValue::Int2(value) => value.to_string(),
         SqlValue::Int4(value) => value.to_string(),
@@ -719,7 +723,10 @@ fn render_default_literal_for_coercion(value: &SqlValue) -> String {
         SqlValue::Date(value) => crate::datetime::format_date(*value),
         SqlValue::Timestamp(value) => crate::datetime::format_timestamp(*value),
         SqlValue::Uuid(value) => crate::uuid::format_uuid(value),
-    }
+        SqlValue::Parameter { .. } => {
+            return Err(ParseError::InvalidParameterReference);
+        }
+    })
 }
 
 fn parse_drop_table_constraint(input: &str) -> Result<DropConstraint, ParseError> {
@@ -1513,6 +1520,36 @@ mod tests {
         assert!(matches!(
             parse_delete("DELETE FROM t WHERE id = 1 RETURNING"),
             Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_typed_literal_projection_without_misclassifying_table_selects() {
+        assert_eq!(
+            parse_relational_command("SELECT 1 AS one", false)
+                .unwrap()
+                .unwrap(),
+            Command::SelectLiteral(crate::SelectLiteral {
+                column_name: "one".to_string(),
+                ty: SqlType::Int4,
+                value: SqlValue::Int4(1),
+            })
+        );
+        assert_eq!(
+            parse_relational_command("SELECT 'Ada'::text AS \"Display Name\"", false)
+                .unwrap()
+                .unwrap(),
+            Command::SelectLiteral(crate::SelectLiteral {
+                column_name: "Display Name".to_string(),
+                ty: SqlType::Text,
+                value: SqlValue::Text("Ada".to_string()),
+            })
+        );
+        assert!(matches!(
+            parse_relational_command("SELECT id FROM people", false)
+                .unwrap()
+                .unwrap(),
+            Command::Select(_)
         ));
     }
 }

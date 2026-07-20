@@ -190,9 +190,14 @@ fn rejects_malformed_frontend_frames() {
         &malformed_bind_with_zero_params_and_invalid_shared_format_payload,
     );
     assert_eq!(
-        parse_frontend_message(&malformed_bind_with_zero_params_and_invalid_shared_format)
-            .unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&malformed_bind_with_zero_params_and_invalid_shared_format).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: String::new(),
+            statement_name: String::new(),
+            parameter_format_codes: vec![2],
+            parameters: vec![],
+            result_format_codes: vec![],
+        }
     );
 
     let invalid_utf8_parse_statement_name = frontend_frame(
@@ -457,8 +462,14 @@ fn rejects_malformed_frontend_frames() {
     let negative_bind_result_format_code =
         frontend_frame(b'B', &negative_bind_result_format_code_payload);
     assert_eq!(
-        parse_frontend_message(&negative_bind_result_format_code).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&negative_bind_result_format_code).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![],
+            parameters: vec![],
+            result_format_codes: vec![-1],
+        }
     );
 
     let mut negative_bind_result_format_count_payload = Vec::new();
@@ -508,8 +519,14 @@ fn rejects_malformed_frontend_frames() {
     invalid_bind_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
     let invalid_bind_format_count = frontend_frame(b'B', &invalid_bind_format_count_payload);
     assert_eq!(
-        parse_frontend_message(&invalid_bind_format_count).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&invalid_bind_format_count).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![0, 1],
+            parameters: vec![None],
+            result_format_codes: vec![],
+        }
     );
 
     let mut invalid_bind_format_count_with_zero_parameters_payload = Vec::new();
@@ -524,8 +541,14 @@ fn rejects_malformed_frontend_frames() {
         &invalid_bind_format_count_with_zero_parameters_payload,
     );
     assert_eq!(
-        parse_frontend_message(&invalid_bind_format_count_with_zero_parameters).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&invalid_bind_format_count_with_zero_parameters).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![0, 1],
+            parameters: vec![],
+            result_format_codes: vec![],
+        }
     );
 
     let mut invalid_bind_format_code_payload = Vec::new();
@@ -536,8 +559,14 @@ fn rejects_malformed_frontend_frames() {
     invalid_bind_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
     let invalid_bind_format_code = frontend_frame(b'B', &invalid_bind_format_code_payload);
     assert_eq!(
-        parse_frontend_message(&invalid_bind_format_code).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&invalid_bind_format_code).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![2],
+            parameters: vec![],
+            result_format_codes: vec![],
+        }
     );
 
     let mut invalid_bind_shared_format_with_multiple_parameters_payload = Vec::new();
@@ -562,8 +591,14 @@ fn rejects_malformed_frontend_frames() {
         &invalid_bind_shared_format_with_multiple_parameters_payload,
     );
     assert_eq!(
-        parse_frontend_message(&invalid_bind_shared_format_with_multiple_parameters).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&invalid_bind_shared_format_with_multiple_parameters).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![2],
+            parameters: vec![Some(42_i32.to_be_bytes().to_vec()), None],
+            result_format_codes: vec![],
+        }
     );
 
     let mut bind_with_multiple_result_formats_payload = Vec::new();
@@ -981,8 +1016,14 @@ fn rejects_malformed_frontend_frames() {
         &bind_with_multiple_parameter_formats_and_invalid_code_payload,
     );
     assert_eq!(
-        parse_frontend_message(&bind_with_multiple_parameter_formats_and_invalid_code).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&bind_with_multiple_parameter_formats_and_invalid_code).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![0, 2],
+            parameters: vec![],
+            result_format_codes: vec![],
+        }
     );
 
     let mut bind_with_negative_parameter_format_code_payload = Vec::new();
@@ -994,8 +1035,14 @@ fn rejects_malformed_frontend_frames() {
     let bind_with_negative_parameter_format_code =
         frontend_frame(b'B', &bind_with_negative_parameter_format_code_payload);
     assert_eq!(
-        parse_frontend_message(&bind_with_negative_parameter_format_code).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&bind_with_negative_parameter_format_code).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![-1],
+            parameters: vec![],
+            result_format_codes: vec![],
+        }
     );
 
     let mut bind_with_invalid_single_result_format_code_payload = Vec::new();
@@ -1007,8 +1054,14 @@ fn rejects_malformed_frontend_frames() {
     let bind_with_invalid_single_result_format_code =
         frontend_frame(b'B', &bind_with_invalid_single_result_format_code_payload);
     assert_eq!(
-        parse_frontend_message(&bind_with_invalid_single_result_format_code).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&bind_with_invalid_single_result_format_code).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![],
+            parameters: vec![],
+            result_format_codes: vec![2],
+        }
     );
 
     let mut bind_with_multiple_result_formats_and_invalid_code_payload = Vec::new();
@@ -1028,8 +1081,14 @@ fn rejects_malformed_frontend_frames() {
         &bind_with_multiple_result_formats_and_invalid_code_payload,
     );
     assert_eq!(
-        parse_frontend_message(&bind_with_multiple_result_formats_and_invalid_code).unwrap_err(),
-        FrontendMessageError::InvalidBindPayload
+        parse_frontend_message(&bind_with_multiple_result_formats_and_invalid_code).unwrap(),
+        FrontendMessage::Bind {
+            portal_name: "portal".to_string(),
+            statement_name: "stmt".to_string(),
+            parameter_format_codes: vec![],
+            parameters: vec![],
+            result_format_codes: vec![0, 2],
+        }
     );
 
     let mut truncated_bind_result_format_payload = Vec::new();

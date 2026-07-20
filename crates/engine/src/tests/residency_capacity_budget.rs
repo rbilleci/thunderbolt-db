@@ -131,3 +131,164 @@ fn sharded_device_index_declines_at_residency_budget() {
     );
     assert!(e.relational_resident_bytes_for_gpu(0) <= budget);
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn active_transaction_pins_remain_globally_accounted_and_non_evictable() {
+    let mut e = Engine::new_local();
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(10, "CREATE TABLE pinned_budget_a (id INT, value INT)")
+        .unwrap();
+    e.execute_text(11, "INSERT INTO pinned_budget_a VALUES (1, 10)")
+        .unwrap();
+    e.execute_text(12, "CREATE TABLE pinned_budget_b (id INT, value INT)")
+        .unwrap();
+    e.execute_text(13, "INSERT INTO pinned_budget_b VALUES (2, 20)")
+        .unwrap();
+    let current = e.relational_resident_bytes_for_gpu(0);
+    let replacement = e.relational_resident_table_bytes_for_gpu("pinned_budget_b", 0);
+    assert!(current > replacement && replacement > 0);
+
+    e.execute_text(14, "BEGIN").unwrap();
+    e.set_relational_residency_budget_bytes(0, current);
+    let result = e.admit_relational_residency_snapshot(
+        "pinned_budget_b",
+        0,
+        replacement.saturating_add(1),
+    );
+    assert!(result.is_err(), "a pinned base generation must not be evicted");
+    let shards = e.read_residency_shards();
+    assert!(shards.contains_key("pinned_budget_a"));
+    assert!(shards.contains_key("pinned_budget_b"));
+    assert_eq!(e.relational_resident_bytes_for_gpu(0), current);
+    e.execute_text(14, "ROLLBACK").unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn same_table_replacement_cannot_hide_snapshot_retained_payload_from_budget() {
+    let mut e = Engine::new_local();
+    e.set_shard_residency_enabled(true);
+    e.execute_text(
+        15,
+        "CREATE TABLE pinned_same_table (id INT, value INT)",
+    )
+    .unwrap();
+    e.execute_text(16, "INSERT INTO pinned_same_table VALUES (1, 10)")
+        .unwrap();
+    repair_test_relational_host_copy(&e, "pinned_same_table");
+    let first = e
+        .populate_relational_residency_snapshot("pinned_same_table")
+        .unwrap();
+    if first.device_memory_proof.is_none() {
+        return;
+    }
+    let first_ptr = e
+        .read_residency_shards()
+        .get("pinned_same_table")
+        .and_then(|shards| shards.first())
+        .and_then(|shard| shard.device_memory.as_ref())
+        .map(|memory| memory.device_ptr())
+        .unwrap();
+    let exact_current = e.relational_resident_bytes_for_gpu(0);
+    assert!(exact_current > 0);
+
+    e.execute_text(17, "BEGIN").unwrap();
+    e.set_relational_residency_budget_bytes(0, exact_current);
+    let replacement = e.populate_relational_residency_snapshot("pinned_same_table");
+    assert!(
+        replacement.is_err(),
+        "a same-size replacement must count the transaction-pinned old allocation instead of excluding the target table wholesale"
+    );
+    let after_ptr = e
+        .read_residency_shards()
+        .get("pinned_same_table")
+        .and_then(|shards| shards.first())
+        .and_then(|shard| shard.device_memory.as_ref())
+        .map(|memory| memory.device_ptr())
+        .unwrap();
+    assert_eq!(after_ptr, first_ptr, "failed admission cannot publish a replacement");
+    assert_eq!(e.relational_resident_bytes_for_gpu(0), exact_current);
+    e.execute_text(17, "ROLLBACK").unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_retained_index_stays_charged_after_cache_purge() {
+    let e = Engine::new_local();
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.set_shard_index_probe_enabled(true);
+    e.execute_text(
+        20,
+        "CREATE TABLE pinned_index_budget (id int4 PRIMARY KEY, value int4)",
+    )
+    .unwrap();
+    e.execute_text(
+        21,
+        "INSERT INTO pinned_index_budget VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .unwrap();
+    let table = e.relational_catalog_table("pinned_index_budget").unwrap();
+    let id = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+    let value = crate::rel_exec_helpers::relational_column_index(&table, "value").unwrap();
+    let _ = e
+        .gather_sharded_int4_point_lookups_batched(
+            e.committed_seq(),
+            &table,
+            id,
+            &[id, value],
+            &[2],
+        )
+        .unwrap();
+    // Isolate the retained CudaResidentDeviceMemory charge from route-plan descriptor charges.
+    e.read_state
+        .residency
+        .sharded_point_routes
+        .store(Arc::new(BTreeMap::new()));
+    e.read_state
+        .residency
+        .compound_point_routes
+        .store(Arc::new(BTreeMap::new()));
+    let index_allocations = e
+        .read_state
+        .residency
+        .shard_pk_device_index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .filter_map(|entry| entry.device_index.as_ref())
+        .map(|memory| (memory.device_ptr(), memory.metadata().allocated_bytes))
+        .collect::<BTreeMap<_, _>>();
+    let index_bytes = index_allocations.values().sum::<u64>();
+    assert!(index_bytes > 0, "the fixture must own a device index");
+    let before = e.relational_resident_bytes_for_gpu(0);
+
+    e.execute_text(22, "BEGIN").unwrap();
+    e.read_state
+        .residency
+        .purge_shard_pk_index_for_table("pinned_index_budget");
+    assert!(e
+        .read_state
+        .residency
+        .shard_pk_device_index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty());
+    assert_eq!(
+        e.relational_resident_bytes_for_gpu(0),
+        before,
+        "the active snapshot's retired index allocation must remain charged"
+    );
+    e.execute_text(22, "ROLLBACK").unwrap();
+    assert!(
+        e.relational_resident_bytes_for_gpu(0) <= before.saturating_sub(index_bytes),
+        "at least the purged index allocation must leave with the final transaction generation"
+    );
+    assert!(e
+        .transaction_retained_gpu_allocations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty());
+}

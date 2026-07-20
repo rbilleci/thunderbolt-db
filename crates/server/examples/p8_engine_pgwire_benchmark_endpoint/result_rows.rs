@@ -17,6 +17,9 @@ fn sql_value_text(value: &SqlValue) -> String {
         SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value),
         SqlValue::Timestamp(value) => gpu_db_protocol::datetime::format_timestamp(*value),
         SqlValue::Uuid(value) => gpu_db_protocol::uuid::format_uuid(value),
+        SqlValue::Parameter { .. } => {
+            unreachable!("benchmark results never contain unbound prepared parameters")
+        }
     }
 }
 

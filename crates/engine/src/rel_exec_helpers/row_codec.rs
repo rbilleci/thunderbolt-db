@@ -23,6 +23,9 @@ pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
             SqlValue::Date(value) => format!("date:{value}"),
             SqlValue::Timestamp(value) => format!("ts:{value}"),
             SqlValue::Uuid(bytes) => format!("uuid:{}", gpu_db_sql::uuid::format_uuid(bytes)),
+            SqlValue::Parameter { .. } => {
+                unreachable!("stored rows never contain unbound prepared parameters")
+            }
         })
         .collect::<Vec<_>>()
         .join("|")

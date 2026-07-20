@@ -29,7 +29,14 @@ use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
 use std::time::Instant;
 
-use gpu_db_facade::{execute_on_shared_engine, SharedEngine};
+use gpu_db_facade::{DbError, QueryOutcome, SharedEngine, SubmissionRequest};
+
+fn submit_text(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
+    let mut session = shared.open_session();
+    shared
+        .submit(&mut session, SubmissionRequest::Text(sql))
+        .into_immediate()
+}
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
@@ -54,7 +61,7 @@ fn median_f64(values: &mut [f64]) -> f64 {
 }
 
 fn run_ok(shared: &SharedEngine, sql: &str) {
-    if let Err(err) = execute_on_shared_engine(shared, sql) {
+    if let Err(err) = submit_text(shared, sql) {
         panic!("{sql:?} setup failed: {err:?}");
     }
 }
@@ -107,9 +114,9 @@ fn run_cell(
                     let sql = format!("INSERT INTO t (id) VALUES ({id})");
                     if serialize {
                         let _guard = lock.write().unwrap();
-                        let _ = execute_on_shared_engine(&shared, &sql);
+                        let _ = submit_text(&shared, &sql);
                     } else {
-                        let _ = execute_on_shared_engine(&shared, &sql);
+                        let _ = submit_text(&shared, &sql);
                     }
                     id += 1;
                     budget -= 1;
@@ -132,11 +139,9 @@ fn run_cell(
                     let started = Instant::now();
                     if serialize {
                         let _guard = lock.read().unwrap();
-                        execute_on_shared_engine(&shared, "SELECT id FROM t WHERE id = 100")
-                            .unwrap();
+                        submit_text(&shared, "SELECT id FROM t WHERE id = 100").unwrap();
                     } else {
-                        execute_on_shared_engine(&shared, "SELECT id FROM t WHERE id = 100")
-                            .unwrap();
+                        submit_text(&shared, "SELECT id FROM t WHERE id = 100").unwrap();
                     }
                     latencies.push(started.elapsed().as_micros() as u64);
                 }

@@ -24,6 +24,14 @@ impl Engine {
                         continue;
                     }
                     Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => {
+                        for command in record.catalog_commands {
+                            match command {
+                                Command::CreateTable(create) => {
+                                    tables.insert(create.table);
+                                }
+                                _ => return None,
+                            }
+                        }
                         for mutation in record.mutations {
                             let table = match mutation {
                                 BinaryTransactionMutation::Insert { table, .. }

@@ -73,7 +73,7 @@ impl Engine {
         }
         self.current_transaction_read_snapshot().map_or_else(
             || self.read_state.latest_catalog(),
-            |snapshot| Arc::clone(&snapshot.catalog),
+            |snapshot| snapshot.transaction_catalog(),
         )
     }
 
@@ -129,7 +129,8 @@ impl Engine {
             return matches!(
                 decode_binary_record(&entry.payload),
                 Ok(crate::wal_binary::BinaryWalRecord::Transaction(record))
-                    if !record.sequence_advances.is_empty()
+                    if !record.catalog_commands.is_empty()
+                        || !record.sequence_advances.is_empty()
             );
         }
         let Ok(Some(command)) = Self::decode_engine_command(&entry.payload) else {
@@ -161,7 +162,7 @@ impl Engine {
     /// oldest active read snapshot can no longer need), and return it (Stage 2 — blocker #1; PART B
     /// co-pinning). Called by the catalog-latch apply path AFTER it has mutated the working maps and
     /// BEFORE it release-stores `committed_seq` — the publish ordering is now: data gen → residency
-    /// tombstones → **catalog ring push (this)** → `publish_committed_seq` LAST. Because the ring push
+    /// tombstones → **catalog ring push (this)** → publication-coordinator join LAST. Because the join
     /// happens before `committed_seq` is bumped, a reader that loads `committed_seq = commit_seq` and
     /// selects `catalog_as_of(commit_seq)` is guaranteed to find this generation (catalog visible no
     /// later than `committed_seq`). DDL is the only publisher and runs under the exclusive latch.
@@ -188,26 +189,6 @@ impl Engine {
             .oldest()
             .map(|oldest| oldest.saturating_sub(1))
             .unwrap_or(up_to)
-    }
-
-    /// Release-store the visibility/publish boundary to `at least` `seq` (monotonic). Called LAST in
-    /// the commit critical section — strictly AFTER the WAL fsync and the data/value-index publish —
-    /// so it is the single point at which a commit becomes visible to lock-free readers.
-    pub(crate) fn publish_committed_seq(&self, seq: Index) {
-        // Monotonic max via a release CAS loop: under the commit_mutex commits are assigned strictly
-        // increasing `commit_seq`, but a CAS keeps this correct even if two paths race.
-        let mut current = self.read_state.committed_seq.load(AtomicOrdering::Relaxed);
-        while seq > current {
-            match self.read_state.committed_seq.compare_exchange_weak(
-                current,
-                seq,
-                AtomicOrdering::Release,
-                AtomicOrdering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
-        }
     }
 
     pub fn applied_len(&self) -> usize {
@@ -477,7 +458,7 @@ impl Engine {
             commit.repl.install_snapshot(meta);
             commit.repl.snapshot_meta().last_included_index
         };
-        self.publish_committed_seq(last_included_index);
+        self.install_publication_snapshot(last_included_index);
     }
 
     pub fn snapshot_meta(&self) -> SnapshotMeta {

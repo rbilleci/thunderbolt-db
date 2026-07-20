@@ -142,7 +142,14 @@ impl Engine {
         payload: &[u8],
     ) -> Result<gpu_db_wal::CanonicalFragmentKind, EngineError> {
         if payload.first() == Some(&WAL_BINARY_TAG) {
-            return Ok(gpu_db_wal::CanonicalFragmentKind::RowMutation);
+            return Ok(match decode_binary_record(payload)? {
+                crate::wal_binary::BinaryWalRecord::Transaction(record)
+                    if !record.catalog_commands.is_empty() =>
+                {
+                    gpu_db_wal::CanonicalFragmentKind::CatalogMutation
+                }
+                _ => gpu_db_wal::CanonicalFragmentKind::RowMutation,
+            });
         }
         let command = Self::decode_engine_command(payload)?.ok_or_else(|| {
             EngineError::Durability(
@@ -405,6 +412,77 @@ impl Engine {
         )
     }
 
+    pub(crate) fn canonical_wal_record_with_isolation(
+        commit: &CommitState,
+        txn_id: TxnId,
+        commit_seq: Index,
+        lane_id: u32,
+        payload: &Arc<[u8]>,
+        isolation: gpu_db_wal::CanonicalIsolation,
+    ) -> Result<WalRecord, EngineError> {
+        let (catalog_epoch, catalog_digest) =
+            Self::canonical_catalog_boundary(commit.canonical_identity, commit.wal.last_record())?;
+        Self::canonical_wal_record_with_boundary_and_outcome_isolation(
+            commit.canonical_identity,
+            catalog_epoch,
+            catalog_digest,
+            txn_id,
+            commit_seq,
+            lane_id,
+            payload,
+            gpu_db_wal::canonical_request_digest(payload),
+            gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
+            Self::canonical_affected_rows(payload)?,
+            isolation,
+        )
+    }
+
+    pub(crate) fn canonical_affected_rows(payload: &[u8]) -> Result<u64, EngineError> {
+        if payload.first() == Some(&WAL_BINARY_TAG) {
+            match decode_binary_record(payload)? {
+                crate::wal_binary::BinaryWalRecord::Insert(record) => Ok(record.rows.len() as u64),
+                crate::wal_binary::BinaryWalRecord::Transaction(record) => {
+                    Ok(record.mutations.len() as u64)
+                }
+                crate::wal_binary::BinaryWalRecord::DeleteByKey(_)
+                | crate::wal_binary::BinaryWalRecord::UpdateByKey(_) => {
+                    Err(EngineError::Durability(
+                        "unresolved by-key WAL requires an exact GPU outcome marker".to_string(),
+                    ))
+                }
+            }
+        } else {
+            match Self::decode_engine_command(payload)?.ok_or_else(|| {
+                EngineError::Durability("canonical WAL command has no typed operation".to_string())
+            })? {
+                Command::Insert(insert) => Ok(insert.rows.len() as u64),
+                Command::Delete(_) | Command::Update(_) => Err(EngineError::Durability(
+                    "unresolved text UPDATE/DELETE requires an exact outcome marker".to_string(),
+                )),
+                _ => Ok(0),
+            }
+        }
+    }
+
+    fn canonical_table_block_count(
+        payload: &[u8],
+        operation_kind: gpu_db_wal::CanonicalFragmentKind,
+    ) -> Result<u32, EngineError> {
+        if payload.first() == Some(&WAL_BINARY_TAG) {
+            if let crate::wal_binary::BinaryWalRecord::Transaction(record) =
+                decode_binary_record(payload)?
+            {
+                return Ok(u32::from(!record.mutations.is_empty()));
+            }
+        }
+        Ok(u32::from(matches!(
+            operation_kind,
+            gpu_db_wal::CanonicalFragmentKind::RowMutation
+                | gpu_db_wal::CanonicalFragmentKind::TableReset
+                | gpu_db_wal::CanonicalFragmentKind::TableRewrite
+        )))
+    }
+
     pub(crate) fn canonical_wal_record_with_commit_request_digest(
         commit: &CommitState,
         txn_id: TxnId,
@@ -438,33 +516,7 @@ impl Engine {
         payload: &Arc<[u8]>,
         request_digest: gpu_db_wal::CanonicalDigest,
     ) -> Result<WalRecord, EngineError> {
-        let affected_rows = if payload.first() == Some(&WAL_BINARY_TAG) {
-            match decode_binary_record(payload)? {
-                crate::wal_binary::BinaryWalRecord::Insert(record) => record.rows.len() as u64,
-                crate::wal_binary::BinaryWalRecord::Transaction(record) => {
-                    record.mutations.len() as u64
-                }
-                crate::wal_binary::BinaryWalRecord::DeleteByKey(_)
-                | crate::wal_binary::BinaryWalRecord::UpdateByKey(_) => {
-                    return Err(EngineError::Durability(
-                        "unresolved by-key WAL requires an exact GPU outcome marker".to_string(),
-                    ))
-                }
-            }
-        } else {
-            match Self::decode_engine_command(payload)?.ok_or_else(|| {
-                EngineError::Durability("canonical WAL command has no typed operation".to_string())
-            })? {
-                Command::Insert(insert) => insert.rows.len() as u64,
-                Command::Delete(_) | Command::Update(_) => {
-                    return Err(EngineError::Durability(
-                        "unresolved text UPDATE/DELETE requires an exact outcome marker"
-                            .to_string(),
-                    ));
-                }
-                _ => 0,
-            }
-        };
+        let affected_rows = Self::canonical_affected_rows(payload)?;
         Self::canonical_wal_record_with_boundary_and_outcome(
             identity,
             catalog_epoch,
@@ -575,6 +627,35 @@ impl Engine {
         outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
         affected_rows: u64,
     ) -> Result<WalRecord, EngineError> {
+        Self::canonical_wal_record_with_boundary_and_outcome_isolation(
+            identity,
+            catalog_epoch,
+            catalog_digest,
+            txn_id,
+            commit_seq,
+            lane_id,
+            payload,
+            request_digest,
+            outcome_kind,
+            affected_rows,
+            gpu_db_wal::CanonicalIsolation::ReadCommitted,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn canonical_wal_record_with_boundary_and_outcome_isolation(
+        identity: gpu_db_wal::CanonicalIdentity,
+        catalog_epoch: u64,
+        catalog_digest: gpu_db_wal::CanonicalDigest,
+        txn_id: TxnId,
+        commit_seq: Index,
+        lane_id: u32,
+        payload: &Arc<[u8]>,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
+        affected_rows: u64,
+        isolation: gpu_db_wal::CanonicalIsolation,
+    ) -> Result<WalRecord, EngineError> {
         if outcome_kind == gpu_db_wal::CanonicalOutcomeKind::AbortError {
             return Err(EngineError::Durability(
                 "committed engine WAL cannot be encoded with an abort outcome".to_string(),
@@ -611,19 +692,14 @@ impl Engine {
             commit_seq,
             stable_transaction_id: txn_id,
             request_digest,
-            isolation: gpu_db_wal::CanonicalIsolation::ReadCommitted,
+            isolation,
             flags: u32::from(operation_kind as u16),
             catalog_before_epoch: catalog_epoch,
             catalog_after_epoch,
             catalog_before_digest: catalog_digest,
             catalog_after_digest,
             operation_count: 2,
-            table_block_count: u32::from(matches!(
-                operation_kind,
-                gpu_db_wal::CanonicalFragmentKind::RowMutation
-                    | gpu_db_wal::CanonicalFragmentKind::TableReset
-                    | gpu_db_wal::CanonicalFragmentKind::TableRewrite
-            )),
+            table_block_count: Self::canonical_table_block_count(payload, operation_kind)?,
             allocator_high_water,
         };
         let outcome = gpu_db_wal::CanonicalOutcome {
@@ -676,8 +752,12 @@ impl Engine {
         // admitted. This makes the one-way migration barrier span checkpoint/serial/lane chunks,
         // without treating a lineage-only identity anchor as evidence that canonical WAL exists.
         let mut canonical_seen = commit.canonical_replay_seen;
+        let mut transaction_claims: HashMap<_, _> = commit
+            .transaction_status
+            .iter()
+            .map(|(txn_id, status)| (*txn_id, status.request_digest))
+            .collect();
         drop(commit);
-        let mut transaction_claims = HashMap::new();
         let mut replay = Vec::with_capacity(records.len());
         for record in records {
             let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)?
@@ -807,12 +887,7 @@ impl Engine {
                 operation_kind,
                 &operation.body,
             );
-            let table_block_count = u32::from(matches!(
-                operation_kind,
-                gpu_db_wal::CanonicalFragmentKind::RowMutation
-                    | gpu_db_wal::CanonicalFragmentKind::TableReset
-                    | gpu_db_wal::CanonicalFragmentKind::TableRewrite
-            ));
+            let table_block_count = Self::canonical_table_block_count(&payload, operation_kind)?;
             if envelope.header.catalog_after_epoch != catalog_after_epoch
                 || envelope.header.catalog_after_digest != catalog_after_digest
                 || envelope.header.flags != u32::from(operation_kind as u16)
@@ -859,6 +934,7 @@ impl Engine {
                         request_digest: envelope.header.request_digest,
                         outcome: DurableTransactionOutcome::Committed {
                             commit_seq: envelope.header.commit_seq,
+                            affected_rows: envelope.outcome.affected_rows,
                         },
                     },
                 ));
@@ -918,7 +994,16 @@ impl Engine {
         }
         let mut commit = self.commit_state();
         for (txn_id, status) in claims {
-            commit.transaction_status.insert(txn_id, status);
+            match commit.transaction_status.entry(txn_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(status);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(EngineError::Durability(format!(
+                        "canonical WAL repeats terminal transaction claim {txn_id} across replay chunks"
+                    )));
+                }
+            }
         }
         Ok(())
     }

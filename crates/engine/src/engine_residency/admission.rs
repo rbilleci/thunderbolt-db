@@ -755,17 +755,43 @@ impl Engine {
             return Ok((Vec::new(), current_bytes + resident_bytes));
         }
 
+        // An active transaction owns exact resident Arc generations. Evicting their global map
+        // entries would leave the still-live allocations outside global accounting because private
+        // COW accounting deliberately excludes base pointers. Pinned tables are therefore not
+        // evictable; this preserves both snapshot correctness and the hard physical GPU budget.
+        let pinned_tables = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .transactions
+            .values()
+            .flat_map(|snapshot| {
+                snapshot
+                    .resident_snapshots
+                    .keys()
+                    .chain(snapshot.resident_shards.keys())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>();
         let mut candidates: BTreeMap<String, u64> = self
             .read_state
             .residency
             .snapshots
             .load()
             .iter()
-            .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
+            .filter(|(name, entry)| {
+                name.as_str() != table
+                    && entry.descriptor.gpu_id == gpu_id
+                    && !pinned_tables.contains(name.as_str())
+            })
             .map(|(name, entry)| (name.clone(), entry.descriptor.valid_through_index))
             .collect();
         for (name, shards) in self.read_state.residency.shards.load().iter() {
-            if name == table || !shards.iter().any(|shard| shard.gpu_id == gpu_id) {
+            if name == table
+                || pinned_tables.contains(name.as_str())
+                || !shards.iter().any(|shard| shard.gpu_id == gpu_id)
+            {
                 continue;
             }
             let age = shards
@@ -861,9 +887,8 @@ impl Engine {
         self.populate_relational_residency_snapshot_inner(&mut guard, table, gpu_id)
     }
 
-    /// E2.5c-1: `&self` residency admission for the route ELISION RE-ENTRY arm — a reopened
-    /// lanes-mode engine is intent-only, so the `&mut` operator warm path is unreachable from
-    /// the surfaces it still exposes. Same latch + producer as the operator path.
+    /// `&self` residency admission for lazy optimized-route preparation. Same latch + producer as
+    /// the operator warm path.
     pub(crate) fn populate_relational_residency_snapshot_shared(
         &self,
         table: &str,

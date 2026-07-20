@@ -10,7 +10,7 @@ use super::*;
 /// Exact retained bytes for every distinct named-index key id on one shard. The sizing mirrors
 /// `ensure_shard_pk_device_index`: capacity-sized directory headroom plus one posting link per row
 /// of shard capacity. Shared key ids are charged once because publication reuses their allocation.
-fn estimated_named_index_bytes_for_shard(
+pub(crate) fn estimated_named_index_bytes_for_shard(
     table: &RelationalTable,
     row_count: usize,
     capacity: usize,
@@ -432,7 +432,19 @@ impl Engine {
     }
 
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
+        let retained_gpu = self
+            .transaction_retained_gpu_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut included_allocation_identities = BTreeSet::new();
         let snapshots = self.read_state.residency.snapshots.load();
+        included_allocation_identities.extend(
+            snapshots
+                .iter()
+                .filter(|(name, _)| name.as_str() != table)
+                .filter_map(|(_, entry)| entry.device_memory.as_ref())
+                .map(|memory| (memory.metadata().gpu_id, memory.device_ptr())),
+        );
         let snapshot_bytes: u64 = snapshots
             .iter()
             .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
@@ -459,11 +471,25 @@ impl Engine {
             })
         })
         .sum::<u64>();
-        let shard_bytes: u64 = self
-            .read_state
-            .residency
-            .shards
-            .load()
+        let shards = self.read_state.residency.shards.load();
+        included_allocation_identities.extend(
+            shards
+                .iter()
+                .filter(|(name, _)| name.as_str() != table)
+                .flat_map(|(_, shards)| shards)
+                .flat_map(|shard| {
+                    [
+                        shard.device_memory.as_ref(),
+                        shard.deleted_by_region.as_ref(),
+                        shard.created_by_region.as_ref(),
+                        shard.row_id_region.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|memory| (memory.metadata().gpu_id, memory.device_ptr()))
+                }),
+        );
+        let shard_bytes: u64 = shards
             .iter()
             .filter(|(name, _shards)| name.as_str() != table)
             .flat_map(|(_name, shards)| shards)
@@ -481,30 +507,106 @@ impl Engine {
                 shard.allocated_bytes.saturating_add(regions)
             })
             .sum();
-        let single_indexes = self
-            .read_state
-            .residency
-            .wave_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let single_indexes = {
+            let cache = self
+                .read_state
+                .residency
+                .wave_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let memories = cache
+                .iter()
+                .filter(|(name, _)| name.as_str() != table)
+                .filter_map(|(_, index)| index.index_memory.as_ref())
+                .collect::<Vec<_>>();
+            included_allocation_identities.extend(
+                memories
+                    .iter()
+                    .map(|memory| (memory.metadata().gpu_id, memory.device_ptr())),
+            );
+            memories
+                .into_iter()
+                .filter(|memory| memory.metadata().gpu_id == gpu_id)
+                .map(|memory| memory.metadata().allocated_bytes)
+                .sum::<u64>()
+        };
+        let shard_indexes = {
+            let cache = self
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let memories = cache
+                .iter()
+                .filter(|((name, _, _), _)| name.as_str() != table)
+                .filter_map(|(_, index)| index.device_index.as_ref())
+                .collect::<Vec<_>>();
+            included_allocation_identities.extend(
+                memories
+                    .iter()
+                    .map(|memory| (memory.metadata().gpu_id, memory.device_ptr())),
+            );
+            memories
+                .into_iter()
+                .filter(|memory| memory.metadata().gpu_id == gpu_id)
+                .map(|memory| memory.metadata().allocated_bytes)
+                .sum::<u64>()
+        };
+        let chunk_indexes = {
+            let cache = self
+                .read_state
+                .residency
+                .chunk_key_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let memories = cache
+                .iter()
+                .filter(|((name, _, _), _)| name.as_str() != table)
+                .map(|(_, index)| &index.device)
+                .collect::<Vec<_>>();
+            included_allocation_identities.extend(
+                memories
+                    .iter()
+                    .map(|memory| (memory.metadata().gpu_id, memory.device_ptr())),
+            );
+            memories
+                .into_iter()
+                .filter(|memory| memory.metadata().gpu_id == gpu_id)
+                .map(|memory| memory.metadata().allocated_bytes)
+                .sum::<u64>()
+        };
+        let chunk_blooms = {
+            let cache = self
+                .read_state
+                .residency
+                .chunk_key_bloom
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let memories = cache
+                .iter()
+                .filter(|((name, _, _), _)| name.as_str() != table)
+                .map(|(_, bloom)| &bloom.device)
+                .collect::<Vec<_>>();
+            included_allocation_identities.extend(
+                memories
+                    .iter()
+                    .map(|memory| (memory.metadata().gpu_id, memory.device_ptr())),
+            );
+            memories
+                .into_iter()
+                .filter(|memory| memory.metadata().gpu_id == gpu_id)
+                .map(|memory| memory.metadata().allocated_bytes)
+                .sum::<u64>()
+        };
+        let retained_non_reclaimable = retained_gpu
             .iter()
-            .filter(|(name, _)| name.as_str() != table)
-            .filter_map(|(_, index)| index.index_memory.as_ref())
-            .filter(|memory| memory.metadata().gpu_id == gpu_id)
-            .map(|memory| memory.metadata().allocated_bytes)
+            .filter(|((device, ptr), _)| {
+                *device == gpu_id && !included_allocation_identities.contains(&(*device, *ptr))
+            })
+            .map(|(_, (bytes, _owners))| *bytes)
             .sum::<u64>();
-        let shard_indexes = self
-            .read_state
-            .residency
-            .shard_pk_device_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|((name, _, _), _)| name.as_str() != table)
-            .filter_map(|(_, index)| index.device_index.as_ref())
-            .filter(|memory| memory.metadata().gpu_id == gpu_id)
-            .map(|memory| memory.metadata().allocated_bytes)
-            .sum::<u64>();
+        drop(retained_gpu);
         let route_descriptors = self
             .read_state
             .residency
@@ -531,6 +633,9 @@ impl Engine {
             .saturating_add(shard_bytes)
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
+            .saturating_add(chunk_indexes)
+            .saturating_add(chunk_blooms)
+            .saturating_add(retained_non_reclaimable)
             .saturating_add(route_descriptors)
             .saturating_add(live_compound_routes)
             .saturating_add(private_bytes)

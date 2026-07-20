@@ -1,8 +1,7 @@
 use super::{
-    exact_device_verdict_cardinality, Engine, EngineError, ExecuteError, Index, LaneIntent,
-    LaneOpKind, RelationalTable, SqlValue,
+    exact_device_verdict_cardinality, Engine, Index, LaneIntent, LaneOpKind, RelationalTable,
+    SqlValue,
 };
-use std::sync::atomic::Ordering as AtomicOrdering;
 
 impl Engine {
     /// Probe optimistically against immutable published descriptors. If an append races that
@@ -159,85 +158,44 @@ impl Engine {
         (violations, conflicts, target_counts)
     }
 
-    /// APPLY LEADER body: merge every pending lane request per table and run
-    /// ONE open-shard append pass (rows + per-row created_by stamps + row ids).
-    /// The leader lock serializes appends, so the PK-index extension chain
-    /// (entry.row_count == base) is preserved exactly as under the old
-    /// exclusive section — just batched across lanes. Any non-appended or incompletely stamped
-    /// durable request fails closed before acknowledgement; the lane never dispatches to a host
-    /// representation.
-    pub(super) fn lane_apply_merged(&self, batch: &mut [crate::engine_intent_lanes::ApplyRequest]) {
-        // P4-2b (audit L5): a CHUNK-AUTHORITATIVE table must be unreachable here — lane ingress
-        // needs a covered/keyed route a keyless class table cannot build. Assert the invariant a
-        // future keyless-lane path would otherwise silently break (lost writes).
-        #[cfg(debug_assertions)]
-        for request in batch.iter() {
-            debug_assert!(
-                self.table_chunk_authoritative(&request.table).is_none(),
-                "a chunk-authoritative table reached the lane apply — the class write path only \
-                 exists on the serialized commit"
+    /// Apply one canonically claimed optimized request. The canonical commit lock prevents a
+    /// second lane request from reaching this phase concurrently; `device_apply_lock` serializes
+    /// against optimistic validation/rebuild activity. Any incomplete device publication panics
+    /// and the caller wedges before acknowledgement.
+    pub(super) fn lane_apply_request(
+        &self,
+        request: &mut crate::engine_intent_lanes::ApplyRequest,
+    ) {
+        debug_assert!(
+            self.table_chunk_authoritative(&request.table).is_none(),
+            "a chunk-authoritative table reached optimized apply"
+        );
+        let table = request.table.as_str();
+        let rows = std::mem::take(&mut request.rows);
+        let row_ids = std::mem::take(&mut request.row_ids);
+        let stamps = std::mem::take(&mut request.stamps);
+        let tombstones = std::mem::take(&mut request.tombstones);
+        let updates = std::mem::take(&mut request.updates);
+        let appended = rows.is_empty()
+            || self.try_append_resident_int4_open_shard(
+                table,
+                &rows,
+                crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
+                Some(&row_ids),
             );
+        if appended && !rows.is_empty() && !self.table_device_authoritative(table) {
+            let snapshot = self.catalog_snapshot();
+            if self.table_device_authority_eligible(&snapshot, table) {
+                self.set_table_device_authoritative(table, true);
+            }
         }
-        use std::collections::BTreeMap;
-        // group request indexes per table (usually exactly one table)
-        let mut tables: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (index, request) in batch.iter().enumerate() {
-            tables.entry(request.table.clone()).or_default().push(index);
-        }
-        for (table, requests) in tables {
-            let table = table.as_str();
-            let total: usize = requests.iter().map(|&i| batch[i].rows.len()).sum();
-            let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(total);
-            let mut row_ids: Vec<u64> = Vec::with_capacity(total);
-            let mut stamps: Vec<Index> = Vec::with_capacity(total);
-            let mut tombstones: Vec<crate::engine_intent_lanes::LaneTombstone> = Vec::new();
-            let mut updates: Vec<crate::engine_intent_lanes::LaneUpdate> = Vec::new();
-            for &i in &requests {
-                // MOVE the row vectors (pointer moves) — the leader was cloning
-                // every merged row's SqlValues, ~1900 heap allocs per wave.
-                rows.append(&mut batch[i].rows);
-                row_ids.extend_from_slice(&batch[i].row_ids);
-                stamps.extend_from_slice(&batch[i].stamps);
-                tombstones.append(&mut batch[i].tombstones);
-                updates.append(&mut batch[i].updates);
-            }
-            // WAL-FIRST APPLY ORDER: APPEND inserts FIRST (device-visible + indexed), THEN
-            // LOCATE + tombstone deletes. The locate runs at each delete's read_snapshot, and its
-            // created_by<=snapshot<deleted_by filter selects EXACTLY the version the delete's
-            // snapshot saw — so append-vs-locate order is immaterial: a same-batch reinsert
-            // (created_by = its seq > the delete's snapshot) is filtered OUT, while a same-batch
-            // insert the delete's snapshot DID see (created_by <= snapshot) is correctly targeted.
-            // (Audit note: "a same-batch insert is never a target" is NOT the invariant — the
-            // visibility filter is what makes every case semantically correct, not append order.)
-            let appended = rows.is_empty()
-                || self.try_append_resident_int4_open_shard(
-                    table,
-                    &rows,
-                    crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
-                    Some(&row_ids),
-                );
-            if appended && !rows.is_empty() && !self.table_device_authoritative(table) {
-                {
-                    let snapshot = self.catalog_snapshot();
-                    if self.table_device_authority_eligible(&snapshot, table) {
-                        self.set_table_device_authoritative(table, true);
-                    }
-                }
-            }
-            // LOCATE + tombstone deletes on the device. Sets each delete's rows-affected cell
-            // (0 or 1) only after the complete device verdict is available.
-            let deletes_ok = tombstones.is_empty()
-                || (appended && self.apply_lane_tombstones_device(table, &tombstones));
-            // U2 WAL-FIRST: LOCATE the update-olds, tombstone them, and CONDITIONALLY append the
-            // new versions (only the 1-row updates append). Sets each update's rows-affected cell
-            // (0 or 1). A decline poisons the lane apply; WAL replay retries in a fresh context.
-            let updates_ok =
-                updates.is_empty() || (appended && self.apply_lane_updates_device(table, &updates));
-            if appended && deletes_ok && updates_ok {
-                continue;
-            }
+        let deletes_ok = tombstones.is_empty()
+            || (appended && self.apply_lane_tombstones_device(table, &tombstones));
+        let updates_ok =
+            updates.is_empty() || (appended && self.apply_lane_updates_device(table, &updates));
+        if !(appended && deletes_ok && updates_ok) {
             panic!(
-                "commit-path invariant violation: durable lane DML for relation \"{table}\" \
+                "commit-path invariant violation: durable optimized DML for relation \"{table}\" \
                  declined device publication — refusing acknowledgement; WAL replay is required"
             );
         }
@@ -482,111 +440,5 @@ impl Engine {
                 .fetch_add(stamped_rows, std::sync::atomic::Ordering::Relaxed);
         }
         true
-    }
-
-    /// Settle every lane wave whose end seq the visible cut covers (durable AND
-    /// applied), publishing `committed_seq` to the global cut first so a polled
-    /// Ok is never observable before the commit is readable.
-    pub(super) fn settle_intent_lane(
-        &self,
-        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
-        lane: usize,
-    ) -> bool {
-        // AUDIT F3 (+ apply poison): an ASYNC durability failure (fence pool
-        // poison after the append returned Ok) OR a failed merged apply
-        // permanently stalls the cut; without this check the stalled waves
-        // would hang their clients forever instead of wedging loudly like the
-        // classic path. The probes are lock-free flags; the mutex-walking
-        // reason fetch (N poison locks) is paid only on an actual wedge.
-        let visible_boundary = lanes.visible_boundary();
-        if visible_boundary.is_err() {
-            lanes
-                .apply_poisoned
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        let wal_poisoned = lanes.wal_peek().is_some_and(|wal| wal.is_poisoned());
-        if wal_poisoned
-            || lanes
-                .apply_poisoned
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            let reason = if let Err(err) = &visible_boundary {
-                format!("intent lane visibility boundary invalid: {err}")
-            } else if wal_poisoned {
-                let inner = lanes
-                    .wal_peek()
-                    .and_then(|wal| wal.poison_reason())
-                    .unwrap_or_else(|| "lane wedged (reason pending)".to_string());
-                format!("intent lane WAL poisoned: {inner}")
-            } else {
-                "intent lane apply leader failed; cut permanently holed".to_string()
-            };
-            self.wedge_commit_path();
-            let mut queue = lanes.settle[lane]
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut settled = false;
-            while let Some(entry) = queue.pop_front() {
-                for item in entry.winners.into_iter().chain(entry.async_winners) {
-                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                        reason.clone(),
-                    ))));
-                }
-                settled = true;
-            }
-            return settled;
-        }
-        let (local_cut, visible_seq) = visible_boundary.expect("visibility error drained above");
-        if let Some(visible_seq) = visible_seq {
-            self.publish_committed_seq(visible_seq);
-        }
-        let mut settled = false;
-        let mut queue = lanes.settle[lane]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Compatibility slot only: ADR-014 production formation leaves `async_winners` empty, so
-        // no SQL success can settle at the applied-only cut ahead of durable publication.
-        let applied_cut = lanes
-            .applied_mirror
-            .load(std::sync::atomic::Ordering::Acquire);
-        for entry in queue.iter_mut() {
-            if entry.end_seq > applied_cut {
-                break;
-            }
-            if !entry.async_settled {
-                entry.async_settled = true;
-                for item in entry.async_winners.drain(..) {
-                    let rows = item.resolved_rows_affected();
-                    item.set_outcome(Ok(rows));
-                }
-                settled = true;
-            }
-        }
-        while queue
-            .front()
-            .is_some_and(|entry| entry.end_seq <= local_cut)
-        {
-            let entry = queue.pop_front().expect("front checked");
-            debug_assert!(
-                entry
-                    .apply_slot
-                    .done
-                    .load(std::sync::atomic::Ordering::Acquire),
-                "cut covered a wave whose apply slot is not done"
-            );
-            lanes.stat_acklag_ns.fetch_add(
-                entry.published_at.elapsed().as_nanos() as u64,
-                AtomicOrdering::Relaxed,
-            );
-            lanes
-                .stat_settled_waves
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            for item in entry.winners.into_iter().chain(entry.async_winners) {
-                let rows = item.resolved_rows_affected();
-                item.set_outcome(Ok(rows));
-            }
-            settled = true;
-        }
-        settled
     }
 }

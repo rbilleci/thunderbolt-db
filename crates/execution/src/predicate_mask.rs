@@ -3,8 +3,9 @@ use std::os::raw::c_void;
 use super::{
     check_cuda, launch_cuda_buffer_i32_compare_indices_ordered,
     launch_cuda_owned_i32_compare_indices_ordered, run_resident_arith_program,
-    CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, ExprStep,
-    ExprTerminal, PooledBufferLease, PooledDeviceBufferOwned, Probe, ResidentElemType,
+    run_resident_predicate_program_at_indices, CudaResidentDeviceMemory, CudaResidentReadSource,
+    CudaRuntimeProbeError, ExprStep, ExprTerminal, PooledBufferLease, PooledDeviceBufferOwned,
+    Probe, ResidentElemType,
 };
 
 impl CudaResidentDeviceMemory {
@@ -44,6 +45,70 @@ impl CudaResidentDeviceMemory {
         elem: ResidentElemType,
     ) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
         launch_cuda_resident_expr_predicate_mask(self, program, text_needles, row_count, elem)
+    }
+
+    /// Evaluate an exact fixed-width predicate only at index-selected source coordinates. The
+    /// coordinate upload is an addressing input; all value comparison and membership decisions run
+    /// on the device, and the returned coordinates are the GPU-approved subset.
+    pub fn run_expr_predicate_filter_at_indices(
+        &self,
+        program: &[ExprStep],
+        source_row_count: u32,
+        indices: &[u32],
+        elem: ResidentElemType,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        if source_row_count == 0 || indices.iter().any(|index| *index >= source_row_count) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(indices.len()));
+        }
+        let index_bytes = indices
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(indices.len()))?;
+        let primary = self.primary();
+        primary.set_current()?;
+        let index_device = primary.lease_device_buffer(index_bytes)?;
+        let cu_memcpy_htod = unsafe {
+            self.lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| self.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                index_device.ptr,
+                indices.as_ptr().cast::<c_void>(),
+                index_bytes,
+            )
+        })?;
+        let mut stack = run_resident_predicate_program_at_indices(
+            self,
+            program,
+            index_device.ptr,
+            indices.len() as u64,
+            u64::from(source_row_count),
+            elem,
+        )?;
+        let mask = stack
+            .pop()
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+        if !stack.is_empty() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+        }
+        let approved_positions = compact_mask_i32_to_indices(self, &mask, indices.len() as u64)?;
+        approved_positions
+            .into_iter()
+            .map(|position| {
+                indices
+                    .get(position as usize)
+                    .copied()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(position as usize))
+            })
+            .collect()
     }
 
     /// A scheduler block range becomes a device mask without uploading an O(block_rows) index vector.

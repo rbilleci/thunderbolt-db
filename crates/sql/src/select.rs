@@ -354,7 +354,8 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => Err(ParseError::InvalidRelationalSql),
+        | SqlValue::Uuid(_)
+        | SqlValue::Parameter { .. } => Err(ParseError::InvalidRelationalSql),
     }
 }
 
@@ -370,7 +371,8 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => Err(ParseError::InvalidRelationalSql),
+        | SqlValue::Uuid(_)
+        | SqlValue::Parameter { .. } => Err(ParseError::InvalidRelationalSql),
     }
 }
 

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{ParseError, SqlValue};
 
 /// Lower PostgreSQL-style `$n` parameters to canonical SQL literals without interpreting
@@ -8,6 +10,62 @@ use crate::{ParseError, SqlValue};
 /// The highest parameter number must equal `params.len()`; repeated and out-of-order references are
 /// accepted, while `$0`, missing values, surplus values, and numeric overflow fail loudly.
 pub fn lower_sql_parameters(input: &str, params: &[SqlValue]) -> Result<String, ParseError> {
+    let (output, highest) =
+        transform_sql_parameters(input, CommentMode::Preserve, |number, end| {
+            let value = params
+                .get(number - 1)
+                .ok_or(ParseError::InvalidParameterCount {
+                    expected: number,
+                    actual: params.len(),
+                })?;
+            render_parameter(value, parameter_has_explicit_cast(input, end)).map(Some)
+        })?;
+    if highest != params.len() {
+        return Err(ParseError::InvalidParameterCount {
+            expected: highest,
+            actual: params.len(),
+        });
+    }
+    Ok(output)
+}
+
+/// Quote/comment/dollar-quote-aware arity of raw PostgreSQL `$n` references.
+pub(crate) fn sql_parameter_arity(input: &str) -> Result<usize, ParseError> {
+    transform_sql_parameters(input, CommentMode::Preserve, |_number, _end| Ok(None))
+        .map(|(_, highest)| highest)
+}
+
+/// Replace PostgreSQL comments outside quoted regions with one token-separating space.
+///
+/// The hand-written command parser consumes whitespace-delimited tokens. PostgreSQL comments are
+/// lexical whitespace too, including nested block comments, so normalizing them once at the parser
+/// entrance keeps every command grammar consistent without changing strings, quoted identifiers,
+/// dollar-quoted bodies, or the original source retained by `ParsedCommand` for WAL identity.
+pub(super) fn normalize_sql_comments(input: &str) -> Result<Cow<'_, str>, ParseError> {
+    if !input
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair == b"--" || pair == b"/*")
+    {
+        return Ok(Cow::Borrowed(input));
+    }
+    transform_sql_parameters(input, CommentMode::ReplaceWithSpace, |_number, _end| {
+        Ok(None)
+    })
+    .map(|(output, _highest)| Cow::Owned(output))
+}
+
+#[derive(Clone, Copy)]
+enum CommentMode {
+    Preserve,
+    ReplaceWithSpace,
+}
+
+fn transform_sql_parameters(
+    input: &str,
+    comment_mode: CommentMode,
+    mut replacement: impl FnMut(usize, usize) -> Result<Option<String>, ParseError>,
+) -> Result<(String, usize), ParseError> {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
     let mut at = 0;
@@ -21,10 +79,20 @@ pub fn lower_sql_parameters(input: &str, params: &[SqlValue]) -> Result<String, 
             }
             b'"' => copy_double_quoted(input, &mut at, &mut output)?,
             b'-' if bytes.get(at + 1) == Some(&b'-') => {
-                copy_line_comment(input, &mut at, &mut output)
+                let output_start = output.len();
+                copy_line_comment(input, &mut at, &mut output);
+                if matches!(comment_mode, CommentMode::ReplaceWithSpace) {
+                    output.truncate(output_start);
+                    output.push(' ');
+                }
             }
             b'/' if bytes.get(at + 1) == Some(&b'*') => {
-                copy_block_comment(input, &mut at, &mut output)?
+                let output_start = output.len();
+                copy_block_comment(input, &mut at, &mut output)?;
+                if matches!(comment_mode, CommentMode::ReplaceWithSpace) {
+                    output.truncate(output_start);
+                    output.push(' ');
+                }
             }
             b'$' => {
                 let follows_identifier = at > 0 && is_identifier_continuation_byte(bytes[at - 1]);
@@ -45,15 +113,11 @@ pub fn lower_sql_parameters(input: &str, params: &[SqlValue]) -> Result<String, 
                     if number == 0 {
                         return Err(ParseError::InvalidParameterReference);
                     }
-                    let value =
-                        params
-                            .get(number - 1)
-                            .ok_or(ParseError::InvalidParameterCount {
-                                expected: number,
-                                actual: params.len(),
-                            })?;
                     highest = highest.max(number);
-                    output.push_str(&render_parameter(value));
+                    match replacement(number, end)? {
+                        Some(replacement) => output.push_str(&replacement),
+                        None => output.push_str(&input[at..end]),
+                    }
                     at = end;
                 } else {
                     output.push('$');
@@ -68,41 +132,57 @@ pub fn lower_sql_parameters(input: &str, params: &[SqlValue]) -> Result<String, 
         }
     }
 
-    if highest != params.len() {
-        return Err(ParseError::InvalidParameterCount {
-            expected: highest,
-            actual: params.len(),
-        });
-    }
-    Ok(output)
+    Ok((output, highest))
 }
 
-fn render_parameter(value: &SqlValue) -> String {
-    match value {
+fn render_parameter(value: &SqlValue, already_cast: bool) -> Result<String, ParseError> {
+    Ok(match value {
         SqlValue::Null => "NULL".to_string(),
+        SqlValue::Int2(value) if already_cast => value.to_string(),
         SqlValue::Int2(value) => format!("{value}::int2"),
+        SqlValue::Int4(value) if already_cast => value.to_string(),
         SqlValue::Int4(value) => format!("{value}::int4"),
+        SqlValue::Int8(value) if already_cast => value.to_string(),
         SqlValue::Int8(value) => format!("{value}::int8"),
+        SqlValue::Numeric(value) if already_cast => value.to_decimal_string(),
         SqlValue::Numeric(value) => format!(
             "{}::numeric({},{})",
             value.to_decimal_string(),
             crate::NUMERIC_DEFAULT_PRECISION,
             value.scale
         ),
+        SqlValue::Bool(value) if already_cast => if *value { "TRUE" } else { "FALSE" }.to_string(),
         SqlValue::Bool(value) => format!("{}::bool", if *value { "TRUE" } else { "FALSE" }),
+        SqlValue::Text(value) if already_cast => quote_literal(value),
         SqlValue::Text(value) => format!("{}::text", quote_literal(value)),
+        SqlValue::Date(value) if already_cast => {
+            quote_literal(&crate::datetime::format_date(*value))
+        }
         SqlValue::Date(value) => format!(
             "{}::date",
             quote_literal(&crate::datetime::format_date(*value))
         ),
+        SqlValue::Timestamp(value) if already_cast => {
+            quote_literal(&crate::datetime::format_timestamp(*value))
+        }
         SqlValue::Timestamp(value) => format!(
             "{}::timestamp",
             quote_literal(&crate::datetime::format_timestamp(*value))
         ),
         SqlValue::Uuid(value) => {
-            format!("{}::uuid", quote_literal(&crate::uuid::format_uuid(value)))
+            let literal = quote_literal(&crate::uuid::format_uuid(value));
+            if already_cast {
+                literal
+            } else {
+                format!("{literal}::uuid")
+            }
         }
-    }
+        SqlValue::Parameter { .. } => return Err(ParseError::InvalidParameterReference),
+    })
+}
+
+fn parameter_has_explicit_cast(input: &str, parameter_end: usize) -> bool {
+    input[parameter_end..].trim_start().starts_with("::")
 }
 
 fn quote_literal(value: &str) -> String {
@@ -118,7 +198,7 @@ fn quote_literal(value: &str) -> String {
     quoted
 }
 
-fn is_escape_string_prefix(input: &str, quote_at: usize) -> bool {
+pub(super) fn is_escape_string_prefix(input: &str, quote_at: usize) -> bool {
     let bytes = input.as_bytes();
     quote_at > 0
         && matches!(bytes[quote_at - 1], b'e' | b'E')
@@ -207,7 +287,7 @@ fn copy_block_comment(input: &str, at: &mut usize, output: &mut String) -> Resul
     Err(ParseError::InvalidParameterReference)
 }
 
-fn dollar_quote_delimiter(input: &str, at: usize) -> Option<(&str, usize)> {
+pub(super) fn dollar_quote_delimiter(input: &str, at: usize) -> Option<(&str, usize)> {
     let tail = &input.as_bytes()[at + 1..];
     let tag_end = tail.iter().position(|byte| *byte == b'$')?;
     let tag = &tail[..tag_end];
@@ -225,7 +305,7 @@ fn dollar_quote_delimiter(input: &str, at: usize) -> Option<(&str, usize)> {
     Some((&input[at..=end], end + 1))
 }
 
-fn is_identifier_continuation_byte(byte: u8) -> bool {
+pub(super) fn is_identifier_continuation_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
 }
 
@@ -377,5 +457,19 @@ mod tests {
         };
         assert_eq!(select.filters[0].value, SqlValue::Int4(7));
         assert_eq!(select.filters[1].value, SqlValue::Int8(70_001));
+    }
+
+    #[test]
+    fn existing_explicit_cast_is_not_duplicated() {
+        let lowered = lower_sql_parameters(
+            "DELETE FROM accounts WHERE id = $1::int8 AND active = $2 :: bool",
+            &[SqlValue::Int8(9), SqlValue::Bool(true)],
+        )
+        .unwrap();
+        assert_eq!(
+            lowered,
+            "DELETE FROM accounts WHERE id = 9::int8 AND active = TRUE :: bool"
+        );
+        assert!(crate::ParsedCommand::parse(&lowered).is_ok());
     }
 }

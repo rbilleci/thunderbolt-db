@@ -136,13 +136,15 @@ impl Planner {
                 },
                 kind: PlanKind::Read,
             },
-            Command::Select(_) | Command::SequenceCurrVal(_) => PlanNode {
-                op: PlannedOp {
-                    name: "relational_select".to_string(),
-                    target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
-                },
-                kind: PlanKind::Read,
-            },
+            Command::Select(_) | Command::SelectLiteral(_) | Command::SequenceCurrVal(_) => {
+                PlanNode {
+                    op: PlannedOp {
+                        name: "relational_select".to_string(),
+                        target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
+                    },
+                    kind: PlanKind::Read,
+                }
+            }
             Command::SelectFunction(_) => PlanNode {
                 op: PlannedOp {
                     name: "routine_select".to_string(),
@@ -150,7 +152,7 @@ impl Planner {
                 },
                 kind: PlanKind::Read,
             },
-            Command::Begin | Command::Commit { .. } | Command::Rollback { .. } => PlanNode {
+            Command::Begin { .. } | Command::Commit { .. } | Command::Rollback { .. } => PlanNode {
                 op: PlannedOp {
                     name: "txn_control".to_string(),
                     target: DeviceTarget::Cpu,
@@ -316,7 +318,9 @@ mod tests {
                 }]],
                 returning: Vec::new(),
             }),
-            Command::Begin,
+            Command::Begin {
+                characteristics: gpu_db_sql::TransactionCharacteristics::default(),
+            },
             Command::Commit { chain: false },
             Command::Rollback { chain: false },
             Command::Flush,

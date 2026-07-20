@@ -42,6 +42,8 @@ pub enum EngineError {
     ProposalFailed(String),
     #[error("apply failed: {0}")]
     ApplyFailed(String),
+    #[error("unique constraint violation: {0}")]
+    UniqueViolation(String),
     #[error("durability failure: {0}")]
     Durability(String),
     #[error("pending mutation queue overloaded: pending={pending} cap={cap}")]

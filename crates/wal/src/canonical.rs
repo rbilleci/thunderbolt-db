@@ -390,6 +390,41 @@ pub struct EncodedCanonicalEnvelope {
     pub final_digest: CanonicalDigest,
 }
 
+/// Exact manifest-accounted logical intent/outcome bytes.
+///
+/// This intentionally counts each typed fragment's two-byte kind plus body and the canonical
+/// terminal outcome body. It excludes the immutable pre-apply identity/header, Merkle/digest
+/// material, physical coordinates, frame headers/digests, record packing, and storage padding.
+/// Those bytes remain durability authority and are reported separately as physical WAL bytes; they
+/// are not request-amplified logical intent/result payload.
+pub fn canonical_logical_intent_outcome_bytes(
+    fragments: &[CanonicalFragment],
+    outcome: &CanonicalOutcome,
+) -> Result<u64, EngineError> {
+    if fragments.is_empty() {
+        return Err(durability("logical byte accounting requires a fragment"));
+    }
+    let mut total = 0u64;
+    for (index, fragment) in fragments.iter().enumerate() {
+        if fragment.body.len() > MAX_FRAGMENT_BYTES {
+            return Err(durability(format!("fragment {index} exceeds byte bound")));
+        }
+        let body = u64::try_from(fragment.body.len())
+            .map_err(|_| durability("logical fragment length exceeds u64 framing"))?;
+        total = total
+            .checked_add(2)
+            .and_then(|value| value.checked_add(body))
+            .ok_or_else(|| durability("logical intent byte length overflow"))?;
+    }
+    let outcome = outcome.encode()?;
+    total
+        .checked_add(
+            u64::try_from(outcome.len())
+                .map_err(|_| durability("logical outcome length exceeds u64 framing"))?,
+        )
+        .ok_or_else(|| durability("logical intent/outcome byte length overflow"))
+}
+
 /// Pack the physical fragment frames into the payload of one existing [`crate::WalRecord`].
 /// The outer record remains the storage/replication indexing unit, while this inner container is
 /// the canonical transaction authority.
@@ -961,6 +996,31 @@ mod tests {
         assert_eq!(decoded.outcome, outcome());
         assert_eq!(decoded.ordered_fragment_root, encoded.ordered_fragment_root);
         assert_eq!(decoded.final_digest, encoded.final_digest);
+    }
+
+    #[test]
+    fn logical_intent_outcome_bytes_exclude_physical_frames_and_record_packing() {
+        let fragments = fragments();
+        let outcome = outcome();
+        let logical = canonical_logical_intent_outcome_bytes(&fragments, &outcome).unwrap();
+        let expected = fragments
+            .iter()
+            .map(|fragment| 2u64 + fragment.body.len() as u64)
+            .sum::<u64>()
+            + outcome.encode().unwrap().len() as u64;
+        assert_eq!(logical, expected);
+
+        let first = encode_canonical_envelope(physical(), &header(), &fragments, &outcome).unwrap();
+        let mut moved = physical();
+        moved.lane_id = 99;
+        moved.segment_id = 999;
+        let second = encode_canonical_envelope(moved, &header(), &fragments, &outcome).unwrap();
+        assert_eq!(
+            canonical_logical_intent_outcome_bytes(&fragments, &outcome).unwrap(),
+            logical
+        );
+        assert!(pack_canonical_record_payload(&first).unwrap().len() as u64 > logical);
+        assert!(pack_canonical_record_payload(&second).unwrap().len() as u64 > logical);
     }
 
     #[test]

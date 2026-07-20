@@ -32,6 +32,9 @@ fn format_default_expr(value: &SqlValue) -> String {
             gpu_db_protocol::datetime::format_timestamp(*value)
         ),
         SqlValue::Uuid(value) => format!("'{}'::uuid", gpu_db_protocol::uuid::format_uuid(value)),
+        SqlValue::Parameter { .. } => {
+            unreachable!("column defaults never contain prepared parameters")
+        }
     }
 }
 

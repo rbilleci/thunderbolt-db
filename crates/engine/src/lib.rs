@@ -35,12 +35,12 @@ use gpu_db_sql::{
     Delete, DropConstraint, DropDatabase, DropDomain, DropExtension, DropIndex,
     DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
     DropTable, DropTablespace, DropView, FunctionPrivilege, GroupedAggKind, GroupedAggregate,
-    Insert, ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
-    RenameDatabase, RenameFunction, RenameIndex, RenameMaterializedView, RenameRole,
-    RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
-    SelectFilterOp, SelectFunction, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType,
-    SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
-    NUMERIC_DEFAULT_PRECISION,
+    Insert, ParseError, PreparedCommand, PublicationTarget, RefreshMaterializedView, RenameColumn,
+    RenameConstraint, RenameDatabase, RenameFunction, RenameIndex, RenameMaterializedView,
+    RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
+    SelectFilterOp, SelectFunction, SelectLiteral, SelectProjection, SequenceNextVal,
+    SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege,
+    TransactionCharacteristics, TruncateTable, Update, NUMERIC_DEFAULT_PRECISION,
 };
 #[cfg(test)]
 use gpu_db_storage::TupleVersion;
@@ -90,6 +90,7 @@ mod resident_route;
 pub(crate) use resident_route::*;
 mod engine_catalog;
 mod engine_commit;
+mod engine_commit_coordinator;
 mod engine_commit_residency;
 mod engine_ddl_acl;
 mod engine_ddl_alter;
@@ -111,7 +112,20 @@ mod engine_expr_ir;
 mod engine_introspection;
 mod engine_join_ir;
 mod engine_lifecycle;
+mod engine_mutation_admission;
+pub use engine_mutation_admission::{
+    MutationRequest, PredeclaredOperationResult, PredeclaredTransaction,
+    PredeclaredTransactionResult, TransactionAdmissionResult, TransactionClass, TransactionRequest,
+    TransactionResources,
+};
+pub use gpu_db_sql::{TransactionAccessMode, TransactionIsolation};
 mod engine_mvcc_dispatch;
+mod engine_prepared;
+pub use engine_prepared::PreparedCommandDescription;
+mod engine_prepared_transaction;
+pub use engine_prepared_transaction::{
+    BoundPreparedTransactionRoute, PreparedTransactionClassAdmissions, PreparedTransactionRoute,
+};
 mod engine_residency;
 mod engine_resident_probe;
 mod engine_result_frame;
@@ -125,6 +139,7 @@ mod engine_select_bind;
 mod engine_select_exec;
 mod engine_sql_pg;
 mod engine_streaming_exec;
+mod engine_transaction_catalog;
 mod engine_transaction_commit;
 mod engine_transaction_delta;
 mod engine_wal_archive;
@@ -147,7 +162,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                 Command::DeleteKv { key } => {
                     self.kv.remove(&key);
                 }
-                Command::Begin
+                Command::Begin { .. }
                 | Command::Commit { .. }
                 | Command::Rollback { .. }
                 | Command::Flush
@@ -184,6 +199,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                 | Command::RenameFunction(_)
                 | Command::DropFunction(_)
                 | Command::SelectFunction(_)
+                | Command::SelectLiteral(_)
                 | Command::CreateExtension(_)
                 | Command::DropExtension(_)
                 | Command::CreateSequence(_)
@@ -250,6 +266,33 @@ pub enum ExecuteError {
     Serialization(String),
     #[error("command is not readable via execute_read_text: {0}")]
     NonReadCommand(&'static str),
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("relation \"{0}\" does not exist")]
+    UndefinedRelation(String),
+    #[error("column \"{0}\" does not exist")]
+    UndefinedColumn(String),
+    #[error("could not determine data type of parameter ${0}")]
+    IndeterminateParameterType(usize),
+    #[error("datatype mismatch: {0}")]
+    DatatypeMismatch(String),
+    #[error("invalid request shape: {0}")]
+    InvalidRequest(String),
+    /// A bounded foreground admission queue could not reserve its class-specific stage credits
+    /// before the pre-WAL service deadline. No transaction state, sequence, WAL, or publication
+    /// effect exists; callers may retry with ordinary overload backoff.
+    #[error("insufficient resources: {0}")]
+    ResourceExhausted(String),
+    /// The durable/log boundary was crossed, but terminal commit publication could not be proven
+    /// to the caller. The engine is fail-stopped and restart recovery owns the outcome.
+    #[error("indeterminate transaction outcome: {0}")]
+    Indeterminate(String),
+}
+
+impl ExecuteError {
+    pub fn is_unique_violation(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::UniqueViolation(_)))
+    }
 }
 
 impl ExecuteError {
@@ -258,6 +301,10 @@ impl ExecuteError {
     /// class-40 case without string-matching the message.
     pub fn is_serialization_conflict(&self) -> bool {
         matches!(self, ExecuteError::Serialization(_))
+    }
+
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self, ExecuteError::Indeterminate(_))
     }
 
     /// Whether this error is the resident-route "the table's GPU residency was invalidated out from
@@ -358,15 +405,35 @@ pub struct Engine {
     /// The commit-critical mutable substate — the replicator (commit-`Index` oracle), the WAL, the
     /// per-txn commit timestamps, and the recent-commits conflict ledger — bundled behind ONE mutex
     /// that IS the **commit_mutex** (write-half MVCC, Stage 4). The concurrent DML commit path locks
-    /// it for its short critical section (validate → assign `commit_seq` → WAL fsync → publish), so
-    /// commits serialize ONLY here while prepare runs off-lock and readers stay lock-free. Code that
-    /// already holds `&mut self` (serialized DDL apply, recovery, checkpoint/snapshot admin) reaches
-    /// it via `commit_state_mut()` (a zero-cost `Mutex::get_mut`, no actual locking).
+    /// it for its short critical section (validate → claim `commit_seq` → append WAL → synchronously
+    /// apply and install terminal status), then leaves the lock for registered group durability and
+    /// the sole coordinator's contiguous publication. Serialized/batch callers may perform their
+    /// durability wait synchronously, but they report the same durable-and-applied index to that
+    /// publication coordinator. Prepare runs off-lock and readers stay lock-free. Code that already
+    /// holds `&mut self` (serialized DDL apply, recovery, checkpoint/snapshot admin) reaches it via
+    /// `commit_state_mut()` (a zero-cost `Mutex::get_mut`, no actual locking).
     commit: Mutex<CommitState>,
+    /// Sole logical visibility owner. Commit strategies report exact durable-and-applied indices;
+    /// this join alone advances the contiguous reader-visible prefix.
+    commit_publication: engine_commit_coordinator::CommitPublicationCoordinator,
+    /// Sole accepted-but-not-terminal transaction-id registry across queued batch and optimized
+    /// intent strategies. The canonical terminal authority remains `CommitState::transaction_status`;
+    /// this shared registry only closes the admission-to-WAL interval and is removed on either
+    /// clean rejection or terminal installation.
+    pending_transaction_claims: Arc<Mutex<HashMap<TxnId, gpu_db_wal::CanonicalDigest>>>,
     /// Sticky fail-stop independent of mutex poisoning. A transaction whose WAL record crossed
     /// the durable/replicated boundary but could not be fully installed must never return to
     /// ordinary service: restart recovery is the only safe continuation.
     commit_path_wedged: Arc<AtomicBool>,
+    /// Engine-local fault injection for explicit-transaction post-durable apply tests. Keeping this
+    /// per instance prevents parallel engines from stealing one another's one-shot failure.
+    #[cfg(test)]
+    fail_next_transaction_post_durable_apply: AtomicBool,
+    /// One-shot deterministic seam after WAL durability and private-generation retirement but
+    /// before canonical apply, used to prove publication credit cannot be stolen by another
+    /// allocator in that exact window.
+    #[cfg(test)]
+    transaction_post_durable_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// In-flight statements' and explicit transactions' read snapshots (write-half MVCC, Stage 4),
     /// for the oldest-active GC boundary. Autocommit prepare registers a scalar guard; explicit
     /// BEGIN registers one keyed, generation-owned catalog/MVCC/GPU-resource bundle.
@@ -375,6 +442,10 @@ pub struct Engine {
     /// allocations are not present in the globally published residency maps, so they must be
     /// charged separately against the same admission budget until the transaction snapshot drops.
     transaction_private_gpu_bytes: Arc<Mutex<BTreeMap<u16, u64>>>,
+    /// Exact payload, sidecar, and index allocations retained by explicit transaction snapshots.
+    /// The allocation-identity registry unions current global ownership with transaction lifetime
+    /// ownership for hard-budget accounting without double counting.
+    transaction_retained_gpu_allocations: Arc<Mutex<TransactionRetainedGpuAccount>>,
     /// Lock-free mirror of the replicator role (0=Leader, 1=Follower, 2=Candidate), updated only
     /// by the rare `become_*` transitions. The per-statement leader check (`repl_role`) used to
     /// lock the commit_mutex for this one field read — measured to CONVOY every "off-lock"
@@ -411,6 +482,14 @@ pub struct Engine {
     /// DDL apply path locks it (`ddl_catalog()`).
     catalog_latch: Mutex<DdlCatalogState>,
     metrics: RuntimeMetrics,
+    /// Live admission telemetry for engine-proven prepared transaction service classes, indexed
+    /// W1/T8/T32/General. These counters are consumed at admission, so the class is operational
+    /// routing state rather than a label attached only to the returned result.
+    prepared_transaction_class_admissions: [AtomicU64; 4],
+    /// Class-aware, pre-BEGIN stage-credit scheduler for engine-proven prepared W1/T8/T32 work.
+    /// General transactions retain the same semantically unbounded operation-count surface but do
+    /// not borrow a low-latency class's reserved foreground population.
+    prepared_transaction_service: engine_prepared_transaction::PreparedTransactionServiceController,
     /// The pending-mutation group-commit batcher (the legacy KV-SET batching subsystem + FLUSH),
     /// behind its OWN `Mutex` (NOT the commit_mutex) so the `&self` `execute_text` FLUSH path can drain
     /// it without `&mut self` (lock-free read path, write-half MVCC). `apply_batch` drains items under
@@ -495,6 +574,7 @@ pub struct Engine {
 /// consults at all. DDL serializes (one writer), so holding the latch makes a DDL's working-map
 /// mutation + its published-snapshot publish atomic w.r.t. another DDL; lock-free readers and the
 /// concurrent-DML path never take this latch.
+#[derive(Debug, Clone)]
 struct DdlCatalogState {
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
@@ -520,10 +600,12 @@ struct DdlCatalogState {
 }
 
 /// The commit-critical mutable substate bundled behind the engine's commit_mutex (write-half MVCC,
-/// Stage 4). Holding the lock on this is exactly the "short commit critical section": validate the
-/// write-set against the ledger, assign a `commit_seq` from the replicator, append + fsync the WAL,
-/// then (back in the engine) publish and bump `committed_seq`. Code holding `&mut Engine` reaches it
-/// lock-free via `Mutex::get_mut`.
+/// Stage 4). Holding the lock covers the common authoritative claim: validate the write-set, assign
+/// a `commit_seq`, append WAL, synchronously apply, and install terminal status. Concurrent callers
+/// then use registered off-lock group durability; serialized/batch callers may wait synchronously.
+/// Every live strategy reports its exact durable-and-applied index to the sole contiguous
+/// publication coordinator, which alone advances `committed_seq`. Code holding `&mut Engine`
+/// reaches this state lock-free via `Mutex::get_mut`.
 struct CommitState {
     /// Durable ADR-014 lineage copied into every canonical WAL envelope. Recovery replaces the
     /// freshly generated value from the first validated canonical record before replay.
@@ -541,9 +623,11 @@ struct CommitState {
     /// The commit-`Index` oracle + log: `propose` assigns the next monotonic `commit_seq` inside the
     /// critical section (Stage 0 unification — `commit_seq == commit Index`).
     repl: LocalReplicator,
-    /// The write-ahead log; `append` + `flush_all` inside the critical section make the commit
-    /// crash-durable before it is published (the group-commit mechanism amortizes concurrent
-    /// committers' fsyncs).
+    /// The sole live write-ahead log. The authoritative claim appends while holding the commit
+    /// mutex; concurrent strategies make the registered record range durable off-lock through
+    /// group flush, while serialized/batch strategies may flush synchronously. Publication is
+    /// separate and can advance only after the sole coordinator receives the exact durable-and-
+    /// applied index.
     wal: WalBuffer,
     /// Per-txn commit timestamps (durable transaction identity → wall-clock micros), for
     /// PITR-by-timestamp lookups. Keyed by the façade txn_id (the durable identity), distinct from
@@ -580,7 +664,10 @@ struct DurableTransactionStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurableTransactionOutcome {
-    Committed { commit_seq: Index },
+    Committed {
+        commit_seq: Index,
+        affected_rows: u64,
+    },
     AbortedDiscardedOrphan,
 }
 
@@ -600,7 +687,7 @@ impl CommitState {
             )));
         }
         match status.outcome {
-            DurableTransactionOutcome::Committed { commit_seq } => {
+            DurableTransactionOutcome::Committed { commit_seq, .. } => {
                 Ok(Some(CommitToken { index: commit_seq }))
             }
             DurableTransactionOutcome::AbortedDiscardedOrphan => Err(EngineError::Durability(
@@ -609,26 +696,56 @@ impl CommitState {
         }
     }
 
-    fn record_transaction_status(&mut self, txn_id: TxnId, payload: &[u8], commit_seq: Index) {
-        self.record_transaction_status_digest(
-            txn_id,
-            gpu_db_wal::canonical_request_digest(payload),
-            commit_seq,
-        );
-    }
-
-    fn record_transaction_status_digest(
+    fn record_transaction_status_digest_outcome(
         &mut self,
         txn_id: TxnId,
         request_digest: gpu_db_wal::CanonicalDigest,
         commit_seq: Index,
-    ) {
+        affected_rows: u64,
+    ) -> Result<(), EngineError> {
         let status = DurableTransactionStatus {
             request_digest,
-            outcome: DurableTransactionOutcome::Committed { commit_seq },
+            outcome: DurableTransactionOutcome::Committed {
+                commit_seq,
+                affected_rows,
+            },
         };
-        let prior = self.transaction_status.insert(txn_id, status);
-        debug_assert!(prior.is_none() || prior == Some(status));
+        match self.transaction_status.entry(txn_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(status);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                Err(EngineError::Durability(format!(
+                    "transaction id {txn_id} already has terminal status {:?}; refusing a second terminal claim {:?}",
+                    entry.get(), status
+                )))
+            }
+        }
+    }
+
+    fn resolve_transaction_retry_digest_outcome(
+        &self,
+        txn_id: TxnId,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<Option<(CommitToken, u64)>, EngineError> {
+        let Some(status) = self.transaction_status.get(&txn_id) else {
+            return Ok(None);
+        };
+        if request_digest != status.request_digest {
+            return Err(EngineError::Durability(format!(
+                "transaction id {txn_id} is already durably claimed by a different request"
+            )));
+        }
+        match status.outcome {
+            DurableTransactionOutcome::Committed {
+                commit_seq,
+                affected_rows,
+            } => Ok(Some((CommitToken { index: commit_seq }, affected_rows))),
+            DurableTransactionOutcome::AbortedDiscardedOrphan => Err(EngineError::Durability(
+                format!("transaction id {txn_id} was durably aborted during crash recovery"),
+            )),
+        }
     }
 
     /// Record a commit's wall-clock timestamp in the PITR map AND advance the O(1) running max
@@ -639,6 +756,92 @@ impl CommitState {
         self.wal_commit_timestamps_micros
             .insert(txn_id, timestamp_micros);
         self.max_commit_timestamp_micros = self.max_commit_timestamp_micros.max(timestamp_micros);
+    }
+}
+
+impl Engine {
+    /// Allocate an explicit-transaction identity that is unclaimed by every durable or accepted
+    /// strategy. Callers hold the commit lock, so terminal status and the shared pending registry
+    /// are observed as one admission boundary.
+    fn begin_unclaimed_transaction(&self, commit: &mut CommitState) -> Result<TxnId, TxnError> {
+        loop {
+            let txn = commit.txn_manager.begin()?;
+            let pending = self
+                .pending_transaction_claims
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let claimed =
+                commit.transaction_status.contains_key(&txn.id) || pending.contains_key(&txn.id);
+            drop(pending);
+            if !claimed {
+                return Ok(txn.id);
+            }
+            commit.txn_manager.rollback(txn.id)?;
+        }
+    }
+
+    fn resolve_pending_transaction_claim(
+        &self,
+        txn_id: TxnId,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<bool, EngineError> {
+        let claims = self
+            .pending_transaction_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(existing) = claims.get(&txn_id) else {
+            return Ok(false);
+        };
+        if *existing != request_digest {
+            return Err(EngineError::Durability(format!(
+                "transaction id {txn_id} is already pending with a different request"
+            )));
+        }
+        Ok(true)
+    }
+
+    /// Reserve the admission-to-WAL interval. Returns false for an exact already-pending request;
+    /// callers decide whether that means their own accepted item or an indeterminate retry.
+    fn reserve_pending_transaction_claim(
+        &self,
+        txn_id: TxnId,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<bool, EngineError> {
+        let mut claims = self
+            .pending_transaction_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match claims.entry(txn_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(request_digest);
+                Ok(true)
+            }
+            std::collections::hash_map::Entry::Occupied(entry)
+                if *entry.get() == request_digest =>
+            {
+                Ok(false)
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(EngineError::Durability(
+                format!("transaction id {txn_id} is already pending with a different request"),
+            )),
+        }
+    }
+
+    fn release_pending_transaction_claim(
+        &self,
+        txn_id: TxnId,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) {
+        let mut claims = self
+            .pending_transaction_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if claims
+            .get(&txn_id)
+            .is_some_and(|existing| *existing == request_digest)
+        {
+            claims.remove(&txn_id);
+        }
     }
 }
 
