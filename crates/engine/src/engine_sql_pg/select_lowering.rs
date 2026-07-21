@@ -1,8 +1,11 @@
 use super::{
-    a_const, relational_column_index, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef,
-    Decimal128, EngineError, ExecuteError, GroupedAggKind, GroupedAggregate, Node, NodeEnum,
-    RelationalTable, ResidentBinaryOp, ResidentExpr, Select, SelectFilter, SelectFilterOp,
-    SelectOrder, SelectProjection, SelectStmt, SetOperation, SortByDir, SortByNulls, SqlValue,
+    a_const, catalog_range_relation_key, like_pattern_for_literal_prefix, relational_column_index,
+    AExpr, AExprKind, BoolExpr, BoolExprType, CatalogSnapshot, ColumnRef, Decimal128, EngineError,
+    ExecuteError, GroupedAggKind, GroupedAggregate, Node, NodeEnum, RelationalTable,
+    ResidentBinaryOp, ResidentExpr, Select, SelectFilter, SelectFilterOp, SelectOrder,
+    SelectProjection, SelectStmt, SetOperation, SortByDir, SortByNulls, SqlType, SqlValue,
+    PG_CATALOG_NAMESPACE_OID, PG_INFORMATION_SCHEMA_NAMESPACE_OID, PG_PUBLIC_NAMESPACE_OID,
+    PROJECTION_WILDCARD_SENTINEL,
 };
 
 /// Parse `sql` with libpg_query (Postgres's grammar) and lift out the single `SELECT` statement's
@@ -52,7 +55,7 @@ pub(super) fn build_select_from_select_stmt(
                 .to_string(),
         ));
     };
-    let table = range_var.relname.clone();
+    let table = catalog_range_relation_key(range_var)?;
     // The single qualifier a `tbl.col` reference must use: PG hides the relation name behind an alias,
     // so an aliased relation is named only by its alias; an unaliased one by its relation name. The
     // mapper validates qualified column references against this and rejects any other (PG's "missing
@@ -61,7 +64,7 @@ pub(super) fn build_select_from_select_stmt(
         .alias
         .as_ref()
         .map(|alias| alias.aliasname.clone())
-        .unwrap_or_else(|| table.clone());
+        .unwrap_or_else(|| range_var.relname.clone());
 
     // HAVING is GROUPED-only. ORDER BY / LIMIT / OFFSET are supported for BOTH grouped (host-side over
     // the materialized group rows) and non-grouped (the projection sorts the surviving indices on the
@@ -105,7 +108,19 @@ pub(super) fn build_select_from_select_stmt(
     };
     // ORDER BY / LIMIT / OFFSET apply to grouped (host-side) AND non-grouped (GPU-sorted projection)
     // queries. HAVING is grouped-only (HAVING-without-GROUP-BY was rejected above).
-    let order_by = parse_order_by(&stmt.sort_clause, &qualifier)?;
+    let order_by = if let Some(default_name) = scalar_aggregate_default_name(&projection) {
+        let output_name = match stmt.target_list.as_slice() {
+            [target] => match node_enum(target)? {
+                NodeEnum::ResTarget(target) if !target.name.is_empty() => target.name.as_str(),
+                _ => default_name,
+            },
+            _ => default_name,
+        };
+        validate_scalar_aggregate_order_by(&stmt.sort_clause, output_name)?;
+        Vec::new()
+    } else {
+        parse_order_by(&stmt.sort_clause, &qualifier)?
+    };
     let limit = parse_limit(&stmt.limit_count)?;
     let offset = parse_limit(&stmt.limit_offset)?;
     let having_groups = if group_by.is_some() {
@@ -123,6 +138,7 @@ pub(super) fn build_select_from_select_stmt(
     }
     let select = Select {
         table,
+        public_only: range_var.schemaname == "public",
         distinct: false,
         projection,
         group_by,
@@ -272,6 +288,11 @@ fn build_grouped_projection(
         let NodeEnum::ResTarget(agg_res) = node_enum(aggregate_target)? else {
             return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
         };
+        if !agg_res.name.is_empty() {
+            return Err(sql_pg_error(
+                "aggregate column aliases are not on the grouped Expr path yet".to_string(),
+            ));
+        }
         let Some(aggregate) = try_parse_scalar_aggregate(agg_res, qualifier)? else {
             return Err(sql_pg_error(
                 "every grouped projection after the GROUP BY column must be an aggregate \
@@ -360,7 +381,24 @@ fn build_projection(
                     .to_string(),
             ));
         };
-        columns.push(resolve_column_name(column_ref, qualifier)?.to_string());
+        let star = match column_ref.fields.as_slice() {
+            [field] => matches!(node_enum(field)?, NodeEnum::AStar(_)),
+            [relation, star] => {
+                matches!(node_enum(relation)?, NodeEnum::String(name) if name.sval == qualifier)
+                    && matches!(node_enum(star)?, NodeEnum::AStar(_))
+            }
+            _ => false,
+        };
+        if star {
+            if !res_target.name.is_empty() {
+                return Err(sql_pg_error(
+                    "a projected star cannot have an alias".to_string(),
+                ));
+            }
+            columns.push(PROJECTION_WILDCARD_SENTINEL.to_string());
+        } else {
+            columns.push(resolve_column_name(column_ref, qualifier)?.to_string());
+        }
     }
     if columns.is_empty() {
         return Err(sql_pg_error("SELECT has no projected columns".to_string()));
@@ -388,11 +426,6 @@ fn try_parse_scalar_aggregate(
     };
     if !matches!(name.as_str(), "count" | "sum" | "min" | "max" | "avg") {
         return Ok(None);
-    }
-    if !res_target.name.is_empty() {
-        return Err(sql_pg_error(
-            "aggregate column aliases are not on the Expr path yet".to_string(),
-        ));
     }
     // FILTER / OVER / WITHIN GROUP / ordered-set modifiers live INSIDE the FuncCall, so the SELECT-
     // level guards (window_clause, ...) cannot see them. Reject them here, or `COUNT(*) FILTER (WHERE
@@ -461,6 +494,55 @@ fn try_parse_scalar_aggregate(
     ))
 }
 
+fn scalar_aggregate_default_name(projection: &SelectProjection) -> Option<&'static str> {
+    match projection {
+        SelectProjection::CountAll | SelectProjection::CountDistinct { .. } => Some("count"),
+        SelectProjection::Sum { .. } => Some("sum"),
+        SelectProjection::Avg { .. } => Some("avg"),
+        SelectProjection::Min { .. } => Some("min"),
+        SelectProjection::Max { .. } => Some("max"),
+        _ => None,
+    }
+}
+
+fn validate_scalar_aggregate_order_by(
+    sort_clause: &[Node],
+    output_name: &str,
+) -> Result<(), ExecuteError> {
+    for item in sort_clause {
+        let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
+            return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
+        };
+        if sort_by.sortby_dir == SortByDir::SortbyUsing as i32 || !sort_by.use_op.is_empty() {
+            return Err(sql_pg_error(
+                "ORDER BY USING is not supported by the GPU ordering path".to_string(),
+            ));
+        }
+        let node = sort_by
+            .node
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
+        let output_reference = match node_enum(node)? {
+            NodeEnum::ColumnRef(column) => match column.fields.as_slice() {
+                [field] => {
+                    matches!(node_enum(field)?, NodeEnum::String(name) if name.sval == output_name)
+                }
+                _ => false,
+            },
+            NodeEnum::AConst(constant) => {
+                matches!(&constant.val, Some(a_const::Val::Ival(position)) if position.ival == 1)
+            }
+            _ => false,
+        };
+        if !output_reference {
+            return Err(sql_pg_error(format!(
+                "scalar aggregate ORDER BY must reference output column {output_name:?} or position 1"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Map a WHERE / predicate parse node to the general `ResidentExpr` IR, resolving column names to
 /// indices against `table`. Recurses through `A_Expr` (arithmetic + comparison). Anything the IR
 /// cannot represent — `BoolExpr` (`AND`/`OR`, slice 4), non-operator `A_Expr` (IN / LIKE / BETWEEN),
@@ -470,6 +552,7 @@ pub(super) fn map_predicate_node(
     node: &Node,
     table: &RelationalTable,
     qualifier: &str,
+    catalog: &CatalogSnapshot,
 ) -> Result<ResidentExpr, ExecuteError> {
     match node_enum(node)? {
         NodeEnum::ColumnRef(column_ref) => Ok(ResidentExpr::Column(relational_column_index(
@@ -495,12 +578,168 @@ pub(super) fn map_predicate_node(
                     .to_string(),
             )),
         },
-        NodeEnum::AExpr(a_expr) => map_a_expr(a_expr, table, qualifier),
-        NodeEnum::BoolExpr(bool_expr) => map_bool_expr(bool_expr, table, qualifier),
+        NodeEnum::AExpr(a_expr) => map_a_expr(a_expr, table, qualifier, catalog),
+        NodeEnum::BoolExpr(bool_expr) => map_bool_expr(bool_expr, table, qualifier, catalog),
         NodeEnum::NullTest(null_test) => map_null_test(null_test, table, qualifier),
+        NodeEnum::TypeCast(type_cast) => map_type_cast(type_cast, table, qualifier, catalog),
+        NodeEnum::CollateClause(collate) => {
+            let collation = collate
+                .collname
+                .iter()
+                .map(|part| match node_enum(part)? {
+                    NodeEnum::String(part) => Ok(part.sval.to_ascii_lowercase()),
+                    _ => Err(sql_pg_error(
+                        "collation name contains a non-name component".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join(".");
+            if !is_gpu_catalog_table(table)
+                || !matches!(collation.as_str(), "default" | "pg_catalog.default")
+            {
+                return Err(sql_pg_error(format!(
+                    "collation {collation} is not supported by this GPU expression path"
+                )));
+            }
+            let arg = collate
+                .arg
+                .as_deref()
+                .ok_or_else(|| sql_pg_error("COLLATE is missing its argument".to_string()))?;
+            map_predicate_node(arg, table, qualifier, catalog)
+        }
+        NodeEnum::FuncCall(function) => super::catalog_visibility::map_catalog_predicate_function(
+            function, table, qualifier, catalog,
+        ),
         _ => Err(sql_pg_error(
             "unsupported expression node for the general GPU executor".to_string(),
         )),
+    }
+}
+
+fn map_type_cast(
+    type_cast: &pg_query::protobuf::TypeCast,
+    table: &RelationalTable,
+    qualifier: &str,
+    catalog: &CatalogSnapshot,
+) -> Result<ResidentExpr, ExecuteError> {
+    if !is_gpu_catalog_table(table) {
+        return Err(sql_pg_error(
+            "unsupported expression node for the general GPU executor".to_string(),
+        ));
+    }
+    let arg = type_cast
+        .arg
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("type cast is missing its argument".to_string()))?;
+    let type_name = type_cast
+        .type_name
+        .as_ref()
+        .ok_or_else(|| sql_pg_error("type cast is missing its target type".to_string()))?;
+    if type_name.setof
+        || type_name.pct_type
+        || !type_name.typmods.is_empty()
+        || !type_name.array_bounds.is_empty()
+    {
+        return Err(sql_pg_error(
+            "complex cast targets are not supported by the general GPU catalog executor"
+                .to_string(),
+        ));
+    }
+    let target = type_name
+        .names
+        .iter()
+        .map(|name| match node_enum(name)? {
+            NodeEnum::String(name) => Ok(name.sval.to_ascii_lowercase()),
+            _ => Err(sql_pg_error(
+                "cast target contains a non-name component".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(".");
+
+    if matches!(target.as_str(), "regnamespace" | "pg_catalog.regnamespace") {
+        let name = cast_string_literal(arg, "regnamespace")?;
+        let oid = match name.as_str() {
+            "public" if catalog.relational_public_schema_exists => PG_PUBLIC_NAMESPACE_OID,
+            "pg_catalog" => PG_CATALOG_NAMESPACE_OID,
+            "information_schema" => PG_INFORMATION_SCHEMA_NAMESPACE_OID,
+            _ => {
+                return Err(sql_pg_error(format!(
+                    "schema \"{name}\" does not exist for regnamespace cast"
+                )))
+            }
+        };
+        return Ok(ResidentExpr::Int4Literal(oid));
+    }
+    if matches!(target.as_str(), "regclass" | "pg_catalog.regclass") {
+        let source = cast_string_literal(arg, "regclass")?;
+        let name = source.strip_prefix("public.").unwrap_or(&source);
+        let oid = catalog
+            .relational_catalog
+            .get(name)
+            .map(|relation| relation.oid)
+            .or_else(|| {
+                catalog
+                    .relational_views
+                    .get(name)
+                    .map(|relation| relation.oid)
+            })
+            .or_else(|| {
+                catalog
+                    .relational_materialized_views
+                    .get(name)
+                    .map(|relation| relation.oid)
+            })
+            .or_else(|| {
+                catalog
+                    .relational_sequences
+                    .get(name)
+                    .map(|relation| relation.oid)
+            })
+            .ok_or_else(|| {
+                sql_pg_error(format!(
+                    "relation \"{source}\" does not exist for regclass cast"
+                ))
+            })?;
+        let oid = i32::try_from(oid)
+            .map_err(|_| sql_pg_error(format!("relation OID {oid} exceeds int4")))?;
+        return Ok(ResidentExpr::Int4Literal(oid));
+    }
+
+    let inner = map_predicate_node(arg, table, qualifier, catalog)?;
+    let compatible = match target.as_str() {
+        "int4" | "integer" | "pg_catalog.int4" => match &inner {
+            ResidentExpr::Int4Literal(_) => true,
+            ResidentExpr::Column(index) => matches!(table.columns[*index].ty, SqlType::Int4),
+            _ => false,
+        },
+        "text" | "pg_catalog.text" => match &inner {
+            ResidentExpr::TextLiteral(_) => true,
+            ResidentExpr::Column(index) => matches!(table.columns[*index].ty, SqlType::Text),
+            _ => false,
+        },
+        _ => false,
+    };
+    if compatible {
+        Ok(inner)
+    } else {
+        Err(sql_pg_error(format!(
+            "cast to {target} is not a representation-preserving GPU expression cast"
+        )))
+    }
+}
+
+fn cast_string_literal(node: &Node, target: &str) -> Result<String, ExecuteError> {
+    let NodeEnum::AConst(constant) = node_enum(node)? else {
+        return Err(sql_pg_error(format!(
+            "{target} casts require a string literal on the GPU catalog path"
+        )));
+    };
+    match &constant.val {
+        Some(a_const::Val::Sval(value)) => Ok(value.sval.clone()),
+        _ => Err(sql_pg_error(format!(
+            "{target} casts require a string literal on the GPU catalog path"
+        ))),
     }
 }
 
@@ -540,6 +779,7 @@ fn map_bool_expr(
     bool_expr: &BoolExpr,
     table: &RelationalTable,
     qualifier: &str,
+    catalog: &CatalogSnapshot,
 ) -> Result<ResidentExpr, ExecuteError> {
     let op = if bool_expr.boolop == BoolExprType::AndExpr as i32 {
         ResidentBinaryOp::And
@@ -558,7 +798,7 @@ fn map_bool_expr(
                 "NOT predicates are not on the Expr path yet".to_string(),
             ));
         }
-        let inner = map_predicate_node(only, table, qualifier)?;
+        let inner = map_predicate_node(only, table, qualifier, catalog)?;
         if matches!(inner, ResidentExpr::Column(_)) {
             return Ok(ResidentExpr::Binary {
                 op: ResidentBinaryOp::Eq,
@@ -574,12 +814,12 @@ fn map_bool_expr(
     let first = args
         .next()
         .ok_or_else(|| sql_pg_error("boolean expression has no operands".to_string()))?;
-    let mut folded = map_predicate_node(first, table, qualifier)?;
+    let mut folded = map_predicate_node(first, table, qualifier, catalog)?;
     for arg in args {
         folded = ResidentExpr::Binary {
             op,
             lhs: Box::new(folded),
-            rhs: Box::new(map_predicate_node(arg, table, qualifier)?),
+            rhs: Box::new(map_predicate_node(arg, table, qualifier, catalog)?),
         };
     }
     Ok(folded)
@@ -592,11 +832,12 @@ fn map_a_expr(
     a_expr: &AExpr,
     table: &RelationalTable,
     qualifier: &str,
+    catalog: &CatalogSnapshot,
 ) -> Result<ResidentExpr, ExecuteError> {
     // AEXPR_IN is `x IN (a, b, ...)` -> an OR-chain of equalities (`NOT IN` -> an AND-chain of `<>`),
     // entirely on the general GPU executor (the same Binary Eq/Ne + And/Or it already runs).
     if a_expr.kind == AExprKind::AexprIn as i32 {
-        return map_in_expr(a_expr, table, qualifier);
+        return map_in_expr(a_expr, table, qualifier, catalog);
     }
     // AEXPR_OP is a normal operator (`+ - * = <> < <= > >=`); AEXPR_LIKE is `LIKE` (operator `~~`,
     // `!~~` for NOT LIKE). Both carry the operator token in `name` and both operands; other kinds
@@ -606,7 +847,7 @@ fn map_a_expr(
             "only operator, LIKE, and IN predicates are supported (no BETWEEN yet)".to_string(),
         ));
     }
-    let op = map_operator(aexpr_op_token(a_expr)?)?;
+    let token = aexpr_op_token(a_expr)?;
     let lexpr = a_expr.lexpr.as_deref().ok_or_else(|| {
         sql_pg_error("operator expression is missing its left operand".to_string())
     })?;
@@ -616,10 +857,152 @@ fn map_a_expr(
                 .to_string(),
         )
     })?;
+    let mut lhs = map_predicate_node(lexpr, table, qualifier, catalog)?;
+    let mut rhs = map_predicate_node(rexpr, table, qualifier, catalog)?;
+    if matches!(token, "=" | "<>" | "<" | "<=" | ">" | ">=") {
+        coerce_catalog_oid_literal(table, &lhs, rexpr, &mut rhs)?;
+        coerce_catalog_oid_literal(table, &rhs, lexpr, &mut lhs)?;
+        reject_catalog_oid_text_cast_comparison(table, &lhs, &rhs)?;
+    }
+    if matches!(token, "~" | "!~") {
+        if !is_gpu_catalog_table(table) {
+            return Err(sql_pg_error(
+                "regular-expression compatibility is restricted to GPU catalog predicates"
+                    .to_string(),
+            ));
+        }
+        let ResidentExpr::TextLiteral(pattern) = rhs else {
+            return Err(sql_pg_error(
+                "catalog regular-expression predicates require a text literal".to_string(),
+            ));
+        };
+        let exact_pg_toast_namespace_exclusion = token == "!~"
+            && pattern == "^pg_toast"
+            && table.schema == "pg_catalog"
+            && table.name == "pg_namespace"
+            && matches!(
+                &lhs,
+                ResidentExpr::Column(index)
+                    if table.columns.get(*index).is_some_and(|column| column.name == "nspname")
+            );
+        if exact_pg_toast_namespace_exclusion {
+            // The modeled namespace relation intentionally has no pg_toast row. Preserve this
+            // exact psql namespace exclusion as a GPU-evaluated non-null self-comparison. The
+            // pattern alone is insufficient: applying it to another catalog text column would
+            // turn a real negative-regex predicate into an unconditional truth value.
+            return Ok(ResidentExpr::Binary {
+                op: ResidentBinaryOp::Eq,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new(lhs),
+            });
+        }
+        if token == "!~" {
+            return Err(sql_pg_error(
+                "negative regular-expression predicates beyond pg_toast exclusion are not supported"
+                    .to_string(),
+            ));
+        }
+        let (op, pattern) = catalog_regex_pattern(&pattern)?;
+        return Ok(ResidentExpr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(ResidentExpr::TextLiteral(pattern)),
+        });
+    }
     Ok(ResidentExpr::Binary {
-        op,
-        lhs: Box::new(map_predicate_node(lexpr, table, qualifier)?),
-        rhs: Box::new(map_predicate_node(rexpr, table, qualifier)?),
+        op: map_operator(token)?,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    })
+}
+
+fn coerce_catalog_oid_literal(
+    table: &RelationalTable,
+    column: &ResidentExpr,
+    candidate_node: &Node,
+    candidate: &mut ResidentExpr,
+) -> Result<(), ExecuteError> {
+    if !is_gpu_catalog_table(table) {
+        return Ok(());
+    }
+    let ResidentExpr::Column(index) = column else {
+        return Ok(());
+    };
+    if !matches!(table.columns[*index].ty, SqlType::Int4) {
+        return Ok(());
+    }
+    let NodeEnum::AConst(constant) = node_enum(candidate_node)? else {
+        return Ok(());
+    };
+    if !matches!(constant.val.as_ref(), Some(a_const::Val::Sval(_))) {
+        return Ok(());
+    }
+    let ResidentExpr::TextLiteral(value) = candidate else {
+        return Ok(());
+    };
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| sql_pg_error(format!("invalid int4 catalog literal {value:?}")))?;
+    *candidate = ResidentExpr::Int4Literal(parsed);
+    Ok(())
+}
+
+fn reject_catalog_oid_text_cast_comparison(
+    table: &RelationalTable,
+    lhs: &ResidentExpr,
+    rhs: &ResidentExpr,
+) -> Result<(), ExecuteError> {
+    if !is_gpu_catalog_table(table) {
+        return Ok(());
+    }
+    let int4_column = |expr: &ResidentExpr| {
+        matches!(
+            expr,
+            ResidentExpr::Column(index) if matches!(table.columns[*index].ty, SqlType::Int4)
+        )
+    };
+    if (int4_column(lhs) && matches!(rhs, ResidentExpr::TextLiteral(_)))
+        || (int4_column(rhs) && matches!(lhs, ResidentExpr::TextLiteral(_)))
+    {
+        return Err(sql_pg_error(
+            "catalog oid/int4 columns cannot be compared to an explicitly typed text value"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_gpu_catalog_table(table: &RelationalTable) -> bool {
+    matches!(table.schema.as_str(), "pg_catalog" | "information_schema")
+}
+
+fn catalog_regex_pattern(pattern: &str) -> Result<(ResidentBinaryOp, String), ExecuteError> {
+    if let Some(exact) = pattern
+        .strip_prefix("^(")
+        .and_then(|value| value.strip_suffix(")$"))
+    {
+        if let Some(prefix) = exact.strip_suffix(".*") {
+            if !catalog_regex_has_metacharacter(prefix) {
+                return Ok((
+                    ResidentBinaryOp::Like,
+                    like_pattern_for_literal_prefix(prefix),
+                ));
+            }
+        } else if !catalog_regex_has_metacharacter(exact) {
+            return Ok((ResidentBinaryOp::Eq, exact.to_string()));
+        }
+    }
+    Err(sql_pg_error(format!(
+        "catalog regular expression {pattern:?} is outside the exact/prefix GPU subset"
+    )))
+}
+
+fn catalog_regex_has_metacharacter(value: &str) -> bool {
+    value.chars().any(|ch| {
+        matches!(
+            ch,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        )
     })
 }
 
@@ -632,6 +1015,7 @@ fn map_in_expr(
     a_expr: &AExpr,
     table: &RelationalTable,
     qualifier: &str,
+    catalog: &CatalogSnapshot,
 ) -> Result<ResidentExpr, ExecuteError> {
     let negated = aexpr_op_token(a_expr)? == "<>";
     let lexpr = a_expr
@@ -650,7 +1034,7 @@ fn map_in_expr(
     if list.items.is_empty() {
         return Err(sql_pg_error("IN requires at least one value".to_string()));
     }
-    let lhs = map_predicate_node(lexpr, table, qualifier)?;
+    let lhs = map_predicate_node(lexpr, table, qualifier, catalog)?;
     let (cmp, combine) = if negated {
         (ResidentBinaryOp::Ne, ResidentBinaryOp::And)
     } else {
@@ -661,7 +1045,7 @@ fn map_in_expr(
         let term = ResidentExpr::Binary {
             op: cmp,
             lhs: Box::new(lhs.clone()),
-            rhs: Box::new(map_predicate_node(item, table, qualifier)?),
+            rhs: Box::new(map_predicate_node(item, table, qualifier, catalog)?),
         };
         folded = Some(match folded {
             None => term,
@@ -751,8 +1135,16 @@ pub(super) fn aexpr_op_token(a_expr: &AExpr) -> Result<&str, ExecuteError> {
                 "operator name is not a String node".to_string(),
             )),
         },
+        [schema, name] if matches!(schema.node.as_ref(), Some(NodeEnum::String(schema)) if schema.sval == "pg_catalog") => {
+            match name.node.as_ref() {
+                Some(NodeEnum::String(string)) => Ok(&string.sval),
+                _ => Err(sql_pg_error(
+                    "operator name is not a String node".to_string(),
+                )),
+            }
+        }
         _ => Err(sql_pg_error(
-            "schema-qualified or multi-part operators are not supported".to_string(),
+            "multi-part operators are not supported".to_string(),
         )),
     }
 }
@@ -972,4 +1364,30 @@ pub(super) fn parse_limit(limit: &Option<Box<Node>>) -> Result<Option<usize>, Ex
 /// surface the rest of the relational path uses), so callers handle it uniformly.
 pub(super) fn sql_pg_error(message: String) -> ExecuteError {
     ExecuteError::Engine(EngineError::ApplyFailed(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libpg_projection_distinguishes_quoted_star_and_escapes_regex_prefix_for_like() {
+        let stmt = parse_single_select(r#"SELECT "*", * FROM t"#).unwrap();
+        let (select, _) = build_select_from_select_stmt(&stmt).unwrap();
+        assert_eq!(
+            select.projection,
+            SelectProjection::Columns(vec![
+                "*".to_string(),
+                PROJECTION_WILDCARD_SENTINEL.to_string(),
+            ])
+        );
+
+        assert_eq!(
+            catalog_regex_pattern("^(catalog_regex_50%.*)$").unwrap(),
+            (
+                ResidentBinaryOp::Like,
+                "catalog\\_regex\\_50\\%%".to_string(),
+            )
+        );
+    }
 }

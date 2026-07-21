@@ -123,6 +123,7 @@ impl Engine {
         // The MERGE select over the partials relation: GROUP BY key with the fold aggregate per column.
         let merge_select = Select {
             table: partials_table.name.clone(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::GroupedAggregates {
                 group_column: group_column.clone(),

@@ -8,6 +8,7 @@ fn parses_relational_select_in_membership_predicates_as_filter_groups() {
         parse_command("SELECT id FROM people WHERE id IN (1, 3, 5) ORDER BY id").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,
@@ -53,6 +54,7 @@ fn parses_relational_select_in_membership_predicates_as_filter_groups() {
             .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -122,6 +124,7 @@ fn parses_relational_select_between_predicates_as_filter_groups() {
         parse_command("SELECT id FROM people WHERE id BETWEEN 2 AND 4 ORDER BY id").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,
@@ -169,6 +172,7 @@ fn parses_relational_select_between_predicates_as_filter_groups() {
             .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -227,6 +231,7 @@ fn parses_relational_select_prefix_like_predicates_as_filters() {
         parse_command("SELECT id FROM people WHERE name LIKE 'Gra%' ORDER BY id").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,
@@ -259,6 +264,7 @@ fn parses_relational_select_prefix_like_predicates_as_filters() {
         parse_command("SELECT name FROM people WHERE name LIKE 'A%' OR id = 3").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -314,6 +320,7 @@ fn parses_relational_select_distinct_projection() {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: true,
             projection: SelectProjection::Columns(vec!["name".to_string(), "id".to_string()]),
             group_by: None,

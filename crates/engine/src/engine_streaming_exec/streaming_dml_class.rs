@@ -311,6 +311,7 @@ impl Engine {
     ) -> Option<ColdChunk> {
         let select_all = Select {
             table: table.name.clone(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::All,
             group_by: None,

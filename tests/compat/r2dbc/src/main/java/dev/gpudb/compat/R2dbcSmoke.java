@@ -147,18 +147,18 @@ public final class R2dbcSmoke {
     private record Server(Process process, int port) implements AutoCloseable {
         static Server start(Path repoRoot) throws IOException, InterruptedException {
             Process build = new ProcessBuilder(
-                    "cargo", "build", "-p", "gpu_db_protocol", "--bin", "gpu-db-server")
+                    "cargo", "build", "-p", "gpu_db_server", "--bin", "gpu-db-engine-server")
                     .directory(repoRoot.toFile())
                     .inheritIO()
                     .start();
             int buildExit = build.waitFor();
             if (buildExit != 0) {
-                throw new IllegalStateException("cargo build for gpu-db-server failed with exit " + buildExit);
+                throw new IllegalStateException("cargo build for gpu-db-engine-server failed with exit " + buildExit);
             }
 
             int port = freeLocalPort();
             Process server = new ProcessBuilder(
-                    repoRoot.resolve("target/debug/gpu-db-server").toString(),
+                    repoRoot.resolve("target/debug/gpu-db-engine-server").toString(),
                     "--listen",
                     "127.0.0.1:" + port)
                     .directory(repoRoot.toFile())
@@ -195,11 +195,12 @@ public final class R2dbcSmoke {
                         Thread.sleep(25);
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
-                        throw new IllegalStateException("interrupted while waiting for gpu-db-server", interrupted);
+                        throw new IllegalStateException(
+                                "interrupted while waiting for gpu-db-engine-server", interrupted);
                     }
                 }
             }
-            throw new IllegalStateException("gpu-db-server did not start on 127.0.0.1:" + port);
+            throw new IllegalStateException("gpu-db-engine-server did not start on 127.0.0.1:" + port);
         }
 
         @Override

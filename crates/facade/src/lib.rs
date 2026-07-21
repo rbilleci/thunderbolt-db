@@ -933,15 +933,55 @@ fn submit_text_inner(
     session: &mut SharedSession,
     sql: &str,
 ) -> Result<QueryOutcome, DbError> {
-    let parsed = match ParsedCommand::parse(sql) {
+    let parsed = match ParsedCommand::parse_allowing_catalog(sql) {
         Ok(parsed) => parsed,
         Err(ParseError::Empty) => return Ok(QueryOutcome::Empty),
+        // The typed parser intentionally rejects joins, expressions, and other richer SELECT
+        // syntax. The engine's libpg_query lowering is the one general GPU relational path for
+        // those statements; an actual syntax error or non-SELECT still fails pre-effect there.
+        Err(_) if gpu_db_sql::is_select_statement(sql) => {
+            return submit_general_select_text_inner(shared, session, sql);
+        }
         Err(error) => {
             session.mark_transaction_failed();
             return Err(map_parse_error(error));
         }
     };
     submit_parsed(shared, session, parsed)
+}
+
+fn submit_general_select_text_inner(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    sql: &str,
+) -> Result<QueryOutcome, DbError> {
+    if session.transaction_failed {
+        return Err(in_failed_transaction_error());
+    }
+    let was_active = session.in_transaction();
+    let result = match session.active_txn_id {
+        Some(txn_id) => shared
+            .engine
+            .execute_resident_expr_select_sql_in_transaction(txn_id, sql),
+        None => shared.engine.execute_resident_expr_select_sql(sql),
+    }
+    .map(map_relational_result)
+    .map_err(map_execute_error);
+    if result.is_err() && was_active {
+        session.mark_transaction_failed();
+    }
+    result
+}
+
+/// Catalog SELECTs must cross the libpg_query binder even when the bounded typed parser can
+/// represent their surface shape. That binder owns schema qualification, empty-source binding,
+/// aggregate/grouping validation, and catalog presentation; letting a typed parse bypass it would
+/// make correctness depend on which parser happened to accept the SQL first.
+fn select_requires_general_catalog_binding(select: &Select) -> bool {
+    !select.public_only
+        && (select.table.starts_with("pg_catalog.")
+            || select.table.starts_with("information_schema.")
+            || select.table.starts_with("pg_"))
 }
 
 fn submit_parsed(
@@ -957,6 +997,25 @@ pub(crate) fn submit_parsed_with_catalog(
     session: &mut SharedSession,
     parsed: ParsedCommand,
     expected_catalog_version: Option<u64>,
+) -> Result<QueryOutcome, DbError> {
+    submit_parsed_with_catalog_mode(shared, session, parsed, expected_catalog_version, false)
+}
+
+fn submit_bound_prepared_with_catalog(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    parsed: ParsedCommand,
+    expected_catalog_version: Option<u64>,
+) -> Result<QueryOutcome, DbError> {
+    submit_parsed_with_catalog_mode(shared, session, parsed, expected_catalog_version, true)
+}
+
+fn submit_parsed_with_catalog_mode(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    parsed: ParsedCommand,
+    expected_catalog_version: Option<u64>,
+    bound_prepared_ast: bool,
 ) -> Result<QueryOutcome, DbError> {
     if session.transaction_failed {
         let rollback = match parsed.command() {
@@ -977,6 +1036,14 @@ pub(crate) fn submit_parsed_with_catalog(
             tag: CommandTag::Rollback,
             rows_affected: None,
         });
+    }
+    if !bound_prepared_ast
+        && matches!(
+            parsed.command(),
+            Command::Select(select) if select_requires_general_catalog_binding(select)
+        )
+    {
+        return submit_general_select_text_inner(shared, session, parsed.source());
     }
     let was_active = session.in_transaction();
     let result = submit_parsed_inner(shared, session, parsed, expected_catalog_version);
@@ -1305,9 +1372,20 @@ fn submit_batched_text_inner(
     batcher: &PointLookupBatcher,
     sql: &str,
 ) -> SubmissionDispatch {
-    let parsed = match ParsedCommand::parse(sql) {
+    if !batcher.is_bound_to(shared) {
+        return SubmissionDispatch::Immediate(Err(DbError {
+            category: ErrorCategory::InvalidRequest,
+            message: "point-lookup batcher belongs to a different SharedEngine".to_string(),
+        }));
+    }
+    let parsed = match ParsedCommand::parse_allowing_catalog(sql) {
         Ok(parsed) => parsed,
         Err(ParseError::Empty) => return SubmissionDispatch::Immediate(Ok(QueryOutcome::Empty)),
+        Err(_) if gpu_db_sql::is_select_statement(sql) => {
+            return SubmissionDispatch::Immediate(submit_general_select_text_inner(
+                shared, session, sql,
+            ));
+        }
         Err(error) => {
             session.mark_transaction_failed();
             return SubmissionDispatch::Immediate(Err(map_parse_error(error)));
@@ -1321,11 +1399,11 @@ fn submit_batched_text_inner(
     {
         return SubmissionDispatch::Immediate(submit_parsed(shared, session, parsed));
     }
-    if !batcher.is_bound_to(shared) {
-        return SubmissionDispatch::Immediate(Err(DbError {
-            category: ErrorCategory::InvalidRequest,
-            message: "point-lookup batcher belongs to a different SharedEngine".to_string(),
-        }));
+    if matches!(
+        parsed.command(),
+        Command::Select(select) if select_requires_general_catalog_binding(select)
+    ) {
+        return SubmissionDispatch::Immediate(submit_parsed(shared, session, parsed));
     }
     // Classify the already-parsed owner under a read lock. Non-batchable commands consume that
     // same owner on the per-query path; no fallback reparses SQL text.

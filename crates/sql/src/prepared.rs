@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use crate::{
-    command::parse_prepared_command, lower_sql_parameters, parameter::sql_parameter_arity, Command,
-    ParseError, ParsedCommand, SelectFilter, SqlType, SqlValue,
+    command::parse_prepared_command_allowing_catalog, lower_sql_parameters,
+    parameter::sql_parameter_arity, Command, ParseError, ParsedCommand, SelectFilter, SqlType,
+    SqlValue,
 };
 
 /// One parsed SQL template whose `$n` references are typed AST slots rather than reconstructed SQL.
@@ -28,7 +29,7 @@ impl PreparedCommand {
                     .to_string(),
             ));
         }
-        let command = parse_prepared_command(source)?;
+        let command = parse_prepared_command_allowing_catalog(source)?;
         let parameter_count = command_parameter_count(&command);
         if parameter_count != raw_parameter_count
             || (parameter_count > 0
@@ -399,6 +400,48 @@ mod tests {
         let bound = prepared.bind(&[]).unwrap();
         assert_eq!(bound.command(), prepared.command());
         assert_eq!(bound.source(), prepared.source());
+    }
+
+    #[test]
+    fn product_prepared_parse_retains_catalog_mixed_star_and_in_filter() {
+        let source = "SELECT oid, * FROM pg_catalog.pg_type \
+                      WHERE typname IN ('hstore','geometry','vector')";
+        assert!(ParsedCommand::parse(source).is_err());
+        let prepared = PreparedCommand::parse(source).unwrap();
+        assert_eq!(prepared.parameter_count(), 0);
+        let Command::Select(select) = prepared.command() else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.table, "pg_catalog.pg_type");
+        assert!(!select.public_only);
+        assert_eq!(
+            select.projection,
+            crate::SelectProjection::Columns(vec![
+                "oid".to_string(),
+                crate::PROJECTION_WILDCARD_SENTINEL.to_string(),
+            ])
+        );
+        assert_eq!(select.filter_groups.len(), 3);
+        let bound = prepared.bind(&[]).unwrap();
+        assert_eq!(bound.command(), prepared.command());
+        assert_eq!(bound.source(), source);
+
+        let quoted = PreparedCommand::parse(r#"SELECT oid, "*" FROM pg_catalog.pg_type"#).unwrap();
+        let Command::Select(quoted) = quoted.command() else {
+            panic!("expected quoted-star SELECT");
+        };
+        assert_eq!(
+            quoted.projection,
+            crate::SelectProjection::Columns(vec!["oid".to_string(), "*".to_string()])
+        );
+
+        let explicit_public =
+            PreparedCommand::parse("SELECT oid FROM public.pg_type ORDER BY oid").unwrap();
+        let Command::Select(explicit_public) = explicit_public.command() else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(explicit_public.table, "pg_type");
+        assert!(explicit_public.public_only);
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub(super) fn from_clause_is_join(stmt: &SelectStmt) -> bool {
 
 /// A JOIN column reference (ON operand or projection item): bare `col` or qualified `alias.col`. No
 /// validation here (the executor resolves it against the two relations); rejects `*` / 3-part refs.
-fn parse_join_col_ref(node: &Node) -> Result<JoinColRef, ExecuteError> {
+pub(super) fn parse_join_col_ref(node: &Node) -> Result<JoinColRef, ExecuteError> {
     let NodeEnum::ColumnRef(column_ref) = node_enum(node)? else {
         return Err(sql_pg_error(
             "a join ON/SELECT term must be a plain column reference (expressions / `*` / aggregates \
@@ -84,20 +84,51 @@ fn parse_join_proj_item(node: &Node) -> Result<JoinProjItem, ExecuteError> {
 /// The (relation name, qualifier) of a join side -- a base-table RangeVar (nested joins / subqueries
 /// are a multi-way follow-up). The qualifier is the alias, else the relation name (mirrors the
 /// single-table builder).
-fn join_side_name_alias(node: &Node) -> Result<(String, String), ExecuteError> {
+fn range_var_relation_name(
+    range_var: &pg_query::protobuf::RangeVar,
+) -> Result<String, ExecuteError> {
+    if !range_var.catalogname.is_empty() {
+        return Err(sql_pg_error(
+            "cross-database JOIN relations are not supported".to_string(),
+        ));
+    }
+    Ok(match range_var.schemaname.as_str() {
+        "" | "public" => range_var.relname.clone(),
+        schema => format!("{schema}.{}", range_var.relname),
+    })
+}
+
+fn reject_join_range_column_aliases(
+    range_var: &pg_query::protobuf::RangeVar,
+) -> Result<(), ExecuteError> {
+    if range_var
+        .alias
+        .as_ref()
+        .is_some_and(|alias| !alias.colnames.is_empty())
+    {
+        return Err(sql_pg_error(
+            "JOIN relation column-alias lists are not supported; use ordinary projected aliases"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn join_side_name_alias(node: &Node) -> Result<(String, String, bool), ExecuteError> {
     let NodeEnum::RangeVar(range_var) = node_enum(node)? else {
         return Err(sql_pg_error(
             "each side of a JOIN must be a base table (nested joins / subqueries are a follow-up)"
                 .to_string(),
         ));
     };
-    let table = range_var.relname.clone();
+    reject_join_range_column_aliases(range_var)?;
+    let table = range_var_relation_name(range_var)?;
     let alias = range_var
         .alias
         .as_ref()
         .map(|alias| alias.aliasname.clone())
-        .unwrap_or_else(|| table.clone());
-    Ok((table, alias))
+        .unwrap_or_else(|| range_var.relname.clone());
+    Ok((table, alias, range_var.schemaname == "public"))
 }
 
 /// Flatten ONE INNER-join node of a LEFT-DEEP chain into `relations` + `steps` (M5 J6). The left arg may
@@ -147,18 +178,20 @@ fn flatten_join_chain(
             None
         }
         _ => {
-            let (table, alias) = join_side_name_alias(larg)?;
+            let (table, alias, public_only) = join_side_name_alias(larg)?;
             relations.push(JoinRelationRef {
                 table,
                 alias: alias.clone(),
+                public_only,
             });
             Some(alias)
         }
     };
-    let (right_table, right_alias) = join_side_name_alias(rarg)?;
+    let (right_table, right_alias, right_public_only) = join_side_name_alias(rarg)?;
     relations.push(JoinRelationRef {
         table: right_table,
         alias: right_alias.clone(),
+        public_only: right_public_only,
     });
     // USING/NATURAL require a base-table left arg (their multi-way coalescing is a follow-up).
     let multi_way_using = || {
@@ -291,6 +324,47 @@ fn parse_on_conjuncts(quals: &Node) -> Result<Vec<(JoinColRef, JoinColRef)>, Exe
 /// operands + projection to relations/columns, validates the key types, and pipelines the chain.
 pub(super) fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
     reject_unsupported_join_clauses(stmt)?;
+    let (relations, steps) = build_join_structure(stmt)?;
+    let (projection, projection_aliases) = parse_join_projection(stmt)?;
+    let (order_by, order_by_nulls_first, limit, offset) = parse_join_order_by_limit(stmt)?;
+    Ok(JoinPlan {
+        relations,
+        steps,
+        projection,
+        projection_aliases,
+        order_by,
+        order_by_nulls_first,
+        limit,
+        offset,
+    })
+}
+
+pub(super) fn build_join_plan_with_projection(
+    stmt: &SelectStmt,
+    projection: Vec<JoinProjItem>,
+    projection_aliases: Vec<Option<String>>,
+    order_by: Vec<(JoinColRef, bool)>,
+    order_by_nulls_first: Vec<Option<bool>>,
+) -> Result<JoinPlan, ExecuteError> {
+    reject_unsupported_join_clauses(stmt)?;
+    let (relations, steps) = build_join_structure(stmt)?;
+    let limit = parse_limit(&stmt.limit_count)?;
+    let offset = parse_limit(&stmt.limit_offset)?;
+    Ok(JoinPlan {
+        relations,
+        steps,
+        projection,
+        projection_aliases,
+        order_by,
+        order_by_nulls_first,
+        limit,
+        offset,
+    })
+}
+
+fn build_join_structure(
+    stmt: &SelectStmt,
+) -> Result<(Vec<JoinRelationRef>, Vec<JoinStep>), ExecuteError> {
     let [from] = stmt.from_clause.as_slice() else {
         return Err(sql_pg_error(
             "expected a single JOIN in the FROM clause".to_string(),
@@ -314,18 +388,7 @@ pub(super) fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteErro
                 .to_string(),
         ));
     }
-    let (projection, projection_aliases) = parse_join_projection(stmt)?;
-    let (order_by, order_by_nulls_first, limit, offset) = parse_join_order_by_limit(stmt)?;
-    Ok(JoinPlan {
-        relations,
-        steps,
-        projection,
-        projection_aliases,
-        order_by,
-        order_by_nulls_first,
-        limit,
-        offset,
-    })
+    Ok((relations, steps))
 }
 
 /// Reject the clauses not on the join path yet (GROUP BY / HAVING / DISTINCT / window / WITH). WHERE is
@@ -432,24 +495,31 @@ pub(super) fn parse_join_projection(
 /// a single FROM relation or any non-base-table FROM entry (an explicit `JoinExpr` -- handled by
 /// `build_join_plan` -- or a subquery; a comma list MIXING those is a follow-up). Each entry's qualifier
 /// is its alias, else the relation name (mirrors the explicit-JOIN builder).
-pub(super) fn comma_join_relations(stmt: &SelectStmt) -> Option<Vec<JoinRelationRef>> {
+pub(super) fn comma_join_relations(
+    stmt: &SelectStmt,
+) -> Result<Option<Vec<JoinRelationRef>>, ExecuteError> {
     if stmt.from_clause.len() < 2 {
-        return None;
+        return Ok(None);
     }
     let mut relations = Vec::with_capacity(stmt.from_clause.len());
     for from in &stmt.from_clause {
         let Some(NodeEnum::RangeVar(range_var)) = from.node.as_ref() else {
-            return None;
+            return Ok(None);
         };
-        let table = range_var.relname.clone();
+        reject_join_range_column_aliases(range_var)?;
+        let table = range_var_relation_name(range_var)?;
         let alias = range_var
             .alias
             .as_ref()
             .map(|alias| alias.aliasname.clone())
-            .unwrap_or_else(|| table.clone());
-        relations.push(JoinRelationRef { table, alias });
+            .unwrap_or_else(|| range_var.relname.clone());
+        relations.push(JoinRelationRef {
+            table,
+            alias,
+            public_only: range_var.schemaname == "public",
+        });
     }
-    Some(relations)
+    Ok(Some(relations))
 }
 
 /// Resolve a column reference to its relation index among `relations`/`tables` (parallel): a qualifier
@@ -501,6 +571,7 @@ pub(super) fn plan_comma_join_where(
     relations: &[JoinRelationRef],
     tables: &[RelationalTable],
     aliases: &[&str],
+    catalog: &super::CatalogSnapshot,
 ) -> Result<(Vec<JoinStep>, Vec<Option<ResidentExpr>>), ExecuteError> {
     let n = relations.len();
     let mut conjuncts: Vec<&Node> = Vec::new();
@@ -517,7 +588,7 @@ pub(super) fn plan_comma_join_where(
             .zip(aliases)
             .enumerate()
             .filter_map(|(i, (table, alias))| {
-                map_predicate_node(conjunct, table, alias)
+                map_predicate_node(conjunct, table, alias, catalog)
                     .ok()
                     .map(|expr| (i, expr))
             })
@@ -597,6 +668,7 @@ pub(super) fn split_join_where(
     where_node: &Node,
     tables: &[RelationalTable],
     aliases: &[&str],
+    catalog: &super::CatalogSnapshot,
 ) -> Result<Vec<Option<ResidentExpr>>, ExecuteError> {
     let mut conjuncts: Vec<&Node> = Vec::new();
     collect_and_conjuncts(where_node, &mut conjuncts)?;
@@ -607,7 +679,7 @@ pub(super) fn split_join_where(
             .zip(aliases)
             .enumerate()
             .filter_map(|(i, (table, alias))| {
-                map_predicate_node(conjunct, table, alias)
+                map_predicate_node(conjunct, table, alias, catalog)
                     .ok()
                     .map(|expr| (i, expr))
             })
@@ -655,4 +727,58 @@ fn collect_and_conjuncts<'a>(node: &'a Node, out: &mut Vec<&'a Node>) -> Result<
     }
     out.push(node);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine_sql_pg::parse_single_select;
+
+    #[test]
+    fn join_relation_identity_normalizes_only_public_and_rejects_column_alias_lists() {
+        let explicit = parse_single_select(
+            "SELECT l.id FROM public.left_table l \
+             JOIN public.right_table r ON l.id = r.id",
+        )
+        .unwrap();
+        let plan = build_join_plan(&explicit).unwrap();
+        assert_eq!(plan.relations[0].table, "left_table");
+        assert_eq!(plan.relations[1].table, "right_table");
+        assert!(plan.relations.iter().all(|relation| relation.public_only));
+
+        let comma = parse_single_select(
+            "SELECT l.id FROM public.left_table l, public.right_table r \
+             WHERE l.id = r.id",
+        )
+        .unwrap();
+        let relations = comma_join_relations(&comma).unwrap().unwrap();
+        assert_eq!(relations[0].table, "left_table");
+        assert_eq!(relations[1].table, "right_table");
+        assert!(relations.iter().all(|relation| relation.public_only));
+
+        let qualified = parse_single_select(
+            "SELECT l.oid FROM evil.pg_class l \
+             JOIN pg_catalog.pg_namespace n ON l.oid = n.oid",
+        )
+        .unwrap();
+        let plan = build_join_plan(&qualified).unwrap();
+        assert_eq!(plan.relations[0].table, "evil.pg_class");
+        assert_eq!(plan.relations[1].table, "pg_catalog.pg_namespace");
+        assert!(plan.relations.iter().all(|relation| !relation.public_only));
+
+        for sql in [
+            "SELECT l.x FROM public.left_table AS l(x) \
+             JOIN public.right_table r ON l.x = r.id",
+            "SELECT l.x FROM public.left_table AS l(x), public.right_table r \
+             WHERE l.x = r.id",
+        ] {
+            let stmt = parse_single_select(sql).unwrap();
+            let error = if from_clause_is_join(&stmt) {
+                build_join_plan(&stmt).unwrap_err()
+            } else {
+                comma_join_relations(&stmt).unwrap_err()
+            };
+            assert!(error.to_string().contains("column-alias lists"), "{error}");
+        }
+    }
 }

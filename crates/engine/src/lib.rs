@@ -41,6 +41,7 @@ use gpu_db_sql::{
     SelectFilterOp, SelectFunction, SelectLiteral, SelectProjection, SequenceNextVal,
     SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege,
     TransactionCharacteristics, TruncateTable, Update, NUMERIC_DEFAULT_PRECISION,
+    PROJECTION_WILDCARD_SENTINEL,
 };
 #[cfg(test)]
 use gpu_db_storage::TupleVersion;
@@ -68,6 +69,8 @@ use gpu_db_wal::{
     WalControlFile, WalDurability, WalGroupCommitStats, WalRecord,
 };
 
+mod rel_exec_catalog;
+pub(crate) use rel_exec_catalog::*;
 mod rel_exec_helpers;
 pub(crate) use rel_exec_helpers::*;
 mod wal_binary;

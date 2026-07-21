@@ -7,9 +7,26 @@ use super::{
     strip_keyword_prefix_case_insensitive, ParseError, SqlValue,
 };
 
+/// Internal marker for an in-place bare `*` inside an otherwise explicit projection list.
+///
+/// PostgreSQL identifiers cannot contain NUL, so this value can never collide with a quoted
+/// identifier such as `"*"`. Consumers compare against this marker when expanding a mixed
+/// projection such as `SELECT oid, *`.
+pub const PROJECTION_WILDCARD_SENTINEL: &str = "\0gpu_db_projection_wildcard";
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Select {
     pub table: String,
+    /// An explicitly qualified `public.table` lookup must resolve only a user relation. Bare names
+    /// retain PostgreSQL's user-first catalog search behavior, while system-schema names remain
+    /// qualified in `table`. This provenance is part of the bound AST and survives prepared
+    /// Parse/Describe/Execute without consulting or reparsing the original SQL text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public_only: bool,
     pub distinct: bool,
     pub projection: SelectProjection,
     pub group_by: Option<String>,
@@ -28,6 +45,9 @@ pub struct Select {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SelectProjection {
     All,
+    /// Explicit columns with an in-place bare `*` expansion. The `Columns` representation keeps
+    /// projection order and duplicates (for example `oid, *`) while binding expands `*` against
+    /// the exact retained table definition.
     Columns(Vec<String>),
     CountAll,
     GroupedCount {
@@ -175,10 +195,14 @@ pub(super) fn parse_select(input: &str, allow_catalog_schemas: bool) -> Result<S
     // Only the engine's catalog-aware entry carries a `pg_catalog.`/`information_schema.`
     // qualifier through; the strict path keeps rejecting non-public schemas (so the legacy
     // server's compatibility layer still handles catalog queries unchanged).
-    let table = if allow_catalog_schemas {
-        normalize_select_relation_identifier(&tail[..table_end])?
+    let relation = &tail[..table_end];
+    let (table, public_only) = if allow_catalog_schemas {
+        normalize_select_relation_identifier(relation)?
     } else {
-        normalize_relation_identifier(&tail[..table_end])?
+        (
+            normalize_relation_identifier(relation)?,
+            relation.split_once('.').is_some(),
+        )
     };
     tail = tail[table_end..].trim_start();
 
@@ -231,6 +255,7 @@ pub(super) fn parse_select(input: &str, allow_catalog_schemas: bool) -> Result<S
     let filters = filter_groups.first().cloned().unwrap_or_default();
     Ok(Select {
         table,
+        public_only,
         distinct,
         projection,
         group_by,
@@ -302,7 +327,14 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
     }
     let columns = items
         .into_iter()
-        .map(|column| normalize_identifier(column.trim()))
+        .map(|column| {
+            let column = column.trim();
+            if column == "*" {
+                Ok(PROJECTION_WILDCARD_SENTINEL.to_string())
+            } else {
+                normalize_identifier(column)
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if columns.is_empty() {
         return Err(ParseError::InvalidRelationalSql);

@@ -1069,8 +1069,25 @@ pub fn parse_command_allowing_catalog(input: &str) -> Result<Command, ParseError
     Ok(command)
 }
 
-pub(crate) fn parse_prepared_command(input: &str) -> Result<Command, ParseError> {
-    parse_command_inner(input, false)
+/// Return whether one statement begins with the `SELECT` keyword after PostgreSQL whitespace and
+/// comments. This is only a read-only dispatch classifier: the real PostgreSQL parser still owns
+/// validation of the richer statement before execution.
+pub fn is_select_statement(input: &str) -> bool {
+    let Ok(normalized) = crate::parameter::normalize_sql_comments(input) else {
+        return false;
+    };
+    let input = normalized.trim_start();
+    input
+        .get(.."select".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select"))
+        && input["select".len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_' && next != '$')
+}
+
+pub(crate) fn parse_prepared_command_allowing_catalog(input: &str) -> Result<Command, ParseError> {
+    parse_command_inner(input, true)
 }
 
 fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Command, ParseError> {
@@ -1322,5 +1339,16 @@ mod transaction_characteristic_tests {
         let parsed = crate::ParsedCommand::parse(source).unwrap();
         assert_eq!(parsed.source(), source);
         assert!(parse_command("SELECT 1 /* unterminated").is_err());
+    }
+
+    #[test]
+    fn select_classifier_is_comment_aware_and_keyword_bounded() {
+        assert!(is_select_statement(
+            " /* outer /* nested */ comment */ SELECT 1"
+        ));
+        assert!(is_select_statement("-- lead\r\nselect * from t"));
+        assert!(!is_select_statement("SELEC broken"));
+        assert!(!is_select_statement("selection FROM t"));
+        assert!(!is_select_statement("COPY t FROM STDIN"));
     }
 }

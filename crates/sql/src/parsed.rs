@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::{parse_command, Command, ParseError};
+use crate::{parse_command, parse_command_allowing_catalog, Command, ParseError};
 
 /// One SQL command parsed exactly once and paired with the exact source text that produced it.
 ///
@@ -18,6 +18,17 @@ pub struct ParsedCommand {
 impl ParsedCommand {
     pub fn parse(source: &str) -> Result<Self, ParseError> {
         let command = parse_command(source)?;
+        Ok(Self {
+            source: Arc::from(source),
+            command,
+        })
+    }
+
+    /// Product-server parse boundary. Unlike the strict legacy-compatible entry, this carries
+    /// `pg_catalog` and `information_schema` relation names into the typed SELECT AST so the engine
+    /// can execute their synthesized relations with GPU operators.
+    pub fn parse_allowing_catalog(source: &str) -> Result<Self, ParseError> {
+        let command = parse_command_allowing_catalog(source)?;
         Ok(Self {
             source: Arc::from(source),
             command,

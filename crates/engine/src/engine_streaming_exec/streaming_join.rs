@@ -327,13 +327,10 @@ impl Engine {
         if budget < 256 {
             return None;
         }
+        let shards = self.read_residency_shards();
         let all_resident = plan.relations.iter().all(|relation| {
             self.relational_residency_entry(&relation.table).is_some()
-                || self
-                    .read_state
-                    .residency
-                    .shards
-                    .load()
+                || shards
                     .get(&relation.table)
                     .is_some_and(|shards| !shards.is_empty())
         });
@@ -805,13 +802,10 @@ impl Engine {
         if budget < 128 {
             return None;
         }
+        let shards = self.read_residency_shards();
         let all_resident = plan.relations.iter().all(|relation| {
             self.relational_residency_entry(&relation.table).is_some()
-                || self
-                    .read_state
-                    .residency
-                    .shards
-                    .load()
+                || shards
                     .get(&relation.table)
                     .is_some_and(|shards| !shards.is_empty())
         });

@@ -10,11 +10,17 @@ impl Engine {
         gpu_id: u16,
         input_cap: u64,
     ) -> Option<Arc<ColdTableChunks>> {
-        self.transition_oversized_device_table_to_streaming_repair(&table.name)
-            .ok()?;
         // Row-byte target is intentionally half the payload reservation: headers, text offset
         // arrays, validity, and section alignment also occupy the retained descriptor bytes.
         let chunk_target = (input_cap / 2).max(1);
+        // A statement/transaction scope owns an immutable representation bundle. Maintenance after
+        // capture would publish into global state that this reader cannot see, so scoped execution
+        // may consume retained cold chunks only and otherwise fails cleanly at route selection.
+        if self.current_transaction_read_snapshot().is_some() {
+            return self.load_streaming_cold(&table.name, table, chunk_target, copin_s);
+        }
+        self.transition_oversized_device_table_to_streaming_repair(&table.name)
+            .ok()?;
         if let Some(cold) = self.load_streaming_cold(&table.name, table, chunk_target, copin_s) {
             return Some(cold);
         }
@@ -25,6 +31,7 @@ impl Engine {
         }
         let count_select = Select {
             table: table.name.clone(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::CountAll,
             group_by: None,

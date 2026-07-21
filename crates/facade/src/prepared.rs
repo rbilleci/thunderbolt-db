@@ -56,6 +56,7 @@ impl BoundPreparedStatement {
     pub(super) fn is_exact_copy_to_select(&self, copy: &CopyToStdout) -> bool {
         let expected = Select {
             table: copy.table.clone(),
+            public_only: false,
             distinct: false,
             projection: copy
                 .columns
@@ -449,9 +450,12 @@ pub(super) fn submit_prepared_inner(
         }
     };
     let outcome = match validated.parsed {
-        Some(parsed) => {
-            super::submit_parsed_with_catalog(shared, session, parsed, validated.catalog_version)?
-        }
+        Some(parsed) => super::submit_bound_prepared_with_catalog(
+            shared,
+            session,
+            parsed,
+            validated.catalog_version,
+        )?,
         None => QueryOutcome::Empty,
     };
     let result = validate_result_columns(outcome, validated.expected_columns.as_deref());
@@ -565,6 +569,58 @@ mod tests {
             submit_prepared(&facade, &mut session, &bound).unwrap(),
             QueryOutcome::Empty
         );
+    }
+
+    #[test]
+    fn r2dbc_catalog_autodetection_is_described_at_the_public_facade_boundary() {
+        let facade = SharedEngine::new();
+        let session = facade.open_session();
+        let prepared = facade
+            .prepare_statement(
+                &session,
+                "SELECT oid, * FROM pg_catalog.pg_type \
+                 WHERE typname IN ('hstore','geometry','vector')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(prepared.parameter_types(), Some([].as_slice()));
+        assert_eq!(
+            prepared
+                .result_columns()
+                .unwrap()
+                .iter()
+                .map(|column| (column.name.as_str(), column.logical_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("oid", LogicalType::Int4),
+                ("oid", LogicalType::Int4),
+                ("typname", LogicalType::Text),
+                ("typlen", LogicalType::Int4),
+                ("typtype", LogicalType::Text),
+                ("typnamespace", LogicalType::Int4),
+            ]
+        );
+        assert!(prepared.bind_values(&[]).is_ok());
+
+        let richer = facade.prepare_statement(
+            &session,
+            "SELECT c.oid FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+            &[],
+        );
+        assert!(
+            richer.is_err(),
+            "a richer prepared catalog shape must reject during Parse/Describe"
+        );
+
+        let typed_richer = facade.prepare_statement(
+            &session,
+            "SELECT count(*) FROM pg_catalog.pg_policy ORDER BY oid",
+            &[],
+        );
+        let error = typed_richer
+            .expect_err("typed-parser catalog aggregate/order must reject during Parse/Describe");
+        assert!(error.message.contains("Parse/Describe"), "{error:?}");
     }
 
     #[test]

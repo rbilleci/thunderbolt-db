@@ -473,6 +473,7 @@ impl Engine {
             catalog_relation_table("public", "__stream_scalar", &[("__p0", partial_type)]);
         let fold_select = Select {
             table: scalar_table.name.clone(),
+            public_only: false,
             distinct: false,
             projection: fold_projection.clone(),
             group_by: None,

@@ -345,6 +345,7 @@ impl Engine {
             catalog_relation_table(&select.table, "__stream_window", &window_column_refs);
         let window_select = Select {
             table: window_table.name.clone(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(
                 window_column_refs

@@ -69,17 +69,9 @@ require_command mvn
 require_command rg
 require_python314
 
-for canonical_driver in node-postgres asyncpg psycopg pgx jdbc; do
+for canonical_driver in node-postgres asyncpg psycopg pgx jdbc r2dbc; do
   require_canonical_driver_source "$canonical_driver"
 done
-if ! rg -q 'gpu_db_protocol|gpu-db-server' tests/compat/r2dbc; then
-  echo "R2DBC must remain an explicit legacy catalog baseline until its catalog slice migrates it" >&2
-  exit 1
-fi
-if rg -q 'gpu_db_server|gpu-db-engine-server' tests/compat/r2dbc; then
-  echo "R2DBC source names both canonical and legacy targets; its baseline is ambiguous" >&2
-  exit 1
-fi
 
 cargo test -p gpu_db_server --test tokio_postgres_smoke -- --color never
 echo "application_driver_smoke_tokio_postgres=passed"
@@ -104,8 +96,8 @@ echo "application_driver_smoke_jdbc=passed"
 
 tests/compat/r2dbc/run.sh
 echo "application_driver_smoke_r2dbc=passed"
-echo "application_driver_smoke_r2dbc_target=legacy_catalog_baseline"
+echo "application_driver_smoke_r2dbc_target=canonical_gpu_catalog"
 
-echo "application_driver_smoke_canonical_targets=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg,pgx,jdbc"
+echo "application_driver_smoke_canonical_targets=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg,pgx,jdbc,r2dbc"
 echo "application_driver_smoke_scope=supported_sql_protocol_subset"
 echo "application driver smoke gate passed"

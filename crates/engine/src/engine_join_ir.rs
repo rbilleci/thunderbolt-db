@@ -22,8 +22,13 @@ pub(crate) enum JoinProjItem {
 /// or the relation name when unaliased -- mirrors the single-table builder).
 #[derive(Debug, Clone)]
 pub(crate) struct JoinRelationRef {
+    /// The normalized residency/catalog lookup key. Explicit `public.foo` intentionally stores
+    /// the same bare key as unqualified `foo`; `public_only` retains the lookup-class distinction.
     pub table: String,
     pub alias: String,
+    /// An explicit `public.` qualifier may resolve only a public user relation. Unqualified names
+    /// retain PostgreSQL's user-then-implicit-pg_catalog lookup behavior.
+    pub public_only: bool,
 }
 
 /// One join step in a left-deep chain. Its condition is one of: explicit ON `conjuncts`

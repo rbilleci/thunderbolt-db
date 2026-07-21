@@ -1108,6 +1108,74 @@ mod tests {
     }
 
     #[test]
+    fn pre_public_only_view_bodies_remain_canonical_and_true_round_trips() {
+        const OLD_BODIES: [&[u8]; 2] = [
+            br#"{"CreateView":{"name":"legacy_v","query":{"table":"legacy_source","distinct":false,"projection":"All","group_by":null,"having_groups":[],"filter":null,"filters":[],"filter_groups":[],"order_by":[],"limit":null,"offset":null},"definition":"SELECT * FROM legacy_source","or_replace":false}}"#,
+            br#"{"CreateMaterializedView":{"name":"legacy_mv","query":{"table":"legacy_source","distinct":false,"projection":"All","group_by":null,"having_groups":[],"filter":null,"filters":[],"filter_groups":[],"order_by":[],"limit":null,"offset":null},"definition":"SELECT * FROM legacy_source","with_data":false}}"#,
+        ];
+
+        for old_body in OLD_BODIES {
+            let mut typed = Vec::with_capacity(10 + old_body.len());
+            typed.push(ENGINE_TYPED_COMMAND_TAG);
+            typed.push(ENGINE_TYPED_COMMAND_VERSION);
+            typed.extend_from_slice(&(old_body.len() as u64).to_le_bytes());
+            typed.extend_from_slice(old_body);
+            let command = Engine::decode_engine_command(&typed)
+                .expect("historical typed view command must decode")
+                .expect("typed command");
+            let historical_public_only = match &command {
+                Command::CreateView(view) => view.query.public_only,
+                Command::CreateMaterializedView(view) => view.query.public_only,
+                other => panic!("unexpected historical command: {other:?}"),
+            };
+            assert!(!historical_public_only);
+            assert_eq!(serde_json::to_vec(&command).unwrap(), old_body);
+
+            let mut operation =
+                Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + old_body.len());
+            operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
+            operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND);
+            operation.extend_from_slice(&[0; 3]);
+            operation.extend_from_slice(&(old_body.len() as u64).to_le_bytes());
+            operation.extend_from_slice(old_body);
+            let replay = Engine::decode_engine_operation(&operation)
+                .expect("historical canonical view fragment must remain replayable");
+            assert_eq!(
+                Engine::decode_engine_command(&replay).unwrap(),
+                Some(command)
+            );
+        }
+
+        let current =
+            parse_command("CREATE VIEW current_v AS SELECT * FROM public.current_source").unwrap();
+        let Command::CreateView(view) = &current else {
+            panic!("expected CREATE VIEW");
+        };
+        assert!(view.query.public_only);
+        let current_body = serde_json::to_vec(&current).unwrap();
+        let marker = b"\"public_only\":true";
+        assert!(current_body
+            .windows(marker.len())
+            .any(|window| window == marker));
+        let decoded: Command = serde_json::from_slice(&current_body).unwrap();
+        assert_eq!(decoded, current);
+
+        let mut current_operation =
+            Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + current_body.len());
+        current_operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
+        current_operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND);
+        current_operation.extend_from_slice(&[0; 3]);
+        current_operation.extend_from_slice(&(current_body.len() as u64).to_le_bytes());
+        current_operation.extend_from_slice(&current_body);
+        let current_replay = Engine::decode_engine_operation(&current_operation)
+            .expect("current canonical view fragment must remain replayable");
+        assert_eq!(
+            Engine::decode_engine_command(&current_replay).unwrap(),
+            Some(current)
+        );
+    }
+
+    #[test]
     fn canonical_record_is_active_and_same_id_retry_resolves_exactly() {
         let engine = Engine::new_local();
         let payload: Arc<[u8]> = Arc::from(&b"SET canonical=value"[..]);

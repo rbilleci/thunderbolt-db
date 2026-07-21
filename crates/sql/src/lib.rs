@@ -33,7 +33,9 @@ pub use ast::{
     TransactionAccessMode, TransactionCharacteristics, TransactionIsolation, TruncateTable,
     UniqueConstraint, Update, UpdateAssignment,
 };
-pub use command::{parse_command, parse_command_allowing_catalog, split_simple_query};
+pub use command::{
+    is_select_statement, parse_command, parse_command_allowing_catalog, split_simple_query,
+};
 pub use copy::{
     is_copy_statement, is_supported_extended_copy, parse_copy_from_stdin, parse_copy_row,
     parse_copy_to_stdout_table, CopyColumn, CopyFormat, CopyFromStdin, CopyOptions, CopyParseError,
@@ -57,7 +59,7 @@ pub use scalar::{
 };
 pub use select::{
     GroupedAggKind, GroupedAggregate, Select, SelectFilter, SelectFilterOp, SelectOrder,
-    SelectProjection,
+    SelectProjection, PROJECTION_WILDCARD_SENTINEL,
 };
 pub mod uuid;
 
@@ -1610,20 +1612,26 @@ fn normalize_relation_identifier(input: &str) -> Result<String, ParseError> {
 pub const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 pub const INFORMATION_SCHEMA: &str = "information_schema";
 
-/// Relation-name normalizer for a SELECT's FROM target. Identical to
-/// [`normalize_relation_identifier`] for user relations (`public.t`/`t` → bare `t`), but
-/// PRESERVES a `pg_catalog.`/`information_schema.` qualifier (lowercased, as
-/// `pg_catalog.pg_class`) so catalog relations survive parsing and reach the engine
-/// instead of being rejected. DML keeps the strict (public-only) normalizer.
-fn normalize_select_relation_identifier(input: &str) -> Result<String, ParseError> {
+/// Relation-name normalizer for a SELECT's FROM target. The returned boolean retains an explicit
+/// `public.` lookup while keeping the residency key bare. `pg_catalog.`/`information_schema.` stay
+/// qualified in the normalized name so system relations reach the catalog synthesizer. DML keeps
+/// the strict public-only normalizer.
+fn normalize_select_relation_identifier(input: &str) -> Result<(String, bool), ParseError> {
     let s = input.trim();
     if let Some((schema, table)) = s.split_once('.') {
         let schema_norm = normalize_identifier(schema)?;
         if schema_norm == PG_CATALOG_SCHEMA || schema_norm == INFORMATION_SCHEMA {
-            return Ok(format!("{schema_norm}.{}", normalize_identifier(table)?));
+            return Ok((
+                format!("{schema_norm}.{}", normalize_identifier(table)?),
+                false,
+            ));
         }
+        if schema_norm == "public" {
+            return Ok((normalize_identifier(table)?, true));
+        }
+        return Err(ParseError::InvalidRelationalSql);
     }
-    normalize_relation_identifier(s)
+    normalize_relation_identifier(s).map(|table| (table, false))
 }
 
 fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {

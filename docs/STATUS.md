@@ -14,15 +14,64 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 psql/GPU-catalog/R2DBC compatibility — accepted 2026-07-21
+
+- PostgreSQL 16 psql scenarios 04/06/07 and the unchanged PostgreSQL R2DBC extension-autodetection query now run
+  through `gpu-db-engine-server` and `SharedEngine::submit`. Versioned `pg_catalog` and `information_schema` rows
+  are synthesized from one pinned catalog snapshot, uploaded as transient device relations, and filtered,
+  projected, grouped, ordered, and joined by the existing GPU relational operators. Exact table-list/description
+  and R2DBC mixed-`*` queries prove nonempty GPU execution; unsupported shapes and device failures remain loud and
+  never enter a host relational fallback.
+- The modeled catalog surface includes namespace, class, attribute, type, access-method, constraint, publication,
+  policy/trigger/statistics/inheritance, and information-schema table/column relations needed by this checkpoint.
+  Explicit `pg_catalog`/`information_schema` identity cannot be replaced by a public shadow, explicit `public.`
+  identity survives prepared Parse/Describe/Execute, and bare catalog fallback is blocked by every modeled public
+  relation kind. RangeVar column aliases retain immutable source-column identity, quoted `"*"` is distinct from
+  wildcard expansion, LIKE/regex prefixes escape metacharacters, and catalog casts, arrays, aggregates,
+  `WITHIN GROUP`, aliases, and visibility functions validate their exact typed shapes before device execution.
+  `pg_table_is_visible` and `pg_type_is_visible` compile modeled search-path shadow exclusions into the GPU
+  predicate, including public system-name/domain collisions and aliased OID columns.
+- Prepared catalog execution retains and binds its typed AST without reparsing rendered WAL identity; richer
+  unsupported shapes fail during Parse/Describe. Each statement holds one immutable catalog/device snapshot,
+  mixed user/catalog joins retain their exact resident owners, and `BatchedText` verifies engine ownership before
+  rich-SQL fallback. The slice adds no facade, transaction, sequence/WAL claimant, or publication owner.
+  `Select.public_only` defaults and omits `false`, so hard-coded pre-field CREATE VIEW and CREATE MATERIALIZED VIEW
+  typed payloads decode, replay, and re-encode byte-identically while explicit-public `true` round-trips.
+- Successive independent audits rejected the interrupted tree for the original alias/wildcard/LIKE/cast/array/
+  aggregate/prepared/batcher families and then exposed prepared explicit-public identity loss, explicit-system
+  presentation shadowing, empty information-schema binding, type/table visibility shadowing, aliased OID
+  provenance, historical WAL compatibility, complex nonempty cast targets, and dropped-public regnamespace
+  semantics. Every finding has a focused ordinary test and, where device execution is reachable, an actual-GPU
+  regression. The final dropped-schema proof also replays the durable WAL before checking the missing namespace.
+- Final gates pass SQL **52/52**, engine **516/545 ignored**, and the globally isolated include-ignored engine
+  differential **1,058/1,058** with only the three independently reproduced **PRODUCT-001** base defects filtered.
+  Facade passes **73/13 ignored** plus concurrency **13/1 ignored** (and **86/86** plus **14/14** with ignored tests
+  included), planner **5**, protocol **71 + 127**, canonical server **70/4 ignored**, pgwire **4/2 ignored**, SQLx
+  **1**, and tokio-postgres **1**. The nine-test catalog/facade HAZARD cohort passes three sequential and two
+  concurrent rounds (**45/45**) with zero CUDA 700/716/717. PostgreSQL 16 psql 04/06/07, standalone R2DBC with
+  default autodetection, and the complete tokio-postgres/SQLx/node-postgres/asyncpg/psycopg/pgx/JDBC/R2DBC
+  aggregate all pass.
+- Workspace all-target/all-feature check, strict Clippy, rustfmt, shell/shellcheck, diff, dependency-direction, and
+  source-size gates pass. Touched production source tops out at **1,996** lines and tests at **2,987**; every new
+  production leaf is at or below the 1,500-line target. The preceding accepted two-layer/two-cache card remains the
+  performance evidence (**231.527M/s at p50 157us** in-L2 and **201.693M/s at p50 199us** out-of-L2): the audit
+  repairs do not change a read kernel, residency layout, typed point-read route, or its result path. A fresh
+  read-only auditor traced the complete accepted implementation and returned **ACCEPT** with no blocker at HEAD
+  `e937d5c737cee84a7ccb89c0f8e7dde8663aa84c`, index tree
+  `47a52bda0ff64253f956e75cb61e8081bc759fd0`, and cached-diff SHA-256
+  `b2ce5ac798fb1e7105e8b594bab514a70eae9da18c9be5072d8f698cac784991`, with 56 staged paths and no unstaged drift.
+  **PRODUCT-001** remains open for pg_dump/restore migration, legacy/P8 deletion, broader transaction/recovery
+  compatibility, the PLAN-owned source outlier, and final single-owner proof.
+
 ## PRODUCT-001 prepared/portal/transaction-state compatibility — accepted 2026-07-21
 
 - Asyncpg, psycopg, pgx, JDBC, and the aggregate tokio-postgres gate now build and boot
   `gpu-db-engine-server`; SQLx and node-postgres remain canonical. The unchanged asyncpg pool reset executes its
   `pg_advisory_unlock_all`/CLOSE/UNLISTEN/RESET sequence through effect-free session control without allocating an
-  additional per-command transaction identity or any WAL position. R2DBC is explicitly reported as a legacy catalog
-  baseline: canonical startup and `SHOW TRANSACTION ISOLATION LEVEL` succeed, then its unchanged extension
-  autodetection reaches the still-unmigrated `pg_catalog.pg_type` query owned by the next PRODUCT-001 GPU-catalog
-  slice.
+  additional per-command transaction identity or any WAL position. At this checkpoint R2DBC was explicitly
+  reported as a legacy catalog baseline: canonical startup and `SHOW TRANSACTION ISOLATION LEVEL` succeeded before
+  its unchanged extension autodetection reached the then-unmigrated `pg_catalog.pg_type` query. The later accepted
+  psql/GPU-catalog/R2DBC slice above now serves that query on the canonical GPU catalog path.
 - Canonical startup now sends `server_version_num=160000` and `standard_conforming_strings=on` alongside the four
   existing status fields. SHOW isolation is a typed session command with prepared result metadata; it reports the
   engine-accepted READ COMMITTED/REPEATABLE READ mode, normalizes READ UNCOMMITTED, survives normal COMMIT/ROLLBACK

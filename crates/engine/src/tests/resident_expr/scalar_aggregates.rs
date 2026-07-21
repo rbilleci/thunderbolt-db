@@ -156,6 +156,13 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         "MAX over empty => SQL NULL"
     );
 
+    let aliased = e
+        .execute_resident_expr_select_sql("SELECT COUNT(*) AS c FROM t WHERE a > 0")
+        .expect("a scalar aggregate output alias remains on the GPU path");
+    assert_eq!(aliased.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(aliased.rows, vec![vec![SqlValue::Int8(N - 1)]]);
+    assert_eq!(aliased.columns[0].name, "c");
+
     // The remaining aggregates are follow-ons -> hard error (clear message, never a wrong/blank
     // answer). FILTER / OVER live INSIDE the FuncCall: they must reject, not silently drop (audit P0).
     for sql in [
@@ -163,7 +170,6 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         "SELECT COUNT(*) FILTER (WHERE a > 90) FROM t WHERE a >= 0",
         "SELECT COUNT(*) OVER () FROM t WHERE a >= 0",
         "SELECT COUNT(*) OVER (ORDER BY a) FROM t WHERE a >= 0",
-        "SELECT COUNT(*) AS c FROM t WHERE a > 0",
         "SELECT SUM(*) FROM t WHERE a > 0",
         "SELECT MIN(*) FROM t WHERE a > 0",
         "SELECT AVG(*) FROM t WHERE a > 0",

@@ -51,6 +51,7 @@ impl Engine {
         let runs_table = catalog_relation_table(&table.schema, "__stream_runs", &runs_column_refs);
         let final_select = Select {
             table: runs_table.name.clone(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(
                 runs_column_refs

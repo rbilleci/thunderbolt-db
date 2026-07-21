@@ -39,13 +39,13 @@ type ChunkKeyCandidates = (
     Option<Arc<gpu_db_execution::CudaResidentDeviceMemory>>,
 );
 
+use crate::catalog_relation_table;
 use crate::engine_expr::{
     grouped_projection_to_aggregates, resident_predicate_from_bound_filters, ResidentExecSource,
     ResidentExpr,
 };
 use crate::rel_exec_helpers::{
-    bind_relational_select, catalog_relation_table, decode_relational_row, relational_key_prefix,
-    relational_row_key,
+    bind_relational_select, decode_relational_row, relational_key_prefix, relational_row_key,
 };
 use std::sync::atomic::Ordering;
 

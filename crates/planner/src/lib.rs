@@ -228,6 +228,7 @@ mod tests {
         let planner = Planner::default();
         let plan = planner.plan_command(&Command::Select(gpu_db_sql::Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: gpu_db_sql::SelectProjection::All,
             group_by: None,
@@ -274,6 +275,7 @@ mod tests {
             },
             Command::Select(gpu_db_sql::Select {
                 table: "t".to_string(),
+                public_only: false,
                 distinct: false,
                 projection: gpu_db_sql::SelectProjection::All,
                 group_by: None,

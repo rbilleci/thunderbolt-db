@@ -14,28 +14,38 @@ use super::*;
 
 use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, JoinType, Node, SelectStmt,
-    SetOperation, SortByDir, SortByNulls,
+    SetOperation, SortByDir, SortByNulls, SubLinkType,
 };
 use pg_query::NodeEnum;
 
 use crate::engine_expr::{
-    JoinColRef, JoinPlan, JoinProjItem, JoinRelationRef, JoinStep, ResidentBinaryOp, ResidentExpr,
+    like_pattern_for_literal_prefix, JoinColRef, JoinPlan, JoinProjItem, JoinRelationRef, JoinStep,
+    ResidentBinaryOp, ResidentExecSource, ResidentExpr,
 };
 use gpu_db_sql::{SelectFilter, SelectFilterOp, SelectOrder};
 
+mod catalog_range_alias;
+mod catalog_visibility;
 mod join_lowering;
 mod select_lowering;
+mod statement_snapshot;
 
+use catalog_range_alias::{
+    apply_catalog_range_column_aliases, catalog_range_relation_key,
+    from_node_has_column_alias_list, from_node_is_join, rank_window_relation_binding,
+};
 use join_lowering::{
-    build_join_plan, comma_join_relations, from_clause_is_join, parse_join_order_by_limit,
-    parse_join_projection, plan_comma_join_where, reject_unsupported_join_clauses,
-    split_join_where,
+    build_join_plan, build_join_plan_with_projection, comma_join_relations, from_clause_is_join,
+    parse_join_col_ref, parse_join_order_by_limit, parse_join_projection, plan_comma_join_where,
+    reject_unsupported_join_clauses, split_join_where,
 };
 pub(crate) use select_lowering::parse_single_select;
 use select_lowering::{
-    build_select_from_select_stmt, map_predicate_node, node_enum, parse_limit, parse_order_by,
-    parse_order_by_null_placement, resolve_column_name, result_column_name, sql_pg_error,
+    aexpr_op_token, build_select_from_select_stmt, map_predicate_node, node_enum, parse_limit,
+    parse_order_by, parse_order_by_null_placement, resolve_column_name, result_column_name,
+    sql_pg_error,
 };
+use statement_snapshot::capture_general_select_statement_snapshot;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GpuRankWindowKind {
@@ -64,101 +74,171 @@ enum GpuRankTarget {
     },
 }
 
+mod catalog_empty;
+mod catalog_presentation;
+
+use catalog_presentation::{
+    apply_catalog_projection_metadata, catalog_join_projection_plan,
+    catalog_single_projection_plan, scalar_aggregate_alias_presentation,
+    select_tree_uses_synthesized_catalog,
+};
+
+/// A resident user relation carries no host rows; a synthesized catalog relation carries the
+/// transient rows that will be uploaded for the same GPU operator path.
+type BoundJoinRelation = (RelationalTable, Option<Vec<Vec<SqlValue>>>);
+
+fn bind_join_relation(
+    relation: &JoinRelationRef,
+    catalog: &CatalogSnapshot,
+) -> Result<BoundJoinRelation, ExecuteError> {
+    let name = relation.table.as_str();
+    let user = |name: &str| {
+        catalog
+            .relational_catalog
+            .get(name)
+            .filter(|table| table.schema == "public")
+            .cloned()
+            .map(|table| (table, None))
+    };
+    let synthesized = |name: &str| {
+        synthesize_catalog_relation(name, catalog).map(|(table, rows)| (table, Some(rows)))
+    };
+    let bound = if relation.public_only {
+        user(name)
+    } else if let Some(name) = name.strip_prefix("public.") {
+        user(name)
+    } else if name.starts_with("pg_catalog.") || name.starts_with("information_schema.") {
+        synthesized(name)
+    } else if name.contains('.') {
+        None
+    } else if public_relation_name_exists(catalog, name) {
+        user(name)
+    } else {
+        synthesized(name)
+    };
+    bound.ok_or_else(|| sql_pg_error(format!("relation \"{name}\" does not exist")))
+}
+
 impl Engine {
-    /// Parse `sql` (libpg_query / real Postgres grammar), map it to the general `ResidentExpr` IR, and
-    /// execute it on the GPU general executor (Charter rule 2). Supported shape: a single-table SELECT
-    /// of int4 columns with an int4 `WHERE` predicate over arithmetic (`+ - *`), comparisons
-    /// (`= <> < <= > >=`), and column-vs-column. The catalog is bound ONCE and the predicate's column
-    /// indices are resolved against that SAME bound table, so the columns, projection, and residency
-    /// snapshot all derive from one catalog generation (a concurrent shape-changing DDL cannot split
-    /// the column resolution from the execution). Errors — not a silent fallback — on any shape the
-    /// mapper cannot represent; the routing layer (slice 5) decides what to do with a rejection.
-    pub fn execute_resident_expr_select_sql(
+    pub(crate) fn execute_resident_expr_select_sql_scoped(
         &self,
         sql: &str,
+        after_snapshot: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         let stmt = parse_single_select(sql)?;
+        let statement_snapshot = capture_general_select_statement_snapshot(self, &stmt)?;
+        let _statement_scope =
+            statement_snapshot.map(|snapshot| self.enter_transaction_read(snapshot));
+        after_snapshot();
         if select_has_inline_window(&stmt)? {
             return self.execute_gpu_rank_window_select(&stmt);
+        }
+        if let Some(result) = self.execute_empty_catalog_select_if_applicable(&stmt)? {
+            return Ok(result);
         }
         // A JOIN in the FROM clause routes to the dedicated 2-relation inner-equi-join path (M5). The
         // single-table path below is byte-identical for a non-join query.
         if from_clause_is_join(&stmt) {
-            let plan = build_join_plan(&stmt)?;
+            // Route selection and relation binding share one exact catalog boundary. The presentation
+            // extension is catalog-only; a user join keeps its original lowering error instead of
+            // being reinterpreted by compatibility metadata rules.
+            let s = self.read_snapshot_boundary();
+            let catalog = self.read_catalog_as_of(s);
+            let (plan, presentation) = match build_join_plan(&stmt) {
+                Ok(plan) => (plan, None),
+                Err(error) => {
+                    if !select_tree_uses_synthesized_catalog(&stmt, &catalog) {
+                        return Err(error);
+                    }
+                    let projection = catalog_join_projection_plan(&stmt)?;
+                    let plan = build_join_plan_with_projection(
+                        &stmt,
+                        projection.projection,
+                        projection.aliases,
+                        projection.order_by,
+                        projection.order_by_nulls_first,
+                    )?;
+                    (plan, Some(projection.presentation))
+                }
+            };
             // Bind BOTH relations at ONE catalog generation (so the WHERE mapping + the join read the
             // same generation), then map the per-relation WHERE conjuncts (each conjunct must reference
             // exactly one relation; a cross-relation conjunct is a follow-up).
-            let s = self.committed_seq();
-            let catalog = self.read_state.catalog_as_of(s);
             // Resolve each join relation to its catalog table + (for a synthesized catalog relation) its
             // host rows. A real user relation is resolved FIRST (so it shadows a catalog name, mirroring
             // the single-relation path) and takes the resident join path (rows = None). A
             // `pg_catalog`/`information_schema` relation has no residency snapshot, so it is SYNTHESIZED
             // here (M5 J5) and its rows are threaded to the executor, which uploads a TRANSIENT device
             // payload and runs the SAME GPU hash join -- no CPU relational join (charter).
-            #[allow(clippy::type_complexity)] // (catalog table, synthesized rows) | resident table
-            let bind = |name: &str| -> Result<(RelationalTable, Option<Vec<Vec<SqlValue>>>), ExecuteError> {
-                if let Some(table) = catalog.relational_catalog.get(name).cloned() {
-                    Ok((table, None))
-                } else if let Some((table, rows)) = synthesize_catalog_relation(name, &catalog) {
-                    Ok((table, Some(rows)))
-                } else {
-                    Err(sql_pg_error(format!("relation \"{name}\" does not exist")))
+            let bind = |relation: &JoinRelationRef| -> Result<BoundJoinRelation, ExecuteError> {
+                let (mut table, mut rows) = bind_join_relation(relation, &catalog)?;
+                if presentation.is_some() {
+                    if let Some(rows) = rows.as_mut() {
+                        add_gpu_catalog_presentation_columns(&mut table, rows, &catalog)?;
+                    }
                 }
+                Ok((table, rows))
             };
             let mut tables: Vec<RelationalTable> = Vec::with_capacity(plan.relations.len());
             let mut rows: Vec<Option<Vec<Vec<SqlValue>>>> =
                 Vec::with_capacity(plan.relations.len());
             for relation in &plan.relations {
-                let (table, relation_rows) = bind(&relation.table)?;
+                let (table, relation_rows) = bind(relation)?;
                 tables.push(table);
                 rows.push(relation_rows);
             }
             let aliases: Vec<&str> = plan.relations.iter().map(|r| r.alias.as_str()).collect();
             let predicates = match stmt.where_clause.as_deref() {
-                Some(where_node) => split_join_where(where_node, &tables, &aliases)?,
+                Some(where_node) => split_join_where(where_node, &tables, &aliases, &catalog)?,
                 None => (0..plan.relations.len()).map(|_| None).collect(),
             };
             if rows.iter().all(Option::is_none) {
                 if let Some(result) = self.try_streaming_inner_join(&plan, &tables, &predicates, s)
                 {
-                    return result;
+                    return result.and_then(|result| match &presentation {
+                        Some(presentation) => {
+                            apply_catalog_projection_metadata(result, presentation)
+                        }
+                        None => Ok(result),
+                    });
                 }
             }
-            return self.execute_resident_expr_inner_join(
+            let result = self.execute_resident_expr_inner_join(
                 &plan, tables, rows, predicates, s, None, None, false,
-            );
+            )?;
+            return match &presentation {
+                Some(presentation) => apply_catalog_projection_metadata(result, presentation),
+                None => Ok(result),
+            };
         }
         // A comma join (`FROM a, b[, c] WHERE a.k = b.k ...`) is an INNER join whose conditions live in
         // the WHERE: bind the relations, then derive the left-deep steps + per-relation filters from the
         // WHERE (the same `JoinStep`/executor as an explicit JOIN, incl. composite 2-edge keys).
-        if let Some(relations) = comma_join_relations(&stmt) {
+        if let Some(relations) = comma_join_relations(&stmt)? {
             reject_unsupported_join_clauses(&stmt)?;
             let (projection, projection_aliases) = parse_join_projection(&stmt)?;
-            let s = self.committed_seq();
-            let catalog = self.read_state.catalog_as_of(s);
-            #[allow(clippy::type_complexity)] // (catalog table, synthesized rows) | resident table
-            let bind = |name: &str| -> Result<(RelationalTable, Option<Vec<Vec<SqlValue>>>), ExecuteError> {
-                if let Some(table) = catalog.relational_catalog.get(name).cloned() {
-                    Ok((table, None))
-                } else if let Some((table, rows)) = synthesize_catalog_relation(name, &catalog) {
-                    Ok((table, Some(rows)))
-                } else {
-                    Err(sql_pg_error(format!("relation \"{name}\" does not exist")))
-                }
+            let s = self.read_snapshot_boundary();
+            let catalog = self.read_catalog_as_of(s);
+            let bind = |relation: &JoinRelationRef| -> Result<BoundJoinRelation, ExecuteError> {
+                bind_join_relation(relation, &catalog)
             };
             let mut tables: Vec<RelationalTable> = Vec::with_capacity(relations.len());
             let mut rows: Vec<Option<Vec<Vec<SqlValue>>>> = Vec::with_capacity(relations.len());
             for relation in &relations {
-                let (table, relation_rows) = bind(&relation.table)?;
+                let (table, relation_rows) = bind(relation)?;
                 tables.push(table);
                 rows.push(relation_rows);
             }
             let aliases: Vec<&str> = relations.iter().map(|r| r.alias.as_str()).collect();
-            let (steps, predicates) =
-                plan_comma_join_where(stmt.where_clause.as_deref(), &relations, &tables, &aliases)?;
+            let (steps, predicates) = plan_comma_join_where(
+                stmt.where_clause.as_deref(),
+                &relations,
+                &tables,
+                &aliases,
+                &catalog,
+            )?;
             let (order_by, order_by_nulls_first, limit, offset) = parse_join_order_by_limit(&stmt)?;
             let plan = JoinPlan {
                 relations,
@@ -180,14 +260,90 @@ impl Engine {
                 &plan, tables, rows, predicates, s, None, None, false,
             );
         }
-        let (select, qualifier) = build_select_from_select_stmt(&stmt)?;
+        // The presentation fallback is classified against the same catalog generation used to bind
+        // the relation. It can never reinterpret an unsupported user-table SELECT.
+        let copin_s = self.read_snapshot_boundary();
+        let catalog = self.read_catalog_as_of(copin_s);
+        let (select, qualifier, presentation, presentation_requires_columns) =
+            match build_select_from_select_stmt(&stmt) {
+                Ok((select, qualifier)) => {
+                    let presentation = scalar_aggregate_alias_presentation(&stmt, &select)?;
+                    (select, qualifier, presentation, false)
+                }
+                Err(error) => {
+                    if !select_tree_uses_synthesized_catalog(&stmt, &catalog) {
+                        return Err(error);
+                    }
+                    let plan = catalog_single_projection_plan(&stmt)?;
+                    (plan.select, plan.qualifier, Some(plan.presentation), true)
+                }
+            };
         // Bind once; map the predicate (if any) against that SAME bound table; execute against that
         // binding. No WHERE clause is a full-table scan (the executor takes `None` for the predicate).
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(&select)?;
+        // A synthesized one-relation catalog query needs the same injected transient device source as
+        // catalog joins. User relations still resolve first, preserving the established shadowing rule.
+        let synthesized_catalog_allowed = stmt.from_clause.as_slice().first().is_some_and(|from| {
+            matches!(
+                from.node.as_ref(),
+                Some(NodeEnum::RangeVar(range)) if range.schemaname != "public"
+            )
+        });
+        let has_range_column_alias_list = stmt
+            .from_clause
+            .first()
+            .is_some_and(from_node_has_column_alias_list);
+        let (table, bound, transient_rows) = if synthesized_catalog_allowed
+            && !public_relation_name_exists(&catalog, &select.table)
+        {
+            if let Some((mut table, mut rows)) =
+                synthesize_catalog_relation(&select.table, &catalog)
+            {
+                let exposed_width = table.columns.len();
+                if presentation_requires_columns {
+                    add_gpu_catalog_presentation_columns(&mut table, &mut rows, &catalog)?;
+                }
+                let range = match stmt.from_clause.as_slice() {
+                    [from] => match node_enum(from)? {
+                        NodeEnum::RangeVar(range) => range,
+                        _ => {
+                            return Err(sql_pg_error(
+                                "catalog single-relation binding lost its RangeVar".to_string(),
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(sql_pg_error(
+                            "catalog single-relation binding requires one RangeVar".to_string(),
+                        ))
+                    }
+                };
+                apply_catalog_range_column_aliases(&mut table, range, exposed_width)?;
+                let bound = bind_relational_select(&table, &select)?;
+                (table, bound, Some(rows))
+            } else {
+                if has_range_column_alias_list {
+                    return Err(sql_pg_error(
+                        "relation column-alias lists are not supported for resident user relations"
+                            .to_string(),
+                    ));
+                }
+                let (table, bound, _) = self.bind_relational_select_at(&select, copin_s)?;
+                (table, bound, None)
+            }
+        } else {
+            if has_range_column_alias_list {
+                return Err(sql_pg_error(
+                    "relation column-alias lists are not supported for resident user relations"
+                        .to_string(),
+                ));
+            }
+            let (table, bound, _) = self.bind_relational_select_at(&select, copin_s)?;
+            (table, bound, None)
+        };
         let predicate = stmt
             .where_clause
             .as_deref()
-            .map(|where_node| map_predicate_node(where_node, &table, &qualifier))
+            .map(|where_node| map_predicate_node(where_node, &table, &qualifier, &catalog))
             .transpose()?;
         // Build the ORDER BY sort-expression list parallel to `select.order_by`: a bare ColumnRef ->
         // None (a plain column key); any other expression (`a+b`, `a*2`) -> a `ResidentExpr` via the
@@ -199,7 +355,11 @@ impl Engine {
         // than on SelectOrder so the legacy protocol crate's SelectOrder is untouched (charter).
         let mut order_by_nulls_first: Vec<Option<bool>> =
             Vec::with_capacity(stmt.sort_clause.len());
-        for item in &stmt.sort_clause {
+        for item in stmt.sort_clause.iter().take(if select.order_by.is_empty() {
+            0
+        } else {
+            stmt.sort_clause.len()
+        }) {
             let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
                 return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
             };
@@ -210,7 +370,9 @@ impl Engine {
             if result_column_name(node, &qualifier).is_ok() {
                 order_by_exprs.push(None);
             } else {
-                order_by_exprs.push(Some(map_predicate_node(node, &table, &qualifier)?));
+                order_by_exprs.push(Some(map_predicate_node(
+                    node, &table, &qualifier, &catalog,
+                )?));
             }
             order_by_nulls_first.push(
                 if sort_by.sortby_nulls == SortByNulls::SortbyNullsFirst as i32 {
@@ -230,7 +392,7 @@ impl Engine {
                 if matches!(node_enum(node)?, NodeEnum::ColumnRef(_)) {
                     None
                 } else {
-                    Some(map_predicate_node(node, &table, &qualifier)?)
+                    Some(map_predicate_node(node, &table, &qualifier, &catalog)?)
                 }
             }
             None => None,
@@ -247,10 +409,21 @@ impl Engine {
         // A SHARD-resident table resolves to the unified exec source (visibility included) INSIDE
         // `execute_resident_expr_select_with_binding` — the one resolution point for every `src: None`
         // caller (THE FLIP). The whole-table single-store path carries no version columns.
-        self.execute_resident_expr_select_with_binding(
+        let transient_source = transient_rows
+            .map(|rows| {
+                let row_count = rows.len() as u64;
+                let (snapshot, memory) = self.build_transient_relation_residency(&table, &rows)?;
+                Ok::<ResidentExecSource, ExecuteError>(ResidentExecSource {
+                    descriptor: Arc::new(snapshot),
+                    device_memory: Arc::new(memory),
+                    row_count,
+                })
+            })
+            .transpose()?;
+        let result = self.execute_resident_expr_select_with_binding(
             &select,
             &table,
-            None,
+            transient_source.as_ref(),
             bound,
             copin_s,
             predicate.as_ref(),
@@ -259,7 +432,11 @@ impl Engine {
             &order_by_nulls_first,
             group_key_expr.as_ref(),
             &group_key_columns,
-        )
+        )?;
+        match &presentation {
+            Some(presentation) => apply_catalog_projection_metadata(result, presentation),
+            None => Ok(result),
+        }
     }
 
     fn execute_gpu_rank_window_select(
@@ -292,11 +469,7 @@ impl Engine {
                 "the GPU rank-window path supports one base relation".to_string(),
             ));
         };
-        let NodeEnum::RangeVar(range) = node_enum(from)? else {
-            return Err(sql_pg_error(
-                "the GPU rank-window path supports one base relation".to_string(),
-            ));
-        };
+        let (table_name, qualifier) = rank_window_relation_binding(from)?;
         if !stmt.group_clause.is_empty()
             || stmt.having_clause.is_some()
             || !stmt.distinct_clause.is_empty()
@@ -307,16 +480,9 @@ impl Engine {
                     .to_string(),
             ));
         }
-        let table_name = range.relname.clone();
-        let qualifier = range
-            .alias
-            .as_ref()
-            .map(|alias| alias.aliasname.clone())
-            .unwrap_or_else(|| table_name.clone());
-        let statement_copin_s = self.committed_seq();
-        let table = self
-            .read_state
-            .catalog_as_of(statement_copin_s)
+        let statement_copin_s = self.read_snapshot_boundary();
+        let catalog = self.read_catalog_as_of(statement_copin_s);
+        let table = catalog
             .relational_catalog
             .get(&table_name)
             .cloned()
@@ -324,7 +490,7 @@ impl Engine {
         let input_predicate = stmt
             .where_clause
             .as_deref()
-            .map(|node| map_predicate_node(node, &table, &qualifier))
+            .map(|node| map_predicate_node(node, &table, &qualifier, &catalog))
             .transpose()?;
         let mut targets = Vec::with_capacity(stmt.target_list.len());
         let mut projected = Vec::<String>::new();
@@ -586,13 +752,16 @@ impl Engine {
         // A resident input that nearly fills the configured budget leaves no room for the rank
         // mask/coordinate/sort/window allocations. Move it through the bounded STRATA repair
         // bridge before choosing the route so input plus scratch—not input alone—defines fit.
-        if let Some(budget) = self.relational_residency_budget_bytes(self.planner.default_gpu_id())
-        {
-            self.transition_device_table_to_streaming_repair_above(
-                &table_name,
-                (budget / 2).max(1),
-            )
-            .map_err(ExecuteError::Engine)?;
+        if self.current_transaction_read_snapshot().is_none() {
+            if let Some(budget) =
+                self.relational_residency_budget_bytes(self.planner.default_gpu_id())
+            {
+                self.transition_device_table_to_streaming_repair_above(
+                    &table_name,
+                    (budget / 2).max(1),
+                )
+                .map_err(ExecuteError::Engine)?;
+            }
         }
         if self.table_is_gpu_resident(&table_name) {
             return self.execute_gpu_rank_window_device_resident(

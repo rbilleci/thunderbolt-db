@@ -390,6 +390,7 @@ fn parses_bounded_materialized_view_lifecycle() {
             name: "mv_people".to_string(),
             query: Select {
                 table: "people".to_string(),
+                public_only: false,
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string(),]),
                 group_by: None,
@@ -415,6 +416,7 @@ fn parses_bounded_materialized_view_lifecycle() {
             name: "mv_people".to_string(),
             query: Select {
                 table: "people".to_string(),
+                public_only: false,
                 distinct: false,
                 projection: SelectProjection::All,
                 group_by: None,

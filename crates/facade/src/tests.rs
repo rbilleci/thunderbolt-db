@@ -158,13 +158,28 @@ fn batched_submission_rejects_a_batcher_from_another_engine_pre_effect() {
     assert!(error.message.contains("different SharedEngine"));
     assert_eq!(first.next_txn_id.load(Ordering::Relaxed), txn_before);
 
+    let rich = first
+        .submit(
+            &mut session,
+            SubmissionRequest::BatchedText {
+                sql: "SELECT c.oid FROM pg_catalog.pg_class c \
+                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+                batcher: &batcher,
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(rich.category, ErrorCategory::InvalidRequest);
+    assert!(rich.message.contains("different SharedEngine"));
+    assert_eq!(first.next_txn_id.load(Ordering::Relaxed), txn_before);
+
     submit_session_text(&first, &mut session, "BEGIN").unwrap();
     assert!(submit_session_text(&first, &mut session, "SELEC broken").is_err());
     assert_eq!(
         session.transaction_status(),
         SessionTransactionStatus::FailedTransaction
     );
-    let rollback = first
+    let foreign_rollback = first
         .submit(
             &mut session,
             SubmissionRequest::BatchedText {
@@ -173,7 +188,13 @@ fn batched_submission_rejects_a_batcher_from_another_engine_pre_effect() {
             },
         )
         .into_immediate()
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(foreign_rollback.category, ErrorCategory::InvalidRequest);
+    assert_eq!(
+        session.transaction_status(),
+        SessionTransactionStatus::FailedTransaction
+    );
+    let rollback = submit_session_text(&first, &mut session, "ROLLBACK").unwrap();
     assert_eq!(
         rollback,
         QueryOutcome::Command {
@@ -926,6 +947,349 @@ fn shared_active_transaction_publishes_create_table_only_at_commit() {
         submit_ephemeral_text(&shared, "SELECT id FROM must_not_autocommit").unwrap()
     else {
         panic!("committed relation must be queryable");
+    };
+    assert!(rows.is_empty());
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn general_gpu_catalog_select_retains_transaction_snapshot_and_failed_state() {
+    let shared = SharedEngine::new();
+    let mut creator = shared.open_session();
+    submit_session_text(&shared, &mut creator, "BEGIN").unwrap();
+    submit_session_text(
+        &shared,
+        &mut creator,
+        "CREATE TABLE private_catalog_join_target (id INT)",
+    )
+    .unwrap();
+    let lookup = "SELECT c.relname, n.nspname \
+                  FROM pg_catalog.pg_class c \
+                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE c.relname = 'private_catalog_join_target'";
+    let QueryOutcome::Rows { rows, .. } =
+        submit_session_text(&shared, &mut creator, lookup).unwrap()
+    else {
+        panic!("transactional catalog lookup must return rows");
+    };
+    assert_eq!(
+        rows,
+        vec![vec![
+            DbValue::Text("private_catalog_join_target".to_string()),
+            DbValue::Text("public".to_string()),
+        ]]
+    );
+
+    let hidden = submit_ephemeral_text(&shared, lookup).unwrap();
+    let QueryOutcome::Rows { rows, .. } = hidden else {
+        panic!("observer catalog lookup must return a row set");
+    };
+    assert!(
+        rows.is_empty(),
+        "private catalog state escaped its transaction"
+    );
+
+    let error = submit_session_text(
+        &shared,
+        &mut creator,
+        "SELECT pg_catalog.pg_get_userbyid(c.oid + 1) \
+         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
+         ON n.oid = c.relnamespace",
+    )
+    .unwrap_err();
+    assert_ne!(error.category, ErrorCategory::InFailedTransaction);
+    assert_eq!(
+        creator.transaction_status(),
+        SessionTransactionStatus::FailedTransaction
+    );
+    let blocked = submit_session_text(&shared, &mut creator, lookup).unwrap_err();
+    assert_eq!(blocked.category, ErrorCategory::InFailedTransaction);
+    submit_session_text(&shared, &mut creator, "ROLLBACK").unwrap();
+
+    submit_session_text(
+        &shared,
+        &mut creator,
+        "CREATE TABLE pg_type (oid INT PRIMARY KEY)",
+    )
+    .unwrap();
+    submit_session_text(&shared, &mut creator, "INSERT INTO pg_type VALUES (9001)").unwrap();
+    let public_prepared = shared
+        .prepare_statement(&creator, "SELECT oid FROM public.pg_type ORDER BY oid", &[])
+        .unwrap();
+    let public_bound = public_prepared.bind_values(&[]).unwrap();
+    let QueryOutcome::Rows { rows, .. } = shared
+        .submit(&mut creator, SubmissionRequest::Prepared(&public_bound))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("explicit public prepared lookup must produce user rows");
+    };
+    assert_eq!(rows, vec![vec![DbValue::Int4(9001)]]);
+
+    let prepared = shared
+        .prepare_statement(
+            &creator,
+            "SELECT oid, * FROM pg_catalog.pg_type WHERE typname = $1",
+            &[Some(LogicalType::Text)],
+        )
+        .unwrap();
+    let bound = prepared
+        .bind_values(&[DbValue::Text("int4".to_string())])
+        .unwrap();
+    let QueryOutcome::Rows { columns, rows } = shared
+        .submit(&mut creator, SubmissionRequest::Prepared(&bound))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("bound catalog AST must produce rows");
+    };
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["oid", "oid", "typname", "typlen", "typtype", "typnamespace"]
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], rows[0][1]);
+    assert_eq!(rows[0][2], DbValue::Text("int4".to_string()));
+}
+
+#[test]
+fn prepared_public_catalog_lookalike_fails_closed_and_survives_drop_aba() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    let sql = "SELECT oid FROM public.pg_type ORDER BY oid";
+    let missing = shared
+        .prepare_statement(&session, sql, &[])
+        .expect_err("missing explicit public relation must fail during Parse/Describe");
+    assert!(missing.message.contains("public.pg_type"), "{missing:?}");
+
+    submit_session_text(&shared, &mut session, "CREATE TABLE pg_type (oid INT)").unwrap();
+    let prepared = shared.prepare_statement(&session, sql, &[]).unwrap();
+    let bound = prepared.bind_values(&[]).unwrap();
+    submit_session_text(&shared, &mut session, "DROP TABLE pg_type").unwrap();
+    let dropped = shared
+        .submit(&mut session, SubmissionRequest::Prepared(&bound))
+        .into_immediate()
+        .expect_err("drop must not rebind public.pg_type to pg_catalog.pg_type");
+    assert!(dropped.message.contains("public.pg_type"), "{dropped:?}");
+}
+
+#[test]
+fn catalog_lookup_fails_closed_for_user_aliases_and_non_table_public_shadows() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE catalog_shadow_source (oid INT)",
+    )
+    .unwrap();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "INSERT INTO catalog_shadow_source VALUES (4242)",
+    )
+    .unwrap();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE VIEW pg_class AS SELECT oid FROM catalog_shadow_source",
+    )
+    .unwrap();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE VIEW pg_namespace AS SELECT oid FROM catalog_shadow_source",
+    )
+    .unwrap();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE MATERIALIZED VIEW pg_type AS SELECT oid FROM catalog_shadow_source WITH NO DATA",
+    )
+    .unwrap();
+    submit_session_text(&shared, &mut session, "CREATE SEQUENCE pg_policy").unwrap();
+    for index in ["pg_attribute", "pg_trigger", "pg_am"] {
+        submit_session_text(
+            &shared,
+            &mut session,
+            &format!("CREATE INDEX {index} ON catalog_shadow_source (oid)"),
+        )
+        .unwrap();
+    }
+
+    let alias_error = submit_session_text(
+        &shared,
+        &mut session,
+        "SELECT oid FROM catalog_shadow_source AS s(alias_oid) WHERE oid + 0 > 0",
+    )
+    .expect_err("resident user alias lists must reject before exposing hidden names");
+    assert!(
+        alias_error.message.contains("column-alias"),
+        "{alias_error:?}"
+    );
+
+    for sql in [
+        "SELECT oid FROM pg_class WHERE oid + 0 > 0",
+        "SELECT attrelid FROM pg_attribute WHERE attrelid + 0 > 0",
+        "SELECT oid FROM pg_policy",
+        "SELECT oid FROM pg_trigger",
+        "SELECT c.oid, n.oid FROM pg_catalog.pg_class c JOIN pg_namespace n \
+         ON c.relnamespace = n.oid",
+        "SELECT c.oid, a.oid FROM pg_catalog.pg_class c JOIN pg_am a ON c.relam = a.oid",
+    ] {
+        submit_session_text(&shared, &mut session, sql)
+            .expect_err("a bare public relation or index owner must block catalog synthesis");
+    }
+
+    for sql in [
+        "SELECT oid FROM pg_class",
+        "SELECT oid FROM pg_type",
+        "SELECT oid FROM pg_policy",
+        "SELECT oid FROM pg_attribute",
+        "SELECT oid FROM pg_trigger",
+    ] {
+        shared.prepare_statement(&session, sql, &[]).expect_err(
+            "prepared Describe must not synthesize behind a public relation or index owner",
+        );
+    }
+
+    let QueryOutcome::Rows { rows, .. } =
+        submit_session_text(&shared, &mut session, "SELECT * FROM public.pg_class").unwrap()
+    else {
+        panic!("explicit public view lookup must return rows");
+    };
+    assert_eq!(rows, vec![vec![DbValue::Int4(4242)]]);
+
+    let QueryOutcome::Rows { rows, .. } = submit_session_text(
+        &shared,
+        &mut session,
+        "SELECT oid FROM pg_catalog.pg_type WHERE oid + 0 > 0 ORDER BY oid LIMIT 1",
+    )
+    .unwrap() else {
+        panic!("explicit system lookup must remain catalog-bound");
+    };
+    assert_eq!(rows, vec![vec![DbValue::Int4(16)]]);
+}
+
+#[test]
+fn typed_catalog_selects_cannot_bypass_general_aggregate_binding() {
+    let shared = Arc::new(SharedEngine::new());
+    let sql = "SELECT count(*) FROM pg_catalog.pg_policy ORDER BY oid";
+    let error = submit_ephemeral_text(&shared, sql)
+        .expect_err("invalid catalog aggregate must fail at the general binder");
+    assert!(!error.message.contains("GPU execution is required"));
+
+    let batcher = PointLookupBatcher::with_triggers(
+        Arc::clone(&shared),
+        8,
+        std::time::Duration::from_secs(1),
+    );
+    let mut session = shared.open_session();
+    let sql = "SELECT 'not-an-integer'::int4 FROM pg_catalog.pg_policy";
+    let error = shared
+        .submit(
+            &mut session,
+            SubmissionRequest::BatchedText {
+                sql,
+                batcher: &batcher,
+            },
+        )
+        .into_immediate()
+        .expect_err("canonical batched text must retain catalog binding");
+    assert!(
+        !error.message.contains("GPU execution is required"),
+        "`{sql}` escaped binding and reached device execution: {error:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn gpu_rich_batched_catalog_fallback_checks_engine_owner_before_dispatch() {
+    let shared = Arc::new(SharedEngine::new());
+    let mut session = shared.open_session();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE rich_batch_catalog_control (id INT)",
+    )
+    .unwrap();
+    let local = PointLookupBatcher::with_triggers(
+        Arc::clone(&shared),
+        8,
+        std::time::Duration::from_secs(1),
+    );
+    let sql = "SELECT c.relname, n.nspname FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+               WHERE c.relname = 'rich_batch_catalog_control'";
+    let QueryOutcome::Rows { rows, .. } = shared
+        .submit(
+            &mut session,
+            SubmissionRequest::BatchedText {
+                sql,
+                batcher: &local,
+            },
+        )
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("owned rich catalog fallback must produce rows");
+    };
+    assert_eq!(
+        rows,
+        vec![vec![
+            DbValue::Text("rich_batch_catalog_control".to_string()),
+            DbValue::Text("public".to_string()),
+        ]]
+    );
+
+    let other = Arc::new(SharedEngine::new());
+    let foreign = PointLookupBatcher::with_triggers(other, 8, std::time::Duration::from_secs(1));
+    let error = shared
+        .submit(
+            &mut session,
+            SubmissionRequest::BatchedText {
+                sql,
+                batcher: &foreign,
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::InvalidRequest);
+    assert!(error.message.contains("different SharedEngine"));
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn facade_gpu_catalog_aggregate_alias_and_grouping_share_general_binding() {
+    let shared = SharedEngine::new();
+    for sql in [
+        "SELECT table_name FROM information_schema.tables ORDER BY table_name",
+        "SELECT column_name FROM information_schema.columns ORDER BY column_name",
+    ] {
+        let QueryOutcome::Rows { rows, .. } = submit_ephemeral_text(&shared, sql).unwrap() else {
+            panic!("empty information_schema query must return rows");
+        };
+        assert!(rows.is_empty(), "{sql}");
+    }
+    let QueryOutcome::Rows { columns, rows } = submit_ephemeral_text(
+        &shared,
+        "SELECT count(*) AS oid FROM pg_catalog.pg_policy ORDER BY oid",
+    )
+    .expect("a scalar aggregate may order by its output alias") else {
+        panic!("catalog aggregate must return rows");
+    };
+    assert_eq!(columns[0].name, "oid");
+    assert_eq!(rows, vec![vec![DbValue::Int8(0)]]);
+
+    let QueryOutcome::Rows { rows, .. } = submit_ephemeral_text(
+        &shared,
+        "SELECT oid, count(*) FROM pg_catalog.pg_policy GROUP BY oid",
+    )
+    .expect("a valid grouped empty catalog query must not enter the typed aggregate path") else {
+        panic!("grouped catalog query must return rows");
     };
     assert!(rows.is_empty());
 }

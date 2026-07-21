@@ -11,6 +11,7 @@ fn parses_relational_count_aggregates() {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::GroupedCount {
                 column: "name".to_string(),
@@ -56,6 +57,7 @@ fn parses_relational_count_aggregates() {
         parse_command("SELECT COUNT(*) FROM people").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::CountAll,
             group_by: None,
@@ -84,6 +86,7 @@ fn parses_relational_having_aggregates() {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::GroupedSum {
                 group_column: "name".to_string(),
@@ -124,6 +127,7 @@ fn parses_relational_sum_aggregates() {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::GroupedSum {
                 group_column: "name".to_string(),
@@ -159,6 +163,7 @@ fn parses_relational_sum_aggregates() {
         parse_command("SELECT SUM(id) FROM people").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Sum {
                 column: "id".to_string(),
@@ -189,6 +194,7 @@ fn parses_relational_avg_aggregates() {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::GroupedAvg {
                 group_column: "name".to_string(),
@@ -224,6 +230,7 @@ fn parses_relational_avg_aggregates() {
         parse_command("SELECT AVG(id) FROM people").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Avg {
                 column: "id".to_string(),
@@ -258,6 +265,7 @@ fn parses_relational_min_max_aggregates() {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::GroupedMin {
                 group_column: "name".to_string(),
@@ -293,6 +301,7 @@ fn parses_relational_min_max_aggregates() {
         parse_command("SELECT MAX(name) FROM people").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Max {
                 column: "name".to_string(),

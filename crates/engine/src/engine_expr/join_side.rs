@@ -27,14 +27,9 @@ impl Engine {
                 // recompacted (or zero-copy single-shard) buffer. A VERSIONED sharded relation
                 // clean-errors: the join kernels do not thread the visibility conjuncts (never a
                 // tombstone leak). No host rows ride the entry — the join is GPU-only (charter).
+                let shards = self.read_residency_shards();
                 if self.relational_residency_entry(name).is_none()
-                    && self
-                        .read_state
-                        .residency
-                        .shards
-                        .load()
-                        .get(name)
-                        .is_some_and(|shards| !shards.is_empty())
+                    && shards.get(name).is_some_and(|shards| !shards.is_empty())
                 {
                     let unified = self.build_sharded_unified_exec_source(table, None, copin_s)?;
                     let row_count = unified.src.descriptor.row_count;
@@ -57,16 +52,11 @@ impl Engine {
                     ))));
                 }
                 let row_count = entry.descriptor.row_count;
-                let memory = self
-                    .read_state
-                    .residency
-                    .device_memory
-                    .get(name)
-                    .ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "relation \"{name}\" has no retained resident device memory"
-                        )))
-                    })?;
+                let memory = entry.device_memory.clone().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{name}\" has no retained resident device memory"
+                    )))
+                })?;
                 Ok((entry, JoinDeviceMemory::Resident(memory), row_count, None))
             }
             Some(rows) => {

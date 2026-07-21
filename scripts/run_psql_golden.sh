@@ -16,6 +16,8 @@ WAIT_TIMEOUT_SEC="${PSQL_GOLDEN_WAIT_TIMEOUT_SEC:-30}"
 BOOT_LOG="$OUT_DIR/boot.log"
 REPORT_PATH="${PSQL_GOLDEN_REPORT:-$ROOT_DIR/target/compat/psql-golden-report.json}"
 REPORT_ROWS="$OUT_DIR/report.rows.tsv"
+SCENARIO_SELECTION="${PSQL_GOLDEN_SCENARIOS:-}"
+RESTART_EACH_SCENARIO="${PSQL_GOLDEN_RESTART_EACH_SCENARIO:-0}"
 boot_pid=""
 suite_status="passed"
 suite_error=""
@@ -94,8 +96,36 @@ normalize() {
     -e '/^Time: [0-9.]+ ms$/d' \
     -e '/^SSL connection \(.+\)$/d' \
     -e '/^psql \([0-9.]+\).*$/d' \
+    -e 's/^([[:space:]]*) List of tables$/\1List of relations/' \
     | perl -pe 's/[ \t\r]+$//' \
     | awk '{ lines[NR] = $0 } END { end = NR; while (end > 0 && lines[end] == "") end--; for (i = 1; i <= end; i++) print lines[i] }'
+}
+
+stop_booted_endpoint() {
+  if [ -n "$STOP_CMD" ]; then
+    bash -lc "$STOP_CMD" >>"$BOOT_LOG" 2>&1 || true
+  fi
+  if [ -n "$boot_pid" ] && kill -0 "$boot_pid" 2>/dev/null; then
+    kill "$boot_pid" 2>/dev/null || true
+    wait "$boot_pid" 2>/dev/null || true
+  fi
+  boot_pid=""
+}
+
+start_booted_endpoint() {
+  if [ -z "$BOOT_CMD" ]; then
+    return
+  fi
+  (
+    cd "$BOOT_CWD"
+    exec bash -lc "$BOOT_CMD"
+  ) >>"$BOOT_LOG" 2>&1 &
+  boot_pid=$!
+  if ! wait_for_endpoint; then
+    suite_status="failed"
+    suite_error="timed out waiting for booted compatibility endpoint"
+    return 1
+  fi
 }
 
 wait_for_endpoint() {
@@ -136,33 +166,39 @@ cleanup() {
     suite_status="failed"
   fi
   write_report "$REPORT_PATH" "$suite_status" "$suite_error"
-  if [ -n "$STOP_CMD" ]; then
-    bash -lc "$STOP_CMD" >>"$BOOT_LOG" 2>&1 || true
-  fi
-  if [ -n "$boot_pid" ] && kill -0 "$boot_pid" 2>/dev/null; then
-    kill "$boot_pid" 2>/dev/null || true
-    wait "$boot_pid" 2>/dev/null || true
-  fi
+  stop_booted_endpoint
   exit "$rc"
 }
 trap cleanup EXIT
 
 if [ -n "$BOOT_CMD" ]; then
   : >"$BOOT_LOG"
-  (
-    cd "$BOOT_CWD"
-    exec bash -lc "$BOOT_CMD"
-  ) >>"$BOOT_LOG" 2>&1 &
-  boot_pid=$!
-  if ! wait_for_endpoint; then
-    suite_status="failed"
-    suite_error="timed out waiting for booted compatibility endpoint"
-    exit 1
+  if [ "$RESTART_EACH_SCENARIO" != "1" ]; then
+    start_booted_endpoint || exit 1
   fi
 fi
 
+scenarios=()
+if [ -n "$SCENARIO_SELECTION" ]; then
+  IFS=',' read -r -a selected_names <<<"$SCENARIO_SELECTION"
+  for name in "${selected_names[@]}"; do
+    if ! [[ "$name" =~ ^[A-Za-z0-9_]+$ ]] || [ ! -f "$SCENARIOS_DIR/$name.sql" ]; then
+      suite_status="failed"
+      suite_error="invalid or missing selected psql scenario: $name"
+      echo "error: $suite_error" >&2
+      exit 2
+    fi
+    scenarios+=("$SCENARIOS_DIR/$name.sql")
+  done
+else
+  scenarios=("$SCENARIOS_DIR"/*.sql)
+fi
+
 status=0
-for scenario in "$SCENARIOS_DIR"/*.sql; do
+for scenario in "${scenarios[@]}"; do
+  if [ "$RESTART_EACH_SCENARIO" = "1" ]; then
+    start_booted_endpoint || exit 1
+  fi
   name=$(basename "$scenario" .sql)
   expected="$EXPECTED_DIR/$name.txt"
   expected_rc_file="$EXPECTED_DIR/$name.rc"
@@ -170,6 +206,9 @@ for scenario in "$SCENARIOS_DIR"/*.sql; do
   if [ ! -f "$expected" ]; then
     echo "error: missing expected artifact for scenario '$name': $expected" >&2
     status=1
+    if [ "$RESTART_EACH_SCENARIO" = "1" ]; then
+      stop_booted_endpoint
+    fi
     continue
   fi
 
@@ -179,6 +218,9 @@ for scenario in "$SCENARIOS_DIR"/*.sql; do
     if ! [[ "$expected_rc" =~ ^[0-9]+$ ]]; then
       echo "error: invalid expected rc for scenario '$name': $expected_rc_file" >&2
       status=1
+      if [ "$RESTART_EACH_SCENARIO" = "1" ]; then
+        stop_booted_endpoint
+      fi
       continue
     fi
   fi
@@ -216,6 +258,9 @@ for scenario in "$SCENARIOS_DIR"/*.sql; do
   else
     printf '%s\t%s\t%s\t%s\n' "$name" "passed" "$expected_rc" "$rc" >>"$REPORT_ROWS"
     echo "scenario '$name' ok (psql exit=$rc)"
+  fi
+  if [ "$RESTART_EACH_SCENARIO" = "1" ]; then
+    stop_booted_endpoint
   fi
 done
 

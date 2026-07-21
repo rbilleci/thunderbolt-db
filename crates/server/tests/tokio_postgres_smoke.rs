@@ -178,6 +178,30 @@ async fn canonical_server_tokio_postgres_copy_and_recovery_smoke(
     let empty_rows = client.query(&statement, &[&99_i32]).await?;
     assert!(empty_rows.is_empty());
 
+    let missing_public = client
+        .prepare("SELECT oid FROM public.pg_type ORDER BY oid")
+        .await
+        .expect_err("explicit public lookup must not synthesize pg_catalog.pg_type");
+    assert_eq!(missing_public.code().map(|code| code.code()), Some("42P01"));
+    client
+        .batch_execute(
+            "CREATE TABLE pg_type (oid INT PRIMARY KEY);
+             INSERT INTO pg_type VALUES (9001);",
+        )
+        .await?;
+    let public_statement = client
+        .prepare("SELECT oid FROM public.pg_type ORDER BY oid")
+        .await?;
+    let public_rows = client.query(&public_statement, &[]).await?;
+    assert_eq!(public_rows.len(), 1);
+    assert_eq!(public_rows[0].get::<_, i32>(0), 9001);
+    client.batch_execute("DROP TABLE pg_type").await?;
+    let dropped_public = client
+        .query(&public_statement, &[])
+        .await
+        .expect_err("drop must not rebind public.pg_type to pg_catalog.pg_type");
+    assert_eq!(dropped_public.code().map(|code| code.code()), Some("42P01"));
+
     let mut copy_stream = stream::iter(
         vec![
             Bytes::from_static(b"id|name\n"),

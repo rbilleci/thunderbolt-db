@@ -95,7 +95,8 @@ impl Engine {
                 type_size: literal.ty.type_size(),
             }],
             Command::Select(select) => {
-                let table = prepared_table(catalog, &select.table)?;
+                let table = prepared_select_table(catalog, select)?;
+                validate_prepared_catalog_select_shape(&table, select)?;
                 // NULL binds safely through every explicit cast and predicate, allowing the
                 // existing SELECT binder to remain the sole owner of projection/aggregate types.
                 let nulls = vec![SqlValue::Null; prepared.parameter_count()];
@@ -103,9 +104,9 @@ impl Engine {
                 let Command::Select(bound_select) = bound_command.command() else {
                     unreachable!("a prepared SELECT binds to SELECT")
                 };
-                let bound = bind_relational_select(table, bound_select)?;
+                let bound = bind_relational_select(&table, bound_select)?;
                 infer_select_parameters(
-                    table,
+                    &table,
                     select,
                     &bound.selected_columns,
                     &mut parameter_types,
@@ -157,6 +158,51 @@ impl Engine {
             result_columns,
         })
     }
+}
+
+fn validate_prepared_catalog_select_shape(
+    table: &RelationalTable,
+    select: &Select,
+) -> Result<(), ExecuteError> {
+    if !matches!(table.schema.as_str(), "pg_catalog" | "information_schema") {
+        return Ok(());
+    }
+    let row_projection = matches!(
+        &select.projection,
+        SelectProjection::All | SelectProjection::Columns(_)
+    );
+    if row_projection
+        && !select.distinct
+        && select.group_by.is_none()
+        && select.having_groups.is_empty()
+    {
+        return Ok(());
+    }
+    Err(ExecuteError::Engine(EngineError::ApplyFailed(
+        "prepared catalog SELECT aggregates, DISTINCT, grouping, and HAVING require the general catalog binder and are not supported at Parse/Describe"
+            .to_string(),
+    )))
+}
+
+fn prepared_select_table(
+    catalog: &CatalogSnapshot,
+    select: &Select,
+) -> Result<RelationalTable, ExecuteError> {
+    let name = select.table.as_str();
+    if let Some(table) = catalog.relational_catalog.get(name) {
+        return Ok(table.clone());
+    }
+    if select.public_only {
+        return Err(ExecuteError::UndefinedRelation(format!("public.{name}")));
+    }
+    if public_relation_name_exists(catalog, name) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "prepared SELECT over public relation {name:?} requires a supported base-table route"
+        ))));
+    }
+    synthesize_catalog_relation(name, catalog)
+        .map(|(table, _rows)| table)
+        .ok_or_else(|| ExecuteError::UndefinedRelation(name.to_string()))
 }
 
 fn prepared_table<'a>(
@@ -339,6 +385,112 @@ mod tests {
         assert_eq!(description.result_columns.len(), 1);
         assert_eq!(description.result_columns[0].name, "balance");
         assert_eq!(description.result_columns[0].ty, SqlType::Int8);
+    }
+
+    #[test]
+    fn description_expands_catalog_mixed_star_against_one_snapshot() {
+        let engine = Engine::new_local();
+        let prepared = PreparedCommand::parse(
+            "SELECT oid, * FROM pg_catalog.pg_type \
+             WHERE typname IN ('hstore','geometry','vector')",
+        )
+        .unwrap();
+        let description = engine.describe_prepared_command(&prepared, &[]).unwrap();
+        assert!(description.parameter_types.is_empty());
+        assert_eq!(
+            description
+                .result_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oid", "oid", "typname", "typlen", "typtype", "typnamespace"]
+        );
+        assert_eq!(
+            description.catalog_version,
+            engine.catalog_snapshot().commit_seq
+        );
+
+        let unsupported =
+            PreparedCommand::parse("SELECT count(*) FROM pg_catalog.pg_policy ORDER BY oid")
+                .unwrap();
+        let error = engine
+            .describe_prepared_command(&unsupported, &[])
+            .expect_err("prepared catalog aggregate/order must reject during Describe");
+        assert!(error.to_string().contains("Parse/Describe"), "{error}");
+    }
+
+    #[test]
+    fn description_retains_explicit_public_identity_across_drop_aba() {
+        let engine = Engine::new_local();
+        let prepared =
+            PreparedCommand::parse("SELECT oid FROM public.pg_type ORDER BY oid").unwrap();
+        let missing = engine
+            .describe_prepared_command(&prepared, &[])
+            .expect_err("explicit public lookup must not synthesize pg_catalog.pg_type");
+        assert!(missing.to_string().contains("public.pg_type"), "{missing}");
+
+        engine
+            .execute_text(1, "CREATE TABLE pg_type (oid INT)")
+            .unwrap();
+        let description = engine.describe_prepared_command(&prepared, &[]).unwrap();
+        assert_eq!(description.result_columns.len(), 1);
+        assert_eq!(description.result_columns[0].name, "oid");
+
+        engine.execute_text(2, "DROP TABLE pg_type").unwrap();
+        let dropped = engine
+            .describe_prepared_command(&prepared, &[])
+            .expect_err("drop must not rebind explicit public to a shape-compatible catalog");
+        assert!(dropped.to_string().contains("public.pg_type"), "{dropped}");
+    }
+
+    #[test]
+    fn description_never_synthesizes_behind_public_view_matview_or_sequence_names() {
+        let engine = Engine::new_local();
+        engine
+            .execute_text(1, "CREATE TABLE catalog_shadow_source (oid INT)")
+            .unwrap();
+        engine
+            .execute_text(
+                2,
+                "CREATE VIEW pg_class AS SELECT oid FROM catalog_shadow_source",
+            )
+            .unwrap();
+        engine
+            .execute_text(
+                3,
+                "CREATE MATERIALIZED VIEW pg_type AS SELECT oid FROM catalog_shadow_source WITH NO DATA",
+            )
+            .unwrap();
+        engine.execute_text(4, "CREATE SEQUENCE pg_policy").unwrap();
+        engine
+            .execute_text(
+                5,
+                "CREATE INDEX pg_attribute ON catalog_shadow_source (oid)",
+            )
+            .unwrap();
+        engine
+            .execute_text(6, "CREATE INDEX pg_trigger ON catalog_shadow_source (oid)")
+            .unwrap();
+
+        for sql in [
+            "SELECT oid FROM pg_class",
+            "SELECT oid FROM pg_type",
+            "SELECT oid FROM pg_policy",
+            "SELECT oid FROM pg_attribute",
+            "SELECT oid FROM pg_trigger",
+        ] {
+            let prepared = PreparedCommand::parse(sql).unwrap();
+            let error = engine
+                .describe_prepared_command(&prepared, &[])
+                .expect_err("a public relation or index owner must block bare catalog synthesis");
+            assert!(
+                error.to_string().contains("supported base-table route"),
+                "{sql}: {error}"
+            );
+        }
+
+        let explicit = PreparedCommand::parse("SELECT oid FROM pg_catalog.pg_type").unwrap();
+        assert!(engine.describe_prepared_command(&explicit, &[]).is_ok());
     }
 
     #[test]

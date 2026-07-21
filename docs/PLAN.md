@@ -113,12 +113,36 @@ does not delay the architecture evidence gate. The active sequence now starts at
    suspension/exhaustion, and explicit failed-transaction rollback proof without adding a facade, WAL, or publication
    owner. Its first report card caught a measurable point-read regression from inserting the new command in the
    middle of the shared enum; the repaired append-only command invariant restores both cache regimes to the accepted
-   baseline. R2DBC remains an explicitly labelled legacy baseline until the next catalog/introspection slice serves its
-   exact `pg_catalog.pg_type` extension-autodetection query on the GPU catalog path; disabling driver autodetection is
-   not an accepted substitute. Its frozen implementation tree received an independent adversarial **ACCEPT** after
-   the auditor traced every claimed protocol, transaction, ownership, and performance invariant and independently
-   reproduced **232.824M/s at p50 156us** in-L2. The active next slice is that GPU catalog/introspection migration,
-   including R2DBC, before pg_dump/restore. Full PostgreSQL compatibility still requires broader transactional DDL and
+   baseline. The independently accepted psql/GPU-catalog/R2DBC slice now serves PostgreSQL 16 psql scenarios
+   04/06/07 and the unchanged R2DBC `pg_catalog.pg_type` extension-autodetection query through the canonical server;
+   R2DBC is no longer a legacy-catalog baseline and autodetection remains enabled. Versioned catalog rows are pinned
+   at one statement snapshot, uploaded as transient device relations, and filtered, projected, grouped, ordered, and
+   joined on the GPU. Explicit system/public relation identity, public-shadow and visibility semantics, RangeVar
+   aliases with immutable OID provenance, mixed wildcard projection, LIKE prefixes, typed casts/arrays/aggregates,
+   prepared AST execution, batcher engine ownership, and old typed-WAL view bodies all have focused fail-closed and
+   actual-GPU coverage. No facade, transaction, sequence/WAL claimant, publication owner, or CPU relational product
+   path was added.
+
+   Final gates pass SQL 52, active engine 516, and a globally isolated include-ignored engine differential of 1,058
+   tests. The nine-test catalog/facade HAZARD cohort passes three sequential and two concurrent rounds (45/45) with
+   zero CUDA 700/716/717; psql 04/06/07, standalone R2DBC, and the full eight-driver aggregate pass. Workspace
+   all-target/all-feature check, strict Clippy, format, shell, diff, dependency, and source-size gates are clean; the
+   touched production/test maxima are 1,996/2,987 lines. The preceding two-layer/two-cache report card remains
+   applicable because the audit repairs do not change a read kernel, residency layout, typed point-read route, or
+   its result path. Successive rejection rounds were repaired and re-audited; the final independent implementation
+   audit returned **ACCEPT** with no blocking finding at base
+   `e937d5c737cee84a7ccb89c0f8e7dde8663aa84c`, index tree
+   `47a52bda0ff64253f956e75cb61e8081bc759fd0`, and cached-diff SHA-256
+   `b2ce5ac798fb1e7105e8b594bab514a70eae9da18c9be5072d8f698cac784991`, with 56 staged paths and no unstaged drift.
+
+   Three inherited base defects remain explicitly owned by **PRODUCT-001** rather than being mislabeled as slice
+   regressions: `gpu_chunk_class_check_and_foreign_keys_stay_device_native`,
+   `transaction_fk_commit_waits_across_classic_wave_tail_handoff`, and
+   `gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover`. The active next compatibility slice is
+   pg_dump/restore migration to the canonical server; it receives its own frozen-tree gates and independent audit
+   before legacy/P8 deletion advances.
+
+   Full PostgreSQL compatibility still requires broader transactional DDL and
    relaxation of the conservative full-generation conflict that serializes a staged CREATE
    after any intervening commit. The remaining SQLSTATE/type-codec breadth and named client suites remain open too.
    Product server/P8

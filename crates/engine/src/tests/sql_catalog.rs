@@ -1,5 +1,6 @@
 use super::*;
 
+mod projection_binding;
 mod relation_lifecycle;
 
 #[test]
@@ -346,6 +347,184 @@ fn engine_answers_pg_attribute_pg_type_and_information_schema() {
         .unwrap()
         .rows,
         vec![vec![SqlValue::Text("BASE TABLE".to_string())]]
+    );
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn gpu_catalog_r2dbc_mixed_star_and_nullable_projection_are_non_vacuous() {
+    let e = Engine::new_local_test_engine();
+
+    let exact_sql = "SELECT oid, * FROM pg_catalog.pg_type \
+                     WHERE typname IN ('hstore','geometry','vector')";
+    let exact = e.execute_resident_expr_select_sql(exact_sql).unwrap();
+    assert_eq!(exact.executed_target, DeviceTarget::Gpu(0));
+    assert!(
+        exact.rows.is_empty(),
+        "extension autodetection must remain empty"
+    );
+    assert_eq!(
+        exact
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["oid", "oid", "typname", "typlen", "typtype", "typnamespace"]
+    );
+
+    let control = e
+        .execute_resident_expr_select_sql(
+            "SELECT oid, * FROM pg_catalog.pg_type WHERE typname IN ('int4','text') ORDER BY oid",
+        )
+        .unwrap();
+    assert_eq!(control.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(control.rows.len(), 2, "catalog control must not be vacuous");
+    for row in &control.rows {
+        assert_eq!(
+            row[0], row[1],
+            "explicit oid and star-expanded oid diverged"
+        );
+    }
+
+    e.execute_text(1, "CREATE TABLE mixed_star_nulls (id INT, note TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO mixed_star_nulls (id, note) VALUES (1, NULL), (2, 'device')",
+    )
+    .unwrap();
+    let Command::Select(nullable) =
+        parse_command("SELECT id, * FROM mixed_star_nulls ORDER BY id").unwrap()
+    else {
+        panic!("expected nullable mixed-star SELECT");
+    };
+    let nullable = e.execute_relational_select(&nullable).unwrap();
+    assert_eq!(nullable.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        nullable.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Null],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Int4(2),
+                SqlValue::Text("device".to_string())
+            ]
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn gpu_catalog_exact_psql_table_list_and_description_are_non_vacuous() {
+    let e = Engine::new_local_test_engine();
+    e.execute_text(
+        1,
+        "CREATE TABLE exact_psql_catalog_people (id INT, name TEXT)",
+    )
+    .unwrap();
+    e.execute_text(2, "CREATE TABLE public.pg_class (id INT)")
+        .unwrap();
+
+    let table_list = e.execute_resident_expr_select_sql(
+        r#"SELECT n.nspname as "Schema",
+  c.relname as "Name",
+  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as "Type",
+  pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+WHERE c.relkind IN ('r','p','')
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname !~ '^pg_toast'
+      AND n.nspname <> 'information_schema'
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ORDER BY 1,2"#,
+    );
+    let table_list = table_list.expect("exact psql table-list GPU query");
+    assert_eq!(table_list.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        table_list.rows,
+        vec![vec![
+            SqlValue::Text("public".to_string()),
+            SqlValue::Text("exact_psql_catalog_people".to_string()),
+            SqlValue::Text("table".to_string()),
+            SqlValue::Text("postgres".to_string()),
+        ]],
+        "the exact psql table-list join must return its nonempty device result"
+    );
+
+    let oid = e
+        .relational_catalog_table("exact_psql_catalog_people")
+        .expect("created table descriptor")
+        .oid;
+    let describe_sql = format!(
+        r#"SELECT a.attname,
+  pg_catalog.format_type(a.atttypid, a.atttypmod),
+  (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)
+   FROM pg_catalog.pg_attrdef d
+   WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef),
+  a.attnotnull,
+  (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t
+   WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS attcollation,
+  a.attidentity,
+  a.attgenerated
+FROM pg_catalog.pg_attribute a
+WHERE a.attrelid = '{oid}' AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum"#
+    );
+    let described = e
+        .execute_resident_expr_select_sql(&describe_sql)
+        .expect("exact psql pg_attribute description");
+    assert_eq!(described.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        described.rows,
+        vec![
+            vec![
+                SqlValue::Text("id".to_string()),
+                SqlValue::Text("integer".to_string()),
+                SqlValue::Null,
+                SqlValue::Bool(false),
+                SqlValue::Null,
+                SqlValue::Text(String::new()),
+                SqlValue::Text(String::new()),
+            ],
+            vec![
+                SqlValue::Text("name".to_string()),
+                SqlValue::Text("text".to_string()),
+                SqlValue::Null,
+                SqlValue::Bool(false),
+                SqlValue::Null,
+                SqlValue::Text(String::new()),
+                SqlValue::Text(String::new()),
+            ],
+        ],
+        "format_type and guarded nullable display values must preserve the GPU-filtered row order"
+    );
+}
+
+#[test]
+fn nonempty_unimplemented_constraint_presentation_fails_instead_of_fabricating_text() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE guarded_constraint_catalog (id INT PRIMARY KEY)",
+        )
+        .unwrap();
+    let error = engine
+        .execute_resident_expr_select_sql(
+            "SELECT pg_catalog.pg_get_constraintdef(oid, true) \
+             FROM pg_catalog.pg_constraint",
+        )
+        .expect_err("nonempty constraint definitions are not implemented")
+        .to_string();
+    assert!(
+        error.contains(GPU_CATALOG_CONSTRAINT_DEF),
+        "the nonempty path must fail at the absent device presentation column: {error}"
+    );
+    assert!(
+        !error.contains("GPU execution is required"),
+        "the failure must occur before any fallback or device effect: {error}"
     );
 }
 

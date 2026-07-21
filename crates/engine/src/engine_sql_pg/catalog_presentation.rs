@@ -1,0 +1,879 @@
+//! GPU-catalog projection presentation and typed empty-result orchestration.
+//!
+//! Relational filtering, joining, sorting, and projection remain device operations. This
+//! leaf only maps PostgreSQL catalog display metadata around those device results.
+
+use super::*;
+
+#[derive(Clone)]
+pub(super) struct CatalogJoinPresentation {
+    output_name: String,
+}
+
+pub(super) struct CatalogJoinProjectionPlan {
+    pub(super) projection: Vec<JoinProjItem>,
+    pub(super) aliases: Vec<Option<String>>,
+    pub(super) order_by: Vec<(JoinColRef, bool)>,
+    pub(super) order_by_nulls_first: Vec<Option<bool>>,
+    pub(super) presentation: Vec<CatalogJoinPresentation>,
+}
+
+pub(super) struct CatalogSingleProjectionPlan {
+    pub(super) select: Select,
+    pub(super) qualifier: String,
+    pub(super) presentation: Vec<CatalogJoinPresentation>,
+}
+
+pub(super) fn scalar_aggregate_alias_presentation(
+    stmt: &SelectStmt,
+    select: &Select,
+) -> Result<Option<Vec<CatalogJoinPresentation>>, ExecuteError> {
+    if !matches!(
+        select.projection,
+        SelectProjection::CountAll
+            | SelectProjection::CountDistinct { .. }
+            | SelectProjection::Sum { .. }
+            | SelectProjection::Avg { .. }
+            | SelectProjection::Min { .. }
+            | SelectProjection::Max { .. }
+    ) {
+        return Ok(None);
+    }
+    let [target] = stmt.target_list.as_slice() else {
+        return Ok(None);
+    };
+    let NodeEnum::ResTarget(target) = node_enum(target)? else {
+        return Err(sql_pg_error(
+            "malformed scalar aggregate target".to_string(),
+        ));
+    };
+    Ok((!target.name.is_empty()).then(|| {
+        vec![CatalogJoinPresentation {
+            output_name: target.name.clone(),
+        }]
+    }))
+}
+
+pub(super) fn catalog_join_projection_plan(
+    stmt: &SelectStmt,
+) -> Result<CatalogJoinProjectionPlan, ExecuteError> {
+    let mut projection = Vec::with_capacity(stmt.target_list.len());
+    let mut aliases = Vec::with_capacity(stmt.target_list.len());
+    let mut presentation = Vec::with_capacity(stmt.target_list.len());
+    for target in &stmt.target_list {
+        let NodeEnum::ResTarget(target) = node_enum(target)? else {
+            return Err(sql_pg_error("malformed catalog join target".to_string()));
+        };
+        let value = target
+            .val
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("catalog join target has no value".to_string()))?;
+        let source = match node_enum(value)? {
+            NodeEnum::ColumnRef(_) => parse_join_col_ref(value)?,
+            NodeEnum::CaseExpr(case) => catalog_case_projection_source(case)?,
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "pg_get_userbyid" =>
+            {
+                let [arg] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "pg_get_userbyid requires one catalog column".to_string(),
+                    ));
+                };
+                let mut source = parse_join_col_ref(arg)?;
+                if source.column != "relowner" {
+                    return Err(sql_pg_error(
+                        "pg_get_userbyid presentation requires relowner".to_string(),
+                    ));
+                }
+                source.column = GPU_CATALOG_OWNER_NAME.to_string();
+                source
+            }
+            NodeEnum::AConst(constant) => {
+                let value = catalog_scalar_constant(constant)?;
+                let mut source = projection
+                    .iter()
+                    .find_map(|item| match item {
+                        JoinProjItem::Column(column) => Some(column.clone()),
+                        JoinProjItem::Star(_) => None,
+                    })
+                    .ok_or_else(|| {
+                        sql_pg_error(
+                            "a constant catalog projection requires an earlier source column"
+                                .to_string(),
+                        )
+                    })?;
+                source.column = match value {
+                    SqlValue::Bool(false) => GPU_CATALOG_FALSE.to_string(),
+                    SqlValue::Text(value) if value.is_empty() => GPU_CATALOG_EMPTY_TEXT.to_string(),
+                    _ => {
+                        return Err(sql_pg_error(
+                            "catalog join constant has no device presentation column".to_string(),
+                        ))
+                    }
+                };
+                source
+            }
+            _ => {
+                return Err(sql_pg_error(
+                    "catalog join presentation supports columns, text CASE, and pg_get_userbyid"
+                        .to_string(),
+                ))
+            }
+        };
+        let default_name = source.column.clone();
+        let output_name = if target.name.is_empty() {
+            default_name
+        } else {
+            target.name.clone()
+        };
+        projection.push(JoinProjItem::Column(source));
+        aliases.push(Some(output_name.clone()));
+        presentation.push(CatalogJoinPresentation { output_name });
+    }
+    if projection.is_empty() {
+        return Err(sql_pg_error(
+            "catalog join must project at least one value".to_string(),
+        ));
+    }
+
+    let mut order_by = Vec::with_capacity(stmt.sort_clause.len());
+    let mut order_by_nulls_first = Vec::with_capacity(stmt.sort_clause.len());
+    for item in &stmt.sort_clause {
+        let NodeEnum::SortBy(sort) = node_enum(item)? else {
+            return Err(sql_pg_error("malformed catalog ORDER BY".to_string()));
+        };
+        let node = sort
+            .node
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("catalog ORDER BY key has no value".to_string()))?;
+        let key = match node_enum(node)? {
+            NodeEnum::AConst(constant) => {
+                let Some(a_const::Val::Ival(position)) = &constant.val else {
+                    return Err(sql_pg_error(
+                        "catalog ORDER BY position must be an integer".to_string(),
+                    ));
+                };
+                let index = usize::try_from(position.ival)
+                    .ok()
+                    .and_then(|position| position.checked_sub(1))
+                    .filter(|index| *index < projection.len())
+                    .ok_or_else(|| {
+                        sql_pg_error("catalog ORDER BY position is out of range".to_string())
+                    })?;
+                let JoinProjItem::Column(column) = &projection[index] else {
+                    unreachable!("catalog presentation projects source columns only")
+                };
+                column.clone()
+            }
+            NodeEnum::ColumnRef(_) => {
+                let requested = parse_join_col_ref(node)?;
+                if requested.qualifier.is_none() {
+                    if let Some(index) = presentation
+                        .iter()
+                        .position(|item| item.output_name == requested.column)
+                    {
+                        let JoinProjItem::Column(column) = &projection[index] else {
+                            unreachable!("catalog presentation projects source columns only")
+                        };
+                        column.clone()
+                    } else {
+                        requested
+                    }
+                } else {
+                    requested
+                }
+            }
+            _ => {
+                return Err(sql_pg_error(
+                    "catalog ORDER BY supports a source column, output alias, or position"
+                        .to_string(),
+                ))
+            }
+        };
+        order_by.push((key, sort.sortby_dir == SortByDir::SortbyDesc as i32));
+        order_by_nulls_first.push(
+            if sort.sortby_nulls == SortByNulls::SortbyNullsFirst as i32 {
+                Some(true)
+            } else if sort.sortby_nulls == SortByNulls::SortbyNullsLast as i32 {
+                Some(false)
+            } else {
+                None
+            },
+        );
+    }
+    Ok(CatalogJoinProjectionPlan {
+        projection,
+        aliases,
+        order_by,
+        order_by_nulls_first,
+        presentation,
+    })
+}
+
+fn catalog_case_projection_source(
+    case: &pg_query::protobuf::CaseExpr,
+) -> Result<JoinColRef, ExecuteError> {
+    let CatalogCaseBinding {
+        mut source,
+        arms,
+        otherwise,
+        reject_unmatched,
+    } = parse_catalog_case(case)?;
+    match source.column.as_str() {
+        "relkind"
+            if !reject_unmatched && otherwise.is_none() && catalog_relkind_case_is_exact(&arms) =>
+        {
+            source.column = GPU_CATALOG_RELKIND_DISPLAY.to_string();
+            Ok(source)
+        }
+        "reloftype"
+            if reject_unmatched
+                && otherwise.is_none()
+                && arms == [(SqlValue::Int4(0), SqlValue::Text(String::new()))] =>
+        {
+            source.column = GPU_CATALOG_RELTYPE_DISPLAY.to_string();
+            Ok(source)
+        }
+        _ => Err(sql_pg_error(
+            "catalog CASE has no exact device presentation column".to_string(),
+        )),
+    }
+}
+
+fn catalog_relkind_case_is_exact(arms: &[(SqlValue, SqlValue)]) -> bool {
+    const EXPECTED: [(&str, &str); 9] = [
+        ("r", "table"),
+        ("v", "view"),
+        ("m", "materialized view"),
+        ("i", "index"),
+        ("S", "sequence"),
+        ("t", "TOAST table"),
+        ("f", "foreign table"),
+        ("p", "partitioned table"),
+        ("I", "partitioned index"),
+    ];
+    arms.len() == EXPECTED.len()
+        && arms
+            .iter()
+            .zip(EXPECTED)
+            .all(|((input, output), expected)| {
+                input == &SqlValue::Text(expected.0.to_string())
+                    && output == &SqlValue::Text(expected.1.to_string())
+            })
+}
+
+pub(super) fn catalog_single_projection_plan(
+    stmt: &SelectStmt,
+) -> Result<CatalogSingleProjectionPlan, ExecuteError> {
+    if !stmt.group_clause.is_empty()
+        || stmt.having_clause.is_some()
+        || !stmt.distinct_clause.is_empty()
+        || stmt.with_clause.is_some()
+    {
+        return Err(sql_pg_error(
+            "catalog single-relation presentation does not support grouped, distinct, or CTE input"
+                .to_string(),
+        ));
+    }
+    let [from] = stmt.from_clause.as_slice() else {
+        return Err(sql_pg_error(
+            "catalog presentation requires one base relation".to_string(),
+        ));
+    };
+    let NodeEnum::RangeVar(range) = node_enum(from)? else {
+        return Err(sql_pg_error(
+            "catalog presentation requires one base relation".to_string(),
+        ));
+    };
+    let table = catalog_range_relation_key(range)?;
+    let qualifier = range
+        .alias
+        .as_ref()
+        .map(|alias| alias.aliasname.clone())
+        .unwrap_or_else(|| range.relname.clone());
+    let mut physical_columns = Vec::with_capacity(stmt.target_list.len());
+    let mut presentation = Vec::with_capacity(stmt.target_list.len());
+    for target in &stmt.target_list {
+        let NodeEnum::ResTarget(target) = node_enum(target)? else {
+            return Err(sql_pg_error("malformed catalog SELECT target".to_string()));
+        };
+        let value = target
+            .val
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("catalog SELECT target has no value".to_string()))?;
+        let (source, default_name) = match node_enum(value)? {
+            NodeEnum::ColumnRef(column) => {
+                let source = resolve_column_name(column, &qualifier)?.to_string();
+                (source.clone(), source)
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "format_type" => {
+                let [source, typmod] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "format_type requires an OID column and a typmod column".to_string(),
+                    ));
+                };
+                let NodeEnum::ColumnRef(column) = node_enum(source)? else {
+                    return Err(sql_pg_error(
+                        "format_type requires an OID column as its first argument".to_string(),
+                    ));
+                };
+                if resolve_column_name(column, &qualifier)? != "atttypid" {
+                    return Err(sql_pg_error(
+                        "format_type presentation requires atttypid".to_string(),
+                    ));
+                }
+                let NodeEnum::ColumnRef(column) = node_enum(typmod)? else {
+                    return Err(sql_pg_error(
+                        "format_type requires a typmod column as its second argument".to_string(),
+                    ));
+                };
+                if resolve_column_name(column, &qualifier)? != "atttypmod" {
+                    return Err(sql_pg_error(
+                        "format_type presentation requires atttypmod".to_string(),
+                    ));
+                }
+                (
+                    GPU_CATALOG_FORMATTED_TYPE.to_string(),
+                    "format_type".to_string(),
+                )
+            }
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "pg_get_constraintdef" =>
+            {
+                let source = match function.args.as_slice() {
+                    [source] => source,
+                    [source, pretty] => {
+                        let NodeEnum::AConst(pretty) = node_enum(pretty)? else {
+                            return Err(sql_pg_error(
+                                "pg_get_constraintdef pretty-print argument must be true"
+                                    .to_string(),
+                            ));
+                        };
+                        if !matches!(pretty.val, Some(a_const::Val::Boolval(ref value)) if value.boolval)
+                        {
+                            return Err(sql_pg_error(
+                                "pg_get_constraintdef pretty-print argument must be true"
+                                    .to_string(),
+                            ));
+                        }
+                        source
+                    }
+                    _ => {
+                        return Err(sql_pg_error(
+                            "pg_get_constraintdef requires one OID and optional true argument"
+                                .to_string(),
+                        ))
+                    }
+                };
+                let NodeEnum::ColumnRef(source) = node_enum(source)? else {
+                    return Err(sql_pg_error(
+                        "pg_get_constraintdef requires the constraint OID column".to_string(),
+                    ));
+                };
+                if resolve_column_name(source, &qualifier)? != "oid" {
+                    return Err(sql_pg_error(
+                        "pg_get_constraintdef requires the constraint OID column".to_string(),
+                    ));
+                }
+                (
+                    GPU_CATALOG_CONSTRAINT_DEF.to_string(),
+                    "pg_get_constraintdef".to_string(),
+                )
+            }
+            NodeEnum::SubLink(sublink) => {
+                let source = catalog_sublink_guard(sublink, &qualifier).ok_or_else(|| {
+                    sql_pg_error(
+                        "catalog scalar subquery has no modeled empty-result guard".to_string(),
+                    )
+                })?;
+                (source, "?column?".to_string())
+            }
+            NodeEnum::AConst(constant) => {
+                let constant = catalog_scalar_constant(constant)?;
+                let source = match constant {
+                    SqlValue::Bool(false) => GPU_CATALOG_FALSE.to_string(),
+                    SqlValue::Text(value) if value.is_empty() => {
+                        GPU_CATALOG_EMPTY_TEXT.to_string()
+                    }
+                    _ => {
+                        return Err(sql_pg_error(
+                            "catalog constant has no device presentation column".to_string(),
+                        ))
+                    }
+                };
+                (source, "?column?".to_string())
+            }
+            _ => {
+                return Err(sql_pg_error(
+                    "catalog projection supports columns, format_type, scalar metadata subqueries, and constants"
+                        .to_string(),
+                ))
+            }
+        };
+        physical_columns.push(source);
+        presentation.push(CatalogJoinPresentation {
+            output_name: if target.name.is_empty() {
+                default_name
+            } else {
+                target.name.clone()
+            },
+        });
+    }
+    let order_by = parse_order_by(&stmt.sort_clause, &qualifier)?;
+    Ok(CatalogSingleProjectionPlan {
+        select: Select {
+            table,
+            public_only: range.schemaname == "public",
+            distinct: false,
+            projection: SelectProjection::Columns(physical_columns),
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by,
+            limit: parse_limit(&stmt.limit_count)?,
+            offset: parse_limit(&stmt.limit_offset)?,
+        },
+        qualifier,
+        presentation,
+    })
+}
+
+fn catalog_sublink_guard(sublink: &pg_query::protobuf::SubLink, qualifier: &str) -> Option<String> {
+    if sublink.sub_link_type != SubLinkType::ExprSublink as i32
+        || sublink.testexpr.is_some()
+        || !sublink.oper_name.is_empty()
+    {
+        return None;
+    }
+    let NodeEnum::SelectStmt(select) = node_enum(sublink.subselect.as_deref()?).ok()? else {
+        return None;
+    };
+    if catalog_default_sublink_is_exact(select, qualifier) {
+        return Some(GPU_CATALOG_DEFAULT_EXPR.to_string());
+    }
+    if catalog_collation_sublink_is_exact(select, qualifier) {
+        return Some(GPU_CATALOG_COLLATION_NAME.to_string());
+    }
+    None
+}
+
+fn catalog_scalar_subselect_is_plain(select: &SelectStmt) -> bool {
+    select.op == SetOperation::SetopNone as i32
+        && !select.all
+        && select.larg.is_none()
+        && select.rarg.is_none()
+        && select.distinct_clause.is_empty()
+        && select.into_clause.is_none()
+        && select.group_clause.is_empty()
+        && !select.group_distinct
+        && select.having_clause.is_none()
+        && select.window_clause.is_empty()
+        && select.values_lists.is_empty()
+        && select.sort_clause.is_empty()
+        && select.limit_offset.is_none()
+        && select.limit_count.is_none()
+        && select.locking_clause.is_empty()
+        && select.with_clause.is_none()
+}
+
+fn catalog_range_is_exact(node: &Node, relation: &str, alias: &str) -> bool {
+    let Ok(NodeEnum::RangeVar(range)) = node_enum(node) else {
+        return false;
+    };
+    range.catalogname.is_empty()
+        && range.schemaname == "pg_catalog"
+        && range.relname == relation
+        && range
+            .alias
+            .as_ref()
+            .is_some_and(|actual| actual.aliasname == alias && actual.colnames.is_empty())
+}
+
+fn catalog_column_is_exact(node: &Node, qualifier: &str, column: &str) -> bool {
+    let Ok(NodeEnum::ColumnRef(reference)) = node_enum(node) else {
+        return false;
+    };
+    let [table, name] = reference.fields.as_slice() else {
+        return false;
+    };
+    matches!(
+        (table.node.as_ref(), name.node.as_ref()),
+        (Some(NodeEnum::String(table)), Some(NodeEnum::String(name)))
+            if table.sval == qualifier && name.sval == column
+    )
+}
+
+fn catalog_bool_constant_is_exact(node: &Node, expected: bool) -> bool {
+    matches!(
+        node.node.as_ref(),
+        Some(NodeEnum::AConst(constant))
+            if matches!(&constant.val, Some(a_const::Val::Boolval(value)) if value.boolval == expected)
+    )
+}
+
+fn catalog_target_value(select: &SelectStmt) -> Option<&Node> {
+    let [target] = select.target_list.as_slice() else {
+        return None;
+    };
+    let NodeEnum::ResTarget(target) = node_enum(target).ok()? else {
+        return None;
+    };
+    if !target.name.is_empty() || !target.indirection.is_empty() {
+        return None;
+    }
+    target.val.as_deref()
+}
+
+fn collect_catalog_and_terms<'a>(node: &'a Node, terms: &mut Vec<&'a Node>) {
+    if let Some(NodeEnum::BoolExpr(expression)) = node.node.as_ref() {
+        if expression.boolop == BoolExprType::AndExpr as i32 {
+            for arg in &expression.args {
+                collect_catalog_and_terms(arg, terms);
+            }
+            return;
+        }
+    }
+    terms.push(node);
+}
+
+fn catalog_column_comparison_is_exact(
+    node: &Node,
+    token: &str,
+    left: (&str, &str),
+    right: (&str, &str),
+) -> bool {
+    let Ok(NodeEnum::AExpr(expression)) = node_enum(node) else {
+        return false;
+    };
+    expression.kind == AExprKind::AexprOp as i32
+        && aexpr_op_token(expression).ok() == Some(token)
+        && expression
+            .lexpr
+            .as_deref()
+            .is_some_and(|node| catalog_column_is_exact(node, left.0, left.1))
+        && expression
+            .rexpr
+            .as_deref()
+            .is_some_and(|node| catalog_column_is_exact(node, right.0, right.1))
+}
+
+fn catalog_default_sublink_is_exact(select: &SelectStmt, outer: &str) -> bool {
+    if !catalog_scalar_subselect_is_plain(select)
+        || select.from_clause.len() != 1
+        || !catalog_range_is_exact(&select.from_clause[0], "pg_attrdef", "d")
+    {
+        return false;
+    }
+    let Some(target) = catalog_target_value(select) else {
+        return false;
+    };
+    let Ok(NodeEnum::FuncCall(function)) = node_enum(target) else {
+        return false;
+    };
+    if catalog_function_name(function).ok().as_deref() != Some("pg_get_expr")
+        || function.args.len() != 3
+        || !catalog_column_is_exact(&function.args[0], "d", "adbin")
+        || !catalog_column_is_exact(&function.args[1], "d", "adrelid")
+        || !catalog_bool_constant_is_exact(&function.args[2], true)
+    {
+        return false;
+    }
+    let Some(predicate) = select.where_clause.as_deref() else {
+        return false;
+    };
+    let mut terms = Vec::new();
+    collect_catalog_and_terms(predicate, &mut terms);
+    terms.len() == 3
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(term, "=", ("d", "adrelid"), (outer, "attrelid"))
+        })
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(term, "=", ("d", "adnum"), (outer, "attnum"))
+        })
+        && terms
+            .iter()
+            .any(|term| catalog_column_is_exact(term, outer, "atthasdef"))
+}
+
+fn catalog_collation_sublink_is_exact(select: &SelectStmt, outer: &str) -> bool {
+    if !catalog_scalar_subselect_is_plain(select)
+        || select.from_clause.len() != 2
+        || !catalog_range_is_exact(&select.from_clause[0], "pg_collation", "c")
+        || !catalog_range_is_exact(&select.from_clause[1], "pg_type", "t")
+        || !catalog_target_value(select)
+            .is_some_and(|target| catalog_column_is_exact(target, "c", "collname"))
+    {
+        return false;
+    }
+    let Some(predicate) = select.where_clause.as_deref() else {
+        return false;
+    };
+    let mut terms = Vec::new();
+    collect_catalog_and_terms(predicate, &mut terms);
+    terms.len() == 3
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(term, "=", ("c", "oid"), (outer, "attcollation"))
+        })
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(term, "=", ("t", "oid"), (outer, "atttypid"))
+        })
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(
+                term,
+                "<>",
+                (outer, "attcollation"),
+                ("t", "typcollation"),
+            )
+        })
+}
+
+pub(super) fn catalog_function_name(
+    function: &pg_query::protobuf::FuncCall,
+) -> Result<String, ExecuteError> {
+    let parts = function
+        .funcname
+        .iter()
+        .map(|name| match node_enum(name)? {
+            NodeEnum::String(name) => Ok(name.sval.to_ascii_lowercase()),
+            _ => Err(sql_pg_error(
+                "catalog function name is malformed".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let name = match parts.as_slice() {
+        [name] => Ok(name.clone()),
+        [schema, name] if schema == "pg_catalog" => Ok(name.clone()),
+        _ => Err(sql_pg_error(format!(
+            "catalog function {} is not an unqualified or pg_catalog builtin",
+            parts.join(".")
+        ))),
+    }?;
+    let aggregate = matches!(
+        name.as_str(),
+        "avg" | "bool_and" | "bool_or" | "count" | "max" | "min" | "string_agg" | "sum"
+    );
+    if !aggregate
+        && (function.agg_distinct
+            || function.agg_filter.is_some()
+            || function.agg_within_group
+            || !function.agg_order.is_empty()
+            || function.agg_star
+            || function.over.is_some()
+            || function.func_variadic)
+    {
+        return Err(sql_pg_error(format!(
+            "scalar catalog function {name} does not accept aggregate or window modifiers"
+        )));
+    }
+    Ok(name)
+}
+
+struct CatalogCaseBinding {
+    source: JoinColRef,
+    arms: Vec<(SqlValue, SqlValue)>,
+    otherwise: Option<SqlValue>,
+    reject_unmatched: bool,
+}
+
+fn parse_catalog_case(
+    case: &pg_query::protobuf::CaseExpr,
+) -> Result<CatalogCaseBinding, ExecuteError> {
+    let mut source = case.arg.as_deref().map(parse_join_col_ref).transpose()?;
+    let mut arms = Vec::with_capacity(case.args.len());
+    for arm in &case.args {
+        let NodeEnum::CaseWhen(arm) = node_enum(arm)? else {
+            return Err(sql_pg_error("catalog CASE arm is malformed".to_string()));
+        };
+        let condition = arm
+            .expr
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("catalog CASE arm has no condition".to_string()))?;
+        let value = match node_enum(condition)? {
+            NodeEnum::AConst(constant) => catalog_scalar_constant(constant)?,
+            NodeEnum::AExpr(compare) => {
+                let lhs = compare.lexpr.as_deref().ok_or_else(|| {
+                    sql_pg_error("catalog CASE comparison has no lhs".to_string())
+                })?;
+                let rhs = compare.rexpr.as_deref().ok_or_else(|| {
+                    sql_pg_error("catalog CASE comparison has no rhs".to_string())
+                })?;
+                let (candidate_source, constant) =
+                    match (node_enum(lhs)?, node_enum(rhs)?) {
+                        (NodeEnum::ColumnRef(_), NodeEnum::AConst(constant)) => {
+                            (parse_join_col_ref(lhs)?, constant)
+                        }
+                        (NodeEnum::CaseTestExpr(_), NodeEnum::AConst(constant)) => {
+                            let source = source.clone().ok_or_else(|| {
+                                sql_pg_error("simple catalog CASE lost its source".to_string())
+                            })?;
+                            (source, constant)
+                        }
+                        (NodeEnum::AConst(constant), NodeEnum::ColumnRef(_)) => {
+                            (parse_join_col_ref(rhs)?, constant)
+                        }
+                        _ => return Err(sql_pg_error(
+                            "catalog CASE comparison requires one source column and one constant"
+                                .to_string(),
+                        )),
+                    };
+                if let Some(expected) = &source {
+                    if expected.qualifier != candidate_source.qualifier
+                        || expected.column != candidate_source.column
+                    {
+                        return Err(sql_pg_error(
+                            "catalog CASE arms must reference one source column".to_string(),
+                        ));
+                    }
+                } else {
+                    source = Some(candidate_source);
+                }
+                if aexpr_op_token(compare)? != "=" {
+                    return Err(sql_pg_error(
+                        "catalog CASE comparison must use equality".to_string(),
+                    ));
+                }
+                catalog_scalar_constant(constant)?
+            }
+            _ => {
+                return Err(sql_pg_error(
+                    "catalog CASE comparison requires a text constant".to_string(),
+                ))
+            }
+        };
+        let result = arm
+            .result
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("catalog CASE arm has no result".to_string()))?;
+        let NodeEnum::AConst(result) = node_enum(result)? else {
+            return Err(sql_pg_error(
+                "catalog CASE result requires a scalar constant".to_string(),
+            ));
+        };
+        arms.push((value, catalog_scalar_constant(result)?));
+    }
+    let (otherwise, reject_unmatched) = match case.defresult.as_deref() {
+        None => (None, false),
+        Some(result) => match node_enum(result)? {
+            NodeEnum::AConst(result) => (Some(catalog_scalar_constant(result)?), false),
+            // psql uses a display cast in the ELSE arm of a CASE whose modeled catalog source
+            // always matches the constant arm (for example pg_class.reloftype = 0). Preserve
+            // that supported case, but reject instead of fabricating NULL if the invariant changes.
+            _ => (None, true),
+        },
+    };
+    Ok(CatalogCaseBinding {
+        source: source
+            .ok_or_else(|| sql_pg_error("catalog CASE has no source column".to_string()))?,
+        arms,
+        otherwise,
+        reject_unmatched,
+    })
+}
+
+fn catalog_scalar_constant(
+    constant: &pg_query::protobuf::AConst,
+) -> Result<SqlValue, ExecuteError> {
+    match &constant.val {
+        Some(a_const::Val::Sval(value)) => Ok(SqlValue::Text(value.sval.clone())),
+        Some(a_const::Val::Ival(value)) => Ok(SqlValue::Int4(value.ival)),
+        Some(a_const::Val::Boolval(value)) => Ok(SqlValue::Bool(value.boolval)),
+        _ => Err(sql_pg_error(
+            "catalog presentation requires a text, int4, or bool constant".to_string(),
+        )),
+    }
+}
+
+pub(super) fn apply_catalog_projection_metadata(
+    mut result: RelationalSelectResult,
+    presentation: &[CatalogJoinPresentation],
+) -> Result<RelationalSelectResult, ExecuteError> {
+    if result.columns.len() != presentation.len() {
+        return Err(sql_pg_error(
+            "catalog presentation width differs from GPU projection".to_string(),
+        ));
+    }
+    let mut columns = result.columns.as_ref().clone();
+    for (index, (column, item)) in columns.iter_mut().zip(presentation).enumerate() {
+        column.name.clone_from(&item.output_name);
+        column.attnum = (index + 1) as i16;
+    }
+    // Result values are already final typed values projected from the transient device relation.
+    // Only wire-visible names/attribute numbers are metadata; no host expression evaluation occurs.
+    result.columns = Arc::new(columns);
+    Ok(result)
+}
+pub(super) fn select_tree_uses_synthesized_catalog(
+    stmt: &SelectStmt,
+    catalog: &CatalogSnapshot,
+) -> bool {
+    let mut relations = Vec::new();
+    collect_select_tree_relations(stmt, &mut relations);
+    relations.into_iter().any(|relation| {
+        !public_relation_name_exists(catalog, &relation)
+            && synthesize_catalog_relation(&relation, catalog).is_some()
+    })
+}
+
+fn collect_select_tree_relations(stmt: &SelectStmt, relations: &mut Vec<String>) {
+    for from in &stmt.from_clause {
+        collect_from_relations(from, relations);
+    }
+    if let Some(left) = stmt.larg.as_deref() {
+        collect_select_tree_relations(left, relations);
+    }
+    if let Some(right) = stmt.rarg.as_deref() {
+        collect_select_tree_relations(right, relations);
+    }
+}
+
+fn collect_from_relations(node: &Node, relations: &mut Vec<String>) {
+    match node.node.as_ref() {
+        Some(NodeEnum::RangeVar(range)) => {
+            let relation = if !range.catalogname.is_empty() {
+                format!(
+                    "{}.{}.{}",
+                    range.catalogname, range.schemaname, range.relname
+                )
+            } else {
+                match range.schemaname.as_str() {
+                    "" => range.relname.clone(),
+                    "pg_catalog" | "information_schema" => {
+                        format!("{}.{}", range.schemaname, range.relname)
+                    }
+                    schema => format!("{schema}.{}", range.relname),
+                }
+            };
+            relations.push(relation);
+        }
+        Some(NodeEnum::JoinExpr(join)) => {
+            if let Some(left) = join.larg.as_deref() {
+                collect_from_relations(left, relations);
+            }
+            if let Some(right) = join.rarg.as_deref() {
+                collect_from_relations(right, relations);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_catalog_lookup_keeps_the_unaliased_relation_qualifier() {
+        let stmt = parse_single_select(
+            "SELECT pg_catalog.format_type(pg_attribute.atttypid, pg_attribute.atttypmod) \
+             FROM pg_catalog.pg_attribute \
+             WHERE pg_attribute.attrelid = 'qualifier_probe'::regclass \
+             ORDER BY pg_attribute.attnum",
+        )
+        .unwrap();
+        let plan = catalog_single_projection_plan(&stmt).unwrap();
+        assert_eq!(plan.select.table, "pg_catalog.pg_attribute");
+        assert_eq!(plan.qualifier, "pg_attribute");
+    }
+}

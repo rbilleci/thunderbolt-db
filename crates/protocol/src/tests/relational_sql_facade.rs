@@ -673,6 +673,7 @@ default: Some(ColumnDefault::SequenceNextVal {
             name: "active_people".to_string(),
             query: Select {
                 table: "people".to_string(),
+                public_only: false,
                 distinct: false,
                 projection: SelectProjection::Columns(vec![
                     "id".to_string(),
@@ -713,6 +714,7 @@ default: Some(ColumnDefault::SequenceNextVal {
             name: "active_people".to_string(),
             query: Select {
                 table: "people".to_string(),
+                public_only: false,
                 distinct: false,
                 projection: SelectProjection::All,
                 group_by: None,
@@ -1664,6 +1666,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT id FROM people WHERE id = +1 LIMIT +1").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,
@@ -1692,6 +1695,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT id FROM public.people WHERE id = 1").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: true,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,
@@ -1720,6 +1724,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT id, name FROM ONLY public.people").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: true,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
             group_by: None,
@@ -1745,6 +1750,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT id FROM people ORDER BY id LIMIT 2 OFFSET 1").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,
@@ -1764,6 +1770,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT id FROM people ORDER BY id OFFSET 1 LIMIT 2").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,
@@ -1785,6 +1792,7 @@ default: Some(ColumnDefault::SequenceNextVal {
             .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
             group_by: None,
@@ -1817,6 +1825,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT name FROM people WHERE id >= 2 ORDER BY id LIMIT 5").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -1849,6 +1858,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT name FROM people WHERE 2 <= id ORDER BY id LIMIT 5").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -1882,6 +1892,7 @@ default: Some(ColumnDefault::SequenceNextVal {
             .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -1914,6 +1925,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT name FROM people WHERE name = 'O''Brien'").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -1946,6 +1958,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
             group_by: None,
@@ -1985,6 +1998,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT name FROM people WHERE id >= 2 AND name = 'Ada'").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -2028,6 +2042,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT name FROM people WHERE id = 1 OR name = 'Ada'").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -2064,6 +2079,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("SELECT name FROM people WHERE (id = 1) OR (name = 'Ada')").unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["name".to_string()]),
             group_by: None,
@@ -2103,6 +2119,7 @@ default: Some(ColumnDefault::SequenceNextVal {
         .unwrap(),
         Command::Select(Select {
             table: "people".to_string(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(vec!["id".to_string()]),
             group_by: None,

@@ -55,6 +55,26 @@ fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -
 }
 
 impl Engine {
+    /// Parse one rich SELECT with libpg_query, retain one immutable autocommit catalog+device
+    /// generation, lower it to the general relational IR, and execute it on the GPU. Unsupported
+    /// syntax or operators fail closed; this entry never reparses through the typed SQL facade and
+    /// never falls back to host relational execution.
+    pub fn execute_resident_expr_select_sql(
+        &self,
+        sql: &str,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_resident_expr_select_sql_scoped(sql, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_resident_expr_select_sql_instrumented(
+        &self,
+        sql: &str,
+        after_snapshot: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_resident_expr_select_sql_scoped(sql, after_snapshot)
+    }
+
     pub fn execute_relational_select(
         &self,
         select: &Select,
@@ -77,6 +97,34 @@ impl Engine {
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.execute_relational_select_in_transaction_with_hook(txn_id, select, || {})
+    }
+
+    /// Execute a libpg_query-lowered SELECT against the generation retained by `txn_id`.
+    ///
+    /// This is the transaction-scoped companion to [`Engine::execute_resident_expr_select_sql`]
+    /// used only after the product facade's typed parser has rejected a richer SELECT. It preserves
+    /// the same statement lock, isolation-level refresh, private-catalog visibility, and
+    /// program-ownership checks as the typed SELECT entry.
+    pub fn execute_resident_expr_select_sql_in_transaction(
+        &self,
+        txn_id: TxnId,
+        sql: &str,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        let snapshot = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
+        let statement_lock = Arc::clone(&snapshot.statement_lock);
+        let _statement = statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let _scope = self.enter_transaction_read(snapshot);
+        self.execute_resident_expr_select_sql(sql)
     }
 
     #[cfg(test)]
@@ -323,11 +371,17 @@ impl Engine {
             };
             return self.execute_transient_rows_via_general(select, table, view.rows, s);
         }
+        if select.public_only && !catalog.relational_catalog.contains_key(&select.table) {
+            return Err(ExecuteError::UndefinedRelation(format!(
+                "public.{}",
+                select.table
+            )));
+        }
         // Phase-3 M2: a SELECT against a synthesized pg_catalog/information_schema relation
         // runs through the SAME bind -> filter -> project -> order/limit core as a user
         // table, over rows projected from this pinned catalog generation (MVCC-consistent).
         // Resolved AFTER user tables/views so a real relation always shadows a catalog name.
-        if !catalog.relational_catalog.contains_key(&select.table) {
+        if !select.public_only && !public_relation_name_exists(&catalog, &select.table) {
             if let Some((catalog_table, catalog_rows)) =
                 synthesize_catalog_relation(&select.table, &catalog)
             {
@@ -541,6 +595,7 @@ impl Engine {
         };
         let select = Select {
             table: table_name.clone(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::Columns(returning.clone()),
             group_by: None,
@@ -713,6 +768,7 @@ impl Engine {
         };
         let select = Select {
             table: table.name.clone(),
+            public_only: false,
             distinct: false,
             projection: SelectProjection::All,
             group_by: None,

@@ -7,9 +7,12 @@
 //! `pg_query` API drift fails here loudly rather than silently in the mapper.
 
 use super::*;
+mod catalog_audit_repairs;
+mod catalog_visibility;
 mod join_materialization_audit;
 mod join_null_keys;
 mod outer_null_semantics;
+mod statement_snapshot;
 
 use crate::engine_sql_pg::parse_single_select;
 use pg_query::protobuf::{a_const, AConst, AExpr, AExprKind, ColumnRef, Node};
@@ -119,6 +122,75 @@ fn libpg_query_parses_arithmetic_predicate_select_into_the_expected_tree() {
         panic!("comparison rhs is not an A_Const");
     };
     assert_eq!(aconst_int(literal), 400);
+}
+
+#[test]
+fn catalog_presentation_fallback_never_reinterprets_user_relations() {
+    let engine = Engine::new_local_test_engine();
+    let join_error = engine
+        .execute_resident_expr_select_sql(
+            "SELECT CASE l.id WHEN 1 THEN 'one' END \
+             FROM ordinary_left l JOIN ordinary_right r ON l.id = r.id",
+        )
+        .expect_err("an unsupported user join projection must fail before execution")
+        .to_string();
+    assert!(
+        !join_error.contains("catalog"),
+        "the catalog presentation fallback masked the original user-join error: {join_error}"
+    );
+
+    let select_error = engine
+        .execute_resident_expr_select_sql(
+            "SELECT pg_catalog.format_type(id, -1) FROM ordinary_table",
+        )
+        .expect_err("an unsupported user projection must fail before execution")
+        .to_string();
+    assert!(
+        !select_error.contains("catalog presentation"),
+        "the catalog presentation fallback masked the original user SELECT error: {select_error}"
+    );
+}
+
+#[test]
+fn catalog_compatibility_casts_do_not_widen_user_relation_sql() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(1, "CREATE TABLE ordinary_cast_scope (id INT)")
+        .unwrap();
+    assert_sql_err_contains(
+        &engine,
+        "SELECT id FROM ordinary_cast_scope WHERE id::int4 = 1",
+        "unsupported expression node",
+    );
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn gpu_empty_catalog_group_less_aggregate_preserves_one_output_row() {
+    let engine = Engine::new_local_test_engine();
+    let result = engine
+        .execute_resident_expr_select_sql("SELECT count(*) FROM pg_catalog.pg_policy")
+        .expect("empty catalog COUNT must execute through the ordinary GPU aggregate path");
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.rows, vec![vec![SqlValue::Int8(0)]]);
+
+    let arithmetic = engine
+        .execute_resident_expr_select_sql("SELECT oid + 1 FROM pg_catalog.pg_policy")
+        .expect("empty catalog arithmetic must retain exact metadata");
+    assert_eq!(arithmetic.executed_target, DeviceTarget::Gpu(0));
+    assert!(arithmetic.rows.is_empty());
+    assert_eq!(arithmetic.columns[0].ty, SqlType::Int4);
+
+    let exists = engine
+        .execute_resident_expr_select_sql(
+            "SELECT EXISTS (SELECT oid FROM pg_catalog.pg_trigger) \
+             FROM pg_catalog.pg_policy",
+        )
+        .expect("empty catalog EXISTS must retain boolean metadata");
+    assert_eq!(exists.executed_target, DeviceTarget::Gpu(0));
+    assert!(exists.rows.is_empty());
+    assert_eq!(exists.columns[0].name, "exists");
+    assert_eq!(exists.columns[0].ty, SqlType::Bool);
 }
 
 #[test]
@@ -2032,6 +2104,48 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
         vec![people, teams],
         "golden 29: relname IN (...) excludes dz_ignored, still GPU join + sort"
     );
+
+    e.execute_text(4, "CREATE TABLE pg_class (bogus INT)")
+        .unwrap();
+    e.execute_text(5, "CREATE TABLE tables (bogus INT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE pg_toast_evil (id INT)")
+        .unwrap();
+    let qualified = e
+        .execute_resident_expr_select_sql(
+            "SELECT relname FROM pg_catalog.pg_class WHERE relname = 'dz_people'",
+        )
+        .expect("an explicit pg_catalog relation cannot be shadowed by public.pg_class");
+    assert_eq!(qualified.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        qualified.rows,
+        vec![vec![SqlValue::Text("dz_people".into())]]
+    );
+    let information_schema = e
+        .execute_resident_expr_select_sql(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_name = 'dz_people'",
+        )
+        .expect("an information_schema qualifier must survive single-relation lowering");
+    assert_eq!(information_schema.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        information_schema.rows,
+        vec![vec![SqlValue::Text("dz_people".into())]]
+    );
+    for sql in [
+        "SELECT relname FROM pg_catalog.pg_class \
+         WHERE relname = 'pg_toast_evil' AND relname !~ '^pg_toast'",
+        "SELECT pg_catalog.format_type(DISTINCT a.atttypid, a.atttypmod) \
+         FROM pg_catalog.pg_attribute a",
+        "SELECT pg_catalog.pg_get_userbyid(DISTINCT c.relowner) \
+         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
+         ON n.oid = c.relnamespace",
+        "SELECT relname FROM pg_catalog.pg_class \
+         WHERE pg_catalog.pg_table_is_visible(DISTINCT oid)",
+    ] {
+        e.execute_resident_expr_select_sql(sql)
+            .expect_err("invalid catalog compatibility syntax must fail closed");
+    }
 }
 
 #[test]
