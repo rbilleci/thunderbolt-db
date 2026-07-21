@@ -14,6 +14,86 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 canonical keyed cancellation — accepted 2026-07-21
+
+- One server-local registry is shared by every worker of each canonical listener. Successful trust or SCRAM startup
+  registers a positive process id plus an OS-random four-byte secret and emits `BackendKeyData` after the four
+  ParameterStatus frames and before ReadyForQuery. Secret-bearing types expose no `Debug`; exact secrets are
+  compared in constant time. Unknown, wrong-length, wrong-secret, stale, or idle requests are silent no-ops; even a
+  short or oversized frame carrying the CancelRequest code closes without an ErrorResponse on direct, TLS, and
+  async startup paths. A connection lease removes only its exact weak-pointer registration.
+- Active frontend work is generation-scoped, so cancellation cannot poison a later request. Blocking and async COPY
+  retain the same generation across CopyData frames, abort before CopyDone publication, emit `57014`, apply simple
+  ReadyForQuery versus extended skip-until-Sync recovery, and then reuse the connection. Async waits for bounded
+  engine permits, Parse/Bind/Describe metadata, implicit BEGIN, and point-read batches are cancellable before facade
+  admission or connection-state installation. CopyData parsing/append and CopyDone wait on the same active request;
+  the last token check occurs immediately before facade `CopyFrom`. A started partial COPY frame is drained before
+  cancellation recovery so discarded async reads cannot desynchronize its remainder.
+- Only effect-free Rows/Empty responses may be replaced by `57014` through the last host-encoding safe point.
+  Every facade error is preserved because it may represent an indeterminate post-durable failure, just as successful
+  Command/RETURNING outcomes may already be published. This rule now also covers metadata, COPY start/TO, and an
+  already-ready batched receiver error. All four async COPY entry helpers use cancellation-aware permits plus a
+  worker token check immediately before their facade owner. Deterministic tests separately prove fresh zero-permit
+  implicit BEGIN and Parse analysis, all four zero-permit COPY entries, a buffered-row finish-permit cancellation,
+  the final pre-facade CopyFrom guard, raw extended frame-queue/Sync recovery, and original error category/message.
+  Every implicit transaction completion now carries that same active generation: blocking/async extended Sync,
+  multi-statement Query, and simple COPY use a cancellation-aware COMMIT admission, while pre-admission cancellation
+  takes an uncancellable ROLLBACK cleanup. Once COMMIT crosses the facade, its success or original error remains
+  authoritative. A raw zero-permit Sync test stages a primary-key insert before cancellation and proves `57014/I`,
+  zero rows, and same-key reuse; a lower-level zero-permit simple-query test proves the same queued auto-commit
+  boundary. Blocking COPY also retains the token through its final pre-facade guard and implicit completion.
+  The batching facade now repeats the token check after acquiring the shared-session mutex and immediately before
+  `BatchedText`, whose non-batchable fallback may mutate. A deterministic barrier runs only after the worker's first
+  check while the test owns that exact mutex; cancellation then proves `57014`, zero publication, and same-key
+  reuse. Simple COPY cancellation retains a narrow drain state for already-pipelined CopyData/Flush/CopyDone/Fail
+  frames, while the first ordinary frame exits drain and is processed normally. A zero-permit raw test pipelines
+  two rows plus CopyDone and proves exactly one error/Ready pair, zero rows, and timed same-key reuse; the transport
+  test also proves a simultaneously ready complete tag is drained before cancellation recovery.
+  Cancellation surfaced by a simple Query now marks an existing explicit transaction failed before completion:
+  blocking and async permanent tests prove `57014` plus ReadyForQuery `E`, subsequent `25P02`, ROLLBACK to `I`,
+  zero publication, and post-rollback reuse. A cached effect-free portal response may replace only a successful
+  encoding; a deterministic post-encoding `XX000` sentinel proves an encoder error always wins unchanged. The new
+  `async_submit` and `wire_response` leaves keep the canonical server root at 1,962 lines and add no facade,
+  transaction, WAL, sequence, or publication authority. The node-postgres smoke now boots
+  `gpu-db-engine-server` and verifies its unchanged driver parsed both BackendKeyData fields.
+- The first frozen-tree independent audit returned **REJECT**: it found that all errors could be falsely relabelled,
+  async CopyDone and extended metadata could cross ordinary permit waits after cancellation, and malformed direct/
+  TLS CancelRequest frames emitted `08P01`. All four findings above are repaired.
+- The second frozen-tree audit also returned **REJECT**. It accepted the first four repairs, then found remaining
+  error relabelling in metadata/COPY/batched branches, ordinary semaphore waits in the four async COPY start/TO
+  helpers, and non-vacuous-evidence overclaims. The shared success-only cancellation classifier, cancellable COPY
+  helpers, ready-result-first batch wait, and accurately split lower-level/raw tests repair that complete class.
+- The third fresh frozen-tree audit returned **REJECT** after accepting the prior race/error/COPY repairs. It found
+  that synthetic simple-query cancellation did not fail an already-open explicit transaction, and that the cached-
+  row encoder's postcheck could still overwrite an encoding error. Central simple-query error-state ownership and
+  the success-only encoded-response classifier plus the permanent tests above repair both findings.
+- The fourth fresh frozen-tree audit accepted all three prior repair families but returned **REJECT** for one
+  remaining publication race: async extended Sync and simple-query automatic COMMIT used an ordinary permit, so
+  cancellation while queued could later publish staged DML. The generation-carrying transaction-completion owner
+  and the two staged-row publication proofs above repair the full class, including simple COPY completion.
+- The fifth fresh frozen-tree audit accepted the explicit-transaction, encoding, implicit-COMMIT, registry, and
+  security repairs but returned **REJECT** for two final queue edges: cancellation while `BatchedText` waited on the
+  session mutex could still admit fallback mutation, and pipelined simple-COPY frames could be interpreted as new
+  requests after cancellation. The post-lock token guard, exact barrier test, narrow simple-COPY drain state, and
+  simultaneous-ready transport/raw pipeline proofs above repair both findings. A sixth different fresh auditor
+  then re-audited the complete frozen slice and returned **ACCEPT** with no blocking findings. It independently ran
+  the server all-target suite, twenty repeated 23-test cancellation rounds, protocol framing, node-postgres, the
+  live TLS/SCRAM preflight, and static gates; the accepted frozen identity was HEAD
+  `6cedf97efe7a5de62c8b98ef01fb2026ae6ed4a5`, index tree
+  `f886c593be2a5a5faef99356a31124f2283ad771`, and staged binary-diff SHA-256
+  `ae90bfdb4d3ada4cff3927b86add8c8a4f86728effd19c25c1c33afa781b4e83` with no unstaged drift.
+- The accepted slice gates pass canonical server **70/4 ignored**, pgwire **4/2 ignored**, SQLx **1**,
+  tokio-postgres **1**, facade **66/10 ignored** plus concurrency **13/1 ignored**, protocol **71 + 127**,
+  node-postgres, the live TLS/SCRAM posture, workspace all-target check, strict affected all-target Clippy, scoped
+  rustfmt, diff, shell, and source-size checks. The report card records **230.133M/s at p50 158us** in-L2 and
+  **199.901M/s at p50 203us**
+  out-of-L2, Layer-1 rooflines of **1,487.9/1,440.8 GB/s**, a **1,676.3M elements/s** grouped kernel, and a
+  **2,076.5s + 0.0s residency** 48M-row build. This is level with or better than the preceding accepted card in
+  both cache regimes. That full slice card remains applicable: the audit repairs change only cancellation/error,
+  metadata, and COPY admission branches, not a read kernel, residency layout, or successful point-read route. The
+  later repair changes add only cancellation/error/transaction-completion branches and permanent tests, so the same
+  card remains applicable. PRODUCT-001 continues with the prepared/portal/transaction-state compatibility migration.
+
 ## PRODUCT-001 canonical TLS/SCRAM security — accepted 2026-07-21
 
 - The product `gpu-db-engine-server` binary now parses one public `ServerConfig`. Its explicit local-development

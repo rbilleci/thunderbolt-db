@@ -88,7 +88,28 @@ does not delay the architecture evidence gate. The active sequence now starts at
    binary an explicit local-development trust profile plus a fail-closed production rustls/SCRAM-SHA-256 profile;
    PostgreSQL SASLprep/raw fallback, uniform wrong-user proof work, strict transcript validation, bounded framing,
    and both-ingress late-auth recovery wrap the existing dispatcher without adding an execution or commit owner.
-   Real keyed cancellation remains open. Full PostgreSQL compatibility still requires broader transactional DDL and
+   The accepted generation-scoped keyed-cancellation slice emits BackendKeyData, handles exact direct/TLS cancellation,
+   cancels queued async metadata/facade/COPY work, preserves every post-submission error plus published mutation
+   outcome, and moves node-postgres to the canonical target. Its first frozen-tree audit rejected error relabelling,
+   queued CopyDone publication, uncancellable extended-metadata permit waits, and blocking/TLS malformed-cancel
+   responses. A second frozen-tree audit accepted those direct repairs but found the same error-relabelling class in
+   COPY/metadata/batched branches, four ordinary-permit async COPY entries, and overclaimed queue-path tests. Both
+   rejection rounds were repaired. A third frozen-tree audit then found that synthetic simple-query cancellation
+   left an explicit transaction usable and that a cached-row post-encoding check could overwrite an encoder error.
+   Central failed-transaction ownership, a success-only encoded-response classifier, and deterministic blocking/
+   async plus error-sentinel tests repaired both findings. A fourth frozen-tree audit accepted those families but
+   found that queued async extended Sync and simple-query automatic COMMIT could still publish staged DML after
+   cancellation. The active generation now reaches every implicit COMMIT (including simple COPY), pre-admission
+   cancellation rolls back, post-admission COMMIT outcomes remain authoritative, and raw/lower-level zero-permit
+   staged-row tests prove no publication plus reuse. A fifth frozen-tree audit accepted those repairs but found a
+   missing post-session-lock guard around mutation-capable `BatchedText` fallback and pipelined simple-COPY frames
+   surviving cancellation into ordinary dispatch. The final token check now follows that exact mutex, a barrier
+   proves the race non-vacuously, and a narrow simple-COPY drain state plus simultaneous-ready transport/raw
+   multi-frame tests prove one `57014`/Ready pair, zero publication, and reuse. Refreshed full gates pass, and a sixth
+   fresh independent frozen-tree audit returned **ACCEPT** with no blocking findings. The active compatibility slice
+   is now prepared-statement/portal and transaction-state migration onto the canonical server; it must preserve the
+   accepted cancellation, COPY, security, and sole-facade boundaries and receive its own fresh adversarial ACCEPT.
+   Full PostgreSQL compatibility still requires broader transactional DDL and
    relaxation of the conservative full-generation conflict that serializes a staged CREATE
    after any intervening commit. The remaining SQLSTATE/type-codec breadth and named client suites remain open too.
    Product server/P8

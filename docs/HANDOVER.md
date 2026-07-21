@@ -141,8 +141,47 @@ This file records only the current boundary and where the next agent resumes. `P
   production rustls/SCRAM-SHA-256 profile around the existing dispatcher. PostgreSQL SASLprep/raw fallback, uniform
   wrong-user proof work, strict transcript/attribute validation, bounded framing, and permanent blocking/async raw-
   wire recovery are proven. The live security preflight now boots `gpu-db-engine-server`; no execution, WAL,
-  sequence, or publication authority moved. CancelRequest still closes without resolving its key or cancelling work,
-  so real cancellation is the next PRODUCT-001 boundary rather than a claim of this slice.
+  sequence, or publication authority moved. At that accepted slice boundary, CancelRequest still closed without
+  resolving its key or cancelling work, so real cancellation was not claimed by the security slice.
+- The PRODUCT-001 keyed-cancellation slice is **accepted**. The canonical listener emits random
+  BackendKeyData, resolves exact direct/TLS CancelRequests through one generation-scoped registry, cancels queued
+  async metadata/facade work and blocking/async COPY with correct simple versus extended recovery, suppresses only
+  effect-free Rows/Empty results, preserves every facade error plus successful mutation/RETURNING outcomes, silently
+  closes malformed CancelRequest-code frames, and moves node-postgres onto the canonical binary. Permanent wrong/
+  stale/idle key, partial-frame, pre-effect queue, queued CopyDone, post-cancel reuse, and ownership tests pass. The
+  first frozen-tree audit **rejected** error relabelling, queued CopyDone publication, ordinary extended-metadata
+  permit waits, and malformed blocking/TLS cancellation responses. A second audit accepted those repairs but
+  **rejected** remaining metadata/COPY/batched error relabelling, four ordinary-permit async COPY entry helpers, and
+  overclaimed queue-path evidence. Both rounds are repaired with one success-only classifier, cancellation-aware
+  COPY helpers, ready-result-first batch selection, and separately accurate lower-level/raw tests. A third fresh
+  audit accepted those repairs but **rejected** explicit transactions remaining usable after synthetic simple-query
+  cancellation and a cached-row post-encoding error being replaceable by `57014`. Both are now repaired: every
+  simple-query error marks an open explicit transaction failed before completion, and only a successful encoded
+  response is suppressible. Deterministic blocking/async tests prove `57014/E`, later `25P02`, ROLLBACK/I, zero
+  publication, and reuse; an `XX000` post-encoding sentinel remains unchanged under cancellation. The pre-repair
+  gates and full report card were green: **230.133M/s at p50 158us** in-L2 and **199.901M/s at p50
+  203us** out-of-L2, **1,487.9/1,440.8 GB/s** rooflines, a **1,676.3M elements/s** grouped kernel, and a
+  **2,076.5s + 0.0s residency** 48M-row build. Refreshed gates now pass server **60/4 ignored**, pgwire **4/2
+  ignored**, SQLx **1**, tokio-postgres **1**, facade **66/10 ignored + 13/1 ignored concurrency**, protocol **71 +
+  127**, node-postgres, live security, workspace, strict Clippy, formatting/diff/shell, and source-size checks. The
+  card remains applicable because the repairs do not change kernels, residency, or the successful point-read route.
+  Second-repair gates pass server **64/4 ignored**, pgwire **4/2 ignored**, SQLx **1**, tokio-postgres **1**, facade
+  **66/10 ignored + 13/1 ignored concurrency**, protocol **71 + 127**, node-postgres, live security, workspace,
+  strict Clippy, and formatting/diff/shell/source-size checks. A fourth fresh audit accepted all prior repair
+  families but **rejected** one remaining async implicit-COMMIT race: cancellation while extended Sync or simple-
+  query automatic COMMIT waited on an ordinary permit could still publish staged DML. The active generation now
+  reaches every implicit COMMIT, including simple COPY; cancellation before facade admission runs uncancellable
+  ROLLBACK cleanup, while any crossed COMMIT result/error wins unchanged. Raw extended-Sync and lower-level simple-
+  query zero-permit tests stage a primary-key row and prove `57014/I`, no publication, and same-key reuse. Fourth-
+  repair gates passed server **69/4 ignored**. A fifth fresh audit accepted those repairs but **rejected** a missing
+  post-session-lock token check around mutation-capable `BatchedText` fallback and pipelined simple-COPY frames
+  surviving cancellation into ordinary dispatch. `BatchedText` now checks immediately after the exact mutex, with
+  a deterministic barrier/primary-key proof. Simple COPY now drains already-pipelined CopyData/Flush/terminal frames
+  without swallowing the first ordinary request; the zero-permit two-row-plus-CopyDone test and simultaneous-ready
+  transport test prove one `57014/I`, zero publication, and timed same-key reuse. Fifth-repair gates pass server
+  **70/4 ignored** plus the same facade/driver/security/workspace/static gates; the root is 1,962 lines. A sixth
+  fresh frozen-tree audit independently re-ran the server, repeated cancellation, protocol, node-postgres, live
+  security, and static gates and returned **ACCEPT** with no blocking findings.
 - Physical multi-GPU work remains user-parked under **MULTI-001/002/003**.
 
 ## Integrated baseline — preserve it
@@ -163,10 +202,10 @@ This file records only the current boundary and where the next agent resumes. `P
 
 ## Resume here
 
-1. Continue **PRODUCT-001** with real keyed CancelRequest ownership on `gpu-db-engine-server`, including
-   BackendKeyData, wrong/stale-key no-op behavior, active-request cancellation/recovery, and the canonical node-
-   postgres smoke. Obtain a fresh independent ACCEPT before taking the prepared/portal/transaction-state,
-   psql/catalog, or pg_dump/restore slices. Delete the legacy server and P8 endpoint only after every named
+1. Continue **PRODUCT-001** with the canonical prepared-statement/portal and transaction-state compatibility slice.
+   Preserve the accepted keyed-cancellation, COPY, TLS/SCRAM, simple-query, and sole-facade boundaries; freeze its
+   focused gates and obtain a fresh independent adversarial ACCEPT before starting psql/catalog or pg_dump/restore.
+   Delete the legacy server and P8 endpoint only after every named
    compatibility gate is accepted. Broader transactional DDL and the conservative
    full-catalog conflict remain PRODUCT-001-owned gaps. Reduce the PLAN-owned 2,070-line
    `engine_dml_concurrent.rs` below 2,000 lines before PRODUCT-001 closes. Every independently reviewable slice needs
@@ -183,6 +222,13 @@ This file records only the current boundary and where the next agent resumes. `P
 
 ## Last green evidence — 2026-07-21
 
+- The accepted keyed-cancellation slice passes canonical server **70/4 ignored**, pgwire **4/2 ignored**,
+  SQLx **1**, tokio-postgres **1**, facade **66/10 ignored** plus concurrency **13/1 ignored**, protocol **71 +
+  127**, node-postgres, the live security posture, workspace check, strict affected Clippy, formatting, diff, shell,
+  and source-size gates. Its report card is **230.133M/s at p50 158us** in-L2 and **199.901M/s at p50 203us**
+  out-of-L2 with **1,487.9/1,440.8 GB/s** rooflines, **1,676.3M elements/s** GROUP BY, and a **2,076.5s + 0.0s
+  residency** build. Five rejection/repair rounds closed the discovered race, classification, transaction-state,
+  completion, and COPY-drain holes; the sixth fresh frozen-tree audit returned **ACCEPT**.
 - The accepted canonical TLS/SCRAM slice passes server **46/4 ignored**, pgwire **4/2 ignored**, SQLx **1**,
   tokio-postgres **1**, protocol **71 + 127**, workspace check, strict server Clippy, formatting, diff, shell, and
   source-size gates. The live canonical preflight passes fail-closed configuration, verifier and plaintext-source

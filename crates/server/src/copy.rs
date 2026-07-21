@@ -22,6 +22,7 @@ use gpu_db_protocol::{
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream as TokioTcpStream;
 
+use crate::cancellation::{cancel_effect_free_success, ActiveRequest};
 use crate::transport::ReadWrite;
 
 use super::extended::ExtendedSession;
@@ -80,6 +81,13 @@ impl CopyWireError {
         Self {
             code: "57014",
             message: "COPY from stdin was aborted by the client".to_string(),
+        }
+    }
+
+    pub(crate) fn query_cancelled() -> Self {
+        Self {
+            code: "57014",
+            message: "canceling statement due to user request".to_string(),
         }
     }
 }
@@ -209,10 +217,15 @@ pub(crate) fn append_copy_data(state: &mut CopyInState, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-pub(crate) fn finish_copy_from(
+/// Validate the buffered payload, then run the supplied guard at the last pre-facade point. The
+/// async path also checks before entering this validation, so an already-observed cancellation
+/// wins with `57014`; the final guard closes a race during validation without ever rewriting a
+/// success or error returned after the facade has been crossed.
+fn finish_copy_from_guarded(
     engine: &SharedEngine,
     session: &mut SharedSession,
     state: CopyInState,
+    before_submit: impl FnOnce() -> Result<(), CopyWireError>,
 ) -> Result<QueryOutcome, CopyWireError> {
     if !state.pending_bytes.is_empty() {
         std::str::from_utf8(&state.pending_bytes).map_err(|_| CopyParseError::InvalidUtf8)?;
@@ -221,6 +234,7 @@ pub(crate) fn finish_copy_from(
             message: "COPY data ended before row terminator".to_string(),
         });
     }
+    before_submit()?;
     engine
         .submit(
             session,
@@ -439,6 +453,7 @@ pub(crate) fn handle_copy_frame_blocking(
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
     copy_in: &mut Option<CopyInState>,
+    active: &ActiveRequest,
     frame: &[u8],
 ) -> Result<bool, String> {
     let message = match parse_frontend_message(frame) {
@@ -450,6 +465,7 @@ pub(crate) fn handle_copy_frame_blocking(
                 engine,
                 session,
                 extended,
+                active,
                 state,
                 Err(CopyWireError::protocol(error.to_string())),
             )?;
@@ -464,18 +480,33 @@ pub(crate) fn handle_copy_frame_blocking(
             );
             if let Err(error) = result {
                 let state = copy_in.take().expect("COPY parse error retains state");
-                write_copy_terminal_blocking(stream, engine, session, extended, state, Err(error))?;
+                write_copy_terminal_blocking(
+                    stream,
+                    engine,
+                    session,
+                    extended,
+                    active,
+                    state,
+                    Err(error),
+                )?;
             }
         }
         FrontendMessage::CopyDone => {
             let state = copy_in.take().expect("COPY done requires active state");
             let ready_after_done = state.ready_after_done();
-            let result = finish_copy_from(engine, session, state);
+            let result = finish_copy_from_guarded(engine, session, state, || {
+                if active.is_cancelled() {
+                    Err(CopyWireError::query_cancelled())
+                } else {
+                    Ok(())
+                }
+            });
             write_copy_terminal_result_blocking(
                 stream,
                 engine,
                 session,
                 extended,
+                active,
                 ready_after_done,
                 result,
             )?;
@@ -487,6 +518,7 @@ pub(crate) fn handle_copy_frame_blocking(
                 engine,
                 session,
                 extended,
+                active,
                 state,
                 Err(CopyWireError::client_aborted()),
             )?;
@@ -506,6 +538,7 @@ pub(crate) fn handle_copy_frame_blocking(
                 engine,
                 session,
                 extended,
+                active,
                 state,
                 Err(CopyWireError::protocol(
                     "only CopyData, CopyDone, CopyFail, Flush, Sync, or Terminate is allowed during COPY FROM STDIN",
@@ -516,16 +549,47 @@ pub(crate) fn handle_copy_frame_blocking(
     Ok(true)
 }
 
+pub(crate) fn cancel_copy_blocking(
+    stream: &mut dyn ReadWrite,
+    engine: &SharedEngine,
+    session: &mut SharedSession,
+    extended: &mut ExtendedSession,
+    copy_in: &mut Option<CopyInState>,
+    active: &ActiveRequest,
+) -> Result<(), String> {
+    let state = copy_in
+        .take()
+        .expect("COPY cancellation requires active state");
+    write_copy_terminal_blocking(
+        stream,
+        engine,
+        session,
+        extended,
+        active,
+        state,
+        Err(CopyWireError::query_cancelled()),
+    )
+}
+
 fn write_copy_terminal_blocking(
     stream: &mut dyn ReadWrite,
     engine: &SharedEngine,
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
+    active: &ActiveRequest,
     state: CopyInState,
     result: Result<QueryOutcome, CopyWireError>,
 ) -> Result<(), String> {
     let ready_after_done = state.ready_after_done();
-    write_copy_terminal_result_blocking(stream, engine, session, extended, ready_after_done, result)
+    write_copy_terminal_result_blocking(
+        stream,
+        engine,
+        session,
+        extended,
+        active,
+        ready_after_done,
+        result,
+    )
 }
 
 fn write_copy_terminal_result_blocking(
@@ -533,6 +597,7 @@ fn write_copy_terminal_result_blocking(
     engine: &SharedEngine,
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
+    active: &ActiveRequest,
     ready_after_done: bool,
     result: Result<QueryOutcome, CopyWireError>,
 ) -> Result<(), String> {
@@ -548,8 +613,15 @@ fn write_copy_terminal_result_blocking(
         Err(error) => encode_copy_error(&error),
     };
     if ready_after_done {
-        complete_simple_query_action_blocking(engine, session, extended, &lifecycle, &mut response)
-            .map_err(|error| error.to_string())?;
+        complete_simple_query_action_blocking(
+            engine,
+            session,
+            extended,
+            active,
+            &lifecycle,
+            &mut response,
+        )
+        .map_err(|error| error.to_string())?;
         let status = session.transaction_status();
         extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
         response.extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
@@ -574,19 +646,32 @@ pub(crate) async fn begin_copy_from_async(
     executor: &Arc<tokio::sync::Semaphore>,
     copy: CopyFromStdin,
     ready_after_done: bool,
+    active: &ActiveRequest,
 ) -> Result<Result<(CopyInState, Vec<u8>), CopyWireError>, String> {
-    let _permit = executor
-        .acquire()
+    let Some(_permit) = active
+        .acquire_permit(executor)
         .await
-        .map_err(|error| error.to_string())?;
-    tokio::task::spawn_blocking(move || {
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Err(CopyWireError::query_cancelled()));
+    };
+    let cancellation = active.token();
+    let result = tokio::task::spawn_blocking(move || {
         let mut session = session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cancellation.is_cancelled() {
+            return Err(CopyWireError::query_cancelled());
+        }
         begin_copy_from(&engine, &mut session, copy, ready_after_done)
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(cancel_effect_free_success(
+        active,
+        result,
+        CopyWireError::query_cancelled,
+    ))
 }
 
 pub(crate) async fn begin_prepared_copy_from_async(
@@ -596,19 +681,32 @@ pub(crate) async fn begin_prepared_copy_from_async(
     copy: CopyFromStdin,
     target: CopyTarget,
     ready_after_done: bool,
+    active: &ActiveRequest,
 ) -> Result<Result<(CopyInState, Vec<u8>), CopyWireError>, String> {
-    let _permit = executor
-        .acquire()
+    let Some(_permit) = active
+        .acquire_permit(executor)
         .await
-        .map_err(|error| error.to_string())?;
-    tokio::task::spawn_blocking(move || {
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Err(CopyWireError::query_cancelled()));
+    };
+    let cancellation = active.token();
+    let result = tokio::task::spawn_blocking(move || {
         let mut session = session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cancellation.is_cancelled() {
+            return Err(CopyWireError::query_cancelled());
+        }
         begin_prepared_copy_from(&engine, &mut session, copy, target, ready_after_done)
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(cancel_effect_free_success(
+        active,
+        result,
+        CopyWireError::query_cancelled,
+    ))
 }
 
 pub(crate) async fn execute_copy_to_async(
@@ -616,19 +714,32 @@ pub(crate) async fn execute_copy_to_async(
     session: Arc<std::sync::Mutex<SharedSession>>,
     executor: &Arc<tokio::sync::Semaphore>,
     copy: CopyToStdout,
+    active: &ActiveRequest,
 ) -> Result<Result<Vec<u8>, CopyWireError>, String> {
-    let _permit = executor
-        .acquire()
+    let Some(_permit) = active
+        .acquire_permit(executor)
         .await
-        .map_err(|error| error.to_string())?;
-    tokio::task::spawn_blocking(move || {
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Err(CopyWireError::query_cancelled()));
+    };
+    let cancellation = active.token();
+    let result = tokio::task::spawn_blocking(move || {
         let mut session = session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cancellation.is_cancelled() {
+            return Err(CopyWireError::query_cancelled());
+        }
         execute_copy_to(&engine, &mut session, &copy)
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(cancel_effect_free_success(
+        active,
+        result,
+        CopyWireError::query_cancelled,
+    ))
 }
 
 pub(crate) async fn execute_prepared_copy_to_async(
@@ -637,19 +748,32 @@ pub(crate) async fn execute_prepared_copy_to_async(
     executor: &Arc<tokio::sync::Semaphore>,
     bound: BoundPreparedStatement,
     copy: CopyToStdout,
+    active: &ActiveRequest,
 ) -> Result<Result<Vec<u8>, CopyWireError>, String> {
-    let _permit = executor
-        .acquire()
+    let Some(_permit) = active
+        .acquire_permit(executor)
         .await
-        .map_err(|error| error.to_string())?;
-    tokio::task::spawn_blocking(move || {
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Err(CopyWireError::query_cancelled()));
+    };
+    let cancellation = active.token();
+    let result = tokio::task::spawn_blocking(move || {
         let mut session = session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cancellation.is_cancelled() {
+            return Err(CopyWireError::query_cancelled());
+        }
         execute_prepared_copy_to(&engine, &mut session, &bound, &copy)
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(cancel_effect_free_success(
+        active,
+        result,
+        CopyWireError::query_cancelled,
+    ))
 }
 
 async fn finish_copy_from_async(
@@ -657,16 +781,30 @@ async fn finish_copy_from_async(
     session: Arc<std::sync::Mutex<SharedSession>>,
     executor: &Arc<tokio::sync::Semaphore>,
     state: CopyInState,
+    active: &ActiveRequest,
 ) -> Result<Result<QueryOutcome, CopyWireError>, String> {
-    let _permit = executor
-        .acquire()
+    let Some(_permit) = active
+        .acquire_permit(executor)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Err(CopyWireError::query_cancelled()));
+    };
+    let cancellation = active.token();
     tokio::task::spawn_blocking(move || {
         let mut session = session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        finish_copy_from(&engine, &mut session, state)
+        if cancellation.is_cancelled() {
+            return Err(CopyWireError::query_cancelled());
+        }
+        finish_copy_from_guarded(&engine, &mut session, state, || {
+            if cancellation.is_cancelled() {
+                Err(CopyWireError::query_cancelled())
+            } else {
+                Ok(())
+            }
+        })
     })
     .await
     .map_err(|error| error.to_string())
@@ -676,17 +814,30 @@ async fn append_copy_data_async(
     executor: &Arc<tokio::sync::Semaphore>,
     mut state: CopyInState,
     bytes: Vec<u8>,
+    active: &ActiveRequest,
 ) -> Result<(CopyInState, Result<(), CopyWireError>), String> {
-    let _permit = executor
-        .acquire()
+    let Some(_permit) = active
+        .acquire_permit(executor)
         .await
-        .map_err(|error| error.to_string())?;
-    tokio::task::spawn_blocking(move || {
-        let result = append_copy_data(&mut state, &bytes);
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok((state, Err(CopyWireError::query_cancelled())));
+    };
+    let cancellation = active.token();
+    let (state, result) = tokio::task::spawn_blocking(move || {
+        let result = if cancellation.is_cancelled() {
+            Err(CopyWireError::query_cancelled())
+        } else {
+            append_copy_data(&mut state, &bytes)
+        };
         (state, result)
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok((
+        state,
+        cancel_effect_free_success(active, result, CopyWireError::query_cancelled),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -697,13 +848,18 @@ pub(crate) async fn handle_copy_frame_async(
     executor: &Arc<tokio::sync::Semaphore>,
     extended: &mut ExtendedSession,
     copy_in: &mut Option<CopyInState>,
+    active: &ActiveRequest,
     frame: Vec<u8>,
 ) -> Result<bool, String> {
     let message = {
-        let _permit = executor
-            .acquire()
+        let Some(_permit) = active
+            .acquire_permit(executor)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+        else {
+            cancel_copy_async(stream, engine, session, executor, extended, copy_in, active).await?;
+            return Ok(true);
+        };
         tokio::task::spawn_blocking(move || parse_frontend_message(&frame))
             .await
             .map_err(|error| error.to_string())?
@@ -718,6 +874,7 @@ pub(crate) async fn handle_copy_frame_async(
                 session,
                 executor,
                 extended,
+                active,
                 state,
                 Err(CopyWireError::protocol(error.to_string())),
             )
@@ -725,10 +882,14 @@ pub(crate) async fn handle_copy_frame_async(
             return Ok(true);
         }
     };
+    if active.is_cancelled() {
+        cancel_copy_async(stream, engine, session, executor, extended, copy_in, active).await?;
+        return Ok(true);
+    }
     match message {
         FrontendMessage::CopyData(bytes) => {
             let state = copy_in.take().expect("COPY data requires active state");
-            let (state, result) = append_copy_data_async(executor, state, bytes).await?;
+            let (state, result) = append_copy_data_async(executor, state, bytes, active).await?;
             match result {
                 Ok(()) => *copy_in = Some(state),
                 Err(error) => {
@@ -738,6 +899,7 @@ pub(crate) async fn handle_copy_frame_async(
                         session,
                         executor,
                         extended,
+                        active,
                         state,
                         Err(error),
                     )
@@ -748,15 +910,21 @@ pub(crate) async fn handle_copy_frame_async(
         FrontendMessage::CopyDone => {
             let state = copy_in.take().expect("COPY done requires active state");
             let ready_after_done = state.ready_after_done();
-            let result =
-                finish_copy_from_async(Arc::clone(&engine), Arc::clone(&session), executor, state)
-                    .await?;
+            let result = finish_copy_from_async(
+                Arc::clone(&engine),
+                Arc::clone(&session),
+                executor,
+                state,
+                active,
+            )
+            .await?;
             write_copy_terminal_result_async(
                 stream,
                 engine,
                 session,
                 executor,
                 extended,
+                active,
                 ready_after_done,
                 result,
             )
@@ -770,6 +938,7 @@ pub(crate) async fn handle_copy_frame_async(
                 session,
                 executor,
                 extended,
+                active,
                 state,
                 Err(CopyWireError::client_aborted()),
             )
@@ -791,6 +960,7 @@ pub(crate) async fn handle_copy_frame_async(
                 session,
                 executor,
                 extended,
+                active,
                 state,
                 Err(CopyWireError::protocol(
                     "only CopyData, CopyDone, CopyFail, Flush, Sync, or Terminate is allowed during COPY FROM STDIN",
@@ -803,12 +973,39 @@ pub(crate) async fn handle_copy_frame_async(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn cancel_copy_async(
+    stream: &mut TokioTcpStream,
+    engine: Arc<SharedEngine>,
+    session: Arc<std::sync::Mutex<SharedSession>>,
+    executor: &Arc<tokio::sync::Semaphore>,
+    extended: &mut ExtendedSession,
+    copy_in: &mut Option<CopyInState>,
+    active: &ActiveRequest,
+) -> Result<(), String> {
+    let state = copy_in
+        .take()
+        .expect("COPY cancellation requires active state");
+    write_copy_terminal_async(
+        stream,
+        engine,
+        session,
+        executor,
+        extended,
+        active,
+        state,
+        Err(CopyWireError::query_cancelled()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn write_copy_terminal_async(
     stream: &mut TokioTcpStream,
     engine: Arc<SharedEngine>,
     session: Arc<std::sync::Mutex<SharedSession>>,
     executor: &Arc<tokio::sync::Semaphore>,
     extended: &mut ExtendedSession,
+    active: &ActiveRequest,
     state: CopyInState,
     result: Result<QueryOutcome, CopyWireError>,
 ) -> Result<(), String> {
@@ -819,6 +1016,7 @@ async fn write_copy_terminal_async(
         session,
         executor,
         extended,
+        active,
         ready_after_done,
         result,
     )
@@ -832,6 +1030,7 @@ async fn write_copy_terminal_result_async(
     session: Arc<std::sync::Mutex<SharedSession>>,
     executor: &Arc<tokio::sync::Semaphore>,
     extended: &mut ExtendedSession,
+    active: &ActiveRequest,
     ready_after_done: bool,
     result: Result<QueryOutcome, CopyWireError>,
 ) -> Result<(), String> {
@@ -852,6 +1051,7 @@ async fn write_copy_terminal_result_async(
             Arc::clone(&session),
             executor,
             extended,
+            active,
             &lifecycle,
             &mut response,
         )
@@ -866,4 +1066,301 @@ async fn write_copy_terminal_result_async(
         .write_all(&response)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cancellation::CancellationRegistry;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn copy_done_cancelled_while_queued_never_crosses_the_facade() {
+        let engine = Arc::new(SharedEngine::new());
+        let session = Arc::new(Mutex::new(engine.open_session()));
+        {
+            let mut session = session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            engine
+                .submit(
+                    &mut session,
+                    SubmissionRequest::Text(
+                        "CREATE TABLE queued_copy_finish (id int4 PRIMARY KEY, name text)",
+                    ),
+                )
+                .into_immediate()
+                .unwrap();
+        }
+        let copy = parse_copy_from_stdin("COPY queued_copy_finish FROM STDIN WITH CSV").unwrap();
+        let mut state = {
+            let mut session = session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            begin_copy_from(&engine, &mut session, copy, false)
+                .unwrap()
+                .0
+        };
+        append_copy_data(&mut state, b"1,queued\n").unwrap();
+
+        let executor = Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = Arc::new(CancellationRegistry::new());
+        let connection = registry.register();
+        let active = connection.begin_request().unwrap();
+        let finish = finish_copy_from_async(
+            Arc::clone(&engine),
+            Arc::clone(&session),
+            &executor,
+            state,
+            &active,
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            assert!(registry.cancel(
+                connection.backend_key().process_id(),
+                &connection.backend_key().secret_key_bytes(),
+            ));
+        };
+        let (finish, ()) = tokio::join!(finish, cancel);
+        let finish = finish.unwrap();
+        let Err(error) = finish else {
+            panic!("queued cancelled COPY unexpectedly published")
+        };
+        assert_eq!(error.code, "57014");
+        drop(active);
+
+        // Reusing the exact primary key proves the buffered row never reached facade CopyFrom.
+        let mut session = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        engine
+            .submit(
+                &mut session,
+                SubmissionRequest::Text("INSERT INTO queued_copy_finish VALUES (1, 'recovered')"),
+            )
+            .into_immediate()
+            .unwrap();
+    }
+
+    #[test]
+    fn copy_final_guard_blocks_a_buffered_row_at_the_last_pre_facade_point() {
+        let engine = SharedEngine::new();
+        let mut session = engine.open_session();
+        engine
+            .submit(
+                &mut session,
+                SubmissionRequest::Text(
+                    "CREATE TABLE guarded_copy_finish (id int4 PRIMARY KEY, name text)",
+                ),
+            )
+            .into_immediate()
+            .unwrap();
+        let copy = parse_copy_from_stdin("COPY guarded_copy_finish FROM STDIN WITH CSV").unwrap();
+        let mut state = begin_copy_from(&engine, &mut session, copy, false)
+            .unwrap()
+            .0;
+        append_copy_data(&mut state, b"1,guarded\n").unwrap();
+        let result = finish_copy_from_guarded(&engine, &mut session, state, || {
+            Err(CopyWireError::query_cancelled())
+        });
+        let Err(error) = result else {
+            panic!("final cancellation guard unexpectedly admitted COPY")
+        };
+        assert_eq!(error.code, "57014");
+
+        engine
+            .submit(
+                &mut session,
+                SubmissionRequest::Text("INSERT INTO guarded_copy_finish VALUES (1, 'recovered')"),
+            )
+            .into_immediate()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_async_copy_entry_cancels_at_a_zero_permit_boundary() {
+        let target_engine = Arc::new(SharedEngine::new());
+        let source_engine = SharedEngine::new();
+        let mut source_session = source_engine.open_session();
+        source_engine
+            .submit(
+                &mut source_session,
+                SubmissionRequest::Text(
+                    "CREATE TABLE queued_copy_source (id int4 PRIMARY KEY, name text)",
+                ),
+            )
+            .into_immediate()
+            .unwrap();
+        let source_from =
+            parse_copy_from_stdin("COPY queued_copy_source FROM STDIN WITH CSV").unwrap();
+        let source_target = match source_engine
+            .submit(
+                &mut source_session,
+                SubmissionRequest::CopyFromStart(&source_from),
+            )
+            .into_immediate()
+            .unwrap()
+        {
+            QueryOutcome::CopyIn { target } => target,
+            _ => panic!("COPY start returned the wrong outcome"),
+        };
+        let source_to =
+            parse_copy_to_stdout_table("COPY queued_copy_source TO STDOUT WITH CSV").unwrap();
+        let source_bound = source_engine
+            .prepare_statement(
+                &source_session,
+                "SELECT id, name FROM queued_copy_source",
+                &[],
+            )
+            .unwrap()
+            .bind_values(&[])
+            .unwrap();
+        let missing_from =
+            parse_copy_from_stdin("COPY queued_copy_missing FROM STDIN WITH CSV").unwrap();
+        let missing_to =
+            parse_copy_to_stdout_table("COPY queued_copy_missing TO STDOUT WITH CSV").unwrap();
+
+        // If any helper crossed its facade call, these exact inputs would return a non-57014
+        // unknown-relation or cross-engine owner error. Zero permits plus exact cancellation must
+        // instead stop all four helpers before that call.
+        let executor = Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = Arc::new(CancellationRegistry::new());
+        let connection = registry.register();
+
+        let active = connection.begin_request().unwrap();
+        let result = begin_copy_from_async(
+            Arc::clone(&target_engine),
+            Arc::new(Mutex::new(target_engine.open_session())),
+            &executor,
+            missing_from.clone(),
+            true,
+            &active,
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            assert!(registry.cancel(
+                connection.backend_key().process_id(),
+                &connection.backend_key().secret_key_bytes(),
+            ));
+        };
+        let (result, ()) = tokio::join!(result, cancel);
+        let Err(error) = result.unwrap() else {
+            panic!("queued simple COPY FROM unexpectedly crossed the facade")
+        };
+        assert_eq!(error.code, "57014");
+        drop(active);
+
+        let active = connection.begin_request().unwrap();
+        let result = begin_prepared_copy_from_async(
+            Arc::clone(&target_engine),
+            Arc::new(Mutex::new(target_engine.open_session())),
+            &executor,
+            source_from.clone(),
+            source_target.clone(),
+            false,
+            &active,
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            assert!(registry.cancel(
+                connection.backend_key().process_id(),
+                &connection.backend_key().secret_key_bytes(),
+            ));
+        };
+        let (result, ()) = tokio::join!(result, cancel);
+        let Err(error) = result.unwrap() else {
+            panic!("queued prepared COPY FROM unexpectedly crossed the facade")
+        };
+        assert_eq!(error.code, "57014");
+        drop(active);
+
+        let active = connection.begin_request().unwrap();
+        let result = execute_copy_to_async(
+            Arc::clone(&target_engine),
+            Arc::new(Mutex::new(target_engine.open_session())),
+            &executor,
+            missing_to.clone(),
+            &active,
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            assert!(registry.cancel(
+                connection.backend_key().process_id(),
+                &connection.backend_key().secret_key_bytes(),
+            ));
+        };
+        let (result, ()) = tokio::join!(result, cancel);
+        let Err(error) = result.unwrap() else {
+            panic!("queued simple COPY TO unexpectedly crossed the facade")
+        };
+        assert_eq!(error.code, "57014");
+        drop(active);
+
+        let active = connection.begin_request().unwrap();
+        let result = execute_prepared_copy_to_async(
+            Arc::clone(&target_engine),
+            Arc::new(Mutex::new(target_engine.open_session())),
+            &executor,
+            source_bound.clone(),
+            source_to.clone(),
+            &active,
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            assert!(registry.cancel(
+                connection.backend_key().process_id(),
+                &connection.backend_key().secret_key_bytes(),
+            ));
+        };
+        let (result, ()) = tokio::join!(result, cancel);
+        let Err(error) = result.unwrap() else {
+            panic!("queued prepared COPY TO unexpectedly crossed the facade")
+        };
+        assert_eq!(error.code, "57014");
+        assert_eq!(executor.available_permits(), 0);
+        let Err(error) = cancel_effect_free_success(
+            &active,
+            Err::<(), _>(CopyWireError {
+                code: "XX000",
+                message: "original COPY facade error".to_string(),
+            }),
+            CopyWireError::query_cancelled,
+        ) else {
+            panic!("COPY error unexpectedly became success")
+        };
+        assert_eq!(error.code, "XX000");
+        assert_eq!(error.message, "original COPY facade error");
+        drop(active);
+
+        // Prove the sentinels are non-vacuous: without cancellation, crossing each facade owner
+        // really does produce its original non-cancellation error.
+        let mut probe = target_engine.open_session();
+        let Err(error) = begin_copy_from(&target_engine, &mut probe, missing_from, true) else {
+            panic!("missing COPY FROM target unexpectedly resolved")
+        };
+        assert_ne!(error.code, "57014");
+        let mut probe = target_engine.open_session();
+        let Err(error) = begin_prepared_copy_from(
+            &target_engine,
+            &mut probe,
+            source_from,
+            source_target,
+            false,
+        ) else {
+            panic!("cross-engine COPY FROM target unexpectedly resolved")
+        };
+        assert_ne!(error.code, "57014");
+        let mut probe = target_engine.open_session();
+        let Err(error) = execute_copy_to(&target_engine, &mut probe, &missing_to) else {
+            panic!("missing COPY TO target unexpectedly resolved")
+        };
+        assert_ne!(error.code, "57014");
+        let mut probe = target_engine.open_session();
+        let Err(error) =
+            execute_prepared_copy_to(&target_engine, &mut probe, &source_bound, &source_to)
+        else {
+            panic!("cross-engine prepared COPY TO unexpectedly resolved")
+        };
+        assert_ne!(error.code, "57014");
+    }
 }

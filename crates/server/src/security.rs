@@ -18,6 +18,7 @@ use rustls::{ServerConfig as TlsServerConfig, ServerConnection, StreamOwned};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::cancellation::{CancellationRegistry, ConnectionCancellation};
 use crate::transport::{read_auth_frame, read_startup_frame, ReadWrite};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:5432";
@@ -26,6 +27,18 @@ const SCRAM_MAX_ITERATIONS: u32 = 10_000_000;
 const SCRAM_MAX_MESSAGE_BYTES: usize = 4096;
 const SCRAM_MAX_NONCE_BYTES: usize = 1024;
 const SCRAM_KEY_BYTES: usize = 32;
+const CANCEL_REQUEST_CODE: u32 = 80_877_102;
+
+/// PostgreSQL cancellation is a one-shot, no-response startup packet. If its identifying code is
+/// present but its frame is not exactly 16 bytes, close silently rather than routing the malformed
+/// packet through ordinary startup error reporting.
+pub(crate) fn is_malformed_cancel_request(frame: &[u8]) -> bool {
+    frame
+        .get(4..8)
+        .and_then(|code| <[u8; 4]>::try_from(code).ok())
+        .is_some_and(|code| u32::from_be_bytes(code) == CANCEL_REQUEST_CODE)
+        && frame.len() != 16
+}
 
 /// Complete process configuration for the canonical product server. Secret-bearing fields do not
 /// implement `Debug`, so ordinary configuration errors and panic reports cannot print credentials.
@@ -299,9 +312,8 @@ enum RuntimeProfile {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlainStartupAction {
-    Ready,
+    Ready(ConnectionCancellation),
     UpgradeTls,
     Close,
 }
@@ -339,10 +351,11 @@ impl RuntimeSecurity {
     pub(crate) fn accept_blocking(
         &self,
         mut stream: TcpStream,
-    ) -> io::Result<Option<Box<dyn ReadWrite + Send>>> {
+        cancellations: &Arc<CancellationRegistry>,
+    ) -> io::Result<Option<(Box<dyn ReadWrite + Send>, ConnectionCancellation)>> {
         let production = matches!(self.profile, RuntimeProfile::Production { .. });
-        match negotiate_plain_startup(&mut stream, production)? {
-            PlainStartupAction::Ready => Ok(Some(Box::new(stream))),
+        match negotiate_plain_startup(&mut stream, production, cancellations)? {
+            PlainStartupAction::Ready(cancellation) => Ok(Some((Box::new(stream), cancellation))),
             PlainStartupAction::Close => Ok(None),
             PlainStartupAction::UpgradeTls => {
                 let RuntimeProfile::Production {
@@ -359,8 +372,16 @@ impl RuntimeSecurity {
                 let connection = ServerConnection::new(Arc::clone(tls))
                     .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
                 let mut tls_stream = StreamOwned::new(connection, stream);
-                finish_tls_startup(&mut tls_stream, auth_user, verifier)
-                    .map(|ready| ready.then(|| Box::new(tls_stream) as Box<dyn ReadWrite + Send>))
+                finish_tls_startup(&mut tls_stream, auth_user, verifier, cancellations).map(
+                    |cancellation| {
+                        cancellation.map(|cancellation| {
+                            (
+                                Box::new(tls_stream) as Box<dyn ReadWrite + Send>,
+                                cancellation,
+                            )
+                        })
+                    },
+                )
             }
         }
     }
@@ -369,11 +390,15 @@ impl RuntimeSecurity {
 fn negotiate_plain_startup(
     stream: &mut dyn ReadWrite,
     production: bool,
+    cancellations: &Arc<CancellationRegistry>,
 ) -> io::Result<PlainStartupAction> {
     loop {
         let Some(frame) = read_startup_frame(stream)? else {
             return Ok(PlainStartupAction::Close);
         };
+        if is_malformed_cancel_request(&frame) {
+            return Ok(PlainStartupAction::Close);
+        }
         match parse_startup_or_error(stream, &frame)? {
             StartupPacket::SslRequest if production => {
                 stream.write_all(b"S")?;
@@ -384,12 +409,19 @@ fn negotiate_plain_startup(
                 stream.write_all(b"N")?;
                 stream.flush()?;
             }
-            StartupPacket::CancelRequest { .. } => return Ok(PlainStartupAction::Close),
+            StartupPacket::CancelRequest {
+                process_id,
+                secret_key,
+            } => {
+                cancellations.cancel(process_id, &secret_key);
+                return Ok(PlainStartupAction::Close);
+            }
             StartupPacket::Startup { .. } if production => return tls_required(stream),
             StartupPacket::Startup { .. } => {
+                let cancellation = cancellations.register();
                 write_authentication_ok(stream)?;
-                write_startup_ready(stream)?;
-                return Ok(PlainStartupAction::Ready);
+                write_startup_ready(stream, cancellation.backend_key())?;
+                return Ok(PlainStartupAction::Ready(cancellation));
             }
         }
     }
@@ -399,11 +431,15 @@ fn finish_tls_startup(
     stream: &mut dyn ReadWrite,
     auth_user: &str,
     verifier: &ScramVerifier,
-) -> io::Result<bool> {
+    cancellations: &Arc<CancellationRegistry>,
+) -> io::Result<Option<ConnectionCancellation>> {
     loop {
         let Some(frame) = read_startup_frame(stream)? else {
-            return Ok(false);
+            return Ok(None);
         };
+        if is_malformed_cancel_request(&frame) {
+            return Ok(None);
+        }
         match parse_startup_or_error(stream, &frame)? {
             StartupPacket::SslRequest => {
                 return protocol_failure(stream, "nested SSLRequest is not supported");
@@ -412,20 +448,32 @@ fn finish_tls_startup(
                 stream.write_all(b"N")?;
                 stream.flush()?;
             }
-            StartupPacket::CancelRequest { .. } => return Ok(false),
+            StartupPacket::CancelRequest {
+                process_id,
+                secret_key,
+            } => {
+                cancellations.cancel(process_id, &secret_key);
+                return Ok(None);
+            }
             StartupPacket::Startup { params, .. } => {
                 authenticate_scram_sha256(stream, auth_user, verifier, &params)?;
-                write_startup_ready(stream)?;
-                return Ok(true);
+                let cancellation = cancellations.register();
+                write_startup_ready(stream, cancellation.backend_key())?;
+                return Ok(Some(cancellation));
             }
         }
     }
 }
 
-pub(crate) fn complete_local_startup(stream: &mut dyn ReadWrite) -> Result<bool, String> {
-    match negotiate_plain_startup(stream, false).map_err(|error| error.to_string())? {
-        PlainStartupAction::Ready => Ok(true),
-        PlainStartupAction::Close => Ok(false),
+pub(crate) fn complete_local_startup(
+    stream: &mut dyn ReadWrite,
+    cancellations: &Arc<CancellationRegistry>,
+) -> Result<Option<ConnectionCancellation>, String> {
+    match negotiate_plain_startup(stream, false, cancellations)
+        .map_err(|error| error.to_string())?
+    {
+        PlainStartupAction::Ready(cancellation) => Ok(Some(cancellation)),
+        PlainStartupAction::Close => Ok(None),
         PlainStartupAction::UpgradeTls => Err(String::from(
             "local-dev startup unexpectedly requested a TLS upgrade",
         )),
@@ -489,8 +537,11 @@ fn write_authentication_ok(stream: &mut dyn ReadWrite) -> io::Result<()> {
     BackendWriter::new(&mut *stream).authentication_ok()
 }
 
-fn write_startup_ready(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    stream.write_all(&crate::encode_startup_statuses_and_ready()?)?;
+fn write_startup_ready(
+    stream: &mut dyn ReadWrite,
+    backend_key: &crate::cancellation::BackendKey,
+) -> io::Result<()> {
+    stream.write_all(&crate::encode_startup_statuses_and_ready(backend_key)?)?;
     stream.flush()
 }
 
@@ -1174,6 +1225,7 @@ mod tests {
         const SSL_REQUEST: u32 = 80_877_103;
         const GSS_REQUEST: u32 = 80_877_104;
         const CANCEL_REQUEST: u32 = 80_877_102;
+        let cancellations = Arc::new(CancellationRegistry::new());
 
         let mut gss_then_ssl = ScriptedIo::new(
             [
@@ -1182,58 +1234,112 @@ mod tests {
             ]
             .concat(),
         );
-        assert_eq!(
-            negotiate_plain_startup(&mut gss_then_ssl, true).unwrap(),
+        assert!(matches!(
+            negotiate_plain_startup(&mut gss_then_ssl, true, &cancellations).unwrap(),
             PlainStartupAction::UpgradeTls
-        );
+        ));
         assert_eq!(gss_then_ssl.output, b"NS");
 
         let mut direct_plaintext = ScriptedIo::new(startup_message("gpudb"));
-        assert_eq!(
-            negotiate_plain_startup(&mut direct_plaintext, true)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::PermissionDenied
-        );
+        let Err(error) = negotiate_plain_startup(&mut direct_plaintext, true, &cancellations)
+        else {
+            panic!("production plaintext startup unexpectedly succeeded");
+        };
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         assert_eq!(direct_plaintext.output.first(), Some(&b'E'));
         assert!(direct_plaintext
             .output
             .windows(b"C28000\0".len())
             .any(|window| window == b"C28000\0"));
 
-        let cancel_suffix = [1_u32.to_be_bytes(), 2_u32.to_be_bytes()].concat();
+        let registered = cancellations.register();
+        let direct_active = registered.begin_request().unwrap();
+        let cancel_suffix = [
+            registered.backend_key().process_id().to_be_bytes().to_vec(),
+            registered.backend_key().secret_key_bytes().to_vec(),
+        ]
+        .concat();
         let mut direct_cancel = ScriptedIo::new(startup_code(CANCEL_REQUEST, &cancel_suffix));
-        assert_eq!(
-            negotiate_plain_startup(&mut direct_cancel, true).unwrap(),
+        assert!(matches!(
+            negotiate_plain_startup(&mut direct_cancel, true, &cancellations).unwrap(),
             PlainStartupAction::Close
-        );
+        ));
         assert!(direct_cancel.output.is_empty());
+        assert!(direct_active.is_cancelled());
+        drop(direct_active);
 
         let verifier = ScramVerifier::from_password(b"secret", b"salt", 4096);
         let mut nested_ssl = ScriptedIo::new(startup_code(SSL_REQUEST, &[]));
-        assert_eq!(
-            finish_tls_startup(&mut nested_ssl, "gpudb", &verifier)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidData
-        );
+        let Err(error) = finish_tls_startup(&mut nested_ssl, "gpudb", &verifier, &cancellations)
+        else {
+            panic!("nested TLS startup unexpectedly succeeded");
+        };
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert_eq!(nested_ssl.output.first(), Some(&b'E'));
         assert!(nested_ssl
             .output
             .windows(b"C08P01\0".len())
             .any(|window| window == b"C08P01\0"));
 
+        let tls_active = registered.begin_request().unwrap();
         let mut tls_cancel = ScriptedIo::new(startup_code(CANCEL_REQUEST, &cancel_suffix));
-        assert!(!finish_tls_startup(&mut tls_cancel, "gpudb", &verifier).unwrap());
+        assert!(
+            finish_tls_startup(&mut tls_cancel, "gpudb", &verifier, &cancellations)
+                .unwrap()
+                .is_none()
+        );
         assert!(tls_cancel.output.is_empty());
+        assert!(tls_active.is_cancelled());
+        drop(tls_active);
+
+        let malformed_target = cancellations.register();
+        let malformed_active = malformed_target.begin_request().unwrap();
+        let process_id = malformed_target.backend_key().process_id().to_be_bytes();
+        let secret = malformed_target.backend_key().secret_key_bytes();
+        let mut short_suffix = process_id.to_vec();
+        short_suffix.extend_from_slice(&secret[..3]);
+        let mut short_direct = ScriptedIo::new(startup_code(CANCEL_REQUEST, &short_suffix));
+        assert!(matches!(
+            negotiate_plain_startup(&mut short_direct, true, &cancellations).unwrap(),
+            PlainStartupAction::Close
+        ));
+        assert!(short_direct.output.is_empty());
+        assert!(!malformed_active.is_cancelled());
+
+        let mut oversized_suffix = process_id.to_vec();
+        oversized_suffix.extend_from_slice(&secret);
+        oversized_suffix.push(0);
+        let mut oversized_direct = ScriptedIo::new(startup_code(CANCEL_REQUEST, &oversized_suffix));
+        assert!(matches!(
+            negotiate_plain_startup(&mut oversized_direct, true, &cancellations).unwrap(),
+            PlainStartupAction::Close
+        ));
+        assert!(oversized_direct.output.is_empty());
+        assert!(!malformed_active.is_cancelled());
+
+        let mut short_tls = ScriptedIo::new(startup_code(CANCEL_REQUEST, &short_suffix));
+        assert!(
+            finish_tls_startup(&mut short_tls, "gpudb", &verifier, &cancellations)
+                .unwrap()
+                .is_none()
+        );
+        assert!(short_tls.output.is_empty());
+        assert!(!malformed_active.is_cancelled());
+
+        let mut oversized_tls = ScriptedIo::new(startup_code(CANCEL_REQUEST, &oversized_suffix));
+        assert!(
+            finish_tls_startup(&mut oversized_tls, "gpudb", &verifier, &cancellations,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(oversized_tls.output.is_empty());
+        assert!(!malformed_active.is_cancelled());
 
         let mut malformed = ScriptedIo::new(startup_code(42, &[]));
-        assert_eq!(
-            negotiate_plain_startup(&mut malformed, true)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidData
-        );
+        let Err(error) = negotiate_plain_startup(&mut malformed, true, &cancellations) else {
+            panic!("malformed startup unexpectedly succeeded");
+        };
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert_eq!(malformed.output.first(), Some(&b'E'));
         assert!(malformed
             .output

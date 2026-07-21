@@ -356,6 +356,7 @@ pub fn error_sqlstate(category: ErrorCategory) -> &'static str {
         ErrorCategory::DatatypeMismatch => "42804",
         ErrorCategory::InvalidRequest => "08P01",
         ErrorCategory::ResourceExhausted => "53000",
+        ErrorCategory::Cancelled => "57014",
         ErrorCategory::InFailedTransaction => "25P02",
         ErrorCategory::UniqueViolation => "23505",
         ErrorCategory::Engine => "XX000",
@@ -535,6 +536,7 @@ mod tests {
         assert_eq!(error_sqlstate(ErrorCategory::Syntax), "42601");
         assert_eq!(error_sqlstate(ErrorCategory::Unsupported), "0A000");
         assert_eq!(error_sqlstate(ErrorCategory::DuplicateColumn), "42701");
+        assert_eq!(error_sqlstate(ErrorCategory::Cancelled), "57014");
         assert_eq!(error_sqlstate(ErrorCategory::UniqueViolation), "23505");
         assert_eq!(error_sqlstate(ErrorCategory::Engine), "XX000");
     }

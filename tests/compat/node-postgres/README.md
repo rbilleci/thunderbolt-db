@@ -9,4 +9,7 @@ npm ci
 npm test
 ```
 
-The smoke builds and starts `gpu-db-server`, then covers startup, simple query, named prepared/bound `SELECT`, empty results, explicit unsupported broader `COPY ... WITH CSV` options, same-session recovery, pooled query, and reconnect behavior.
+The smoke builds and starts the canonical facade-backed `gpu-db-engine-server`, then covers startup
+and parsed BackendKeyData, simple query, named prepared/bound `SELECT`, empty results, explicit
+unsupported broader `COPY ... WITH CSV` options, same-session recovery, pooled query, and reconnect
+behavior.

@@ -970,6 +970,23 @@ impl ExtendedSession {
             .is_some_and(|portal| portal.transaction_exit)
     }
 
+    /// Whether a cached portal result can still be replaced by a cancellation error before any
+    /// bytes are published to the client. Rows and empty outcomes are effect-free. Any error may
+    /// represent an indeterminate post-durable failure, while a Command or RETURNING outcome may
+    /// represent an already-published mutation; neither may be falsely relabelled.
+    pub(crate) fn portal_outcome_can_be_cancelled(
+        &self,
+        portal_name: &str,
+    ) -> Result<bool, ExtendedError> {
+        let portal = self.portals.get(portal_name).ok_or_else(|| {
+            ExtendedError::new("34000", format!("portal \"{portal_name}\" does not exist"))
+        })?;
+        Ok(matches!(
+            portal.outcome.as_ref(),
+            Some(Ok(QueryOutcome::Rows { .. } | QueryOutcome::Empty))
+        ))
+    }
+
     pub(crate) fn set_execution_outcome(
         &mut self,
         portal_name: &str,

@@ -193,6 +193,9 @@ pub enum ErrorCategory {
     /// The engine refused a bounded pre-effect admission because its foreground resource or
     /// queue-time credits were unavailable. PostgreSQL adapters map this to class 53.
     ResourceExhausted,
+    /// The protocol owner cancelled active effect-free work before admission or before exposing
+    /// its result. A successful mutation is never rewritten into this category after publication.
+    Cancelled,
     InFailedTransaction,
     UniqueViolation,
     Engine,

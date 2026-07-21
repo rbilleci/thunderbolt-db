@@ -35,7 +35,7 @@
 //!   little throughput for connection *scale*; thread-per-conn `serve` stays the
 //!   higher-throughput choice at a few hundred connections.
 
-use std::io::{self, ErrorKind};
+use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
@@ -44,24 +44,37 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use gpu_db_facade::{
-    pg_adapter, BoundPreparedStatement, CommandTag, DbError, ErrorCategory, PointLookupBatcher,
+    BoundPreparedStatement, CommandTag, DbError, ErrorCategory, PointLookupBatcher,
     PreparedStatement, QueryOutcome, SessionTransactionStatus, SharedEngine, SharedSession,
-    SubmissionDispatch, SubmissionRequest,
+    SubmissionRequest,
 };
-use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, split_simple_query, Command,
-    StartupPacket, TransactionStatus as WireTransactionStatus,
+    StartupPacket,
 };
 
+mod async_submit;
+use async_submit::{
+    analyze_prepare_cancellable, bind_cancellable,
+    complete_simple_query_action as complete_simple_query_action_async,
+    execute_batchable_or_fallback,
+    execute_prepared_cancellable as execute_prepared_shared_session_blocking_cancellable,
+    execute_text as execute_shared_session_blocking,
+    execute_text_cancellable as execute_shared_session_blocking_cancellable,
+    revalidate_description_cancellable,
+};
+mod cancellation;
+use cancellation::{
+    cancel_effect_free_success, ActiveRequest, CancellationRegistry, ConnectionCancellation,
+};
 mod copy;
 use copy::{
     begin_copy_from, begin_copy_from_async, begin_prepared_copy_from,
-    begin_prepared_copy_from_async, classify_copy_statement, copy_lifecycle_error,
-    copy_lifecycle_success, encode_copy_error, execute_copy_to, execute_copy_to_async,
-    execute_prepared_copy_to, execute_prepared_copy_to_async, handle_copy_frame_async,
-    handle_copy_frame_blocking, mark_shared_session_failed, CopyClassification, CopyInState,
-    CopyStatement, CopyWireError,
+    begin_prepared_copy_from_async, cancel_copy_async, cancel_copy_blocking,
+    classify_copy_statement, copy_lifecycle_error, copy_lifecycle_success, encode_copy_error,
+    execute_copy_to, execute_copy_to_async, execute_prepared_copy_to,
+    execute_prepared_copy_to_async, handle_copy_frame_async, handle_copy_frame_blocking,
+    mark_shared_session_failed, CopyClassification, CopyInState, CopyStatement, CopyWireError,
 };
 mod extended;
 use extended::{
@@ -72,7 +85,18 @@ mod security;
 use security::complete_local_startup;
 pub use security::ServerConfig;
 mod transport;
-use transport::{read_startup_frame_async, read_tagged_frame, read_tagged_frame_async, ReadWrite};
+use transport::{
+    read_startup_frame_async, read_tagged_frame, read_tagged_frame_async,
+    read_tagged_frame_polling_cancel, read_tagged_frame_polling_cancel_async, PolledTaggedFrame,
+    ReadWrite,
+};
+mod wire_response;
+use wire_response::{
+    cancellation_checked_outcome, cancellation_error, encode_cancellable_outcome_messages,
+    encode_execute_cancellable, encode_extended_error, encode_frontend_message_error,
+    encode_io_error, encode_optional_error_and_ready, encode_outcome, encode_outcome_messages,
+    encode_ready, encode_startup_handshake, encode_startup_statuses_and_ready,
+};
 
 /// Serve connections **concurrently** on `listener`: one engine shared across a
 /// thread-per-connection worker pool (`Arc<SharedEngine>`), each statement dispatched
@@ -94,21 +118,31 @@ pub fn serve_configured(config: ServerConfig) -> io::Result<()> {
     let listener = TcpListener::bind(&listen)?;
     let engine = shared_engine_from_env()?;
     let security = Arc::new(security);
+    let cancellations = Arc::new(CancellationRegistry::new());
     eprintln!("gpu-db-engine-server (facade-backed) listening on {listen}");
     for stream in listener.incoming() {
         let stream = stream?;
         let _ = stream.set_nodelay(true);
+        let timeout_control = stream.try_clone()?;
         let engine = Arc::clone(&engine);
         let security = Arc::clone(&security);
-        thread::spawn(move || match security.accept_blocking(stream) {
-            Ok(Some(mut stream)) => {
-                if let Err(error) = handle_ready_connection(stream.as_mut(), &engine) {
-                    eprintln!("gpu-db-engine-server connection error: {error}");
+        let cancellations = Arc::clone(&cancellations);
+        thread::spawn(
+            move || match security.accept_blocking(stream, &cancellations) {
+                Ok(Some((mut stream, cancellation))) => {
+                    if let Err(error) = handle_ready_connection(
+                        stream.as_mut(),
+                        &engine,
+                        &cancellation,
+                        Some(&timeout_control),
+                    ) {
+                        eprintln!("gpu-db-engine-server connection error: {error}");
+                    }
                 }
-            }
-            Ok(None) => {}
-            Err(error) => eprintln!("gpu-db-engine-server startup error: {error}"),
-        });
+                Ok(None) => {}
+                Err(error) => eprintln!("gpu-db-engine-server startup error: {error}"),
+            },
+        );
     }
     Ok(())
 }
@@ -131,6 +165,7 @@ fn shared_engine_from_env() -> io::Result<Arc<SharedEngine>> {
 /// `serve` over a caller-provided shared engine — e.g. one pre-warmed to GPU residency
 /// before serving (the GPU-retained benchmark).
 pub fn serve_with_engine(listener: TcpListener, engine: Arc<SharedEngine>) -> io::Result<()> {
+    let cancellations = Arc::new(CancellationRegistry::new());
     for stream in listener.incoming() {
         let stream = stream?;
         // Disable Nagle: pgwire responses are several small frames (RowDescription, DataRow,
@@ -138,9 +173,10 @@ pub fn serve_with_engine(listener: TcpListener, engine: Arc<SharedEngine>) -> io
         // reply ~40ms on loopback. Surfaced by the P1-M4 load harness.
         let _ = stream.set_nodelay(true);
         let engine = Arc::clone(&engine);
+        let cancellations = Arc::clone(&cancellations);
         thread::spawn(move || {
             let mut stream = stream;
-            if let Err(err) = handle_connection(&mut stream, &engine) {
+            if let Err(err) = handle_connection_registered(&mut stream, &engine, &cancellations) {
                 eprintln!("gpu-db-engine-server connection error: {err}");
             }
         });
@@ -152,10 +188,11 @@ pub fn serve_with_engine(listener: TcpListener, engine: Arc<SharedEngine>) -> io
 /// handler. Only connection acceptance is serial; this is the P1-M4 A/B baseline.
 pub fn serve_sequential(listener: TcpListener) -> io::Result<()> {
     let engine = shared_engine_from_env()?;
+    let cancellations = Arc::new(CancellationRegistry::new());
     for stream in listener.incoming() {
         let mut stream = stream?;
         let _ = stream.set_nodelay(true);
-        if let Err(err) = handle_connection(&mut stream, &engine) {
+        if let Err(err) = handle_connection_registered(&mut stream, &engine, &cancellations) {
             eprintln!("gpu-db-engine-server connection error: {err}");
         }
     }
@@ -164,25 +201,40 @@ pub fn serve_sequential(listener: TcpListener) -> io::Result<()> {
 
 /// Drive the startup handshake. Returns `Ok(false)` if the client disconnected before sending a
 /// real startup message.
-fn complete_startup(stream: &mut TcpStream) -> Result<bool, String> {
-    complete_local_startup(stream)
+fn complete_startup(
+    stream: &mut TcpStream,
+    cancellations: &Arc<CancellationRegistry>,
+) -> Result<Option<ConnectionCancellation>, String> {
+    complete_local_startup(stream, cancellations)
 }
 
 /// Handle one connection against the shared engine: startup handshake, then a simple-query loop
 /// dispatched through the session-aware shared façade (one transaction owner per connection).
 pub fn handle_connection(stream: &mut TcpStream, engine: &SharedEngine) -> Result<(), String> {
-    if !complete_startup(stream)? {
+    let cancellations = Arc::new(CancellationRegistry::new());
+    handle_connection_registered(stream, engine, &cancellations)
+}
+
+fn handle_connection_registered(
+    stream: &mut TcpStream,
+    engine: &SharedEngine,
+    cancellations: &Arc<CancellationRegistry>,
+) -> Result<(), String> {
+    let Some(cancellation) = complete_startup(stream, cancellations)? else {
         return Ok(());
-    }
-    handle_ready_connection(stream, engine)
+    };
+    let timeout_control = stream.try_clone().map_err(|error| error.to_string())?;
+    handle_ready_connection(stream, engine, &cancellation, Some(&timeout_control))
 }
 
 fn handle_ready_connection(
     stream: &mut dyn ReadWrite,
     engine: &SharedEngine,
+    cancellation: &ConnectionCancellation,
+    timeout_control: Option<&TcpStream>,
 ) -> Result<(), String> {
     let mut session = engine.open_session();
-    let result = run_shared_query_loop(stream, engine, &mut session);
+    let result = run_shared_query_loop(stream, engine, &mut session, cancellation, timeout_control);
     let _ = engine.submit(&mut session, SubmissionRequest::CloseSession);
     result
 }
@@ -205,6 +257,30 @@ fn submit_prepared(
     engine
         .submit(session, SubmissionRequest::Prepared(bound))
         .into_immediate()
+}
+
+fn submit_text_cancellable(
+    engine: &SharedEngine,
+    session: &mut SharedSession,
+    sql: &str,
+    active: &ActiveRequest,
+) -> Result<QueryOutcome, DbError> {
+    if active.is_cancelled() {
+        return Err(cancellation_error());
+    }
+    cancellation_checked_outcome(active, submit_text(engine, session, sql))
+}
+
+fn submit_prepared_cancellable(
+    engine: &SharedEngine,
+    session: &mut SharedSession,
+    bound: &BoundPreparedStatement,
+    active: &ActiveRequest,
+) -> Result<QueryOutcome, DbError> {
+    if active.is_cancelled() {
+        return Err(cancellation_error());
+    }
+    cancellation_checked_outcome(active, submit_prepared(engine, session, bound))
 }
 
 fn outcome_is_transaction_control(outcome: &Result<QueryOutcome, DbError>) -> bool {
@@ -279,13 +355,37 @@ fn execute_simple_query_blocking(
     extended: &mut ExtendedSession,
     copy_in: &mut Option<CopyInState>,
     sql: &str,
+    active: &ActiveRequest,
 ) -> io::Result<Vec<u8>> {
     extended.clear_unnamed_for_simple_query();
+    if active.is_cancelled() {
+        let outcome = Err(cancellation_error());
+        let mut response = encode_outcome_messages(outcome.clone())?;
+        complete_simple_query_action_blocking(
+            engine,
+            session,
+            extended,
+            active,
+            &outcome,
+            &mut response,
+        )?;
+        let status = session.transaction_status();
+        extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+        response.extend_from_slice(&encode_ready(status)?);
+        return Ok(response);
+    }
     let statements = split_simple_query(sql);
     if statements.is_empty() {
-        let outcome = Ok(QueryOutcome::Empty);
+        let outcome = cancellation_checked_outcome(active, Ok(QueryOutcome::Empty));
         let mut response = encode_outcome_messages(outcome.clone())?;
-        complete_simple_query_action_blocking(engine, session, extended, &outcome, &mut response)?;
+        complete_simple_query_action_blocking(
+            engine,
+            session,
+            extended,
+            active,
+            &outcome,
+            &mut response,
+        )?;
         let status = session.transaction_status();
         extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
         response.extend_from_slice(&encode_ready(status)?);
@@ -299,7 +399,14 @@ fn execute_simple_query_blocking(
         session.mark_transaction_failed();
         let outcome = Err(error);
         let mut response = encode_outcome_messages(outcome.clone())?;
-        complete_simple_query_action_blocking(engine, session, extended, &outcome, &mut response)?;
+        complete_simple_query_action_blocking(
+            engine,
+            session,
+            extended,
+            active,
+            &outcome,
+            &mut response,
+        )?;
         let status = session.transaction_status();
         extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
         response.extend_from_slice(&encode_ready(status)?);
@@ -317,7 +424,14 @@ fn execute_simple_query_blocking(
         session.mark_transaction_failed();
         let outcome = Err(error);
         let mut response = encode_outcome_messages(outcome.clone())?;
-        complete_simple_query_action_blocking(engine, session, extended, &outcome, &mut response)?;
+        complete_simple_query_action_blocking(
+            engine,
+            session,
+            extended,
+            active,
+            &outcome,
+            &mut response,
+        )?;
         let status = session.transaction_status();
         extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
         response.extend_from_slice(&encode_ready(status)?);
@@ -338,6 +452,7 @@ fn execute_simple_query_blocking(
                     engine,
                     session,
                     extended,
+                    active,
                     &outcome,
                     &mut response,
                 )?;
@@ -347,7 +462,12 @@ fn execute_simple_query_blocking(
                 return Ok(response);
             }
             CopyClassification::Supported(CopyStatement::To(copy)) => {
-                let result = execute_copy_to(engine, session, &copy);
+                let result = if active.is_cancelled() {
+                    Err(CopyWireError::query_cancelled())
+                } else {
+                    let result = execute_copy_to(engine, session, &copy);
+                    cancel_effect_free_success(active, result, CopyWireError::query_cancelled)
+                };
                 let lifecycle = result
                     .as_ref()
                     .map(|_| copy_lifecycle_success())
@@ -363,6 +483,7 @@ fn execute_simple_query_blocking(
                     engine,
                     session,
                     extended,
+                    active,
                     &lifecycle,
                     &mut response,
                 )?;
@@ -372,7 +493,13 @@ fn execute_simple_query_blocking(
                 return Ok(response);
             }
             CopyClassification::Supported(CopyStatement::From(copy)) => {
-                return match begin_copy_from(engine, session, copy, true) {
+                let result = if active.is_cancelled() {
+                    Err(CopyWireError::query_cancelled())
+                } else {
+                    let result = begin_copy_from(engine, session, copy, true);
+                    cancel_effect_free_success(active, result, CopyWireError::query_cancelled)
+                };
+                return match result {
                     Ok((state, response)) => {
                         *copy_in = Some(state);
                         Ok(response)
@@ -385,6 +512,7 @@ fn execute_simple_query_blocking(
                             engine,
                             session,
                             extended,
+                            active,
                             &lifecycle,
                             &mut response,
                         )?;
@@ -404,20 +532,21 @@ fn execute_simple_query_blocking(
         if let Some(begin) =
             simple_query_segment_begin(&statements[index..], session.transaction_status(), extended)
         {
-            if let Err(error) = submit_text(engine, session, begin) {
+            if let Err(error) = submit_text_cancellable(engine, session, begin, active) {
                 response.extend_from_slice(&encode_outcome_messages(Err(error))?);
                 break;
             }
             extended.complete_transaction_action(TransactionAction::BeginImplicit, true);
         }
-        let outcome = submit_text(engine, session, statement);
-        response.extend_from_slice(&encode_outcome_messages(outcome.clone())?);
+        let mut outcome = submit_text_cancellable(engine, session, statement, active);
+        response.extend_from_slice(&encode_cancellable_outcome_messages(active, &mut outcome)?);
         let failed = outcome.is_err();
         if failed || outcome_is_transaction_control(&outcome) {
             complete_simple_query_action_blocking(
                 engine,
                 session,
                 extended,
+                active,
                 &outcome,
                 &mut response,
             )?;
@@ -432,6 +561,7 @@ fn execute_simple_query_blocking(
             engine,
             session,
             extended,
+            active,
             &last_outcome,
             &mut response,
         )?;
@@ -446,15 +576,24 @@ fn complete_simple_query_action_blocking(
     engine: &SharedEngine,
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
+    active: &ActiveRequest,
     outcome: &Result<QueryOutcome, DbError>,
     response: &mut Vec<u8>,
 ) -> io::Result<()> {
+    if outcome.is_err() {
+        session.mark_transaction_failed();
+    }
     let action = extended.simple_query_completion_action(outcome);
     let Some(sql) = action.sql() else {
         extended.complete_transaction_action(action, true);
         return Ok(());
     };
-    match submit_text(engine, session, sql) {
+    let completion = if matches!(action, TransactionAction::CommitImplicit) {
+        submit_text_cancellable(engine, session, sql, active)
+    } else {
+        submit_text(engine, session, sql)
+    };
+    match completion {
         Ok(_) => extended.complete_transaction_action(action, true),
         Err(error) => {
             response.extend_from_slice(&encode_outcome_messages(Err(error))?);
@@ -468,27 +607,118 @@ fn complete_simple_query_action_blocking(
     Ok(())
 }
 
+fn cancelled_simple_copy_needs_drain(
+    copy_in: &Option<CopyInState>,
+    consumed_tag: Option<u8>,
+) -> bool {
+    copy_in.as_ref().is_some_and(CopyInState::ready_after_done)
+        && !matches!(consumed_tag, Some(b'c' | b'f'))
+}
+
+fn drain_cancelled_simple_copy_frame(draining: &mut bool, tag: u8) -> bool {
+    if !*draining {
+        return false;
+    }
+    match tag {
+        b'd' | b'H' => true,
+        b'c' | b'f' => {
+            *draining = false;
+            true
+        }
+        _ => {
+            *draining = false;
+            false
+        }
+    }
+}
+
 fn run_shared_query_loop(
     stream: &mut dyn ReadWrite,
     engine: &SharedEngine,
     session: &mut SharedSession,
+    cancellation: &ConnectionCancellation,
+    timeout_control: Option<&TcpStream>,
 ) -> Result<(), String> {
     let mut extended = ExtendedSession::default();
     let mut copy_in = None;
-    while let Some(frame) = read_tagged_frame(stream).map_err(|err| err.to_string())? {
+    let mut copy_request: Option<ActiveRequest> = None;
+    let mut draining_cancelled_simple_copy = false;
+    loop {
+        let polled = if copy_in.is_some() {
+            let active = copy_request
+                .as_ref()
+                .expect("COPY state retains its active request");
+            match timeout_control {
+                Some(timeout_control) => {
+                    read_tagged_frame_polling_cancel(stream, timeout_control, || {
+                        active.is_cancelled()
+                    })
+                    .map_err(|error| error.to_string())?
+                }
+                None if active.is_cancelled() => PolledTaggedFrame::Cancelled,
+                None => PolledTaggedFrame::Frame(
+                    read_tagged_frame(stream).map_err(|error| error.to_string())?,
+                ),
+            }
+        } else {
+            PolledTaggedFrame::Frame(read_tagged_frame(stream).map_err(|error| error.to_string())?)
+        };
+        let frame = match polled {
+            PolledTaggedFrame::Frame(Some(frame)) => frame,
+            PolledTaggedFrame::Frame(None) => break,
+            PolledTaggedFrame::Cancelled => {
+                draining_cancelled_simple_copy = cancelled_simple_copy_needs_drain(&copy_in, None);
+                let active = copy_request
+                    .as_ref()
+                    .expect("COPY cancellation retains its active request");
+                cancel_copy_blocking(stream, engine, session, &mut extended, &mut copy_in, active)?;
+                copy_request.take();
+                continue;
+            }
+        };
+        if drain_cancelled_simple_copy_frame(&mut draining_cancelled_simple_copy, frame[0]) {
+            continue;
+        }
         if copy_in.is_some() {
-            if !handle_copy_frame_blocking(
-                stream,
-                engine,
-                session,
-                &mut extended,
-                &mut copy_in,
-                &frame,
-            )? {
-                break;
+            let active = copy_request
+                .take()
+                .expect("COPY frame retains its active request");
+            if active.is_cancelled() {
+                draining_cancelled_simple_copy =
+                    cancelled_simple_copy_needs_drain(&copy_in, Some(frame[0]));
+                cancel_copy_blocking(
+                    stream,
+                    engine,
+                    session,
+                    &mut extended,
+                    &mut copy_in,
+                    &active,
+                )?;
+            } else {
+                let simple_copy = copy_in.as_ref().is_some_and(CopyInState::ready_after_done);
+                if !handle_copy_frame_blocking(
+                    stream,
+                    engine,
+                    session,
+                    &mut extended,
+                    &mut copy_in,
+                    &active,
+                    &frame,
+                )? {
+                    break;
+                }
+                if simple_copy && copy_in.is_none() && !matches!(frame[0], b'c' | b'f') {
+                    draining_cancelled_simple_copy = true;
+                }
+            }
+            if copy_in.is_some() {
+                copy_request = Some(active);
             }
             continue;
         }
+        let active = cancellation
+            .begin_request()
+            .map_err(|error| error.to_string())?;
         match extended.skipping_frame_action(frame[0]) {
             SkippingFrameAction::Parse => {}
             SkippingFrameAction::Discard => continue,
@@ -551,10 +781,28 @@ fn run_shared_query_loop(
                 continue;
             }
         };
+        if active.is_cancelled()
+            && !matches!(
+                &message,
+                gpu_db_protocol::FrontendMessage::SimpleQuery(_)
+                    | gpu_db_protocol::FrontendMessage::Sync
+                    | gpu_db_protocol::FrontendMessage::Terminate
+            )
+        {
+            session.mark_transaction_failed();
+            extended.fail();
+            stream
+                .write_all(&encode_extended_error(extended::ExtendedError::new(
+                    "57014",
+                    "canceling statement due to user request",
+                )))
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         let transaction_action =
             extended.before_dispatch_transaction_action(&message, session.transaction_status());
         if let Some(sql) = transaction_action.sql() {
-            if let Err(error) = submit_text(engine, session, sql) {
+            if let Err(error) = submit_text_cancellable(engine, session, sql, &active) {
                 extended.complete_transaction_action(transaction_action, false);
                 extended.fail();
                 stream
@@ -565,10 +813,15 @@ fn run_shared_query_loop(
             extended.complete_transaction_action(transaction_action, true);
         }
         let response = match extended.dispatch(message, session.transaction_status()) {
-            ExtendedDispatch::SimpleQuery(sql) => {
-                execute_simple_query_blocking(engine, session, &mut extended, &mut copy_in, &sql)
-                    .map_err(encode_io_error)
-            }
+            ExtendedDispatch::SimpleQuery(sql) => execute_simple_query_blocking(
+                engine,
+                session,
+                &mut extended,
+                &mut copy_in,
+                &sql,
+                &active,
+            )
+            .map_err(encode_io_error),
             ExtendedDispatch::Prepare(request) => {
                 let prepared = ExtendedSession::analyze_prepare(engine, session, &request);
                 extended
@@ -589,7 +842,7 @@ fn run_shared_query_loop(
                 let action = extended.sync_transaction_action();
                 let commit_error = action
                     .sql()
-                    .and_then(|sql| submit_text(engine, session, sql).err());
+                    .and_then(|sql| submit_text_cancellable(engine, session, sql, &active).err());
                 if commit_error.is_some() {
                     if let Some(cleanup) = action.failure_cleanup().sql() {
                         let _ = submit_text(engine, session, cleanup);
@@ -612,7 +865,8 @@ fn run_shared_query_loop(
                     if let Some(request) = extended.execution_request(&portal_name)? {
                         match request {
                             ExecutionRequest::Query(bound) => {
-                                let outcome = submit_prepared(engine, session, &bound);
+                                let outcome =
+                                    submit_prepared_cancellable(engine, session, &bound, &active);
                                 extended.set_execution_outcome(&portal_name, outcome)?;
                             }
                             ExecutionRequest::Copy {
@@ -620,11 +874,23 @@ fn run_shared_query_loop(
                                 target: _,
                                 bound,
                             } => {
+                                if active.is_cancelled() {
+                                    return Err(extended::ExtendedError::new(
+                                        "57014",
+                                        "canceling statement due to user request",
+                                    ));
+                                }
                                 let response =
                                     execute_prepared_copy_to(engine, session, &bound, &copy)
                                         .map_err(|error| {
                                             extended::ExtendedError::new(error.code, error.message)
                                         })?;
+                                if active.is_cancelled() {
+                                    return Err(extended::ExtendedError::new(
+                                        "57014",
+                                        "canceling statement due to user request",
+                                    ));
+                                }
                                 extended.complete_copy_execute(&portal_name)?;
                                 return Ok(response);
                             }
@@ -639,18 +905,30 @@ fn run_shared_query_loop(
                                         "COPY FROM portal lost its target proof",
                                     )
                                 })?;
+                                if active.is_cancelled() {
+                                    return Err(extended::ExtendedError::new(
+                                        "57014",
+                                        "canceling statement due to user request",
+                                    ));
+                                }
                                 let (state, response) =
                                     begin_prepared_copy_from(engine, session, copy, target, false)
                                         .map_err(|error| {
                                             extended::ExtendedError::new(error.code, error.message)
                                         })?;
+                                if active.is_cancelled() {
+                                    return Err(extended::ExtendedError::new(
+                                        "57014",
+                                        "canceling statement due to user request",
+                                    ));
+                                }
                                 extended.complete_copy_execute(&portal_name)?;
                                 copy_in = Some(state);
                                 return Ok(response);
                             }
                         }
                     }
-                    extended.encode_execute(&portal_name, max_rows)
+                    encode_execute_cancellable(&mut extended, &portal_name, max_rows, &active)
                 })();
                 if transaction_ended && result.is_ok() {
                     extended.finish_transaction_boundary(false);
@@ -667,123 +945,11 @@ fn run_shared_query_loop(
                 stream.write_all(&buf).map_err(|err| err.to_string())?;
             }
         }
-    }
-    Ok(())
-}
-
-/// Encode a neutral façade outcome into pgwire backend message bytes (EmptyQueryResponse /
-/// RowDescription+DataRow+CommandComplete / ErrorResponse, then ReadyForQuery). All
-/// PostgreSQL-specific encoding lives in `gpu_db_facade::pg_adapter`. Built into a buffer so
-/// it is shared by the sync (`write_outcome`) and async (`serve_async`) write paths.
-fn encode_outcome(
-    outcome: Result<QueryOutcome, DbError>,
-    transaction_status: SessionTransactionStatus,
-) -> io::Result<Vec<u8>> {
-    let mut buf = encode_outcome_messages(outcome)?;
-    buf.extend_from_slice(&encode_ready(transaction_status)?);
-    Ok(buf)
-}
-
-/// Encode one statement's simple-query messages without ReadyForQuery. A multi-statement Query
-/// concatenates these fragments and emits exactly one ReadyForQuery after its final transaction
-/// action, matching PostgreSQL's message boundary.
-fn encode_outcome_messages(outcome: Result<QueryOutcome, DbError>) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    {
-        let mut writer = BackendWriter::new(&mut buf);
-        match outcome {
-            // An empty statement gets EmptyQueryResponse (not CommandComplete), per
-            // the wire protocol.
-            Ok(QueryOutcome::Empty) => {
-                writer.empty_query_response()?;
-            }
-            Ok(QueryOutcome::CopyIn { .. }) => {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "COPY start outcome reached the ordinary simple-query encoder",
-                ));
-            }
-            Ok(outcome) => {
-                let tag = pg_adapter::command_complete_tag(&outcome);
-                let returned_rows = match &outcome {
-                    QueryOutcome::Rows { columns, rows }
-                    | QueryOutcome::Returning { columns, rows, .. } => Some((columns, rows)),
-                    _ => None,
-                };
-                if let Some((columns, rows)) = returned_rows {
-                    let backend_columns: Vec<BackendColumn> = columns
-                        .iter()
-                        .map(|column| {
-                            BackendColumn::new(
-                                column.name.clone(),
-                                pg_adapter::logical_type_oid(column.logical_type),
-                                pg_adapter::logical_type_size(column.logical_type),
-                            )
-                        })
-                        .collect();
-                    writer.row_description(&backend_columns)?;
-                    for row in rows {
-                        let values: Vec<Option<String>> =
-                            row.iter().map(pg_adapter::db_value_text_opt).collect();
-                        writer.data_row(&values)?;
-                    }
-                }
-                writer.command_complete(&tag)?;
-            }
-            Err(error) => {
-                writer.error_response(&BackendError::new(
-                    pg_adapter::error_sqlstate(error.category).to_string(),
-                    error.message,
-                ))?;
-            }
+        if copy_in.is_some() {
+            copy_request = Some(active);
         }
     }
-    Ok(buf)
-}
-
-fn encode_ready(transaction_status: SessionTransactionStatus) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    BackendWriter::new(&mut buf)
-        .ready_for_query_status(wire_transaction_status(transaction_status))?;
-    Ok(buf)
-}
-
-fn encode_optional_error_and_ready(
-    error: Option<extended::ExtendedError>,
-    transaction_status: SessionTransactionStatus,
-) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    if let Some(error) = error {
-        buf.extend_from_slice(&error.encode()?);
-    }
-    buf.extend_from_slice(&encode_ready(transaction_status)?);
-    Ok(buf)
-}
-
-fn wire_transaction_status(status: SessionTransactionStatus) -> WireTransactionStatus {
-    match status {
-        SessionTransactionStatus::Idle => WireTransactionStatus::Idle,
-        SessionTransactionStatus::InTransaction => WireTransactionStatus::InTransaction,
-        SessionTransactionStatus::FailedTransaction => WireTransactionStatus::FailedTransaction,
-    }
-}
-
-fn encode_extended_error(error: extended::ExtendedError) -> Vec<u8> {
-    error.encode().unwrap_or_default()
-}
-
-fn encode_io_error(error: io::Error) -> Vec<u8> {
-    encode_extended_error(extended::ExtendedError {
-        code: "XX000",
-        message: error.to_string(),
-    })
-}
-
-fn encode_frontend_message_error(error: gpu_db_protocol::FrontendMessageError) -> Vec<u8> {
-    encode_extended_error(extended::ExtendedError {
-        code: "08P01",
-        message: error.to_string(),
-    })
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +1045,7 @@ pub async fn serve_async_with_engine_batching(
     let executor = Arc::new(tokio::sync::Semaphore::new(
         max_concurrent_executions.max(1),
     ));
+    let cancellations = Arc::new(CancellationRegistry::new());
     // One coalescer for the whole server when batching is on; `None` keeps the unchanged path.
     let batcher = batching.then(|| Arc::new(PointLookupBatcher::new(Arc::clone(&engine))));
     loop {
@@ -887,9 +1054,16 @@ pub async fn serve_async_with_engine_batching(
         let engine = Arc::clone(&engine);
         let executor = Arc::clone(&executor);
         let batcher = batcher.clone();
+        let cancellations = Arc::clone(&cancellations);
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection_async(stream, &engine, &executor, batcher.as_ref()).await
+            if let Err(err) = handle_connection_async(
+                stream,
+                &engine,
+                &executor,
+                batcher.as_ref(),
+                &cancellations,
+            )
+            .await
             {
                 eprintln!("gpu-db-engine-server async connection error: {err}");
             }
@@ -902,12 +1076,21 @@ async fn handle_connection_async(
     engine: &Arc<SharedEngine>,
     executor: &Arc<tokio::sync::Semaphore>,
     batcher: Option<&Arc<PointLookupBatcher>>,
+    cancellations: &Arc<CancellationRegistry>,
 ) -> Result<(), String> {
-    if !complete_startup_async(&mut stream).await? {
+    let Some(cancellation) = complete_startup_async(&mut stream, cancellations).await? else {
         return Ok(());
-    }
+    };
     let session = Arc::new(std::sync::Mutex::new(engine.open_session()));
-    let result = run_async_query_loop(&mut stream, engine, executor, batcher, &session).await;
+    let result = run_async_query_loop(
+        &mut stream,
+        engine,
+        executor,
+        batcher,
+        &session,
+        &cancellation,
+    )
+    .await;
     let mut session = session
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -915,12 +1098,18 @@ async fn handle_connection_async(
     result
 }
 
-async fn complete_startup_async(stream: &mut TokioTcpStream) -> Result<bool, String> {
+async fn complete_startup_async(
+    stream: &mut TokioTcpStream,
+    cancellations: &Arc<CancellationRegistry>,
+) -> Result<Option<ConnectionCancellation>, String> {
     let mut frame = match read_startup_frame_async(stream).await? {
         Some(frame) => frame,
-        None => return Ok(false),
+        None => return Ok(None),
     };
     loop {
+        if security::is_malformed_cancel_request(&frame) {
+            return Ok(None);
+        }
         match parse_startup_packet(&frame).map_err(|err| err.to_string())? {
             StartupPacket::SslRequest | StartupPacket::GssEncRequest => {
                 stream
@@ -929,40 +1118,27 @@ async fn complete_startup_async(stream: &mut TokioTcpStream) -> Result<bool, Str
                     .map_err(|err| err.to_string())?;
                 frame = match read_startup_frame_async(stream).await? {
                     Some(frame) => frame,
-                    None => return Ok(false),
+                    None => return Ok(None),
                 };
             }
-            StartupPacket::CancelRequest { .. } => return Ok(false),
+            StartupPacket::CancelRequest {
+                process_id,
+                secret_key,
+            } => {
+                cancellations.cancel(process_id, &secret_key);
+                return Ok(None);
+            }
             StartupPacket::Startup { .. } => break,
         }
     }
-    let handshake = encode_startup_handshake().map_err(|err| err.to_string())?;
+    let cancellation = cancellations.register();
+    let handshake =
+        encode_startup_handshake(cancellation.backend_key()).map_err(|err| err.to_string())?;
     stream
         .write_all(&handshake)
         .await
         .map_err(|err| err.to_string())?;
-    Ok(true)
-}
-
-/// Build the startup-OK handshake (AuthenticationOk, ParameterStatus×4, ReadyForQuery).
-fn encode_startup_handshake() -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    BackendWriter::new(&mut buf).authentication_ok()?;
-    buf.extend_from_slice(&encode_startup_statuses_and_ready()?);
-    Ok(buf)
-}
-
-/// Parameter/status tail shared by trust authentication and SCRAM authentication. SCRAM emits
-/// its own AuthenticationSASLFinal + AuthenticationOk before this exact canonical tail.
-fn encode_startup_statuses_and_ready() -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut writer = BackendWriter::new(&mut buf);
-    writer.parameter_status("server_version", "16.0-gpu-db-engine-facade")?;
-    writer.parameter_status("client_encoding", "UTF8")?;
-    writer.parameter_status("DateStyle", "ISO, MDY")?;
-    writer.parameter_status("integer_datetimes", "on")?;
-    writer.ready_for_query(false)?;
-    Ok(buf)
+    Ok(Some(cancellation))
 }
 
 async fn run_async_query_loop(
@@ -971,26 +1147,92 @@ async fn run_async_query_loop(
     executor: &Arc<tokio::sync::Semaphore>,
     batcher: Option<&Arc<PointLookupBatcher>>,
     session: &Arc<std::sync::Mutex<SharedSession>>,
+    cancellation: &ConnectionCancellation,
 ) -> Result<(), String> {
     let mut extended = ExtendedSession::default();
     let mut copy_in = None;
-    while let Some(frame) = read_tagged_frame_async(stream).await? {
+    let mut copy_request: Option<ActiveRequest> = None;
+    let mut draining_cancelled_simple_copy = false;
+    loop {
+        let polled = if copy_in.is_some() {
+            let active = copy_request
+                .as_ref()
+                .expect("COPY state retains its active request");
+            read_tagged_frame_polling_cancel_async(stream, active.cancelled()).await?
+        } else {
+            PolledTaggedFrame::Frame(read_tagged_frame_async(stream).await?)
+        };
+        let frame = match polled {
+            PolledTaggedFrame::Frame(Some(frame)) => frame,
+            PolledTaggedFrame::Frame(None) => break,
+            PolledTaggedFrame::Cancelled => {
+                draining_cancelled_simple_copy = cancelled_simple_copy_needs_drain(&copy_in, None);
+                let active = copy_request
+                    .as_ref()
+                    .expect("COPY cancellation retains its active request");
+                cancel_copy_async(
+                    stream,
+                    Arc::clone(engine),
+                    Arc::clone(session),
+                    executor,
+                    &mut extended,
+                    &mut copy_in,
+                    active,
+                )
+                .await?;
+                copy_request.take();
+                continue;
+            }
+        };
+        if drain_cancelled_simple_copy_frame(&mut draining_cancelled_simple_copy, frame[0]) {
+            continue;
+        }
         if copy_in.is_some() {
-            if !handle_copy_frame_async(
-                stream,
-                Arc::clone(engine),
-                Arc::clone(session),
-                executor,
-                &mut extended,
-                &mut copy_in,
-                frame,
-            )
-            .await?
-            {
-                break;
+            let active = copy_request
+                .take()
+                .expect("COPY frame retains its active request");
+            if active.is_cancelled() {
+                draining_cancelled_simple_copy =
+                    cancelled_simple_copy_needs_drain(&copy_in, Some(frame[0]));
+                cancel_copy_async(
+                    stream,
+                    Arc::clone(engine),
+                    Arc::clone(session),
+                    executor,
+                    &mut extended,
+                    &mut copy_in,
+                    &active,
+                )
+                .await?;
+            } else {
+                let simple_copy = copy_in.as_ref().is_some_and(CopyInState::ready_after_done);
+                let frame_tag = frame[0];
+                if !handle_copy_frame_async(
+                    stream,
+                    Arc::clone(engine),
+                    Arc::clone(session),
+                    executor,
+                    &mut extended,
+                    &mut copy_in,
+                    &active,
+                    frame,
+                )
+                .await?
+                {
+                    break;
+                }
+                if simple_copy && copy_in.is_none() && !matches!(frame_tag, b'c' | b'f') {
+                    draining_cancelled_simple_copy = true;
+                }
+            }
+            if copy_in.is_some() {
+                copy_request = Some(active);
             }
             continue;
         }
+        let active = cancellation
+            .begin_request()
+            .map_err(|error| error.to_string())?;
         let frame_tag = frame[0];
         match extended.skipping_frame_action(frame_tag) {
             SkippingFrameAction::Parse => {}
@@ -1077,16 +1319,39 @@ async fn run_async_query_loop(
                 continue;
             }
         };
+        if active.is_cancelled()
+            && !matches!(
+                &message,
+                gpu_db_protocol::FrontendMessage::SimpleQuery(_)
+                    | gpu_db_protocol::FrontendMessage::Sync
+                    | gpu_db_protocol::FrontendMessage::Terminate
+            )
+        {
+            session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mark_transaction_failed();
+            extended.fail();
+            stream
+                .write_all(&encode_extended_error(extended::ExtendedError::new(
+                    "57014",
+                    "canceling statement due to user request",
+                )))
+                .await
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         let transaction_action = extended.before_dispatch_transaction_action(
             &message,
             shared_session_transaction_status(session),
         );
         if let Some(sql) = transaction_action.sql() {
-            let begin = execute_shared_session_blocking(
+            let begin = execute_shared_session_blocking_cancellable(
                 Arc::clone(engine),
                 Arc::clone(session),
                 executor,
                 sql.to_string(),
+                &active,
             )
             .await?;
             if let Err(error) = begin {
@@ -1110,32 +1375,31 @@ async fn run_async_query_loop(
                 &mut extended,
                 &mut copy_in,
                 sql,
+                &active,
             )
             .await
             .map_err(|error| encode_io_error(io::Error::other(error))),
             ExtendedDispatch::Prepare(request) => {
-                let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-                let engine = Arc::clone(engine);
-                let session = Arc::clone(session);
-                let request_for_analysis = request.clone();
-                let prepared = tokio::task::spawn_blocking(move || {
-                    let mut session = session
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    ExtendedSession::analyze_prepare(&engine, &mut session, &request_for_analysis)
-                })
-                .await
-                .map_err(|err| err.to_string())?;
+                let prepared = analyze_prepare_cancellable(
+                    Arc::clone(engine),
+                    Arc::clone(session),
+                    executor,
+                    (*request).clone(),
+                    &active,
+                )
+                .await?;
+                let prepared = cancel_effect_free_success(&active, prepared, cancellation_error);
                 extended
                     .complete_parse(*request, prepared)
                     .map_err(encode_extended_error)
             }
             ExtendedDispatch::Bind(request) => {
-                let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-                let completion =
-                    tokio::task::spawn_blocking(move || ExtendedSession::bind_request(*request))
-                        .await
-                        .map_err(|err| err.to_string())?;
+                let completion = bind_cancellable(executor, *request, &active).await?;
+                let completion = cancel_effect_free_success(
+                    &active,
+                    completion,
+                    wire_response::cancelled_extended_error,
+                );
                 extended
                     .complete_bind(completion)
                     .map_err(encode_extended_error)
@@ -1145,22 +1409,19 @@ async fn run_async_query_loop(
                 match extended.description_owner(target, &name, status) {
                     Err(error) => Err(encode_extended_error(error)),
                     Ok(owner) => {
-                        let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-                        let engine_for_validation = Arc::clone(engine);
-                        let session_for_validation = Arc::clone(session);
-                        let validation = tokio::task::spawn_blocking(move || {
-                            let session = session_for_validation
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            ExtendedSession::revalidate_description_owner(
-                                &engine_for_validation,
-                                &session,
-                                owner,
-                            )
-                        })
-                        .await
-                        .map_err(|err| err.to_string())?;
-                        match validation {
+                        let validation = revalidate_description_cancellable(
+                            Arc::clone(engine),
+                            Arc::clone(session),
+                            executor,
+                            owner,
+                            &active,
+                        )
+                        .await?;
+                        match cancel_effect_free_success(
+                            &active,
+                            validation,
+                            wire_response::cancelled_extended_error,
+                        ) {
                             Ok(()) => extended
                                 .describe(target, &name, status)
                                 .map_err(encode_extended_error),
@@ -1173,11 +1434,12 @@ async fn run_async_query_loop(
             ExtendedDispatch::Sync => {
                 let action = extended.sync_transaction_action();
                 let commit_error = if let Some(sql) = action.sql() {
-                    execute_shared_session_blocking(
+                    execute_shared_session_blocking_cancellable(
                         Arc::clone(engine),
                         Arc::clone(session),
                         executor,
                         sql.to_string(),
+                        &active,
                     )
                     .await?
                     .err()
@@ -1211,20 +1473,24 @@ async fn run_async_query_loop(
                 let result = match extended.execution_request(&portal_name) {
                     Err(error) => Err(encode_extended_error(error)),
                     Ok(Some(ExecutionRequest::Query(bound))) => {
-                        let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-                        let engine = Arc::clone(engine);
-                        let session = Arc::clone(session);
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            let mut session = session
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            submit_prepared(&engine, &mut session, &bound)
-                        })
-                        .await
-                        .map_err(|err| err.to_string())?;
+                        let outcome = execute_prepared_shared_session_blocking_cancellable(
+                            Arc::clone(engine),
+                            Arc::clone(session),
+                            executor,
+                            *bound,
+                            &active,
+                        )
+                        .await?;
                         extended
                             .set_execution_outcome(&portal_name, outcome)
-                            .and_then(|()| extended.encode_execute(&portal_name, max_rows))
+                            .and_then(|()| {
+                                encode_execute_cancellable(
+                                    &mut extended,
+                                    &portal_name,
+                                    max_rows,
+                                    &active,
+                                )
+                            })
                             .map_err(encode_extended_error)
                     }
                     Ok(Some(ExecutionRequest::Copy {
@@ -1232,23 +1498,37 @@ async fn run_async_query_loop(
                         target: _,
                         bound,
                     })) => {
-                        match execute_prepared_copy_to_async(
-                            Arc::clone(engine),
-                            Arc::clone(session),
-                            executor,
-                            *bound,
-                            copy,
-                        )
-                        .await?
-                        {
-                            Ok(response) => extended
-                                .complete_copy_execute(&portal_name)
-                                .map(|()| response)
-                                .map_err(encode_extended_error),
-                            Err(error) => Err(encode_extended_error(extended::ExtendedError::new(
-                                error.code,
-                                error.message,
-                            ))),
+                        if active.is_cancelled() {
+                            Err(encode_extended_error(extended::ExtendedError::new(
+                                "57014",
+                                "canceling statement due to user request",
+                            )))
+                        } else {
+                            let result = execute_prepared_copy_to_async(
+                                Arc::clone(engine),
+                                Arc::clone(session),
+                                executor,
+                                *bound,
+                                copy,
+                                &active,
+                            )
+                            .await?;
+                            if active.is_cancelled() && result.is_ok() {
+                                Err(encode_extended_error(extended::ExtendedError::new(
+                                    "57014",
+                                    "canceling statement due to user request",
+                                )))
+                            } else {
+                                match result {
+                                    Ok(response) => extended
+                                        .complete_copy_execute(&portal_name)
+                                        .map(|()| response)
+                                        .map_err(encode_extended_error),
+                                    Err(error) => Err(encode_extended_error(
+                                        extended::ExtendedError::new(error.code, error.message),
+                                    )),
+                                }
+                            }
                         }
                     }
                     Ok(Some(ExecutionRequest::Copy {
@@ -1260,32 +1540,49 @@ async fn run_async_query_loop(
                             "XX000",
                             "COPY FROM portal lost its target proof",
                         ))),
-                        Some(target) => match begin_prepared_copy_from_async(
-                            Arc::clone(engine),
-                            Arc::clone(session),
-                            executor,
-                            copy,
-                            target,
-                            false,
-                        )
-                        .await?
-                        {
-                            Ok((state, response)) => extended
-                                .complete_copy_execute(&portal_name)
-                                .map(|()| {
-                                    copy_in = Some(state);
-                                    response
-                                })
-                                .map_err(encode_extended_error),
-                            Err(error) => Err(encode_extended_error(extended::ExtendedError::new(
-                                error.code,
-                                error.message,
-                            ))),
-                        },
+                        Some(target) => {
+                            if active.is_cancelled() {
+                                Err(encode_extended_error(extended::ExtendedError::new(
+                                    "57014",
+                                    "canceling statement due to user request",
+                                )))
+                            } else {
+                                let result = begin_prepared_copy_from_async(
+                                    Arc::clone(engine),
+                                    Arc::clone(session),
+                                    executor,
+                                    copy,
+                                    target,
+                                    false,
+                                    &active,
+                                )
+                                .await?;
+                                if active.is_cancelled() && result.is_ok() {
+                                    Err(encode_extended_error(extended::ExtendedError::new(
+                                        "57014",
+                                        "canceling statement due to user request",
+                                    )))
+                                } else {
+                                    match result {
+                                        Ok((state, response)) => extended
+                                            .complete_copy_execute(&portal_name)
+                                            .map(|()| {
+                                                copy_in = Some(state);
+                                                response
+                                            })
+                                            .map_err(encode_extended_error),
+                                        Err(error) => Err(encode_extended_error(
+                                            extended::ExtendedError::new(error.code, error.message),
+                                        )),
+                                    }
+                                }
+                            }
+                        }
                     },
-                    Ok(None) => extended
-                        .encode_execute(&portal_name, max_rows)
-                        .map_err(encode_extended_error),
+                    Ok(None) => {
+                        encode_execute_cancellable(&mut extended, &portal_name, max_rows, &active)
+                            .map_err(encode_extended_error)
+                    }
                 };
                 if transaction_ended && result.is_ok() {
                     extended.finish_transaction_boundary(false);
@@ -1315,6 +1612,9 @@ async fn run_async_query_loop(
                     .map_err(|err| err.to_string())?;
             }
         }
+        if copy_in.is_some() {
+            copy_request = Some(active);
+        }
     }
     Ok(())
 }
@@ -1328,6 +1628,7 @@ fn shared_session_transaction_status(
         .transaction_status()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_simple_query_async(
     engine: Arc<SharedEngine>,
     session: Arc<std::sync::Mutex<SharedSession>>,
@@ -1336,14 +1637,11 @@ async fn execute_simple_query_async(
     extended: &mut ExtendedSession,
     copy_in: &mut Option<CopyInState>,
     sql: String,
+    active: &ActiveRequest,
 ) -> Result<Vec<u8>, String> {
     extended.clear_unnamed_for_simple_query();
-    let statements = split_simple_query(&sql)
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if statements.is_empty() {
-        let outcome = Ok(QueryOutcome::Empty);
+    if active.is_cancelled() {
+        let outcome = Err(cancellation_error());
         let mut response =
             encode_outcome_messages(outcome.clone()).map_err(|error| error.to_string())?;
         complete_simple_query_action_async(
@@ -1351,6 +1649,30 @@ async fn execute_simple_query_async(
             Arc::clone(&session),
             executor,
             extended,
+            active,
+            &outcome,
+            &mut response,
+        )
+        .await?;
+        let status = shared_session_transaction_status(&session);
+        extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+        response.extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
+        return Ok(response);
+    }
+    let statements = split_simple_query(&sql)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if statements.is_empty() {
+        let outcome = cancellation_checked_outcome(active, Ok(QueryOutcome::Empty));
+        let mut response =
+            encode_outcome_messages(outcome.clone()).map_err(|error| error.to_string())?;
+        complete_simple_query_action_async(
+            Arc::clone(&engine),
+            Arc::clone(&session),
+            executor,
+            extended,
+            active,
             &outcome,
             &mut response,
         )
@@ -1374,6 +1696,7 @@ async fn execute_simple_query_async(
             Arc::clone(&session),
             executor,
             extended,
+            active,
             &outcome,
             &mut response,
         )
@@ -1400,6 +1723,7 @@ async fn execute_simple_query_async(
             Arc::clone(&session),
             executor,
             extended,
+            active,
             &outcome,
             &mut response,
         )
@@ -1425,6 +1749,7 @@ async fn execute_simple_query_async(
                     Arc::clone(&session),
                     executor,
                     extended,
+                    active,
                     &outcome,
                     &mut response,
                 )
@@ -1436,13 +1761,19 @@ async fn execute_simple_query_async(
                 return Ok(response);
             }
             CopyClassification::Supported(CopyStatement::To(copy)) => {
-                let result = execute_copy_to_async(
-                    Arc::clone(&engine),
-                    Arc::clone(&session),
-                    executor,
-                    copy,
-                )
-                .await?;
+                let result = if active.is_cancelled() {
+                    Err(CopyWireError::query_cancelled())
+                } else {
+                    let result = execute_copy_to_async(
+                        Arc::clone(&engine),
+                        Arc::clone(&session),
+                        executor,
+                        copy,
+                        active,
+                    )
+                    .await?;
+                    cancel_effect_free_success(active, result, CopyWireError::query_cancelled)
+                };
                 let lifecycle = result
                     .as_ref()
                     .map(|_| copy_lifecycle_success())
@@ -1459,6 +1790,7 @@ async fn execute_simple_query_async(
                     Arc::clone(&session),
                     executor,
                     extended,
+                    active,
                     &lifecycle,
                     &mut response,
                 )
@@ -1470,15 +1802,21 @@ async fn execute_simple_query_async(
                 return Ok(response);
             }
             CopyClassification::Supported(CopyStatement::From(copy)) => {
-                return match begin_copy_from_async(
-                    Arc::clone(&engine),
-                    Arc::clone(&session),
-                    executor,
-                    copy,
-                    true,
-                )
-                .await?
-                {
+                let result = if active.is_cancelled() {
+                    Err(CopyWireError::query_cancelled())
+                } else {
+                    let result = begin_copy_from_async(
+                        Arc::clone(&engine),
+                        Arc::clone(&session),
+                        executor,
+                        copy,
+                        true,
+                        active,
+                    )
+                    .await?;
+                    cancel_effect_free_success(active, result, CopyWireError::query_cancelled)
+                };
+                return match result {
                     Ok((state, response)) => {
                         *copy_in = Some(state);
                         Ok(response)
@@ -1492,6 +1830,7 @@ async fn execute_simple_query_async(
                             Arc::clone(&session),
                             executor,
                             extended,
+                            active,
                             &lifecycle,
                             &mut response,
                         )
@@ -1521,13 +1860,19 @@ async fn execute_simple_query_async(
             shared_session_transaction_status(&session),
             extended,
         ) {
-            let begin = execute_shared_session_blocking(
-                Arc::clone(&engine),
-                Arc::clone(&session),
-                executor,
-                begin.to_string(),
-            )
-            .await?;
+            let begin = if active.is_cancelled() {
+                Err(cancellation_error())
+            } else {
+                execute_shared_session_blocking_cancellable(
+                    Arc::clone(&engine),
+                    Arc::clone(&session),
+                    executor,
+                    begin.to_string(),
+                    active,
+                )
+                .await?
+            };
+            let begin = cancellation_checked_outcome(active, begin);
             if let Err(error) = begin {
                 response.extend_from_slice(
                     &encode_outcome_messages(Err(error)).map_err(|error| error.to_string())?,
@@ -1536,7 +1881,9 @@ async fn execute_simple_query_async(
             }
             extended.complete_transaction_action(TransactionAction::BeginImplicit, true);
         }
-        let outcome = if single_can_batch {
+        let outcome = if active.is_cancelled() {
+            Err(cancellation_error())
+        } else if single_can_batch {
             match &batcher {
                 Some(batcher) => {
                     execute_batchable_or_fallback(
@@ -1545,30 +1892,35 @@ async fn execute_simple_query_async(
                         Arc::clone(batcher),
                         Arc::clone(&session),
                         statement.clone(),
+                        active,
                     )
                     .await?
                 }
                 None => {
-                    execute_shared_session_blocking(
+                    execute_shared_session_blocking_cancellable(
                         Arc::clone(&engine),
                         Arc::clone(&session),
                         executor,
                         statement.clone(),
+                        active,
                     )
                     .await?
                 }
             }
         } else {
-            execute_shared_session_blocking(
+            execute_shared_session_blocking_cancellable(
                 Arc::clone(&engine),
                 Arc::clone(&session),
                 executor,
                 statement.clone(),
+                active,
             )
             .await?
         };
+        let mut outcome = cancellation_checked_outcome(active, outcome);
         response.extend_from_slice(
-            &encode_outcome_messages(outcome.clone()).map_err(|error| error.to_string())?,
+            &encode_cancellable_outcome_messages(active, &mut outcome)
+                .map_err(|error| error.to_string())?,
         );
         let failed = outcome.is_err();
         if failed || outcome_is_transaction_control(&outcome) {
@@ -1577,6 +1929,7 @@ async fn execute_simple_query_async(
                 Arc::clone(&session),
                 executor,
                 extended,
+                active,
                 &outcome,
                 &mut response,
             )
@@ -1593,6 +1946,7 @@ async fn execute_simple_query_async(
             Arc::clone(&session),
             executor,
             extended,
+            active,
             &last_outcome,
             &mut response,
         )
@@ -1602,123 +1956,6 @@ async fn execute_simple_query_async(
     extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
     response.extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
     Ok(response)
-}
-
-async fn complete_simple_query_action_async(
-    engine: Arc<SharedEngine>,
-    session: Arc<std::sync::Mutex<SharedSession>>,
-    executor: &Arc<tokio::sync::Semaphore>,
-    extended: &mut ExtendedSession,
-    outcome: &Result<QueryOutcome, DbError>,
-    response: &mut Vec<u8>,
-) -> Result<(), String> {
-    let action = extended.simple_query_completion_action(outcome);
-    let Some(sql) = action.sql() else {
-        extended.complete_transaction_action(action, true);
-        return Ok(());
-    };
-    match execute_shared_session_blocking(
-        Arc::clone(&engine),
-        Arc::clone(&session),
-        executor,
-        sql.to_string(),
-    )
-    .await?
-    {
-        Ok(_) => extended.complete_transaction_action(action, true),
-        Err(error) => {
-            response.extend_from_slice(
-                &encode_outcome_messages(Err(error)).map_err(|error| error.to_string())?,
-            );
-            if let Some(cleanup) = action.failure_cleanup().sql() {
-                if execute_shared_session_blocking(engine, session, executor, cleanup.to_string())
-                    .await?
-                    .is_ok()
-                {
-                    extended.complete_transaction_action(action.failure_cleanup(), true);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn execute_shared_session_blocking(
-    engine: Arc<SharedEngine>,
-    session: Arc<std::sync::Mutex<SharedSession>>,
-    executor: &Arc<tokio::sync::Semaphore>,
-    sql: String,
-) -> Result<Result<QueryOutcome, DbError>, String> {
-    let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-    tokio::task::spawn_blocking(move || {
-        let mut session = session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        submit_text(&engine, &mut session, &sql)
-    })
-    .await
-    .map_err(|err| err.to_string())
-}
-
-/// Batching-ON dispatch for one SimpleQuery (Thread-3 Stage 1). Classification + the unchanged
-/// per-query fallback run inside `spawn_blocking` under a permit (so the runtime never blocks on
-/// the engine lock or a slow query). A batchable point-lookup returns a `oneshot::Receiver`,
-/// whose permit is then released and the connection task `await`s the receiver with NO permit
-/// held — so parked lookups don't consume the bounded-executor budget while they coalesce. A
-/// dropped/closed coalescer makes the receiver resolve to a `RecvError`, surfaced as a neutral
-/// engine error rather than a hang.
-async fn execute_batchable_or_fallback(
-    engine: Arc<SharedEngine>,
-    executor: &Arc<tokio::sync::Semaphore>,
-    batcher: Arc<PointLookupBatcher>,
-    session: Arc<std::sync::Mutex<SharedSession>>,
-    sql: String,
-) -> Result<Result<QueryOutcome, DbError>, String> {
-    // Phase 1 (permit held): classify against the engine snapshot and either resolve the
-    // unchanged path or enqueue on the batcher. Both are short or self-bounded.
-    let dispatch = {
-        let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-        tokio::task::spawn_blocking(move || {
-            let mut session = session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // The session-owned batched boundary returns `Immediate(result)` for everything
-            // non-batchable or transaction-bound, or `Batched(receiver)` for an eligible read.
-            match engine.submit(
-                &mut session,
-                SubmissionRequest::BatchedText {
-                    sql: &sql,
-                    batcher: &batcher,
-                },
-            ) {
-                SubmissionDispatch::Immediate(result) => DispatchOut::Immediate(result),
-                SubmissionDispatch::Batched(receiver) => DispatchOut::Batched(receiver),
-            }
-        })
-        .await
-        .map_err(|err| err.to_string())?
-        // permit drops here
-    };
-    // Phase 2 (no permit): if batched, park on the oneshot off the bounded executor.
-    match dispatch {
-        DispatchOut::Immediate(result) => Ok(result),
-        DispatchOut::Batched(receiver) => match receiver.await {
-            Ok(result) => Ok(result),
-            // The coalescer dropped the sender (shutdown / unexpected): a neutral error, never
-            // a hung connection.
-            Err(_) => Ok(Err(DbError {
-                category: gpu_db_facade::ErrorCategory::Internal,
-                message: "batched point-lookup did not produce a response (coalescer unavailable)"
-                    .to_string(),
-            })),
-        },
-    }
-}
-
-/// Internal owned form of `SubmissionDispatch` so it can cross `spawn_blocking`.
-enum DispatchOut {
-    Immediate(Result<QueryOutcome, DbError>),
-    Batched(tokio::sync::oneshot::Receiver<Result<QueryOutcome, DbError>>),
 }
 
 #[cfg(test)]

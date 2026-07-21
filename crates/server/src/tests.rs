@@ -1,12 +1,12 @@
 use super::{
-    handle_connection, parse_batching_flag, read_tagged_frame_async,
-    serve_async_with_engine_batching,
+    handle_connection, handle_connection_async, handle_connection_registered, parse_batching_flag,
+    read_tagged_frame_async, serve_async_with_engine_batching, CancellationRegistry,
 };
 use gpu_db_facade::SharedEngine;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Thread-3 default-on: an unset `GPU_DB_BATCHING` enables batching. A default-started
 /// async server (no env) therefore constructs a `PointLookupBatcher` and routes batchable
@@ -57,7 +57,7 @@ fn blocking_late_auth_frames_error_skip_until_sync_and_recover() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 6);
+    let _ = read_messages(&mut client, 7);
 
     for (case, payload) in late_auth_payloads() {
         client.write_all(&tagged(b'p', &payload)).unwrap();
@@ -101,7 +101,7 @@ async fn async_late_auth_frames_error_skip_until_sync_and_recover() {
     ));
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let _ = read_messages_async(&mut client, 6).await;
+    let _ = read_messages_async(&mut client, 7).await;
 
     for (case, payload) in late_auth_payloads() {
         client.write_all(&tagged(b'p', &payload)).await.unwrap();
@@ -136,6 +136,555 @@ async fn async_late_auth_frames_error_skip_until_sync_and_recover() {
 }
 
 #[test]
+fn blocking_backend_key_cancels_simple_and_extended_copy_and_recovers() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let engine = std::sync::Arc::new(SharedEngine::new());
+        let cancellations = std::sync::Arc::new(CancellationRegistry::new());
+        let (mut primary, _) = listener.accept().unwrap();
+        let primary_engine = std::sync::Arc::clone(&engine);
+        let primary_cancellations = std::sync::Arc::clone(&cancellations);
+        let primary = std::thread::spawn(move || {
+            handle_connection_registered(&mut primary, &primary_engine, &primary_cancellations)
+                .unwrap();
+        });
+        for _ in 0..4 {
+            let (mut cancel, _) = listener.accept().unwrap();
+            handle_connection_registered(&mut cancel, &engine, &cancellations).unwrap();
+        }
+        primary.join().unwrap();
+    });
+
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client.write_all(&startup_frame()).unwrap();
+    let startup = read_messages(&mut client, 7);
+    let (process_id, secret_key) = backend_key(&startup);
+
+    // PostgreSQL treats cancellation while idle as a no-op; it must not poison the next query.
+    send_cancel(address, process_id, secret_key);
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE blocking_cancel_rows (id int4, name text)"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 2), vec![b'C', b'Z']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY blocking_cancel_rows FROM STDIN WITH CSV"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 1), vec![b'G']);
+    let mut wrong_key = secret_key;
+    wrong_key[0] ^= 0x80;
+    send_cancel(address, process_id, wrong_key);
+    client
+        .write_all(&tagged(b'd', b"1,must-not-publish\n"))
+        .unwrap();
+    send_cancel(address, process_id, secret_key);
+    let cancelled = read_messages(&mut client, 2);
+    assert_error_sqlstate(&cancelled, b"C57014\0");
+    assert_eq!(cancelled[1].1, vec![b'I']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("SELECT COUNT(*) FROM blocking_cancel_rows"),
+        ))
+        .unwrap();
+    let empty = read_messages(&mut client, 4);
+    assert_eq!(
+        empty.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'Z']
+    );
+    assert!(
+        empty[1].1.ends_with(b"0"),
+        "cancelled COPY published rows: {empty:?}"
+    );
+
+    let mut extended_copy = Vec::new();
+    extended_copy.extend(tagged(
+        b'P',
+        &parse_payload(
+            "blocking_cancel_copy",
+            "COPY blocking_cancel_rows FROM STDIN WITH CSV",
+            &[],
+        ),
+    ));
+    extended_copy.extend(tagged(
+        b'B',
+        &bind_payload("blocking_cancel_portal", "blocking_cancel_copy"),
+    ));
+    extended_copy.extend(tagged(b'E', &execute_payload("blocking_cancel_portal", 0)));
+    client.write_all(&extended_copy).unwrap();
+    assert_eq!(read_tags(&mut client, 3), vec![b'1', b'2', b'G']);
+    send_cancel(address, process_id, secret_key);
+    let extended_error = read_messages(&mut client, 1);
+    assert_eq!(extended_error[0].0, b'E');
+    assert!(extended_error[0]
+        .1
+        .windows(b"C57014\0".len())
+        .any(|window| window == b"C57014\0"));
+    client.write_all(&tagged(b'S', &[])).unwrap();
+    assert_eq!(read_messages(&mut client, 1), vec![(b'Z', vec![b'I'])]);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("INSERT INTO blocking_cancel_rows VALUES (2, 'recovered')"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 2), vec![b'C', b'Z']);
+    client.write_all(&tagged(b'X', &[])).unwrap();
+    drop(client);
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_backend_key_cancels_waiting_copy_and_recovers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(SharedEngine::new());
+    let executor = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let cancellations = std::sync::Arc::new(CancellationRegistry::new());
+    let server_engine = std::sync::Arc::clone(&engine);
+    let server_executor = std::sync::Arc::clone(&executor);
+    let server_cancellations = std::sync::Arc::clone(&cancellations);
+    let server = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.unwrap();
+        let primary_engine = std::sync::Arc::clone(&server_engine);
+        let primary_executor = std::sync::Arc::clone(&server_executor);
+        let primary_cancellations = std::sync::Arc::clone(&server_cancellations);
+        let primary = tokio::spawn(async move {
+            handle_connection_async(
+                primary,
+                &primary_engine,
+                &primary_executor,
+                None,
+                &primary_cancellations,
+            )
+            .await
+            .unwrap();
+        });
+        for _ in 0..3 {
+            let (cancel, _) = listener.accept().await.unwrap();
+            handle_connection_async(
+                cancel,
+                &server_engine,
+                &server_executor,
+                None,
+                &server_cancellations,
+            )
+            .await
+            .unwrap();
+        }
+        primary.await.unwrap();
+    });
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    client.write_all(&startup_frame()).await.unwrap();
+    let startup = read_messages_async(&mut client, 7).await;
+    let (process_id, secret_key) = backend_key(&startup);
+
+    send_cancel_async(address, process_id, secret_key).await;
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE async_cancel_rows (id int4, name text)"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_tags_async(&mut client, 2).await, vec![b'C', b'Z']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY async_cancel_rows FROM STDIN WITH CSV"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_tags_async(&mut client, 1).await, vec![b'G']);
+    let mut wrong_key = secret_key;
+    wrong_key[3] ^= 0x01;
+    send_cancel_async(address, process_id, wrong_key).await;
+    let held = executor.acquire().await.unwrap();
+    let mut queued_copy = tagged(b'd', b"1,must-not-publish\n");
+    queued_copy.extend(tagged(b'd', b"2,must-not-publish-either\n"));
+    queued_copy.extend(tagged(b'c', &[]));
+    client.write_all(&queued_copy).await.unwrap();
+    send_cancel_async(address, process_id, secret_key).await;
+    drop(held);
+    let cancelled = read_messages_async(&mut client, 2).await;
+    assert_error_sqlstate(&cancelled, b"C57014\0");
+    assert_eq!(cancelled[1].1, vec![b'I']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("SELECT COUNT(*) FROM async_cancel_rows"),
+        ))
+        .await
+        .unwrap();
+    let empty = tokio::time::timeout(Duration::from_secs(2), read_messages_async(&mut client, 4))
+        .await
+        .expect("queued COPY frames poisoned the following count request");
+    assert_eq!(
+        empty.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'Z']
+    );
+    assert!(
+        empty[1].1.ends_with(b"0"),
+        "cancelled async COPY published rows: {empty:?}"
+    );
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("INSERT INTO async_cancel_rows VALUES (1, 'recovered')"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), read_tags_async(&mut client, 2),)
+            .await
+            .expect("queued COPY frames poisoned same-key connection reuse"),
+        vec![b'C', b'Z']
+    );
+    client.write_all(&tagged(b'X', &[])).await.unwrap();
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_queued_parse_cancels_before_metadata_and_recovers_at_sync() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(SharedEngine::new());
+    let executor = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let cancellations = std::sync::Arc::new(CancellationRegistry::new());
+    let server_engine = std::sync::Arc::clone(&engine);
+    let server_executor = std::sync::Arc::clone(&executor);
+    let server_cancellations = std::sync::Arc::clone(&cancellations);
+    let server = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.unwrap();
+        let primary_engine = std::sync::Arc::clone(&server_engine);
+        let primary_executor = std::sync::Arc::clone(&server_executor);
+        let primary_cancellations = std::sync::Arc::clone(&server_cancellations);
+        let primary = tokio::spawn(async move {
+            handle_connection_async(
+                primary,
+                &primary_engine,
+                &primary_executor,
+                None,
+                &primary_cancellations,
+            )
+            .await
+            .unwrap();
+        });
+        let (cancel, _) = listener.accept().await.unwrap();
+        handle_connection_async(
+            cancel,
+            &server_engine,
+            &server_executor,
+            None,
+            &server_cancellations,
+        )
+        .await
+        .unwrap();
+        primary.await.unwrap();
+    });
+
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    client.write_all(&startup_frame()).await.unwrap();
+    let startup = read_messages_async(&mut client, 7).await;
+    let (process_id, secret_key) = backend_key(&startup);
+    client
+        .write_all(&tagged(
+            b'P',
+            &parse_payload("queued_parse", "SELECT 1 AS value", &[]),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cancellations.request_is_active(process_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Parse never entered its active request");
+    send_cancel_async(address, process_id, secret_key).await;
+    executor.add_permits(1);
+
+    let error = read_messages_async(&mut client, 1).await;
+    assert_eq!(error[0].0, b'E');
+    assert!(error[0]
+        .1
+        .windows(b"C57014\0".len())
+        .any(|window| window == b"C57014\0"));
+    client.write_all(&tagged(b'S', &[])).await.unwrap();
+    assert_eq!(
+        read_messages_async(&mut client, 1).await,
+        vec![(b'Z', vec![b'I'])],
+        "cancelled queued Parse leaked its synthetic implicit transaction"
+    );
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE queued_parse_recovery (id int4)"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_tags_async(&mut client, 2).await, vec![b'C', b'Z']);
+    client.write_all(&tagged(b'X', &[])).await.unwrap();
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_cancelled_queued_extended_sync_rolls_back_staged_insert() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(SharedEngine::new());
+    let executor = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let cancellations = std::sync::Arc::new(CancellationRegistry::new());
+    let server_engine = std::sync::Arc::clone(&engine);
+    let server_executor = std::sync::Arc::clone(&executor);
+    let server_cancellations = std::sync::Arc::clone(&cancellations);
+    let server = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.unwrap();
+        let primary_engine = std::sync::Arc::clone(&server_engine);
+        let primary_executor = std::sync::Arc::clone(&server_executor);
+        let primary_cancellations = std::sync::Arc::clone(&server_cancellations);
+        let primary = tokio::spawn(async move {
+            handle_connection_async(
+                primary,
+                &primary_engine,
+                &primary_executor,
+                None,
+                &primary_cancellations,
+            )
+            .await
+            .unwrap();
+        });
+        let (cancel, _) = listener.accept().await.unwrap();
+        handle_connection_async(
+            cancel,
+            &server_engine,
+            &server_executor,
+            None,
+            &server_cancellations,
+        )
+        .await
+        .unwrap();
+        primary.await.unwrap();
+    });
+
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    client.write_all(&startup_frame()).await.unwrap();
+    let startup = read_messages_async(&mut client, 7).await;
+    let (process_id, secret_key) = backend_key(&startup);
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE queued_sync_commit (id int4 PRIMARY KEY)"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_tags_async(&mut client, 2).await, vec![b'C', b'Z']);
+
+    let mut staged = tagged(
+        b'P',
+        &parse_payload(
+            "queued_sync_insert",
+            "INSERT INTO queued_sync_commit VALUES (1)",
+            &[],
+        ),
+    );
+    staged.extend(tagged(
+        b'B',
+        &bind_payload("queued_sync_portal", "queued_sync_insert"),
+    ));
+    staged.extend(tagged(b'E', &execute_payload("queued_sync_portal", 0)));
+    client.write_all(&staged).await.unwrap();
+    assert_eq!(
+        read_tags_async(&mut client, 3).await,
+        vec![b'1', b'2', b'C']
+    );
+
+    let held = executor.acquire().await.unwrap();
+    client.write_all(&tagged(b'S', &[])).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cancellations.request_is_active(process_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Sync never entered its active request");
+    send_cancel_async(address, process_id, secret_key).await;
+    drop(held);
+
+    let cancelled = read_messages_async(&mut client, 2).await;
+    assert_error_sqlstate(&cancelled, b"C57014\0");
+    assert_eq!(cancelled[1].1, vec![b'I']);
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("SELECT COUNT(*) FROM queued_sync_commit"),
+        ))
+        .await
+        .unwrap();
+    let count = tokio::time::timeout(Duration::from_secs(2), read_messages_async(&mut client, 4))
+        .await
+        .expect("cancelled queued Sync poisoned the following count request");
+    assert!(
+        count[1].1.ends_with(b"0"),
+        "cancelled queued Sync published its staged row: {count:?}"
+    );
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("INSERT INTO queued_sync_commit VALUES (1)"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), read_tags_async(&mut client, 2),)
+            .await
+            .expect("cancelled queued Sync poisoned same-key connection reuse"),
+        vec![b'C', b'Z']
+    );
+
+    client.write_all(&tagged(b'X', &[])).await.unwrap();
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_extended_copy_cancelled_before_queued_done_frame_recovers_at_sync() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(SharedEngine::new());
+    let executor = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let cancellations = std::sync::Arc::new(CancellationRegistry::new());
+    let server_engine = std::sync::Arc::clone(&engine);
+    let server_executor = std::sync::Arc::clone(&executor);
+    let server_cancellations = std::sync::Arc::clone(&cancellations);
+    let server = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.unwrap();
+        let primary_engine = std::sync::Arc::clone(&server_engine);
+        let primary_executor = std::sync::Arc::clone(&server_executor);
+        let primary_cancellations = std::sync::Arc::clone(&server_cancellations);
+        let primary = tokio::spawn(async move {
+            handle_connection_async(
+                primary,
+                &primary_engine,
+                &primary_executor,
+                None,
+                &primary_cancellations,
+            )
+            .await
+            .unwrap();
+        });
+        let (cancel, _) = listener.accept().await.unwrap();
+        handle_connection_async(
+            cancel,
+            &server_engine,
+            &server_executor,
+            None,
+            &server_cancellations,
+        )
+        .await
+        .unwrap();
+        primary.await.unwrap();
+    });
+
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    client.write_all(&startup_frame()).await.unwrap();
+    let startup = read_messages_async(&mut client, 7).await;
+    let (process_id, secret_key) = backend_key(&startup);
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE queued_extended_copy (id int4 PRIMARY KEY, name text)"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_tags_async(&mut client, 2).await, vec![b'C', b'Z']);
+
+    let mut extended_copy = Vec::new();
+    extended_copy.extend(tagged(
+        b'P',
+        &parse_payload(
+            "queued_extended_copy_stmt",
+            "COPY queued_extended_copy FROM STDIN WITH CSV",
+            &[],
+        ),
+    ));
+    extended_copy.extend(tagged(
+        b'B',
+        &bind_payload("queued_extended_copy_portal", "queued_extended_copy_stmt"),
+    ));
+    extended_copy.extend(tagged(
+        b'E',
+        &execute_payload("queued_extended_copy_portal", 0),
+    ));
+    client.write_all(&extended_copy).await.unwrap();
+    assert_eq!(
+        read_tags_async(&mut client, 3).await,
+        vec![b'1', b'2', b'G']
+    );
+
+    // This raw-wire case deliberately proves cancellation/recovery while CopyDone itself is
+    // queued for frame parsing. `copy::tests::copy_done_cancelled_while_queued_never_crosses_the_facade`
+    // separately enters the finish helper with a buffered row and a zero-permit executor.
+    let held = executor.acquire().await.unwrap();
+    client.write_all(&tagged(b'c', &[])).await.unwrap();
+    tokio::task::yield_now().await;
+    send_cancel_async(address, process_id, secret_key).await;
+    drop(held);
+    let error = read_messages_async(&mut client, 1).await;
+    assert_eq!(error[0].0, b'E');
+    assert!(error[0]
+        .1
+        .windows(b"C57014\0".len())
+        .any(|window| window == b"C57014\0"));
+    client.write_all(&tagged(b'S', &[])).await.unwrap();
+    assert_eq!(
+        read_messages_async(&mut client, 1).await,
+        vec![(b'Z', vec![b'I'])]
+    );
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("SELECT COUNT(*) FROM queued_extended_copy"),
+        ))
+        .await
+        .unwrap();
+    let count = read_messages_async(&mut client, 4).await;
+    assert!(
+        count[1].1.ends_with(b"0"),
+        "cancelled queued extended COPY published rows: {count:?}"
+    );
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("INSERT INTO queued_extended_copy VALUES (1, 'recovered')"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_tags_async(&mut client, 2).await, vec![b'C', b'Z']);
+    client.write_all(&tagged(b'X', &[])).await.unwrap();
+    drop(client);
+    server.await.unwrap();
+}
+
+#[test]
 fn blocking_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -149,7 +698,7 @@ fn blocking_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 6);
+    let _ = read_messages(&mut client, 7);
 
     // Query is a transaction boundary even when its SQL consists only of comments. A preceding
     // Parse has opened the synthetic extended transaction; the comment-only Query must close it
@@ -533,7 +1082,7 @@ async fn async_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     ));
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let _ = read_messages_async(&mut client, 6).await;
+    let _ = read_messages_async(&mut client, 7).await;
 
     client
         .write_all(&tagged(
@@ -919,8 +1468,8 @@ fn pgwire_extended_lifecycle_preserves_transaction_status_and_skip_until_sync() 
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
     assert_eq!(
-        read_tags(&mut client, 6),
-        vec![b'R', b'S', b'S', b'S', b'S', b'Z']
+        read_tags(&mut client, 7),
+        vec![b'R', b'S', b'S', b'S', b'S', b'K', b'Z']
     );
 
     let mut begin = Vec::new();
@@ -997,7 +1546,7 @@ fn raw_malformed_nonextended_frames_emit_error_and_ready_without_skip() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 6);
+    let _ = read_messages(&mut client, 7);
 
     // Parse opens the synthetic extended-cycle transaction. A malformed Query is not an
     // extended message, so it rolls that transaction back and emits ErrorResponse + Ready
@@ -1070,7 +1619,7 @@ fn raw_bind_resolves_missing_statement_before_parameter_format_arity() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 6);
+    let _ = read_messages(&mut client, 7);
 
     // Two parameter formats for zero supplied values is semantically malformed, but Bind
     // must resolve the named statement first. The frame parser therefore preserves it for the
@@ -1112,7 +1661,7 @@ fn extended_ddl_commits_at_sync_and_rolls_back_with_a_later_cycle_error() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    assert_eq!(read_tags(&mut client, 6).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut client, 7).last(), Some(&b'Z'));
 
     let mut ddl = Vec::new();
     ddl.extend(tagged(
@@ -1182,7 +1731,7 @@ fn extended_describe_revalidates_catalog_before_emitting_cached_metadata() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    assert_eq!(read_tags(&mut client, 6).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut client, 7).last(), Some(&b'Z'));
 
     client
         .write_all(&tagged(
@@ -1244,7 +1793,7 @@ async fn async_extended_describe_revalidates_catalog_before_emitting_cached_meta
     ));
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    assert_eq!(read_tags_async(&mut client, 6).await.last(), Some(&b'Z'));
+    assert_eq!(read_tags_async(&mut client, 7).await.last(), Some(&b'Z'));
 
     client
         .write_all(&tagged(
@@ -1328,8 +1877,8 @@ fn blocking_parse_and_describe_use_only_the_connection_private_catalog() {
     }
     creator.write_all(&startup_frame()).unwrap();
     observer.write_all(&startup_frame()).unwrap();
-    assert_eq!(read_tags(&mut creator, 6).last(), Some(&b'Z'));
-    assert_eq!(read_tags(&mut observer, 6).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut creator, 7).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut observer, 7).last(), Some(&b'Z'));
 
     creator
         .write_all(&tagged(b'Q', &query_payload("BEGIN")))
@@ -1428,8 +1977,8 @@ async fn async_parse_and_describe_use_only_the_connection_private_catalog() {
     let mut observer = tokio::net::TcpStream::connect(address).await.unwrap();
     creator.write_all(&startup_frame()).await.unwrap();
     observer.write_all(&startup_frame()).await.unwrap();
-    assert_eq!(read_tags_async(&mut creator, 6).await.last(), Some(&b'Z'));
-    assert_eq!(read_tags_async(&mut observer, 6).await.last(), Some(&b'Z'));
+    assert_eq!(read_tags_async(&mut creator, 7).await.last(), Some(&b'Z'));
+    assert_eq!(read_tags_async(&mut observer, 7).await.last(), Some(&b'Z'));
 
     creator
         .write_all(&tagged(b'Q', &query_payload("BEGIN")))
@@ -1534,7 +2083,7 @@ fn simple_query_literal_gpu_path_preserves_typed_null_differential() {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 6);
+    let _ = read_messages(&mut client, 7);
 
     // Both NULLs and their zero/empty controls traverse the same typed transient GPU relation.
     // The contrasting validity payloads prove NULL is not fabricated from the device placeholder.
@@ -1580,7 +2129,7 @@ fn simple_query_commit_and_rollback_end_the_pending_extended_cycle() {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 6);
+    let _ = read_messages(&mut client, 7);
     client
         .write_all(&tagged(
             b'Q',
@@ -1703,7 +2252,7 @@ fn blocking_simple_copy_from_to_abort_and_transaction_boundaries() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 6);
+    let _ = read_messages(&mut client, 7);
 
     client
         .write_all(&tagged(
@@ -1848,8 +2397,8 @@ fn copy_parse_and_completion_bind_to_the_analyzed_relation_generation() {
     }
     copy_client.write_all(&startup_frame()).unwrap();
     ddl_client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut copy_client, 6);
-    let _ = read_messages(&mut ddl_client, 6);
+    let _ = read_messages(&mut copy_client, 7);
+    let _ = read_messages(&mut ddl_client, 7);
 
     let mut missing_parse = tagged(
         b'P',
@@ -2088,6 +2637,57 @@ fn tagged(tag: u8, payload: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&u32::try_from(payload.len() + 4).unwrap().to_be_bytes());
     frame.extend_from_slice(payload);
     frame
+}
+
+fn backend_key(messages: &[(u8, Vec<u8>)]) -> (u32, [u8; 4]) {
+    let payload = &messages
+        .iter()
+        .find(|(tag, _)| *tag == b'K')
+        .expect("startup omitted BackendKeyData")
+        .1;
+    assert_eq!(payload.len(), 8);
+    (
+        u32::from_be_bytes(payload[..4].try_into().unwrap()),
+        payload[4..].try_into().unwrap(),
+    )
+}
+
+fn cancel_startup_frame(process_id: u32, secret_key: [u8; 4]) -> Vec<u8> {
+    let mut payload = 80_877_102_u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(&process_id.to_be_bytes());
+    payload.extend_from_slice(&secret_key);
+    let mut frame = u32::try_from(payload.len() + 4)
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    frame.extend(payload);
+    frame
+}
+
+fn send_cancel(address: std::net::SocketAddr, process_id: u32, secret_key: [u8; 4]) {
+    let mut cancel = TcpStream::connect(address).unwrap();
+    cancel
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    cancel
+        .write_all(&cancel_startup_frame(process_id, secret_key))
+        .unwrap();
+    cancel.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    cancel.read_to_end(&mut response).unwrap();
+    assert!(response.is_empty(), "CancelRequest emitted a response");
+}
+
+async fn send_cancel_async(address: std::net::SocketAddr, process_id: u32, secret_key: [u8; 4]) {
+    let mut cancel = tokio::net::TcpStream::connect(address).await.unwrap();
+    cancel
+        .write_all(&cancel_startup_frame(process_id, secret_key))
+        .await
+        .unwrap();
+    cancel.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    cancel.read_to_end(&mut response).await.unwrap();
+    assert!(response.is_empty(), "CancelRequest emitted a response");
 }
 
 async fn read_messages_async(
