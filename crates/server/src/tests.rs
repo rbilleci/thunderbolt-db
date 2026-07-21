@@ -44,6 +44,98 @@ fn truthy_and_unrecognized_values_keep_batching_on() {
 }
 
 #[test]
+fn blocking_late_auth_frames_error_skip_until_sync_and_recover() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let engine = SharedEngine::new();
+        handle_connection(&mut stream, &engine).unwrap();
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client.write_all(&startup_frame()).unwrap();
+    let _ = read_messages(&mut client, 6);
+
+    for (case, payload) in late_auth_payloads() {
+        client.write_all(&tagged(b'p', &payload)).unwrap();
+        assert_late_auth_error(&read_messages(&mut client, 1));
+
+        // A post-startup auth error is an extended-protocol error: every frame through Sync is
+        // ignored. Reusing the exact table name after idle Ready proves that the queued Query was
+        // discarded, while the successful CREATE proves the connection remains usable.
+        let table = format!("blocking_late_auth_{case}");
+        let mut recovery = tagged(
+            b'Q',
+            &query_payload(&format!("CREATE TABLE {table} (id int4)")),
+        );
+        recovery.extend(tagged(b'S', &[]));
+        client.write_all(&recovery).unwrap();
+        assert_eq!(read_messages(&mut client, 1), vec![(b'Z', vec![b'I'])]);
+
+        client
+            .write_all(&tagged(
+                b'Q',
+                &query_payload(&format!("CREATE TABLE {table} (id int4)")),
+            ))
+            .unwrap();
+        assert_eq!(read_tags(&mut client, 2), vec![b'C', b'Z']);
+    }
+
+    client.write_all(&tagged(b'X', &[])).unwrap();
+    drop(client);
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_late_auth_frames_error_skip_until_sync_and_recover() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_async_with_engine_batching(
+        listener,
+        std::sync::Arc::new(SharedEngine::new()),
+        2,
+        false,
+    ));
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    client.write_all(&startup_frame()).await.unwrap();
+    let _ = read_messages_async(&mut client, 6).await;
+
+    for (case, payload) in late_auth_payloads() {
+        client.write_all(&tagged(b'p', &payload)).await.unwrap();
+        assert_late_auth_error(&read_messages_async(&mut client, 1).await);
+
+        let table = format!("async_late_auth_{case}");
+        let mut recovery = tagged(
+            b'Q',
+            &query_payload(&format!("CREATE TABLE {table} (id int4)")),
+        );
+        recovery.extend(tagged(b'S', &[]));
+        client.write_all(&recovery).await.unwrap();
+        assert_eq!(
+            read_messages_async(&mut client, 1).await,
+            vec![(b'Z', vec![b'I'])]
+        );
+
+        client
+            .write_all(&tagged(
+                b'Q',
+                &query_payload(&format!("CREATE TABLE {table} (id int4)")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read_tags_async(&mut client, 2).await, vec![b'C', b'Z']);
+    }
+
+    client.write_all(&tagged(b'X', &[])).await.unwrap();
+    drop(client);
+    server.abort();
+    let _ = server.await;
+}
+
+#[test]
 fn blocking_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -2055,6 +2147,30 @@ fn assert_error_sqlstate(messages: &[(u8, Vec<u8>)], sqlstate: &[u8]) {
         .1
         .windows(sqlstate.len())
         .any(|window| window == sqlstate));
+}
+
+fn assert_late_auth_error(messages: &[(u8, Vec<u8>)]) {
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, b'E');
+    assert!(messages[0]
+        .1
+        .windows(b"C08P01\0".len())
+        .any(|window| window == b"C08P01\0"));
+}
+
+fn late_auth_payloads() -> Vec<(&'static str, Vec<u8>)> {
+    let mut sasl_initial = b"SCRAM-SHA-256\0".to_vec();
+    let client_first = b"n,,n=,r=late";
+    sasl_initial.extend_from_slice(&i32::try_from(client_first.len()).unwrap().to_be_bytes());
+    sasl_initial.extend_from_slice(client_first);
+    vec![
+        ("password", b"late-secret\0".to_vec()),
+        ("sasl_initial", sasl_initial),
+        (
+            "sasl_response",
+            b"c=biws,r=late,p=proof-without-trailing-nul".to_vec(),
+        ),
+    ]
 }
 
 fn parse_payload(name: &str, query: &str, type_oids: &[u32]) -> Vec<u8> {

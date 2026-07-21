@@ -17,6 +17,15 @@ path = "src/main.rs"
 [dependencies]
 gpu_db_protocol = { path = "../protocol" }
 gpu_db_facade = { path = "../facade" }
+base64 = "0.22"
+hmac = "0.12"
+pbkdf2 = "0.12"
+rand = "0.8"
+rustls = "0.23"
+rustls-pemfile = "2"
+sha2 = "0.10"
+stringprep = "0.1"
+subtle = "2"
 # Production global allocator: jemalloc cuts multi-threaded malloc-arena contention vs
 # glibc under the engine's concurrent read+write load (measured ~1.4-1.7x throughput).
 tikv-jemallocator.workspace = true

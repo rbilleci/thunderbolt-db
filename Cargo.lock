@@ -709,6 +709,7 @@ dependencies = [
 name = "gpu_db_server"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "futures-util",
  "gpu_db_engine",
@@ -716,7 +717,15 @@ dependencies = [
  "gpu_db_facade",
  "gpu_db_metrics",
  "gpu_db_protocol",
+ "hmac 0.12.1",
+ "pbkdf2",
+ "rand 0.8.6",
+ "rustls",
+ "rustls-pemfile",
+ "sha2 0.10.9",
  "sqlx",
+ "stringprep",
+ "subtle",
  "tikv-jemallocator",
  "tokio",
  "tokio-postgres",

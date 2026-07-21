@@ -25,6 +25,25 @@ fn submit_prepared(
 }
 
 #[test]
+fn post_startup_password_and_sasl_messages_are_protocol_errors() {
+    for message in [
+        FrontendMessage::PasswordMessage("secret".to_string()),
+        FrontendMessage::SaslInitialResponse {
+            mechanism: "SCRAM-SHA-256".to_string(),
+            initial_response: Some(b"n,,n=,r=late".to_vec()),
+        },
+        FrontendMessage::SaslResponse(b"c=biws,r=late,p=proof".to_vec()),
+    ] {
+        let Dispatch::Response(Err(error)) =
+            ExtendedSession::default().dispatch(message, SessionTransactionStatus::Idle)
+        else {
+            panic!("post-startup authentication message was not rejected");
+        };
+        assert_eq!(error.code, "08P01");
+    }
+}
+
+#[test]
 fn parse_bind_and_describe_are_effect_free_and_catalog_typed() {
     let engine = SharedEngine::new();
     let mut session = engine.open_session();

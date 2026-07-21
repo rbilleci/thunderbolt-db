@@ -84,7 +84,11 @@ does not delay the architecture evidence gate. The active sequence now starts at
    retains an exact engine/transaction/relation proof through zero-row or nonempty completion, repeats definitive
    constraint validation under the commit lock before WAL, and enters the sole facade admission and canonical
    publication owner. Simple COPY TO synthesizes its exact parsed SELECT, while extended COPY TO retains and
-   executes its exact bound SELECT AST. Full PostgreSQL compatibility still requires broader transactional DDL and
+   executes its exact bound SELECT AST. The independently accepted connection-security slice now gives the product
+   binary an explicit local-development trust profile plus a fail-closed production rustls/SCRAM-SHA-256 profile;
+   PostgreSQL SASLprep/raw fallback, uniform wrong-user proof work, strict transcript validation, bounded framing,
+   and both-ingress late-auth recovery wrap the existing dispatcher without adding an execution or commit owner.
+   Real keyed cancellation remains open. Full PostgreSQL compatibility still requires broader transactional DDL and
    relaxation of the conservative full-generation conflict that serializes a staged CREATE
    after any intervening commit. The remaining SQLSTATE/type-codec breadth and named client suites remain open too.
    Product server/P8

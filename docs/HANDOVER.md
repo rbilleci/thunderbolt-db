@@ -136,6 +136,13 @@ This file records only the current boundary and where the next agent resumes. `P
   are **231.468M/s at p50 156us** in-L2 and **198.067M/s at p50 205us** out-of-L2; Layer-1 rooflines are
   **1,418.1/1,440.2 GB/s**, GROUP BY is **1,674.9M elements/s**, and the 48M-row build is **2,061.6s + 0.0s
   residency**. The frozen-tree re-audit verdict is **ACCEPT**.
+- The PRODUCT-001 canonical TLS/SCRAM slice is **accepted** after two independent rejection/repair rounds and a
+  third frozen-tree audit. The product binary now owns an explicit local-development trust profile and a fail-closed
+  production rustls/SCRAM-SHA-256 profile around the existing dispatcher. PostgreSQL SASLprep/raw fallback, uniform
+  wrong-user proof work, strict transcript/attribute validation, bounded framing, and permanent blocking/async raw-
+  wire recovery are proven. The live security preflight now boots `gpu-db-engine-server`; no execution, WAL,
+  sequence, or publication authority moved. CancelRequest still closes without resolving its key or cancelling work,
+  so real cancellation is the next PRODUCT-001 boundary rather than a claim of this slice.
 - Physical multi-GPU work remains user-parked under **MULTI-001/002/003**.
 
 ## Integrated baseline — preserve it
@@ -156,9 +163,9 @@ This file records only the current boundary and where the next agent resumes. `P
 
 ## Resume here
 
-1. Continue **PRODUCT-001** with the next compatibility slice: migrate the production TLS/SCRAM security posture
-   onto `gpu-db-engine-server` without adding an execution or commit boundary, and move the live security preflight
-   to that canonical target. Obtain a fresh independent ACCEPT before taking cancellation, node-postgres,
+1. Continue **PRODUCT-001** with real keyed CancelRequest ownership on `gpu-db-engine-server`, including
+   BackendKeyData, wrong/stale-key no-op behavior, active-request cancellation/recovery, and the canonical node-
+   postgres smoke. Obtain a fresh independent ACCEPT before taking the prepared/portal/transaction-state,
    psql/catalog, or pg_dump/restore slices. Delete the legacy server and P8 endpoint only after every named
    compatibility gate is accepted. Broader transactional DDL and the conservative
    full-catalog conflict remain PRODUCT-001-owned gaps. Reduce the PLAN-owned 2,070-line
@@ -176,6 +183,13 @@ This file records only the current boundary and where the next agent resumes. `P
 
 ## Last green evidence — 2026-07-21
 
+- The accepted canonical TLS/SCRAM slice passes server **46/4 ignored**, pgwire **4/2 ignored**, SQLx **1**,
+  tokio-postgres **1**, protocol **71 + 127**, workspace check, strict server Clippy, formatting, diff, shell, and
+  source-size gates. The live canonical preflight passes fail-closed configuration, verifier and plaintext-source
+  conflict checks, real TLS/SCRAM engine-backed DDL/DML/read, wrong password/user, recovery, non-TLS rejection, and
+  Unicode SASLprep. Permanent raw startup, transcript, and both-ingress late-auth recovery tests pass. Two rejection
+  rounds drove the repairs; the third independent frozen-tree audit returned **ACCEPT**. No report card applies to
+  this transport/authentication-only change.
 - The accepted canonical COPY slice passes engine **502/536 ignored**, SQL **49**, protocol **71 + 127**, facade
   **66/10 ignored** plus concurrency **13/1 ignored**, canonical server **31/4 ignored**, pgwire **4/2 ignored**,
   SQLx **1**, and canonical tokio-postgres **1**, plus strict affected Clippy, formatting, diff, and source-size

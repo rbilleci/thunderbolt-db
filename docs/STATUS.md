@@ -14,6 +14,36 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 canonical TLS/SCRAM security — accepted 2026-07-21
+
+- The product `gpu-db-engine-server` binary now parses one public `ServerConfig`. Its explicit local-development
+  profile retains trust authentication without TLS for local/test harnesses; its opt-in production profile fails
+  closed unless a certificate, private key, configured user, and exactly one SCRAM verifier source are valid before
+  bind. Plaintext password input is labeled and restricted to an explicit local/test credential-bootstrap path;
+  secret-bearing configuration and verifier types do not expose `Debug`, and the public configuration formatter
+  redacts credentials.
+- Production connections negotiate rustls before entering the unchanged connection/session dispatcher and
+  `SharedEngine::submit` boundary. SCRAM-SHA-256 validates bounded verifier material, PostgreSQL-compatible SASLprep
+  plus raw-password fallback, exact GS2/client-first/final attribute order, combined nonce and channel-binding
+  transcript, 32-byte proofs, and constant-time stored-key comparison. Unknown or malformed startup identities
+  complete the same real-verifier-backed challenge/proof work and are doomed only after proof validation, avoiding
+  the prior user-enumeration distinction.
+- Startup and authentication frames are capped at 64 KiB; ordinary/COPY frames remain capped at 64 MiB. Clean EOF,
+  partial prefixes, SSL/GSS transitions, nested SSL, direct and TLS CancelRequest closure, malformed startup,
+  transcript tampering, and post-startup Password/SASL protocol errors have permanent raw-frame coverage. Both the
+  blocking and async loops prove that all three late-auth `p` shapes emit `08P01`, discard through Sync, return idle
+  ReadyForQuery, and then execute the same DDL successfully.
+- Gates pass canonical server **46/4 ignored**, pgwire **4/2 ignored**, SQLx **1**, tokio-postgres **1**, protocol
+  **71 + 127**, workspace all-target check, strict server all-target Clippy, scoped rustfmt, diff, shell, and source-
+  size checks. The live preflight boots the canonical binary and passes production config/verifier rejection, TLS-
+  required behavior, valid engine-backed DDL/DML/read, wrong-password/user uniform failure, recovery, and Unicode
+  password bootstrap. This transport/authentication-only slice did not touch a read kernel, residency layout, or
+  result path, so the report card is not applicable. The first audit rejected SASLprep, username-enumeration,
+  attribute-order, and permanent raw-wire gaps; a second fresh audit rejected enum-only late-auth coverage. Every
+  finding was repaired, and a third independent frozen-tree audit returned **ACCEPT**. No execution, WAL, sequence,
+  or publication authority was added. Real keyed query cancellation remains accurately outside this accepted slice
+  under **PRODUCT-001**.
+
 ## PRODUCT-001 canonical COPY compatibility — accepted 2026-07-21
 
 - Blocking and async canonical ingresses now own the same simple and extended text/CSV COPY FROM/TO lifecycle.
@@ -464,9 +494,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   dump/restore surfaces. Broader type/protocol breadth is **PRODUCT-002**.
 - The facade and pgwire server expose the engine, including the production point-lookup batcher. Server
   consolidation remains **PRODUCT-001**.
-- The legacy compatibility endpoint's opt-in production security profile requires TLS plus a SCRAM-SHA-256
-  verifier; plaintext password input is restricted to its explicit local/test credential bootstrap. The
-  connection-security preflight exercises valid, invalid-password, recovery, and non-TLS rejection paths.
+- The canonical product server's opt-in production security profile requires TLS plus SCRAM-SHA-256 with a
+  precomputed verifier; plaintext password input is restricted to its explicit local/test credential bootstrap.
+  That bootstrap applies PostgreSQL-compatible SASLprep with raw-password fallback for prohibited input. Unknown
+  startup users complete a verifier-backed but doomed proof exchange, client-first `n,r` order and transcript
+  nonce/channel binding are exact, and stored-key comparison is constant-time. TLS wraps the existing
+  transport-neutral dispatcher and does not add an execution or commit boundary. Permanent raw-wire tests cover
+  GSS-to-SSL, nested SSL, direct/TLS CancelRequest closure, malformed startup, transcript tampering, and late auth
+  messages. The live connection-security preflight now boots `gpu-db-engine-server` and exercises valid
+  engine-backed DDL/DML/read, invalid-password/user, post-failure recovery, non-TLS rejection, and a Unicode
+  password-bootstrap SASLprep path.
 
 ## Write path, durability, and recovery
 

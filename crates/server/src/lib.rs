@@ -10,9 +10,10 @@
 //!
 //! - **Simple query plus engine-backed extended query.** Parse/Bind/Describe/Execute/Close share
 //!   one connection-local lifecycle and execute prepared R1/W1 commands through the same façade
-//!   session as simple Query. COPY FROM/TO uses the same session and facade mutation/read boundary;
-//!   auth (SCRAM/TLS) and the catalog/introspection surface remain outside this canonical server
-//!   until their compatibility migration slices.
+//!   session as simple Query. COPY FROM/TO uses the same session and facade mutation/read boundary.
+//!   The product listener offers an explicit local-development trust profile or a fail-closed
+//!   production TLS + SCRAM-SHA-256 profile; transport authentication wraps this same dispatcher.
+//!   The catalog/introspection surface remains subject to its compatibility migration slice.
 //!   A multi-statement simple `Query` uses the shared SQL splitter, executes statements in order,
 //!   and emits one final ReadyForQuery. Each idle segment runs in one implicit transaction; exact
 //!   BEGIN characteristics promote that segment, while COMMIT/ROLLBACK divide it. A failing
@@ -34,12 +35,12 @@
 //!   little throughput for connection *scale*; thread-per-conn `serve` stays the
 //!   higher-throughput choice at a few hundred connections.
 
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use gpu_db_facade::{
@@ -67,12 +68,11 @@ use extended::{
     Dispatch as ExtendedDispatch, ExecutionRequest, ExtendedSession, MalformedFrameAction,
     SkippingFrameAction, TransactionAction,
 };
-
-/// Maximum accepted pgwire frame length (DoS guard): a malicious/huge length prefix would
-/// otherwise `resize` a buffer to that size before reading a byte — reachable pre-auth, and
-/// more exposed now that async ingress holds many untrusted connections. 64 MiB is far above
-/// any reasonable simple-query statement and bounds each individual COPY data frame.
-const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+mod security;
+use security::complete_local_startup;
+pub use security::ServerConfig;
+mod transport;
+use transport::{read_startup_frame_async, read_tagged_frame, read_tagged_frame_async, ReadWrite};
 
 /// Serve connections **concurrently** on `listener`: one engine shared across a
 /// thread-per-connection worker pool (`Arc<SharedEngine>`), each statement dispatched
@@ -84,6 +84,33 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// this exact handler and submission path.
 pub fn serve(listener: TcpListener) -> io::Result<()> {
     serve_with_engine(listener, shared_engine_from_env()?)
+}
+
+/// Parse-time validated product configuration owns the listener security posture. Runtime TLS
+/// material and the SCRAM verifier are loaded before bind, then every accepted transport enters
+/// the same facade-backed connection/session handler used by local and test ingresses.
+pub fn serve_configured(config: ServerConfig) -> io::Result<()> {
+    let (listen, security) = config.into_runtime()?;
+    let listener = TcpListener::bind(&listen)?;
+    let engine = shared_engine_from_env()?;
+    let security = Arc::new(security);
+    eprintln!("gpu-db-engine-server (facade-backed) listening on {listen}");
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let _ = stream.set_nodelay(true);
+        let engine = Arc::clone(&engine);
+        let security = Arc::clone(&security);
+        thread::spawn(move || match security.accept_blocking(stream) {
+            Ok(Some(mut stream)) => {
+                if let Err(error) = handle_ready_connection(stream.as_mut(), &engine) {
+                    eprintln!("gpu-db-engine-server connection error: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("gpu-db-engine-server startup error: {error}"),
+        });
+    }
+    Ok(())
 }
 
 /// Build the default served engine honoring the first-class durability config (write-path
@@ -138,42 +165,7 @@ pub fn serve_sequential(listener: TcpListener) -> io::Result<()> {
 /// Drive the startup handshake. Returns `Ok(false)` if the client disconnected before sending a
 /// real startup message.
 fn complete_startup(stream: &mut TcpStream) -> Result<bool, String> {
-    let mut frame = match read_startup_frame(stream).map_err(|err| err.to_string())? {
-        Some(frame) => frame,
-        None => return Ok(false),
-    };
-    loop {
-        match parse_startup_packet(&frame).map_err(|err| err.to_string())? {
-            StartupPacket::SslRequest | StartupPacket::GssEncRequest => {
-                stream.write_all(b"N").map_err(|err| err.to_string())?;
-                frame = match read_startup_frame(stream).map_err(|err| err.to_string())? {
-                    Some(frame) => frame,
-                    None => return Ok(false),
-                };
-            }
-            StartupPacket::CancelRequest { .. } => return Ok(false),
-            StartupPacket::Startup { .. } => break,
-        }
-    }
-
-    let mut writer = BackendWriter::new(&mut *stream);
-    writer.authentication_ok().map_err(|err| err.to_string())?;
-    writer
-        .parameter_status("server_version", "16.0-gpu-db-engine-facade")
-        .map_err(|err| err.to_string())?;
-    writer
-        .parameter_status("client_encoding", "UTF8")
-        .map_err(|err| err.to_string())?;
-    writer
-        .parameter_status("DateStyle", "ISO, MDY")
-        .map_err(|err| err.to_string())?;
-    writer
-        .parameter_status("integer_datetimes", "on")
-        .map_err(|err| err.to_string())?;
-    writer
-        .ready_for_query(false)
-        .map_err(|err| err.to_string())?;
-    Ok(true)
+    complete_local_startup(stream)
 }
 
 /// Handle one connection against the shared engine: startup handshake, then a simple-query loop
@@ -182,6 +174,13 @@ pub fn handle_connection(stream: &mut TcpStream, engine: &SharedEngine) -> Resul
     if !complete_startup(stream)? {
         return Ok(());
     }
+    handle_ready_connection(stream, engine)
+}
+
+fn handle_ready_connection(
+    stream: &mut dyn ReadWrite,
+    engine: &SharedEngine,
+) -> Result<(), String> {
     let mut session = engine.open_session();
     let result = run_shared_query_loop(stream, engine, &mut session);
     let _ = engine.submit(&mut session, SubmissionRequest::CloseSession);
@@ -470,7 +469,7 @@ fn complete_simple_query_action_blocking(
 }
 
 fn run_shared_query_loop(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &SharedEngine,
     session: &mut SharedSession,
 ) -> Result<(), String> {
@@ -787,63 +786,6 @@ fn encode_frontend_message_error(error: gpu_db_protocol::FrontendMessageError) -
     })
 }
 
-/// Read one untagged startup-style frame (4-byte length prefix, no type byte).
-fn read_startup_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
-    let mut len = [0_u8; 4];
-    match stream.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err),
-    }
-    let frame_len = u32::from_be_bytes(len) as usize;
-    if frame_len < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "startup frame length is shorter than length field",
-        ));
-    }
-    if frame_len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "startup frame length exceeds maximum",
-        ));
-    }
-    let mut frame = len.to_vec();
-    frame.resize(frame_len, 0);
-    stream.read_exact(&mut frame[4..])?;
-    Ok(Some(frame))
-}
-
-/// Read one tagged frame (1-byte type + 4-byte length prefix + payload).
-fn read_tagged_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
-    let mut tag = [0_u8; 1];
-    match stream.read_exact(&mut tag) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err),
-    }
-    let mut len = [0_u8; 4];
-    stream.read_exact(&mut len)?;
-    let frame_len = u32::from_be_bytes(len) as usize;
-    if frame_len < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "frontend frame length is shorter than length field",
-        ));
-    }
-    if frame_len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "frontend frame length exceeds maximum",
-        ));
-    }
-    let mut frame = vec![tag[0]];
-    frame.extend_from_slice(&len);
-    frame.resize(frame_len + 1, 0);
-    stream.read_exact(&mut frame[5..])?;
-    Ok(Some(frame))
-}
-
 // ---------------------------------------------------------------------------
 // Async ingress (P1-M5): tokio acceptor + per-connection tasks + bounded executor
 // ---------------------------------------------------------------------------
@@ -1005,15 +947,21 @@ async fn complete_startup_async(stream: &mut TokioTcpStream) -> Result<bool, Str
 /// Build the startup-OK handshake (AuthenticationOk, ParameterStatus×4, ReadyForQuery).
 fn encode_startup_handshake() -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    {
-        let mut writer = BackendWriter::new(&mut buf);
-        writer.authentication_ok()?;
-        writer.parameter_status("server_version", "16.0-gpu-db-engine-facade")?;
-        writer.parameter_status("client_encoding", "UTF8")?;
-        writer.parameter_status("DateStyle", "ISO, MDY")?;
-        writer.parameter_status("integer_datetimes", "on")?;
-        writer.ready_for_query(false)?;
-    }
+    BackendWriter::new(&mut buf).authentication_ok()?;
+    buf.extend_from_slice(&encode_startup_statuses_and_ready()?);
+    Ok(buf)
+}
+
+/// Parameter/status tail shared by trust authentication and SCRAM authentication. SCRAM emits
+/// its own AuthenticationSASLFinal + AuthenticationOk before this exact canonical tail.
+fn encode_startup_statuses_and_ready() -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut writer = BackendWriter::new(&mut buf);
+    writer.parameter_status("server_version", "16.0-gpu-db-engine-facade")?;
+    writer.parameter_status("client_encoding", "UTF8")?;
+    writer.parameter_status("DateStyle", "ISO, MDY")?;
+    writer.parameter_status("integer_datetimes", "on")?;
+    writer.ready_for_query(false)?;
     Ok(buf)
 }
 
@@ -1771,60 +1719,6 @@ async fn execute_batchable_or_fallback(
 enum DispatchOut {
     Immediate(Result<QueryOutcome, DbError>),
     Batched(tokio::sync::oneshot::Receiver<Result<QueryOutcome, DbError>>),
-}
-
-/// Async read of one untagged startup frame (4-byte length prefix, no type byte).
-async fn read_startup_frame_async(stream: &mut TokioTcpStream) -> Result<Option<Vec<u8>>, String> {
-    let mut len = [0_u8; 4];
-    match stream.read_exact(&mut len).await {
-        Ok(_) => {}
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.to_string()),
-    }
-    let frame_len = u32::from_be_bytes(len) as usize;
-    if frame_len < 4 {
-        return Err("startup frame length is shorter than length field".to_string());
-    }
-    if frame_len > MAX_FRAME_LEN {
-        return Err("startup frame length exceeds maximum".to_string());
-    }
-    let mut frame = len.to_vec();
-    frame.resize(frame_len, 0);
-    stream
-        .read_exact(&mut frame[4..])
-        .await
-        .map_err(|err| err.to_string())?;
-    Ok(Some(frame))
-}
-
-/// Async read of one tagged frame (1-byte type + 4-byte length prefix + payload).
-async fn read_tagged_frame_async(stream: &mut TokioTcpStream) -> Result<Option<Vec<u8>>, String> {
-    let mut tag = [0_u8; 1];
-    match stream.read_exact(&mut tag).await {
-        Ok(_) => {}
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.to_string()),
-    }
-    let mut len = [0_u8; 4];
-    stream
-        .read_exact(&mut len)
-        .await
-        .map_err(|err| err.to_string())?;
-    let frame_len = u32::from_be_bytes(len) as usize;
-    if frame_len < 4 {
-        return Err("frontend frame length is shorter than length field".to_string());
-    }
-    if frame_len > MAX_FRAME_LEN {
-        return Err("frontend frame length exceeds maximum".to_string());
-    }
-    let mut frame = vec![tag[0]];
-    frame.extend_from_slice(&len);
-    frame.resize(frame_len + 1, 0);
-    stream
-        .read_exact(&mut frame[5..])
-        .await
-        .map_err(|err| err.to_string())?;
-    Ok(Some(frame))
 }
 
 #[cfg(test)]

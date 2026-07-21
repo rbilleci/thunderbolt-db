@@ -10,12 +10,17 @@ silently omit behavior or leave a product-like write entry behind.
 | Cargo target | Source | Current execution authority | Current protocol surface |
 |---|---|---|---|
 | `gpu-db-server` (`gpu_db_protocol` bin) | `crates/protocol/src/bin/gpu-db-server.rs` plus the `gpu-db-server/` module tree | Legacy `Session`/`SharedCatalog` host-relational state and direct compatibility handlers | Startup, TLS/SCRAM production profile, simple and extended Parse/Bind/Describe/Execute/Close/Sync, prepared statements/portals/cursors, COPY, session state, psql/pg_dump catalog compatibility. `CancelRequest` is parsed and its connection is closed, but the process id/key are not resolved and no running query is cancelled. |
-| `gpu-db-engine-server` (`gpu_db_server` bin) | `crates/server/src/main.rs`, `crates/server/src/lib.rs`, `crates/server/src/extended.rs`, and `crates/server/src/copy.rs` | One session-owned `SharedEngine::submit` boundary plus effect-free prepare/describe over the real engine | Engine-backed simple query plus one shared Parse/Bind/Describe/Execute/Close portal lifecycle, transaction-private Parse/Describe, one-`CREATE TABLE` plus ordered DML composite transactions, bounded GPU scalar projection, atomic ordinary multi-statement Query messages, and typed text/CSV COPY FROM/TO. COPY FROM retains and revalidates its analyzed relation generation through CopyDone and enters the canonical transaction/WAL/publication boundary. TLS/SCRAM, cancellation, multiple transactional DDL, and legacy catalog/introspection breadth remain outside this target. |
+| `gpu-db-engine-server` (`gpu_db_server` bin) | `crates/server/src/main.rs`, `crates/server/src/lib.rs`, `crates/server/src/security.rs`, `crates/server/src/transport.rs`, `crates/server/src/extended.rs`, and `crates/server/src/copy.rs` | One session-owned `SharedEngine::submit` boundary plus effect-free prepare/describe over the real engine | Engine-backed simple query plus one shared Parse/Bind/Describe/Execute/Close portal lifecycle, transaction-private Parse/Describe, one-`CREATE TABLE` plus ordered DML composite transactions, bounded GPU scalar projection, atomic ordinary multi-statement Query messages, and typed text/CSV COPY FROM/TO. COPY FROM retains and revalidates its analyzed relation generation through CopyDone and enters the canonical transaction/WAL/publication boundary. An explicit local-dev trust profile and fail-closed production TLS/SCRAM-SHA-256 profile wrap the same dispatcher. Cancellation, multiple transactional DDL, and legacy catalog/introspection breadth remain outside this target. |
 | `p8_engine_pgwire_benchmark_endpoint` (`gpu_db_server` example) | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` plus its three child modules | Direct `Engine` ownership with retained-route and COPY adapters | Product-like benchmark endpoint; simple/COPY/session behavior needed by the P8 harness, not the canonical product server |
 | `p8_engine_protocol_boundary_probe` (`gpu_db_server` example) | `crates/server/examples/p8_engine_protocol_boundary_probe.rs` | Its own direct-engine `EngineBackedSession` calls `execute_text` and `execute_relational_copy_rows` | Bounded protocol/session/COPY proof invoked by `scripts/lib/p8_ch_benchmark_protocol_boundary.sh`; it is not a listener, but it is an independently callable engine/protocol adapter that must be migrated, deleted, or retained only as a facade-level test seam |
 
 Cargo metadata reports no other pgwire binary target. `p8_persistent_pgwire_concurrency_runner` is a
 client/runner example, not a listener.
+
+The canonical target's TLS/SCRAM surface above passed its independent PRODUCT-001 audit on 2026-07-21. It wraps the
+same dispatcher and adds no facade submission, WAL, sequence, or publication authority. Both pgwire server targets
+still only close parsed CancelRequest connections; neither resolves BackendKeyData credentials or cancels active
+work.
 
 ## Mutation, transaction, and recovery entry points
 
@@ -81,8 +86,8 @@ The legacy target's existing behavior is concretely exercised by:
 - the Rust SQLx and tokio-postgres integration tests in `crates/server/tests/`, now running unchanged client
   behavior against `gpu-db-engine-server`, including typed COPY and post-error recovery;
 - application-driver smokes under `tests/compat/{node-postgres,asyncpg,psycopg,jdbc,r2dbc,pgx}/`;
-- the production TLS/SCRAM posture and live handshake checks in
-  `scripts/run_connection_security_posture_preflight.sh`;
+- the production TLS/SCRAM posture and live engine-backed handshake/mutation/read checks against
+  `gpu-db-engine-server` in `scripts/run_connection_security_posture_preflight.sh`;
 - the protocol binary's unit suites in `crates/protocol/src/bin/gpu-db-server/tests/` for catalog,
   COPY/DML, cursor/SQL PREPARE, extended Bind, portal lifecycle, and shared catalog behavior;
 - the protocol library framing/malformed-message suites, including Parse/Bind/Execute/COPY message

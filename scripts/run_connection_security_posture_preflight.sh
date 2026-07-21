@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The posture gate must never inherit a caller's durable database or partial security material.
+# Preserve GPU/runtime selection, but force an isolated in-memory engine and explicit credentials.
+unset GPU_DB_WAL_SEGMENT
+unset GPU_DB_SECURITY_PROFILE GPU_DB_TLS_CERT GPU_DB_TLS_KEY GPU_DB_AUTH_USER
+unset GPU_DB_AUTH_PASSWORD GPU_DB_AUTH_SCRAM_VERIFIER GPU_DB_AUTH_SCRAM_VERIFIER_FILE
+
 require_line() {
   local file="$1"
   local pattern="$2"
@@ -15,48 +21,27 @@ require_line() {
 
 require_line crates/protocol/src/lib.rs "PG_SSL_REQUEST_CODE"
 require_line crates/protocol/src/lib.rs "PG_GSSENC_REQUEST_CODE"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "SecurityConfig::LocalDev"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "SecurityConfig::Production"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "production security profile requires TLS"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "ScramCredential::Verifier"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "production SCRAM verifier must start with SCRAM-SHA-256$"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "local/test --auth-password"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "write_authentication_sasl(stream, &[\"SCRAM-SHA-256\"])?"
-require_line crates/protocol/src/bin/gpu-db-server/server_bootstrap.rs "write_authentication_ok(stream)"
-require_line crates/protocol/src/bin/gpu-db-server/frontend_dispatch.rs "FrontendMessage::PasswordMessage(_) => \"password messages are not supported after startup\""
-require_line crates/protocol/src/bin/gpu-db-server/frontend_dispatch.rs "\"SASL authentication is not supported\""
-require_line crates/protocol/src/bin/gpu-db-server/backend_adapter.rs "fn write_authentication_ok(stream: &mut dyn ReadWrite) -> io::Result<()>"
+require_line crates/server/src/security.rs "SecurityConfig::LocalDev"
+require_line crates/server/src/security.rs "SecurityConfig::Production"
+require_line crates/server/src/security.rs "production security profile requires TLS"
+require_line crates/server/src/security.rs "ScramCredential::Verifier"
+require_line crates/server/src/security.rs "production SCRAM verifier must start with SCRAM-SHA-256$"
+require_line crates/server/src/security.rs "local/test --auth-password"
+require_line crates/server/src/security.rs "authentication_sasl(&[\"SCRAM-SHA-256\"])?"
+require_line crates/server/src/security.rs "fn write_authentication_ok(stream: &mut dyn ReadWrite) -> io::Result<()>"
+require_line crates/server/src/security.rs "ConstantTimeEq"
+require_line crates/server/src/security.rs "SCRAM channel binding does not match the GS2 header"
+require_line crates/server/src/security.rs "SCRAM nonce does not match"
+require_line crates/server/src/security.rs "stringprep::saslprep(password)"
+require_line crates/server/src/security.rs "doomed only after proof verification"
+require_line crates/server/src/security.rs "requires ordered n and r attributes before extensions"
+require_line crates/server/src/security.rs "raw_startup_state_machine_covers_gss_ssl_cancel_nested_and_malformed"
+require_line crates/server/src/security.rs "raw_scram_transcript_nonce_tampering_is_protocol_failure"
+require_line crates/server/src/transport.rs "MAX_AUTH_FRAME_BYTES: usize = 64 * 1024"
+require_line crates/server/src/extended.rs "password messages are not supported after startup"
+require_line crates/server/src/extended.rs "SASL authentication is only supported during startup"
 require_line crates/protocol/src/lib.rs "self.message(b'R', &0_i32.to_be_bytes())"
-require_line crates/protocol/src/bin/gpu-db-server/role_ddl.rs "text_column(\"rolpassword\")"
-require_line docs/STATUS.md "opt-in production security profile requires TLS plus a SCRAM-SHA-256"
-
-cargo build -p gpu_db_protocol --bin gpu-db-server >/dev/null
-
-if ./target/debug/gpu-db-server --security-profile production >/tmp/gpu-db-security-missing.out 2>/tmp/gpu-db-security-missing.err; then
-  printf 'production profile accepted incomplete config\n' >&2
-  exit 1
-fi
-if ! grep -Fq "production security profile requires --tls-cert" /tmp/gpu-db-security-missing.err; then
-  printf 'production profile did not report missing TLS material\n' >&2
-  cat /tmp/gpu-db-security-missing.err >&2
-  exit 1
-fi
-
-if ./target/debug/gpu-db-server \
-  --security-profile production \
-  --tls-cert /tmp/missing.crt \
-  --tls-key /tmp/missing.key \
-  --auth-user gpudb \
-  --auth-scram-verifier not-a-verifier \
-  >/tmp/gpu-db-security-malformed.out 2>/tmp/gpu-db-security-malformed.err; then
-  printf 'production profile accepted malformed SCRAM verifier\n' >&2
-  exit 1
-fi
-if ! grep -Fq "production SCRAM verifier must start with SCRAM-SHA-256$" /tmp/gpu-db-security-malformed.err; then
-  printf 'production profile did not report malformed SCRAM verifier\n' >&2
-  cat /tmp/gpu-db-security-malformed.err >&2
-  exit 1
-fi
+require_line docs/STATUS.md "canonical product server's opt-in production security profile requires TLS plus SCRAM-SHA-256"
 
 tmp="$(mktemp -d)"
 server_pid=""
@@ -68,6 +53,34 @@ cleanup() {
   rm -rf "$tmp"
 }
 trap cleanup EXIT
+
+cargo build -p gpu_db_server --bin gpu-db-engine-server >/dev/null
+
+if ./target/debug/gpu-db-engine-server --security-profile production >"$tmp/missing.out" 2>"$tmp/missing.err"; then
+  printf 'production profile accepted incomplete config\n' >&2
+  exit 1
+fi
+if ! grep -Fq "production security profile requires --tls-cert" "$tmp/missing.err"; then
+  printf 'production profile did not report missing TLS material\n' >&2
+  cat "$tmp/missing.err" >&2
+  exit 1
+fi
+
+if ./target/debug/gpu-db-engine-server \
+  --security-profile production \
+  --tls-cert /tmp/missing.crt \
+  --tls-key /tmp/missing.key \
+  --auth-user gpudb \
+  --auth-scram-verifier not-a-verifier \
+  >"$tmp/malformed.out" 2>"$tmp/malformed.err"; then
+  printf 'production profile accepted malformed SCRAM verifier\n' >&2
+  exit 1
+fi
+if ! grep -Fq "production SCRAM verifier must start with SCRAM-SHA-256$" "$tmp/malformed.err"; then
+  printf 'production profile did not report malformed SCRAM verifier\n' >&2
+  cat "$tmp/malformed.err" >&2
+  exit 1
+fi
 
 openssl req -new -x509 -nodes -subj '/CN=localhost' -days 1 \
   -keyout "$tmp/server.key" -out "$tmp/server.crt" >/dev/null 2>&1
@@ -95,7 +108,7 @@ print(
 )
 PY
 
-if ./target/debug/gpu-db-server \
+if ./target/debug/gpu-db-engine-server \
   --security-profile production \
   --tls-cert "$tmp/server.crt" \
   --tls-key "$tmp/server.key" \
@@ -122,9 +135,8 @@ s.close()
 PY
 )"
 
-./target/debug/gpu-db-server \
+./target/debug/gpu-db-engine-server \
   --listen "127.0.0.1:${port}" \
-  --shared-catalog \
   --security-profile production \
   --tls-cert "$tmp/server.crt" \
   --tls-key "$tmp/server.key" \
@@ -161,6 +173,17 @@ if ! grep -Fq "password authentication failed" "$tmp/invalid.err"; then
   exit 1
 fi
 
+if PGPASSWORD=secret psql "host=127.0.0.1 port=${port} user=other dbname=postgres sslmode=require" \
+  -Atc "select id from prod_auth" >"$tmp/wrong-user.out" 2>"$tmp/wrong-user.err"; then
+  printf 'production SCRAM accepted an unconfigured startup user\n' >&2
+  exit 1
+fi
+if ! grep -Fq "password authentication failed" "$tmp/wrong-user.err"; then
+  printf 'production SCRAM wrong-user path did not use the uniform authentication error\n' >&2
+  cat "$tmp/wrong-user.err" >&2
+  exit 1
+fi
+
 PGPASSWORD=secret psql "host=127.0.0.1 port=${port} user=gpudb dbname=postgres sslmode=require" \
   -Atc "select id from prod_auth" >"$tmp/recovery.out" 2>"$tmp/recovery.err"
 if ! grep -Fxq "7" "$tmp/recovery.out"; then
@@ -181,6 +204,47 @@ if ! grep -Fq "production security profile requires TLS" "$tmp/notls.err"; then
   exit 1
 fi
 
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+server_pid=""
+
+unicode_port="$(
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+unicode_password="$(printf 'I\u00adX')"
+./target/debug/gpu-db-engine-server \
+  --listen "127.0.0.1:${unicode_port}" \
+  --security-profile production \
+  --tls-cert "$tmp/server.crt" \
+  --tls-key "$tmp/server.key" \
+  --auth-user gpudb \
+  --auth-password "$unicode_password" \
+  >"$tmp/unicode-server.out" 2>"$tmp/unicode-server.err" &
+server_pid="$!"
+
+for _ in $(seq 1 100); do
+  if (echo >"/dev/tcp/127.0.0.1/${unicode_port}") >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.05
+done
+
+PGPASSWORD="$unicode_password" psql \
+  "host=127.0.0.1 port=${unicode_port} user=gpudb dbname=postgres sslmode=require" \
+  -Atc "select 1 as one" >"$tmp/unicode.out" 2>"$tmp/unicode.err"
+if ! grep -Fxq "1" "$tmp/unicode.out"; then
+  printf 'production plaintext bootstrap did not match PostgreSQL SASLprep semantics\n' >&2
+  cat "$tmp/unicode.out" >&2
+  cat "$tmp/unicode.err" >&2
+  exit 1
+fi
+
 printf 'connection_security_posture_preflight=passed\n'
 printf 'connection_security_posture_preflight_scope=local_dev_trust_auth_no_tls_plus_opt_in_production_tls_scram\n'
 printf 'connection_security_posture_preflight_local_dev_profile=trust_auth_no_tls_supported\n'
@@ -191,7 +255,9 @@ printf 'connection_security_posture_preflight_production_plaintext_password_conf
 printf 'connection_security_posture_preflight_production_tls_required=passed\n'
 printf 'connection_security_posture_preflight_production_scram_sha_256_valid_password=passed\n'
 printf 'connection_security_posture_preflight_production_scram_sha_256_invalid_password=passed\n'
+printf 'connection_security_posture_preflight_production_scram_sha_256_invalid_user=passed\n'
 printf 'connection_security_posture_preflight_production_recovery_after_invalid_password=passed\n'
+printf 'connection_security_posture_preflight_production_password_bootstrap_saslprep=passed\n'
 printf 'connection_security_posture_preflight_non_claim_mtls=not_supported\n'
 printf 'connection_security_posture_preflight_non_claim_enterprise_identity=not_supported\n'
 printf 'connection_security_posture_preflight_non_claim_kms_hsm_secret_manager=not_supported\n'

@@ -257,6 +257,16 @@ impl ExtendedSession {
                 Dispatch::Response(self.close(target, &name))
             }
             FrontendMessage::Flush => Dispatch::Response(Ok(Vec::new())),
+            FrontendMessage::PasswordMessage(_) => Dispatch::Response(Err(ExtendedError::new(
+                "08P01",
+                "password messages are not supported after startup",
+            ))),
+            FrontendMessage::SaslInitialResponse { .. } | FrontendMessage::SaslResponse(_) => {
+                Dispatch::Response(Err(ExtendedError::new(
+                    "08P01",
+                    "SASL authentication is only supported during startup",
+                )))
+            }
             _ => Dispatch::Response(Err(ExtendedError::new(
                 "0A000",
                 "frontend message is not supported by the engine-backed server",

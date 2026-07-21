@@ -5,8 +5,7 @@
 //! `SharedEngine::submit`, and COPY TO reads the session's exact engine snapshot through that same
 //! facade. WAL, global order, apply, and publication remain engine-owned.
 
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::io;
 use std::sync::Arc;
 
 use gpu_db_facade::{
@@ -22,6 +21,8 @@ use gpu_db_protocol::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream as TokioTcpStream;
+
+use crate::transport::ReadWrite;
 
 use super::extended::ExtendedSession;
 use super::{
@@ -433,7 +434,7 @@ pub(crate) fn copy_lifecycle_error(error: &CopyWireError) -> DbError {
 }
 
 pub(crate) fn handle_copy_frame_blocking(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &SharedEngine,
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
@@ -516,7 +517,7 @@ pub(crate) fn handle_copy_frame_blocking(
 }
 
 fn write_copy_terminal_blocking(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &SharedEngine,
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
@@ -528,7 +529,7 @@ fn write_copy_terminal_blocking(
 }
 
 fn write_copy_terminal_result_blocking(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &SharedEngine,
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
