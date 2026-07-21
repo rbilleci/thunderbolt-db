@@ -10,7 +10,7 @@ silently omit behavior or leave a product-like write entry behind.
 | Cargo target | Source | Current execution authority | Current protocol surface |
 |---|---|---|---|
 | `gpu-db-server` (`gpu_db_protocol` bin) | `crates/protocol/src/bin/gpu-db-server.rs` plus the `gpu-db-server/` module tree | Legacy `Session`/`SharedCatalog` host-relational state and direct compatibility handlers | Startup, TLS/SCRAM production profile, simple and extended Parse/Bind/Describe/Execute/Close/Sync, prepared statements/portals/cursors, COPY, session state, psql/pg_dump catalog compatibility. `CancelRequest` is parsed and its connection is closed, but the process id/key are not resolved and no running query is cancelled. |
-| `gpu-db-engine-server` (`gpu_db_server` bin) | `crates/server/src/main.rs` plus the bounded `lib`, `security`, `transport`, `cancellation`, `async_submit`, `wire_response`, `extended`, and `copy` module owners | One session-owned `SharedEngine::submit` boundary plus effect-free prepare/describe over the real engine | Engine-backed simple query plus one shared Parse/Bind/Describe/Execute/Close portal lifecycle, transaction-private Parse/Describe, one-`CREATE TABLE` plus ordered DML composite transactions, bounded GPU scalar projection, atomic ordinary multi-statement Query messages, and typed text/CSV COPY FROM/TO. COPY FROM retains and revalidates its analyzed relation generation through CopyDone and enters the canonical transaction/WAL/publication boundary. An explicit local-dev trust profile and fail-closed production TLS/SCRAM-SHA-256 profile wrap the same dispatcher. Startup now emits one random `BackendKeyData`; direct or TLS-contained exact-key CancelRequest connections silently signal only the current request generation. Blocking and async COPY, queued async facade/metadata work, effect-free result encoding, extended Sync recovery, malformed/wrong/stale/idle keys, and post-cancel reuse share that one server-local registry. Every post-submission facade error and successful mutation/RETURNING outcome is preserved. Multiple transactional DDL and legacy catalog/introspection breadth remain outside this target. |
+| `gpu-db-engine-server` (`gpu_db_server` bin) | `crates/server/src/main.rs` plus the bounded `lib`, `security`, `transport`, `cancellation`, `async_submit`, `wire_response`, `extended`, and `copy` module owners | One session-owned `SharedEngine::submit` boundary plus effect-free prepare/describe over the real engine | Engine-backed simple query plus one shared Parse/Bind/Describe/Execute/Close portal lifecycle, transaction-private Parse/Describe, one-`CREATE TABLE` plus ordered DML composite transactions, bounded GPU scalar projection, atomic ordinary multi-statement Query messages, and typed text/CSV COPY FROM/TO. COPY FROM retains and revalidates its analyzed relation generation through CopyDone and enters the canonical transaction/WAL/publication boundary. An explicit local-dev trust profile and fail-closed production TLS/SCRAM-SHA-256 profile wrap the same dispatcher. Startup advertises the PostgreSQL 16 version number and standard-conforming strings among six `ParameterStatus` fields, then emits one random `BackendKeyData`; direct or TLS-contained exact-key CancelRequest connections silently signal only the current request generation. Typed SHOW isolation metadata, text/binary TEXT parameters with invalid UTF-8/NUL rejection, exact-once suspended portals, failed-transaction recovery/chain handling, and bounded pool cleanup remain session control around the same facade owner. Blocking and async COPY, queued async facade/metadata work, effect-free result encoding, extended Sync recovery, malformed/wrong/stale/idle keys, and post-cancel reuse share that one server-local registry. Every post-submission facade error and successful mutation/RETURNING outcome is preserved. Multiple transactional DDL and legacy catalog/introspection breadth remain outside this target. |
 | `p8_engine_pgwire_benchmark_endpoint` (`gpu_db_server` example) | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` plus its three child modules | Direct `Engine` ownership with retained-route and COPY adapters | Product-like benchmark endpoint; simple/COPY/session behavior needed by the P8 harness, not the canonical product server |
 | `p8_engine_protocol_boundary_probe` (`gpu_db_server` example) | `crates/server/examples/p8_engine_protocol_boundary_probe.rs` | Its own direct-engine `EngineBackedSession` calls `execute_text` and `execute_relational_copy_rows` | Bounded protocol/session/COPY proof invoked by `scripts/lib/p8_ch_benchmark_protocol_boundary.sh`; it is not a listener, but it is an independently callable engine/protocol adapter that must be migrated, deleted, or retained only as a facade-level test seam |
 
@@ -24,6 +24,10 @@ own BackendKeyData registry and interrupts only protocol/queue/response work aro
 does not add an execution, WAL, sequence, or publication claimant. Five independent audits rejected race, response-
 classification, transaction-state/completion, frame-drain, and non-vacuous-evidence holes; all five repair rounds
 are incorporated, and a sixth fresh frozen-tree audit returned **ACCEPT** with no blocking findings.
+The prepared/portal and transaction-state compatibility slice is likewise independently accepted on its exact
+frozen implementation tree. Its startup, typed SHOW, cleanup, TEXT codec, portal, driver, ownership, and append-only
+performance claims add no facade submission, WAL, sequence, or publication authority; the remaining R2DBC catalog
+query stays explicitly assigned to the active GPU catalog/introspection migration.
 
 ## Mutation, transaction, and recovery entry points
 
@@ -58,12 +62,11 @@ stale parameter or result contracts fail without emitting cached metadata. Priva
 dispatch remains below the engine admission surface.
 
 The current transactional-DDL foundation stages one `CREATE TABLE` in the explicit transaction's private catalog,
-allows subsequent DML and private-catalog Parse/Describe in that same transaction, and commits the complete ordered
-program through the existing `engine_transaction_delta` claimant. It adds no WAL or publication authority. The
-canonical simple-query server uses this envelope for an ordinary multi-statement Query message, so a failing statement
-rolls back every predecessor and suppresses every successor. Multiple transactional DDL and DML-before-CREATE remain
-fail-closed PRODUCT-001 migration work; an intervening unrelated commit currently forces a conservative pre-WAL
-serialization retry.
+composes DML before or after that CREATE, and carries private-catalog Parse/Describe through the same ordered
+program and existing `engine_transaction_delta` claimant. It adds no WAL or publication authority. The canonical
+simple-query server uses this envelope for an ordinary multi-statement Query message, so a failing statement rolls
+back every predecessor and suppresses every successor. Multiple transactional DDL remain fail-closed under
+PRODUCT-001; an intervening unrelated commit currently forces a conservative pre-WAL serialization retry.
 
 ## Physical commit and publication owners
 
@@ -88,8 +91,11 @@ The legacy target's existing behavior is concretely exercised by:
 - `tests/compat/pg-dump/run.sh` and `tests/compat/pg-dumpall/run.sh`, including restore variants;
 - the Rust SQLx and tokio-postgres integration tests in `crates/server/tests/`, now running unchanged client
   behavior against `gpu-db-engine-server`, including typed COPY and post-error recovery;
-- application-driver smokes under `tests/compat/{node-postgres,asyncpg,psycopg,jdbc,r2dbc,pgx}/`; node-postgres now
-  boots the canonical binary and proves that its unchanged driver parses the emitted process id and secret key;
+- application-driver smokes under `tests/compat/{node-postgres,asyncpg,psycopg,jdbc,r2dbc,pgx}/`; node-postgres,
+  asyncpg, psycopg, pgx, and JDBC now boot the canonical binary. R2DBC remains an explicitly labelled legacy
+  catalog baseline because its unchanged connection initialization issues the exact extension-autodetection query
+  `SELECT oid, * FROM pg_catalog.pg_type WHERE typname IN ('hstore','geometry','vector')`, which is part of the
+  next PRODUCT-001 catalog/introspection migration rather than a second session-execution owner;
 - the production TLS/SCRAM posture and live engine-backed handshake/mutation/read checks against
   `gpu-db-engine-server` in `scripts/run_connection_security_posture_preflight.sh`;
 - the protocol binary's unit suites in `crates/protocol/src/bin/gpu-db-server/tests/` for catalog,

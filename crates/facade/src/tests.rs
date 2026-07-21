@@ -360,6 +360,169 @@ fn transaction_error_enters_failed_state_and_commit_rolls_back() {
 }
 
 #[test]
+fn session_cleanup_and_compatibility_reads_do_not_enter_mutation_admission() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    let next_before = shared.next_txn_id.load(Ordering::Relaxed);
+
+    assert!(matches!(
+        submit_session_text(&shared, &mut session, "RESET ALL").unwrap(),
+        QueryOutcome::Command { .. }
+    ));
+    assert_eq!(shared.next_txn_id.load(Ordering::Relaxed), next_before);
+
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    let next_after_begin = shared.next_txn_id.load(Ordering::Relaxed);
+    assert!(matches!(
+        submit_session_text(&shared, &mut session, "SELECT pg_advisory_unlock_all()").unwrap(),
+        QueryOutcome::Command { .. }
+    ));
+    for cleanup in ["CLOSE ALL", "UNLISTEN *", "RESET ALL"] {
+        assert!(matches!(
+            submit_session_text(&shared, &mut session, cleanup).unwrap(),
+            QueryOutcome::Command { .. }
+        ));
+    }
+    assert_eq!(
+        session.transaction_status(),
+        SessionTransactionStatus::InTransaction
+    );
+    assert_eq!(
+        shared.next_txn_id.load(Ordering::Relaxed),
+        next_after_begin,
+        "effect-free session cleanup must not allocate a second transaction identity"
+    );
+    assert!(shared.engine.durable_wal_records().is_empty());
+
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+    assert_eq!(session.transaction_status(), SessionTransactionStatus::Idle);
+    assert!(shared.engine.durable_wal_records().is_empty());
+}
+
+#[test]
+fn show_transaction_isolation_reports_session_state_without_claiming_work() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    let next_before = shared.next_txn_id.load(Ordering::Relaxed);
+
+    let expected = |value: &str| QueryOutcome::Rows {
+        columns: vec![ColumnMeta {
+            name: "transaction_isolation".to_string(),
+            logical_type: LogicalType::Text,
+        }],
+        rows: vec![vec![DbValue::Text(value.to_string())]],
+    };
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        expected("read committed")
+    );
+    assert_eq!(shared.next_txn_id.load(Ordering::Relaxed), next_before);
+
+    submit_session_text(
+        &shared,
+        &mut session,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    )
+    .unwrap();
+    let next_after_begin = shared.next_txn_id.load(Ordering::Relaxed);
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW transaction_isolation").unwrap(),
+        expected("repeatable read")
+    );
+    assert_eq!(shared.next_txn_id.load(Ordering::Relaxed), next_after_begin);
+
+    submit_session_text(&shared, &mut session, "COMMIT AND CHAIN").unwrap();
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        expected("repeatable read")
+    );
+    submit_session_text(&shared, &mut session, "ROLLBACK AND CHAIN").unwrap();
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        expected("repeatable read")
+    );
+    submit_session_text(&shared, &mut session, "COMMIT").unwrap();
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        expected("read committed")
+    );
+
+    submit_session_text(
+        &shared,
+        &mut session,
+        "BEGIN ISOLATION LEVEL READ UNCOMMITTED",
+    )
+    .unwrap();
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        expected("read committed")
+    );
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+
+    submit_session_text(
+        &shared,
+        &mut session,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    )
+    .unwrap();
+    let _relation_error = submit_session_text(
+        &shared,
+        &mut session,
+        "SELECT id FROM missing_isolation_relation",
+    )
+    .unwrap_err();
+    let blocked =
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap_err();
+    assert_eq!(blocked.category, ErrorCategory::InFailedTransaction);
+    // PostgreSQL treats COMMIT in an aborted block as rollback; AND CHAIN must retain the
+    // characteristics of that failed block for the successor transaction.
+    assert!(matches!(
+        submit_session_text(&shared, &mut session, "COMMIT AND CHAIN").unwrap(),
+        QueryOutcome::Command {
+            tag: CommandTag::Rollback,
+            ..
+        }
+    ));
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        expected("repeatable read")
+    );
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        expected("read committed")
+    );
+    assert!(shared.engine.durable_wal_records().is_empty());
+}
+
+#[test]
+fn batched_text_fallback_preserves_session_metadata_reads() {
+    let shared = Arc::new(SharedEngine::new());
+    let batcher = PointLookupBatcher::with_triggers(
+        Arc::clone(&shared),
+        8,
+        std::time::Duration::from_secs(1),
+    );
+    let mut session = shared.open_session();
+    let outcome = shared
+        .submit(
+            &mut session,
+            SubmissionRequest::BatchedText {
+                sql: "SHOW TRANSACTION ISOLATION LEVEL",
+                batcher: &batcher,
+            },
+        )
+        .into_immediate()
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        QueryOutcome::Rows { rows, .. }
+            if rows == vec![vec![DbValue::Text("read committed".to_string())]]
+    ));
+    assert!(shared.engine.durable_wal_records().is_empty());
+}
+
+#[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn parameterized_w1_update_preserves_types_and_returning_rows() {
     let mut facade = MultiSessionHarness::new();

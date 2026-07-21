@@ -37,7 +37,7 @@ use gpu_db_engine::{
 };
 use gpu_db_sql::{
     parse_command, Command, CopyFromStdin, CopyToStdout, Decimal128, ParseError, ParsedCommand,
-    Select, SqlType, SqlValue,
+    Select, SqlType, SqlValue, TransactionCharacteristics, TransactionIsolation,
 };
 
 #[cfg(test)]
@@ -313,6 +313,7 @@ impl SubmissionDispatch {
 pub struct SharedSession {
     engine_identity: Arc<()>,
     active_txn_id: Option<u64>,
+    transaction_characteristics: Option<TransactionCharacteristics>,
     transaction_failed: bool,
 }
 
@@ -390,6 +391,7 @@ impl SharedEngine {
         SharedSession {
             engine_identity: Arc::clone(&self.identity),
             active_txn_id: None,
+            transaction_characteristics: None,
             transaction_failed: false,
         }
     }
@@ -468,6 +470,7 @@ impl SharedEngine {
                 return Err(invalid_mutation_result("session close ROLLBACK"));
             };
             session.active_txn_id = None;
+            session.transaction_characteristics = None;
         }
         session.transaction_failed = false;
         Ok(QueryOutcome::Empty)
@@ -851,13 +854,6 @@ pub fn durable_wal_segment_from_env(value: Option<&std::ffi::OsStr>) -> Option<s
 /// possibly-torn state — the engine deliberately wedges (the WAL is the durable source of truth; a
 /// restart replays it). A retryable SI serialization conflict is NOT a poison: it maps to
 /// [`ErrorCategory::Serialization`] (class-40) and the client retries.
-fn submit_autocommit_parsed(
-    shared: &SharedEngine,
-    parsed: ParsedCommand,
-) -> Result<QueryOutcome, DbError> {
-    submit_autocommit_parsed_with_catalog(shared, parsed, None)
-}
-
 fn submit_autocommit_parsed_with_catalog(
     shared: &SharedEngine,
     parsed: ParsedCommand,
@@ -997,8 +993,40 @@ fn submit_parsed_inner(
     expected_catalog_version: Option<u64>,
 ) -> Result<QueryOutcome, DbError> {
     match parsed.command() {
-        Command::Begin { .. } => {
+        Command::ResetAll => Ok(QueryOutcome::Command {
+            // The SQL parser deliberately normalizes the bounded session-cleanup family
+            // (RESET/DISCARD/DEALLOCATE/CLOSE/UNLISTEN) to one effect-free command. It belongs
+            // to the session control plane and must neither enter transaction catalog staging
+            // nor claim an autocommit transaction/WAL position.
+            tag: command_tag(parsed.command()),
+            rows_affected: None,
+        }),
+        Command::ShowTransactionIsolation => {
+            let isolation = session
+                .transaction_characteristics
+                .unwrap_or_default()
+                .isolation;
+            let value = match isolation {
+                TransactionIsolation::ReadUncommitted | TransactionIsolation::ReadCommitted => {
+                    "read committed"
+                }
+                TransactionIsolation::RepeatableRead => "repeatable read",
+                TransactionIsolation::Serializable => "serializable",
+            };
+            Ok(QueryOutcome::Rows {
+                columns: vec![ColumnMeta {
+                    name: "transaction_isolation".to_string(),
+                    logical_type: LogicalType::Text,
+                }],
+                rows: vec![vec![DbValue::Text(value.to_string())]],
+            })
+        }
+        Command::Begin { characteristics } => {
             if session.active_txn_id.is_none() {
+                let mut accepted = *characteristics;
+                if accepted.isolation == TransactionIsolation::ReadUncommitted {
+                    accepted.isolation = TransactionIsolation::ReadCommitted;
+                }
                 if shared.engine.is_commit_path_poisoned() {
                     return Err(poisoned_engine_error());
                 }
@@ -1012,6 +1040,7 @@ fn submit_parsed_inner(
                     TransactionAdmissionResult::Transaction(Some(id)) if id == txn_id
                 ));
                 session.active_txn_id = Some(txn_id);
+                session.transaction_characteristics = Some(accepted);
                 session.transaction_failed = false;
             }
             Ok(QueryOutcome::Command {
@@ -1037,6 +1066,8 @@ fn submit_parsed_inner(
                         .fetch_max(next_txn_id.saturating_add(1), Ordering::Relaxed);
                 }
                 session.active_txn_id = successor;
+                session.transaction_characteristics =
+                    successor.and(session.transaction_characteristics);
                 session.transaction_failed = false;
             }
             Ok(QueryOutcome::Command {
@@ -1062,6 +1093,8 @@ fn submit_parsed_inner(
                         .fetch_max(next_txn_id.saturating_add(1), Ordering::Relaxed);
                 }
                 session.active_txn_id = successor;
+                session.transaction_characteristics =
+                    successor.and(session.transaction_characteristics);
                 session.transaction_failed = false;
             }
             Ok(QueryOutcome::Command {
@@ -1094,6 +1127,26 @@ fn submit_parsed_inner(
                 .execute_relational_literal(literal)
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
+        }
+        Command::GetKv { .. } | Command::SelectFunction(_) | Command::SequenceCurrVal(_)
+            if session.active_txn_id.is_some() =>
+        {
+            // Compatibility reads remain unsequenced inside an explicit/implicit block just as
+            // they are in autocommit. In particular asyncpg's pool reset begins with
+            // pg_advisory_unlock_all(); routing it through mutation admission would both violate
+            // the read-only ownership rule and fail the enclosing implicit Query transaction.
+            if shared.engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            let tag = command_tag(parsed.command());
+            shared
+                .engine
+                .execute_parsed_compatibility_read(parsed)
+                .map_err(map_execute_error)?;
+            Ok(QueryOutcome::Command {
+                tag,
+                rows_affected: None,
+            })
         }
         Command::Insert(_) | Command::Update(_) | Command::Delete(_)
             if session.active_txn_id.is_some() =>
@@ -1278,7 +1331,10 @@ fn submit_batched_text_inner(
     // same owner on the per-query path; no fallback reparses SQL text.
     match classify_batchable_point_lookup(shared, &parsed) {
         Some((select, needle)) => SubmissionDispatch::Batched(batcher.enqueue(select, needle)),
-        None => SubmissionDispatch::Immediate(submit_autocommit_parsed(shared, parsed)),
+        // The fallback remains session-owned even while idle. Session metadata/control commands
+        // (for example SHOW transaction isolation) are deliberately not autocommit mutations and
+        // must retain the same SharedSession semantics as ordinary Text submission.
+        None => SubmissionDispatch::Immediate(submit_parsed(shared, session, parsed)),
     }
 }
 

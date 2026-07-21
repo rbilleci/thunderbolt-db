@@ -47,16 +47,16 @@ func waitForEndpoint(port int, timeout time.Duration) error {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	return fmt.Errorf("gpu-db-server did not start on 127.0.0.1:%d", port)
+	return fmt.Errorf("gpu-db-engine-server did not start on 127.0.0.1:%d", port)
 }
 
 func startServer(ctx context.Context, root string) (*server, error) {
-	build := exec.CommandContext(ctx, "cargo", "build", "-p", "gpu_db_protocol", "--bin", "gpu-db-server")
+	build := exec.CommandContext(ctx, "cargo", "build", "-p", "gpu_db_server", "--bin", "gpu-db-engine-server")
 	build.Dir = root
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
-		return nil, fmt.Errorf("cargo build for gpu-db-server failed: %w", err)
+		return nil, fmt.Errorf("cargo build for gpu-db-engine-server failed: %w", err)
 	}
 
 	port, err := freeLocalPort()
@@ -64,7 +64,7 @@ func startServer(ctx context.Context, root string) (*server, error) {
 		return nil, err
 	}
 
-	binary := filepath.Join(root, "target", "debug", "gpu-db-server")
+	binary := filepath.Join(root, "target", "debug", "gpu-db-engine-server")
 	cmd := exec.CommandContext(ctx, binary, "--listen", fmt.Sprintf("127.0.0.1:%d", port))
 	cmd.Dir = root
 	cmd.Stdin = nil

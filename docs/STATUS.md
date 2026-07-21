@@ -14,10 +14,49 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 prepared/portal/transaction-state compatibility — accepted 2026-07-21
+
+- Asyncpg, psycopg, pgx, JDBC, and the aggregate tokio-postgres gate now build and boot
+  `gpu-db-engine-server`; SQLx and node-postgres remain canonical. The unchanged asyncpg pool reset executes its
+  `pg_advisory_unlock_all`/CLOSE/UNLISTEN/RESET sequence through effect-free session control without allocating an
+  additional per-command transaction identity or any WAL position. R2DBC is explicitly reported as a legacy catalog
+  baseline: canonical startup and `SHOW TRANSACTION ISOLATION LEVEL` succeed, then its unchanged extension
+  autodetection reaches the still-unmigrated `pg_catalog.pg_type` query owned by the next PRODUCT-001 GPU-catalog
+  slice.
+- Canonical startup now sends `server_version_num=160000` and `standard_conforming_strings=on` alongside the four
+  existing status fields. SHOW isolation is a typed session command with prepared result metadata; it reports the
+  engine-accepted READ COMMITTED/REPEATABLE READ mode, normalizes READ UNCOMMITTED, survives normal COMMIT/ROLLBACK
+  AND CHAIN plus failed COMMIT AND CHAIN, resets after the terminal transaction, and obeys failed-transaction
+  precedence without entering mutation admission. Text and binary TEXT Bind parameters decode as UTF-8, NULL remains
+  out-of-band, and invalid UTF-8 or an embedded zero byte fails before portal execution.
+- The real tokio-postgres gate proves bounded portal suspension, resume, EOF and exact-once execution; an explicit
+  prepared insert transaction stages a TEXT value, enters `23505`/`25P02`, rolls back with zero publication, and
+  reuses the key. A separate TEXT NULL prepared insert plus readback is the GPU differential. No new facade method,
+  sequence/WAL claimant, or publication owner was added; `SharedEngine::submit` remains the only public product
+  execution boundary. The only production outlier touched is the already PLAN-owned
+  `engine_dml_concurrent.rs`, now **2,078** lines and still required below 2,000 before PRODUCT-001 closes.
+- Current gates pass SQL **50/50**, engine **502/536 ignored**, facade **69/10 ignored** plus concurrency **13/1
+  ignored**, canonical server **70/4 ignored** plus pgwire **4/2 ignored**, SQLx **1**, tokio-postgres **1**,
+  protocol **71 + 127**, and the complete application-driver aggregate. Workspace all-target/all-feature check,
+  strict affected all-target/all-feature Clippy, scoped rustfmt, shell/diff/source-size, and canonical-consumer source
+  guards pass. The prepared-W1 plus real-driver HAZARD pair passes three sequential and two overlapping runs with
+  zero CUDA 700/716/717; hiding the GPU fails loudly with `CUDA driver library is unavailable`.
+- The first full card exposed a real in-memory layout regression: the mid-enum session-command insertion measured
+  **215.716M/s at p50 175us** in-L2, and a same-environment clean-HEAD/candidate pair measured **231.872M/s at p50
+  157us** versus **218.787M/s at p50 174us**. Keeping new `Command` variants append-only restored two repeated
+  candidate runs to **232.553/231.908M/s at p50 156us**, alongside repeated clean-HEAD results of
+  **231.872/231.407M/s at p50 157us**. The repaired full card records **231.527M/s at p50 157us** in-L2 and
+  **201.693M/s at p50 199us** out-of-L2, Layer-1 rooflines of **1,476.2/1,444.2 GB/s**, a **1,675.6M elements/s**
+  grouped kernel, and a **2,092.3s + 0.0s residency** 48M-row build. A fresh read-only auditor verified the frozen
+  implementation identity (base `5403923f6b`, index tree `ac914b3341`, staged-diff SHA-256 `2b43fc5758`), traced
+  every claimed protocol, transaction-state, codec, portal, ownership, and performance invariant, independently
+  measured **232.824M/s at p50 156us** in-L2, and returned **ACCEPT** with no blocking finding. Its only residual was
+  the active PLAN source-size row's stale 2,065 snapshot; the acceptance update corrects that factual count to 2,078.
+
 ## PRODUCT-001 canonical keyed cancellation — accepted 2026-07-21
 
 - One server-local registry is shared by every worker of each canonical listener. Successful trust or SCRAM startup
-  registers a positive process id plus an OS-random four-byte secret and emits `BackendKeyData` after the four
+  registers a positive process id plus an OS-random four-byte secret and emits `BackendKeyData` after the six
   ParameterStatus frames and before ReadyForQuery. Secret-bearing types expose no `Debug`; exact secrets are
   compared in constant time. Unknown, wrong-length, wrong-secret, stale, or idle requests are silent no-ops; even a
   short or oversized frame carrying the CancelRequest code closes without an ErrorResponse on direct, TLS, and

@@ -12,18 +12,52 @@ require_command() {
   fi
 }
 
+python_has_pip() {
+  local python="$1"
+  if [[ "$python" == */* ]]; then
+    [[ -x "$python" ]] || return 1
+  elif ! command -v "$python" >/dev/null 2>&1; then
+    return 1
+  fi
+  "$python" -m pip --version >/dev/null 2>&1
+}
+
 require_python314() {
   if [[ -n "${PYTHON_BIN:-}" ]]; then
+    if python_has_pip "$PYTHON_BIN"; then
+      export PYTHON_BIN
+      return
+    fi
+    echo "application driver smoke PYTHON_BIN must name an executable Python 3.14 interpreter with pip" >&2
+    exit 1
+  fi
+  local path_python
+  path_python=$(command -v python3.14 2>/dev/null || true)
+  if [[ -n "$path_python" ]] && "$path_python" -m pip --version >/dev/null 2>&1; then
+    PYTHON_BIN=$path_python
+    export PYTHON_BIN
     return
   fi
-  if command -v python3.14 >/dev/null 2>&1; then
-    return
-  fi
-  if [[ -x /home/linuxbrew/.linuxbrew/bin/python3.14 ]]; then
+  if [[ -x /home/linuxbrew/.linuxbrew/bin/python3.14 ]] \
+    && /home/linuxbrew/.linuxbrew/bin/python3.14 -m pip --version >/dev/null 2>&1; then
+    PYTHON_BIN=/home/linuxbrew/.linuxbrew/bin/python3.14
+    export PYTHON_BIN
     return
   fi
   echo "application driver smokes require Python 3.14 for asyncpg/psycopg; set PYTHON_BIN to a compatible interpreter" >&2
   exit 1
+}
+
+require_canonical_driver_source() {
+  local driver="$1"
+  if rg -q 'gpu_db_protocol|gpu-db-server' "tests/compat/$driver"; then
+    echo "canonical application driver still names the legacy server: $driver" >&2
+    exit 1
+  fi
+  if ! rg -q 'gpu_db_server|gpu-db-engine-server' "tests/compat/$driver"; then
+    echo "canonical application driver does not name gpu-db-engine-server: $driver" >&2
+    exit 1
+  fi
 }
 
 require_command cargo
@@ -32,9 +66,22 @@ require_command npm
 require_command go
 require_command javac
 require_command mvn
+require_command rg
 require_python314
 
-cargo test -p gpu_db_protocol --test tokio_postgres_smoke -- --color never
+for canonical_driver in node-postgres asyncpg psycopg pgx jdbc; do
+  require_canonical_driver_source "$canonical_driver"
+done
+if ! rg -q 'gpu_db_protocol|gpu-db-server' tests/compat/r2dbc; then
+  echo "R2DBC must remain an explicit legacy catalog baseline until its catalog slice migrates it" >&2
+  exit 1
+fi
+if rg -q 'gpu_db_server|gpu-db-engine-server' tests/compat/r2dbc; then
+  echo "R2DBC source names both canonical and legacy targets; its baseline is ambiguous" >&2
+  exit 1
+fi
+
+cargo test -p gpu_db_server --test tokio_postgres_smoke -- --color never
 echo "application_driver_smoke_tokio_postgres=passed"
 
 cargo test -p gpu_db_server --test sqlx_smoke -- --color never
@@ -57,6 +104,8 @@ echo "application_driver_smoke_jdbc=passed"
 
 tests/compat/r2dbc/run.sh
 echo "application_driver_smoke_r2dbc=passed"
+echo "application_driver_smoke_r2dbc_target=legacy_catalog_baseline"
 
+echo "application_driver_smoke_canonical_targets=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg,pgx,jdbc"
 echo "application_driver_smoke_scope=supported_sql_protocol_subset"
 echo "application driver smoke gate passed"

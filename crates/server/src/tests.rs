@@ -57,7 +57,7 @@ fn blocking_late_auth_frames_error_skip_until_sync_and_recover() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 7);
+    let _ = read_messages(&mut client, 9);
 
     for (case, payload) in late_auth_payloads() {
         client.write_all(&tagged(b'p', &payload)).unwrap();
@@ -101,7 +101,7 @@ async fn async_late_auth_frames_error_skip_until_sync_and_recover() {
     ));
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let _ = read_messages_async(&mut client, 7).await;
+    let _ = read_messages_async(&mut client, 9).await;
 
     for (case, payload) in late_auth_payloads() {
         client.write_all(&tagged(b'p', &payload)).await.unwrap();
@@ -161,7 +161,7 @@ fn blocking_backend_key_cancels_simple_and_extended_copy_and_recovers() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let startup = read_messages(&mut client, 7);
+    let startup = read_messages(&mut client, 9);
     let (process_id, secret_key) = backend_key(&startup);
 
     // PostgreSQL treats cancellation while idle as a no-op; it must not poison the next query.
@@ -288,7 +288,7 @@ async fn async_backend_key_cancels_waiting_copy_and_recovers() {
     });
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let startup = read_messages_async(&mut client, 7).await;
+    let startup = read_messages_async(&mut client, 9).await;
     let (process_id, secret_key) = backend_key(&startup);
 
     send_cancel_async(address, process_id, secret_key).await;
@@ -401,7 +401,7 @@ async fn async_queued_parse_cancels_before_metadata_and_recovers_at_sync() {
 
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let startup = read_messages_async(&mut client, 7).await;
+    let startup = read_messages_async(&mut client, 9).await;
     let (process_id, secret_key) = backend_key(&startup);
     client
         .write_all(&tagged(
@@ -486,7 +486,7 @@ async fn async_cancelled_queued_extended_sync_rolls_back_staged_insert() {
 
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let startup = read_messages_async(&mut client, 7).await;
+    let startup = read_messages_async(&mut client, 9).await;
     let (process_id, secret_key) = backend_key(&startup);
     client
         .write_all(&tagged(
@@ -605,7 +605,7 @@ async fn async_extended_copy_cancelled_before_queued_done_frame_recovers_at_sync
 
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let startup = read_messages_async(&mut client, 7).await;
+    let startup = read_messages_async(&mut client, 9).await;
     let (process_id, secret_key) = backend_key(&startup);
     client
         .write_all(&tagged(
@@ -698,7 +698,7 @@ fn blocking_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 7);
+    let _ = read_messages(&mut client, 9);
 
     // Query is a transaction boundary even when its SQL consists only of comments. A preceding
     // Parse has opened the synthetic extended transaction; the comment-only Query must close it
@@ -1082,7 +1082,7 @@ async fn async_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     ));
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    let _ = read_messages_async(&mut client, 7).await;
+    let _ = read_messages_async(&mut client, 9).await;
 
     client
         .write_all(&tagged(
@@ -1467,9 +1467,24 @@ fn pgwire_extended_lifecycle_preserves_transaction_status_and_skip_until_sync() 
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
+    let startup = read_messages(&mut client, 9);
     assert_eq!(
-        read_tags(&mut client, 7),
-        vec![b'R', b'S', b'S', b'S', b'S', b'K', b'Z']
+        startup.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+        vec![b'R', b'S', b'S', b'S', b'S', b'S', b'S', b'K', b'Z']
+    );
+    assert_eq!(
+        startup[1..7]
+            .iter()
+            .map(|(_, payload)| payload.as_slice())
+            .collect::<Vec<_>>(),
+        vec![
+            b"server_version\x0016.0-gpu-db-engine-facade\0".as_slice(),
+            b"server_version_num\x00160000\0".as_slice(),
+            b"client_encoding\0UTF8\0".as_slice(),
+            b"DateStyle\0ISO, MDY\0".as_slice(),
+            b"integer_datetimes\0on\0".as_slice(),
+            b"standard_conforming_strings\0on\0".as_slice(),
+        ]
     );
 
     let mut begin = Vec::new();
@@ -1546,7 +1561,7 @@ fn raw_malformed_nonextended_frames_emit_error_and_ready_without_skip() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 7);
+    let _ = read_messages(&mut client, 9);
 
     // Parse opens the synthetic extended-cycle transaction. A malformed Query is not an
     // extended message, so it rolls that transaction back and emits ErrorResponse + Ready
@@ -1619,7 +1634,7 @@ fn raw_bind_resolves_missing_statement_before_parameter_format_arity() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 7);
+    let _ = read_messages(&mut client, 9);
 
     // Two parameter formats for zero supplied values is semantically malformed, but Bind
     // must resolve the named statement first. The frame parser therefore preserves it for the
@@ -1661,7 +1676,7 @@ fn extended_ddl_commits_at_sync_and_rolls_back_with_a_later_cycle_error() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    assert_eq!(read_tags(&mut client, 7).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut client, 9).last(), Some(&b'Z'));
 
     let mut ddl = Vec::new();
     ddl.extend(tagged(
@@ -1731,7 +1746,7 @@ fn extended_describe_revalidates_catalog_before_emitting_cached_metadata() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    assert_eq!(read_tags(&mut client, 7).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut client, 9).last(), Some(&b'Z'));
 
     client
         .write_all(&tagged(
@@ -1793,7 +1808,7 @@ async fn async_extended_describe_revalidates_catalog_before_emitting_cached_meta
     ));
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&startup_frame()).await.unwrap();
-    assert_eq!(read_tags_async(&mut client, 7).await.last(), Some(&b'Z'));
+    assert_eq!(read_tags_async(&mut client, 9).await.last(), Some(&b'Z'));
 
     client
         .write_all(&tagged(
@@ -1877,8 +1892,8 @@ fn blocking_parse_and_describe_use_only_the_connection_private_catalog() {
     }
     creator.write_all(&startup_frame()).unwrap();
     observer.write_all(&startup_frame()).unwrap();
-    assert_eq!(read_tags(&mut creator, 7).last(), Some(&b'Z'));
-    assert_eq!(read_tags(&mut observer, 7).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut creator, 9).last(), Some(&b'Z'));
+    assert_eq!(read_tags(&mut observer, 9).last(), Some(&b'Z'));
 
     creator
         .write_all(&tagged(b'Q', &query_payload("BEGIN")))
@@ -1977,8 +1992,8 @@ async fn async_parse_and_describe_use_only_the_connection_private_catalog() {
     let mut observer = tokio::net::TcpStream::connect(address).await.unwrap();
     creator.write_all(&startup_frame()).await.unwrap();
     observer.write_all(&startup_frame()).await.unwrap();
-    assert_eq!(read_tags_async(&mut creator, 7).await.last(), Some(&b'Z'));
-    assert_eq!(read_tags_async(&mut observer, 7).await.last(), Some(&b'Z'));
+    assert_eq!(read_tags_async(&mut creator, 9).await.last(), Some(&b'Z'));
+    assert_eq!(read_tags_async(&mut observer, 9).await.last(), Some(&b'Z'));
 
     creator
         .write_all(&tagged(b'Q', &query_payload("BEGIN")))
@@ -2083,7 +2098,7 @@ fn simple_query_literal_gpu_path_preserves_typed_null_differential() {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 7);
+    let _ = read_messages(&mut client, 9);
 
     // Both NULLs and their zero/empty controls traverse the same typed transient GPU relation.
     // The contrasting validity payloads prove NULL is not fabricated from the device placeholder.
@@ -2129,7 +2144,7 @@ fn simple_query_commit_and_rollback_end_the_pending_extended_cycle() {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 7);
+    let _ = read_messages(&mut client, 9);
     client
         .write_all(&tagged(
             b'Q',
@@ -2252,7 +2267,7 @@ fn blocking_simple_copy_from_to_abort_and_transaction_boundaries() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut client, 7);
+    let _ = read_messages(&mut client, 9);
 
     client
         .write_all(&tagged(
@@ -2397,8 +2412,8 @@ fn copy_parse_and_completion_bind_to_the_analyzed_relation_generation() {
     }
     copy_client.write_all(&startup_frame()).unwrap();
     ddl_client.write_all(&startup_frame()).unwrap();
-    let _ = read_messages(&mut copy_client, 7);
-    let _ = read_messages(&mut ddl_client, 7);
+    let _ = read_messages(&mut copy_client, 9);
+    let _ = read_messages(&mut ddl_client, 9);
 
     let mut missing_parse = tagged(
         b'P',

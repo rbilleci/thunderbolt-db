@@ -42,6 +42,8 @@ run_gate \
   "application_driver_smoke_pgx=passed" \
   "application_driver_smoke_jdbc=passed" \
   "application_driver_smoke_r2dbc=passed" \
+  "application_driver_smoke_r2dbc_target=legacy_catalog_baseline" \
+  "application_driver_smoke_canonical_targets=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg,pgx,jdbc" \
   "application_driver_smoke_scope=supported_sql_protocol_subset"
 
 run_gate \

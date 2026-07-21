@@ -1586,6 +1586,11 @@ fn execute_statement(
             Command::SelectLiteral(_) => {
                 return execute_session_compat_fallback(stream, session, &canonical)
             }
+            // SHOW was already served by this legacy string fallback before the shared parser
+            // gained a typed variant. Preserve that behavior without adding another handler.
+            Command::ShowTransactionIsolation => {
+                return execute_session_compat_fallback(stream, session, &canonical)
+            }
         },
     }
 

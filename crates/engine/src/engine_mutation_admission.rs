@@ -364,6 +364,7 @@ impl Engine {
             Command::Select(_)
             | Command::SelectFunction(_)
             | Command::SelectLiteral(_)
+            | Command::ShowTransactionIsolation
             | Command::SequenceCurrVal(_)
             | Command::GetKv { .. } => Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "read-only commands do not enter mutation admission".to_string(),

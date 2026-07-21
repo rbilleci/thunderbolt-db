@@ -1109,6 +1109,18 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
     if let Some(reset) = parse_reset_command(s) {
         return reset;
     }
+    let show_tokens = s.split_whitespace().collect::<Vec<_>>();
+    if (show_tokens.len() == 4
+        && show_tokens[0].eq_ignore_ascii_case("SHOW")
+        && show_tokens[1].eq_ignore_ascii_case("TRANSACTION")
+        && show_tokens[2].eq_ignore_ascii_case("ISOLATION")
+        && show_tokens[3].eq_ignore_ascii_case("LEVEL"))
+        || (show_tokens.len() == 2
+            && show_tokens[0].eq_ignore_ascii_case("SHOW")
+            && show_tokens[1].eq_ignore_ascii_case("transaction_isolation"))
+    {
+        return Ok(Command::ShowTransactionIsolation);
+    }
     if let Some(relational) = parse_relational_command(s, allow_catalog_schemas) {
         return relational;
     }
@@ -1208,6 +1220,21 @@ mod transaction_characteristic_tests {
     fn malformed_read_committed_isolation_is_not_silently_accepted() {
         assert!(parse_command("BEGIN ISOLATION LEVEL COMMITTED").is_err());
         assert!(parse_command("START TRANSACTION ISOLATION LEVEL COMMITTED").is_err());
+    }
+
+    #[test]
+    fn show_transaction_isolation_is_typed_session_metadata() {
+        for sql in [
+            "SHOW TRANSACTION ISOLATION LEVEL",
+            "show transaction_isolation;",
+            "SHOW /* session metadata */ TRANSACTION ISOLATION LEVEL",
+        ] {
+            assert_eq!(
+                parse_command(sql).unwrap(),
+                Command::ShowTransactionIsolation
+            );
+        }
+        assert!(parse_command("SHOW TRANSACTION ISOLATION").is_err());
     }
 
     #[test]

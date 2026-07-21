@@ -56,7 +56,7 @@ pub fn logical_type_from_oid(oid: u32) -> Result<LogicalType, PgValueCodecError>
     }
 }
 
-/// Decode one PostgreSQL Bind parameter for the canonical BENCH integer/UUID vocabulary.
+/// Decode one PostgreSQL Bind parameter for the canonical prepared integer/TEXT/UUID vocabulary.
 /// A missing value is SQL NULL; text (format 0) and exact-width network-order binary (format 1)
 /// are both accepted. Broader codecs remain explicit rather than silently guessing.
 pub fn decode_parameter(
@@ -75,7 +75,11 @@ pub fn decode_parameter(
     };
     if !matches!(
         logical_type,
-        LogicalType::Int2 | LogicalType::Int4 | LogicalType::Int8 | LogicalType::Uuid
+        LogicalType::Int2
+            | LogicalType::Int4
+            | LogicalType::Int8
+            | LogicalType::Text
+            | LogicalType::Uuid
     ) {
         return Err(PgValueCodecError::UnsupportedParameterType(logical_type));
     }
@@ -108,6 +112,13 @@ fn decode_text_parameter(
         LogicalType::Int8 => parse_pg_integer(text, i64::MIN, i64::MAX)
             .map(DbValue::Int8)
             .ok_or_else(invalid),
+        LogicalType::Text => {
+            if text.contains('\0') {
+                Err(invalid())
+            } else {
+                Ok(DbValue::Text(text.to_string()))
+            }
+        }
         LogicalType::Uuid => parse_pg_uuid(text).map(DbValue::Uuid).ok_or_else(invalid),
         _ => unreachable!("decode_parameter restricts the canonical vocabulary"),
     }
@@ -248,6 +259,15 @@ fn decode_binary_parameter(
             .map(i64::from_be_bytes)
             .map(DbValue::Int8)
             .map_err(|_| invalid()),
+        LogicalType::Text => std::str::from_utf8(value)
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                if value.contains('\0') {
+                    Err(invalid())
+                } else {
+                    Ok(DbValue::Text(value.to_string()))
+                }
+            }),
         LogicalType::Uuid => value.try_into().map(DbValue::Uuid).map_err(|_| invalid()),
         _ => unreachable!("decode_parameter restricts the canonical vocabulary"),
     }
@@ -475,13 +495,28 @@ mod tests {
             decode_parameter(2950, 0, Some(b"not-a-uuid")),
             Err(PgValueCodecError::InvalidValue { .. })
         ));
-        assert_eq!(
-            decode_parameter(25, 0, Some(b"text")),
-            Err(PgValueCodecError::UnsupportedParameterType(
-                LogicalType::Text
-            ))
-        );
-        for oid in [16, 25, 1082, 1114, 1700] {
+        for format in [0, 1] {
+            assert_eq!(decode_parameter(25, format, None).unwrap(), DbValue::Null);
+            assert_eq!(
+                decode_parameter(25, format, Some("Grüße".as_bytes())).unwrap(),
+                DbValue::Text("Grüße".to_string())
+            );
+            assert!(matches!(
+                decode_parameter(25, format, Some(&[0xff])),
+                Err(PgValueCodecError::InvalidValue {
+                    logical_type: LogicalType::Text,
+                    format: failed_format,
+                }) if failed_format == format
+            ));
+            assert!(matches!(
+                decode_parameter(25, format, Some(b"nul\0byte")),
+                Err(PgValueCodecError::InvalidValue {
+                    logical_type: LogicalType::Text,
+                    format: failed_format,
+                }) if failed_format == format
+            ));
+        }
+        for oid in [16, 1082, 1114, 1700] {
             assert_eq!(decode_parameter(oid, 0, None).unwrap(), DbValue::Null);
             assert_eq!(decode_parameter(oid, 1, None).unwrap(), DbValue::Null);
         }

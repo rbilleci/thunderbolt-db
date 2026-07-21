@@ -50,6 +50,11 @@ impl TransactionCharacteristics {
     };
 }
 
+/// Typed SQL command ownership.
+///
+/// New variants stay append-only. Canonical WAL uses named JSON tags, but changing established
+/// in-memory discriminants also changes large engine match tables and hot linked-code layout; a
+/// mid-enum insertion measurably regressed the production point-read route.
 #[allow(clippy::large_enum_variant)]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -148,6 +153,7 @@ pub enum Command {
     Update(Update),
     Select(Select),
     SelectLiteral(SelectLiteral),
+    ShowTransactionIsolation,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

@@ -168,6 +168,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                 | Command::Rollback { .. }
                 | Command::Flush
                 | Command::ResetAll
+                | Command::ShowTransactionIsolation
                 | Command::SetRole { .. }
                 | Command::GetKv { .. }
                 | Command::CreateSchema(_)

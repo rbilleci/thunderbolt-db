@@ -63,7 +63,7 @@ async fn connect(port: u16) -> Result<Client, tokio_postgres::Error> {
 async fn canonical_server_tokio_postgres_copy_and_recovery_smoke(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server = start_server();
-    let client = connect(server.port).await?;
+    let mut client = connect(server.port).await?;
 
     let simple = client.simple_query("SELECT 1 AS one").await?;
     let row = simple
@@ -75,13 +75,97 @@ async fn canonical_server_tokio_postgres_copy_and_recovery_smoke(
         .expect("simple query row");
     assert_eq!(row.get("one"), Some("1"));
 
+    let isolation = client
+        .query_one("SHOW TRANSACTION ISOLATION LEVEL", &[])
+        .await?;
+    assert_eq!(isolation.get::<_, String>(0), "read committed");
+
     client
         .batch_execute(
-            "CREATE TABLE driver_people (id INT, name TEXT);
+            "CREATE TABLE driver_people (id INT PRIMARY KEY, name TEXT);
              INSERT INTO driver_people (id, name)
              VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace');",
         )
         .await?;
+
+    {
+        let transaction = client.transaction().await?;
+        let statement = transaction
+            .prepare("SELECT id FROM driver_people ORDER BY id")
+            .await?;
+        let portal = transaction.bind(&statement, &[]).await?;
+        let first = transaction.query_portal(&portal, 2).await?;
+        let second = transaction.query_portal(&portal, 1).await?;
+        let exhausted = transaction.query_portal(&portal, 1).await?;
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.get::<_, i32>(0))
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(second[0].get::<_, i32>(0), 3);
+        assert!(exhausted.is_empty());
+        transaction.commit().await?;
+    }
+
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let isolation = client
+        .query_one("SHOW TRANSACTION ISOLATION LEVEL", &[])
+        .await?;
+    assert_eq!(isolation.get::<_, String>(0), "repeatable read");
+    client.batch_execute("ROLLBACK").await?;
+
+    client.batch_execute("BEGIN").await?;
+    client
+        .execute(
+            "INSERT INTO driver_people (id, name) VALUES ($1, $2)",
+            &[&90_i32, &"staged"],
+        )
+        .await?;
+    let duplicate = client
+        .execute(
+            "INSERT INTO driver_people (id, name) VALUES ($1, $2)",
+            &[&90_i32, &"duplicate"],
+        )
+        .await
+        .expect_err("duplicate staged key must fail the explicit transaction");
+    assert_eq!(duplicate.code().map(|code| code.code()), Some("23505"));
+    let blocked = client
+        .query_one("SELECT name FROM driver_people WHERE id = 3", &[])
+        .await
+        .expect_err("failed transaction must reject subsequent prepared work");
+    assert_eq!(blocked.code().map(|code| code.code()), Some("25P02"));
+    client.batch_execute("ROLLBACK").await?;
+    let rolled_back = client
+        .query("SELECT id FROM driver_people WHERE id = 90", &[])
+        .await?;
+    assert!(rolled_back.is_empty());
+    assert_eq!(
+        client
+            .execute(
+                "INSERT INTO driver_people (id, name) VALUES ($1, $2)",
+                &[&90_i32, &"reused"],
+            )
+            .await?,
+        1
+    );
+    let null_name: Option<&str> = None;
+    assert_eq!(
+        client
+            .execute(
+                "INSERT INTO driver_people (id, name) VALUES ($1, $2)",
+                &[&91_i32, &null_name],
+            )
+            .await?,
+        1
+    );
+    let null_row = client
+        .query_one("SELECT name FROM driver_people WHERE id = $1", &[&91_i32])
+        .await?;
+    assert_eq!(null_row.get::<_, Option<String>>(0), None);
 
     let statement = client
         .prepare("SELECT id, name FROM driver_people WHERE id = $1")
@@ -113,7 +197,7 @@ async fn canonical_server_tokio_postgres_copy_and_recovery_smoke(
 
     let copied_rows = client
         .query(
-            "SELECT id, name FROM driver_people WHERE id >= $1 ORDER BY id",
+            "SELECT id, name FROM driver_people WHERE id >= $1 AND id <= 5 ORDER BY id",
             &[&4_i32],
         )
         .await?;

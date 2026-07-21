@@ -955,20 +955,20 @@ fn execute_chunks_a_cached_result_and_never_requests_reexecution() {
 }
 
 #[test]
-fn bind_rejects_unsupported_binary_results_before_execution() {
+fn bind_rejects_unsupported_binary_results_after_supported_parameters() {
     let engine = SharedEngine::new();
     let mut session = engine.open_session();
     submit_text(
         &engine,
         &mut session,
-        "CREATE TABLE notes (id int4 PRIMARY KEY, body text)",
+        "CREATE TABLE notes (id int4 PRIMARY KEY, active bool)",
     )
     .unwrap();
     let mut extended = ExtendedSession::default();
     extended
         .parse(
             "insert_note".to_string(),
-            "INSERT INTO notes VALUES ($1, $2) RETURNING body",
+            "INSERT INTO notes VALUES ($1, true) RETURNING active",
             &[],
             |sql, hints| engine.prepare_statement(&session, sql, hints),
         )
@@ -979,7 +979,7 @@ fn bind_rejects_unsupported_binary_results_before_execution() {
                 "portal".to_string(),
                 "insert_note",
                 &[],
-                &[Some(b"1".to_vec()), Some(b"body".to_vec())],
+                &[Some(b"1".to_vec())],
                 &[1],
             )
             .unwrap_err()
@@ -1002,6 +1002,11 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
         .unwrap();
     extended
         .parse("uuid_arg".to_string(), "BEGIN", &[2950], |sql, hints| {
+            engine.prepare_statement(&session, sql, hints)
+        })
+        .unwrap();
+    extended
+        .parse("text_arg".to_string(), "BEGIN", &[25], |sql, hints| {
             engine.prepare_statement(&session, sql, hints)
         })
         .unwrap();
@@ -1041,6 +1046,34 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
             "uuid_arg",
             vec![1],
             vec![Some(vec![0; 15])],
+            "22P03",
+        ),
+        (
+            "bad_text_utf8",
+            "text_arg",
+            vec![0],
+            vec![Some(vec![0xff])],
+            "22P02",
+        ),
+        (
+            "bad_text_binary_utf8",
+            "text_arg",
+            vec![1],
+            vec![Some(vec![0xff])],
+            "22P03",
+        ),
+        (
+            "bad_text_nul",
+            "text_arg",
+            vec![0],
+            vec![Some(b"nul\0byte".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_text_binary_nul",
+            "text_arg",
+            vec![1],
+            vec![Some(b"nul\0byte".to_vec())],
             "22P03",
         ),
     ] {

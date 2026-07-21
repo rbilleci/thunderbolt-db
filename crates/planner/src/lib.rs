@@ -173,13 +173,15 @@ impl Planner {
                 },
                 kind: PlanKind::Admin,
             },
-            Command::ResetAll | Command::SetRole { .. } => PlanNode {
-                op: PlannedOp {
-                    name: "session_control".to_string(),
-                    target: DeviceTarget::Cpu,
-                },
-                kind: PlanKind::TxnControl,
-            },
+            Command::ResetAll | Command::ShowTransactionIsolation | Command::SetRole { .. } => {
+                PlanNode {
+                    op: PlannedOp {
+                        name: "session_control".to_string(),
+                        target: DeviceTarget::Cpu,
+                    },
+                    kind: PlanKind::TxnControl,
+                }
+            }
         };
 
         ExecutionPlan::new(vec![node])

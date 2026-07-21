@@ -1862,6 +1862,11 @@ impl Engine {
             Command::ResetAll | Command::SetRole { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
+            Command::ShowTransactionIsolation => {
+                return Err(ExecuteError::NonReadCommand(
+                    "SHOW TRANSACTION ISOLATION LEVEL",
+                ));
+            }
             Command::CreateExtension(create) => {
                 validate_bootstrap_create_extension(&create).map_err(ExecuteError::Engine)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -1950,6 +1955,9 @@ impl Engine {
             Command::Rollback { .. } => Err(ExecuteError::NonReadCommand("ROLLBACK")),
             Command::Flush => Err(ExecuteError::NonReadCommand("FLUSH")),
             Command::ResetAll => Err(ExecuteError::NonReadCommand("RESET ALL")),
+            Command::ShowTransactionIsolation => Err(ExecuteError::NonReadCommand(
+                "SHOW TRANSACTION ISOLATION LEVEL",
+            )),
             Command::SetRole { .. } => Err(ExecuteError::NonReadCommand("SET ROLE")),
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),

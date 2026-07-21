@@ -72,6 +72,17 @@ impl Engine {
         }
 
         let result_columns = match prepared.command() {
+            Command::ShowTransactionIsolation => vec![RelationalColumn {
+                id: 0,
+                table_oid: 0,
+                attnum: 0,
+                name: "transaction_isolation".to_string(),
+                ty: SqlType::Text,
+                domain: None,
+                default: None,
+                type_oid: SqlType::Text.postgres_oid(),
+                type_size: SqlType::Text.type_size(),
+            }],
             Command::SelectLiteral(literal) => vec![RelationalColumn {
                 id: 0,
                 table_oid: 0,

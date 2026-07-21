@@ -203,7 +203,7 @@ pub(crate) fn encode_frontend_message_error(
     })
 }
 
-/// Build the startup-OK handshake (AuthenticationOk, ParameterStatus x4, BackendKeyData,
+/// Build the startup-OK handshake (AuthenticationOk, ParameterStatus x6, BackendKeyData,
 /// ReadyForQuery).
 pub(crate) fn encode_startup_handshake(backend_key: &BackendKey) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -218,9 +218,11 @@ pub(crate) fn encode_startup_statuses_and_ready(backend_key: &BackendKey) -> io:
     let mut buf = Vec::new();
     let mut writer = BackendWriter::new(&mut buf);
     writer.parameter_status("server_version", "16.0-gpu-db-engine-facade")?;
+    writer.parameter_status("server_version_num", "160000")?;
     writer.parameter_status("client_encoding", "UTF8")?;
     writer.parameter_status("DateStyle", "ISO, MDY")?;
     writer.parameter_status("integer_datetimes", "on")?;
+    writer.parameter_status("standard_conforming_strings", "on")?;
     writer.backend_key_data(backend_key.process_id_i32(), backend_key.secret_key_i32())?;
     writer.ready_for_query(false)?;
     Ok(buf)
