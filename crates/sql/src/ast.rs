@@ -154,6 +154,30 @@ pub enum Command {
     Select(Select),
     SelectLiteral(SelectLiteral),
     ShowTransactionIsolation,
+    /// Session control accepted by the product protocol boundary. `transaction` carries the exact
+    /// characteristics for `SET TRANSACTION`; `access_share_relations` carries the bounded
+    /// relation list for pg_dump's `LOCK TABLE ... IN ACCESS SHARE MODE`. Empty fields describe a
+    /// bounded PostgreSQL client setting whose state does not affect engine name/type semantics.
+    ///
+    /// Keep this variant append-only: command discriminant order is performance-sensitive.
+    SessionControl {
+        transaction: Option<TransactionCharacteristics>,
+        access_share_relations: Vec<String>,
+    },
+    /// Strict, versioned prepared catalog programs emitted by supported PostgreSQL clients. The
+    /// parameter remains a typed AST value and is bound without reconstructing or reparsing SQL.
+    PreparedCatalog(PreparedCatalogProgram),
+    /// Bounded role-login mutation emitted by PostgreSQL 16 pg_dumpall. Keep append-only: command
+    /// discriminant order is performance-sensitive.
+    AlterRoleLogin(AlterRoleLogin),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum PreparedCatalogProgram {
+    Pg16DomainConstraints { type_oid: SqlValue },
+    Pg16DomainDefinition { type_oid: SqlValue },
+    Pg16FunctionDefinition { function_oid: SqlValue },
+    Pg16MaterializedViewDependencies,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -480,6 +504,15 @@ pub struct DropRole {
 pub struct RenameRole {
     pub old_name: String,
     pub new_name: String,
+}
+
+/// Bounded role-attribute mutation used by PostgreSQL 16 global dumps. The engine's role model
+/// deliberately owns login capability only; the parser accepts pg_dump's complete fixed-default
+/// attribute program but rejects any non-default privilege attribute before mutation admission.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AlterRoleLogin {
+    pub name: String,
+    pub login: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

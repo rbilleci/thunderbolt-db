@@ -384,6 +384,40 @@ impl Engine {
                 self.rollback_explicit_transaction(txn_id, chain)
                     .map(TransactionAdmissionResult::Transaction)
             }
+            Command::SessionControl {
+                transaction: Some(characteristics),
+                access_share_relations,
+            } => {
+                reject_prepared_hook(on_prepared)?;
+                if !access_share_relations.is_empty() {
+                    return Err(ExecuteError::Unsupported(
+                        "SET TRANSACTION cannot carry an access-share relation list".to_string(),
+                    ));
+                }
+                self.set_empty_transaction_characteristics(txn_id, characteristics)?;
+                Ok(TransactionAdmissionResult::Command)
+            }
+            Command::TruncateTable(truncate)
+                if self.transaction_snapshot_handle(txn_id).is_some()
+                    && !truncate.restart_identity =>
+            {
+                reject_prepared_hook(on_prepared)?;
+                // Archive workers use CONTINUE IDENTITY before COPY; reuse the transaction-private
+                // full-table GPU DELETE. RESTART IDENTITY is excluded because it owns sequence state.
+                self.execute_prepared_dml_in_transaction_with_result(
+                    txn_id,
+                    Command::Delete(Delete {
+                        table: truncate.name,
+                        filter: None,
+                        filters: Vec::new(),
+                        filter_groups: Vec::new(),
+                        returning: Vec::new(),
+                    }),
+                    expected_catalog_version,
+                    true,
+                )?;
+                Ok(TransactionAdmissionResult::Command)
+            }
             command @ (Command::Insert(_) | Command::Update(_) | Command::Delete(_)) => {
                 let result = if self.transaction_snapshot_handle(txn_id).is_some() {
                     reject_prepared_hook(on_prepared)?;
@@ -391,6 +425,7 @@ impl Engine {
                         txn_id,
                         command,
                         expected_catalog_version,
+                        false,
                     )?
                 } else if self.is_concurrent_dml_command(&command) {
                     match on_prepared {
@@ -449,6 +484,7 @@ impl Engine {
         txn_id: TxnId,
         command: Command,
         expected: Option<u64>,
+        full_table_delete: bool,
     ) -> Result<DmlExecutionResult, ExecuteError> {
         let snapshot = self
             .transaction_snapshot_handle(txn_id)
@@ -483,7 +519,13 @@ impl Engine {
                 ));
             }
         }
-        self.execute_parsed_dml_in_transaction_statement_locked(txn_id, command, &snapshot)
+        if full_table_delete {
+            self.execute_full_table_delete_in_transaction_statement_locked(
+                txn_id, command, &snapshot,
+            )
+        } else {
+            self.execute_parsed_dml_in_transaction_statement_locked(txn_id, command, &snapshot)
+        }
     }
 
     fn submit_predeclared_transaction(
@@ -988,7 +1030,11 @@ impl Engine {
                 }
                 Ok(())
             }
-            Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
+            Command::SelectFunction(call) if call.name == "pg_advisory_unlock_all" => {
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                Ok(())
+            }
+            Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
                 Ok(())
             }
@@ -1661,7 +1707,11 @@ mod tests {
         let wal_before = engine.durable_wal_records().len();
         let fallback_before = engine.metrics().snapshot().fallback_total;
 
-        for sql in ["GET answer", "SELECT bounded_fn()", "SELECT currval('seq')"] {
+        for sql in [
+            "GET answer",
+            "SELECT pg_advisory_unlock_all()",
+            "SELECT currval('seq')",
+        ] {
             engine
                 .execute_parsed_compatibility_read(parsed(sql))
                 .unwrap();

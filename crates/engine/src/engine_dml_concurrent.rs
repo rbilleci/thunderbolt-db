@@ -1827,6 +1827,7 @@ impl Engine {
             | Command::CreateRole(_)
             | Command::DropRole(_)
             | Command::RenameRole(_)
+            | Command::AlterRoleLogin(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -1859,7 +1860,7 @@ impl Engine {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::ResetAll | Command::SetRole { .. } => {
+            Command::ResetAll | Command::SetRole { .. } | Command::SessionControl { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::ShowTransactionIsolation => {
@@ -1925,6 +1926,7 @@ impl Engine {
             Command::Select(_)
             | Command::SelectFunction(_)
             | Command::SelectLiteral(_)
+            | Command::PreparedCatalog(_)
             | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -1959,6 +1961,7 @@ impl Engine {
                 "SHOW TRANSACTION ISOLATION LEVEL",
             )),
             Command::SetRole { .. } => Err(ExecuteError::NonReadCommand("SET ROLE")),
+            Command::SessionControl { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
             Command::CreateSchema(_) => Err(ExecuteError::NonReadCommand("CREATE SCHEMA")),
@@ -2033,6 +2036,7 @@ impl Engine {
             Command::CreateRole(_) => Err(ExecuteError::NonReadCommand("CREATE ROLE")),
             Command::DropRole(_) => Err(ExecuteError::NonReadCommand("DROP ROLE")),
             Command::RenameRole(_) => Err(ExecuteError::NonReadCommand("ALTER ROLE")),
+            Command::AlterRoleLogin(_) => Err(ExecuteError::NonReadCommand("ALTER ROLE")),
             Command::GrantDefaultTablePrivileges(_) => {
                 Err(ExecuteError::NonReadCommand("ALTER DEFAULT PRIVILEGES"))
             }
@@ -2047,6 +2051,7 @@ impl Engine {
             Command::Select(_)
             | Command::SelectFunction(_)
             | Command::SelectLiteral(_)
+            | Command::PreparedCatalog(_)
             | Command::SequenceCurrVal(_) => Err(ExecuteError::NonReadCommand("SELECT")),
         }
     }

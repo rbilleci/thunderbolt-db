@@ -29,6 +29,72 @@ pub fn lower_sql_parameters(input: &str, params: &[SqlValue]) -> Result<String, 
     Ok(output)
 }
 
+/// Canonicalize a fixed PostgreSQL compatibility program without changing quoted semantics.
+///
+/// Whitespace and comments outside quoted regions become a single token separator, and unquoted
+/// SQL text is ASCII-case-folded. Single-quoted values, double-quoted identifiers, and dollar-
+/// quoted bodies remain byte-for-byte intact. Callers may therefore compare a versioned client
+/// program exactly without accidentally accepting a different literal or quoted identifier.
+pub fn canonicalize_sql_for_exact_match(input: &str) -> Result<String, ParseError> {
+    let normalized = normalize_sql_comments(input)?;
+    let input = normalized.as_ref();
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut at = 0;
+    let mut pending_space = false;
+
+    while at < bytes.len() {
+        match bytes[at] {
+            byte if byte.is_ascii_whitespace() => {
+                pending_space = !output.is_empty();
+                at += 1;
+            }
+            b'\'' => {
+                if pending_space {
+                    output.push(' ');
+                    pending_space = false;
+                }
+                let backslash_escapes = is_escape_string_prefix(input, at);
+                copy_single_quoted(input, &mut at, &mut output, backslash_escapes)?;
+            }
+            b'"' => {
+                if pending_space {
+                    output.push(' ');
+                    pending_space = false;
+                }
+                copy_double_quoted(input, &mut at, &mut output)?;
+            }
+            b'$' if at == 0 || !is_identifier_continuation_byte(bytes[at.saturating_sub(1)]) => {
+                if let Some((delimiter, body_start)) = dollar_quote_delimiter(input, at) {
+                    if pending_space {
+                        output.push(' ');
+                        pending_space = false;
+                    }
+                    copy_dollar_quoted(input, &mut at, &mut output, delimiter, body_start)?;
+                } else {
+                    if pending_space {
+                        output.push(' ');
+                        pending_space = false;
+                    }
+                    output.push('$');
+                    at += 1;
+                }
+            }
+            _ => {
+                if pending_space {
+                    output.push(' ');
+                    pending_space = false;
+                }
+                let ch = input[at..].chars().next().expect("at is inside the input");
+                output.push(ch.to_ascii_lowercase());
+                at += ch.len_utf8();
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 /// Quote/comment/dollar-quote-aware arity of raw PostgreSQL `$n` references.
 pub(crate) fn sql_parameter_arity(input: &str) -> Result<usize, ParseError> {
     transform_sql_parameters(input, CommentMode::Preserve, |_number, _end| Ok(None))
@@ -328,6 +394,25 @@ fn copy_dollar_quoted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_match_canonicalization_preserves_quoted_semantics() {
+        assert_eq!(
+            canonicalize_sql_for_exact_match(
+                " SELECT /* gap */ VALUE, 'MiX  ed', \"Case ID\", $tag$Body  X$tag$  FROM T "
+            )
+            .unwrap(),
+            "select value, 'MiX  ed', \"Case ID\", $tag$Body  X$tag$ from t"
+        );
+        assert_ne!(
+            canonicalize_sql_for_exact_match("SELECT array_to_string(v, ' ')").unwrap(),
+            canonicalize_sql_for_exact_match("SELECT array_to_string(v, '  ')").unwrap(),
+        );
+        assert_ne!(
+            canonicalize_sql_for_exact_match("SELECT 'S'::\"char\"").unwrap(),
+            canonicalize_sql_for_exact_match("SELECT 's'::\"CHAR\"").unwrap(),
+        );
+    }
 
     #[test]
     fn lowers_typed_parameters_without_changing_sql_structure() {

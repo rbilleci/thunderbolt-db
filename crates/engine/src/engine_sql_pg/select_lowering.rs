@@ -119,7 +119,7 @@ pub(super) fn build_select_from_select_stmt(
         validate_scalar_aggregate_order_by(&stmt.sort_clause, output_name)?;
         Vec::new()
     } else {
-        parse_order_by(&stmt.sort_clause, &qualifier)?
+        parse_order_by_with_target_positions(&stmt.sort_clause, &stmt.target_list, &qualifier)?
     };
     let limit = parse_limit(&stmt.limit_count)?;
     let offset = parse_limit(&stmt.limit_offset)?;
@@ -885,6 +885,19 @@ fn map_a_expr(
                 ResidentExpr::Column(index)
                     if table.columns.get(*index).is_some_and(|column| column.name == "nspname")
             );
+        let pg_builtin_name_column = matches!(
+            (table.name.as_str(), &lhs),
+            ("pg_roles", ResidentExpr::Column(index))
+                if table.columns.get(*index).is_some_and(|column| column.name == "rolname")
+        ) || matches!(
+            (table.name.as_str(), &lhs),
+            ("pg_tablespace", ResidentExpr::Column(index))
+                if table.columns.get(*index).is_some_and(|column| column.name == "spcname")
+        );
+        let exact_pg_builtin_name_exclusion = token == "!~"
+            && pattern == "^pg_"
+            && table.schema == "pg_catalog"
+            && pg_builtin_name_column;
         if exact_pg_toast_namespace_exclusion {
             // The modeled namespace relation intentionally has no pg_toast row. Preserve this
             // exact psql namespace exclusion as a GPU-evaluated non-null self-comparison. The
@@ -894,6 +907,24 @@ fn map_a_expr(
                 op: ResidentBinaryOp::Eq,
                 lhs: Box::new(lhs.clone()),
                 rhs: Box::new(lhs),
+            });
+        }
+        if exact_pg_builtin_name_exclusion {
+            // For an anchored ASCII prefix, NOT-regex is the union of the two ranges outside
+            // ["pg_", "pg`"). Both comparisons and the OR remain device expressions and retain
+            // SQL NULL behavior. Keep this fail-closed to PG16's exact built-in-name predicate.
+            return Ok(ResidentExpr::Binary {
+                op: ResidentBinaryOp::Or,
+                lhs: Box::new(ResidentExpr::Binary {
+                    op: ResidentBinaryOp::Lt,
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(ResidentExpr::TextLiteral("pg_".to_string())),
+                }),
+                rhs: Box::new(ResidentExpr::Binary {
+                    op: ResidentBinaryOp::Ge,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(ResidentExpr::TextLiteral("pg`".to_string())),
+                }),
             });
         }
         if token == "!~" {
@@ -1314,6 +1345,59 @@ pub(super) fn parse_order_by(
         // to these keys in execute_resident_expr_select_sql).
         let column = result_column_name(node, qualifier).unwrap_or_default();
         keys.push(SelectOrder { column, descending });
+    }
+    Ok(keys)
+}
+
+/// Resolve PostgreSQL positional sort keys (`ORDER BY 1`) against the SELECT target list before
+/// falling back to the ordinary column/expression parser. This keeps the device ordering plan
+/// column-based: the integer is binding syntax, not a per-row arithmetic literal.
+fn parse_order_by_with_target_positions(
+    sort_clause: &[Node],
+    target_list: &[Node],
+    qualifier: &str,
+) -> Result<Vec<SelectOrder>, ExecuteError> {
+    let mut keys = Vec::with_capacity(sort_clause.len());
+    for item in sort_clause {
+        let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
+            return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
+        };
+        if sort_by.sortby_dir == SortByDir::SortbyUsing as i32 || !sort_by.use_op.is_empty() {
+            return Err(sql_pg_error(
+                "ORDER BY USING is not supported by the GPU ordering path".to_string(),
+            ));
+        }
+        let node = sort_by
+            .node
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
+        let column = match node_enum(node)? {
+            NodeEnum::AConst(constant) => {
+                let Some(a_const::Val::Ival(position)) = &constant.val else {
+                    return Err(sql_pg_error(
+                        "ORDER BY position must be an integer".to_string(),
+                    ));
+                };
+                let index = usize::try_from(position.ival)
+                    .ok()
+                    .and_then(|position| position.checked_sub(1))
+                    .filter(|index| *index < target_list.len())
+                    .ok_or_else(|| sql_pg_error("ORDER BY position is out of range".to_string()))?;
+                let NodeEnum::ResTarget(target) = node_enum(&target_list[index])? else {
+                    return Err(sql_pg_error("malformed SELECT target".to_string()));
+                };
+                let value = target
+                    .val
+                    .as_deref()
+                    .ok_or_else(|| sql_pg_error("SELECT target has no value".to_string()))?;
+                result_column_name(value, qualifier)?
+            }
+            _ => result_column_name(node, qualifier).unwrap_or_default(),
+        };
+        keys.push(SelectOrder {
+            column,
+            descending: sort_by.sortby_dir == SortByDir::SortbyDesc as i32,
+        });
     }
     Ok(keys)
 }

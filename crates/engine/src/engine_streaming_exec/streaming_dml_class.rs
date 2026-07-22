@@ -1403,9 +1403,34 @@ impl Engine {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(Some((matches, old_rows, epoch)));
         }
-        let predicate = some_or_decline!(
-            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)
-        );
+        let predicate = if filter_groups.is_empty() {
+            let column = if table.columns.is_empty() {
+                return Ok(None);
+            } else {
+                0
+            };
+            // `col IS NULL OR col IS NOT NULL` is an exact all-row device mask for every modeled
+            // type, including nullable columns. This keeps private TRUNCATE resolution on the same
+            // chunk GPU locate path instead of decoding the class on the host.
+            crate::engine_expr::ResidentExpr::Binary {
+                op: crate::engine_expr::ResidentBinaryOp::Or,
+                lhs: Box::new(crate::engine_expr::ResidentExpr::IsNull {
+                    col: column,
+                    is_not_null: false,
+                }),
+                rhs: Box::new(crate::engine_expr::ResidentExpr::IsNull {
+                    col: column,
+                    is_not_null: true,
+                }),
+            }
+        } else {
+            some_or_decline!(
+                crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+                    table,
+                    filter_groups,
+                )
+            )
+        };
         // Keep coordinates, row images, and the returned epoch on ONE pinned entry Arc. This
         // resolver can run off-lock; reloading inside locate would let a concurrent tail/stamp/
         // compaction publish E2, then interpret E2 coordinates against E1 below and poison the

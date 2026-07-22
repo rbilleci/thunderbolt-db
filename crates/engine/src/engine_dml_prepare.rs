@@ -258,6 +258,25 @@ impl Engine {
         delete: &Delete,
         snapshot: DmlReadSnapshot,
     ) -> Result<WriteDelta, EngineError> {
+        self.prepare_delete_inner(delete, snapshot, false)
+    }
+
+    /// Private transaction-TRUNCATE representation. Ordinary SQL DELETE remains predicate-required;
+    /// only mutation admission can select this full-table path after parsing a TRUNCATE command.
+    pub(crate) fn prepare_full_table_delete(
+        &self,
+        delete: &Delete,
+        snapshot: DmlReadSnapshot,
+    ) -> Result<WriteDelta, EngineError> {
+        self.prepare_delete_inner(delete, snapshot, true)
+    }
+
+    fn prepare_delete_inner(
+        &self,
+        delete: &Delete,
+        snapshot: DmlReadSnapshot,
+        full_table: bool,
+    ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
         // Lock-free concurrent-DML path (Stage 2 — blocker #1): pin ONE catalog snapshot for both the
         // target bind and the inbound-FK-dependents scan below.
@@ -268,8 +287,12 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", delete.table))
             })?;
-        let filter_groups = bind_delete_filter_groups(table, delete)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let filter_groups = if full_table {
+            Vec::new()
+        } else {
+            bind_delete_filter_groups(table, delete)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
+        };
         let visibility = StorageVisibility {
             read_txn_id: txn_id,
         };

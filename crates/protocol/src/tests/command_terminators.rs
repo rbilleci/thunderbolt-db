@@ -102,11 +102,23 @@ fn accepts_optional_statement_terminator() {
     );
     assert_eq!(
         parse_command("SET TRANSACTION READ ONLY;\n").unwrap(),
-        Command::ResetAll
+        Command::SessionControl {
+            transaction: Some(TransactionCharacteristics {
+                access: TransactionAccessMode::ReadOnly,
+                ..TransactionCharacteristics::default()
+            }),
+            access_share_relations: Vec::new(),
+        }
     );
     assert_eq!(
         parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;\n").unwrap(),
-        Command::ResetAll
+        Command::SessionControl {
+            transaction: Some(TransactionCharacteristics {
+                access: TransactionAccessMode::ReadOnly,
+                ..TransactionCharacteristics::default()
+            }),
+            access_share_relations: Vec::new(),
+        }
     );
     assert_eq!(
         parse_command("FLUSH WRITE AHEAD LOG;\n").unwrap(),

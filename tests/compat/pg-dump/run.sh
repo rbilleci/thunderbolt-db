@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT_DIR="${PG_DUMP_SMOKE_OUT_DIR:-$ROOT_DIR/target/pg-dump-smoke}"
+PG16_BIN="${PG16_BIN:-/usr/lib/postgresql/16/bin}"
+SERVER_BIN="${GPU_DB_ENGINE_SERVER_BIN:-$ROOT_DIR/target/debug/gpu-db-engine-server}"
 SOURCE_PORT="${PG_DUMP_SMOKE_SOURCE_PORT:-55444}"
 RESTORE_PORT="${PG_DUMP_SMOKE_RESTORE_PORT:-55445}"
 CUSTOM_RESTORE_PORT="${PG_DUMP_SMOKE_CUSTOM_RESTORE_PORT:-55446}"
@@ -17,8 +19,16 @@ DIRECTORY_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_DIRECTORY_SPLIT_RESTORE_PORT:-5545
 TAR_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_SPLIT_RESTORE_PORT:-55455}"
 PRIVILEGE_RESTORE_PORT="${PG_DUMP_SMOKE_PRIVILEGE_RESTORE_PORT:-55456}"
 
+for pg_tool in psql pg_dump pg_restore; do
+  if [[ ! -x "$PG16_BIN/$pg_tool" ]]; then
+    echo "PostgreSQL 16 tool is not executable: $PG16_BIN/$pg_tool" >&2
+    exit 1
+  fi
+done
+export PATH="$PG16_BIN:$PATH"
+
 rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR/wal"
 
 source_pid=""
 restore_pid=""
@@ -90,10 +100,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+port_is_open() {
+  local port="$1"
+  (echo >"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
+}
+
 wait_for_port() {
   local port="$1"
+  local child_pid="$2"
   for _ in $(seq 1 160); do
-    if (echo >"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+      wait "$child_pid" 2>/dev/null || true
+      echo "server process $child_pid exited before port $port became ready" >&2
+      return 2
+    fi
+    if port_is_open "$port" && kill -0 "$child_pid" 2>/dev/null; then
       return 0
     fi
     sleep 0.1
@@ -102,12 +123,44 @@ wait_for_port() {
   return 1
 }
 
-cd "$ROOT_DIR"
+start_server() {
+  local port="$1"
+  local log_name="$2"
+  local wal_name="$3"
+  local -n pid_ref="$4"
+  if port_is_open "$port"; then
+    echo "refusing to start test server: port $port is already occupied" >&2
+    return 1
+  fi
+  GPU_DB_WAL_SEGMENT="$OUT_DIR/wal/$wal_name.wal" \
+    "$SERVER_BIN" --listen "127.0.0.1:$port" \
+    >"$OUT_DIR/$log_name" 2>&1 &
+  pid_ref=$!
+  local wait_status=0
+  wait_for_port "$port" "$pid_ref" || wait_status=$?
+  if (( wait_status == 2 )); then
+    pid_ref=""
+  fi
+  (( wait_status == 0 ))
+}
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SOURCE_PORT" --shared-catalog \
-  >"$OUT_DIR/source-server.log" 2>&1 &
-source_pid=$!
-wait_for_port "$SOURCE_PORT"
+verify_relation_acl() {
+  local port="$1"
+  local relation="$2"
+  local expected_acl="$3"
+  local artifact_prefix="${4:-privilege}"
+  local output="$OUT_DIR/${artifact_prefix}-${relation}-acl.out"
+  local error="$OUT_DIR/${artifact_prefix}-${relation}-acl.err"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -q -c "\\dp public.$relation" >"$output" 2>"$error"
+  grep -F "public | $relation" "$output" >/dev/null
+  grep -F "$expected_acl" "$output" >/dev/null
+}
+
+cd "$ROOT_DIR"
+cargo build -p gpu_db_server --bin gpu-db-engine-server
+
+start_server "$SOURCE_PORT" source-server.log source source_pid
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
@@ -154,6 +207,9 @@ GRANT EXECUTE ON FUNCTION public.dump_answer() TO dump_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dump_reader;
 SQL
 
+verify_relation_acl "$SOURCE_PORT" account_seq "postgres=rwU/postgres" "source"
+verify_relation_acl "$SOURCE_PORT" account_seq "dump_reader=rw/postgres" "source"
+
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_dump --schema=public --no-owner --no-privileges --format=plain \
   >"$OUT_DIR/dump.sql" 2>"$OUT_DIR/pg_dump.err"
@@ -189,10 +245,7 @@ PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_dump --schema=public --no-owner --format=plain \
   >"$OUT_DIR/dump-privileges.sql" 2>"$OUT_DIR/pg_dump_privileges.err"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/restore-server.log" 2>&1 &
-restore_pid=$!
-wait_for_port "$RESTORE_PORT"
+start_server "$RESTORE_PORT" restore-server.log plain-restore restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump.sql" \
@@ -231,16 +284,16 @@ public|accounts|accounts_pkey|p
 EOF
 
 cat >"$OUT_DIR/comment-verify.expected" <<'EOF'
+public|account_seq|S||account sequence
 public|accounts_name_idx|i||accounts name lookup
 public|events_note_idx|i||events note lookup
+public|account_snapshot|m||account snapshot
 public|accounts|r||accounts table
 public|accounts|r|name|account display name
 public|events|r||events table
 public|events|r|note|event note
 public|account_lookup|v||active account lookup
 public|account_lookup_layer|v||layered account lookup
-public|account_snapshot|m||account snapshot
-public|account_seq|s||account sequence
 EOF
 
 cat >"$OUT_DIR/constraint-comment-verify.expected" <<'EOF'
@@ -283,7 +336,7 @@ verify_comments() {
   local prefix="$2"
   PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
     psql -v ON_ERROR_STOP=1 -X -A -t \
-    -c "SELECT n.nspname, c.relname, c.relkind, a.attname, d.description FROM pg_catalog.pg_description d JOIN pg_catalog.pg_class c ON c.oid = d.objoid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid WHERE n.nspname = 'public' AND c.relkind IN ('r','i','v','m','s') ORDER BY c.relkind, c.relname, d.objsubid;" \
+    -c "SELECT n.nspname, c.relname, c.relkind, a.attname, d.description FROM pg_catalog.pg_description d JOIN pg_catalog.pg_class c ON c.oid = d.objoid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid WHERE n.nspname = 'public' AND c.relkind IN ('r','i','v','m','S') ORDER BY c.relkind, c.relname, d.objsubid;" \
     >"$OUT_DIR/${prefix}-comment-verify.out" 2>"$OUT_DIR/${prefix}-comment-verify.err"
   diff -u "$OUT_DIR/comment-verify.expected" "$OUT_DIR/${prefix}-comment-verify.out"
 }
@@ -343,7 +396,7 @@ verify_materialized_views() {
 verify_materialized_views "$RESTORE_PORT" "restore"
 
 cat >"$OUT_DIR/sequence-verify.expected" <<'EOF'
-public|account_seq|s|p
+public|account_seq|S|p
 EOF
 cat >"$OUT_DIR/sequence-value-verify.expected" <<'EOF'
 2|t
@@ -354,7 +407,7 @@ verify_sequences() {
   local prefix="$2"
   PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
     psql -v ON_ERROR_STOP=1 -X -A -t \
-    -c "SELECT c.oid, n.nspname, c.relname, c.relkind, c.relpersistence FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 's' ORDER BY c.relname;" \
+    -c "SELECT c.oid, n.nspname, c.relname, c.relkind, c.relpersistence FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'S' ORDER BY c.relname;" \
     2>"$OUT_DIR/${prefix}-sequence-verify.err" \
     | cut -d'|' -f2- >"$OUT_DIR/${prefix}-sequence-verify.out"
   diff -u "$OUT_DIR/sequence-verify.expected" "$OUT_DIR/${prefix}-sequence-verify.out"
@@ -408,10 +461,7 @@ verify_functions() {
 
 verify_functions "$RESTORE_PORT" "restore"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PRIVILEGE_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/privilege-restore-server.log" 2>&1 &
-privilege_restore_pid=$!
-wait_for_port "$PRIVILEGE_RESTORE_PORT"
+start_server "$PRIVILEGE_RESTORE_PORT" privilege-restore-server.log privilege-restore privilege_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$PRIVILEGE_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q -c "CREATE ROLE dump_reader;" \
@@ -446,11 +496,16 @@ grep -F "dump_reader=X/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "postgres | public | table | dump_reader=r/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "privilege_default_probe" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "42" "$OUT_DIR/privilege-verify.out" >/dev/null
+verify_relation_acl "$PRIVILEGE_RESTORE_PORT" accounts "dump_reader=r/postgres"
+verify_relation_acl "$PRIVILEGE_RESTORE_PORT" account_lookup "dump_reader=r/postgres"
+verify_relation_acl "$PRIVILEGE_RESTORE_PORT" account_lookup_layer "dump_reader=r/postgres"
+verify_relation_acl "$PRIVILEGE_RESTORE_PORT" account_snapshot "dump_reader=r/postgres"
+verify_relation_acl "$PRIVILEGE_RESTORE_PORT" account_seq "dump_reader=rw/postgres"
+verify_relation_acl "$PRIVILEGE_RESTORE_PORT" account_seq "postgres=rwU/postgres" "restored"
+verify_relation_acl "$PRIVILEGE_RESTORE_PORT" privilege_default_probe "dump_reader=r/postgres"
+diff -u "$OUT_DIR/source-account_seq-acl.out" "$OUT_DIR/restored-account_seq-acl.out"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/custom-restore-server.log" 2>&1 &
-custom_restore_pid=$!
-wait_for_port "$CUSTOM_RESTORE_PORT"
+start_server "$CUSTOM_RESTORE_PORT" custom-restore-server.log custom-restore custom_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$CUSTOM_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_restore --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.custom" \
@@ -473,10 +528,7 @@ verify_sequences "$CUSTOM_RESTORE_PORT" "custom"
 verify_domains "$CUSTOM_RESTORE_PORT" "custom"
 verify_functions "$CUSTOM_RESTORE_PORT" "custom"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/directory-restore-server.log" 2>&1 &
-directory_restore_pid=$!
-wait_for_port "$DIRECTORY_RESTORE_PORT"
+start_server "$DIRECTORY_RESTORE_PORT" directory-restore-server.log directory-restore directory_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_restore --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.dir" \
@@ -499,10 +551,7 @@ verify_sequences "$DIRECTORY_RESTORE_PORT" "directory"
 verify_domains "$DIRECTORY_RESTORE_PORT" "directory"
 verify_functions "$DIRECTORY_RESTORE_PORT" "directory"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/tar-restore-server.log" 2>&1 &
-tar_restore_pid=$!
-wait_for_port "$TAR_RESTORE_PORT"
+start_server "$TAR_RESTORE_PORT" tar-restore-server.log tar-restore tar_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_restore --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.tar" \
@@ -525,10 +574,7 @@ verify_sequences "$TAR_RESTORE_PORT" "tar"
 verify_domains "$TAR_RESTORE_PORT" "tar"
 verify_functions "$TAR_RESTORE_PORT" "tar"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/directory-parallel-restore-server.log" 2>&1 &
-parallel_directory_restore_pid=$!
-wait_for_port "$PARALLEL_DIRECTORY_RESTORE_PORT"
+start_server "$PARALLEL_DIRECTORY_RESTORE_PORT" directory-parallel-restore-server.log directory-parallel-restore parallel_directory_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_restore --jobs=2 --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.dir" \
@@ -551,10 +597,7 @@ verify_sequences "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_domains "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_functions "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/clean-restore-server.log" 2>&1 &
-clean_restore_pid=$!
-wait_for_port "$CLEAN_RESTORE_PORT"
+start_server "$CLEAN_RESTORE_PORT" clean-restore-server.log clean-restore clean_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
@@ -593,10 +636,7 @@ verify_sequences "$CLEAN_RESTORE_PORT" "clean"
 verify_domains "$CLEAN_RESTORE_PORT" "clean"
 verify_functions "$CLEAN_RESTORE_PORT" "clean"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/insert-restore-server.log" 2>&1 &
-insert_restore_pid=$!
-wait_for_port "$INSERT_RESTORE_PORT"
+start_server "$INSERT_RESTORE_PORT" insert-restore-server.log insert-restore insert_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump-inserts.sql" \
@@ -619,10 +659,7 @@ verify_sequences "$INSERT_RESTORE_PORT" "insert"
 verify_domains "$INSERT_RESTORE_PORT" "insert"
 verify_functions "$INSERT_RESTORE_PORT" "insert"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/split-restore-server.log" 2>&1 &
-split_restore_pid=$!
-wait_for_port "$SPLIT_RESTORE_PORT"
+start_server "$SPLIT_RESTORE_PORT" split-restore-server.log split-restore split_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump-schema.sql" \
@@ -649,10 +686,7 @@ verify_sequences "$SPLIT_RESTORE_PORT" "split"
 verify_domains "$SPLIT_RESTORE_PORT" "split"
 verify_functions "$SPLIT_RESTORE_PORT" "split"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/custom-split-restore-server.log" 2>&1 &
-custom_split_restore_pid=$!
-wait_for_port "$CUSTOM_SPLIT_RESTORE_PORT"
+start_server "$CUSTOM_SPLIT_RESTORE_PORT" custom-split-restore-server.log custom-split-restore custom_split_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_restore --schema-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.custom" \
@@ -679,10 +713,7 @@ verify_sequences "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_domains "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_functions "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/directory-split-restore-server.log" 2>&1 &
-directory_split_restore_pid=$!
-wait_for_port "$DIRECTORY_SPLIT_RESTORE_PORT"
+start_server "$DIRECTORY_SPLIT_RESTORE_PORT" directory-split-restore-server.log directory-split-restore directory_split_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_restore --schema-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.dir" \
@@ -709,10 +740,7 @@ verify_sequences "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_domains "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_functions "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 
-cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
-  >"$OUT_DIR/tar-split-restore-server.log" 2>&1 &
-tar_split_restore_pid=$!
-wait_for_port "$TAR_SPLIT_RESTORE_PORT"
+start_server "$TAR_SPLIT_RESTORE_PORT" tar-split-restore-server.log tar-split-restore tar_split_restore_pid
 
 PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_restore --schema-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.tar" \
@@ -751,6 +779,14 @@ grep -F "GRANT SELECT ON TABLE public.account_lookup TO dump_reader;" "$OUT_DIR/
 grep -F "GRANT SELECT ON TABLE public.account_lookup_layer TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "GRANT SELECT ON TABLE public.account_snapshot TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "GRANT SELECT,UPDATE ON SEQUENCE public.account_seq TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+if grep -F "REVOKE ALL ON SEQUENCE public.account_seq FROM postgres;" "$OUT_DIR/dump-privileges.sql" >/dev/null; then
+  echo "pg_dump emitted a spurious owner REVOKE for account_seq" >&2
+  exit 1
+fi
+if grep -F " ON SEQUENCE public.account_seq TO postgres;" "$OUT_DIR/dump-privileges.sql" >/dev/null; then
+  echo "pg_dump emitted a spurious owner GRANT for account_seq" >&2
+  exit 1
+fi
 grep -F "GRANT ALL ON FUNCTION public.dump_answer() TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "INSERT INTO public.accounts VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null

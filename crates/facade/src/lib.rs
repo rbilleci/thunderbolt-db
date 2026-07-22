@@ -37,7 +37,7 @@ use gpu_db_engine::{
 };
 use gpu_db_sql::{
     parse_command, Command, CopyFromStdin, CopyToStdout, Decimal128, ParseError, ParsedCommand,
-    Select, SqlType, SqlValue, TransactionCharacteristics, TransactionIsolation,
+    Select, SelectProjection, SqlType, SqlValue, TransactionCharacteristics, TransactionIsolation,
 };
 
 #[cfg(test)]
@@ -314,6 +314,7 @@ pub struct SharedSession {
     engine_identity: Arc<()>,
     active_txn_id: Option<u64>,
     transaction_characteristics: Option<TransactionCharacteristics>,
+    transaction_has_statement: bool,
     transaction_failed: bool,
 }
 
@@ -392,6 +393,7 @@ impl SharedEngine {
             engine_identity: Arc::clone(&self.identity),
             active_txn_id: None,
             transaction_characteristics: None,
+            transaction_has_statement: false,
             transaction_failed: false,
         }
     }
@@ -471,6 +473,7 @@ impl SharedEngine {
             };
             session.active_txn_id = None;
             session.transaction_characteristics = None;
+            session.transaction_has_statement = false;
         }
         session.transaction_failed = false;
         Ok(QueryOutcome::Empty)
@@ -840,8 +843,9 @@ pub fn durable_wal_segment_from_env(value: Option<&std::ffi::OsStr>) -> Option<s
 /// - **Mutations** cross `Engine::submit_transaction` once. The engine
 ///   privately selects concurrent DML, explicit overlay, or serialized generic preparation before
 ///   any sequence/WAL claim; those strategies are not separate facade routes.
-/// - **Legacy non-relational reads** (`GET`, bounded function select, `currval`) use a separate
-///   unsequenced compatibility read boundary and cannot trigger representation repair.
+/// - **Legacy non-relational reads** (`GET`, the exact session-cleanup advisory-unlock call,
+///   `currval`) use a separate unsequenced compatibility read boundary and cannot trigger
+///   representation repair.
 /// - **DDL / sequence-default INSERT / everything else** still serializes inside the engine's
 ///   catalog/commit ownership, not under a facade write lock, so it does not exclude readers.
 ///
@@ -881,10 +885,29 @@ fn submit_autocommit_parsed_with_catalog(
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
         }
+        Command::SelectFunction(call) if is_effect_free_session_function(call) => {
+            let tag = command_tag(parsed.command());
+            engine
+                .execute_parsed_compatibility_read(parsed)
+                .map_err(map_execute_error)?;
+            Ok(QueryOutcome::Command {
+                tag,
+                rows_affected: None,
+            })
+        }
+        Command::SelectFunction(call) => {
+            if engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            let result = engine
+                .execute_relational_function(call)
+                .map_err(map_execute_error)?;
+            Ok(map_relational_result(result))
+        }
         Command::Begin { .. } | Command::Commit { .. } | Command::Rollback { .. } => {
             Err(stateless_transaction_control_error())
         }
-        Command::GetKv { .. } | Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
+        Command::GetKv { .. } | Command::SequenceCurrVal(_) => {
             let tag = command_tag(parsed.command());
             engine
                 .execute_parsed_compatibility_read(parsed)
@@ -959,6 +982,9 @@ fn submit_general_select_text_inner(
         return Err(in_failed_transaction_error());
     }
     let was_active = session.in_transaction();
+    if was_active {
+        session.transaction_has_statement = true;
+    }
     let result = match session.active_txn_id {
         Some(txn_id) => shared
             .engine
@@ -982,6 +1008,23 @@ fn select_requires_general_catalog_binding(select: &Select) -> bool {
         && (select.table.starts_with("pg_catalog.")
             || select.table.starts_with("information_schema.")
             || select.table.starts_with("pg_"))
+}
+
+fn select_has_pg_dump_sequence_state_shape(select: &Select) -> bool {
+    select.public_only
+        && select.projection
+            == SelectProjection::Columns(vec!["last_value".to_string(), "is_called".to_string()])
+        && select.group_by.is_none()
+        && select.having_groups.is_empty()
+        && select.filter_groups.is_empty()
+        && select.order_by.is_empty()
+        && select.limit.is_none()
+        && select.offset.is_none()
+}
+
+fn select_requires_general_engine_binding(select: &Select) -> bool {
+    select_requires_general_catalog_binding(select)
+        || select_has_pg_dump_sequence_state_shape(select)
 }
 
 fn submit_parsed(
@@ -1037,13 +1080,25 @@ fn submit_parsed_with_catalog_mode(
             rows_affected: None,
         });
     }
-    if !bound_prepared_ast
-        && matches!(
+    if !bound_prepared_ast {
+        if let Command::Select(select) = parsed.command() {
+            if select_requires_general_engine_binding(select) {
+                return submit_general_select_text_inner(shared, session, parsed.source());
+            }
+        }
+    }
+    if session.in_transaction()
+        && !matches!(
             parsed.command(),
-            Command::Select(select) if select_requires_general_catalog_binding(select)
+            Command::Begin { .. }
+                | Command::Commit { .. }
+                | Command::Rollback { .. }
+                | Command::ResetAll
+                | Command::SessionControl { .. }
+                | Command::ShowTransactionIsolation
         )
     {
-        return submit_general_select_text_inner(shared, session, parsed.source());
+        session.transaction_has_statement = true;
     }
     let was_active = session.in_transaction();
     let result = submit_parsed_inner(shared, session, parsed, expected_catalog_version);
@@ -1060,6 +1115,52 @@ fn submit_parsed_inner(
     expected_catalog_version: Option<u64>,
 ) -> Result<QueryOutcome, DbError> {
     match parsed.command() {
+        Command::PreparedCatalog(program) => {
+            if shared.engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            let result = match session.active_txn_id {
+                Some(txn_id) => shared
+                    .engine
+                    .execute_prepared_catalog_program_in_transaction(txn_id, program),
+                None => shared.engine.execute_prepared_catalog_program(program),
+            }
+            .map_err(map_execute_error)?;
+            Ok(map_relational_result(result))
+        }
+        Command::SessionControl {
+            transaction,
+            access_share_relations,
+        } => {
+            if let Some(characteristics) = transaction {
+                reset_empty_transaction_characteristics(
+                    shared,
+                    session,
+                    parsed.clone(),
+                    *characteristics,
+                )?;
+            }
+            if !access_share_relations.is_empty() {
+                let Some(txn_id) = session.active_txn_id else {
+                    return Err(DbError {
+                        category: ErrorCategory::InvalidRequest,
+                        message: "LOCK TABLE can only be used in transaction blocks".to_string(),
+                    });
+                };
+                shared
+                    .engine
+                    .validate_access_share_relations_in_transaction(txn_id, access_share_relations)
+                    .map_err(map_execute_error)?;
+            }
+            Ok(QueryOutcome::Command {
+                tag: CommandTag::Other(if access_share_relations.is_empty() {
+                    "SET".to_string()
+                } else {
+                    "LOCK TABLE".to_string()
+                }),
+                rows_affected: None,
+            })
+        }
         Command::ResetAll => Ok(QueryOutcome::Command {
             // The SQL parser deliberately normalizes the bounded session-cleanup family
             // (RESET/DISCARD/DEALLOCATE/CLOSE/UNLISTEN) to one effect-free command. It belongs
@@ -1108,6 +1209,7 @@ fn submit_parsed_inner(
                 ));
                 session.active_txn_id = Some(txn_id);
                 session.transaction_characteristics = Some(accepted);
+                session.transaction_has_statement = false;
                 session.transaction_failed = false;
             }
             Ok(QueryOutcome::Command {
@@ -1135,6 +1237,7 @@ fn submit_parsed_inner(
                 session.active_txn_id = successor;
                 session.transaction_characteristics =
                     successor.and(session.transaction_characteristics);
+                session.transaction_has_statement = false;
                 session.transaction_failed = false;
             }
             Ok(QueryOutcome::Command {
@@ -1162,6 +1265,7 @@ fn submit_parsed_inner(
                 session.active_txn_id = successor;
                 session.transaction_characteristics =
                     successor.and(session.transaction_characteristics);
+                session.transaction_has_statement = false;
                 session.transaction_failed = false;
             }
             Ok(QueryOutcome::Command {
@@ -1195,9 +1299,36 @@ fn submit_parsed_inner(
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
         }
-        Command::GetKv { .. } | Command::SelectFunction(_) | Command::SequenceCurrVal(_)
-            if session.active_txn_id.is_some() =>
+        Command::SelectFunction(call)
+            if session.active_txn_id.is_some() && is_effect_free_session_function(call) =>
         {
+            if shared.engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            let tag = command_tag(parsed.command());
+            shared
+                .engine
+                .execute_parsed_compatibility_read(parsed)
+                .map_err(map_execute_error)?;
+            Ok(QueryOutcome::Command {
+                tag,
+                rows_affected: None,
+            })
+        }
+        Command::SelectFunction(call) if session.active_txn_id.is_some() => {
+            if shared.engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            let txn_id = session
+                .active_txn_id
+                .expect("guarded by transaction-active match arm");
+            let result = shared
+                .engine
+                .execute_relational_function_in_transaction(txn_id, call)
+                .map_err(map_execute_error)?;
+            Ok(map_relational_result(result))
+        }
+        Command::GetKv { .. } | Command::SequenceCurrVal(_) if session.active_txn_id.is_some() => {
             // Compatibility reads remain unsequenced inside an explicit/implicit block just as
             // they are in autocommit. In particular asyncpg's pool reset begins with
             // pg_advisory_unlock_all(); routing it through mutation admission would both violate
@@ -1264,6 +1395,42 @@ fn submit_parsed_inner(
         }
         _ => submit_autocommit_parsed_with_catalog(shared, parsed, expected_catalog_version),
     }
+}
+
+/// PostgreSQL allows `SET TRANSACTION` immediately after `BEGIN`, before the first query. Replace
+/// only the characteristics on that still-empty engine snapshot; the transaction identity and
+/// retained catalog/data generation remain unchanged, and rejection leaves the transaction active
+/// for the caller's normal failed-transaction handling.
+fn reset_empty_transaction_characteristics(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    parsed: ParsedCommand,
+    mut characteristics: TransactionCharacteristics,
+) -> Result<(), DbError> {
+    let Some(current_txn_id) = session.active_txn_id else {
+        return Err(DbError {
+            category: ErrorCategory::InvalidRequest,
+            message: "SET TRANSACTION requires an active transaction".to_string(),
+        });
+    };
+    if session.transaction_has_statement {
+        return Err(DbError {
+            category: ErrorCategory::InvalidRequest,
+            message: "SET TRANSACTION must precede the first transaction statement".to_string(),
+        });
+    }
+    let result = shared
+        .engine
+        .submit_transaction(current_txn_id, MutationRequest::new(parsed))
+        .map_err(map_execute_error)?;
+    let TransactionAdmissionResult::Command = result else {
+        return Err(invalid_mutation_result("SET TRANSACTION"));
+    };
+    if characteristics.isolation == TransactionIsolation::ReadUncommitted {
+        characteristics.isolation = TransactionIsolation::ReadCommitted;
+    }
+    session.transaction_characteristics = Some(characteristics);
+    Ok(())
 }
 
 /// Test-support: run a concurrent DML statement through the shared engine with a hook invoked
@@ -1399,11 +1566,10 @@ fn submit_batched_text_inner(
     {
         return SubmissionDispatch::Immediate(submit_parsed(shared, session, parsed));
     }
-    if matches!(
-        parsed.command(),
-        Command::Select(select) if select_requires_general_catalog_binding(select)
-    ) {
-        return SubmissionDispatch::Immediate(submit_parsed(shared, session, parsed));
+    if let Command::Select(select) = parsed.command() {
+        if select_requires_general_engine_binding(select) {
+            return SubmissionDispatch::Immediate(submit_parsed(shared, session, parsed));
+        }
     }
     // Classify the already-parsed owner under a read lock. Non-batchable commands consume that
     // same owner on the per-query path; no fallback reparses SQL text.
@@ -1694,6 +1860,10 @@ fn command_tag(command: &Command) -> CommandTag {
         Command::Delete(_) => CommandTag::Delete,
         _ => CommandTag::Other("OK".to_string()),
     }
+}
+
+fn is_effect_free_session_function(call: &gpu_db_sql::SelectFunction) -> bool {
+    call.name == "pg_advisory_unlock_all"
 }
 
 #[cfg(test)]

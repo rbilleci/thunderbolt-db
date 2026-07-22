@@ -94,6 +94,24 @@ impl Engine {
                 type_oid: literal.ty.postgres_oid(),
                 type_size: literal.ty.type_size(),
             }],
+            Command::PreparedCatalog(program) => {
+                let parameter = match program {
+                    PreparedCatalogProgram::Pg16DomainConstraints { type_oid }
+                    | PreparedCatalogProgram::Pg16DomainDefinition { type_oid } => type_oid,
+                    PreparedCatalogProgram::Pg16FunctionDefinition { function_oid } => function_oid,
+                    PreparedCatalogProgram::Pg16MaterializedViewDependencies => {
+                        return Ok(PreparedCommandDescription {
+                            catalog_version: catalog.commit_seq,
+                            parameter_types: Vec::new(),
+                            result_columns: crate::engine_sql_pg::pg_dump_catalog::pg16_prepared_catalog_program_table(program)
+                                .columns,
+                        });
+                    }
+                };
+                infer_value(parameter, SqlType::Int4, &mut parameter_types)?;
+                crate::engine_sql_pg::pg_dump_catalog::pg16_prepared_catalog_program_table(program)
+                    .columns
+            }
             Command::Select(select) => {
                 let table = prepared_select_table(catalog, select)?;
                 validate_prepared_catalog_select_shape(&table, select)?;
@@ -403,7 +421,15 @@ mod tests {
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["oid", "oid", "typname", "typlen", "typtype", "typnamespace"]
+            vec![
+                "oid",
+                "oid",
+                "typname",
+                "typlen",
+                "typtype",
+                "typnamespace",
+                "typbasetype",
+            ]
         );
         assert_eq!(
             description.catalog_version,

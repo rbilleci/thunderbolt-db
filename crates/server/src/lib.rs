@@ -44,9 +44,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use gpu_db_facade::{
-    BoundPreparedStatement, CommandTag, DbError, ErrorCategory, PointLookupBatcher,
-    PreparedStatement, QueryOutcome, SessionTransactionStatus, SharedEngine, SharedSession,
-    SubmissionRequest,
+    CommandTag, DbError, ErrorCategory, PointLookupBatcher, PreparedStatement, QueryOutcome,
+    SessionTransactionStatus, SharedEngine, SharedSession, SubmissionRequest,
 };
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, split_simple_query, Command,
@@ -84,6 +83,18 @@ use extended::{
 mod security;
 use security::complete_local_startup;
 pub use security::ServerConfig;
+mod sql_prepared;
+use sql_prepared::classify_sql_prepared_statement;
+mod sql_cursor;
+use sql_cursor::classify_sql_cursor_statement;
+mod sql_session;
+use sql_session::{
+    execute_cursor_action_async as execute_sql_cursor_action_async,
+    execute_cursor_action_blocking as execute_sql_cursor_action_blocking,
+    execute_prepared_action_async as execute_sql_prepared_action_async,
+    execute_prepared_action_blocking as execute_sql_prepared_action_blocking,
+    submit_prepared_cancellable,
+};
 mod transport;
 use transport::{
     read_startup_frame_async, read_tagged_frame, read_tagged_frame_async,
@@ -249,16 +260,6 @@ fn submit_text(
         .into_immediate()
 }
 
-fn submit_prepared(
-    engine: &SharedEngine,
-    session: &mut SharedSession,
-    bound: &BoundPreparedStatement,
-) -> Result<QueryOutcome, DbError> {
-    engine
-        .submit(session, SubmissionRequest::Prepared(bound))
-        .into_immediate()
-}
-
 fn submit_text_cancellable(
     engine: &SharedEngine,
     session: &mut SharedSession,
@@ -269,18 +270,6 @@ fn submit_text_cancellable(
         return Err(cancellation_error());
     }
     cancellation_checked_outcome(active, submit_text(engine, session, sql))
-}
-
-fn submit_prepared_cancellable(
-    engine: &SharedEngine,
-    session: &mut SharedSession,
-    bound: &BoundPreparedStatement,
-    active: &ActiveRequest,
-) -> Result<QueryOutcome, DbError> {
-    if active.is_cancelled() {
-        return Err(cancellation_error());
-    }
-    cancellation_checked_outcome(active, submit_prepared(engine, session, bound))
 }
 
 fn outcome_is_transaction_control(outcome: &Result<QueryOutcome, DbError>) -> bool {
@@ -308,7 +297,10 @@ fn preflight_simple_query<S: AsRef<str>>(
     // its own parser; a supported classification is its syntax proof, while unsupported COPY is a
     // semantic decision deliberately deferred until every ordinary span has been checked.
     for (statement, copy) in statements.iter().zip(copy_statements) {
-        if matches!(copy, CopyClassification::NotCopy) {
+        if matches!(copy, CopyClassification::NotCopy)
+            && classify_sql_cursor_statement(statement.as_ref())?.is_none()
+            && classify_sql_prepared_statement(statement.as_ref())?.is_none()
+        {
             PreparedStatement::parse(statement.as_ref())?.bind_values(&[])?;
         }
     }
@@ -538,7 +530,19 @@ fn execute_simple_query_blocking(
             }
             extended.complete_transaction_action(TransactionAction::BeginImplicit, true);
         }
-        let mut outcome = submit_text_cancellable(engine, session, statement, active);
+        let mut outcome = match classify_sql_cursor_statement(statement) {
+            Ok(Some(action)) => {
+                execute_sql_cursor_action_blocking(engine, session, extended, action, active)
+            }
+            Err(error) => Err(error),
+            Ok(None) => match classify_sql_prepared_statement(statement) {
+                Ok(Some(action)) => {
+                    execute_sql_prepared_action_blocking(engine, session, extended, action, active)
+                }
+                Ok(None) => submit_text_cancellable(engine, session, statement, active),
+                Err(error) => Err(error),
+            },
+        };
         response.extend_from_slice(&encode_cancellable_outcome_messages(active, &mut outcome)?);
         let failed = outcome.is_err();
         if failed || outcome_is_transaction_control(&outcome) {
@@ -1881,22 +1885,58 @@ async fn execute_simple_query_async(
             }
             extended.complete_transaction_action(TransactionAction::BeginImplicit, true);
         }
-        let outcome = if active.is_cancelled() {
-            Err(cancellation_error())
-        } else if single_can_batch {
-            match &batcher {
-                Some(batcher) => {
-                    execute_batchable_or_fallback(
+        let sql_cursor = classify_sql_cursor_statement(statement);
+        let outcome = match sql_cursor {
+            Err(error) => Err(error),
+            Ok(Some(action)) => {
+                execute_sql_cursor_action_async(
+                    Arc::clone(&engine),
+                    Arc::clone(&session),
+                    executor,
+                    extended,
+                    action,
+                    active,
+                )
+                .await?
+            }
+            Ok(None) => match classify_sql_prepared_statement(statement) {
+                Err(error) => Err(error),
+                Ok(Some(action)) => {
+                    execute_sql_prepared_action_async(
                         Arc::clone(&engine),
-                        executor,
-                        Arc::clone(batcher),
                         Arc::clone(&session),
-                        statement.clone(),
+                        executor,
+                        extended,
+                        action,
                         active,
                     )
                     .await?
                 }
-                None => {
+                Ok(None) if active.is_cancelled() => Err(cancellation_error()),
+                Ok(None) if single_can_batch => match &batcher {
+                    Some(batcher) => {
+                        execute_batchable_or_fallback(
+                            Arc::clone(&engine),
+                            executor,
+                            Arc::clone(batcher),
+                            Arc::clone(&session),
+                            statement.clone(),
+                            active,
+                        )
+                        .await?
+                    }
+                    None => {
+                        execute_shared_session_blocking_cancellable(
+                            Arc::clone(&engine),
+                            Arc::clone(&session),
+                            executor,
+                            statement.clone(),
+                            active,
+                        )
+                        .await?
+                    }
+                },
+                Ok(None) => {
                     execute_shared_session_blocking_cancellable(
                         Arc::clone(&engine),
                         Arc::clone(&session),
@@ -1906,16 +1946,7 @@ async fn execute_simple_query_async(
                     )
                     .await?
                 }
-            }
-        } else {
-            execute_shared_session_blocking_cancellable(
-                Arc::clone(&engine),
-                Arc::clone(&session),
-                executor,
-                statement.clone(),
-                active,
-            )
-            .await?
+            },
         };
         let mut outcome = cancellation_checked_outcome(active, outcome);
         response.extend_from_slice(

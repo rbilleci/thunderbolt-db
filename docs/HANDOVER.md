@@ -6,30 +6,34 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
 
 ## Current boundary
 
-- **PRODUCT-001** is the active PLAN item. Canonical serving/write unification is accepted through SQLx/simple
-  query, COPY, TLS/SCRAM, keyed cancellation, prepared/portal/transaction-state compatibility, and now the
-  psql/GPU-catalog/R2DBC checkpoint. Asyncpg, psycopg, pgx, JDBC, tokio-postgres, SQLx, node-postgres, and R2DBC all
-  pass against `gpu-db-engine-server`; R2DBC keeps default extension autodetection enabled.
-- PostgreSQL 16 psql scenarios 04/06/07 and the R2DBC `pg_catalog.pg_type` query execute through versioned transient
-  GPU catalog relations, including GPU filtering, projection, grouping, ordering, and joins. The slice retains
-  `SharedEngine::submit` as the sole public product boundary and adds no facade, sequence/WAL claimant, publication
-  owner, or host relational fallback. Its final fresh implementation audit returned **ACCEPT** at base
-  `e937d5c737cee84a7ccb89c0f8e7dde8663aa84c`, index tree
-  `47a52bda0ff64253f956e75cb61e8081bc759fd0`, and cached-diff SHA-256
-  `b2ce5ac798fb1e7105e8b594bab514a70eae9da18c9be5072d8f698cac784991` with 56 staged paths and no unstaged drift.
-- Final evidence includes active engine **516**, the globally isolated include-ignored differential **1,058**, the
-  nine-test HAZARD matrix **45/45** with zero CUDA 700/716/717, psql 04/06/07, standalone R2DBC, the full eight-driver
-  aggregate, and clean workspace check/strict Clippy/static/source-size gates. The preceding full two-cache report
-  card remains applicable because the audit repairs did not enter a read-kernel, residency, typed point-read, or
-  result-path boundary. The three filtered inherited base defects remain explicitly named in PLAN.
-- The legacy `gpu-db-server`, the P8 product-like endpoint/probe, broader transactional DDL, conservative
-  full-catalog conflict, and the 2,078-line `engine_dml_concurrent.rs` remain PRODUCT-001-owned facts/gaps recorded
-  in PLAN. PRODUCT-001 is not complete until their compatibility, deletion, source-size, recovery/mixed-traffic, and
-  final single-owner gates pass.
+- **PRODUCT-001** has an independently accepted PostgreSQL 16 pg_dump/pg_restore and pg_dumpall-globals slice on
+  `gpu-db-engine-server`, in addition to SQLx/simple query, COPY, TLS/SCRAM, cancellation, prepared/portal/session
+  compatibility, and psql/GPU-catalog/R2DBC. All eight application-driver gates remain canonical; fresh architecture,
+  semantics, and evidence panels accepted the exact frozen candidate with no blockers. No later PRODUCT-001 boundary
+  was started in this slice.
+- All 18 plain/archive/parallel/clean/insert/split/metadata/privilege dump cases and pg_dumpall role-login/
+  tablespace/comment/ACL restore pass. Exact quote-aware program recognition, pinned catalog/sequence snapshots,
+  complete candidate relations plus typed GPU filter/join/projection/order plans and a block-reduced device COUNT,
+  transaction/failed-state controls, exact source/restored sequence ACL equivalence, isolated default-ACL
+  inheritance, and safe child/port ownership pass focused gates. The accepted immutable review
+  target is base `744d2e1113f403afff1e88bc175f11f6cda2dc7e`, code/test index tree
+  `91efd8ba72c666e1b51881257930f778a8c71d1d`, and cached binary-diff SHA-256
+  `5671761b1fd4a62eab7457f9a8e731a3b807c3c2f58c6d0477bd826c5c8a96d8` across 62 code/test paths.
+- Current evidence is SQL **57**, engine **525**, facade **75** plus concurrency **13**, server **76**, protocol
+  **71 + 127**, both dump harnesses, psql 04/06/07, the eight-driver aggregate, workspace check, strict Clippy, and
+  static gates. The full final-repair card measures **201.959M/s at p50 193us** in-L2 and **174.844M/s at p50
+  241us** out-of-L2 after a **2,138.3s + 0.0s** build/residency phase; immediate/prior repaired-tree controls are
+  **202.024M/s** in-L2 and **177.974M/s** out-of-L2 at the same p50s. No facade, WAL/sequence/commit/publication, or
+  CPU relational owner was added.
+- The remaining legacy listener/P8 adapters and consumers, broader transactional/recovery compatibility,
+  conservative full-catalog conflict, and PLAN-owned **2,012**-line `engine_mutation_admission.rs` plus **2,083**-line
+  `engine_dml_concurrent.rs` are the current PRODUCT-001 facts.
 
 ## Resume here
 
-Continue **PRODUCT-001** at the PLAN current-focus boundary: migrate pg_dump/restore compatibility to the canonical
-server while preserving the accepted GPU-catalog/session/facade/WAL/publication ownership, then freeze and obtain
-its own independent acceptance before advancing legacy/P8 deletion. Follow the remaining sequence only from
+Resume **PRODUCT-001** only at the PLAN current-focus boundary: close the remaining broader transactional-DDL,
+conservative full-generation-conflict, SQLSTATE/type-codec, named-client, and mixed-recovery proofs. After those
+proofs are independently accepted, re-inventory and migrate or disposition the remaining legacy psql/preflight/
+benchmark consumers, then delete the legacy listener plus independently callable P8 protocol adapters in the same
+frozen, independently audited slice. Follow the complete sequence and deletion gates only from
 [`PLAN.md`](PLAN.md).

@@ -1306,4 +1306,67 @@ mod tests {
             .transaction_delta_is_empty());
         engine.submit_transaction(40, parsed("ROLLBACK")).unwrap();
     }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn transaction_truncate_continue_identity_composes_with_insert_and_rollback() {
+        let engine = Engine::new_local();
+        engine.set_shard_residency_enabled(true);
+        engine.set_auto_admit_on_commit(true);
+        engine
+            .submit_transaction(
+                90,
+                parsed("CREATE TABLE restore_target (id int4 PRIMARY KEY)"),
+            )
+            .unwrap();
+        engine
+            .submit_transaction(91, parsed("INSERT INTO restore_target VALUES (1)"))
+            .unwrap();
+
+        engine.submit_transaction(92, parsed("BEGIN")).unwrap();
+        engine
+            .submit_transaction(92, parsed("TRUNCATE TABLE ONLY restore_target"))
+            .unwrap();
+        engine
+            .submit_transaction(92, parsed("INSERT INTO restore_target VALUES (2)"))
+            .unwrap();
+        engine.submit_transaction(92, parsed("COMMIT")).unwrap();
+        let rows = engine
+            .execute_relational_select_text("SELECT id FROM restore_target ORDER BY id")
+            .unwrap()
+            .rows;
+        assert_eq!(rows, vec![vec![SqlValue::Int4(2)]]);
+
+        engine.submit_transaction(93, parsed("BEGIN")).unwrap();
+        engine
+            .submit_transaction(93, parsed("TRUNCATE TABLE ONLY restore_target"))
+            .unwrap();
+        engine.submit_transaction(93, parsed("ROLLBACK")).unwrap();
+        let rows = engine
+            .execute_relational_select_text("SELECT id FROM restore_target ORDER BY id")
+            .unwrap()
+            .rows;
+        assert_eq!(rows, vec![vec![SqlValue::Int4(2)]]);
+    }
+
+    #[test]
+    fn transaction_truncate_restart_identity_remains_pre_effect() {
+        let engine = Engine::new_local();
+        engine
+            .submit_transaction(94, parsed("CREATE TABLE restart_target (id int4)"))
+            .unwrap();
+        engine.submit_transaction(95, parsed("BEGIN")).unwrap();
+        let wal_before = engine.durable_wal_records().len();
+
+        let error = engine
+            .submit_transaction(95, parsed("TRUNCATE restart_target RESTART IDENTITY"))
+            .unwrap_err();
+        assert!(matches!(error, ExecuteError::Unsupported(_)));
+        assert_eq!(engine.durable_wal_records().len(), wal_before);
+        assert!(engine
+            .transaction_snapshot_handle(95)
+            .unwrap()
+            .transaction_delta_is_empty());
+        engine.submit_transaction(95, parsed("ROLLBACK")).unwrap();
+    }
 }

@@ -1,8 +1,9 @@
 //! Top-level SQL command and session-control parsing.
 
 use super::{
-    normalize_identifier, parse_relational_command, strip_keyword_prefix_case_insensitive, Command,
-    ParseError, TransactionAccessMode, TransactionCharacteristics, TransactionIsolation,
+    normalize_identifier, normalize_relation_identifier, parse_relational_command, split_csv,
+    strip_keyword_prefix_case_insensitive, Command, ParseError, TransactionAccessMode,
+    TransactionCharacteristics, TransactionIsolation,
 };
 use crate::parameter::{
     dollar_quote_delimiter, is_escape_string_prefix, is_identifier_continuation_byte,
@@ -691,11 +692,12 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         {
             let tail = after_transaction.trim_start();
             return Some(
-                if !tail.is_empty() && is_begin_mode_list(&normalize_begin_tokens(tail)) {
-                    Ok(Command::ResetAll)
-                } else {
-                    Err(ParseError::InvalidSet)
-                },
+                parse_begin_mode_list(&normalize_begin_tokens(tail))
+                    .map(|transaction| Command::SessionControl {
+                        transaction: Some(transaction),
+                        access_share_relations: Vec::new(),
+                    })
+                    .ok_or(ParseError::InvalidSet),
             );
         }
     }
@@ -716,11 +718,12 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
     if let Some(after_transaction) = strip_keyword_prefix_case_insensitive(rest, "TRANSACTION") {
         let tail = after_transaction.trim_start();
         return Some(
-            if !tail.is_empty() && is_begin_mode_list(&normalize_begin_tokens(tail)) {
-                Ok(Command::ResetAll)
-            } else {
-                Err(ParseError::InvalidSet)
-            },
+            parse_begin_mode_list(&normalize_begin_tokens(tail))
+                .map(|transaction| Command::SessionControl {
+                    transaction: Some(transaction),
+                    access_share_relations: Vec::new(),
+                })
+                .ok_or(ParseError::InvalidSet),
         );
     }
 
@@ -768,11 +771,12 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
                 {
                     let tail = after_transaction.trim_start();
                     return Some(
-                        if !tail.is_empty() && is_begin_mode_list(&normalize_begin_tokens(tail)) {
-                            Ok(Command::ResetAll)
-                        } else {
-                            Err(ParseError::InvalidSet)
-                        },
+                        parse_begin_mode_list(&normalize_begin_tokens(tail))
+                            .map(|transaction| Command::SessionControl {
+                                transaction: Some(transaction),
+                                access_share_relations: Vec::new(),
+                            })
+                            .ok_or(ParseError::InvalidSet),
                     );
                 }
             }
@@ -980,10 +984,6 @@ fn parse_begin_mode_list(tokens: &[String]) -> Option<TransactionCharacteristics
     Some(characteristics)
 }
 
-fn is_begin_mode_list(tokens: &[String]) -> bool {
-    parse_begin_mode_list(tokens).is_some()
-}
-
 fn strip_single_leading_comma(tokens: &[String]) -> Option<&[String]> {
     match tokens {
         [first, rest @ ..] if first == "," && !rest.is_empty() => Some(rest),
@@ -1103,6 +1103,12 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
     }
 
     let s = s.trim_start();
+
+    if is_pg16_dump_materialized_view_dependency_program(s) {
+        return Ok(Command::PreparedCatalog(
+            super::PreparedCatalogProgram::Pg16MaterializedViewDependencies,
+        ));
+    }
     if s.is_empty() {
         return Err(ParseError::Empty);
     }
@@ -1142,6 +1148,13 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
         return relational;
     }
 
+    if let Some(relations) = parse_access_share_lock(s)? {
+        return Ok(Command::SessionControl {
+            transaction: None,
+            access_share_relations: relations,
+        });
+    }
+
     let mut parts = s.splitn(2, char::is_whitespace);
     if let Some(cmd) = parts.next() {
         if cmd.eq_ignore_ascii_case("SET") {
@@ -1162,6 +1175,12 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
             let value = v.trim();
             if key.is_empty() || key.chars().any(char::is_whitespace) {
                 return Err(ParseError::InvalidSet);
+            }
+            if is_bounded_postgres_session_parameter(key, value) {
+                return Ok(Command::SessionControl {
+                    transaction: None,
+                    access_share_relations: Vec::new(),
+                });
             }
             return Ok(Command::SetKv {
                 key: key.to_string(),
@@ -1229,6 +1248,69 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
     Err(ParseError::Unsupported(s.to_string()))
 }
 
+fn is_pg16_dump_materialized_view_dependency_program(input: &str) -> bool {
+    let Ok(canonical) = crate::canonicalize_sql_for_exact_match(input) else {
+        return false;
+    };
+    canonical
+        == "with recursive w as ( select d1.objid, d2.refobjid, c2.relkind as refrelkind from \
+            pg_depend d1 join pg_class c1 on c1.oid = d1.objid and c1.relkind = 'm' join \
+            pg_rewrite r1 on r1.ev_class = d1.objid join pg_depend d2 on d2.classid = \
+            'pg_rewrite'::regclass and d2.objid = r1.oid and d2.refobjid <> d1.objid join \
+            pg_class c2 on c2.oid = d2.refobjid and c2.relkind in ('m','v') where d1.classid = \
+            'pg_class'::regclass union select w.objid, d3.refobjid, c3.relkind from w join \
+            pg_rewrite r3 on r3.ev_class = w.refobjid join pg_depend d3 on d3.classid = \
+            'pg_rewrite'::regclass and d3.objid = r3.oid and d3.refobjid <> w.refobjid join \
+            pg_class c3 on c3.oid = d3.refobjid and c3.relkind in ('m','v') ) select \
+            'pg_class'::regclass::oid as classid, objid, refobjid from w where refrelkind = 'm'"
+}
+
+fn parse_access_share_lock(input: &str) -> Result<Option<Vec<String>>, ParseError> {
+    let Some(rest) = strip_keyword_prefix_case_insensitive(input, "LOCK TABLE") else {
+        return Ok(None);
+    };
+    let lower = rest.to_ascii_lowercase();
+    let suffix = " in access share mode";
+    let Some(relation_list_len) = lower.strip_suffix(suffix).map(str::len) else {
+        return Err(ParseError::Unsupported(input.to_string()));
+    };
+    let relation_list = rest[..relation_list_len].trim();
+    if relation_list.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let relations = split_csv(relation_list)?
+        .into_iter()
+        .map(normalize_relation_identifier)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(relations))
+}
+
+fn is_bounded_postgres_session_parameter(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let value = value.trim().to_ascii_lowercase();
+    matches!(
+        (key.as_str(), value.as_str()),
+        ("datestyle", "iso")
+            | ("intervalstyle", "postgres")
+            | ("extra_float_digits", "3")
+            | ("statement_timeout", "0")
+            | ("lock_timeout", "0")
+            | ("idle_in_transaction_session_timeout", "0")
+            | ("client_encoding", "'utf8'")
+            | ("standard_conforming_strings", "on")
+            | ("synchronize_seqscans", "off")
+            | ("check_function_bodies", "false")
+            | ("xmloption", "content")
+            | ("client_min_messages", "warning")
+            | ("row_security", "off")
+            | ("default_tablespace", "''")
+            | ("default_table_access_method", "heap")
+            | ("default_transaction_read_only", "off")
+            | ("search_path", "pg_catalog, public")
+            | ("search_path", "public, pg_catalog")
+    )
+}
+
 #[cfg(test)]
 mod transaction_characteristic_tests {
     use super::*;
@@ -1252,6 +1334,54 @@ mod transaction_characteristic_tests {
             );
         }
         assert!(parse_command("SHOW TRANSACTION ISOLATION").is_err());
+    }
+
+    #[test]
+    fn bounded_postgres_set_is_session_control_but_unknown_set_remains_kv() {
+        for sql in [
+            "SET statement_timeout = 0",
+            "SET search_path = pg_catalog, public",
+            "SET search_path = public, pg_catalog",
+        ] {
+            assert!(matches!(
+                parse_command(sql).unwrap(),
+                Command::SessionControl {
+                    transaction: None,
+                    ref access_share_relations,
+                } if access_share_relations.is_empty()
+            ));
+        }
+        assert!(matches!(
+            parse_command("SET application_key = arbitrary_value").unwrap(),
+            Command::SetKv { .. }
+        ));
+    }
+
+    #[test]
+    fn pg16_dump_role_login_program_is_bounded() {
+        assert_eq!(
+            parse_command(
+                "ALTER ROLE global_reader WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB \
+                 LOGIN NOREPLICATION NOBYPASSRLS"
+            )
+            .unwrap(),
+            Command::AlterRoleLogin(crate::AlterRoleLogin {
+                name: "global_reader".to_string(),
+                login: true,
+            })
+        );
+        assert!(matches!(
+            parse_command("ALTER ROLE global_reader NOLOGIN").unwrap(),
+            Command::AlterRoleLogin(crate::AlterRoleLogin { login: false, .. })
+        ));
+        for unsupported in [
+            "ALTER ROLE global_reader WITH SUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS",
+            "ALTER ROLE global_reader WITH NOSUPERUSER NOINHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS",
+            "ALTER ROLE global_reader WITH CREATEDB",
+            "ALTER ROLE global_reader WITH LOGIN PASSWORD 'secret'",
+        ] {
+            assert!(parse_command(unsupported).is_err(), "{unsupported}");
+        }
     }
 
     #[test]
@@ -1350,5 +1480,47 @@ mod transaction_characteristic_tests {
         assert!(!is_select_statement("SELEC broken"));
         assert!(!is_select_statement("selection FROM t"));
         assert!(!is_select_statement("COPY t FROM STDIN"));
+    }
+
+    #[test]
+    fn pg16_materialized_dependency_program_is_exact_and_near_misses_fail_closed() {
+        let canonical = "WITH RECURSIVE w AS ( \
+            SELECT d1.objid, d2.refobjid, c2.relkind AS refrelkind \
+            FROM pg_depend d1 \
+            JOIN pg_class c1 ON c1.oid = d1.objid AND c1.relkind = 'm' \
+            JOIN pg_rewrite r1 ON r1.ev_class = d1.objid \
+            JOIN pg_depend d2 ON d2.classid = 'pg_rewrite'::regclass \
+                AND d2.objid = r1.oid AND d2.refobjid <> d1.objid \
+            JOIN pg_class c2 ON c2.oid = d2.refobjid AND c2.relkind IN ('m','v') \
+            WHERE d1.classid = 'pg_class'::regclass \
+            UNION \
+            SELECT w.objid, d3.refobjid, c3.relkind \
+            FROM w \
+            JOIN pg_rewrite r3 ON r3.ev_class = w.refobjid \
+            JOIN pg_depend d3 ON d3.classid = 'pg_rewrite'::regclass \
+                AND d3.objid = r3.oid AND d3.refobjid <> w.refobjid \
+            JOIN pg_class c3 ON c3.oid = d3.refobjid AND c3.relkind IN ('m','v') \
+            ) \
+            SELECT 'pg_class'::regclass::oid AS classid, objid, refobjid \
+            FROM w WHERE refrelkind = 'm'";
+        assert!(matches!(
+            parse_command_allowing_catalog(canonical).unwrap(),
+            Command::PreparedCatalog(
+                crate::PreparedCatalogProgram::Pg16MaterializedViewDependencies
+            )
+        ));
+
+        for near_miss in [
+            canonical.replace("objid, refobjid", "objid, refobjid, refrelkind"),
+            canonical.replace("WHERE refrelkind = 'm'", "WHERE refrelkind = 'v'"),
+            canonical.replace("c1.relkind = 'm'", "c1.relkind = 'M'"),
+            canonical.replace("UNION", "UNION ALL"),
+            canonical.replace("FROM pg_depend d1", "FROM (pg_depend d1"),
+        ] {
+            assert!(
+                parse_command_allowing_catalog(&near_miss).is_err(),
+                "near-miss dependency CTE must not enter the fixed-result route: {near_miss}"
+            );
+        }
     }
 }

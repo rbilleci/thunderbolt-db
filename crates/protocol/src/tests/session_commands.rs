@@ -2,6 +2,13 @@
 
 use super::*;
 
+fn transaction_control(characteristics: TransactionCharacteristics) -> Command {
+    Command::SessionControl {
+        transaction: Some(characteristics),
+        access_share_relations: Vec::new(),
+    }
+}
+
 #[test]
 fn parses_set() {
     let cmd = parse_command("SET a = 42").unwrap();
@@ -144,28 +151,41 @@ fn parses_postgres_style_set_session_reset_aliases() {
     assert_eq!(
         parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .unwrap(),
-        Command::ResetAll
+        transaction_control(TransactionCharacteristics::default())
     );
     assert_eq!(
         parse_command("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap(),
-        Command::ResetAll
+        transaction_control(TransactionCharacteristics {
+            isolation: TransactionIsolation::RepeatableRead,
+            ..TransactionCharacteristics::default()
+        })
     );
     assert_eq!(
         parse_command("SET TRANSACTION READ ONLY, DEFERRABLE").unwrap(),
-        Command::ResetAll
+        transaction_control(TransactionCharacteristics {
+            access: TransactionAccessMode::ReadOnly,
+            deferrable: true,
+            ..TransactionCharacteristics::default()
+        })
     );
     assert_eq!(
         parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE, NOT DEFERRABLE")
             .unwrap(),
-        Command::ResetAll
+        transaction_control(TransactionCharacteristics::default())
     );
     assert_eq!(
         parse_command("SET LOCAL TRANSACTION READ ONLY").unwrap(),
-        Command::ResetAll
+        transaction_control(TransactionCharacteristics {
+            access: TransactionAccessMode::ReadOnly,
+            ..TransactionCharacteristics::default()
+        })
     );
     assert_eq!(
         parse_command("SET LOCAL TRANSACTION READ WRITE, DEFERRABLE").unwrap(),
-        Command::ResetAll
+        transaction_control(TransactionCharacteristics {
+            deferrable: true,
+            ..TransactionCharacteristics::default()
+        })
     );
 }
 

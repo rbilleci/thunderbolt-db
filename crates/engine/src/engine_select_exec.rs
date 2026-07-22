@@ -203,6 +203,13 @@ impl Engine {
                 "commit path is wedged; restart recovery required".to_string(),
             )));
         }
+        // A PostgreSQL sequence exposes `last_value`/`is_called` as a relation, but it is catalog
+        // state rather than a user table in the canonical engine. Route this exact pg_dump shape
+        // through the libpg_query catalog-program path before the typed table dispatcher can reject
+        // the sequence name. The downstream route retains the ordinary immutable statement scope.
+        if crate::engine_sql_pg::pg_dump_catalog::is_pg16_dump_sequence_state_program(text) {
+            return self.execute_resident_expr_select_sql(text);
+        }
         match parse_command_allowing_catalog(text) {
             Ok(Command::Select(select)) => {
                 // A non-grouped ORDER BY over an i64-sortable int key is a charter-native GPU sort: run
@@ -688,8 +695,38 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
-        // Lock-free read path (Stage 2 — blocker #1): pin the catalog snapshot for the function lookup.
-        let catalog = self.catalog_snapshot();
+        self.execute_relational_function_scoped(call)
+    }
+
+    pub fn execute_relational_function_in_transaction(
+        &self,
+        txn_id: TxnId,
+        call: &SelectFunction,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        let snapshot = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
+        let statement_lock = Arc::clone(&snapshot.statement_lock);
+        let _statement = statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let _scope = self.enter_transaction_read(snapshot);
+        self.execute_relational_function_scoped(call)
+    }
+
+    fn execute_relational_function_scoped(
+        &self,
+        call: &SelectFunction,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        // Lock-free read path: pin one catalog generation for lookup and scalar execution.
+        let boundary = self.read_snapshot_boundary();
+        let catalog = self.read_catalog_as_of(boundary);
         let Some(function) = catalog.relational_functions.get(&call.name) else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "function \"{}\" does not exist",
@@ -708,7 +745,7 @@ impl Engine {
             format!("__gpu_function_{}", function.oid),
             function.oid,
             1,
-            self.committed_seq(),
+            boundary,
         )
     }
 

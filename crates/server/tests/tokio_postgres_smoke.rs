@@ -88,6 +88,55 @@ async fn canonical_server_tokio_postgres_copy_and_recovery_smoke(
         )
         .await?;
 
+    client
+        .batch_execute(
+            "PREPARE dump_lookup(pg_catalog.int4) AS \
+             SELECT id, name FROM driver_people WHERE id = $1",
+        )
+        .await?;
+    let executed = client.simple_query("EXECUTE dump_lookup(2)").await?;
+    let executed = executed
+        .iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .expect("SQL EXECUTE row");
+    assert_eq!(executed.get("id"), Some("2"));
+    assert_eq!(executed.get("name"), Some("Linus"));
+    client.batch_execute("DEALLOCATE dump_lookup").await?;
+
+    client.batch_execute("BEGIN").await?;
+    client
+        .batch_execute(
+            "DECLARE _pg_dump_cursor CURSOR FOR \
+             SELECT id, name FROM ONLY public.driver_people ORDER BY id",
+        )
+        .await?;
+    let first_fetch = client.simple_query("FETCH 2 FROM _pg_dump_cursor").await?;
+    let first_ids = first_fetch
+        .iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get("id"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_ids, vec!["1", "2"]);
+    let second_fetch = client.simple_query("FETCH 2 FROM _pg_dump_cursor").await?;
+    let second_ids = second_fetch
+        .iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get("id"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(second_ids, vec!["3"]);
+    client.batch_execute("COMMIT").await?;
+    client
+        .simple_query("FETCH 1 FROM _pg_dump_cursor")
+        .await
+        .expect_err("transaction completion must close SQL cursors");
+
     {
         let transaction = client.transaction().await?;
         let statement = transaction

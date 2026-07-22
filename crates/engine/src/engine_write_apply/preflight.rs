@@ -1014,6 +1014,19 @@ impl Engine {
                     )));
                 }
             }
+            Command::AlterRoleLogin(alter) => {
+                if alter.name == "postgres" {
+                    return Err(EngineError::ApplyFailed(
+                        "cannot alter bootstrap role \"postgres\"".to_string(),
+                    ));
+                }
+                if !cat.relational_roles.contains_key(&alter.name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "role \"{}\" does not exist",
+                        alter.name
+                    )));
+                }
+            }
             Command::GrantDefaultTablePrivileges(grant) => {
                 self.preflight_acl_grantee(&grant.grantee)?;
             }

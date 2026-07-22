@@ -99,6 +99,7 @@ impl Planner {
             | Command::CreateRole(_)
             | Command::DropRole(_)
             | Command::RenameRole(_)
+            | Command::AlterRoleLogin(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
@@ -145,7 +146,7 @@ impl Planner {
                     kind: PlanKind::Read,
                 }
             }
-            Command::SelectFunction(_) => PlanNode {
+            Command::SelectFunction(_) | Command::PreparedCatalog(_) => PlanNode {
                 op: PlannedOp {
                     name: "routine_select".to_string(),
                     target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
@@ -173,15 +174,16 @@ impl Planner {
                 },
                 kind: PlanKind::Admin,
             },
-            Command::ResetAll | Command::ShowTransactionIsolation | Command::SetRole { .. } => {
-                PlanNode {
-                    op: PlannedOp {
-                        name: "session_control".to_string(),
-                        target: DeviceTarget::Cpu,
-                    },
-                    kind: PlanKind::TxnControl,
-                }
-            }
+            Command::ResetAll
+            | Command::ShowTransactionIsolation
+            | Command::SetRole { .. }
+            | Command::SessionControl { .. } => PlanNode {
+                op: PlannedOp {
+                    name: "session_control".to_string(),
+                    target: DeviceTarget::Cpu,
+                },
+                kind: PlanKind::TxnControl,
+            },
         };
 
         ExecutionPlan::new(vec![node])

@@ -305,16 +305,50 @@ fn parse_equi_conjunct(node: &Node) -> Result<(JoinColRef, JoinColRef), ExecuteE
 /// executor packs a 2-conjunct key into one i64 for the hash join; >2 conjuncts (wider than 64 bits) are
 /// validated/rejected there.
 fn parse_on_conjuncts(quals: &Node) -> Result<Vec<(JoinColRef, JoinColRef)>, ExecuteError> {
-    if let NodeEnum::BoolExpr(bool_expr) = node_enum(quals)? {
-        if bool_expr.boolop == BoolExprType::AndExpr as i32 {
-            return bool_expr.args.iter().map(parse_equi_conjunct).collect();
+    let mut terms = Vec::new();
+    collect_and_conjuncts(quals, &mut terms)?;
+    let mut equi = Vec::new();
+    for term in terms {
+        match parse_equi_conjunct(term) {
+            Ok(conjunct) => equi.push(conjunct),
+            Err(_) if on_local_filter_has_supported_syntax(term) => {}
+            Err(error) => return Err(error),
         }
+    }
+    if equi.is_empty() {
         return Err(sql_pg_error(
-            "a join ON with OR / NOT is a follow-up; use AND-combined `a.k = b.k` equalities"
-                .to_string(),
+            "a join ON requires at least one equality between the joined relations".to_string(),
         ));
     }
-    Ok(vec![parse_equi_conjunct(quals)?])
+    Ok(equi)
+}
+
+fn on_local_filter_has_supported_syntax(node: &Node) -> bool {
+    let Ok(NodeEnum::AExpr(expression)) = node_enum(node) else {
+        return false;
+    };
+    if expression.kind != AExprKind::AexprOp as i32
+        || !matches!(
+            aexpr_op_token(expression),
+            Ok("=" | "<>" | "<" | "<=" | ">" | ">=")
+        )
+    {
+        return false;
+    }
+    matches!(
+        (
+            expression
+                .lexpr
+                .as_deref()
+                .and_then(|node| node.node.as_ref()),
+            expression
+                .rexpr
+                .as_deref()
+                .and_then(|node| node.node.as_ref()),
+        ),
+        (Some(NodeEnum::ColumnRef(_)), Some(NodeEnum::AConst(_)))
+            | (Some(NodeEnum::AConst(_)), Some(NodeEnum::ColumnRef(_)))
+    )
 }
 
 /// Parse `SELECT <cols> FROM a JOIN b ON .. [JOIN c ON ..]` (libpg_query) into a [`JoinPlan`] (M5). Scope:
@@ -715,6 +749,112 @@ pub(super) fn split_join_where(
         .collect())
 }
 
+/// Lower single-relation ON conjuncts into the same per-relation GPU predicates as WHERE. This is
+/// semantics-preserving for INNER joins and for the non-preserved side of an OUTER join. Predicates
+/// on a preserved side remain rejected instead of being incorrectly pushed below the join.
+pub(super) fn split_join_on_local_filters(
+    stmt: &SelectStmt,
+    tables: &[RelationalTable],
+    aliases: &[&str],
+    catalog: &super::CatalogSnapshot,
+) -> Result<Vec<Option<ResidentExpr>>, ExecuteError> {
+    let [from] = stmt.from_clause.as_slice() else {
+        return Err(sql_pg_error(
+            "expected one explicit JOIN while lowering ON filters".to_string(),
+        ));
+    };
+    let NodeEnum::JoinExpr(join) = node_enum(from)? else {
+        return Err(sql_pg_error(
+            "expected an explicit JOIN while lowering ON filters".to_string(),
+        ));
+    };
+    let mut filters: Vec<Vec<ResidentExpr>> = (0..tables.len()).map(|_| Vec::new()).collect();
+    collect_join_on_local_filters(join, tables, aliases, catalog, &mut filters)?;
+    Ok(filters
+        .into_iter()
+        .map(|filters| {
+            filters
+                .into_iter()
+                .reduce(|left, right| ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(left),
+                    rhs: Box::new(right),
+                })
+        })
+        .collect())
+}
+
+fn collect_join_on_local_filters(
+    join: &pg_query::protobuf::JoinExpr,
+    tables: &[RelationalTable],
+    aliases: &[&str],
+    catalog: &super::CatalogSnapshot,
+    filters: &mut [Vec<ResidentExpr>],
+) -> Result<(), ExecuteError> {
+    if let Some(NodeEnum::JoinExpr(inner)) =
+        join.larg.as_deref().and_then(|node| node.node.as_ref())
+    {
+        collect_join_on_local_filters(inner, tables, aliases, catalog, filters)?;
+    }
+    // USING and NATURAL joins carry their equality semantics in `using_clause` / `is_natural`,
+    // not `quals`. They have no independent ON-local predicates to push down.
+    if join.is_natural || !join.using_clause.is_empty() {
+        return Ok(());
+    }
+    let right = join
+        .rarg
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("JOIN missing its right relation".to_string()))?;
+    let (_, right_alias, _) = join_side_name_alias(right)?;
+    let right_index = aliases
+        .iter()
+        .position(|alias| *alias == right_alias)
+        .ok_or_else(|| sql_pg_error("JOIN right relation lost its bound alias".to_string()))?;
+    let quals = join
+        .quals
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("JOIN requires an ON condition".to_string()))?;
+    let mut conjuncts = Vec::new();
+    collect_and_conjuncts(quals, &mut conjuncts)?;
+    for conjunct in conjuncts {
+        if parse_equi_conjunct(conjunct).is_ok() {
+            continue;
+        }
+        let mapped = tables
+            .iter()
+            .zip(aliases)
+            .enumerate()
+            .filter_map(|(index, (table, alias))| {
+                map_predicate_node(conjunct, table, alias, catalog)
+                    .ok()
+                    .map(|predicate| (index, predicate))
+            })
+            .collect::<Vec<_>>();
+        let [(index, predicate)] = mapped.as_slice() else {
+            return Err(sql_pg_error(
+                "a local join ON predicate must resolve against exactly one relation".to_string(),
+            ));
+        };
+        let pushdown_safe = if join.jointype == JoinType::JoinInner as i32 {
+            true
+        } else if join.jointype == JoinType::JoinLeft as i32 {
+            *index == right_index
+        } else if join.jointype == JoinType::JoinRight as i32 {
+            *index != right_index
+        } else {
+            false
+        };
+        if !pushdown_safe {
+            return Err(sql_pg_error(
+                "an ON predicate on the preserved side of an outer join cannot be pushed below the GPU join"
+                    .to_string(),
+            ));
+        }
+        filters[*index].push(predicate.clone());
+    }
+    Ok(())
+}
+
 /// Flatten a top-level chain of `AND`s into individual conjuncts; any other node is a single conjunct.
 fn collect_and_conjuncts<'a>(node: &'a Node, out: &mut Vec<&'a Node>) -> Result<(), ExecuteError> {
     if let NodeEnum::BoolExpr(bool_expr) = node_enum(node)? {
@@ -779,6 +919,27 @@ mod tests {
                 comma_join_relations(&stmt).unwrap_err()
             };
             assert!(error.to_string().contains("column-alias lists"), "{error}");
+        }
+    }
+
+    #[test]
+    fn using_and_natural_joins_do_not_require_an_on_predicate_for_local_filter_lowering() {
+        for sql in [
+            "SELECT * FROM left_table l JOIN right_table r USING (id)",
+            "SELECT * FROM left_table l NATURAL JOIN right_table r",
+        ] {
+            let stmt = parse_single_select(sql).unwrap();
+            assert!(
+                split_join_on_local_filters(
+                    &stmt,
+                    &[],
+                    &[],
+                    &crate::engine_state::CatalogSnapshot::default(),
+                )
+                .unwrap()
+                .is_empty(),
+                "{sql}"
+            );
         }
     }
 }

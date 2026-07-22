@@ -22,13 +22,14 @@ use crate::engine_expr::{
     like_pattern_for_literal_prefix, JoinColRef, JoinPlan, JoinProjItem, JoinRelationRef, JoinStep,
     ResidentBinaryOp, ResidentExecSource, ResidentExpr,
 };
-use gpu_db_sql::{SelectFilter, SelectFilterOp, SelectOrder};
+use gpu_db_sql::{canonicalize_sql_for_exact_match, SelectFilter, SelectFilterOp, SelectOrder};
 
 mod catalog_range_alias;
 mod catalog_visibility;
 mod join_lowering;
 mod select_lowering;
 mod statement_snapshot;
+mod window_lowering;
 
 use catalog_range_alias::{
     apply_catalog_range_column_aliases, catalog_range_relation_key,
@@ -37,15 +38,15 @@ use catalog_range_alias::{
 use join_lowering::{
     build_join_plan, build_join_plan_with_projection, comma_join_relations, from_clause_is_join,
     parse_join_col_ref, parse_join_order_by_limit, parse_join_projection, plan_comma_join_where,
-    reject_unsupported_join_clauses, split_join_where,
+    reject_unsupported_join_clauses, split_join_on_local_filters, split_join_where,
 };
 pub(crate) use select_lowering::parse_single_select;
 use select_lowering::{
     aexpr_op_token, build_select_from_select_stmt, map_predicate_node, node_enum, parse_limit,
-    parse_order_by, parse_order_by_null_placement, resolve_column_name, result_column_name,
-    sql_pg_error,
+    parse_order_by, parse_order_by_null_placement, resolve_column_name, sql_pg_error,
 };
 use statement_snapshot::capture_general_select_statement_snapshot;
+use window_lowering::{resolve_rank_window_def, select_has_inline_window};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GpuRankWindowKind {
@@ -76,6 +77,7 @@ enum GpuRankTarget {
 
 mod catalog_empty;
 mod catalog_presentation;
+pub(crate) mod pg_dump_catalog;
 
 use catalog_presentation::{
     apply_catalog_projection_metadata, catalog_join_projection_plan,
@@ -132,6 +134,9 @@ impl Engine {
         let _statement_scope =
             statement_snapshot.map(|snapshot| self.enter_transaction_read(snapshot));
         after_snapshot();
+        if let Some(result) = self.execute_pg_dump_catalog_route_if_applicable(sql)? {
+            return Ok(result);
+        }
         if select_has_inline_window(&stmt)? {
             return self.execute_gpu_rank_window_select(&stmt);
         }
@@ -190,10 +195,21 @@ impl Engine {
                 rows.push(relation_rows);
             }
             let aliases: Vec<&str> = plan.relations.iter().map(|r| r.alias.as_str()).collect();
-            let predicates = match stmt.where_clause.as_deref() {
+            let mut predicates = match stmt.where_clause.as_deref() {
                 Some(where_node) => split_join_where(where_node, &tables, &aliases, &catalog)?,
                 None => (0..plan.relations.len()).map(|_| None).collect(),
             };
+            let on_predicates = split_join_on_local_filters(&stmt, &tables, &aliases, &catalog)?;
+            for (predicate, on_predicate) in predicates.iter_mut().zip(on_predicates) {
+                *predicate = match (predicate.take(), on_predicate) {
+                    (Some(left), Some(right)) => Some(ResidentExpr::Binary {
+                        op: ResidentBinaryOp::And,
+                        lhs: Box::new(left),
+                        rhs: Box::new(right),
+                    }),
+                    (left, right) => left.or(right),
+                };
+            }
             if rows.iter().all(Option::is_none) {
                 if let Some(result) = self.try_streaming_inner_join(&plan, &tables, &predicates, s)
                 {
@@ -355,11 +371,16 @@ impl Engine {
         // than on SelectOrder so the legacy protocol crate's SelectOrder is untouched (charter).
         let mut order_by_nulls_first: Vec<Option<bool>> =
             Vec::with_capacity(stmt.sort_clause.len());
-        for item in stmt.sort_clause.iter().take(if select.order_by.is_empty() {
-            0
-        } else {
-            stmt.sort_clause.len()
-        }) {
+        for (order_index, item) in stmt
+            .sort_clause
+            .iter()
+            .take(if select.order_by.is_empty() {
+                0
+            } else {
+                stmt.sort_clause.len()
+            })
+            .enumerate()
+        {
             let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
                 return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
             };
@@ -367,7 +388,14 @@ impl Engine {
                 .node
                 .as_deref()
                 .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
-            if result_column_name(node, &qualifier).is_ok() {
+            // Lowering has already resolved column references and positional keys such as
+            // `ORDER BY 1` to a concrete projected column. Only an empty SelectOrder column marks
+            // a true per-row expression that needs a derived device key.
+            if select
+                .order_by
+                .get(order_index)
+                .is_some_and(|order| !order.column.is_empty())
+            {
                 order_by_exprs.push(None);
             } else {
                 order_by_exprs.push(Some(map_predicate_node(
@@ -1925,72 +1953,4 @@ impl Engine {
             access_path: Arc::new(RelationalAccessPath::FullTableScan),
         })
     }
-}
-
-fn resolve_rank_window_def(
-    over: &pg_query::protobuf::WindowDef,
-    clauses: &[Node],
-    depth: usize,
-) -> Result<pg_query::protobuf::WindowDef, ExecuteError> {
-    fn named<'a>(
-        name: &str,
-        clauses: &'a [Node],
-    ) -> Result<&'a pg_query::protobuf::WindowDef, ExecuteError> {
-        clauses
-            .iter()
-            .find_map(|node| match node.node.as_ref() {
-                Some(NodeEnum::WindowDef(window)) if window.name == name => Some(window.as_ref()),
-                _ => None,
-            })
-            .ok_or_else(|| sql_pg_error(format!("window \"{name}\" does not exist")))
-    }
-    fn source(
-        window: &pg_query::protobuf::WindowDef,
-        clauses: &[Node],
-        depth: usize,
-    ) -> Result<pg_query::protobuf::WindowDef, ExecuteError> {
-        if depth > clauses.len().saturating_add(1) {
-            return Err(sql_pg_error("cyclic named WINDOW reference".to_string()));
-        }
-        let mut resolved = if window.refname.is_empty() {
-            window.clone()
-        } else {
-            let mut base = source(named(&window.refname, clauses)?, clauses, depth + 1)?;
-            if !window.partition_clause.is_empty() {
-                base.partition_clause = window.partition_clause.clone();
-            }
-            if !window.order_clause.is_empty() {
-                base.order_clause = window.order_clause.clone();
-            }
-            if window.frame_options & 0x00001 != 0 {
-                base.frame_options = window.frame_options;
-                base.start_offset = window.start_offset.clone();
-                base.end_offset = window.end_offset.clone();
-            }
-            base
-        };
-        resolved.name.clear();
-        resolved.refname.clear();
-        Ok(resolved)
-    }
-    if over.name.is_empty() {
-        source(over, clauses, depth)
-    } else {
-        source(named(&over.name, clauses)?, clauses, depth + 1)
-    }
-}
-
-fn select_has_inline_window(stmt: &SelectStmt) -> Result<bool, ExecuteError> {
-    for target in &stmt.target_list {
-        let NodeEnum::ResTarget(target) = node_enum(target)? else {
-            continue;
-        };
-        let Some(value) = target.val.as_deref() else {
-            continue;
-        };
-        if matches!(node_enum(value)?, NodeEnum::FuncCall(func) if func.over.is_some()) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }

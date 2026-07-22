@@ -35,6 +35,40 @@ impl Engine {
         self.ddl_catalog().relational_catalog.get(table).cloned()
     }
 
+    /// Validate pg_dump's bounded access-share declaration against the transaction's immutable
+    /// catalog generation. The retained catalog/data generation supplies the DDL-stability
+    /// contract that PostgreSQL obtains from an ACCESS SHARE lock; this method does not sequence,
+    /// write WAL, or publish state.
+    pub fn validate_access_share_relations_in_transaction(
+        &self,
+        txn_id: TxnId,
+        relations: &[String],
+    ) -> Result<(), ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        let snapshot = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
+        let statement_lock = Arc::clone(&snapshot.statement_lock);
+        let _statement = statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
+        let catalog = snapshot.transaction_catalog();
+        for relation in relations {
+            let exists = catalog.relational_catalog.contains_key(relation)
+                || catalog.relational_views.contains_key(relation)
+                || catalog.relational_materialized_views.contains_key(relation)
+                || catalog.relational_sequences.contains_key(relation);
+            if !exists {
+                return Err(ExecuteError::UndefinedRelation(relation.clone()));
+            }
+        }
+        Ok(())
+    }
+
     pub fn relational_copy_columns(&self, table: &str) -> Result<Vec<CopyColumn>, ExecuteError> {
         self.relational_copy_target(table)
             .map(|(columns, _proof)| columns)

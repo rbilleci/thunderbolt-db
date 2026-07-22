@@ -12,6 +12,7 @@ mod catalog_visibility;
 mod join_materialization_audit;
 mod join_null_keys;
 mod outer_null_semantics;
+mod pg_dump_compat;
 mod statement_snapshot;
 
 use crate::engine_sql_pg::parse_single_select;

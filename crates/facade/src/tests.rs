@@ -421,6 +421,148 @@ fn session_cleanup_and_compatibility_reads_do_not_enter_mutation_admission() {
 }
 
 #[test]
+fn pg_dump_session_controls_and_access_share_lock_are_wal_neutral() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE dump_lock_target (id INT PRIMARY KEY)",
+    )
+    .unwrap();
+    let wal_before = shared.engine.durable_wal_records().len();
+    let visible_before = shared.engine.visible_up_to();
+
+    for sql in [
+        "SET statement_timeout = 0",
+        "SET search_path = pg_catalog, public",
+        "SET standard_conforming_strings = on",
+    ] {
+        assert!(matches!(
+            submit_session_text(&shared, &mut session, sql).unwrap(),
+            QueryOutcome::Command { .. }
+        ));
+        assert_eq!(
+            shared.engine.durable_wal_records().len(),
+            wal_before,
+            "{sql} claimed WAL"
+        );
+    }
+    let outside = submit_session_text(
+        &shared,
+        &mut session,
+        "LOCK TABLE dump_lock_target IN ACCESS SHARE MODE",
+    )
+    .unwrap_err();
+    assert_eq!(outside.category, ErrorCategory::InvalidRequest);
+    assert_eq!(shared.engine.durable_wal_records().len(), wal_before);
+
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    assert_eq!(shared.engine.durable_wal_records().len(), wal_before);
+    let next_after_begin = shared.next_txn_id.load(Ordering::Relaxed);
+    submit_session_text(
+        &shared,
+        &mut session,
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    )
+    .unwrap();
+    assert_eq!(shared.next_txn_id.load(Ordering::Relaxed), next_after_begin);
+    assert_eq!(shared.engine.durable_wal_records().len(), wal_before);
+    assert!(matches!(
+        submit_session_text(
+            &shared,
+            &mut session,
+            "LOCK TABLE dump_lock_target IN ACCESS SHARE MODE"
+        )
+        .unwrap(),
+        QueryOutcome::Command {
+            tag: CommandTag::Other(ref tag),
+            ..
+        } if tag == "LOCK TABLE"
+    ));
+    assert_eq!(shared.engine.durable_wal_records().len(), wal_before);
+    assert_eq!(
+        submit_session_text(&shared, &mut session, "SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+        QueryOutcome::Rows {
+            columns: vec![ColumnMeta {
+                name: "transaction_isolation".to_string(),
+                logical_type: LogicalType::Text,
+            }],
+            rows: vec![vec![DbValue::Text("repeatable read".to_string())]],
+        }
+    );
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+
+    assert_eq!(shared.engine.durable_wal_records().len(), wal_before);
+    assert_eq!(shared.engine.visible_up_to(), visible_before);
+    assert_eq!(session.transaction_status(), SessionTransactionStatus::Idle);
+}
+
+#[test]
+fn rejected_set_transaction_preserves_the_original_failed_block_and_never_autocommits() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE set_txn_atomicity (id INT PRIMARY KEY)",
+    )
+    .unwrap();
+    let wal_before = shared.engine.durable_wal_records();
+
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    let next_after_begin = shared.next_txn_id.load(Ordering::Relaxed);
+    let unsupported = submit_session_text(
+        &shared,
+        &mut session,
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    )
+    .unwrap_err();
+    assert_eq!(unsupported.category, ErrorCategory::Unsupported);
+    assert_eq!(
+        session.transaction_status(),
+        SessionTransactionStatus::FailedTransaction
+    );
+    assert_eq!(shared.next_txn_id.load(Ordering::Relaxed), next_after_begin);
+    assert_eq!(shared.engine.durable_wal_records(), wal_before);
+
+    let blocked = submit_session_text(
+        &shared,
+        &mut session,
+        "INSERT INTO set_txn_atomicity VALUES (1)",
+    )
+    .unwrap_err();
+    assert_eq!(blocked.category, ErrorCategory::InFailedTransaction);
+    assert_eq!(shared.engine.durable_wal_records(), wal_before);
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+
+    let QueryOutcome::Rows { rows, .. } =
+        submit_ephemeral_text(&shared, "SELECT id FROM set_txn_atomicity WHERE id = 1").unwrap()
+    else {
+        panic!("verification SELECT must return rows");
+    };
+    assert!(
+        rows.is_empty(),
+        "rejected SET allowed a later write to autocommit"
+    );
+
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    let deferrable = submit_session_text(
+        &shared,
+        &mut session,
+        "SET TRANSACTION READ ONLY, DEFERRABLE",
+    )
+    .unwrap_err();
+    assert_eq!(deferrable.category, ErrorCategory::Unsupported);
+    assert_eq!(
+        session.transaction_status(),
+        SessionTransactionStatus::FailedTransaction
+    );
+    assert_eq!(shared.engine.durable_wal_records(), wal_before);
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+}
+
+#[test]
 fn show_transaction_isolation_reports_session_state_without_claiming_work() {
     let shared = SharedEngine::new();
     let mut session = shared.open_session();
@@ -1053,6 +1195,129 @@ fn general_gpu_catalog_select_retains_transaction_snapshot_and_failed_state() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], rows[0][1]);
     assert_eq!(rows[0][2], DbValue::Text("int4".to_string()));
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn successful_rich_select_prevents_late_set_transaction_snapshot_replacement() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE rich_statement_marker (id INT)",
+    )
+    .unwrap();
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    let QueryOutcome::Rows { rows, .. } = submit_session_text(
+        &shared,
+        &mut session,
+        "SELECT c.relname, n.nspname FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = 'rich_statement_marker'",
+    )
+    .unwrap() else {
+        panic!("rich catalog SELECT must return rows");
+    };
+    assert_eq!(rows.len(), 1);
+
+    let late = submit_session_text(
+        &shared,
+        &mut session,
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    )
+    .unwrap_err();
+    assert_eq!(late.category, ErrorCategory::InvalidRequest);
+    assert!(late
+        .message
+        .contains("must precede the first transaction statement"));
+    assert_eq!(
+        session.transaction_status(),
+        SessionTransactionStatus::FailedTransaction
+    );
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn pg_dump_sequence_state_routing_uses_the_pinned_catalog_and_falls_through_for_tables() {
+    let shared = SharedEngine::new();
+    let mut setup = shared.open_session();
+    submit_session_text(&shared, &mut setup, "CREATE SEQUENCE snapshot_sequence").unwrap();
+    submit_session_text(
+        &shared,
+        &mut setup,
+        "SELECT nextval('snapshot_sequence'::regclass)",
+    )
+    .unwrap();
+    submit_session_text(
+        &shared,
+        &mut setup,
+        "SELECT nextval('snapshot_sequence'::regclass)",
+    )
+    .unwrap();
+
+    let mut repeatable = shared.open_session();
+    submit_session_text(
+        &shared,
+        &mut repeatable,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    )
+    .unwrap();
+    let old_state = submit_session_text(
+        &shared,
+        &mut repeatable,
+        "SELECT last_value, is_called FROM public.snapshot_sequence",
+    )
+    .unwrap();
+    assert!(matches!(
+        old_state,
+        QueryOutcome::Rows { ref rows, .. }
+            if rows == &vec![vec![DbValue::Int8(2), DbValue::Bool(true)]]
+    ));
+
+    submit_session_text(&shared, &mut setup, "DROP SEQUENCE snapshot_sequence").unwrap();
+    submit_session_text(&shared, &mut setup, "CREATE SEQUENCE snapshot_sequence").unwrap();
+    submit_session_text(
+        &shared,
+        &mut setup,
+        "SELECT nextval('snapshot_sequence'::regclass)",
+    )
+    .unwrap();
+    assert_eq!(
+        submit_session_text(
+            &shared,
+            &mut repeatable,
+            "SELECT last_value, is_called FROM public.snapshot_sequence",
+        )
+        .unwrap(),
+        old_state,
+        "repeatable-read sequence routing consulted the live DROP/recreate catalog"
+    );
+    submit_session_text(&shared, &mut repeatable, "COMMIT").unwrap();
+
+    submit_session_text(
+        &shared,
+        &mut setup,
+        "CREATE TABLE sequence_shape_table (last_value BIGINT, is_called BOOL)",
+    )
+    .unwrap();
+    submit_session_text(
+        &shared,
+        &mut setup,
+        "INSERT INTO sequence_shape_table VALUES (41, TRUE)",
+    )
+    .unwrap();
+    assert!(matches!(
+        submit_session_text(
+            &shared,
+            &mut setup,
+            "SELECT last_value, is_called FROM public.sequence_shape_table",
+        )
+        .unwrap(),
+        QueryOutcome::Rows { rows, .. }
+            if rows == vec![vec![DbValue::Int8(41), DbValue::Bool(true)]]
+    ));
 }
 
 #[test]

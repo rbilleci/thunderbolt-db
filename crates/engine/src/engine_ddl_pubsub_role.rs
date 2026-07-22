@@ -89,6 +89,23 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn apply_alter_role_login(
+        &self,
+        cat: &mut DdlCatalogState,
+        alter: AlterRoleLogin,
+    ) -> Result<(), EngineError> {
+        if alter.name == "postgres" {
+            return Err(EngineError::ApplyFailed(
+                "cannot alter bootstrap role \"postgres\"".to_string(),
+            ));
+        }
+        let role = cat.relational_roles.get_mut(&alter.name).ok_or_else(|| {
+            EngineError::ApplyFailed(format!("role \"{}\" does not exist", alter.name))
+        })?;
+        role.login = alter.login;
+        Ok(())
+    }
+
     pub(crate) fn role_has_dependencies(&self, role: &str) -> bool {
         let cat = self.catalog_snapshot();
         cat.relational_comments

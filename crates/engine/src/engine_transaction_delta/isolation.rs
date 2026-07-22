@@ -5,8 +5,65 @@
 //! statement, then retains it. The stable statement lock and delta Arc survive base replacement.
 
 use super::*;
+use crate::engine_mutation_admission::validate_transaction_characteristics;
 
 impl Engine {
+    /// Replace only the characteristics of an explicit transaction that has not acquired a
+    /// statement snapshot or staged a mutation. The transaction identity, retained generation,
+    /// private-delta owner, and active-snapshot accounting stay unchanged. Validation and every
+    /// fallible precondition run before the keyed snapshot is replaced, so a rejected
+    /// `SET TRANSACTION` cannot silently end the caller's transaction.
+    pub(crate) fn set_empty_transaction_characteristics(
+        &self,
+        txn_id: TxnId,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<TransactionCharacteristics, ExecuteError> {
+        let characteristics = validate_transaction_characteristics(characteristics)?;
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        let current = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        self.ensure_transaction_not_program_owned(txn_id, &current)?;
+        let statement_lock = Arc::clone(&current.statement_lock);
+        let _statement = statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &current)?;
+        if current.data_snapshot_acquired.load(AtomicOrdering::Acquire)
+            || !current.transaction_delta_is_empty()
+        {
+            return Err(ExecuteError::Unsupported(
+                "SET TRANSACTION must precede the first transaction statement".to_string(),
+            ));
+        }
+
+        let replacement = Arc::new(TransactionSnapshot {
+            characteristics,
+            boundary: current.boundary,
+            next_row_id: current.next_row_id,
+            catalog: Arc::clone(&current.catalog),
+            table_versions: current.table_versions.clone(),
+            resident_snapshots: Arc::clone(&current.resident_snapshots),
+            resident_shards: Arc::clone(&current.resident_shards),
+            device_authoritative_tables: Arc::clone(&current.device_authoritative_tables),
+            chunk_authoritative_tables: Arc::clone(&current.chunk_authoritative_tables),
+            delta: Arc::clone(&current.delta),
+            statement_lock: Arc::clone(&current.statement_lock),
+            program_owned: Arc::clone(&current.program_owned),
+            data_snapshot_acquired: Arc::clone(&current.data_snapshot_acquired),
+            base_streaming_cold_chunks: Arc::clone(&current.base_streaming_cold_chunks),
+            private_gpu_account: Arc::clone(&current.private_gpu_account),
+            _resident_index_resources: current._resident_index_resources.clone(),
+            _resident_gpu_charge: Arc::clone(&current._resident_gpu_charge),
+        });
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace_transaction_snapshot(txn_id, &current, replacement, false)?;
+        Ok(characteristics)
+    }
+
     pub(crate) fn refresh_transaction_snapshot_for_statement(
         &self,
         txn_id: TxnId,

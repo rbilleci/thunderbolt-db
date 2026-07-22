@@ -14,6 +14,73 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 PostgreSQL 16 pg_dump/restore compatibility — accepted 2026-07-22
+
+- PostgreSQL 16 `pg_dump` now generates and restores plain, custom, directory, tar, parallel-directory,
+  clean/if-exists, insert-style, and split schema/data archives against `gpu-db-engine-server`. The restored
+  surface includes typed table data/defaults, indexes and constraints, comments, bounded views and layered views,
+  materialized views and refresh data, sequences and state, domains, SQL functions, relation/schema/sequence/
+  function privileges, and default table ACLs. Each relation ACL integration assertion is isolated to one exact
+  object result, so another restored object's grant cannot satisfy it accidentally. Sequence ACL presentation uses
+  PostgreSQL's `rwU` owner baseline rather than the table `arwdDxt` baseline; the harness requires byte-identical
+  source/restored `account_seq` ACL output and rejects any synthetic owner REVOKE or GRANT.
+- `pg_dumpall --globals-only` now restores non-bootstrap roles with the modeled LOGIN attribute, tablespaces,
+  comments, and tablespace ACLs through the same canonical binary. The bounded `ALTER ROLE` grammar accepts only
+  LOGIN/NOLOGIN plus PostgreSQL 16's exact default capability list; SUPERUSER, NOINHERIT, CREATEDB, passwords, and
+  other unmodeled capabilities fail before WAL. The bootstrap `postgres` create/alter is the only filtered role,
+  role passwords are not claimed, and direct `pg_roles` verification proves the restored non-bootstrap login bit.
+- Versioned dump catalog programs are recognized with one quote-aware canonicalizer that folds only unquoted SQL
+  and whitespace. Single-quoted values, double-quoted identifiers, dollar-quoted bodies, and internal literal
+  whitespace remain exact; literal-case, quoted-identifier-case, delimiter-whitespace, and structural near misses
+  fail closed. Recognized programs read one statement-pinned catalog generation, encode complete query-independent
+  candidate system relations, and use typed GPU plans for requested-OID/catalog joins, filters, subscription COUNT,
+  final scalar projection/gather, and ordering. Authoritatively empty programs carry a modeled-state proof; every
+  returned scalar is read back from device. Subscription COUNT scans `subdbid` through the block-reduced device
+  equal-count kernel, including zero- and multi-row actual-GPU controls; it does not derive the scalar from a host
+  compacted-index length. Sequence `last_value/is_called` reads
+  classify and resolve against that same pinned generation; actual-GPU drop/recreate ABA and ordinary-table
+  lookalike tests prevent live-catalog or shape-only routing.
+- PostgreSQL dump session behavior remains connection-local around the sole `SharedEngine::submit` boundary:
+  bounded SET/RESET/LOCK, SQL PREPARE/EXECUTE/DEALLOCATE, DECLARE/FETCH/CLOSE, and transaction characteristics add
+  no facade, transaction-id allocator, WAL claimant, or publication owner. `SET TRANSACTION` validates before
+  replacing the same transaction snapshot and retains its id, delta, residency handles, and accounting. Rich
+  SELECTs mark an explicit transaction as used, and FETCH/CLOSE/DEALLOCATE obey `25P02` without mutating local
+  state. The legacy `gpu-db-server` receives no new role-login compatibility handler.
+- Both shell harnesses refuse occupied ports, record the exact child immediately, distinguish and clear a reaped
+  dead-child PID before EXIT cleanup, and never signal the unrelated occupied-port listener. `/bin/false` traces
+  prove the stale PID is empty at cleanup; successful full runs leave no test listener behind.
+- Current gates pass SQL **57/57**, planner **5/5**, engine **525/549 ignored** plus **2/2** integration and **2/3
+  ignored** GPU-required tests, facade **75/15 ignored** plus concurrency **13/1 ignored**, canonical server **76/4
+  ignored** plus pgwire **4/2 ignored**, SQLx **1**, tokio-postgres **1**, and protocol **71 + 127**. Both dump
+  harnesses, the complete eight-driver aggregate, psql 04/06/07, workspace all-target/all-feature check, strict
+  workspace Clippy, rustfmt, shell syntax, and diff gates pass. The final repair tree's mandatory full report card
+  completes both layers and cache regimes: raw `sum_i32` rooflines are **1,423.0 GB/s at p50 24us** in-L2 and
+  **1,444.7 GB/s at p50 186us** out-of-L2; scalar COUNT compare is **0.89x/1.00x** those rooflines, and the
+  constant-mask path remains device-only at **1,138.9/1,486.3 GB/s**. Production point reads measure
+  **201.959M/s at p50 193us** in-L2 and **174.844M/s at p50 241us** out-of-L2 after a **2,138.3s + 0.0s** 48M-row
+  build/residency phase. Those figures match the immediate **202.024M/s at p50 193us** in-L2 control and the prior
+  repaired-tree **177.974M/s at p50 241us** out-of-L2 result within 1.8%; no point-route source changed in the ACL
+  or catalog-count repairs. The earlier same-day **197.548M/s at p50 198us** artifact remains a disclosed
+  cross-run absolute difference, while causal attribution rests on the flat same-host controls. The
+  `engine_mutation_admission.rs` (**2,012**) and `engine_dml_concurrent.rs` (**2,083**) outliers have explicit
+  no-exception PRODUCT-001 dispositions in PLAN.
+- Two initial adversarial freeze rounds rejected fail-open recognizers, transaction/session-state errors, a
+  live-catalog sequence race, filtered role state, unsafe harness startup/cleanup, cross-object ACL assertions, and
+  stale source dispositions. A third architecture audit rejected the recognized routes for uploading already-final
+  host rows; requested-OID filters, catalog joins, dependency resolution, prepared/sequence OID selection, and
+  subscription COUNT execute in typed device plans, with an actual-GPU cross-route differential. A fourth
+  three-lane audit rejected host-derived COUNT scalar provenance, table-shaped sequence-owner ACLs plus a vacuous
+  default-ACL probe, and two contradictory evidence statements. The repairs route COUNT through the block-reduced
+  device scan, make both pg_dump and psql ACL presentation relation-kind-aware, require exact sequence ACL
+  source/restore equivalence plus an isolated inherited-default probe, and clarify acceptance/source-size status.
+  Every finding has a focused regression or sabotage proof. The accepted implementation is frozen at base
+  `744d2e1113f403afff1e88bc175f11f6cda2dc7e`, code/test index tree
+  `91efd8ba72c666e1b51881257930f778a8c71d1d`, and cached binary-diff SHA-256
+  `5671761b1fd4a62eab7457f9a8e731a3b807c3c2f58c6d0477bd826c5c8a96d8` across 62 code/test paths. Fresh
+  independent architecture, semantics/security, and evidence/documentation panels all returned **ACCEPT** with no
+  blockers or implementation drift on full candidate tree `c32d6090b31a017197e828c539250c955e658d6e` and full
+  binary-diff SHA-256 `1dc026bba261f7e1e0a2114ec52ab2b74f34188640c3d5aa7a104024c78379dc` across 66 paths.
+
 ## PRODUCT-001 psql/GPU-catalog/R2DBC compatibility — accepted 2026-07-21
 
 - PostgreSQL 16 psql scenarios 04/06/07 and the unchanged PostgreSQL R2DBC extension-autodetection query now run
@@ -60,8 +127,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `e937d5c737cee84a7ccb89c0f8e7dde8663aa84c`, index tree
   `47a52bda0ff64253f956e75cb61e8081bc759fd0`, and cached-diff SHA-256
   `b2ce5ac798fb1e7105e8b594bab514a70eae9da18c9be5072d8f698cac784991`, with 56 staged paths and no unstaged drift.
-  **PRODUCT-001** remains open for pg_dump/restore migration, legacy/P8 deletion, broader transaction/recovery
-  compatibility, the PLAN-owned source outlier, and final single-owner proof.
+  At this 2026-07-21 checkpoint **PRODUCT-001** still lacked pg_dump/restore migration; the accepted 2026-07-22
+  section above records that later migration. Legacy/P8 deletion, broader transaction/recovery compatibility, the
+  PLAN-owned source outliers, and final single-owner proof remain the current gaps recorded in PLAN.
 
 ## PRODUCT-001 prepared/portal/transaction-state compatibility — accepted 2026-07-21
 

@@ -246,6 +246,35 @@ fn catalog_compatibility_binding_fails_closed_before_empty_or_device_execution()
 
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+fn pg_dump_optional_setting_probe_binds_as_an_exact_empty_gpu_catalog_result() {
+    let engine = Engine::new_local_test_engine();
+    let result = engine
+        .execute_resident_expr_select_sql(
+            "SELECT set_config(name, 'view, foreign-table', false) \
+             FROM pg_settings \
+             WHERE name = 'restrict_nonsystem_relation_kind'",
+        )
+        .expect("an unavailable optional server setting must produce a typed empty result");
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert!(result.rows.is_empty());
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].name, "set_config");
+    assert_eq!(result.columns[0].ty, SqlType::Text);
+
+    let malformed = engine
+        .execute_resident_expr_select_sql(
+            "SELECT set_config(name, 'view, foreign-table') FROM pg_settings",
+        )
+        .expect_err("set_config arity must still bind on a proven-empty source")
+        .to_string();
+    assert!(
+        malformed.contains("unsupported argument count"),
+        "{malformed}"
+    );
+}
+
+#[test]
+#[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn gpu_catalog_audit_repairs_preserve_identity_aliases_casts_arrays_and_literal_patterns() {
     let engine = Engine::new_local_test_engine();
 

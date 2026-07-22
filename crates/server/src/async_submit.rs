@@ -149,6 +149,43 @@ pub(crate) async fn analyze_prepare_cancellable(
     ))
 }
 
+pub(crate) async fn analyze_sql_prepare_cancellable(
+    engine: Arc<SharedEngine>,
+    session: Arc<Mutex<SharedSession>>,
+    executor: &Arc<tokio::sync::Semaphore>,
+    query: String,
+    parameter_hints: Vec<Option<gpu_db_facade::LogicalType>>,
+    active: &ActiveRequest,
+) -> Result<Result<gpu_db_facade::PreparedStatement, DbError>, String> {
+    let Some(_permit) = active
+        .acquire_permit(executor)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Err(cancellation_error()));
+    };
+    let cancellation = active.token();
+    let analysis = tokio::task::spawn_blocking(move || {
+        if cancellation.is_cancelled() {
+            return Err(cancellation_error());
+        }
+        let session = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cancellation.is_cancelled() {
+            return Err(cancellation_error());
+        }
+        ExtendedSession::analyze_sql_prepare(&engine, &session, &query, &parameter_hints)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(cancel_effect_free_success(
+        active,
+        analysis,
+        cancellation_error,
+    ))
+}
+
 /// Decode and bind parameters off the runtime without allowing a queued cancellation to install
 /// a portal or emit BindComplete afterward. Bind is connection-local and effect-free until the
 /// caller installs its returned completion.

@@ -428,6 +428,7 @@ impl Engine {
             | Command::CreateRole(_)
             | Command::DropRole(_)
             | Command::RenameRole(_)
+            | Command::AlterRoleLogin(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -537,7 +538,7 @@ impl Engine {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::ResetAll | Command::SetRole { .. } => {
+            Command::ResetAll | Command::SetRole { .. } | Command::SessionControl { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::ShowTransactionIsolation => {
@@ -577,6 +578,7 @@ impl Engine {
             Command::Select(_)
             | Command::SelectFunction(_)
             | Command::SelectLiteral(_)
+            | Command::PreparedCatalog(_)
             | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }

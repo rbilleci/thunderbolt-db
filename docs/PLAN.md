@@ -123,6 +123,22 @@ does not delay the architecture evidence gate. The active sequence now starts at
    actual-GPU coverage. No facade, transaction, sequence/WAL claimant, publication owner, or CPU relational product
    path was added.
 
+   The independently accepted PostgreSQL 16 pg_dump/restore slice now generates and restores plain, custom,
+   directory, tar, parallel-directory, clean/if-exists, insert-style, and split schema/data archives against the
+   canonical server. Exact versioned dump programs retain quoted literal/identifier semantics, encode complete
+   query-independent catalog candidates from one pinned generation, then run requested-OID joins, catalog joins,
+   filters, aggregate, final scalar projection/gather, and ordering through typed GPU plans. Authoritatively empty
+   programs carry an explicit catalog-model proof; semantic near misses fail closed. Sequence state is
+   snapshot-pinned across drop/recreate ABA; bounded dump session
+   controls preserve transaction and failed-transaction semantics; pg_dumpall globals restore non-bootstrap role
+   LOGIN state, tablespaces, comments, and ACLs without widening unmodeled role privileges. Both harnesses own and
+   clear exact child identities, reject occupied ports, and bind every restored relation ACL assertion to its
+   object. Sequence ACLs use the relation-kind `rwU` owner baseline, source and restored sequence ACL output must
+   match exactly, and a newly created default-privilege probe is checked in isolation. Subscription COUNT uses the
+   block-reduced device equal-count scan for zero and nonzero results rather than host index cardinality. The slice
+   adds no facade, transaction-id, WAL, recovery, sequence, commit, publication, or host-relational product owner,
+   and the legacy server receives no new compatibility behavior.
+
    Final gates pass SQL 52, active engine 516, and a globally isolated include-ignored engine differential of 1,058
    tests. The nine-test catalog/facade HAZARD cohort passes three sequential and two concurrent rounds (45/45) with
    zero CUDA 700/716/717; psql 04/06/07, standalone R2DBC, and the full eight-driver aggregate pass. Workspace
@@ -135,19 +151,39 @@ does not delay the architecture evidence gate. The active sequence now starts at
    `47a52bda0ff64253f956e75cb61e8081bc759fd0`, and cached-diff SHA-256
    `b2ce5ac798fb1e7105e8b594bab514a70eae9da18c9be5072d8f698cac784991`, with 56 staged paths and no unstaged drift.
 
+   The accepted pg_dump/restore slice passes SQL 57, active engine 525, facade 75 plus the 13-test concurrency cohort,
+   canonical server 76, protocol 71 + 127, all 18 pg_dump restore/metadata/privilege cases, and pg_dumpall globals
+   restore. Workspace check, strict workspace Clippy, format/shell/diff, source inventory, actual-GPU sequence ABA,
+   and the complete application-driver aggregate are green. The mandatory repaired-tree card completes both layers
+   and cache regimes at 201.959M/s, p50 193us in-L2 and 174.844M/s, p50 241us out-of-L2 after a 2,138.3s build.
+   These match the immediate 202.024M/s in-L2 control and prior repaired-tree 177.974M/s out-of-L2 result; the fresh
+   evidence panel accepted the disclosed lower earlier-versus-current cross-run absolute and its same-host controls. Two
+   initial rejection rounds repaired recognition, transaction/session, snapshot, role, harness, and evidence
+   defects. A third architecture audit then rejected the host-finalized dump catalog seam; the repair replaces
+   query-time host filtering/join/count decisions with typed device plans and adds an actual-GPU cross-route
+   differential. A fourth three-lane audit rejected host-derived subscription COUNT, sequence/default ACL fidelity,
+   and contradictory acceptance/source-size evidence; the device-count, relation-kind ACL, exact-object harness,
+   and documentation repairs above close those findings. Fresh architecture, semantics/security, and
+   evidence/documentation lanes all returned **ACCEPT** with no blocker or implementation drift on full candidate
+   tree `c32d6090b31a017197e828c539250c955e658d6e` and full binary-diff SHA-256
+   `1dc026bba261f7e1e0a2114ec52ab2b74f34188640c3d5aa7a104024c78379dc` across 66 paths. The accepted immutable
+   implementation target is base `744d2e1113f403afff1e88bc175f11f6cda2dc7e`, code/test index tree
+   `91efd8ba72c666e1b51881257930f778a8c71d1d`, and cached binary-diff SHA-256
+   `5671761b1fd4a62eab7457f9a8e731a3b807c3c2f58c6d0477bd826c5c8a96d8` across 62 code/test paths. This accepted
+   slice stops here without starting the next PRODUCT-001 boundary.
+
    Three inherited base defects remain explicitly owned by **PRODUCT-001** rather than being mislabeled as slice
    regressions: `gpu_chunk_class_check_and_foreign_keys_stay_device_native`,
    `transaction_fk_commit_waits_across_classic_wave_tail_handoff`, and
-   `gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover`. The active next compatibility slice is
-   pg_dump/restore migration to the canonical server; it receives its own frozen-tree gates and independent audit
-   before legacy/P8 deletion advances.
-
-   Full PostgreSQL compatibility still requires broader transactional DDL and
-   relaxation of the conservative full-generation conflict that serializes a staged CREATE
-   after any intervening commit. The remaining SQLSTATE/type-codec breadth and named client suites remain open too.
-   Product server/P8
-   migration and same-slice deletion of superseded targets follow those proofs. Bounded/offloaded response streaming
-   remains SCALE-001 and must be explicit while the async task still formats materialized results.
+   `gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover`. The active next boundary closes the
+   remaining compatibility proofs: broader transactional DDL, relaxation of the conservative full-generation
+   conflict that serializes a staged CREATE after any intervening commit, remaining SQLSTATE/type-codec breadth,
+   named client suites, and mixed recovery coverage. Only after those proofs are independently accepted does the
+   legacy/P8 compatibility-and-deletion slice re-inventory the still-live psql/preflight/benchmark consumers,
+   migrate or explicitly disposition each behavior, and delete the superseded listener plus independently callable
+   P8 protocol adapters in the same audited slice. Do not retain a second product-like execution or write owner as
+   a compatibility shortcut. Bounded/offloaded response streaming remains SCALE-001 and must be explicit while the
+   async task still formats materialized results.
 
    Before migration, inventory every legacy server behavior, product target, public write API, test suite, and live
    consumer. Deletion requires the canonical server to pass the existing psql golden, pg_dump/restore, tokio-
@@ -183,8 +219,10 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 
 The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline had **30 files outside
 its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
-or tools over 3,000 lines. Every outlier plus one subsequently crossed test threshold now has a completed audited
-disposition. The current queue is **zero files**; `engine_expr.rs` is the sole accepted registered exception.
+or tools over 3,000 lines. Every baseline outlier plus one subsequently crossed test threshold has a completed
+audited disposition. The standalone **STRUCT-001** queue is **zero files**; `engine_expr.rs` is the sole accepted
+registered exception. Two later-crossing engine files are explicitly reopened and owned by active **PRODUCT-001**
+below, so they are not a hidden STRUCT queue or accepted exceptions.
 
 ### Analysis packet required for each file
 
@@ -238,7 +276,8 @@ facades, unless one is a safe leaf extraction that directly reduces an earlier w
 
 | Lines | File | Disposition / evidence |
 |---:|---|---|
-| 2,078 | `crates/engine/src/engine_dml_concurrent.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The accepted STRUCT-001IW/IX/IY split left this facade at 1,761 lines. PRODUCT-001's transaction-isolation, canonical-admission, transaction-private catalog, composite-publication, and prepared compatibility foundations added 317 net lines of snapshot capture, program ownership, catalog stamps, coordinator integration, and typed compatibility routing, crossing the 2,000-line analysis threshold. The active PRODUCT-001 unification row owns removal or extraction of that transitional control-plane surface while it deletes the old callable write paths; this file must return below 2,000 lines before PRODUCT-001 closes. Existing `wave.rs`, `lane.rs`, and `lane_apply.rs` ownership remains unchanged, and a permanent size exception is not accepted. |
+| 2,083 | `crates/engine/src/engine_dml_concurrent.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The accepted STRUCT-001IW/IX/IY split left this facade at 1,761 lines. PRODUCT-001's transaction-isolation, canonical-admission, transaction-private catalog, composite-publication, prepared compatibility, and pg_dump command-exhaustiveness foundations added 322 net lines of snapshot capture, program ownership, catalog stamps, coordinator integration, and typed compatibility routing, crossing the 2,000-line analysis threshold. The active PRODUCT-001 unification row owns removal or extraction of that transitional control-plane surface while it deletes the old callable write paths; this file must return below 2,000 lines before PRODUCT-001 closes. Existing `wave.rs`, `lane.rs`, and `lane_apply.rs` ownership remains unchanged, and a permanent size exception is not accepted. |
+| 2,012 | `crates/engine/src/engine_mutation_admission.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The accepted bounded admission owner crossed the production analysis threshold when PRODUCT-001 added typed session-control admission and the atomic same-transaction characteristic replacement needed by canonical pg_dump. It still owns one cohesive parsed-command admission match and its closest boundary tests, but the active PRODUCT-001 legacy/API deletion slice must remove obsolete arms or extract a private invariant-owned child and return this file below 2,000 lines before PRODUCT-001 closes. No public execution boundary, catch-all shard, or permanent size exception is accepted. |
 | 1,952 | `crates/engine/src/mvcc_read_exec.rs` | **DISPOSITION COMPLETE — bounded GPU-native MVCC read root below 2,000 lines; no exception.** STRUCT-001IZ/JA/JB/JC isolated exact row-operation (1,441), source-resolution (400), query-capability (347), and CUDA filter (594) owners behind stable crate facades. The final JC slice passed 39 sequential plus 26 concurrent actual-CUDA filter executions, both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, fresh inventory, and independent audit. Dependencies remain one-way, backend contracts remain root-owned, and no CPU hot path or API drift was introduced. |
 | 1,606 | `crates/engine/src/engine_retained_read.rs` | **DISPOSITION COMPLETE — bounded retained-read facade below 2,000 lines; no exception.** STRUCT-001JD–JI isolated exact prepared-template (145), cached wave-index (133), payload-submission (150), device-index append (167), wave-locate (383), and complete sharded point-lookup backend (1,388) owners. JI retained exactly two existing `pub(crate)` contracts, six private helpers, and three narrow parent/sibling bridges; its 24-route matrix passed 24 sequential plus 48 concurrent CUDA executions, the independent audit added 60, both 505/487 modes and the complete 992 suite pass, and fresh inventory reduced to 18 actionable outliers. The root cohesively owns retained job preparation/submission/completion, public benchmark adapters, row assembly, and small cache-source/type/test contracts. |
 | 1,838 | `crates/engine/src/engine_sql_pg.rs` | **DISPOSITION COMPLETE — bounded SQL-to-GPU dispatch/window root below 2,000 lines; no exception.** STRUCT-001JJ/JK isolated exact join lowering (658 lines) and SELECT lowering (975 lines). JK preserves the crate-visible parser through one facade, keeps ten internal bridges and 15 private helpers, and establishes the sole one-way `join_lowering -> select_lowering` edge. Its 20-route matrix passed 20 sequential plus 40 concurrent controls, the independent audit added 40 host/GPU runs, both 505/487 modes and the complete 992 suite pass, and fresh inventory reduced to 17 actionable outliers. The root cohesively owns catalog-bound SQL dispatch and GPU rank/window runtime execution. |

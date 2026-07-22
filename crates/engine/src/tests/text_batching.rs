@@ -1528,6 +1528,34 @@ fn execute_text_replays_bounded_role_metadata_and_acl_grantees() {
 }
 
 #[test]
+fn execute_text_applies_and_replays_pg16_dump_role_login_without_widening_capabilities() {
+    let e = Engine::new_local_test_engine();
+    e.execute_text(1, "CREATE ROLE global_reader").unwrap();
+    assert!(!e.relational_role("global_reader").unwrap().login);
+
+    e.execute_text(
+        2,
+        "ALTER ROLE global_reader WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB \
+         LOGIN NOREPLICATION NOBYPASSRLS",
+    )
+    .unwrap();
+    assert!(e.relational_role("global_reader").unwrap().login);
+    let durable_records = e.durable_wal_records();
+    let recovered = Engine::recover_from_durable_wal(&durable_records).unwrap();
+    assert!(recovered.relational_role("global_reader").unwrap().login);
+
+    let before_rejected = e.durable_wal_records();
+    assert!(e
+        .execute_text(
+            3,
+            "ALTER ROLE global_reader WITH SUPERUSER INHERIT NOCREATEROLE NOCREATEDB \
+             LOGIN NOREPLICATION NOBYPASSRLS",
+        )
+        .is_err());
+    assert_eq!(e.durable_wal_records(), before_rejected);
+}
+
+#[test]
 fn execute_text_replays_bounded_database_metadata() {
     let e = Engine::new_local_test_engine();
 

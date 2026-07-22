@@ -20,18 +20,18 @@ pub use acl::{
 };
 pub use ast::{
     AddCheckConstraint, AddColumn, AddForeignKey, AddPrimaryKey, AddUniqueConstraint,
-    AlterColumnDefault, CheckConstraint, ColumnDef, ColumnDefault, Command, CommentOn,
-    CommentTarget, CreateDatabase, CreateDomain, CreateExtension, CreateFunction, CreateIndex,
-    CreateMaterializedView, CreatePublication, CreateRole, CreateSchema, CreateSequence,
-    CreateSubscription, CreateTable, CreateTablespace, CreateView, Delete, DropColumn,
-    DropConstraint, DropDatabase, DropDomain, DropExtension, DropFunction, DropIndex,
+    AlterColumnDefault, AlterRoleLogin, CheckConstraint, ColumnDef, ColumnDefault, Command,
+    CommentOn, CommentTarget, CreateDatabase, CreateDomain, CreateExtension, CreateFunction,
+    CreateIndex, CreateMaterializedView, CreatePublication, CreateRole, CreateSchema,
+    CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView, Delete,
+    DropColumn, DropConstraint, DropDatabase, DropDomain, DropExtension, DropFunction, DropIndex,
     DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
-    DropTable, DropTablespace, DropView, Insert, PrimaryKey, PublicationTarget,
-    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
-    RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace,
-    RenameView, SelectFunction, SelectLiteral, SequenceCurrVal, SequenceNextVal, SequenceSetVal,
-    TransactionAccessMode, TransactionCharacteristics, TransactionIsolation, TruncateTable,
-    UniqueConstraint, Update, UpdateAssignment,
+    DropTable, DropTablespace, DropView, Insert, PreparedCatalogProgram, PrimaryKey,
+    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
+    RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
+    RenameTablespace, RenameView, SelectFunction, SelectLiteral, SequenceCurrVal, SequenceNextVal,
+    SequenceSetVal, TransactionAccessMode, TransactionCharacteristics, TransactionIsolation,
+    TruncateTable, UniqueConstraint, Update, UpdateAssignment,
 };
 pub use command::{
     is_select_statement, parse_command, parse_command_allowing_catalog, split_simple_query,
@@ -50,7 +50,7 @@ mod scalar;
 mod select;
 
 pub use decimal::{Decimal128, NumericOverflow};
-pub use parameter::lower_sql_parameters;
+pub use parameter::{canonicalize_sql_for_exact_match, lower_sql_parameters};
 pub use parsed::ParsedCommand;
 pub use prepared::PreparedCommand;
 pub mod datetime;
@@ -148,6 +148,61 @@ fn parse_select_function(input: &str) -> Result<Command, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(Command::SelectFunction(SelectFunction { name }))
+}
+
+/// PostgreSQL's dump clients start every catalog session by clearing `search_path` through
+/// `set_config`.  Name resolution in the engine is already explicit (`pg_catalog` first, then the
+/// modeled `public` schema), so the empty setting does not alter a hidden host-side lookup path.
+/// Lower the function's returned value to the ordinary typed literal command: execution still
+/// materializes that value through the transient GPU projection route instead of fabricating a
+/// pgwire row in the server.
+fn parse_select_pg_dump_builtin(input: &str) -> Result<Command, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "SELECT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if rest.eq_ignore_ascii_case("pg_catalog.pg_is_in_recovery()") {
+        return Ok(Command::SelectLiteral(SelectLiteral {
+            column_name: "pg_is_in_recovery".to_string(),
+            ty: SqlType::Bool,
+            value: SqlValue::Bool(false),
+        }));
+    }
+    if rest.eq_ignore_ascii_case("pg_catalog.current_schemas(false)") {
+        return Ok(Command::SelectLiteral(SelectLiteral {
+            column_name: "current_schemas".to_string(),
+            ty: SqlType::Text,
+            value: SqlValue::Text("{public}".to_string()),
+        }));
+    }
+    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
+    if !rest[close + 1..].trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let function = rest[..open].trim();
+    if !function.eq_ignore_ascii_case("pg_catalog.set_config") {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let args = split_csv(&rest[open + 1..close])?;
+    let [setting, value, local] = args.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let (setting_type, setting_value) = scalar::parse_typed_sql_literal(setting.trim())?;
+    let (value_type, value) = scalar::parse_typed_sql_literal(value.trim())?;
+    let (local_type, local_value) = scalar::parse_typed_sql_literal(local.trim())?;
+    if setting_type != SqlType::Text
+        || setting_value != SqlValue::Text("search_path".to_string())
+        || value_type != SqlType::Text
+        || local_type != SqlType::Bool
+        || local_value != SqlValue::Bool(false)
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(Command::SelectLiteral(SelectLiteral {
+        column_name: "set_config".to_string(),
+        ty: SqlType::Text,
+        value,
+    }))
 }
 
 fn parse_select_literal(input: &str) -> Result<Command, ParseError> {
@@ -1154,6 +1209,42 @@ fn parse_rename_role(input: &str) -> Result<RenameRole, ParseError> {
         old_name,
         new_name: normalize_identifier(after_to)?,
     })
+}
+
+fn parse_alter_role(input: &str) -> Result<Command, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "ROLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if find_keyword_outside_quotes(rest, "RENAME").is_some() {
+        return parse_rename_role(input).map(Command::RenameRole);
+    }
+
+    let (raw_name, rest) = split_leading_identifier(rest)?;
+    let name = normalize_identifier(raw_name)?;
+    let mut rest = rest.trim_start();
+    if let Some(after_with) = strip_keyword_prefix_case_insensitive(rest, "WITH") {
+        rest = after_with.trim_start();
+    }
+    let options = rest.split_whitespace().collect::<Vec<_>>();
+    let login = match options.as_slice() {
+        [login] if login.eq_ignore_ascii_case("LOGIN") => true,
+        [login] if login.eq_ignore_ascii_case("NOLOGIN") => false,
+        [nosuperuser, inherit, nocreaterole, nocreatedb, login, noreplication, nobypassrls]
+            if nosuperuser.eq_ignore_ascii_case("NOSUPERUSER")
+                && inherit.eq_ignore_ascii_case("INHERIT")
+                && nocreaterole.eq_ignore_ascii_case("NOCREATEROLE")
+                && nocreatedb.eq_ignore_ascii_case("NOCREATEDB")
+                && noreplication.eq_ignore_ascii_case("NOREPLICATION")
+                && nobypassrls.eq_ignore_ascii_case("NOBYPASSRLS")
+                && (login.eq_ignore_ascii_case("LOGIN")
+                    || login.eq_ignore_ascii_case("NOLOGIN")) =>
+        {
+            login.eq_ignore_ascii_case("LOGIN")
+        }
+        _ => return Err(ParseError::InvalidRelationalSql),
+    };
+    Ok(Command::AlterRoleLogin(AlterRoleLogin { name, login }))
 }
 
 fn parse_create_database(input: &str) -> Result<CreateDatabase, ParseError> {

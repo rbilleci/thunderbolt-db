@@ -480,6 +480,7 @@ fn function_arity_is_valid(name: &str, len: usize) -> bool {
         "generate_series" | "pg_get_expr" => (2..=3).contains(&len),
         "pg_get_indexdef" => (1..=3).contains(&len),
         "obj_description" | "pg_get_constraintdef" | "pg_get_triggerdef" => (1..=2).contains(&len),
+        "set_config" => len == 3,
         "pg_function_is_visible"
         | "pg_get_partkeydef"
         | "pg_get_statisticsobjdef_columns"
@@ -640,6 +641,11 @@ fn validate_function(
         "string_agg" => {
             require(0, SqlType::Text)?;
             require(1, SqlType::Text)?;
+        }
+        "set_config" => {
+            require(0, SqlType::Text)?;
+            require(1, SqlType::Text)?;
+            require(2, SqlType::Bool)?;
         }
         _ => {}
     }

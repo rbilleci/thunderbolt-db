@@ -5,9 +5,9 @@ use std::io;
 
 use crate::copy::{classify_copy_statement, CopyClassification, CopyStatement};
 use gpu_db_facade::{
-    pg_adapter, BoundPreparedStatement, ColumnMeta, CommandTag, CopyTarget, DbError, ErrorCategory,
-    LogicalType, PreparedStatement, QueryOutcome, SessionTransactionStatus, SharedEngine,
-    SharedSession, SubmissionRequest,
+    pg_adapter, BoundPreparedStatement, ColumnMeta, CommandTag, CopyTarget, DbError, DbValue,
+    ErrorCategory, LogicalType, PreparedStatement, QueryOutcome, SessionTransactionStatus,
+    SharedEngine, SharedSession, SubmissionRequest,
 };
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use gpu_db_protocol::{parse_frontend_message, CopyToStdout, DescribeTarget, FrontendMessage};
@@ -195,12 +195,139 @@ impl From<gpu_db_protocol::FrontendMessageError> for ExtendedError {
 #[derive(Debug, Default)]
 pub(crate) struct ExtendedSession {
     statements: HashMap<String, Statement>,
+    sql_statements: HashMap<String, PreparedStatement>,
+    sql_cursors: HashMap<String, SqlCursor>,
     portals: HashMap<String, Portal>,
     skip_until_sync: bool,
     implicit_transaction: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SqlCursor {
+    columns: Vec<ColumnMeta>,
+    rows: Vec<Vec<DbValue>>,
+    position: usize,
+}
+
 impl ExtendedSession {
+    pub(crate) fn install_sql_cursor(
+        &mut self,
+        name: String,
+        outcome: QueryOutcome,
+    ) -> Result<(), ExtendedError> {
+        if self.sql_cursors.contains_key(&name) {
+            return Err(ExtendedError::new(
+                "42P03",
+                format!("cursor \"{name}\" already exists"),
+            ));
+        }
+        let QueryOutcome::Rows { columns, rows } = outcome else {
+            return Err(ExtendedError::new(
+                "0A000",
+                "cursor declarations require a row-producing SELECT",
+            ));
+        };
+        self.sql_cursors.insert(
+            name,
+            SqlCursor {
+                columns,
+                rows,
+                position: 0,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn fetch_sql_cursor(
+        &mut self,
+        name: &str,
+        count: Option<usize>,
+    ) -> Result<QueryOutcome, ExtendedError> {
+        let cursor = self.sql_cursors.get_mut(name).ok_or_else(|| {
+            ExtendedError::new("34000", format!("cursor \"{name}\" does not exist"))
+        })?;
+        let start = cursor.position;
+        let end = count
+            .map(|count| start.saturating_add(count).min(cursor.rows.len()))
+            .unwrap_or(cursor.rows.len());
+        cursor.position = end;
+        Ok(QueryOutcome::Returning {
+            tag: CommandTag::Other("FETCH".to_string()),
+            columns: cursor.columns.clone(),
+            rows: cursor.rows[start..end].to_vec(),
+            rows_affected: (end - start) as u64,
+        })
+    }
+
+    pub(crate) fn close_sql_cursor(
+        &mut self,
+        target: crate::sql_cursor::SqlCursorCloseTarget,
+    ) -> Result<(), ExtendedError> {
+        match target {
+            crate::sql_cursor::SqlCursorCloseTarget::All => self.sql_cursors.clear(),
+            crate::sql_cursor::SqlCursorCloseTarget::Named(name) => {
+                if self.sql_cursors.remove(&name).is_none() {
+                    return Err(ExtendedError::new(
+                        "34000",
+                        format!("cursor \"{name}\" does not exist"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn analyze_sql_prepare(
+        engine: &SharedEngine,
+        session: &SharedSession,
+        query: &str,
+        parameter_hints: &[Option<LogicalType>],
+    ) -> Result<PreparedStatement, DbError> {
+        engine.prepare_statement(session, query, parameter_hints)
+    }
+
+    pub(crate) fn install_sql_prepared(
+        &mut self,
+        name: String,
+        prepared: PreparedStatement,
+    ) -> Result<(), ExtendedError> {
+        if self.sql_statements.contains_key(&name) {
+            return Err(ExtendedError::new(
+                "42P05",
+                format!("prepared statement \"{name}\" already exists"),
+            ));
+        }
+        self.sql_statements.insert(name, prepared);
+        Ok(())
+    }
+
+    pub(crate) fn sql_prepared(&self, name: &str) -> Result<PreparedStatement, ExtendedError> {
+        self.sql_statements.get(name).cloned().ok_or_else(|| {
+            ExtendedError::new(
+                "26000",
+                format!("prepared statement \"{name}\" does not exist"),
+            )
+        })
+    }
+
+    pub(crate) fn deallocate_sql_prepared(
+        &mut self,
+        target: crate::sql_prepared::SqlDeallocateTarget,
+    ) -> Result<(), ExtendedError> {
+        match target {
+            crate::sql_prepared::SqlDeallocateTarget::All => self.sql_statements.clear(),
+            crate::sql_prepared::SqlDeallocateTarget::Named(name) => {
+                if self.sql_statements.remove(&name).is_none() {
+                    return Err(ExtendedError::new(
+                        "26000",
+                        format!("prepared statement \"{name}\" does not exist"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_implicit_transaction(&self) -> bool {
         self.implicit_transaction
     }
@@ -435,6 +562,7 @@ impl ExtendedSession {
     pub(crate) fn finish_transaction_boundary(&mut self, transaction_open: bool) {
         if !transaction_open {
             self.portals.clear();
+            self.sql_cursors.clear();
         }
     }
 

@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use crate::{
-    command::parse_prepared_command_allowing_catalog, lower_sql_parameters,
-    parameter::sql_parameter_arity, Command, ParseError, ParsedCommand, SelectFilter, SqlType,
-    SqlValue,
+    canonicalize_sql_for_exact_match, command::parse_prepared_command_allowing_catalog,
+    lower_sql_parameters, parameter::sql_parameter_arity, Command, ParseError, ParsedCommand,
+    PreparedCatalogProgram, SelectFilter, SqlType, SqlValue,
 };
 
 /// One parsed SQL template whose `$n` references are typed AST slots rather than reconstructed SQL.
@@ -29,7 +29,8 @@ impl PreparedCommand {
                     .to_string(),
             ));
         }
-        let command = parse_prepared_command_allowing_catalog(source)?;
+        let command = parse_pg16_dump_catalog_program(source)
+            .map_or_else(|| parse_prepared_command_allowing_catalog(source), Ok)?;
         let parameter_count = command_parameter_count(&command);
         if parameter_count != raw_parameter_count
             || (parameter_count > 0
@@ -39,6 +40,7 @@ impl PreparedCommand {
                         | Command::Insert(_)
                         | Command::Update(_)
                         | Command::Delete(_)
+                        | Command::PreparedCatalog(_)
                 ))
         {
             return Err(ParseError::Unsupported(
@@ -124,6 +126,53 @@ fn supports_parameterized_command(source: &str) -> bool {
         .any(|allowed| keyword.eq_ignore_ascii_case(allowed))
 }
 
+fn parse_pg16_dump_catalog_program(source: &str) -> Option<Command> {
+    let canonical = canonicalize_sql_for_exact_match(source).ok()?;
+    let parameter = || SqlValue::Parameter {
+        index: 1,
+        cast: Some(SqlType::Int4),
+    };
+    if canonical
+        == "select tableoid, oid, conname, pg_catalog.pg_get_constraintdef(oid) as consrc, \
+            convalidated from pg_catalog.pg_constraint where contypid = $1 order by conname"
+    {
+        return Some(Command::PreparedCatalog(
+            PreparedCatalogProgram::Pg16DomainConstraints {
+                type_oid: parameter(),
+            },
+        ));
+    }
+    if canonical
+        == "select t.typnotnull, pg_catalog.format_type(t.typbasetype, t.typtypmod) as typdefn, \
+            pg_catalog.pg_get_expr(t.typdefaultbin, 'pg_catalog.pg_type'::pg_catalog.regclass) as \
+            typdefaultbin, t.typdefault, case when t.typcollation <> u.typcollation then \
+            t.typcollation else 0 end as typcollation from pg_catalog.pg_type t left join \
+            pg_catalog.pg_type u on (t.typbasetype = u.oid) where t.oid = $1"
+    {
+        return Some(Command::PreparedCatalog(
+            PreparedCatalogProgram::Pg16DomainDefinition {
+                type_oid: parameter(),
+            },
+        ));
+    }
+    if canonical
+        == "select proretset, prosrc, probin, provolatile, proisstrict, prosecdef, lanname, \
+            proconfig, procost, prorows, pg_catalog.pg_get_function_arguments(p.oid) as funcargs, \
+            pg_catalog.pg_get_function_identity_arguments(p.oid) as funciargs, \
+            pg_catalog.pg_get_function_result(p.oid) as funcresult, proleakproof, \
+            array_to_string(protrftypes, ' ') as protrftypes, proparallel, prokind, prosupport, \
+            pg_get_function_sqlbody(p.oid) as prosqlbody from pg_catalog.pg_proc p, \
+            pg_catalog.pg_language l where p.oid = $1 and l.oid = p.prolang"
+    {
+        return Some(Command::PreparedCatalog(
+            PreparedCatalogProgram::Pg16FunctionDefinition {
+                function_oid: parameter(),
+            },
+        ));
+    }
+    None
+}
+
 pub(crate) fn command_parameter_count(command: &Command) -> usize {
     let mut highest = 0;
     visit_command_values(command, &mut |value| {
@@ -184,6 +233,12 @@ fn visit_command_values(command: &Command, visit: &mut impl FnMut(&SqlValue)) {
         Command::AddCheckConstraint(constraint) => visit(&constraint.filter.value),
         Command::AddColumn(add) => visit_default(add.column.default.as_ref(), visit),
         Command::AlterColumnDefault(alter) => visit_default(alter.default.as_ref(), visit),
+        Command::PreparedCatalog(program) => match program {
+            PreparedCatalogProgram::Pg16DomainConstraints { type_oid }
+            | PreparedCatalogProgram::Pg16DomainDefinition { type_oid } => visit(type_oid),
+            PreparedCatalogProgram::Pg16FunctionDefinition { function_oid } => visit(function_oid),
+            PreparedCatalogProgram::Pg16MaterializedViewDependencies => {}
+        },
         _ => {}
     }
 }
@@ -255,6 +310,12 @@ fn visit_command_values_mut(
             &mut delete.filter_groups,
             visit,
         )?,
+        Command::PreparedCatalog(program) => match program {
+            PreparedCatalogProgram::Pg16DomainConstraints { type_oid }
+            | PreparedCatalogProgram::Pg16DomainDefinition { type_oid } => visit(type_oid)?,
+            PreparedCatalogProgram::Pg16FunctionDefinition { function_oid } => visit(function_oid)?,
+            PreparedCatalogProgram::Pg16MaterializedViewDependencies => {}
+        },
         _ => {}
     }
     Ok(())
@@ -457,6 +518,36 @@ mod tests {
                 Err(ParseError::InvalidParameterReference)
             ));
             assert!(PreparedCommand::parse(sql).is_err());
+        }
+    }
+
+    #[test]
+    fn pg16_function_definition_program_is_exact_and_near_misses_fail_closed() {
+        let canonical = "SELECT proretset, prosrc, probin, provolatile, proisstrict, prosecdef, \
+            lanname, proconfig, procost, prorows, \
+            pg_catalog.pg_get_function_arguments(p.oid) AS funcargs, \
+            pg_catalog.pg_get_function_identity_arguments(p.oid) AS funciargs, \
+            pg_catalog.pg_get_function_result(p.oid) AS funcresult, proleakproof, \
+            array_to_string(protrftypes, ' ') AS protrftypes, proparallel, prokind, prosupport, \
+            pg_get_function_sqlbody(p.oid) AS prosqlbody \
+            FROM pg_catalog.pg_proc p, pg_catalog.pg_language l \
+            WHERE p.oid = $1 AND l.oid = p.prolang";
+        assert!(matches!(
+            PreparedCommand::parse(canonical).unwrap().command(),
+            Command::PreparedCatalog(PreparedCatalogProgram::Pg16FunctionDefinition { .. })
+        ));
+
+        for near_miss in [
+            canonical.replace("prosupport,", "prosupport, p.oid,"),
+            canonical.replace("p.oid = $1", "p.oid <> $1"),
+            canonical.replace("AND l.oid = p.prolang", "OR l.oid = p.prolang"),
+            canonical.replace("FROM pg_catalog.pg_proc", "FROM (pg_catalog.pg_proc"),
+            canonical.replace("protrftypes, ' '", "protrftypes, '  '"),
+        ] {
+            assert!(
+                PreparedCommand::parse(&near_miss).is_err(),
+                "near-miss pg_dump function program must not enter the fixed-result route: {near_miss}"
+            );
         }
     }
 

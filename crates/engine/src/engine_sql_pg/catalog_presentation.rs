@@ -80,13 +80,91 @@ pub(super) fn catalog_join_projection_plan(
                     ));
                 };
                 let mut source = parse_join_col_ref(arg)?;
-                if source.column != "relowner" {
+                if !matches!(
+                    source.column.as_str(),
+                    "relowner" | "nspowner" | "proowner" | "defaclrole"
+                ) {
                     return Err(sql_pg_error(
-                        "pg_get_userbyid presentation requires relowner".to_string(),
+                        "pg_get_userbyid presentation requires a modeled catalog owner column"
+                            .to_string(),
                     ));
                 }
                 source.column = GPU_CATALOG_OWNER_NAME.to_string();
                 source
+            }
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "pg_get_function_result" =>
+            {
+                let [arg] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "pg_get_function_result requires one catalog OID column".to_string(),
+                    ));
+                };
+                let mut source = parse_join_col_ref(arg)?;
+                if source.column != "oid" {
+                    return Err(sql_pg_error(
+                        "pg_get_function_result presentation requires pg_proc.oid".to_string(),
+                    ));
+                }
+                source.column = GPU_CATALOG_FUNCTION_RESULT.to_string();
+                source
+            }
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "pg_get_function_arguments" =>
+            {
+                let [arg] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "pg_get_function_arguments requires one catalog OID column".to_string(),
+                    ));
+                };
+                let mut source = parse_join_col_ref(arg)?;
+                if source.column != "oid" {
+                    return Err(sql_pg_error(
+                        "pg_get_function_arguments presentation requires pg_proc.oid".to_string(),
+                    ));
+                }
+                source.column = GPU_CATALOG_EMPTY_TEXT.to_string();
+                source
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "obj_description" => {
+                catalog_obj_description_source(function)?
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "format_type" => {
+                let [source, typmod] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "format_type requires an OID column and a typmod column".to_string(),
+                    ));
+                };
+                let mut source = parse_join_col_ref(source)?;
+                let typmod = parse_join_col_ref(typmod)?;
+                if source.column != "typbasetype"
+                    || typmod.column != "typtypmod"
+                    || source.qualifier != typmod.qualifier
+                {
+                    return Err(sql_pg_error(
+                        "domain format_type presentation requires typbasetype and typtypmod"
+                            .to_string(),
+                    ));
+                }
+                source.column = GPU_CATALOG_FORMATTED_TYPE.to_string();
+                source
+            }
+            NodeEnum::SubLink(sublink) => {
+                catalog_join_sublink_projection_source(sublink).ok_or_else(|| {
+                    sql_pg_error(
+                        "catalog join scalar subquery has no modeled presentation column"
+                            .to_string(),
+                    )
+                })?
+            }
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "array_to_string" =>
+            {
+                catalog_join_array_to_string_source(function).ok_or_else(|| {
+                    sql_pg_error(
+                        "catalog array_to_string has no modeled presentation column".to_string(),
+                    )
+                })?
             }
             NodeEnum::AConst(constant) => {
                 let value = catalog_scalar_constant(constant)?;
@@ -115,7 +193,7 @@ pub(super) fn catalog_join_projection_plan(
             }
             _ => {
                 return Err(sql_pg_error(
-                    "catalog join presentation supports columns, text CASE, and pg_get_userbyid"
+                    "catalog join presentation supports columns and modeled GPU catalog display expressions"
                         .to_string(),
                 ))
             }
@@ -213,6 +291,12 @@ pub(super) fn catalog_join_projection_plan(
 fn catalog_case_projection_source(
     case: &pg_query::protobuf::CaseExpr,
 ) -> Result<JoinColRef, ExecuteError> {
+    if catalog_function_internal_name_case_is_exact(case) {
+        return Ok(JoinColRef {
+            qualifier: Some("p".to_string()),
+            column: GPU_CATALOG_FUNCTION_INTERNAL_NAME.to_string(),
+        });
+    }
     let CatalogCaseBinding {
         mut source,
         arms,
@@ -226,12 +310,69 @@ fn catalog_case_projection_source(
             source.column = GPU_CATALOG_RELKIND_DISPLAY.to_string();
             Ok(source)
         }
+        "relkind"
+            if !reject_unmatched
+                && otherwise.is_none()
+                && catalog_relation_acl_kind_case_is_exact(&arms) =>
+        {
+            source.column = GPU_CATALOG_RELKIND_ACL_DISPLAY.to_string();
+            Ok(source)
+        }
         "reloftype"
             if reject_unmatched
                 && otherwise.is_none()
                 && arms == [(SqlValue::Int4(0), SqlValue::Text(String::new()))] =>
         {
             source.column = GPU_CATALOG_RELTYPE_DISPLAY.to_string();
+            Ok(source)
+        }
+        "typnotnull"
+            if !reject_unmatched
+                && otherwise.is_none()
+                && arms == [(SqlValue::Bool(true), SqlValue::Text("not null".to_string()))] =>
+        {
+            source.column = GPU_CATALOG_NULLABLE_DISPLAY.to_string();
+            Ok(source)
+        }
+        "prokind"
+            if !reject_unmatched
+                && otherwise == Some(SqlValue::Text("func".to_string()))
+                && arms
+                    == [
+                        (
+                            SqlValue::Text("a".to_string()),
+                            SqlValue::Text("agg".to_string()),
+                        ),
+                        (
+                            SqlValue::Text("w".to_string()),
+                            SqlValue::Text("window".to_string()),
+                        ),
+                        (
+                            SqlValue::Text("p".to_string()),
+                            SqlValue::Text("proc".to_string()),
+                        ),
+                    ] =>
+        {
+            source.column = GPU_CATALOG_FUNCTION_KIND.to_string();
+            Ok(source)
+        }
+        "provolatile" if catalog_function_volatility_case_is_exact(&arms, &otherwise) => {
+            source.column = GPU_CATALOG_FUNCTION_VOLATILITY.to_string();
+            Ok(source)
+        }
+        "proparallel" if catalog_function_parallel_case_is_exact(&arms, &otherwise) => {
+            source.column = GPU_CATALOG_FUNCTION_PARALLEL.to_string();
+            Ok(source)
+        }
+        "prosecdef"
+            if arms == [(SqlValue::Bool(true), SqlValue::Text("definer".to_string()))]
+                && otherwise == Some(SqlValue::Text("invoker".to_string())) =>
+        {
+            source.column = GPU_CATALOG_FUNCTION_SECURITY.to_string();
+            Ok(source)
+        }
+        "defaclobjtype" if catalog_default_acl_kind_case_is_exact(&arms, &otherwise) => {
+            source.column = GPU_CATALOG_DEFAULT_ACL_TYPE.to_string();
             Ok(source)
         }
         _ => Err(sql_pg_error(
@@ -260,6 +401,135 @@ fn catalog_relkind_case_is_exact(arms: &[(SqlValue, SqlValue)]) -> bool {
                 input == &SqlValue::Text(expected.0.to_string())
                     && output == &SqlValue::Text(expected.1.to_string())
             })
+}
+
+fn catalog_relation_acl_kind_case_is_exact(arms: &[(SqlValue, SqlValue)]) -> bool {
+    const EXPECTED: [(&str, &str); 6] = [
+        ("r", "table"),
+        ("v", "view"),
+        ("m", "materialized view"),
+        ("S", "sequence"),
+        ("f", "foreign table"),
+        ("p", "partitioned table"),
+    ];
+    arms.len() == EXPECTED.len()
+        && arms
+            .iter()
+            .zip(EXPECTED)
+            .all(|((input, output), expected)| {
+                input == &SqlValue::Text(expected.0.to_string())
+                    && output == &SqlValue::Text(expected.1.to_string())
+            })
+}
+
+fn catalog_function_volatility_case_is_exact(
+    arms: &[(SqlValue, SqlValue)],
+    otherwise: &Option<SqlValue>,
+) -> bool {
+    otherwise.is_none()
+        && arms
+            == [
+                (
+                    SqlValue::Text("i".to_string()),
+                    SqlValue::Text("immutable".to_string()),
+                ),
+                (
+                    SqlValue::Text("s".to_string()),
+                    SqlValue::Text("stable".to_string()),
+                ),
+                (
+                    SqlValue::Text("v".to_string()),
+                    SqlValue::Text("volatile".to_string()),
+                ),
+            ]
+}
+
+fn catalog_function_parallel_case_is_exact(
+    arms: &[(SqlValue, SqlValue)],
+    otherwise: &Option<SqlValue>,
+) -> bool {
+    otherwise.is_none()
+        && arms
+            == [
+                (
+                    SqlValue::Text("r".to_string()),
+                    SqlValue::Text("restricted".to_string()),
+                ),
+                (
+                    SqlValue::Text("s".to_string()),
+                    SqlValue::Text("safe".to_string()),
+                ),
+                (
+                    SqlValue::Text("u".to_string()),
+                    SqlValue::Text("unsafe".to_string()),
+                ),
+            ]
+}
+
+fn catalog_default_acl_kind_case_is_exact(
+    arms: &[(SqlValue, SqlValue)],
+    otherwise: &Option<SqlValue>,
+) -> bool {
+    const EXPECTED: [(&str, &str); 5] = [
+        ("r", "table"),
+        ("S", "sequence"),
+        ("f", "function"),
+        ("T", "type"),
+        ("n", "schema"),
+    ];
+    otherwise.is_none()
+        && arms.len() == EXPECTED.len()
+        && arms
+            .iter()
+            .zip(EXPECTED)
+            .all(|((input, output), expected)| {
+                input == &SqlValue::Text(expected.0.to_string())
+                    && output == &SqlValue::Text(expected.1.to_string())
+            })
+}
+
+fn catalog_function_internal_name_case_is_exact(case: &pg_query::protobuf::CaseExpr) -> bool {
+    if case.arg.is_some() || case.args.len() != 1 || case.defresult.is_some() {
+        return false;
+    }
+    let Ok(NodeEnum::CaseWhen(arm)) = node_enum(&case.args[0]) else {
+        return false;
+    };
+    let Some(condition) = arm.expr.as_deref() else {
+        return false;
+    };
+    let Ok(NodeEnum::AExpr(expression)) = node_enum(condition) else {
+        return false;
+    };
+    if expression.kind != AExprKind::AexprIn as i32
+        || expression
+            .lexpr
+            .as_deref()
+            .is_none_or(|left| !catalog_column_is_exact(left, "l", "lanname"))
+    {
+        return false;
+    }
+    let Some(right) = expression.rexpr.as_deref() else {
+        return false;
+    };
+    let Ok(NodeEnum::List(values)) = node_enum(right) else {
+        return false;
+    };
+    let expected = ["internal", "c"];
+    if values.items.len() != expected.len()
+        || !values.items.iter().zip(expected).all(|(value, expected)| {
+            matches!(
+                node_enum(value),
+                Ok(NodeEnum::AConst(constant))
+                    if matches!(&constant.val, Some(a_const::Val::Sval(value)) if value.sval == expected)
+            )
+        })
+    {
+        return false;
+    }
+    arm.result
+        .as_deref()
+        .is_some_and(|result| catalog_column_is_exact(result, "p", "prosrc"))
 }
 
 pub(super) fn catalog_single_projection_plan(
@@ -338,6 +608,132 @@ pub(super) fn catalog_single_projection_plan(
                 )
             }
             NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "pg_get_userbyid" =>
+            {
+                let [source] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "pg_get_userbyid requires one catalog owner column".to_string(),
+                    ));
+                };
+                let NodeEnum::ColumnRef(source) = node_enum(source)? else {
+                    return Err(sql_pg_error(
+                        "pg_get_userbyid requires a catalog owner column".to_string(),
+                    ));
+                };
+                if !matches!(
+                    resolve_column_name(source, &qualifier)?,
+                    "relowner" | "nspowner" | "proowner" | "defaclrole" | "spcowner"
+                ) {
+                    return Err(sql_pg_error(
+                        "pg_get_userbyid requires a modeled catalog owner column".to_string(),
+                    ));
+                }
+                (
+                    GPU_CATALOG_OWNER_NAME.to_string(),
+                    "pg_get_userbyid".to_string(),
+                )
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "array_to_string" => {
+                let source = catalog_single_array_to_string_source(function, &qualifier)
+                    .ok_or_else(|| {
+                        sql_pg_error(
+                            "catalog array_to_string has no modeled presentation column"
+                                .to_string(),
+                        )
+                    })?;
+                (source, "array_to_string".to_string())
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "obj_description" => {
+                let source = catalog_obj_description_source(function)?;
+                if source.qualifier.as_deref() != Some(qualifier.as_str()) {
+                    return Err(sql_pg_error(
+                        "obj_description source does not belong to the catalog relation"
+                            .to_string(),
+                    ));
+                }
+                (GPU_CATALOG_DESCRIPTION.to_string(), "obj_description".to_string())
+            }
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "shobj_description" =>
+            {
+                catalog_single_shobj_description_source(function, &table, &qualifier)?
+            }
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "pg_tablespace_location" =>
+            {
+                catalog_single_tablespace_oid_function_source(
+                    function,
+                    &table,
+                    &qualifier,
+                    GPU_CATALOG_TABLESPACE_LOCATION,
+                )?
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "pg_size_pretty" => {
+                catalog_single_tablespace_size_source(function, &table, &qualifier)?
+            }
+            NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "pg_get_function_result" =>
+            {
+                let [source] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "pg_get_function_result requires one catalog OID column".to_string(),
+                    ));
+                };
+                let NodeEnum::ColumnRef(source) = node_enum(source)? else {
+                    return Err(sql_pg_error(
+                        "pg_get_function_result requires a catalog OID column".to_string(),
+                    ));
+                };
+                if resolve_column_name(source, &qualifier)? != "oid" {
+                    return Err(sql_pg_error(
+                        "pg_get_function_result presentation requires pg_proc.oid".to_string(),
+                    ));
+                }
+                (
+                    GPU_CATALOG_FUNCTION_RESULT.to_string(),
+                    "pg_get_function_result".to_string(),
+                )
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "acldefault" => {
+                let [kind, owner] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "acldefault requires an object kind and owner column".to_string(),
+                    ));
+                };
+                let NodeEnum::AConst(kind) = node_enum(kind)? else {
+                    return Err(sql_pg_error(
+                        "acldefault object kind must be a text literal".to_string(),
+                    ));
+                };
+                let Some(a_const::Val::Sval(kind)) = &kind.val else {
+                    return Err(sql_pg_error(
+                        "acldefault object kind must be a text literal".to_string(),
+                    ));
+                };
+                let NodeEnum::ColumnRef(owner) = node_enum(owner)? else {
+                    return Err(sql_pg_error(
+                        "acldefault owner must be a catalog column".to_string(),
+                    ));
+                };
+                let owner = resolve_column_name(owner, &qualifier)?;
+                let supported = (table.ends_with("pg_namespace")
+                    && kind.sval == "n"
+                    && owner == "nspowner")
+                    || (table.ends_with("pg_tablespace")
+                        && kind.sval == "t"
+                        && owner == "spcowner");
+                if !supported {
+                    return Err(sql_pg_error(
+                        "catalog acldefault requires a modeled object kind and owner column"
+                            .to_string(),
+                    ));
+                }
+                (
+                    GPU_CATALOG_ACL_DEFAULT.to_string(),
+                    "acldefault".to_string(),
+                )
+            }
+            NodeEnum::FuncCall(function)
                 if catalog_function_name(function)? == "pg_get_constraintdef" =>
             {
                 let source = match function.args.as_slice() {
@@ -403,6 +799,14 @@ pub(super) fn catalog_single_projection_plan(
                 };
                 (source, "?column?".to_string())
             }
+            NodeEnum::AExpr(expression)
+                if catalog_current_user_comparison_is_exact(expression, &qualifier) =>
+            {
+                (
+                    GPU_CATALOG_CURRENT_USER_MATCH.to_string(),
+                    "?column?".to_string(),
+                )
+            }
             _ => {
                 return Err(sql_pg_error(
                     "catalog projection supports columns, format_type, scalar metadata subqueries, and constants"
@@ -419,7 +823,12 @@ pub(super) fn catalog_single_projection_plan(
             },
         });
     }
-    let order_by = parse_order_by(&stmt.sort_clause, &qualifier)?;
+    let order_by = catalog_single_order_by(
+        &stmt.sort_clause,
+        &qualifier,
+        &physical_columns,
+        &presentation,
+    )?;
     Ok(CatalogSingleProjectionPlan {
         select: Select {
             table,
@@ -438,6 +847,61 @@ pub(super) fn catalog_single_projection_plan(
         qualifier,
         presentation,
     })
+}
+
+fn catalog_single_order_by(
+    sort_clause: &[Node],
+    qualifier: &str,
+    physical_columns: &[String],
+    presentation: &[CatalogJoinPresentation],
+) -> Result<Vec<SelectOrder>, ExecuteError> {
+    let mut order_by = Vec::with_capacity(sort_clause.len());
+    for item in sort_clause {
+        let NodeEnum::SortBy(sort) = node_enum(item)? else {
+            return Err(sql_pg_error("malformed catalog ORDER BY".to_string()));
+        };
+        let node = sort
+            .node
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("catalog ORDER BY key has no value".to_string()))?;
+        let column = match node_enum(node)? {
+            NodeEnum::AConst(constant) => {
+                let Some(a_const::Val::Ival(position)) = &constant.val else {
+                    return Err(sql_pg_error(
+                        "catalog ORDER BY position must be an integer".to_string(),
+                    ));
+                };
+                usize::try_from(position.ival)
+                    .ok()
+                    .and_then(|position| position.checked_sub(1))
+                    .and_then(|index| physical_columns.get(index))
+                    .cloned()
+                    .ok_or_else(|| {
+                        sql_pg_error("catalog ORDER BY position is out of range".to_string())
+                    })?
+            }
+            NodeEnum::ColumnRef(reference) => {
+                let requested = resolve_column_name(reference, qualifier)?;
+                presentation
+                    .iter()
+                    .position(|item| item.output_name == requested)
+                    .and_then(|index| physical_columns.get(index))
+                    .cloned()
+                    .unwrap_or_else(|| requested.to_string())
+            }
+            _ => {
+                return Err(sql_pg_error(
+                    "catalog ORDER BY supports a source column, output alias, or position"
+                        .to_string(),
+                ))
+            }
+        };
+        order_by.push(SelectOrder {
+            column,
+            descending: sort.sortby_dir == SortByDir::SortbyDesc as i32,
+        });
+    }
+    Ok(order_by)
 }
 
 fn catalog_sublink_guard(sublink: &pg_query::protobuf::SubLink, qualifier: &str) -> Option<String> {
@@ -559,6 +1023,27 @@ fn catalog_column_comparison_is_exact(
             .is_some_and(|node| catalog_column_is_exact(node, right.0, right.1))
 }
 
+fn catalog_current_user_comparison_is_exact(
+    expression: &pg_query::protobuf::AExpr,
+    qualifier: &str,
+) -> bool {
+    expression.kind == AExprKind::AexprOp as i32
+        && aexpr_op_token(expression).ok() == Some("=")
+        && expression.lexpr.as_deref().is_some_and(|node| {
+            matches!(
+                node_enum(node),
+                Ok(NodeEnum::ColumnRef(column))
+                    if resolve_column_name(column, qualifier).ok() == Some("rolname")
+            )
+        })
+        && matches!(
+            expression.rexpr.as_deref().and_then(|node| node.node.as_ref()),
+            Some(NodeEnum::SqlvalueFunction(function))
+                if function.op == pg_query::protobuf::SqlValueFunctionOp::SvfopCurrentUser as i32
+                    && function.xpr.is_none()
+        )
+}
+
 fn catalog_default_sublink_is_exact(select: &SelectStmt, outer: &str) -> bool {
     if !catalog_scalar_subselect_is_plain(select)
         || select.from_clause.len() != 1
@@ -629,6 +1114,302 @@ fn catalog_collation_sublink_is_exact(select: &SelectStmt, outer: &str) -> bool 
         })
 }
 
+fn catalog_join_sublink_projection_source(
+    sublink: &pg_query::protobuf::SubLink,
+) -> Option<JoinColRef> {
+    if sublink.sub_link_type != SubLinkType::ExprSublink as i32
+        || sublink.testexpr.is_some()
+        || !sublink.oper_name.is_empty()
+    {
+        return None;
+    }
+    let NodeEnum::SelectStmt(select) = node_enum(sublink.subselect.as_deref()?).ok()? else {
+        return None;
+    };
+    catalog_domain_collation_sublink_is_exact(select, "t").then_some(JoinColRef {
+        qualifier: Some("t".to_string()),
+        column: GPU_CATALOG_COLLATION_NAME.to_string(),
+    })
+}
+
+fn catalog_domain_collation_sublink_is_exact(select: &SelectStmt, outer: &str) -> bool {
+    if !catalog_scalar_subselect_is_plain(select)
+        || select.from_clause.len() != 2
+        || !catalog_range_is_exact(&select.from_clause[0], "pg_collation", "c")
+        || !catalog_range_is_exact(&select.from_clause[1], "pg_type", "bt")
+        || !catalog_target_value(select)
+            .is_some_and(|target| catalog_column_is_exact(target, "c", "collname"))
+    {
+        return false;
+    }
+    let Some(predicate) = select.where_clause.as_deref() else {
+        return false;
+    };
+    let mut terms = Vec::new();
+    collect_catalog_and_terms(predicate, &mut terms);
+    terms.len() == 3
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(term, "=", ("c", "oid"), (outer, "typcollation"))
+        })
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(term, "=", ("bt", "oid"), (outer, "typbasetype"))
+        })
+        && terms.iter().any(|term| {
+            catalog_column_comparison_is_exact(
+                term,
+                "<>",
+                (outer, "typcollation"),
+                ("bt", "typcollation"),
+            )
+        })
+}
+
+fn catalog_join_array_to_string_source(
+    function: &pg_query::protobuf::FuncCall,
+) -> Option<JoinColRef> {
+    let [source, separator] = function.args.as_slice() else {
+        return None;
+    };
+    let NodeEnum::AConst(separator) = node_enum(separator).ok()? else {
+        return None;
+    };
+    let Some(a_const::Val::Sval(separator)) = &separator.val else {
+        return None;
+    };
+    if let Ok(NodeEnum::ColumnRef(_)) = node_enum(source) {
+        let mut source = parse_join_col_ref(source).ok()?;
+        if matches!(
+            source.column.as_str(),
+            "typacl" | "nspacl" | "relacl" | "proacl" | "defaclacl" | "spcacl"
+        ) && separator.sval == "\n"
+        {
+            source.column = GPU_CATALOG_ACL_DISPLAY.to_string();
+            return Some(source);
+        }
+        return None;
+    }
+    let Ok(NodeEnum::SubLink(sublink)) = node_enum(source) else {
+        return None;
+    };
+    let NodeEnum::SelectStmt(select) = node_enum(sublink.subselect.as_deref()?).ok()? else {
+        return None;
+    };
+    if separator.sval == " " && catalog_domain_check_sublink_is_exact(sublink, select, "t") {
+        return Some(JoinColRef {
+            qualifier: Some("t".to_string()),
+            column: GPU_CATALOG_DOMAIN_CHECK.to_string(),
+        });
+    }
+    catalog_relation_acl_sublink_source(sublink, select)
+}
+
+fn catalog_single_array_to_string_source(
+    function: &pg_query::protobuf::FuncCall,
+    qualifier: &str,
+) -> Option<String> {
+    let [source, separator] = function.args.as_slice() else {
+        return None;
+    };
+    let NodeEnum::ColumnRef(source) = node_enum(source).ok()? else {
+        return None;
+    };
+    let NodeEnum::AConst(separator) = node_enum(separator).ok()? else {
+        return None;
+    };
+    let Some(a_const::Val::Sval(separator)) = &separator.val else {
+        return None;
+    };
+    let source = resolve_column_name(source, qualifier).ok()?;
+    if source == "spcoptions" && separator.sval == ", " {
+        return Some("spcoptions".to_string());
+    }
+    (separator.sval == "\n"
+        && matches!(
+            source,
+            "typacl" | "nspacl" | "relacl" | "proacl" | "defaclacl" | "spcacl"
+        ))
+    .then(|| GPU_CATALOG_ACL_DISPLAY.to_string())
+}
+
+fn catalog_obj_description_source(
+    function: &pg_query::protobuf::FuncCall,
+) -> Result<JoinColRef, ExecuteError> {
+    let [source, class] = function.args.as_slice() else {
+        return Err(sql_pg_error(
+            "obj_description requires an OID column and catalog class".to_string(),
+        ));
+    };
+    let mut source = parse_join_col_ref(source)?;
+    let NodeEnum::AConst(class) = node_enum(class)? else {
+        return Err(sql_pg_error(
+            "obj_description catalog class must be text".to_string(),
+        ));
+    };
+    let Some(a_const::Val::Sval(class)) = &class.val else {
+        return Err(sql_pg_error(
+            "obj_description catalog class must be text".to_string(),
+        ));
+    };
+    if source.column != "oid" || !matches!(class.sval.as_str(), "pg_namespace" | "pg_proc") {
+        return Err(sql_pg_error(
+            "obj_description requires a modeled catalog OID".to_string(),
+        ));
+    }
+    source.column = GPU_CATALOG_DESCRIPTION.to_string();
+    Ok(source)
+}
+
+fn catalog_single_shobj_description_source(
+    function: &pg_query::protobuf::FuncCall,
+    table: &str,
+    qualifier: &str,
+) -> Result<(String, String), ExecuteError> {
+    let [source, class] = function.args.as_slice() else {
+        return Err(sql_pg_error(
+            "shobj_description requires an OID column and shared catalog class".to_string(),
+        ));
+    };
+    let NodeEnum::ColumnRef(source) = node_enum(source)? else {
+        return Err(sql_pg_error(
+            "shobj_description requires a catalog OID column".to_string(),
+        ));
+    };
+    let NodeEnum::AConst(class) = node_enum(class)? else {
+        return Err(sql_pg_error(
+            "shobj_description shared catalog class must be text".to_string(),
+        ));
+    };
+    let Some(a_const::Val::Sval(class)) = &class.val else {
+        return Err(sql_pg_error(
+            "shobj_description shared catalog class must be text".to_string(),
+        ));
+    };
+    let modeled = resolve_column_name(source, qualifier)? == "oid"
+        && ((table.ends_with("pg_roles") && class.sval == "pg_authid")
+            || (table.ends_with("pg_tablespace") && class.sval == "pg_tablespace"));
+    if !modeled {
+        return Err(sql_pg_error(
+            "shobj_description requires a modeled shared catalog OID".to_string(),
+        ));
+    }
+    Ok((
+        GPU_CATALOG_DESCRIPTION.to_string(),
+        "shobj_description".to_string(),
+    ))
+}
+
+fn catalog_single_tablespace_oid_function_source(
+    function: &pg_query::protobuf::FuncCall,
+    table: &str,
+    qualifier: &str,
+    physical_column: &str,
+) -> Result<(String, String), ExecuteError> {
+    let [source] = function.args.as_slice() else {
+        return Err(sql_pg_error(
+            "tablespace catalog function requires one OID column".to_string(),
+        ));
+    };
+    let NodeEnum::ColumnRef(source) = node_enum(source)? else {
+        return Err(sql_pg_error(
+            "tablespace catalog function requires an OID column".to_string(),
+        ));
+    };
+    if !table.ends_with("pg_tablespace") || resolve_column_name(source, qualifier)? != "oid" {
+        return Err(sql_pg_error(
+            "tablespace catalog function requires pg_tablespace.oid".to_string(),
+        ));
+    }
+    Ok((
+        physical_column.to_string(),
+        "pg_tablespace_location".to_string(),
+    ))
+}
+
+fn catalog_single_tablespace_size_source(
+    function: &pg_query::protobuf::FuncCall,
+    table: &str,
+    qualifier: &str,
+) -> Result<(String, String), ExecuteError> {
+    let [inner] = function.args.as_slice() else {
+        return Err(sql_pg_error(
+            "pg_size_pretty tablespace presentation requires one size expression".to_string(),
+        ));
+    };
+    let NodeEnum::FuncCall(inner) = node_enum(inner)? else {
+        return Err(sql_pg_error(
+            "pg_size_pretty tablespace presentation requires pg_tablespace_size".to_string(),
+        ));
+    };
+    if catalog_function_name(inner)? != "pg_tablespace_size" {
+        return Err(sql_pg_error(
+            "pg_size_pretty tablespace presentation requires pg_tablespace_size".to_string(),
+        ));
+    }
+    let (source, _) = catalog_single_tablespace_oid_function_source(
+        inner,
+        table,
+        qualifier,
+        GPU_CATALOG_TABLESPACE_SIZE,
+    )?;
+    Ok((source, "pg_size_pretty".to_string()))
+}
+
+fn catalog_relation_acl_sublink_source(
+    sublink: &pg_query::protobuf::SubLink,
+    select: &SelectStmt,
+) -> Option<JoinColRef> {
+    if sublink.sub_link_type != SubLinkType::ArraySublink as i32
+        || sublink.testexpr.is_some()
+        || !sublink.oper_name.is_empty()
+        || !catalog_scalar_subselect_is_plain(select)
+    {
+        return None;
+    }
+    let program = NodeEnum::SelectStmt(Box::new(select.clone()))
+        .deparse()
+        .ok()
+        .and_then(|sql| canonicalize_sql_for_exact_match(&sql).ok())?;
+    let column = match program.as_str() {
+        "select (attname || ':\n  ') || pg_catalog.array_to_string(attacl, '\n  ') from pg_catalog.pg_attribute a where attrelid = c.oid and not attisdropped and attacl is not null" => GPU_CATALOG_COLUMN_PRIVILEGES,
+        "select ((((polname || case when not polpermissive then ' (RESTRICTIVE)' else '' end) || case when polcmd <> '*' then (' (' || polcmd::pg_catalog.text) || '):' else ':' end) || case when polqual is not null then '\n  (u): ' || pg_catalog.pg_get_expr(polqual, polrelid) else '' end) || case when polwithcheck is not null then '\n  (c): ' || pg_catalog.pg_get_expr(polwithcheck, polrelid) else '' end) || case when polroles <> '{0}' then '\n  to: ' || pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any(polroles) order by 1), ', ') else '' end from pg_catalog.pg_policy pol where polrelid = c.oid" => GPU_CATALOG_POLICY_DISPLAY,
+        _ => return None,
+    };
+    Some(JoinColRef {
+        qualifier: Some("c".to_string()),
+        column: column.to_string(),
+    })
+}
+
+fn catalog_domain_check_sublink_is_exact(
+    sublink: &pg_query::protobuf::SubLink,
+    select: &SelectStmt,
+    outer: &str,
+) -> bool {
+    if sublink.sub_link_type != SubLinkType::ArraySublink as i32
+        || !catalog_scalar_subselect_is_plain(select)
+        || select.from_clause.len() != 1
+        || !catalog_range_is_exact(&select.from_clause[0], "pg_constraint", "r")
+    {
+        return false;
+    }
+    let Some(target) = catalog_target_value(select) else {
+        return false;
+    };
+    let Ok(NodeEnum::FuncCall(function)) = node_enum(target) else {
+        return false;
+    };
+    if catalog_function_name(function).ok().as_deref() != Some("pg_get_constraintdef")
+        || function.args.len() != 2
+        || !catalog_column_is_exact(&function.args[0], "r", "oid")
+        || !catalog_bool_constant_is_exact(&function.args[1], true)
+    {
+        return false;
+    }
+    select.where_clause.as_deref().is_some_and(|predicate| {
+        catalog_column_comparison_is_exact(predicate, "=", (outer, "oid"), ("r", "contypid"))
+    })
+}
+
 pub(super) fn catalog_function_name(
     function: &pg_query::protobuf::FuncCall,
 ) -> Result<String, ExecuteError> {
@@ -692,6 +1473,21 @@ fn parse_catalog_case(
             .ok_or_else(|| sql_pg_error("catalog CASE arm has no condition".to_string()))?;
         let value = match node_enum(condition)? {
             NodeEnum::AConst(constant) => catalog_scalar_constant(constant)?,
+            NodeEnum::ColumnRef(_) => {
+                let candidate_source = parse_join_col_ref(condition)?;
+                if let Some(expected) = &source {
+                    if expected.qualifier != candidate_source.qualifier
+                        || expected.column != candidate_source.column
+                    {
+                        return Err(sql_pg_error(
+                            "catalog CASE arms must reference one source column".to_string(),
+                        ));
+                    }
+                } else {
+                    source = Some(candidate_source);
+                }
+                SqlValue::Bool(true)
+            }
             NodeEnum::AExpr(compare) => {
                 let lhs = compare.lexpr.as_deref().ok_or_else(|| {
                     sql_pg_error("catalog CASE comparison has no lhs".to_string())

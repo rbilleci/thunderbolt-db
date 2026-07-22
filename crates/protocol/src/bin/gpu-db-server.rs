@@ -1485,7 +1485,12 @@ fn execute_statement(
             | Command::TruncateTable(_)
             | Command::SetKv { .. }
             | Command::DeleteKv { .. }
-            | Command::GetKv { .. } => {}
+            | Command::GetKv { .. }
+            // PRODUCT-001 keeps the legacy endpoint behavior-neutral: its existing exact string
+            // compatibility dispatcher below remains the sole owner until the target is deleted.
+            | Command::SessionControl { .. }
+            | Command::PreparedCatalog(_)
+            | Command::AlterRoleLogin(_) => {}
             Command::SetRole { .. }
             | Command::Begin { .. }
             | Command::Commit { .. }

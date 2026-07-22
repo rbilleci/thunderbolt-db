@@ -152,6 +152,25 @@ impl Engine {
         command: Command,
         snapshot: &Arc<TransactionSnapshot>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.execute_dml_in_transaction_statement_locked(txn_id, command, snapshot, false)
+    }
+
+    pub(crate) fn execute_full_table_delete_in_transaction_statement_locked(
+        &self,
+        txn_id: TxnId,
+        command: Command,
+        snapshot: &Arc<TransactionSnapshot>,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.execute_dml_in_transaction_statement_locked(txn_id, command, snapshot, true)
+    }
+
+    fn execute_dml_in_transaction_statement_locked(
+        &self,
+        txn_id: TxnId,
+        command: Command,
+        snapshot: &Arc<TransactionSnapshot>,
+        full_table_delete: bool,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         self.ensure_commit_path_available()
@@ -199,14 +218,21 @@ impl Engine {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (delta.generation, delta.next_row_id)
         };
-        let prepared = self.prepare_dml(
-            &command,
-            DmlReadSnapshot {
-                commit_seq: snapshot.boundary,
-                next_row_id,
-            },
-            InsertPrepareValidation::Full,
-        )?;
+        let dml_snapshot = DmlReadSnapshot {
+            commit_seq: snapshot.boundary,
+            next_row_id,
+        };
+        let prepared = if full_table_delete {
+            let Command::Delete(delete) = &command else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "full-table transaction staging requires DELETE representation".to_string(),
+                )));
+            };
+            self.prepare_full_table_delete(delete, dml_snapshot)
+                .map_err(ExecuteError::Engine)?
+        } else {
+            self.prepare_dml(&command, dml_snapshot, InsertPrepareValidation::Full)?
+        };
         let prepared_sequence_state = match &prepared.mutation {
             PreparedMutation::Insert { seq_advances, .. } => seq_advances.clone(),
             PreparedMutation::Update { .. } | PreparedMutation::Delete { .. } => BTreeMap::new(),

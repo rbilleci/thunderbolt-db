@@ -1866,6 +1866,7 @@ impl Engine {
             Command::CreateRole(create) => self.apply_create_role(cat, create)?,
             Command::DropRole(drop) => self.apply_drop_role(cat, drop)?,
             Command::RenameRole(rename) => self.apply_rename_role(cat, rename)?,
+            Command::AlterRoleLogin(alter) => self.apply_alter_role_login(cat, alter)?,
             Command::GrantTable(grant) => self.apply_grant_acl(
                 cat,
                 &grant.relation,

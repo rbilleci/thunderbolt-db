@@ -30,12 +30,23 @@ fn compatibility_reads_stay_outside_mutation_admission() {
         (engine.visible_up_to(), engine.durable_wal_records().len())
     };
 
-    for sql in ["GET answer", "SELECT bounded_fn()", "SELECT currval('seq')"] {
+    for sql in [
+        "GET answer",
+        "SELECT pg_advisory_unlock_all()",
+        "SELECT currval('seq')",
+    ] {
         assert!(matches!(
             submit_text(&shared, &mut session, sql).unwrap(),
             QueryOutcome::Command { .. }
         ));
     }
+    assert_eq!(
+        submit_text(&shared, &mut session, "SELECT bounded_fn()")
+            .unwrap_err()
+            .category,
+        ErrorCategory::Engine,
+        "arbitrary function calls must use catalog lookup rather than the cleanup escape hatch"
+    );
 
     let engine = shared.read_engine().unwrap();
     assert_eq!(engine.visible_up_to(), visible_before);

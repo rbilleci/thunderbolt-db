@@ -28,20 +28,20 @@ use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine}
 use gpu_db_snapshot::{SnapshotCell, SnapshotHandle};
 use gpu_db_sql::{
     parse_command, parse_command_allowing_catalog, AclRelationKind, AddCheckConstraint,
-    AddForeignKey, AddUniqueConstraint, ColumnDef, ColumnDefault, Command, CommentTarget,
-    CopyColumn, CopyFromStdin, CreateDatabase, CreateDomain, CreateExtension, CreateIndex,
-    CreateMaterializedView, CreatePublication, CreateRole, CreateSchema, CreateSequence,
-    CreateSubscription, CreateTable, CreateTablespace, CreateView, DatabasePrivilege, Decimal128,
-    Delete, DropConstraint, DropDatabase, DropDomain, DropExtension, DropIndex,
-    DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
-    DropTable, DropTablespace, DropView, FunctionPrivilege, GroupedAggKind, GroupedAggregate,
-    Insert, ParseError, PreparedCommand, PublicationTarget, RefreshMaterializedView, RenameColumn,
-    RenameConstraint, RenameDatabase, RenameFunction, RenameIndex, RenameMaterializedView,
-    RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
-    SelectFilterOp, SelectFunction, SelectLiteral, SelectProjection, SequenceNextVal,
-    SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege,
-    TransactionCharacteristics, TruncateTable, Update, NUMERIC_DEFAULT_PRECISION,
-    PROJECTION_WILDCARD_SENTINEL,
+    AddForeignKey, AddUniqueConstraint, AlterRoleLogin, ColumnDef, ColumnDefault, Command,
+    CommentTarget, CopyColumn, CopyFromStdin, CreateDatabase, CreateDomain, CreateExtension,
+    CreateIndex, CreateMaterializedView, CreatePublication, CreateRole, CreateSchema,
+    CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
+    DatabasePrivilege, Decimal128, Delete, DropConstraint, DropDatabase, DropDomain, DropExtension,
+    DropIndex, DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence,
+    DropSubscription, DropTable, DropTablespace, DropView, FunctionPrivilege, GroupedAggKind,
+    GroupedAggregate, Insert, ParseError, PreparedCatalogProgram, PreparedCommand,
+    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
+    RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
+    RenameTablespace, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction,
+    SelectLiteral, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
+    TablePrivilege, TablespacePrivilege, TransactionCharacteristics, TruncateTable, Update,
+    NUMERIC_DEFAULT_PRECISION, PROJECTION_WILDCARD_SENTINEL,
 };
 #[cfg(test)]
 use gpu_db_storage::TupleVersion;
@@ -173,6 +173,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                 | Command::ResetAll
                 | Command::ShowTransactionIsolation
                 | Command::SetRole { .. }
+                | Command::SessionControl { .. }
+                | Command::PreparedCatalog(_)
                 | Command::GetKv { .. }
                 | Command::CreateSchema(_)
                 | Command::DropSchema(_)
@@ -220,6 +222,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                 | Command::CreateRole(_)
                 | Command::DropRole(_)
                 | Command::RenameRole(_)
+                | Command::AlterRoleLogin(_)
                 | Command::DropTable(_)
                 | Command::TruncateTable(_)
                 | Command::DropIndex(_)

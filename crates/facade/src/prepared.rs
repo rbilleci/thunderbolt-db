@@ -598,6 +598,7 @@ mod tests {
                 ("typlen", LogicalType::Int4),
                 ("typtype", LogicalType::Text),
                 ("typnamespace", LogicalType::Int4),
+                ("typbasetype", LogicalType::Int4),
             ]
         );
         assert!(prepared.bind_values(&[]).is_ok());

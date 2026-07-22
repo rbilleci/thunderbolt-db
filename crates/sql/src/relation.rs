@@ -2,17 +2,17 @@
 
 use super::{
     acl, find_char_outside_quotes, find_keyword_outside_quotes, find_matching_paren,
-    normalize_identifier, normalize_relation_identifier, parse_comment_on, parse_create_database,
-    parse_create_domain, parse_create_extension, parse_create_function,
+    normalize_identifier, normalize_relation_identifier, parse_alter_role, parse_comment_on,
+    parse_create_database, parse_create_domain, parse_create_extension, parse_create_function,
     parse_create_materialized_view, parse_create_publication, parse_create_role,
     parse_create_sequence, parse_create_subscription, parse_create_tablespace, parse_create_view,
     parse_drop_database, parse_drop_domain, parse_drop_extension, parse_drop_function,
     parse_drop_materialized_view, parse_drop_publication, parse_drop_role, parse_drop_sequence,
     parse_drop_subscription, parse_drop_tablespace, parse_drop_view,
     parse_refresh_materialized_view, parse_rename_database, parse_rename_function,
-    parse_rename_materialized_view, parse_rename_role, parse_rename_sequence,
-    parse_rename_tablespace, parse_rename_view, parse_select, parse_select_filter,
-    parse_select_filter_groups, parse_select_function, parse_select_literal,
+    parse_rename_materialized_view, parse_rename_sequence, parse_rename_tablespace,
+    parse_rename_view, parse_select, parse_select_filter, parse_select_filter_groups,
+    parse_select_function, parse_select_literal, parse_select_pg_dump_builtin,
     parse_sequence_regclass_arg, parse_sequence_value_function, parse_sql_value,
     parse_supported_sql_type_name, parse_typed_value_from_str, split_csv,
     strip_keyword_prefix_case_insensitive, strip_keyword_suffix_case_insensitive,
@@ -167,7 +167,7 @@ pub(super) fn parse_relational_command(
             .nth(1)
             .is_some_and(|second| second.eq_ignore_ascii_case("ROLE"))
         {
-            return Some(parse_rename_role(input).map(Command::RenameRole));
+            return Some(parse_alter_role(input));
         }
         if input
             .split_whitespace()
@@ -251,6 +251,9 @@ pub(super) fn parse_relational_command(
     if first.eq_ignore_ascii_case("SELECT") {
         if let Ok(sequence_command) = parse_sequence_value_function(input) {
             return Some(Ok(sequence_command));
+        }
+        if let Ok(builtin_command) = parse_select_pg_dump_builtin(input) {
+            return Some(Ok(builtin_command));
         }
         if let Ok(function_command) = parse_select_function(input) {
             return Some(Ok(function_command));
@@ -1551,5 +1554,45 @@ mod tests {
                 .unwrap(),
             Command::Select(_)
         ));
+
+        assert_eq!(
+            parse_relational_command(
+                "SELECT pg_catalog.set_config('search_path', '', false)",
+                true,
+            )
+            .unwrap()
+            .unwrap(),
+            Command::SelectLiteral(crate::SelectLiteral {
+                column_name: "set_config".to_string(),
+                ty: SqlType::Text,
+                value: SqlValue::Text(String::new()),
+            })
+        );
+        assert!(parse_relational_command(
+            "SELECT pg_catalog.set_config('work_mem', '1GB', false)",
+            true,
+        )
+        .unwrap()
+        .is_err());
+        assert_eq!(
+            parse_relational_command("SELECT pg_catalog.pg_is_in_recovery()", true)
+                .unwrap()
+                .unwrap(),
+            Command::SelectLiteral(crate::SelectLiteral {
+                column_name: "pg_is_in_recovery".to_string(),
+                ty: SqlType::Bool,
+                value: SqlValue::Bool(false),
+            })
+        );
+        assert_eq!(
+            parse_relational_command("SELECT pg_catalog.current_schemas(false)", true)
+                .unwrap()
+                .unwrap(),
+            Command::SelectLiteral(crate::SelectLiteral {
+                column_name: "current_schemas".to_string(),
+                ty: SqlType::Text,
+                value: SqlValue::Text("{public}".to_string()),
+            })
+        );
     }
 }

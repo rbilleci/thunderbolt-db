@@ -190,15 +190,21 @@ pub(crate) fn append_copy_data(state: &mut CopyInState, bytes: &[u8]) -> Result<
             line.pop();
         }
         let line = std::str::from_utf8(&line).map_err(|_| CopyParseError::InvalidUtf8)?;
-        if state.copy.options.format == CopyFormat::Text && line == r"\." {
-            state.seen_terminator = true;
-            continue;
-        }
+        // PostgreSQL archive COPY members end with `\.\n\n\n`; pg_restore forwards that member
+        // through CopyData and then sends CopyDone. The two separator lines are archive framing,
+        // not rows. Preserve the strict post-marker rejection for every non-empty line.
         if state.seen_terminator {
+            if line.is_empty() {
+                continue;
+            }
             return Err(CopyWireError {
                 code: "22P04",
                 message: "COPY data follows the end-of-data marker".to_string(),
             });
+        }
+        if state.copy.options.format == CopyFormat::Text && line == r"\." {
+            state.seen_terminator = true;
+            continue;
         }
         if state.copy.options.header {
             state.copy.options.header = false;
@@ -1073,6 +1079,28 @@ mod tests {
     use super::*;
     use crate::cancellation::CancellationRegistry;
     use std::sync::Mutex;
+
+    #[test]
+    fn copy_accepts_archive_separator_lines_after_the_text_terminator_only() {
+        let engine = SharedEngine::new();
+        let mut session = engine.open_session();
+        engine
+            .submit(
+                &mut session,
+                SubmissionRequest::Text("CREATE TABLE archive_copy (id int4, name text)"),
+            )
+            .into_immediate()
+            .unwrap();
+        let copy = parse_copy_from_stdin("COPY archive_copy FROM STDIN").unwrap();
+        let mut state = begin_copy_from(&engine, &mut session, copy, false)
+            .unwrap()
+            .0;
+
+        append_copy_data(&mut state, b"1\tAda\n\\.\n\n\n").unwrap();
+        assert_eq!(state.pending_rows.len(), 1);
+        let error = append_copy_data(&mut state, b"2\tGrace\n").unwrap_err();
+        assert_eq!(error.code, "22P04");
+    }
 
     #[tokio::test]
     async fn copy_done_cancelled_while_queued_never_crosses_the_facade() {

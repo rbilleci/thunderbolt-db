@@ -369,7 +369,15 @@ fn gpu_catalog_r2dbc_mixed_star_and_nullable_projection_are_non_vacuous() {
             .iter()
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["oid", "oid", "typname", "typlen", "typtype", "typnamespace"]
+        vec![
+            "oid",
+            "oid",
+            "typname",
+            "typlen",
+            "typtype",
+            "typnamespace",
+            "typbasetype",
+        ]
     );
 
     let control = e

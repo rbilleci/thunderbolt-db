@@ -5,6 +5,16 @@
 
 use super::*;
 
+mod compatibility;
+pub(crate) use compatibility::{
+    catalog_constraint_oid, catalog_index_entries, catalog_index_oid, synthesize_pg_tablespace,
+};
+use compatibility::{
+    relation_acl_array, synthesize_pg_default_acl, synthesize_pg_description,
+    synthesize_pg_indexes, synthesize_pg_language, synthesize_pg_proc, synthesize_pg_roles,
+    synthesize_pg_views,
+};
+
 pub(crate) const GPU_CATALOG_RELKIND_DISPLAY: &str = "__gpu_relkind_display";
 pub(crate) const GPU_CATALOG_OWNER_NAME: &str = "__gpu_owner_name";
 pub(crate) const GPU_CATALOG_FALSE: &str = "__gpu_false";
@@ -14,6 +24,24 @@ pub(crate) const GPU_CATALOG_FORMATTED_TYPE: &str = "__gpu_formatted_type";
 pub(crate) const GPU_CATALOG_DEFAULT_EXPR: &str = "__gpu_default_expr";
 pub(crate) const GPU_CATALOG_COLLATION_NAME: &str = "__gpu_collation_name";
 pub(crate) const GPU_CATALOG_CONSTRAINT_DEF: &str = "__gpu_constraint_def";
+pub(crate) const GPU_CATALOG_ACL_DEFAULT: &str = "__gpu_acl_default";
+pub(crate) const GPU_CATALOG_FUNCTION_RESULT: &str = "__gpu_function_result";
+pub(crate) const GPU_CATALOG_NULLABLE_DISPLAY: &str = "__gpu_nullable_display";
+pub(crate) const GPU_CATALOG_DOMAIN_CHECK: &str = "__gpu_domain_check";
+pub(crate) const GPU_CATALOG_ACL_DISPLAY: &str = "__gpu_acl_display";
+pub(crate) const GPU_CATALOG_DESCRIPTION: &str = "__gpu_description";
+pub(crate) const GPU_CATALOG_RELKIND_ACL_DISPLAY: &str = "__gpu_relkind_acl_display";
+pub(crate) const GPU_CATALOG_FUNCTION_KIND: &str = "__gpu_function_kind";
+pub(crate) const GPU_CATALOG_FUNCTION_VOLATILITY: &str = "__gpu_function_volatility";
+pub(crate) const GPU_CATALOG_FUNCTION_PARALLEL: &str = "__gpu_function_parallel";
+pub(crate) const GPU_CATALOG_FUNCTION_SECURITY: &str = "__gpu_function_security";
+pub(crate) const GPU_CATALOG_FUNCTION_INTERNAL_NAME: &str = "__gpu_function_internal_name";
+pub(crate) const GPU_CATALOG_DEFAULT_ACL_TYPE: &str = "__gpu_default_acl_type";
+pub(crate) const GPU_CATALOG_COLUMN_PRIVILEGES: &str = "__gpu_column_privileges";
+pub(crate) const GPU_CATALOG_POLICY_DISPLAY: &str = "__gpu_policy_display";
+pub(crate) const GPU_CATALOG_CURRENT_USER_MATCH: &str = "__gpu_current_user_match";
+pub(crate) const GPU_CATALOG_TABLESPACE_LOCATION: &str = "__gpu_tablespace_location";
+pub(crate) const GPU_CATALOG_TABLESPACE_SIZE: &str = "__gpu_tablespace_size";
 
 fn sql_pg_error(message: String) -> ExecuteError {
     ExecuteError::Engine(EngineError::ApplyFailed(message))
@@ -57,7 +85,12 @@ pub(crate) const MODELED_PG_CATALOG_RELATION_NAMES: &[&str] = &[
     "pg_class",
     "pg_collation",
     "pg_constraint",
+    "pg_extension",
+    "pg_description",
+    "pg_default_acl",
     "pg_inherits",
+    "pg_indexes",
+    "pg_language",
     "pg_namespace",
     "pg_policy",
     "pg_proc",
@@ -66,9 +99,12 @@ pub(crate) const MODELED_PG_CATALOG_RELATION_NAMES: &[&str] = &[
     "pg_publication_rel",
     "pg_publication_tables",
     "pg_roles",
+    "pg_settings",
     "pg_statistic_ext",
+    "pg_tablespace",
     "pg_trigger",
     "pg_type",
+    "pg_views",
 ];
 
 /// Build a transient in-memory [`RelationalTable`] describing a catalog relation's fixed
@@ -130,32 +166,70 @@ pub(crate) fn synthesize_pg_namespace(
         "pg_catalog",
         "pg_namespace",
         &[
+            ("tableoid", SqlType::Int4),
             ("oid", SqlType::Int4),
             ("nspname", SqlType::Text),
             ("nspowner", SqlType::Int4),
+            ("nspacl", SqlType::Text),
         ],
     );
     let owner = SqlValue::Int4(PG_BOOTSTRAP_OWNER_OID);
     let mut rows = vec![
         vec![
+            SqlValue::Int4(2615),
             SqlValue::Int4(PG_CATALOG_NAMESPACE_OID),
             SqlValue::Text("pg_catalog".to_string()),
             owner.clone(),
+            SqlValue::Null,
         ],
         vec![
+            SqlValue::Int4(2615),
             SqlValue::Int4(PG_INFORMATION_SCHEMA_NAMESPACE_OID),
             SqlValue::Text("information_schema".to_string()),
             owner.clone(),
+            SqlValue::Null,
         ],
     ];
     if catalog.relational_public_schema_exists {
         rows.push(vec![
+            SqlValue::Int4(2615),
             SqlValue::Int4(PG_PUBLIC_NAMESPACE_OID),
             SqlValue::Text("public".to_string()),
             owner,
+            schema_acl_array_value(catalog),
         ]);
     }
     (table, rows)
+}
+
+fn schema_acl_array_value(catalog: &CatalogSnapshot) -> SqlValue {
+    if catalog.relational_schema_acl.is_empty() {
+        return SqlValue::Null;
+    }
+    let mut entries = vec![
+        "postgres=UC/postgres".to_string(),
+        "=U/postgres".to_string(),
+    ];
+    entries.extend(
+        catalog
+            .relational_schema_acl
+            .iter()
+            .filter_map(|(grantee, privileges)| {
+                if privileges.is_empty() {
+                    return None;
+                }
+                let mut letters = String::new();
+                if privileges.contains(&SchemaPrivilege::Usage) {
+                    letters.push('U');
+                }
+                if privileges.contains(&SchemaPrivilege::Create) {
+                    letters.push('C');
+                }
+                let grantee = if grantee == "public" { "" } else { grantee };
+                Some(format!("{grantee}={letters}/postgres"))
+            }),
+    );
+    SqlValue::Text(format!("{{{}}}", entries.join(",")))
 }
 
 /// `pg_catalog.pg_class` — one row per relation (table `r`, view `v`, materialized view
@@ -233,6 +307,15 @@ pub(crate) fn synthesize_pg_class(
     for s in catalog.relational_sequences.values() {
         rows.push(row(s.oid, &s.name, "S", 0, false));
     }
+    for index in catalog_index_entries(catalog) {
+        rows.push(row(
+            index.index_oid,
+            &index.index.name,
+            "i",
+            index.attnums.len(),
+            false,
+        ));
+    }
     (table, rows)
 }
 
@@ -269,47 +352,49 @@ pub(crate) fn synthesize_pg_constraint(
         ],
     );
     let mut rows = Vec::new();
-    let mut synthetic_oid = 50_000_i32;
     for relation in catalog.relational_catalog.values() {
         for index in &relation.indexes {
             if !(index.primary_key || index.unique_constraint) {
                 continue;
             }
+            let oid = catalog_constraint_oid(catalog, &relation.name, &index.name)
+                .expect("catalog key constraint has a deterministic OID");
             rows.push(vec![
-                SqlValue::Int4(synthetic_oid),
+                SqlValue::Int4(oid as i32),
                 SqlValue::Text(index.name.clone()),
                 SqlValue::Int4(relation.oid as i32),
                 SqlValue::Text(if index.primary_key { "p" } else { "u" }.to_string()),
                 SqlValue::Int4(0),
                 SqlValue::Int4(0),
             ]);
-            synthetic_oid += 1;
         }
         for constraint in &relation.check_constraints {
+            let oid = catalog_constraint_oid(catalog, &relation.name, &constraint.name)
+                .expect("catalog check constraint has a deterministic OID");
             rows.push(vec![
-                SqlValue::Int4(synthetic_oid),
+                SqlValue::Int4(oid as i32),
                 SqlValue::Text(constraint.name.clone()),
                 SqlValue::Int4(relation.oid as i32),
                 SqlValue::Text("c".to_string()),
                 SqlValue::Int4(0),
                 SqlValue::Int4(0),
             ]);
-            synthetic_oid += 1;
         }
         for constraint in &relation.foreign_keys {
             let referenced_oid = catalog
                 .relational_catalog
                 .get(&constraint.referenced_table)
                 .map_or(0, |table| table.oid as i32);
+            let oid = catalog_constraint_oid(catalog, &relation.name, &constraint.name)
+                .expect("catalog foreign key has a deterministic OID");
             rows.push(vec![
-                SqlValue::Int4(synthetic_oid),
+                SqlValue::Int4(oid as i32),
                 SqlValue::Text(constraint.name.clone()),
                 SqlValue::Int4(relation.oid as i32),
                 SqlValue::Text("f".to_string()),
                 SqlValue::Int4(0),
                 SqlValue::Int4(referenced_oid),
             ]);
-            synthetic_oid += 1;
         }
     }
     (table, rows)
@@ -394,6 +479,7 @@ pub(crate) fn synthesize_pg_type(
             ("typlen", SqlType::Int4),
             ("typtype", SqlType::Text),
             ("typnamespace", SqlType::Int4),
+            ("typbasetype", SqlType::Int4),
         ],
     );
     let base = |ty: SqlType| {
@@ -403,6 +489,7 @@ pub(crate) fn synthesize_pg_type(
             SqlValue::Int4(i32::from(ty.type_size())),
             SqlValue::Text("b".to_string()),
             SqlValue::Int4(PG_CATALOG_NAMESPACE_OID),
+            SqlValue::Int4(0),
         ]
     };
     let mut rows = vec![
@@ -422,6 +509,7 @@ pub(crate) fn synthesize_pg_type(
             SqlValue::Int4(i32::from(domain.base_type.type_size())),
             SqlValue::Text("d".to_string()),
             SqlValue::Int4(PG_PUBLIC_NAMESPACE_OID),
+            SqlValue::Int4(domain.base_type.postgres_oid() as i32),
         ]);
     }
     (table, rows)
@@ -476,19 +564,31 @@ pub(crate) fn synthesize_information_schema_columns(
             ("ordinal_position", SqlType::Int4),
             ("data_type", SqlType::Text),
             ("is_nullable", SqlType::Text),
+            ("udt_schema", SqlType::Text),
+            ("udt_name", SqlType::Text),
         ],
     );
     let mut rows = Vec::new();
     for t in catalog.relational_catalog.values() {
         for col in &t.columns {
+            let (data_type, udt_schema, udt_name) = match &col.domain {
+                Some(domain) => (domain.as_str(), "public", domain.as_str()),
+                None => (
+                    information_schema_data_type(col.ty),
+                    "pg_catalog",
+                    col.ty.catalog_name(),
+                ),
+            };
             rows.push(vec![
                 SqlValue::Text("postgres".to_string()),
                 SqlValue::Text("public".to_string()),
                 SqlValue::Text(t.name.clone()),
                 SqlValue::Text(col.name.clone()),
                 SqlValue::Int4(i32::from(col.attnum)),
-                SqlValue::Text(information_schema_data_type(col.ty).to_string()),
+                SqlValue::Text(data_type.to_string()),
                 SqlValue::Text("YES".to_string()),
+                SqlValue::Text(udt_schema.to_string()),
+                SqlValue::Text(udt_name.to_string()),
             ]);
         }
     }
@@ -532,7 +632,15 @@ pub(crate) fn synthesize_catalog_relation(
         "pg_attribute" => Some(synthesize_pg_attribute(catalog)),
         "pg_type" => Some(synthesize_pg_type(catalog)),
         "pg_am" => Some(synthesize_pg_am()),
+        "pg_roles" => Some(synthesize_pg_roles(catalog)),
+        "pg_tablespace" => Some(synthesize_pg_tablespace(catalog)),
         "pg_constraint" => Some(synthesize_pg_constraint(catalog)),
+        "pg_description" => Some(synthesize_pg_description(catalog)),
+        "pg_default_acl" => Some(synthesize_pg_default_acl(catalog)),
+        "pg_indexes" => Some(synthesize_pg_indexes(catalog)),
+        "pg_language" => Some(synthesize_pg_language()),
+        "pg_proc" => Some(synthesize_pg_proc(catalog)),
+        "pg_views" => Some(synthesize_pg_views(catalog)),
         "pg_publication" if catalog.relational_publications.is_empty() => {
             Some(synthesize_empty_catalog_table(
                 "pg_publication",
@@ -596,6 +704,28 @@ pub(crate) fn synthesize_catalog_relation(
                 ("polcmd", SqlType::Text),
             ],
         )),
+        "pg_extension" => Some(synthesize_empty_catalog_table(
+            "pg_extension",
+            &[
+                ("tableoid", SqlType::Int4),
+                ("oid", SqlType::Int4),
+                ("extname", SqlType::Text),
+                ("extnamespace", SqlType::Int4),
+                ("extrelocatable", SqlType::Bool),
+                ("extversion", SqlType::Text),
+                ("extconfig", SqlType::Text),
+                ("extcondition", SqlType::Text),
+            ],
+        )),
+        // PostgreSQL 17+ dump clients conditionally set
+        // `restrict_nonsystem_relation_kind` only when that setting exists. The engine does not
+        // expose the server setting, so this catalog source is authoritatively empty; the normal
+        // empty-catalog binder still validates the projected `set_config` call and returns its
+        // exact descriptor.
+        "pg_settings" => Some(synthesize_empty_catalog_table(
+            "pg_settings",
+            &[("name", SqlType::Text)],
+        )),
         "pg_trigger" => Some(synthesize_empty_catalog_table(
             "pg_trigger",
             &[
@@ -643,7 +773,187 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
     catalog: &CatalogSnapshot,
 ) -> Result<(), ExecuteError> {
     match table.name.as_str() {
+        "pg_roles" => {
+            let rolname = catalog_column_position(table, "rolname")?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_CURRENT_USER_MATCH,
+                SqlType::Bool,
+                rows.iter()
+                    .map(|row| {
+                        SqlValue::Bool(matches!(
+                            row.get(rolname),
+                            Some(SqlValue::Text(name)) if name == "postgres"
+                        ))
+                    })
+                    .collect(),
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DESCRIPTION,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(rolname) {
+                        Some(SqlValue::Text(name)) => catalog
+                            .relational_comments
+                            .get(&RelationalCommentTarget::Role { role: name.clone() })
+                            .map_or(SqlValue::Null, |value| SqlValue::Text(value.clone())),
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+        }
+        "pg_tablespace" => {
+            let spcname = catalog_column_position(table, "spcname")?;
+            let spcowner = catalog_column_position(table, "spcowner")?;
+            let spcacl = catalog_column_position(table, "spcacl")?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_OWNER_NAME,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(spcowner) {
+                        Some(SqlValue::Int4(oid)) => catalog_role_name(*oid, catalog)
+                            .map(|name| SqlValue::Text(name.to_string()))
+                            .ok_or_else(|| {
+                                sql_pg_error(format!(
+                                    "catalog presentation does not model owner OID {oid}"
+                                ))
+                            }),
+                        other => Err(sql_pg_error(format!(
+                            "catalog spcowner row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_TABLESPACE_LOCATION,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(spcname) {
+                        Some(SqlValue::Text(name)) => {
+                            catalog.relational_tablespaces.get(name).map_or_else(
+                                || SqlValue::Text(String::new()),
+                                |tablespace| SqlValue::Text(tablespace.location.clone()),
+                            )
+                        }
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DISPLAY,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| catalog_acl_display(row.get(spcacl)))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DEFAULT,
+                SqlType::Text,
+                vec![SqlValue::Text("{postgres=C/postgres}".to_string()); rows.len()],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_TABLESPACE_SIZE,
+                SqlType::Text,
+                vec![SqlValue::Text("0 bytes".to_string()); rows.len()],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DESCRIPTION,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(spcname) {
+                        Some(SqlValue::Text(name)) => catalog
+                            .relational_comments
+                            .get(&RelationalCommentTarget::Tablespace {
+                                tablespace: name.clone(),
+                            })
+                            .map_or(SqlValue::Null, |value| SqlValue::Text(value.clone())),
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+        }
+        "pg_namespace" => {
+            let nspname = catalog_column_position(table, "nspname")?;
+            let nspowner = catalog_column_position(table, "nspowner")?;
+            let nspacl = catalog_column_position(table, "nspacl")?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DEFAULT,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(nspname) {
+                        Some(SqlValue::Text(name)) if name == "public" => {
+                            SqlValue::Text("{postgres=UC/postgres,=U/postgres}".to_string())
+                        }
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_OWNER_NAME,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(nspowner) {
+                        Some(SqlValue::Int4(oid)) => catalog_role_name(*oid, catalog)
+                            .map(|name| SqlValue::Text(name.to_string()))
+                            .ok_or_else(|| {
+                                sql_pg_error(format!(
+                                    "catalog presentation does not model owner OID {oid}"
+                                ))
+                            }),
+                        other => Err(sql_pg_error(format!(
+                            "catalog nspowner row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DISPLAY,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| catalog_acl_display(row.get(nspacl)))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DESCRIPTION,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(nspname) {
+                        Some(SqlValue::Text(name)) => catalog
+                            .relational_comments
+                            .get(&RelationalCommentTarget::Schema {
+                                schema: name.clone(),
+                            })
+                            .map_or(SqlValue::Null, |value| SqlValue::Text(value.clone())),
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+        }
         "pg_class" => {
+            let oid = catalog_column_position(table, "oid")?;
             let relkind = catalog_column_position(table, "relkind")?;
             let relowner = catalog_column_position(table, "relowner")?;
             let reloftype = catalog_column_position(table, "reloftype")?;
@@ -666,6 +976,58 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
                         ))),
                     })
                     .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_RELKIND_ACL_DISPLAY,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(relkind) {
+                        Some(SqlValue::Text(kind)) => match kind.as_str() {
+                            "r" => SqlValue::Text("table".to_string()),
+                            "v" => SqlValue::Text("view".to_string()),
+                            "m" => SqlValue::Text("materialized view".to_string()),
+                            "S" => SqlValue::Text("sequence".to_string()),
+                            "f" => SqlValue::Text("foreign table".to_string()),
+                            "p" => SqlValue::Text("partitioned table".to_string()),
+                            _ => SqlValue::Null,
+                        },
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+            let relation_acls = rows
+                .iter()
+                .map(|row| match row.get(oid) {
+                    Some(SqlValue::Int4(oid)) => catalog_relation_acl(*oid as u32, catalog),
+                    _ => SqlValue::Null,
+                })
+                .collect::<Vec<_>>();
+            append_catalog_column(table, rows, "relacl", SqlType::Text, relation_acls.clone())?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DISPLAY,
+                SqlType::Text,
+                relation_acls
+                    .iter()
+                    .map(|value| catalog_acl_display(Some(value)))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_COLUMN_PRIVILEGES,
+                SqlType::Text,
+                vec![SqlValue::Null; rows.len()],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_POLICY_DISPLAY,
+                SqlType::Text,
+                vec![SqlValue::Null; rows.len()],
             )?;
             append_catalog_column(
                 table,
@@ -775,6 +1137,255 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
                     .collect::<Result<Vec<_>, _>>()?,
             )?;
         }
+        "pg_proc" => {
+            let oid = catalog_column_position(table, "oid")?;
+            let proname = catalog_column_position(table, "proname")?;
+            let proowner = catalog_column_position(table, "proowner")?;
+            let prorettype = catalog_column_position(table, "prorettype")?;
+            let proacl = catalog_column_position(table, "proacl")?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_FUNCTION_RESULT,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(prorettype) {
+                        Some(SqlValue::Int4(oid)) => catalog_type_name(*oid, catalog)
+                            .map(|name| SqlValue::Text(name.to_string()))
+                            .ok_or_else(|| {
+                                sql_pg_error(format!(
+                                    "pg_get_function_result does not model type OID {oid}"
+                                ))
+                            }),
+                        other => Err(sql_pg_error(format!(
+                            "catalog prorettype row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_OWNER_NAME,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(proowner) {
+                        Some(SqlValue::Int4(oid)) => catalog_role_name(*oid, catalog)
+                            .map(|name| SqlValue::Text(name.to_string()))
+                            .ok_or_else(|| {
+                                sql_pg_error(format!(
+                                    "catalog presentation does not model owner OID {oid}"
+                                ))
+                            }),
+                        other => Err(sql_pg_error(format!(
+                            "catalog proowner row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_EMPTY_TEXT,
+                SqlType::Text,
+                vec![SqlValue::Text(String::new()); rows.len()],
+            )?;
+            for (name, value) in [
+                (GPU_CATALOG_FUNCTION_KIND, "func"),
+                (GPU_CATALOG_FUNCTION_VOLATILITY, "volatile"),
+                (GPU_CATALOG_FUNCTION_PARALLEL, "unsafe"),
+                (GPU_CATALOG_FUNCTION_SECURITY, "invoker"),
+            ] {
+                append_catalog_column(
+                    table,
+                    rows,
+                    name,
+                    SqlType::Text,
+                    vec![SqlValue::Text(value.to_string()); rows.len()],
+                )?;
+            }
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_FUNCTION_INTERNAL_NAME,
+                SqlType::Text,
+                vec![SqlValue::Null; rows.len()],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DISPLAY,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| catalog_acl_display(row.get(proacl)))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DESCRIPTION,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match (row.get(oid), row.get(proname)) {
+                        (Some(SqlValue::Int4(_)), Some(SqlValue::Text(name))) => catalog
+                            .relational_comments
+                            .get(&RelationalCommentTarget::Function {
+                                function: name.clone(),
+                            })
+                            .map_or(SqlValue::Null, |value| SqlValue::Text(value.clone())),
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+        }
+        "pg_default_acl" => {
+            let owner = catalog_column_position(table, "defaclrole")?;
+            let kind = catalog_column_position(table, "defaclobjtype")?;
+            let acl = catalog_column_position(table, "defaclacl")?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_OWNER_NAME,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(owner) {
+                        Some(SqlValue::Int4(oid)) => catalog_role_name(*oid, catalog)
+                            .map(|name| SqlValue::Text(name.to_string()))
+                            .ok_or_else(|| {
+                                sql_pg_error(format!(
+                                    "catalog presentation does not model owner OID {oid}"
+                                ))
+                            }),
+                        other => Err(sql_pg_error(format!(
+                            "catalog defaclrole row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DEFAULT_ACL_TYPE,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(kind) {
+                        Some(SqlValue::Text(kind)) => match kind.as_str() {
+                            "r" => SqlValue::Text("table".to_string()),
+                            "S" => SqlValue::Text("sequence".to_string()),
+                            "f" => SqlValue::Text("function".to_string()),
+                            "T" => SqlValue::Text("type".to_string()),
+                            "n" => SqlValue::Text("schema".to_string()),
+                            _ => SqlValue::Null,
+                        },
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DISPLAY,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| catalog_acl_display(row.get(acl)))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+        }
+        "pg_type" => {
+            let typbasetype = catalog_column_position(table, "typbasetype")?;
+            let row_count = rows.len();
+            append_catalog_column(
+                table,
+                rows,
+                "tableoid",
+                SqlType::Int4,
+                vec![SqlValue::Int4(1247); row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                "typtypmod",
+                SqlType::Int4,
+                vec![SqlValue::Int4(-1); row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                "typcollation",
+                SqlType::Int4,
+                vec![SqlValue::Int4(0); row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                "typnotnull",
+                SqlType::Bool,
+                vec![SqlValue::Bool(false); row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                "typdefault",
+                SqlType::Text,
+                vec![SqlValue::Null; row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                "typacl",
+                SqlType::Text,
+                vec![SqlValue::Null; row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_FORMATTED_TYPE,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(typbasetype) {
+                        Some(SqlValue::Int4(0)) => Ok(SqlValue::Null),
+                        Some(SqlValue::Int4(oid)) => catalog_type_name(*oid, catalog)
+                            .map(|name| SqlValue::Text(name.to_string()))
+                            .ok_or_else(|| {
+                                sql_pg_error(format!(
+                                    "format_type does not model domain base type OID {oid}"
+                                ))
+                            }),
+                        other => Err(sql_pg_error(format!(
+                            "catalog typbasetype row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_COLLATION_NAME,
+                SqlType::Text,
+                vec![SqlValue::Null; row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_NULLABLE_DISPLAY,
+                SqlType::Text,
+                vec![SqlValue::Null; row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DOMAIN_CHECK,
+                SqlType::Text,
+                vec![SqlValue::Null; row_count],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_ACL_DISPLAY,
+                SqlType::Text,
+                vec![SqlValue::Null; row_count],
+            )?;
+        }
         _ => {}
     }
     Ok(())
@@ -865,6 +1476,54 @@ fn catalog_type_name(oid: i32, catalog: &CatalogSnapshot) -> Option<&str> {
             .find(|domain| domain.oid == oid as u32)
             .map(|domain| domain.name.as_str())
     })
+}
+
+fn catalog_acl_display(value: Option<&SqlValue>) -> Result<SqlValue, ExecuteError> {
+    match value {
+        Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+        Some(SqlValue::Text(value)) => Ok(SqlValue::Text(
+            value
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .unwrap_or(value)
+                .split(',')
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )),
+        other => Err(sql_pg_error(format!(
+            "catalog ACL row is malformed: {other:?}"
+        ))),
+    }
+}
+
+fn catalog_relation_acl(oid: u32, catalog: &CatalogSnapshot) -> SqlValue {
+    catalog
+        .relational_catalog
+        .values()
+        .find(|relation| relation.oid == oid)
+        .map(|relation| relation_acl_array(&relation.acl, "r"))
+        .or_else(|| {
+            catalog
+                .relational_views
+                .values()
+                .find(|relation| relation.oid == oid)
+                .map(|relation| relation_acl_array(&relation.acl, "v"))
+        })
+        .or_else(|| {
+            catalog
+                .relational_materialized_views
+                .values()
+                .find(|relation| relation.oid == oid)
+                .map(|relation| relation_acl_array(&relation.acl, "m"))
+        })
+        .or_else(|| {
+            catalog
+                .relational_sequences
+                .values()
+                .find(|relation| relation.oid == oid)
+                .map(|relation| relation_acl_array(&relation.acl, "S"))
+        })
+        .unwrap_or(SqlValue::Null)
 }
 
 fn catalog_attribute_default_expr(
