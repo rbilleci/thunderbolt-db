@@ -14,6 +14,35 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 transaction-private catalog generation proof — accepted 2026-07-22
+
+- A transaction-private `CREATE TABLE` no longer receives a false `40001` solely because an unrelated DML or KV
+  commit republished byte-identical catalog contents at a newer `commit_seq`. `CatalogSnapshot` now carries the
+  OID and column-ID allocator high-waters, and `same_contents` ignores only the publication stamp while derived
+  equality continues to cover every catalog relation, namespace flag, ACL/default-ACL, comment, domain, sequence,
+  and allocator field. A real catalog change or create/drop allocator ABA still rejects before sequence/WAL claim.
+- READ COMMITTED rebases the private catalog overlay onto the fresh statement publication, seeds each uncommitted
+  created table from its private empty shard generation, rekeys provisional inserts after an unrelated global row-ID
+  advance, and replays ordered private deltas through the transaction catalog rather than the published-only
+  catalog. The actual-GPU differential includes a NULL-bearing row and compares live state with fresh WAL recovery.
+  REPEATABLE READ retains its held snapshot and uses the same catalog-content proof at direct COMMIT.
+- The focused catalog module passes **10/10** ordinary tests with **15** GPU tests ignored. The new GPU NULL/rekey/
+  recovery case passes three sequential and two concurrent HAZARD rounds with zero CUDA 700/716/717. The engine
+  passes **527/527** ordinary tests with **550** ignored; facade passes **75/75** plus concurrency **13/13**, and
+  canonical server passes **76/76**. Workspace all-target/all-feature check, strict workspace Clippy, scoped
+  rustfmt, diff, and source-size gates pass. No read kernel, residency layout, production result path, facade,
+  sequence/WAL claimant, publication owner, or host relational executor changed, so the report card was inapplicable.
+- The accepted implementation is frozen at base `ae222b5809bca620bd2e483e80cd4c8a3ed7945c`, code/test index tree
+  `7a41b1a86e277b612110d0ca0def609b9ad14e2a`, and cached binary-diff SHA-256
+  `f3db8416f31024edfda84d9d0ea28c4f060c75129782ef270e5f63d333ad2bae` across five engine paths. The fresh
+  independent runtime audit returned **ACCEPT**. Its stale-comment residual was repaired; the first narrow re-audit
+  rejected overbroad publisher prose, and the corrected comment-only tree then received **ACCEPT** with no residual.
+- **PRODUCT-001** remains open. Active-transaction `TRUNCATE ... CONTINUE IDENTITY` is still lowered to private
+  row deletes rather than the ADR-014 typed table-reset/rewrite-fence lifecycle; multiple transactional catalog
+  commands remain fail-closed. Those broader DDL facts, remaining SQLSTATE/type-codec and named-client coverage,
+  mixed recovery, legacy/P8 deletion, ownership guards, and the two PLAN-owned source outliers remain with
+  **PRODUCT-001**.
+
 ## PRODUCT-001 PostgreSQL 16 pg_dump/restore compatibility — accepted 2026-07-22
 
 - PostgreSQL 16 `pg_dump` now generates and restores plain, custom, directory, tar, parallel-directory,

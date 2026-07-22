@@ -353,9 +353,13 @@ impl Engine {
                     "transactional catalog command lost its base generation".to_string(),
                 ))
             })?;
-            if self.catalog_snapshot().as_ref() != base.as_ref() {
+            if !self
+                .read_state
+                .latest_catalog()
+                .same_contents(base.as_ref())
+            {
                 return Err(ExecuteError::Serialization(
-                    "catalog changed after transactional DDL staging".to_string(),
+                    "catalog contents changed after transactional DDL staging".to_string(),
                 ));
             }
             debug_assert!(matches!(catalog_command.command, Command::CreateTable(_)));

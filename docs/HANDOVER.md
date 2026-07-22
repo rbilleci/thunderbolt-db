@@ -29,14 +29,21 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
   now builds in a fresh isolated target, records compiler/binary/native-archive identities, and invokes the exact
   hashed binaries directly. No facade, WAL/sequence/commit/publication, or CPU relational owner was added.
 - The remaining legacy listener/P8 adapters and consumers, broader transactional/recovery compatibility,
-  conservative full-catalog conflict, and PLAN-owned **2,012**-line `engine_mutation_admission.rs` plus **2,083**-line
-  `engine_dml_concurrent.rs` are the current PRODUCT-001 facts.
+  multiple transactional catalog commands, typed table-reset/rewrite-fence coverage, and PLAN-owned **2,012**-line
+  `engine_mutation_admission.rs` plus **2,083**-line `engine_dml_concurrent.rs` are the current PRODUCT-001 facts.
+- The transaction-private catalog-generation proof is independently accepted at base
+  `ae222b5809bca620bd2e483e80cd4c8a3ed7945c`, code/test tree
+  `7a41b1a86e277b612110d0ca0def609b9ad14e2a`, and cached binary-diff SHA-256
+  `f3db8416f31024edfda84d9d0ea28c4f060c75129782ef270e5f63d333ad2bae`. Unrelated DML/KV publication no longer
+  aborts a staged CREATE when every catalog field and allocator high-water is unchanged; real catalog/allocator
+  drift remains pre-WAL `40001`. The GPU NULL/rekey/recovery proof passes 3 sequential plus 2 concurrent rounds.
 
 ## Resume here
 
-Resume **PRODUCT-001** only at the PLAN current-focus boundary: close the remaining broader transactional-DDL,
-conservative full-generation-conflict, SQLSTATE/type-codec, named-client, and mixed-recovery proofs. After those
-proofs are independently accepted, re-inventory and migrate or disposition the remaining legacy psql/preflight/
-benchmark consumers, then delete the legacy listener plus independently callable P8 protocol adapters in the same
-frozen, independently audited slice. Follow the complete sequence and deletion gates only from
+Resume **PRODUCT-001** only at the PLAN current-focus boundary: replace active-transaction `TRUNCATE ... CONTINUE
+IDENTITY` row-delete emulation with the typed table-reset, ordered overlay, WAL/replay, and non-MVCC rewrite-fence
+contract. After that slice is independently accepted, continue the PLAN-ordered multiple-DDL, SQLSTATE/type-codec,
+named-client, and mixed-recovery proofs. Only then re-inventory and migrate or disposition the remaining legacy
+psql/preflight/benchmark consumers and delete the legacy listener plus independently callable P8 protocol adapters
+in the same frozen, independently audited slice. Follow the complete sequence and deletion gates only from
 [`PLAN.md`](PLAN.md).

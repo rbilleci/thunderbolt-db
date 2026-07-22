@@ -73,7 +73,12 @@ composes DML before or after that CREATE, and carries private-catalog Parse/Desc
 program and existing `engine_transaction_delta` claimant. It adds no WAL or publication authority. The canonical
 simple-query server uses this envelope for an ordinary multi-statement Query message, so a failing statement rolls
 back every predecessor and suppresses every successor. Multiple transactional DDL remain fail-closed under
-PRODUCT-001; an intervening unrelated commit currently forces a conservative pre-WAL serialization retry.
+PRODUCT-001. An intervening DML/KV commit no longer forces a retry when every catalog field plus the OID/column-ID
+allocator high-waters remains unchanged: READ COMMITTED rebinds the private overlay and GPU delta to the newer
+publication stamp, while REPEATABLE READ validates the same content proof at COMMIT. Real catalog or allocator
+drift remains a pre-WAL serialization failure. Active-transaction `TRUNCATE ... CONTINUE IDENTITY` is currently
+lowered to private full-table row deletion rather than a typed table-reset/rewrite-fence record, and `RESTART
+IDENTITY` remains pre-effect rejected; the broader transactional-DDL boundary remains owned by **PRODUCT-001**.
 
 ## Physical commit and publication owners
 

@@ -118,6 +118,8 @@ impl Engine {
             relational_schema_acl: cat.relational_schema_acl.clone(),
             relational_default_table_acl: cat.relational_default_table_acl.clone(),
             relational_comments: cat.relational_comments.clone(),
+            relational_next_oid: cat.relational_next_oid,
+            relational_next_column_id: cat.relational_next_column_id,
         })
     }
 

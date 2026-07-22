@@ -137,19 +137,43 @@ impl Engine {
         current: &Arc<TransactionSnapshot>,
         fresh: &Arc<TransactionSnapshot>,
     ) -> Result<(), ExecuteError> {
-        {
+        let (rebased_catalog_overlay, private_catalog_tables) = {
             let delta = current
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if delta.catalog_command.is_some()
-                && delta.catalog_base.as_deref() != Some(fresh.catalog.as_ref())
-            {
-                return Err(ExecuteError::Serialization(
-                    "published state changed after transactional DDL staging".to_string(),
-                ));
+            if let Some(catalog_command) = delta.catalog_command.as_ref() {
+                let base = delta.catalog_base.as_deref().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "transactional catalog command lost its base generation".to_string(),
+                    ))
+                })?;
+                if !base.same_contents(fresh.catalog.as_ref()) {
+                    return Err(ExecuteError::Serialization(
+                        "published catalog contents changed after transactional DDL staging"
+                            .to_string(),
+                    ));
+                }
+                let mut overlay = delta.catalog_overlay.as_deref().cloned().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "transactional catalog command lost its private catalog overlay"
+                            .to_string(),
+                    ))
+                })?;
+                // Only the publication stamp changed. Object/column allocators and every catalog
+                // dependency are byte-identical, so the private overlay retains its stable
+                // identities and is rebound to the fresh READ COMMITTED statement boundary.
+                overlay.commit_seq = fresh.catalog.commit_seq;
+                let private_tables = match &catalog_command.command {
+                    Command::CreateTable(create) => vec![create.table.clone()],
+                    _ => unreachable!("transactional catalog staging supports CREATE TABLE"),
+                };
+                (Some(Arc::new(overlay)), private_tables)
+            } else {
+                (None, Vec::new())
             }
-        }
+        };
+        let transaction_catalog = rebased_catalog_overlay.as_ref().unwrap_or(&fresh.catalog);
         let (generation, mut deltas, write_set, sequence_state, old_private_gpu_bytes) = {
             let delta = current
                 .delta
@@ -166,6 +190,12 @@ impl Engine {
         rekey_provisional_inserts(&mut deltas, fresh.next_row_id)?;
 
         let mut next_shards = (*fresh.resident_shards).clone();
+        // A transaction-created table has no globally published shard generation. Rebase starts
+        // it from the same private empty generation installed by CREATE, then replays the staged
+        // row deltas in order; copying its prior final shard would double-apply those mutations.
+        for table in private_catalog_tables {
+            next_shards.entry(table).or_default();
+        }
         let mut next_cold_chunks = (*fresh.base_streaming_cold_chunks).clone();
         // Replay is itself a tiny private transaction generation. Deep device locate/materialize
         // helpers resolve through the scoped snapshot, so each delta reads the exact captured
@@ -181,7 +211,7 @@ impl Engine {
             sequence_state: BTreeMap::new(),
             catalog_command: None,
             catalog_base: None,
-            catalog_overlay: None,
+            catalog_overlay: rebased_catalog_overlay.clone(),
             private_gpu_bytes_by_gpu: BTreeMap::new(),
             commit_gpu_bytes_by_gpu: BTreeMap::new(),
         }));
@@ -207,7 +237,7 @@ impl Engine {
         let mut gpu_reservation = TransactionGpuReservation::new(self);
         for delta in &deltas {
             for (name, expected) in &delta.catalog_dependencies {
-                if fresh.catalog.relational_catalog.get(name) != Some(expected) {
+                if transaction_catalog.relational_catalog.get(name) != Some(expected) {
                     return Err(ExecuteError::Serialization(format!(
                         "catalog dependency \"{name}\" changed after transaction statement snapshot {}",
                         delta.read_snapshot
@@ -219,8 +249,7 @@ impl Engine {
                 | PreparedMutation::Update { table, .. }
                 | PreparedMutation::Delete { table, .. } => table,
             };
-            let table = fresh
-                .catalog
+            let table = transaction_catalog
                 .relational_catalog
                 .get(table_name)
                 .ok_or_else(|| {
@@ -284,6 +313,10 @@ impl Engine {
                 )
             })?;
         state.sequence_state = sequence_state;
+        if let Some(overlay) = rebased_catalog_overlay {
+            state.catalog_base = Some(Arc::clone(&fresh.catalog));
+            state.catalog_overlay = Some(overlay);
+        }
         gpu_reservation
             .replace_charges(&mut state.private_gpu_bytes_by_gpu, next_private_gpu_bytes);
         Ok(())

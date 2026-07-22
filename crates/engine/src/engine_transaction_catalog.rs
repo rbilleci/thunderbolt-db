@@ -1090,25 +1090,159 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_commit_conservatively_serializes_staged_catalog_before_wal() {
+    fn unrelated_commit_rebases_staged_catalog_without_changing_private_identity() {
         let engine = Engine::new_local();
         engine.submit_transaction(41, parsed("BEGIN")).unwrap();
         engine
             .submit_transaction(41, parsed("CREATE TABLE conservative_ddl (id int4)"))
             .unwrap();
+        let private_before = engine
+            .transaction_snapshot_handle(41)
+            .unwrap()
+            .transaction_catalog()
+            .relational_catalog["conservative_ddl"]
+            .clone();
 
         engine
             .submit_transaction(42, parsed("SET unrelated = value"))
             .unwrap();
         let wal_after_unrelated = engine.durable_wal_records().len();
-        let commit = engine.submit_transaction(41, parsed("COMMIT")).unwrap_err();
+        // This metadata lookup is a new READ COMMITTED statement and therefore exercises private
+        // overlay rebasing before COMMIT, not only the terminal revalidation shortcut.
+        let columns = engine
+            .relational_copy_columns_in_transaction(41, "conservative_ddl")
+            .unwrap();
+        assert_eq!(columns.len(), 1);
+        let private_after = engine
+            .transaction_snapshot_handle(41)
+            .unwrap()
+            .transaction_catalog()
+            .relational_catalog["conservative_ddl"]
+            .clone();
+        assert_eq!(private_after, private_before);
+
+        engine.submit_transaction(41, parsed("COMMIT")).unwrap();
+        assert_eq!(engine.durable_wal_records().len(), wal_after_unrelated + 1);
+        assert_eq!(
+            engine
+                .catalog_snapshot()
+                .relational_catalog
+                .get("conservative_ddl"),
+            Some(&private_before)
+        );
+        let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .catalog_snapshot()
+                .relational_catalog
+                .get("conservative_ddl"),
+            Some(&private_before)
+        );
+    }
+
+    #[test]
+    fn catalog_allocator_aba_still_serializes_staged_create_before_wal() {
+        let engine = Engine::new_local();
+        engine.submit_transaction(43, parsed("BEGIN")).unwrap();
+        engine
+            .submit_transaction(43, parsed("CREATE TABLE allocator_guarded (id int4)"))
+            .unwrap();
+
+        engine
+            .submit_transaction(44, parsed("CREATE TABLE allocator_aba (id int4)"))
+            .unwrap();
+        engine
+            .submit_transaction(45, parsed("DROP TABLE allocator_aba"))
+            .unwrap();
+        let wal_after_aba = engine.durable_wal_records().len();
+        let commit = engine.submit_transaction(43, parsed("COMMIT")).unwrap_err();
         assert!(matches!(commit, ExecuteError::Serialization(_)));
-        assert_eq!(engine.durable_wal_records().len(), wal_after_unrelated);
+        assert_eq!(engine.durable_wal_records().len(), wal_after_aba);
         assert!(!engine
             .catalog_snapshot()
             .relational_catalog
-            .contains_key("conservative_ddl"));
-        engine.submit_transaction(41, parsed("ROLLBACK")).unwrap();
+            .contains_key("allocator_guarded"));
+        engine.submit_transaction(43, parsed("ROLLBACK")).unwrap();
+    }
+
+    #[test]
+    fn repeatable_read_create_commits_after_unrelated_change_without_statement_rebase() {
+        let engine = Engine::new_local();
+        engine
+            .submit_transaction(46, parsed("BEGIN ISOLATION LEVEL REPEATABLE READ"))
+            .unwrap();
+        engine
+            .submit_transaction(46, parsed("CREATE TABLE rr_unrelated_ddl (id int4)"))
+            .unwrap();
+        let private = engine
+            .transaction_snapshot_handle(46)
+            .unwrap()
+            .transaction_catalog()
+            .relational_catalog["rr_unrelated_ddl"]
+            .clone();
+
+        engine
+            .submit_transaction(47, parsed("SET rr_unrelated = value"))
+            .unwrap();
+        // No transaction statement follows the unrelated commit: this goes directly through the
+        // terminal catalog-content proof rather than READ COMMITTED overlay rebasing.
+        engine.submit_transaction(46, parsed("COMMIT")).unwrap();
+        assert_eq!(
+            engine
+                .catalog_snapshot()
+                .relational_catalog
+                .get("rr_unrelated_ddl"),
+            Some(&private)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn unrelated_commit_rebases_private_create_dml_with_null_and_recovers() {
+        let engine = Engine::new_local();
+        engine.set_shard_residency_enabled(true);
+        engine.set_auto_admit_on_commit(true);
+        engine
+            .submit_transaction(
+                48,
+                parsed("CREATE TABLE unrelated_row_ids (id int4 PRIMARY KEY)"),
+            )
+            .unwrap();
+        engine.submit_transaction(49, parsed("BEGIN")).unwrap();
+        engine
+            .submit_transaction(
+                49,
+                parsed("CREATE TABLE rebased_private (id int4 PRIMARY KEY, value int4)"),
+            )
+            .unwrap();
+        engine
+            .submit_transaction(49, parsed("INSERT INTO rebased_private VALUES (1, NULL)"))
+            .unwrap();
+
+        // A real unrelated row commit republishes identical catalog contents, advances the global
+        // row-id allocator, and forces rekey + replay of the private NULL-bearing insert.
+        engine
+            .submit_transaction(50, parsed("INSERT INTO unrelated_row_ids VALUES (100)"))
+            .unwrap();
+        engine
+            .submit_transaction(49, parsed("INSERT INTO rebased_private VALUES (2, 9)"))
+            .unwrap();
+        engine.submit_transaction(49, parsed("COMMIT")).unwrap();
+
+        let select =
+            match parse_command("SELECT id, value FROM rebased_private ORDER BY id").unwrap() {
+                Command::Select(select) => select,
+                other => panic!("expected SELECT, got {other:?}"),
+            };
+        let live = engine.execute_relational_select(&select).unwrap().rows;
+        assert_eq!(live.row(0), &[SqlValue::Int4(1), SqlValue::Null]);
+        assert_eq!(live.row(1), &[SqlValue::Int4(2), SqlValue::Int4(9)]);
+
+        let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+        recovered.set_shard_residency_enabled(true);
+        recovered.set_auto_admit_on_commit(true);
+        let replayed = recovered.execute_relational_select(&select).unwrap().rows;
+        assert_eq!(replayed, live);
     }
 
     #[test]

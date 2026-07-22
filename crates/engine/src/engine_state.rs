@@ -400,6 +400,8 @@ impl CatalogHistory {
                 commit_seq: 0,
                 relational_public_schema_exists: true,
                 relational_public_schema_implicit: true,
+                relational_next_oid: FIRST_USER_RELATION_OID,
+                relational_next_column_id: FIRST_USER_COLUMN_ID,
                 ..CatalogSnapshot::default()
             })],
         }
@@ -454,20 +456,23 @@ impl CatalogHistory {
     }
 }
 
-/// The immutable, published slice of the catalog, published as one `Arc` per DDL commit (Stage 2 —
-/// blocker #1; lock-free read path, write-half MVCC). The lock-free read path itself consults only the
+/// The immutable, published slice of the catalog, published as one stamped `Arc` at each canonical
+/// commit (Stage 2 — blocker #1; lock-free read path, write-half MVCC). DDL writes schema/object
+/// metadata and allocator high-waters, while typed sequence-value transitions update sequence
+/// state. Commits with neither effect republish unchanged contents at a new sequence so data and
+/// catalog remain co-pinned. The lock-free read path itself consults only the
 /// first four maps (tables / views / materialized views / functions); the rest are here so the
 /// **off-latch** paths — the concurrent-DML preflight (`preflight_unique_index_constraints` + its
 /// helper tree) and the test-only catalog introspection accessors — can read the catalog WITHOUT
 /// taking the catalog latch (which would serialize DML behind DDL and re-enter the latch). Because the
 /// preflight runs strictly BEFORE any apply and DDL is single-writer, the published snapshot a
-/// preflight reads is byte-identical to the working maps it used to read directly. Only the
-/// oid/column-id allocators and the resident-cache admission accounting are NOT here — those are
-/// touched solely by the under-latch apply path / residency admin. `commit_seq` stamps the commit
-/// `Index` this generation was published at (PART B: catalog↔data co-pinning); the read path selects
-/// the generation as-of its pinned `committed_seq` so a shape-changing DDL can never split a reader's
-/// (catalog, data) pair. The field names mirror the `Engine`/`DdlCatalogState` working maps so the
-/// publish is a straight clone-and-store.
+/// preflight reads is byte-identical to the working maps it used to read directly. The OID and
+/// column-ID allocators are included as immutable high-water proofs; only resident-cache admission
+/// accounting remains outside this snapshot. `commit_seq` stamps the commit `Index` this generation
+/// was published at (PART B: catalog↔data co-pinning); the read path selects the generation as-of its
+/// pinned `committed_seq` so a shape-changing DDL can never split a reader's (catalog, data) pair.
+/// The field names mirror the `Engine`/`DdlCatalogState` working maps so publication is a straight
+/// clone-and-store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CatalogSnapshot {
     /// The commit `Index` this catalog generation was published at (PART B). `0` for the initial
@@ -490,6 +495,28 @@ pub(crate) struct CatalogSnapshot {
     pub(crate) relational_schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
     pub(crate) relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     pub(crate) relational_comments: BTreeMap<RelationalCommentTarget, String>,
+    /// Catalog-stable object identity allocation is part of the immutable generation proof.
+    /// Transaction-private DDL may survive a later non-catalog commit only when these high-waters
+    /// are unchanged; otherwise replaying the staged command could silently assign different OIDs
+    /// or column identities than the private catalog used by later statements.
+    pub(crate) relational_next_oid: u32,
+    pub(crate) relational_next_column_id: u32,
+}
+
+impl CatalogSnapshot {
+    /// Compare the complete catalog authority while deliberately ignoring only its publication
+    /// sequence. Every commit republishes the unchanged working catalog at a newer sequence, so
+    /// exact equality would spuriously serialize transaction-private DDL after ordinary DML/KV.
+    /// Cloning keeps this proof automatically closed over future snapshot fields through derived
+    /// `PartialEq`, rather than maintaining a second field-by-field authority list.
+    pub(crate) fn same_contents(&self, other: &Self) -> bool {
+        if self.commit_seq == other.commit_seq {
+            return self == other;
+        }
+        let mut normalized = other.clone();
+        normalized.commit_seq = self.commit_seq;
+        self == &normalized
+    }
 }
 
 pub(crate) type NamedIndexCoverage = BTreeMap<(String, u32, usize), (u64, usize)>;

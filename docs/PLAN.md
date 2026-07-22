@@ -175,13 +175,25 @@ does not delay the architecture evidence gate. The active sequence now starts at
    `5671761b1fd4a62eab7457f9a8e731a3b807c3c2f58c6d0477bd826c5c8a96d8` across 62 code/test paths. This accepted
    slice stops here without starting the next PRODUCT-001 boundary.
 
+   The independently accepted transaction-private catalog-generation slice now permits a staged `CREATE TABLE` to
+   survive an intervening DML/KV commit when the complete catalog contents and OID/column-ID allocator high-waters
+   are unchanged. READ COMMITTED rebinds the private overlay and replays its GPU delta after provisional-row-ID
+   rekey; REPEATABLE READ uses the same terminal content proof. Real catalog drift and create/drop allocator ABA
+   still reject before WAL, and fresh recovery matches the live NULL-bearing result. No second execution, WAL, or
+   publication owner was added.
+
    Three inherited base defects remain explicitly owned by **PRODUCT-001** rather than being mislabeled as slice
    regressions: `gpu_chunk_class_check_and_foreign_keys_stay_device_native`,
    `transaction_fk_commit_waits_across_classic_wave_tail_handoff`, and
-   `gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover`. The active next boundary closes the
-   remaining compatibility proofs: broader transactional DDL, relaxation of the conservative full-generation
-   conflict that serializes a staged CREATE after any intervening commit, remaining SQLSTATE/type-codec breadth,
-   named client suites, and mixed recovery coverage. Only after those proofs are independently accepted does the
+   `gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover`. The active next boundary corrects the
+   already reachable active-transaction `TRUNCATE ... CONTINUE IDENTITY` path: replace its row-DELETE emulation with
+   a typed, statement-ordered table reset, one atomic WAL/replay representation, and the ADR-014 non-MVCC rewrite
+   fence, while retaining pre-effect refusal of `RESTART IDENTITY` until private sequence-reset semantics exist.
+   Prove `INSERT; TRUNCATE`, `TRUNCATE; INSERT`, rollback, FK/table-guard races, old-snapshot behavior, post-durable
+   recovery, non-vacuous GPU execution, and the applicable report card before proceeding. Ordered multiple-catalog-
+   command expansion follows that accepted reset lifecycle; remaining SQLSTATE/type-codec breadth, named client
+   suites, and mixed recovery coverage follow within the same PRODUCT-001 compatibility boundary. Only after those
+   proofs are independently accepted does the
    legacy/P8 compatibility-and-deletion slice re-inventory the still-live psql/preflight/benchmark consumers,
    migrate or explicitly disposition each behavior, and delete the superseded listener plus independently callable
    P8 protocol adapters in the same audited slice. Do not retain a second product-like execution or write owner as
