@@ -274,6 +274,45 @@ fn copy_description_errors_are_pre_effect_and_fail_an_explicit_transaction() {
 }
 
 #[test]
+fn zero_row_copy_target_blocks_typed_reset_until_protocol_drop() {
+    let shared = SharedEngine::new();
+    let mut copy_session = shared.open_session();
+    let mut reset_session = shared.open_session();
+    submit_text(
+        &shared,
+        &mut reset_session,
+        "CREATE TABLE copy_reset_guard (id INT PRIMARY KEY)",
+    )
+    .unwrap();
+    let copy = CopyFromStdin {
+        table: "copy_reset_guard".to_string(),
+        columns: None,
+        options: gpu_db_sql::CopyOptions::TEXT,
+    };
+    let QueryOutcome::CopyIn { target } = shared
+        .submit(&mut copy_session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("COPY start must retain a protocol target")
+    };
+    let before = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+
+    let error = submit_text(&shared, &mut reset_session, "TRUNCATE copy_reset_guard").unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Serialization, "{error:?}");
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before,
+        "even a zero-row COPY target owns the relation until protocol cancellation/drop"
+    );
+    drop(target);
+}
+
+#[test]
 fn copy_target_proof_rejects_drop_recreate_before_any_copy_effect() {
     let shared = SharedEngine::new();
     let mut copy_session = shared.open_session();

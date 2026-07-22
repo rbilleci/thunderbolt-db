@@ -61,6 +61,20 @@ impl Engine {
         table: &str,
         gpu_id: u16,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        self.populate_relational_residency_snapshot_inner_with_boundary(cat, table, gpu_id, None)
+    }
+
+    /// Build the same authoritative generation while allowing a typed table-root replacement to
+    /// stamp its actual publication index. Ordinary admission derives the boundary from the
+    /// working catalog; row-only transactions retain the table's catalog generation, so a reset
+    /// must supply its newer non-MVCC root boundary explicitly.
+    pub(crate) fn populate_relational_residency_snapshot_inner_with_boundary(
+        &self,
+        cat: &mut DdlCatalogState,
+        table: &str,
+        gpu_id: u16,
+        residency_boundary_override: Option<Index>,
+    ) -> Result<RelationalResidencySnapshot, ExecuteError> {
         let apply_leader =
             crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(std::cell::Cell::get);
         let _apply = if apply_leader {
@@ -111,7 +125,8 @@ impl Engine {
         // entry in the same durable batch is visible to the next DML entry. Storage rejects boundary
         // zero even for an empty relation, so use one only for the physical empty scan while retaining
         // the exact catalog boundary in the published descriptor below.
-        let residency_boundary = self.catalog_snapshot().commit_seq;
+        let residency_boundary =
+            residency_boundary_override.unwrap_or_else(|| self.catalog_snapshot().commit_seq);
         let visibility = StorageVisibility {
             read_txn_id: residency_boundary.max(1),
         };

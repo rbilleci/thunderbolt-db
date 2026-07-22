@@ -222,6 +222,186 @@ fn cuda_driver_runtime_launches_smoke_kernel() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn resident_visibility_count_validates_alignment_and_exact_primary_context() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let row_count = 1_u64.to_le_bytes();
+    let deleted_by = i64::MAX.to_le_bytes();
+    let resident = runtime
+        .retain_device_memory_chunks(
+            0,
+            24,
+            &[
+                CudaDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: &row_count,
+                },
+                CudaDeviceMemoryChunk {
+                    byte_offset: 8,
+                    bytes: &deleted_by,
+                },
+            ],
+        )
+        .unwrap();
+    let (resident, header_rows, visible_rows) = std::thread::spawn(move || {
+        let header_rows = resident.count_rows_from_header().unwrap();
+        let visible_rows = resident
+            .count_visible_rows(1, 1, Some((&resident, 8)), None)
+            .unwrap();
+        (resident, header_rows, visible_rows)
+    })
+    .join()
+    .expect("fresh worker-thread count first use");
+    assert_eq!(header_rows, 1);
+    assert_eq!(visible_rows, 1);
+    assert!(matches!(
+        resident.count_visible_rows(1, 1, Some((&resident, 4)), None),
+        Err(CudaRuntimeProbeError::InvalidInputLength(_))
+    ));
+
+    let distinct_primary = distinct_gpu_primary_context_for_test(0).unwrap();
+    let wrong_context = resident.clone_with_primary_for_test(distinct_primary);
+    assert!(matches!(
+        resident.count_visible_rows(1, 1, Some((&wrong_context, 8)), None),
+        Err(CudaRuntimeProbeError::InvalidInputLength(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn resident_visible_source_digest_binds_values_nulls_ids_and_visibility() {
+    fn payload(values: [i32; 3], validity: u8) -> Vec<u8> {
+        let mut bytes = values
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        bytes.push(0b0000_0101); // bool values: true, false, true
+        bytes.push(validity);
+        bytes.resize(16, 0); // text offsets are 8-aligned
+        for offset in [0_u64, 1, 3, 6] {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        bytes.extend_from_slice(b"abcdef");
+        bytes
+    }
+
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let columns = [
+        CudaVisibleDigestColumn::Fixed {
+            byte_offset: 0,
+            width_bytes: 4,
+            validity_byte_offset: Some(13),
+        },
+        CudaVisibleDigestColumn::Bool {
+            bitmap_byte_offset: 12,
+            validity_byte_offset: None,
+        },
+        CudaVisibleDigestColumn::Text {
+            offsets_byte_offset: 16,
+            bytes_byte_offset: 48,
+            bytes_len: 6,
+            validity_byte_offset: Some(13),
+        },
+    ];
+    let ids = [10_u64, 11, 12]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect::<Vec<_>>();
+    let ids = runtime.retain_device_memory_copy(0, &ids).unwrap();
+    let base = runtime
+        .retain_device_memory_copy(0, &payload([7, 8, 9], 0b0000_0101))
+        .unwrap();
+    let digest = base
+        .digest_visible_source(3, &columns, Some((&ids, 0)), 5, None, None)
+        .unwrap();
+    assert_eq!(digest.visible_rows, 3);
+
+    let changed_value = runtime
+        .retain_device_memory_copy(0, &payload([70, 8, 9], 0b0000_0101))
+        .unwrap()
+        .digest_visible_source(3, &columns, Some((&ids, 0)), 5, None, None)
+        .unwrap();
+    assert_ne!(digest.lanes, changed_value.lanes);
+
+    let changed_null = runtime
+        .retain_device_memory_copy(0, &payload([7, 8, 9], 0b0000_0111))
+        .unwrap()
+        .digest_visible_source(3, &columns, Some((&ids, 0)), 5, None, None)
+        .unwrap();
+    assert_ne!(digest.lanes, changed_null.lanes);
+
+    let other_ids = [10_u64, 111, 12]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect::<Vec<_>>();
+    let other_ids = runtime.retain_device_memory_copy(0, &other_ids).unwrap();
+    let changed_id = base
+        .digest_visible_source(3, &columns, Some((&other_ids, 0)), 5, None, None)
+        .unwrap();
+    assert_ne!(digest.lanes, changed_id.lanes);
+
+    let deleted = [i64::MAX, 2, i64::MAX]
+        .into_iter()
+        .flat_map(i64::to_le_bytes)
+        .collect::<Vec<_>>();
+    let deleted = runtime.retain_device_memory_copy(0, &deleted).unwrap();
+    let filtered = base
+        .digest_visible_source(3, &columns, Some((&ids, 0)), 5, Some((&deleted, 0)), None)
+        .unwrap();
+    assert_eq!(filtered.visible_rows, 2);
+    assert_ne!(digest.lanes, filtered.lanes);
+
+    let fixed = [CudaVisibleDigestColumn::Fixed {
+        byte_offset: 0,
+        width_bytes: 4,
+        validity_byte_offset: None,
+    }];
+    let ordered_values = [7_i32, 8, 9]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let permuted_values = [9_i32, 7, 8]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let permuted_ids = [12_u64, 10, 11]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect::<Vec<_>>();
+    let ordered = runtime
+        .retain_device_memory_copy(0, &ordered_values)
+        .unwrap()
+        .digest_visible_source(3, &fixed, Some((&ids, 0)), 5, None, None)
+        .unwrap();
+    let permuted_ids = runtime.retain_device_memory_copy(0, &permuted_ids).unwrap();
+    let permuted = runtime
+        .retain_device_memory_copy(0, &permuted_values)
+        .unwrap()
+        .digest_visible_source(3, &fixed, Some((&permuted_ids, 0)), 5, None, None)
+        .unwrap();
+    assert_eq!(
+        ordered, permuted,
+        "physical row order is not logical identity"
+    );
+
+    let misaligned = [CudaVisibleDigestColumn::Fixed {
+        byte_offset: 1,
+        width_bytes: 4,
+        validity_byte_offset: None,
+    }];
+    assert!(matches!(
+        base.digest_visible_source(1, &misaligned, Some((&ids, 0)), 5, None, None),
+        Err(CudaRuntimeProbeError::InvalidInputLength(_))
+    ));
+    assert_eq!(
+        base.digest_visible_source(3, &columns, Some((&ids, 0)), 5, None, None)
+            .unwrap(),
+        digest,
+        "rejecting a misaligned descriptor must leave the primary context reusable"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn append_owned_chunks_into_headroom_equals_a_fresh_upload() {
     // Slice 1a: appending rows IN PLACE into an open shard's headroom must produce byte-identical
     // device contents to a single fresh upload of the whole column — that equality is what lets us

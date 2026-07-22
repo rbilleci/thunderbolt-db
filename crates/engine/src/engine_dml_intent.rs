@@ -32,6 +32,7 @@
 //! `item.payload` verbatim).
 
 use super::*;
+use crate::engine_transaction_reset::StableRetryOr;
 
 /// Commit durability mode for a single intent — the PostgreSQL
 /// `synchronous_commit` model, per statement.
@@ -129,6 +130,13 @@ impl CoveredDeleteRoute {
     pub fn table(&self) -> &str {
         &self.table
     }
+
+    fn request_record(&self, pk: i32) -> Vec<u8> {
+        let mut record = Vec::with_capacity(self.record_prefix.len() + 4);
+        record.extend_from_slice(&self.record_prefix);
+        record.extend_from_slice(&pk.to_le_bytes());
+        record
+    }
 }
 
 /// U2: a prepared covered-UPDATE route — the by-PK full-row-replace shape (`UPDATE t SET
@@ -160,6 +168,13 @@ impl CoveredUpdateRoute {
     }
 }
 
+struct EncodedLaneUpdate {
+    pk: i32,
+    values: Vec<SqlValue>,
+    record: Vec<u8>,
+    request_digest: [u8; 32],
+}
+
 impl Engine {
     /// PostgreSQL-compatibility setting surface. ADR-014 currently provides only strict RPO-0
     /// acknowledgement, so both modes are accepted and intentionally share the same gate.
@@ -186,6 +201,7 @@ impl Engine {
         &self,
         table_name: &str,
     ) -> Result<CoveredInsertRoute, ExecuteError> {
+        let _table_access = self.acquire_autocommit_table_access(table_name)?;
         let catalog = self.catalog_snapshot();
         let table = catalog.relational_catalog.get(table_name).ok_or_else(|| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -315,13 +331,32 @@ impl Engine {
         params: &[i32],
     ) -> Result<(), ExecuteError> {
         self.check_intent_params(route, params)?;
+        let logical_request = route.synthesize_text(params);
+        let request_digest = gpu_db_wal::canonical_request_digest(logical_request.as_bytes());
+        let table_access = match self.acquire_autocommit_table_access_after_retry(
+            &route.table,
+            txn_id,
+            request_digest,
+        )? {
+            StableRetryOr::Terminal(_) => return Ok(()),
+            StableRetryOr::Fresh(access) => access,
+        };
         // Pin + register the read snapshot exactly like the classic off-lock
         // prepare (the guard holds the MVCC GC boundary; conflicts() validates
         // against this snapshot).
         let read_snapshot = self.committed_seq();
         let snapshot_guard = self.register_active_snapshot(read_snapshot);
-        match self.build_covered_insert_intent(txn_id, route, params, read_snapshot) {
-            IntentBuild::Item(item) => self.commit_wave_item_blocking(item),
+        match self.build_covered_insert_intent(
+            txn_id,
+            route,
+            params,
+            &logical_request,
+            read_snapshot,
+        ) {
+            IntentBuild::Item(mut item) => {
+                item.table_access = Some(table_access);
+                self.commit_wave_item_blocking(item)
+            }
             IntentBuild::Fallback(text) => {
                 drop(snapshot_guard);
                 self.execute_dml_concurrent(txn_id, &text)
@@ -346,6 +381,7 @@ impl Engine {
         txn_id: u64,
         route: &CoveredInsertRoute,
         params: &[i32],
+        request_digest: [u8; 32],
         read_snapshot: Index,
     ) -> Option<crate::engine_dml_concurrent::LaneIntent> {
         let catalog = self.catalog_snapshot();
@@ -369,7 +405,6 @@ impl Engine {
                         route.binary_row_id_offset,
                     )
                 })?;
-        let logical_request = route.synthesize_text(params);
         Some(crate::engine_dml_concurrent::LaneIntent {
             op: crate::engine_dml_concurrent::LaneOpKind::Insert,
             txn_id,
@@ -382,7 +417,8 @@ impl Engine {
             template,
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
-            request_digest: gpu_db_wal::canonical_request_digest(logical_request.as_bytes()),
+            table_access: None,
+            request_digest,
             transaction_claims: None,
             outstanding: None,
             rows_affected: 1,
@@ -412,6 +448,22 @@ impl Engine {
         _mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
         self.check_intent_params(route, params)?;
+        let logical_request = route.synthesize_text(params);
+        let request_digest = gpu_db_wal::canonical_request_digest(logical_request.as_bytes());
+        let table_access = match self.acquire_autocommit_table_access_after_retry(
+            &route.table,
+            txn_id,
+            request_digest,
+        )? {
+            StableRetryOr::Terminal(affected_rows) => {
+                return Ok(IntentTicket {
+                    outcome: None,
+                    snapshot_hold: None,
+                    resolved: Some(Ok(affected_rows)),
+                });
+            }
+            StableRetryOr::Fresh(access) => access,
+        };
         // LEAN LANE PATH: in lanes mode, build the compact LaneIntent and push
         // straight to its PK lane — CommitWaveItem is never constructed here.
         if let Some(lanes) = &self.intent_lanes {
@@ -419,7 +471,10 @@ impl Engine {
             std::mem::forget(self.register_active_snapshot(read_snapshot));
             let snapshot_hold =
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-            if let Some(mut intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
+            if let Some(mut intent) =
+                self.build_lane_intent(txn_id, route, params, request_digest, read_snapshot)
+            {
+                intent.table_access = Some(table_access);
                 let retry = match self.claim_lane_intent(&mut intent) {
                     Ok(retry) => retry,
                     Err(error) => {
@@ -450,7 +505,7 @@ impl Engine {
             // eligibility drift: classic inline fallback (rare). A covered INSERT is
             // single-row by shape, so a successful classic run affected exactly 1 row.
             let resolved = self
-                .execute_dml_concurrent(txn_id, &route.synthesize_text(params))
+                .execute_dml_concurrent(txn_id, &logical_request)
                 .map(|()| 1);
             self.deregister_active_snapshot(read_snapshot);
             return Ok(IntentTicket {
@@ -465,8 +520,15 @@ impl Engine {
         // leaked by a dropped-unpolled ticket.
         std::mem::forget(self.register_active_snapshot(read_snapshot));
         let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-        match self.build_covered_insert_intent(txn_id, route, params, read_snapshot) {
-            IntentBuild::Item(item) => {
+        match self.build_covered_insert_intent(
+            txn_id,
+            route,
+            params,
+            &logical_request,
+            read_snapshot,
+        ) {
+            IntentBuild::Item(mut item) => {
+                item.table_access = Some(table_access);
                 let outcome = match self.submit_commit_wave_item(item) {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -502,6 +564,7 @@ impl Engine {
         &self,
         table_name: &str,
     ) -> Result<CoveredDeleteRoute, ExecuteError> {
+        let _table_access = self.acquire_autocommit_table_access(table_name)?;
         let insert_route = self.prepare_covered_insert_route(table_name)?;
         let route_err = |reason: &str| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -572,6 +635,22 @@ impl Engine {
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
+        let request_record = route.request_record(pk);
+        let request_digest = gpu_db_wal::canonical_request_digest(&request_record);
+        let table_access = match self.acquire_autocommit_table_access_after_retry(
+            &route.table,
+            txn_id,
+            request_digest,
+        )? {
+            StableRetryOr::Terminal(affected_rows) => {
+                return Ok(IntentTicket {
+                    outcome: None,
+                    snapshot_hold: None,
+                    resolved: Some(Ok(affected_rows)),
+                });
+            }
+            StableRetryOr::Fresh(access) => access,
+        };
         let Some(lanes) = &self.intent_lanes else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "covered-DELETE intents require intent-lanes mode; use the classic path"
@@ -581,8 +660,16 @@ impl Engine {
         let read_snapshot = self.committed_seq();
         std::mem::forget(self.register_active_snapshot(read_snapshot));
         let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-        match self.build_lane_delete_intent(txn_id, route, pk, read_snapshot) {
+        match self.build_lane_delete_intent(
+            txn_id,
+            route,
+            pk,
+            request_record,
+            request_digest,
+            read_snapshot,
+        ) {
             Some(mut intent) => {
+                intent.table_access = Some(table_access);
                 let retry = match self.claim_lane_intent(&mut intent) {
                     Ok(retry) => retry,
                     Err(error) => {
@@ -624,6 +711,8 @@ impl Engine {
         txn_id: u64,
         route: &CoveredDeleteRoute,
         pk: i32,
+        record: Vec<u8>,
+        request_digest: [u8; 32],
         read_snapshot: Index,
     ) -> Option<crate::engine_dml_concurrent::LaneIntent> {
         let catalog = self.catalog_snapshot();
@@ -635,9 +724,6 @@ impl Engine {
         if !eligible {
             return None;
         }
-        let mut record = Vec::with_capacity(route.record_prefix.len() + 4);
-        record.extend_from_slice(&route.record_prefix);
-        record.extend_from_slice(&pk.to_le_bytes());
         Some(crate::engine_dml_concurrent::LaneIntent {
             op: crate::engine_dml_concurrent::LaneOpKind::Delete,
             txn_id,
@@ -650,7 +736,8 @@ impl Engine {
             template: std::sync::Arc::from(record.as_slice()),
             values: Vec::new(),
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
-            request_digest: gpu_db_wal::canonical_request_digest(record.as_slice()),
+            table_access: None,
+            request_digest,
             transaction_claims: None,
             outstanding: None,
             // WAL-FIRST: the delete's rows-affected (0 or 1) is resolved at APPLY (the locate
@@ -671,6 +758,7 @@ impl Engine {
         &self,
         table_name: &str,
     ) -> Result<CoveredUpdateRoute, ExecuteError> {
+        let _table_access = self.acquire_autocommit_table_access(table_name)?;
         let insert_route = self.prepare_covered_insert_route(table_name)?;
         let route_err = |reason: &str| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -745,12 +833,6 @@ impl Engine {
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
-        let Some(lanes) = &self.intent_lanes else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "covered-UPDATE intents require intent-lanes mode; use the classic path"
-                    .to_string(),
-            )));
-        };
         if new_values.len() != route.column_count {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "covered-UPDATE intent expects {} params for table \"{}\", got {}",
@@ -759,11 +841,54 @@ impl Engine {
                 new_values.len()
             ))));
         }
+        let pk = new_values[route.pk_column_index];
+        let values: Vec<SqlValue> = new_values.iter().map(|&v| SqlValue::Int4(v)).collect();
+        let request_record = crate::wal_binary::encode_binary_update_by_key(
+            &route.table,
+            &route.pk_column_name,
+            pk,
+            0,
+            &values,
+        )
+        .ok_or_else(|| {
+            ExecuteError::Serialization(
+                "covered-UPDATE route drifted (record encoding declined); re-prepare the route"
+                    .to_string(),
+            )
+        })?;
+        let request_digest = gpu_db_wal::canonical_request_digest(&request_record);
+        let table_access = match self.acquire_autocommit_table_access_after_retry(
+            &route.table,
+            txn_id,
+            request_digest,
+        )? {
+            StableRetryOr::Terminal(affected_rows) => {
+                return Ok(IntentTicket {
+                    outcome: None,
+                    snapshot_hold: None,
+                    resolved: Some(Ok(affected_rows)),
+                });
+            }
+            StableRetryOr::Fresh(access) => access,
+        };
+        let Some(lanes) = &self.intent_lanes else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "covered-UPDATE intents require intent-lanes mode; use the classic path"
+                    .to_string(),
+            )));
+        };
         let read_snapshot = self.committed_seq();
         std::mem::forget(self.register_active_snapshot(read_snapshot));
         let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-        match self.build_lane_update_intent(txn_id, route, new_values, read_snapshot) {
+        let encoded = EncodedLaneUpdate {
+            pk,
+            values,
+            record: request_record,
+            request_digest,
+        };
+        match self.build_lane_update_intent(txn_id, route, encoded, read_snapshot) {
             Some(mut intent) => {
+                intent.table_access = Some(table_access);
                 let retry = match self.claim_lane_intent(&mut intent) {
                     Ok(retry) => retry,
                     Err(error) => {
@@ -806,7 +931,7 @@ impl Engine {
         &self,
         txn_id: u64,
         route: &CoveredUpdateRoute,
-        new_values: &[i32],
+        encoded: EncodedLaneUpdate,
         read_snapshot: Index,
     ) -> Option<crate::engine_dml_concurrent::LaneIntent> {
         let catalog = self.catalog_snapshot();
@@ -819,17 +944,12 @@ impl Engine {
         if !eligible {
             return None;
         }
-        let pk = *new_values.get(route.pk_column_index)?;
-        let values: Vec<SqlValue> = new_values.iter().map(|&v| SqlValue::Int4(v)).collect();
-        // PLACEHOLDER new_row_id (0): the pump stamps the v1 allocator reservation into these
-        // bytes. `None` (name-width) declines to the retryable drift.
-        let record = crate::wal_binary::encode_binary_update_by_key(
-            &route.table,
-            &route.pk_column_name,
+        let EncodedLaneUpdate {
             pk,
-            0,
-            &values,
-        )?;
+            values,
+            record,
+            request_digest,
+        } = encoded;
         let row_id_offset =
             crate::wal_binary::binary_update_new_row_id_offset(&route.table, &route.pk_column_name)
                 as u32;
@@ -849,7 +969,8 @@ impl Engine {
             template: std::sync::Arc::from(record.as_slice()),
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
-            request_digest: gpu_db_wal::canonical_request_digest(record.as_slice()),
+            table_access: None,
+            request_digest,
             transaction_claims: None,
             outstanding: None,
             // WAL-FIRST: the update's rows-affected (0 or 1) is resolved at APPLY (the locate moved
@@ -962,6 +1083,7 @@ impl Engine {
         txn_id: u64,
         route: &CoveredInsertRoute,
         params: &[i32],
+        logical_request: &str,
         read_snapshot: Index,
     ) -> IntentBuild {
         // Re-derive eligibility against the LIVE catalog generation. The gate must match what the
@@ -982,7 +1104,7 @@ impl Engine {
                     && self.insert_unique_wave_batchable(&catalog, table)
             });
         if !eligible {
-            return IntentBuild::Fallback(route.synthesize_text(params));
+            return IntentBuild::Fallback(logical_request.to_string());
         }
 
         let values: Vec<SqlValue> = params.iter().map(|&param| SqlValue::Int4(param)).collect();
@@ -1035,11 +1157,10 @@ impl Engine {
         // WAL fallback payload: the sequencer logs the W5a BINARY record for this reuse-eligible
         // delta; the text payload is written verbatim only on its fallback arms (catalog drift
         // mid-wave, binary encode decline), so it must stay valid replayable SQL.
-        let text = route.synthesize_text(params);
         IntentBuild::Item(self.make_covered_insert_wave_item(
             txn_id,
             cmd,
-            &text,
+            logical_request,
             write_set,
             read_snapshot,
             prepared_catalog_seq,

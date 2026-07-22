@@ -1462,14 +1462,14 @@ mod tests {
             .submit_transaction(92, parsed("TRUNCATE TABLE ONLY restore_target"))
             .unwrap();
         engine
-            .submit_transaction(92, parsed("INSERT INTO restore_target VALUES (2)"))
+            .submit_transaction(92, parsed("INSERT INTO restore_target VALUES (1)"))
             .unwrap();
         engine.submit_transaction(92, parsed("COMMIT")).unwrap();
         let rows = engine
             .execute_relational_select_text("SELECT id FROM restore_target ORDER BY id")
             .unwrap()
             .rows;
-        assert_eq!(rows, vec![vec![SqlValue::Int4(2)]]);
+        assert_eq!(rows, vec![vec![SqlValue::Int4(1)]]);
 
         engine.submit_transaction(93, parsed("BEGIN")).unwrap();
         engine
@@ -1480,7 +1480,7 @@ mod tests {
             .execute_relational_select_text("SELECT id FROM restore_target ORDER BY id")
             .unwrap()
             .rows;
-        assert_eq!(rows, vec![vec![SqlValue::Int4(2)]]);
+        assert_eq!(rows, vec![vec![SqlValue::Int4(1)]]);
     }
 
     #[test]

@@ -148,6 +148,7 @@ pub enum CommandTag {
     Insert,
     Update,
     Delete,
+    Truncate,
     Copy,
     Other(String),
 }
@@ -1858,6 +1859,7 @@ fn command_tag(command: &Command) -> CommandTag {
         Command::Insert(_) => CommandTag::Insert,
         Command::Update(_) => CommandTag::Update,
         Command::Delete(_) => CommandTag::Delete,
+        Command::TruncateTable(_) => CommandTag::Truncate,
         _ => CommandTag::Other("OK".to_string()),
     }
 }

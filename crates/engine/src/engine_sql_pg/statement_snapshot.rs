@@ -10,10 +10,22 @@ pub(super) fn capture_general_select_statement_snapshot(
     engine: &Engine,
     stmt: &SelectStmt,
 ) -> Result<Option<Arc<TransactionSnapshot>>, ExecuteError> {
-    if engine.current_transaction_read_snapshot().is_some() || engine.mvcc_read_skips_leader_check()
-    {
+    let mut relation_names = Vec::new();
+    for from in &stmt.from_clause {
+        collect_range_tables(from, &mut relation_names)?;
+    }
+    if let Some(snapshot) = engine.current_transaction_read_snapshot() {
+        engine.acquire_transaction_table_access(&snapshot, relation_names)?;
         return Ok(None);
     }
+    if engine.mvcc_read_skips_leader_check() {
+        return Ok(None);
+    }
+
+    let _pre_capture_access = relation_names
+        .iter()
+        .map(|table| engine.acquire_autocommit_table_access(table))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let rank_window = select_has_inline_window(stmt)?;
     let streaming_join = from_clause_is_join(stmt) || stmt.from_clause.len() > 1;
@@ -26,6 +38,7 @@ pub(super) fn capture_general_select_statement_snapshot(
         .ensure_commit_path_available()
         .map_err(ExecuteError::Engine)?;
     let snapshot = engine.capture_statement_snapshot(engine.committed_seq());
+    engine.acquire_transaction_table_access(&snapshot, relation_names)?;
     drop(commit);
     Ok(Some(snapshot))
 }

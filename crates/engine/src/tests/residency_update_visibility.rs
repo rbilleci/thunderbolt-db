@@ -640,6 +640,63 @@ fn pending_retained_completions_recheck_origin_wedge_after_device_drain() {
     assert!(error.to_string().contains("restart recovery"), "{error}");
 }
 
+/// PRODUCT-001: the deferred submission, rather than only its submit call, owns the source-table
+/// guard through GPU completion or caller cancellation/drop.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn pending_retained_submission_blocks_reset_until_completion_or_drop() {
+    fn pending_submission() -> (Arc<Engine>, u32, RelationalRetainedReadSubmission) {
+        let mut engine = Engine::new_local();
+        engine.set_auto_admit_on_commit(true);
+        engine
+            .execute_text(1, "CREATE TABLE retained_guard (id INT PRIMARY KEY, value INT)")
+            .unwrap();
+        engine
+            .execute_text(
+                2,
+                "INSERT INTO retained_guard (id, value) VALUES (1, 10), (2, 20)",
+            )
+            .unwrap();
+        install_test_single_buffer_residency(&mut engine, "retained_guard");
+        let oid = engine.relational_catalog_table("retained_guard").unwrap().oid;
+        let engine = Arc::new(engine);
+        let Command::Select(select) =
+            parse_command("SELECT id FROM retained_guard WHERE id = 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let job = engine
+            .prepare_relational_retained_read_job(&select)
+            .unwrap();
+        let submission = engine
+            .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[job])
+            .unwrap();
+        assert!(submission.is_pending(), "fixture must own deferred GPU work");
+        (engine, oid, submission)
+    }
+
+    let (engine, oid, submission) = pending_submission();
+    let reset = engine.table_access.lease();
+    assert!(matches!(
+        reset.acquire_exclusive([oid]),
+        Err(ExecuteError::Serialization(_))
+    ));
+    let results = engine
+        .complete_relational_retained_read_submission(submission)
+        .unwrap();
+    assert_eq!(results[0].rows, vec![vec![SqlValue::Int4(1)]]);
+    reset.acquire_exclusive([oid]).unwrap();
+
+    let (engine, oid, submission) = pending_submission();
+    let reset = engine.table_access.lease();
+    assert!(matches!(
+        reset.acquire_exclusive([oid]),
+        Err(ExecuteError::Serialization(_))
+    ));
+    drop(submission);
+    reset.acquire_exclusive([oid]).unwrap();
+}
+
 /// R3-003 atomic publication: several private GPU statements (including an update of a
 /// transaction-local insert, a delete, and NULL payloads) become visible at one commit index and
 /// one resolved WAL record. Recovery must reproduce the same final identity state.

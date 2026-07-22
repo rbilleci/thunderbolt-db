@@ -5,16 +5,28 @@
 //! object kind) plus COPY-rows execution (execute_relational_copy_rows[_profiled]).
 
 use super::*;
+use crate::engine_transaction_reset::{table_access_dependency_identities, StableRetryOr};
 
 /// Opaque identity of the exact relation definition accepted when COPY FROM begins.
 ///
 /// The facade carries this value from COPY-in response through final row admission.  Its fields
 /// intentionally remain private: protocol code may transport the proof, but only the engine may
 /// compare it with a transaction or published catalog generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CopyTargetProof {
     table: Arc<RelationalTable>,
+    /// The source relation's shared stable-OID lease, owned from COPY-in description until the
+    /// protocol target and any final admission clone are dropped.
+    table_access: Option<Arc<TableAccessLease>>,
 }
+
+impl PartialEq for CopyTargetProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.table == other.table
+    }
+}
+
+impl Eq for CopyTargetProof {}
 
 /// Structural origin of a COPY target resolved inside an explicit transaction.
 ///
@@ -66,6 +78,7 @@ impl Engine {
                 return Err(ExecuteError::UndefinedRelation(relation.clone()));
             }
         }
+        self.acquire_transaction_table_access(&snapshot, relations.iter().cloned())?;
         Ok(())
     }
 
@@ -83,7 +96,10 @@ impl Engine {
     ) -> Result<(Vec<CopyColumn>, CopyTargetProof), ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
-        copy_target_from_catalog(&self.catalog_snapshot(), table)
+        let table_access = self.acquire_autocommit_table_access(table)?;
+        let (columns, mut proof) = copy_target_from_catalog(&self.catalog_snapshot(), table)?;
+        proof.table_access = Some(table_access);
+        Ok((columns, proof))
     }
 
     /// Resolve COPY input columns against an explicit transaction's exact catalog generation.
@@ -135,6 +151,7 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
         let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
+        self.acquire_transaction_table_access(&snapshot, [table.to_string()])?;
         let transaction_catalog = snapshot.transaction_catalog();
         let origin = {
             let delta = snapshot
@@ -150,8 +167,23 @@ impl Engine {
                 TransactionCopyTargetOrigin::SnapshotBase
             }
         };
-        copy_target_from_catalog(&transaction_catalog, table)
-            .map(|(columns, proof)| (columns, proof, origin))
+        let (columns, mut proof) = copy_target_from_catalog(&transaction_catalog, table)?;
+        let target = transaction_catalog
+            .relational_catalog
+            .get(table)
+            .ok_or_else(|| ExecuteError::UndefinedRelation(table.to_string()))?;
+        let identities =
+            table_access_dependency_identities(&transaction_catalog.relational_catalog, target)?;
+        // Do not clone the transaction's accumulating owner into a named protocol object. A
+        // separately droppable same-owner token retains only this COPY dependency closure; after
+        // COMMIT/ROLLBACK it remains shared, while unrelated identities and any reset upgrade are
+        // released with the transaction snapshot.
+        proof.table_access = Some(
+            snapshot
+                .table_access
+                .retain_shared(identities.values().copied())?,
+        );
+        Ok((columns, proof, origin))
     }
 
     pub(crate) fn copy_target_matches_catalog(
@@ -231,7 +263,9 @@ impl Engine {
         copy: &CopyFromStdin,
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
-        let (_columns, proof) = self.relational_copy_target(&copy.table)?;
+        // Resolve the typed shape without claiming fresh table access. The complete rows below
+        // determine canonical retry identity; only fresh work acquires and retains the guard.
+        let (_columns, proof) = copy_target_from_catalog(&self.catalog_snapshot(), &copy.table)?;
         self.execute_relational_copy_rows_profiled_with_target(txn_id, copy, rows, &proof)
     }
 
@@ -260,7 +294,7 @@ impl Engine {
         rows: Vec<Vec<SqlValue>>,
         on_precommit: impl FnOnce(),
     ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
-        let (_columns, proof) = self.relational_copy_target(&copy.table)?;
+        let (_columns, proof) = copy_target_from_catalog(&self.catalog_snapshot(), &copy.table)?;
         self.execute_relational_copy_rows_profiled_with_target_and_hook(
             txn_id,
             copy,
@@ -278,7 +312,7 @@ impl Engine {
         copy: &CopyFromStdin,
         on_target_validated: impl FnOnce(),
     ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
-        let (_columns, proof) = self.relational_copy_target(&copy.table)?;
+        let (_columns, proof) = copy_target_from_catalog(&self.catalog_snapshot(), &copy.table)?;
         self.execute_relational_copy_rows_profiled_with_target_and_hook(
             txn_id,
             copy,
@@ -304,6 +338,7 @@ impl Engine {
     {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let mut proof = proof.clone();
         let mut normalized_copy = copy.clone();
         if normalized_copy.columns.is_none() {
             normalized_copy.columns = Some(
@@ -322,6 +357,9 @@ impl Engine {
             ..RelationalCopyAdmissionProfile::default()
         };
         if row_count == 0 {
+            if proof.table_access.is_none() {
+                proof.table_access = Some(self.acquire_autocommit_table_access(&copy.table)?);
+            }
             let preflight_started = Instant::now();
             let command = Command::Insert(insert);
             let mut target_changed = false;
@@ -330,7 +368,7 @@ impl Engine {
                 txn_id,
                 |engine, _prospective_commit_seq| {
                     let catalog = engine.catalog_snapshot();
-                    if !engine.copy_target_matches_catalog(&catalog, &normalized_copy, proof) {
+                    if !engine.copy_target_matches_catalog(&catalog, &normalized_copy, &proof) {
                         target_changed = true;
                         return Err(EngineError::ApplyFailed(format!(
                             "COPY target relation \"{}\" changed after COPY began",
@@ -362,35 +400,29 @@ impl Engine {
         profile.render_sql_wal_payload_micros = render_started.elapsed().as_micros();
         let payload: std::sync::Arc<[u8]> = sql.into_bytes().into();
         let request_digest = gpu_db_wal::canonical_request_digest(&payload);
-        let commit = self.commit_state();
-        match commit.resolve_transaction_retry_digest_outcome(txn_id, request_digest) {
-            Ok(Some((token, affected_rows))) if self.committed_seq() >= token.index => {
-                let affected_rows = usize::try_from(affected_rows).map_err(|_| {
-                    ExecuteError::Engine(EngineError::Durability(
-                        "recorded COPY affected-row count exceeds usize".to_string(),
-                    ))
-                })?;
-                return Ok((affected_rows, profile));
+        let terminal_rows = if proof.table_access.is_none() {
+            match self.acquire_autocommit_table_access_after_retry(
+                &copy.table,
+                txn_id,
+                request_digest,
+            )? {
+                StableRetryOr::Terminal(affected_rows) => Some(affected_rows),
+                StableRetryOr::Fresh(table_access) => {
+                    proof.table_access = Some(table_access);
+                    None
+                }
             }
-            Ok(Some((token, _))) => {
-                return Err(ExecuteError::Indeterminate(format!(
-                    "COPY transaction {txn_id} has canonical commit sequence {} but publication has not reached it",
-                    token.index
-                )));
-            }
-            Err(error) => return Err(ExecuteError::Engine(error)),
-            Ok(None) => {}
+        } else {
+            self.resolve_stable_retry_before_table_access(txn_id, request_digest)?
+        };
+        if let Some(affected_rows) = terminal_rows {
+            let affected_rows = usize::try_from(affected_rows).map_err(|_| {
+                ExecuteError::Engine(EngineError::Durability(
+                    "recorded COPY affected-row count exceeds usize".to_string(),
+                ))
+            })?;
+            return Ok((affected_rows, profile));
         }
-        match self.resolve_pending_transaction_claim(txn_id, request_digest) {
-            Ok(true) => {
-                return Err(ExecuteError::Indeterminate(format!(
-                    "COPY transaction {txn_id} is pending in canonical mutation admission"
-                )));
-            }
-            Err(error) => return Err(ExecuteError::Engine(error)),
-            Ok(false) => {}
-        }
-        drop(commit);
         on_precommit();
         let timestamp_micros = self.next_commit_timestamp_micros();
         let mut apply_profile = RelationalCopyAdmissionProfile::default();
@@ -801,6 +833,7 @@ fn copy_target_from_catalog(
         columns,
         CopyTargetProof {
             table: Arc::new(table.clone()),
+            table_access: None,
         },
     ))
 }

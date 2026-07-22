@@ -497,6 +497,13 @@ impl Engine {
     /// The class check: `Some(freeze boundary)` when `table` is chunk-authoritative.
     pub(crate) fn table_chunk_authoritative(&self, table: &str) -> Option<Index> {
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            // A reset or a post-fence first access replaces the inherited cold authority with a
+            // transaction-private typed shard root. Every later statement in this transaction
+            // must keep routing through that new root, including READ COMMITTED rebases.
+            if snapshot.table_is_rewrite_fenced(table) || snapshot.transaction_table_is_reset(table)
+            {
+                return None;
+            }
             return snapshot.chunk_authoritative_tables.get(table).copied();
         }
         self.read_state

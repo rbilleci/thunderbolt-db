@@ -401,6 +401,7 @@ pub fn command_complete_tag(outcome: &QueryOutcome) -> String {
             CommandTag::Insert => format!("INSERT 0 {rows_affected}"),
             CommandTag::Update => format!("UPDATE {rows_affected}"),
             CommandTag::Delete => format!("DELETE {rows_affected}"),
+            CommandTag::Truncate => "TRUNCATE TABLE".to_string(),
             _ => format!("{} {rows_affected}", command_tag_label(tag)),
         },
         QueryOutcome::Command { tag, rows_affected } => match tag {
@@ -412,6 +413,7 @@ pub fn command_complete_tag(outcome: &QueryOutcome) -> String {
             CommandTag::Insert => format!("INSERT 0 {}", rows_affected.unwrap_or(0)),
             CommandTag::Update => format!("UPDATE {}", rows_affected.unwrap_or(0)),
             CommandTag::Delete => format!("DELETE {}", rows_affected.unwrap_or(0)),
+            CommandTag::Truncate => "TRUNCATE TABLE".to_string(),
             CommandTag::Copy => format!("COPY {}", rows_affected.unwrap_or(0)),
             CommandTag::Other(label) => label.clone(),
         },
@@ -429,6 +431,7 @@ fn command_tag_label(tag: &CommandTag) -> &str {
         CommandTag::Insert => "INSERT",
         CommandTag::Update => "UPDATE",
         CommandTag::Delete => "DELETE",
+        CommandTag::Truncate => "TRUNCATE TABLE",
         CommandTag::Copy => "COPY",
         CommandTag::Other(label) => label,
     }

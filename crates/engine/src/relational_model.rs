@@ -556,6 +556,42 @@ pub struct RelationalRetainedSnapshotHandle {
     pub resident_device_null_columns: Vec<ResidentDeviceNullBitmapLayout>,
 }
 
+/// A retained device view plus the exact table-access lease that makes it safe to store and launch
+/// after the engine call returns. The snapshot metadata is captured under the same lease, avoiding
+/// a generation split between an independently fetched handle and the allocation view.
+#[derive(Debug, Clone)]
+pub struct RelationalRetainedDeviceReadView {
+    handle: RelationalRetainedSnapshotHandle,
+    view: CudaResidentDeviceMemoryReadView,
+    _table_access: Arc<TableAccessLease>,
+}
+
+impl RelationalRetainedDeviceReadView {
+    pub(crate) fn new(
+        handle: RelationalRetainedSnapshotHandle,
+        view: CudaResidentDeviceMemoryReadView,
+        table_access: Arc<TableAccessLease>,
+    ) -> Self {
+        Self {
+            handle,
+            view,
+            _table_access: table_access,
+        }
+    }
+
+    pub fn snapshot_handle(&self) -> &RelationalRetainedSnapshotHandle {
+        &self.handle
+    }
+}
+
+impl std::ops::Deref for RelationalRetainedDeviceReadView {
+    type Target = CudaResidentDeviceMemoryReadView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalRetainedReadParam {
     Int4Eq { column: String, value: i32 },
@@ -619,6 +655,10 @@ pub struct RelationalRetainedReadSubmission {
     pub job_count: usize,
     pub submit_wall_micros: u64,
     pub(crate) commit_path_wedged: Arc<AtomicBool>,
+    /// Shared table/dependency lease retained through GPU completion or caller drop. This is part
+    /// of the deferred work item—not merely the submitting stack frame—so a typed reset cannot
+    /// retire its source generation while a kernel still owns it.
+    pub(crate) table_access: Option<Arc<crate::table_access::TableAccessLease>>,
     pub(crate) inner: RelationalRetainedReadSubmissionInner,
 }
 
@@ -637,6 +677,7 @@ impl RelationalRetainedReadSubmission {
                     .to_string(),
             )));
         }
+        let table_access = self.table_access;
         let results = match self.inner {
             RelationalRetainedReadSubmissionInner::Ready(results) => results,
             RelationalRetainedReadSubmissionInner::ReadyBatched(result) => {
@@ -653,6 +694,7 @@ impl RelationalRetainedReadSubmission {
                     .to_string(),
             )));
         }
+        drop(table_access);
         Ok(results)
     }
 }

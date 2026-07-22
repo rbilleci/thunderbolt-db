@@ -777,45 +777,65 @@ impl Engine {
         if self.ensure_commit_path_available().is_err() {
             return None;
         }
-        self.read_residency_snapshots().get(table).map(|entry| {
-            let snapshot = &entry.descriptor;
-            let memory_pressure_active = self
-                .router
-                .runtime()
-                .snapshot()
-                .memory_pressured_gpu_ids
-                .contains(&snapshot.gpu_id);
-            RelationalRetainedSnapshotHandle {
-                schema: snapshot.schema.clone(),
-                table: snapshot.table.clone(),
-                gpu_id: snapshot.gpu_id,
-                generation: snapshot.generation,
-                row_count: snapshot.row_count,
-                column_count: snapshot.column_count,
-                resident_bytes: snapshot.resident_bytes,
-                valid_through_index: snapshot.valid_through_index,
-                valid: snapshot.invalidated_by_txn_id.is_none()
-                    && snapshot.invalidated_at_index.is_none()
-                    && !snapshot.invalidated_by_memory_pressure
-                    && !memory_pressure_active,
-                has_retained_device_memory: self.read_resident_device_memory(table).is_some(),
-                resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
-                resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
-                resident_device_null_columns: snapshot.resident_device_null_columns.clone(),
-            }
-        })
+        let entry = self.read_residency_snapshots().get(table).cloned()?;
+        Some(self.relational_retained_snapshot_handle_from_entry(&entry))
+    }
+
+    fn relational_retained_snapshot_handle_from_entry(
+        &self,
+        entry: &RelationalResidencyEntry,
+    ) -> RelationalRetainedSnapshotHandle {
+        let snapshot = &entry.descriptor;
+        let memory_pressure_active = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&snapshot.gpu_id);
+        RelationalRetainedSnapshotHandle {
+            schema: snapshot.schema.clone(),
+            table: snapshot.table.clone(),
+            gpu_id: snapshot.gpu_id,
+            generation: snapshot.generation,
+            row_count: snapshot.row_count,
+            column_count: snapshot.column_count,
+            resident_bytes: snapshot.resident_bytes,
+            valid_through_index: snapshot.valid_through_index,
+            valid: snapshot.invalidated_by_txn_id.is_none()
+                && snapshot.invalidated_at_index.is_none()
+                && !snapshot.invalidated_by_memory_pressure
+                && !memory_pressure_active,
+            has_retained_device_memory: entry.device_memory.is_some()
+                && snapshot
+                    .device_memory_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.retained),
+            resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
+            resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
+            resident_device_null_columns: snapshot.resident_device_null_columns.clone(),
+        }
     }
 
     pub fn relational_retained_device_read_view(
         &self,
         table: &str,
-    ) -> Option<CudaResidentDeviceMemoryReadView> {
-        let handle = self.relational_retained_snapshot_handle(table)?;
+    ) -> Option<RelationalRetainedDeviceReadView> {
+        let table_access = self.acquire_autocommit_table_access(table).ok()?;
+        self.ensure_commit_path_available().ok()?;
+        // One immutable entry owns both descriptor and allocation. The legacy side map is
+        // write-side lifecycle bookkeeping and may already contain generation B while the entry
+        // map still publishes A; read execution must never combine those independent loads.
+        let entry = self.read_residency_snapshots().get(table).cloned()?;
+        let handle = self.relational_retained_snapshot_handle_from_entry(&entry);
         if !handle.valid || !handle.has_retained_device_memory {
             return None;
         }
-        self.read_resident_device_memory(table)
-            .map(|device_memory| device_memory.read_view())
+        let device_memory = entry.device_memory.as_ref()?;
+        Some(RelationalRetainedDeviceReadView::new(
+            handle,
+            device_memory.read_view(),
+            table_access,
+        ))
     }
 
     /// Pin the resident snapshot metadata for `table` as an OWNED clone (Stage 3 — blocker #2). The

@@ -258,24 +258,13 @@ impl Engine {
         delete: &Delete,
         snapshot: DmlReadSnapshot,
     ) -> Result<WriteDelta, EngineError> {
-        self.prepare_delete_inner(delete, snapshot, false)
-    }
-
-    /// Private transaction-TRUNCATE representation. Ordinary SQL DELETE remains predicate-required;
-    /// only mutation admission can select this full-table path after parsing a TRUNCATE command.
-    pub(crate) fn prepare_full_table_delete(
-        &self,
-        delete: &Delete,
-        snapshot: DmlReadSnapshot,
-    ) -> Result<WriteDelta, EngineError> {
-        self.prepare_delete_inner(delete, snapshot, true)
+        self.prepare_delete_inner(delete, snapshot)
     }
 
     fn prepare_delete_inner(
         &self,
         delete: &Delete,
         snapshot: DmlReadSnapshot,
-        full_table: bool,
     ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
         // Lock-free concurrent-DML path (Stage 2 — blocker #1): pin ONE catalog snapshot for both the
@@ -287,12 +276,8 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", delete.table))
             })?;
-        let filter_groups = if full_table {
-            Vec::new()
-        } else {
-            bind_delete_filter_groups(table, delete)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
-        };
+        let filter_groups = bind_delete_filter_groups(table, delete)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         let visibility = StorageVisibility {
             read_txn_id: txn_id,
         };
@@ -1091,14 +1076,15 @@ impl Engine {
         exclude_keys: Option<&BTreeSet<String>>,
     ) -> Option<bool> {
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
-            if !snapshot
-                .catalog
-                .relational_catalog
-                .contains_key(&table.name)
-                && snapshot
-                    .transaction_shards()
-                    .get(&table.name)
-                    .is_some_and(Vec::is_empty)
+            if snapshot.table_has_typed_empty_root(&table.name)
+                || (!snapshot
+                    .catalog
+                    .relational_catalog
+                    .contains_key(&table.name)
+                    && snapshot
+                        .transaction_shards()
+                        .get(&table.name)
+                        .is_some_and(Vec::is_empty))
             {
                 // A private CREATE owns an exact empty device relation before its first INSERT.
                 // No published or host relation can contain a conflicting key, and later private

@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::engine_mutation_admission::validate_transaction_characteristics;
+use crate::engine_transaction_reset::StableRetryOr;
 
 mod lane;
 mod lane_apply;
@@ -469,7 +470,7 @@ impl Engine {
                 generation: 0,
                 resident_shards: Arc::clone(&resident_shards),
                 streaming_cold_chunks: Arc::clone(&streaming_cold_chunks),
-                deltas: Vec::new(),
+                operations: Vec::new(),
                 write_set: WriteSet::default(),
                 next_row_id: self.read_state.mvcc.current_row_id(),
                 sequence_state: BTreeMap::new(),
@@ -479,6 +480,8 @@ impl Engine {
                 private_gpu_bytes_by_gpu: BTreeMap::new(),
                 commit_gpu_bytes_by_gpu: BTreeMap::new(),
             })),
+            table_access: self.table_access.lease(),
+            rewrite_fenced_tables: Arc::new(Mutex::new(BTreeSet::new())),
             statement_lock: Arc::new(std::sync::Mutex::new(())),
             program_owned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             data_snapshot_acquired: Arc::new(std::sync::atomic::AtomicBool::new(statement_owned)),
@@ -499,7 +502,7 @@ impl Engine {
         characteristics: TransactionCharacteristics,
     ) -> Result<(), ExecuteError> {
         let characteristics = validate_transaction_characteristics(characteristics)?;
-        self.begin_transaction_context_with_owner(txn_id, false, characteristics)
+        self.begin_transaction_context_with_owner(txn_id, false, characteristics, None)
             .map_err(ExecuteError::Txn)
     }
 
@@ -509,8 +512,24 @@ impl Engine {
         characteristics: TransactionCharacteristics,
     ) -> Result<(), ExecuteError> {
         let characteristics = validate_transaction_characteristics(characteristics)?;
-        self.begin_transaction_context_with_owner(txn_id, true, characteristics)
+        self.begin_transaction_context_with_owner(txn_id, true, characteristics, None)
             .map_err(ExecuteError::Txn)
+    }
+
+    pub(crate) fn begin_claimed_transaction_context(
+        &self,
+        txn_id: TxnId,
+        characteristics: TransactionCharacteristics,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<(), ExecuteError> {
+        let characteristics = validate_transaction_characteristics(characteristics)?;
+        self.begin_transaction_context_with_owner(
+            txn_id,
+            false,
+            characteristics,
+            Some(request_digest),
+        )
+        .map_err(ExecuteError::Txn)
     }
 
     fn begin_transaction_context_with_owner(
@@ -518,17 +537,21 @@ impl Engine {
         txn_id: TxnId,
         program_owned: bool,
         characteristics: TransactionCharacteristics,
+        allowed_pending: Option<gpu_db_wal::CanonicalDigest>,
     ) -> Result<(), TxnError> {
         let mut commit = self.commit_state();
-        if commit.transaction_status.contains_key(&txn_id)
-            || self
-                .pending_transaction_claims
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(&txn_id)
-        {
+        let pending = self
+            .pending_transaction_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pending_rejected = match allowed_pending {
+            Some(expected) => pending.get(&txn_id) != Some(&expected),
+            None => pending.contains_key(&txn_id),
+        };
+        if commit.transaction_status.contains_key(&txn_id) || pending_rejected {
             return Err(TxnError::AlreadyExists(txn_id));
         }
+        drop(pending);
         let snapshot = self.capture_transaction_snapshot(self.committed_seq(), characteristics);
         snapshot
             .program_owned
@@ -591,6 +614,25 @@ impl Engine {
         drop(active);
         self.gc_transaction_created_by_regions();
         Ok(successor_id)
+    }
+
+    /// Drop an internal autocommit transaction that failed before durability while leaving its
+    /// caller-owned stable ID reusable. This is deliberately unavailable to user BEGIN/ROLLBACK.
+    pub(crate) fn cancel_internal_transaction_context(
+        &self,
+        txn_id: TxnId,
+    ) -> Result<(), TxnError> {
+        let mut commit = self.commit_state();
+        commit.txn_manager.cancel(txn_id)?;
+        let removed = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deregister_transaction(txn_id);
+        debug_assert!(removed.is_some(), "cancelled transaction lost its snapshot");
+        drop(commit);
+        self.gc_transaction_created_by_regions();
+        Ok(())
     }
 
     /// Off-lock prepare dispatch: run the pure `prepare_*` for a DML command against `snapshot`.
@@ -723,6 +765,7 @@ impl Engine {
             expected_catalog_version,
             offlock_delta,
             binary_wal_template: None,
+            table_access: None,
             write_set,
             read_snapshot,
             outcome: Arc::new(CommitWaveDone::default()),
@@ -767,6 +810,7 @@ impl Engine {
             expected_catalog_version: None,
             offlock_delta,
             binary_wal_template,
+            table_access: None,
             write_set,
             read_snapshot,
             outcome: Arc::new(CommitWaveDone::default()),
@@ -1699,6 +1743,22 @@ impl Engine {
         if command_has_returning(&cmd) {
             return Err(discarded_returning_error());
         }
+        if let Command::TruncateTable(truncate) = &cmd {
+            if self.transaction_snapshot_handle(txn_id).is_some() {
+                self.execute_truncate_in_transaction(
+                    txn_id,
+                    truncate.clone(),
+                    expected_catalog_version,
+                )?;
+            } else {
+                self.execute_truncate_autocommit(
+                    txn_id,
+                    truncate.clone(),
+                    expected_catalog_version,
+                )?;
+            }
+            return Ok(());
+        }
         if let Some(snapshot) = self.transaction_snapshot_handle(txn_id) {
             self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
             if matches!(
@@ -1719,6 +1779,24 @@ impl Engine {
                 )));
             }
         }
+        let canonical_payload = Self::command_claims_canonical_mutation(&cmd)
+            .then(|| std::sync::Arc::<[u8]>::from(text.as_bytes()));
+        // Resolve stable request identity before claiming any new relation. Exact retries have no
+        // new table access and must remain idempotent while a later reset retains exclusivity.
+        // Fresh work retains the claimant through reverse-gather, apply, and publication.
+        let _table_access = if let Some(payload) = canonical_payload.as_ref() {
+            let request_digest = gpu_db_wal::canonical_request_digest(payload);
+            match self.acquire_autocommit_command_table_access_after_retry(
+                &cmd,
+                txn_id,
+                request_digest,
+            )? {
+                StableRetryOr::Terminal(_) => return Ok(()),
+                StableRetryOr::Fresh(access) => access,
+            }
+        } else {
+            self.acquire_autocommit_command_table_access(&cmd)?
+        };
         // RETIRE-002 boundary: representation-changing commands reverse-gather every
         // device-authoritative table before DDL repair/validation. Normal DML and SELECT never
         // enter this sweep, and no device decline dispatches here.
@@ -1838,20 +1916,30 @@ impl Engine {
                 self.preflight_unique_index_constraints(&cmd, txn_id)?;
                 match self.route_command(&cmd) {
                     RouteDecision::Gpu(_) | RouteDecision::Cpu => {
-                        self.commit_mutation_at_with_catalog(
+                        self.commit_mutation_at_with_catalog_table_access(
                             txn_id,
-                            std::sync::Arc::from(text.as_bytes()),
+                            std::sync::Arc::clone(
+                                canonical_payload
+                                    .as_ref()
+                                    .expect("serialized mutation carries canonical payload"),
+                            ),
                             timestamp_micros,
                             expected_catalog_version,
+                            _table_access.as_ref(),
                         )?;
                     }
                     RouteDecision::CpuFallback { reason, .. } => {
                         self.metrics.inc_gpu_fallback(reason);
-                        self.commit_mutation_at_with_catalog(
+                        self.commit_mutation_at_with_catalog_table_access(
                             txn_id,
-                            std::sync::Arc::from(text.as_bytes()),
+                            std::sync::Arc::clone(
+                                canonical_payload
+                                    .as_ref()
+                                    .expect("serialized mutation carries canonical payload"),
+                            ),
                             timestamp_micros,
                             expected_catalog_version,
+                            _table_access.as_ref(),
                         )?;
                     }
                 }

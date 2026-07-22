@@ -190,7 +190,13 @@ impl Engine {
             let mut rows: Vec<Option<Vec<Vec<SqlValue>>>> =
                 Vec::with_capacity(plan.relations.len());
             for relation in &plan.relations {
-                let (table, relation_rows) = bind(relation)?;
+                let (table, mut relation_rows) = bind(relation)?;
+                if self
+                    .current_transaction_read_snapshot()
+                    .is_some_and(|snapshot| snapshot.table_has_typed_empty_root(&table.name))
+                {
+                    relation_rows = Some(Vec::new());
+                }
                 tables.push(table);
                 rows.push(relation_rows);
             }
@@ -243,7 +249,13 @@ impl Engine {
             let mut tables: Vec<RelationalTable> = Vec::with_capacity(relations.len());
             let mut rows: Vec<Option<Vec<Vec<SqlValue>>>> = Vec::with_capacity(relations.len());
             for relation in &relations {
-                let (table, relation_rows) = bind(relation)?;
+                let (table, mut relation_rows) = bind(relation)?;
+                if self
+                    .current_transaction_read_snapshot()
+                    .is_some_and(|snapshot| snapshot.table_has_typed_empty_root(&table.name))
+                {
+                    relation_rows = Some(Vec::new());
+                }
                 tables.push(table);
                 rows.push(relation_rows);
             }
@@ -308,7 +320,7 @@ impl Engine {
             .from_clause
             .first()
             .is_some_and(from_node_has_column_alias_list);
-        let (table, bound, transient_rows) = if synthesized_catalog_allowed
+        let (table, bound, mut transient_rows) = if synthesized_catalog_allowed
             && !public_relation_name_exists(&catalog, &select.table)
         {
             if let Some((mut table, mut rows)) =
@@ -356,6 +368,12 @@ impl Engine {
             let (table, bound, _) = self.bind_relational_select_at(&select, copin_s)?;
             (table, bound, None)
         };
+        if self
+            .current_transaction_read_snapshot()
+            .is_some_and(|snapshot| snapshot.table_has_typed_empty_root(&table.name))
+        {
+            transient_rows = Some(Vec::new());
+        }
         let predicate = stmt
             .where_clause
             .as_deref()

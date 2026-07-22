@@ -51,6 +51,15 @@ impl Engine {
         txn_id: u64,
         payload: std::sync::Arc<[u8]>,
     ) -> Result<CommitToken, EngineError> {
+        self.commit_mutation_with_table_access(txn_id, payload, None)
+    }
+
+    pub(crate) fn commit_mutation_with_table_access(
+        &self,
+        txn_id: u64,
+        payload: std::sync::Arc<[u8]>,
+        table_access: Option<&Arc<TableAccessLease>>,
+    ) -> Result<CommitToken, EngineError> {
         if self.transaction_snapshot_handle(txn_id).is_some() {
             return Err(EngineError::ApplyFailed(format!(
                 "transaction id {txn_id} is active and cannot be claimed by an autocommit write"
@@ -62,7 +71,13 @@ impl Engine {
         #[cfg(test)]
         self.run_commit_prelock_hook();
         let timestamp_micros = self.next_commit_timestamp_micros();
-        self.commit_mutation_at(txn_id, payload, timestamp_micros)
+        self.commit_mutation_at_with_catalog_inner(
+            txn_id,
+            payload,
+            timestamp_micros,
+            None,
+            table_access,
+        )
     }
 
     fn reject_discarded_returning_payload(payload: &[u8]) -> Result<(), EngineError> {
@@ -103,6 +118,40 @@ impl Engine {
         timestamp_micros: u64,
         expected_catalog_version: Option<Index>,
     ) -> Result<CommitToken, EngineError> {
+        self.commit_mutation_at_with_catalog_inner(
+            txn_id,
+            payload,
+            timestamp_micros,
+            expected_catalog_version,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_mutation_at_with_catalog_table_access(
+        &self,
+        txn_id: u64,
+        payload: std::sync::Arc<[u8]>,
+        timestamp_micros: u64,
+        expected_catalog_version: Option<Index>,
+        table_access: Option<&Arc<TableAccessLease>>,
+    ) -> Result<CommitToken, EngineError> {
+        self.commit_mutation_at_with_catalog_inner(
+            txn_id,
+            payload,
+            timestamp_micros,
+            expected_catalog_version,
+            table_access,
+        )
+    }
+
+    fn commit_mutation_at_with_catalog_inner(
+        &self,
+        txn_id: u64,
+        payload: std::sync::Arc<[u8]>,
+        timestamp_micros: u64,
+        expected_catalog_version: Option<Index>,
+        table_access: Option<&Arc<TableAccessLease>>,
+    ) -> Result<CommitToken, EngineError> {
         if self.transaction_snapshot_handle(txn_id).is_some() {
             return Err(EngineError::ApplyFailed(format!(
                 "transaction id {txn_id} is active and cannot be claimed by an autocommit write"
@@ -132,6 +181,15 @@ impl Engine {
         if let Some(token) = commit.resolve_transaction_retry(txn_id, &payload)? {
             return Ok(token);
         }
+        // Raw compatibility callers can still reach this low-level claimant without the typed
+        // admission facade. Retain a shared stable-OID guard through apply/publication so a
+        // transactional table reset cannot replace the same root concurrently. This raw API
+        // exposes only `EngineError`; product-facing paths acquire the guard earlier and preserve
+        // the retryable `ExecuteError::Serialization`/40001 classification.
+        let _raw_table_access = table_access
+            .is_none()
+            .then(|| self.acquire_raw_mutation_table_access(&payload))
+            .transpose()?;
         if let Some(expected) = expected_catalog_version {
             let actual = self.catalog_snapshot().commit_seq;
             if expected != actual {
@@ -354,6 +412,18 @@ impl Engine {
             return Ok(());
         };
         let last_txn_id = *last_txn_id;
+        // Queue items already own these guards, but the crate-private batch claimant also has
+        // direct recovery/compatibility tests. Re-derive the complete set from admitted payloads
+        // so no caller can bypass the table-reset boundary; exact canonical retries were removed
+        // above and need no new lease.
+        let _table_access = admitted
+            .iter()
+            .map(|(_, payload)| self.acquire_raw_mutation_table_access(payload))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| BatchCommitFailure {
+                requeue: false,
+                error,
+            })?;
         let exact_outcomes: Vec<u64> = admitted
             .iter()
             .map(|(_, payload)| Self::canonical_affected_rows(payload))
@@ -527,17 +597,21 @@ impl Engine {
         let (handled, maintained) = {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
-            let atomic_transaction = to_apply.len() == 1
-                && matches!(
-                    decode_binary_record(&to_apply[0].payload),
-                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(_))
-                );
+            let atomic_transaction =
+                crate::engine_transaction_reset::is_single_binary_transaction(&to_apply);
             let mut applied: Vec<AppliedRowMutation> = Vec::new();
             let mut recorded_write_set = false;
             let mut insert_batch: BTreeMap<String, InsertAccum> = BTreeMap::new();
             let mut maintained: BTreeSet<String> = BTreeSet::new();
             let mut working_catalog_changed = false;
             for e in &to_apply {
+                let mutates_working_catalog = Self::entry_mutates_working_catalog(e, cat);
+                let prior_table_identities =
+                    mutates_working_catalog.then(|| Self::table_root_identities(cat));
+                crate::engine_transaction_reset::validate_binary_table_reset_source_roots_payload(
+                    &e.payload,
+                    &commit.ledger,
+                )?;
                 // RETIRE-002 repair boundary: DML no longer maintains a host tuple-store shadow.
                 // A rare DDL/recovery operator that still consumes that repair representation must
                 // reconstruct it explicitly from the current device generation immediately before
@@ -633,7 +707,7 @@ impl Engine {
                         .sum()
                 };
                 commit.last_applied_outcome = Some((e.index, affected_rows));
-                working_catalog_changed |= Self::entry_mutates_working_catalog(e, cat);
+                working_catalog_changed |= mutates_working_catalog;
                 for m in applied_entry {
                     // C2 (write-path assessment): record the SERIALIZED path's write-set into the
                     // SI recent-commits ledger, exactly as the concurrent path records its own —
@@ -659,6 +733,16 @@ impl Engine {
                         }
                     }
                     applied.push(m);
+                }
+                if let Some(prior_table_identities) = prior_table_identities.as_ref() {
+                    // Catalog/DML groups are replayed one durable record at a time. Reconcile at
+                    // this exact transition as well, so create/rename/drop/recreate batches build
+                    // the same stable-OID root ledger regardless of apply grouping.
+                    self.reconcile_table_root_ledger(
+                        &mut commit.ledger,
+                        prior_table_identities,
+                        cat,
+                    );
                 }
                 commit.repl.mark_applied(e.index);
             }
@@ -805,6 +889,7 @@ impl Engine {
             if !atomic_transaction {
                 if let Some(applied_ref) = applied.last() {
                     let table_name = match applied_ref {
+                        AppliedRowMutation::TableReset { reset, .. } => reset.table.as_str(),
                         AppliedRowMutation::Insert { table, .. }
                         | AppliedRowMutation::Delete { table, .. }
                         | AppliedRowMutation::Update { table, .. } => table.as_str(),
@@ -813,6 +898,7 @@ impl Engine {
                     // authoritative generation stays current, but cannot establish authority for a table
                     // whose residency was not confirmed by an actual append or tombstone.
                     let applied_changed_rows = match applied_ref {
+                        AppliedRowMutation::TableReset { .. } => true,
                         AppliedRowMutation::Insert { rows, .. } => !rows.is_empty(),
                         AppliedRowMutation::Delete { rows, .. } => !rows.is_empty(),
                         AppliedRowMutation::Update { old_rows, .. } => !old_rows.is_empty(),
@@ -850,6 +936,9 @@ impl Engine {
                         && !maintained.contains(table_name)
                     {
                         match applied_ref {
+                            AppliedRowMutation::TableReset { .. } => {
+                                unreachable!("table resets are atomic-transaction-only")
+                            }
                             AppliedRowMutation::Insert { rows, row_ids, .. }
                                 if !rows.is_empty() =>
                             {
@@ -981,6 +1070,7 @@ impl Engine {
             if handled && self.auto_vacuum_enabled() {
                 if let Some(applied_ref) = applied.last() {
                     let table_name = match applied_ref {
+                        AppliedRowMutation::TableReset { reset, .. } => reset.table.as_str(),
                         AppliedRowMutation::Insert { table, .. }
                         | AppliedRowMutation::Delete { table, .. }
                         | AppliedRowMutation::Update { table, .. } => table.as_str(),
@@ -1170,7 +1260,11 @@ impl Engine {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
             let mut working_catalog_changed = false;
+            let mut recorded_write_set = false;
             for e in &to_apply {
+                let mutates_working_catalog = Self::entry_mutates_working_catalog(e, cat);
+                let prior_table_identities =
+                    mutates_working_catalog.then(|| Self::table_root_identities(cat));
                 if Self::entry_requires_relational_repair(e) {
                     let boundary = e.index.saturating_sub(1);
                     let class_tables = self
@@ -1228,7 +1322,12 @@ impl Engine {
                         return Err(error);
                     }
                 };
-                if let Some((table, rows, _write_set, row_ids)) = applied_insert {
+                if let Some((table, rows, write_set, row_ids)) = applied_insert {
+                    // The direct-current COPY optimization bypasses `apply_mvcc_entry` for the
+                    // current record, so it must install the same row/table write footprint here.
+                    // Typed reset source roots and replay both consume this canonical high-water.
+                    commit.ledger.record(&write_set, e.index);
+                    recorded_write_set = true;
                     let appended = if rows.is_empty() {
                         true
                     } else if self.table_chunk_authoritative(&table).is_some() {
@@ -1257,8 +1356,25 @@ impl Engine {
                         return Err(error);
                     }
                 }
-                working_catalog_changed |= Self::entry_mutates_working_catalog(e, cat);
+                working_catalog_changed |= mutates_working_catalog;
+                if let Some(prior_table_identities) = prior_table_identities.as_ref() {
+                    self.reconcile_table_root_ledger(
+                        &mut commit.ledger,
+                        prior_table_identities,
+                        cat,
+                    );
+                }
                 commit.repl.mark_applied(e.index);
+            }
+            if recorded_write_set {
+                let prune_boundary = self
+                    .active_snapshots
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .oldest()
+                    .map(|oldest| oldest.saturating_sub(1))
+                    .unwrap_or(token.index);
+                commit.ledger.prune_below(prune_boundary);
             }
 
             // Publish ordering (PART B): residency → catalog ring push → `committed_seq` LAST (mirrors

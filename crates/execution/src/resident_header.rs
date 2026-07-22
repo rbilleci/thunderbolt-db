@@ -59,6 +59,9 @@ pub(super) fn launch_cuda_resident_row_count(
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
+    // A cache miss loads the CUDA module before the launch helper gets a chance to bind. Make
+    // first use safe when reset proof runs on a worker other than the allocation thread.
+    resident.primary().set_current()?;
     let function = resident
         .primary()
         .cached_function(c"gpu_db_resident_row_count", &ptx)?;

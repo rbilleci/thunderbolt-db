@@ -629,6 +629,26 @@ impl MvccData {
         result
     }
 
+    /// Publish a fresh empty table root without cloning or walking the retired payload. Semantic
+    /// table resets use this O(1) control-plane replacement; old handles remain internally pinned
+    /// for reclamation but are no longer reachable by a future SQL read.
+    pub(crate) fn publish_empty_table(&self, table: &str) {
+        let data = Arc::new(TableVersionData::default());
+        if let Some(cell) = self.tables_read().get(table) {
+            cell.publish(data);
+            return;
+        }
+        let mut map = self.tables_write();
+        match map.get(table) {
+            Some(cell) => {
+                cell.publish(data);
+            }
+            None => {
+                map.insert(table.to_string(), SnapshotCell::new(data));
+            }
+        }
+    }
+
     /// Mutate the KV partition via copy-on-write and publish the new generation. `&self` (the cell
     /// publishes via `&self`); the caller serializes (commit critical section / serialized DDL apply).
     pub(crate) fn with_kv_mut<R>(&self, mutate: impl FnOnce(&mut InMemoryTupleStore) -> R) -> R {
@@ -839,7 +859,35 @@ impl Engine {
     ) -> Arc<BTreeMap<String, RelationalResidencyEntry>> {
         self.current_transaction_read_snapshot().map_or_else(
             || self.read_state.residency.snapshots.load_full(),
-            |snapshot| Arc::clone(&snapshot.resident_snapshots),
+            |snapshot| {
+                let fenced = snapshot
+                    .rewrite_fenced_tables
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let mut visible = (*snapshot.resident_snapshots).clone();
+                for table in fenced.iter() {
+                    visible.remove(table);
+                }
+                let reset_tables = snapshot
+                    .delta
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .operations
+                    .iter()
+                    .filter_map(|operation| match operation {
+                        TransactionOperation::TableReset(reset) => Some(reset.table.clone()),
+                        TransactionOperation::Row(_) => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                if fenced.is_empty() && reset_tables.is_empty() {
+                    return Arc::clone(&snapshot.resident_snapshots);
+                }
+                for table in reset_tables {
+                    visible.remove(&table);
+                }
+                Arc::new(visible)
+            },
         )
     }
 
@@ -866,6 +914,10 @@ impl Engine {
         table: &str,
     ) -> Option<Arc<CudaResidentDeviceMemory>> {
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            if snapshot.table_is_rewrite_fenced(table) || snapshot.transaction_table_is_reset(table)
+            {
+                return None;
+            }
             return snapshot
                 .resident_snapshots
                 .get(table)
@@ -880,6 +932,10 @@ impl Engine {
                 boundary, snapshot.boundary,
                 "transaction-scoped table read attempted to rebind its boundary"
             );
+            if snapshot.table_is_rewrite_fenced(table) || snapshot.transaction_table_is_reset(table)
+            {
+                return TableRowsView::Empty(Arc::clone(&EMPTY_TABLE_VERSION_DATA));
+            }
             return snapshot.table_versions.get(table).map_or_else(
                 || TableRowsView::Empty(Arc::clone(&EMPTY_TABLE_VERSION_DATA)),
                 |handle| TableRowsView::Resident(handle.clone()),

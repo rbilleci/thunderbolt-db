@@ -602,6 +602,7 @@ impl Engine {
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_transaction_snapshot_current(txn_id, snapshot)?;
+        self.acquire_transaction_table_access(snapshot, [select.table.clone()])?;
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
@@ -623,6 +624,15 @@ impl Engine {
             .get(&select.table)
             .cloned()
             .ok_or_else(|| ExecuteError::UndefinedRelation(select.table.clone()))?;
+        if snapshot.table_has_typed_empty_root(&select.table) {
+            let _scope = self.enter_transaction_read(Arc::clone(snapshot));
+            return self.execute_transient_rows_via_general(
+                select,
+                table,
+                Vec::new(),
+                snapshot.boundary,
+            );
+        }
         let bound = bind_relational_select(&table, select)?;
         let groups = normalized_select_groups(&bound);
         let [group] = groups.as_slice() else {

@@ -380,7 +380,7 @@ impl Engine {
             .collect()
     }
 
-    pub(super) fn purge_chunk_key_indexes_for_table(&self, table_name: &str) {
+    pub(crate) fn purge_chunk_key_indexes_for_table(&self, table_name: &str) {
         let residency = &self.read_state.residency;
         let mut cache = residency
             .chunk_key_index
@@ -400,7 +400,7 @@ impl Engine {
         }
     }
 
-    pub(super) fn purge_chunk_key_blooms_for_table(&self, table_name: &str) {
+    pub(crate) fn purge_chunk_key_blooms_for_table(&self, table_name: &str) {
         let residency = &self.read_state.residency;
         let mut cache = residency
             .chunk_key_bloom

@@ -1276,6 +1276,10 @@ fn parse_truncate_table(input: &str) -> Result<TruncateTable, ParseError> {
     if let Some(before_restart) = strip_keyword_suffix_case_insensitive(rest, "RESTART IDENTITY") {
         rest = before_restart.trim_end();
         restart_identity = true;
+    } else if let Some(before_continue) =
+        strip_keyword_suffix_case_insensitive(rest, "CONTINUE IDENTITY")
+    {
+        rest = before_continue.trim_end();
     }
     if rest.is_empty()
         || find_keyword_outside_quotes(rest, "CASCADE").is_some()
@@ -1472,6 +1476,26 @@ fn split_returning_clause(input: &str) -> Result<(&str, Vec<String>), ParseError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_bounded_truncate_identity_modes() {
+        assert_eq!(
+            parse_truncate_table("TRUNCATE TABLE accounts CONTINUE IDENTITY").unwrap(),
+            TruncateTable {
+                name: "accounts".to_string(),
+                restart_identity: false,
+            }
+        );
+        assert_eq!(
+            parse_truncate_table("TRUNCATE ONLY accounts RESTART IDENTITY").unwrap(),
+            TruncateTable {
+                name: "accounts".to_string(),
+                restart_identity: true,
+            }
+        );
+        assert!(parse_truncate_table("TRUNCATE a, b CONTINUE IDENTITY").is_err());
+        assert!(parse_truncate_table("TRUNCATE accounts CASCADE").is_err());
+    }
 
     #[test]
     fn parses_frozen_w1_returning_and_checked_update_shape() {

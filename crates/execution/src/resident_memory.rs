@@ -5,7 +5,11 @@ use std::sync::{Arc, Mutex};
 use libloading::Library;
 
 use crate::cuda_context::{check_cuda, GpuPrimaryContext};
-use crate::{launch_cuda_resident_row_count, CudaDeviceMemoryProof, CudaRuntimeProbeError};
+use crate::{
+    launch_cuda_resident_row_count, launch_cuda_resident_visible_count,
+    launch_cuda_resident_visible_digest, CudaDeviceMemoryProof, CudaRuntimeProbeError,
+    CudaVisibleDigestColumn, CudaVisibleSourceDigest,
+};
 
 pub struct CudaResidentDeviceMemory {
     pub(super) metadata: CudaDeviceMemoryProof,
@@ -439,6 +443,17 @@ impl CudaResidentDeviceMemory {
         CudaResidentAllocationWeak(Arc::downgrade(&self.allocation))
     }
 
+    #[cfg(test)]
+    pub(crate) fn clone_with_primary_for_test(&self, primary: Arc<GpuPrimaryContext>) -> Self {
+        Self {
+            metadata: self.metadata.clone(),
+            device_ptr: self.device_ptr,
+            primary,
+            allocation: Arc::clone(&self.allocation),
+            last_kernel_event_elapsed_us: Mutex::new(None),
+        }
+    }
+
     pub fn last_kernel_event_elapsed_us(&self) -> Option<u64> {
         self.last_kernel_event_elapsed_us
             .lock()
@@ -458,5 +473,43 @@ impl CudaResidentDeviceMemory {
 
     pub fn count_rows_from_header(&self) -> Result<u64, CudaRuntimeProbeError> {
         launch_cuda_resident_row_count(self)
+    }
+
+    /// GPU-reduce the rows visible at `read_txn_id` to one scalar. Version lanes may live in
+    /// independent allocations (resident shards) or at byte offsets in this allocation (cold
+    /// chunk replay); `None` denotes an all-visible side of the predicate.
+    pub fn count_visible_rows(
+        &self,
+        row_count: u64,
+        read_txn_id: i64,
+        deleted_by: Option<(&Self, u64)>,
+        created_by: Option<(&Self, u64)>,
+    ) -> Result<u64, CudaRuntimeProbeError> {
+        launch_cuda_resident_visible_count(self, row_count, read_txn_id, deleted_by, created_by)
+    }
+
+    /// GPU-reduce the exact visible logical source set to a constant-size digest. The digest binds
+    /// every visible stable row identity, typed column value, and NULL bit; version lanes select
+    /// visibility but are not representation-dependent digest input. This makes the result stable
+    /// across equivalent hot-shard and staged-cold layouts while detecting same-cardinality content
+    /// substitution. Only the 40-byte count/digest result crosses D2H.
+    pub fn digest_visible_source(
+        &self,
+        row_count: u64,
+        columns: &[CudaVisibleDigestColumn],
+        row_ids: Option<(&Self, u64)>,
+        read_txn_id: i64,
+        deleted_by: Option<(&Self, u64)>,
+        created_by: Option<(&Self, u64)>,
+    ) -> Result<CudaVisibleSourceDigest, CudaRuntimeProbeError> {
+        launch_cuda_resident_visible_digest(
+            self,
+            row_count,
+            columns,
+            row_ids,
+            read_txn_id,
+            deleted_by,
+            created_by,
+        )
     }
 }

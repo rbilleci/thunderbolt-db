@@ -4,8 +4,12 @@
 //! accessors.
 
 use super::*;
+use crate::engine_transaction_reset::{
+    final_transaction_operations, final_transaction_write_set, table_access_dependency_identities,
+    table_schema_digest, transaction_row_deltas,
+};
 
-mod gpu_accounting;
+pub(crate) mod gpu_accounting;
 mod isolation;
 use gpu_accounting::transaction_private_shard_bytes;
 pub(crate) use gpu_accounting::TransactionGpuReservation;
@@ -152,25 +156,6 @@ impl Engine {
         command: Command,
         snapshot: &Arc<TransactionSnapshot>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
-        self.execute_dml_in_transaction_statement_locked(txn_id, command, snapshot, false)
-    }
-
-    pub(crate) fn execute_full_table_delete_in_transaction_statement_locked(
-        &self,
-        txn_id: TxnId,
-        command: Command,
-        snapshot: &Arc<TransactionSnapshot>,
-    ) -> Result<DmlExecutionResult, ExecuteError> {
-        self.execute_dml_in_transaction_statement_locked(txn_id, command, snapshot, true)
-    }
-
-    fn execute_dml_in_transaction_statement_locked(
-        &self,
-        txn_id: TxnId,
-        command: Command,
-        snapshot: &Arc<TransactionSnapshot>,
-        full_table_delete: bool,
-    ) -> Result<DmlExecutionResult, ExecuteError> {
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         self.ensure_commit_path_available()
@@ -209,6 +194,11 @@ impl Engine {
                     "relation \"{table_name}\" does not exist in the transaction generation"
                 )))
             })?;
+        let access_identities =
+            table_access_dependency_identities(&transaction_catalog.relational_catalog, &table)?;
+        // RR reads retain their historical catalog/OID binding, but writes may not target an
+        // object that has since been renamed, dropped, or recreated under the same name.
+        self.acquire_transaction_write_table_access_identities(snapshot, &access_identities)?;
         let _scope = self.enter_transaction_read(Arc::clone(snapshot));
 
         let (generation, next_row_id) = {
@@ -222,17 +212,7 @@ impl Engine {
             commit_seq: snapshot.boundary,
             next_row_id,
         };
-        let prepared = if full_table_delete {
-            let Command::Delete(delete) = &command else {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "full-table transaction staging requires DELETE representation".to_string(),
-                )));
-            };
-            self.prepare_full_table_delete(delete, dml_snapshot)
-                .map_err(ExecuteError::Engine)?
-        } else {
-            self.prepare_dml(&command, dml_snapshot, InsertPrepareValidation::Full)?
-        };
+        let prepared = self.prepare_dml(&command, dml_snapshot, InsertPrepareValidation::Full)?;
         let prepared_sequence_state = match &prepared.mutation {
             PreparedMutation::Insert { seq_advances, .. } => seq_advances.clone(),
             PreparedMutation::Update { .. } | PreparedMutation::Delete { .. } => BTreeMap::new(),
@@ -277,10 +257,12 @@ impl Engine {
             &delta.private_gpu_bytes_by_gpu,
             &next_private_gpu_bytes,
         )?;
-        delta.write_set.extend_deduplicated(&prepared.write_set);
         delta.next_row_id = delta.next_row_id.saturating_add(prepared.rows_consumed);
         delta.sequence_state.extend(prepared_sequence_state);
-        delta.deltas.push(prepared);
+        delta
+            .operations
+            .push(TransactionOperation::Row(Box::new(prepared)));
+        delta.write_set = final_transaction_write_set(&delta.operations);
         delta.resident_shards = Arc::new(next_shards);
         delta.streaming_cold_chunks = Arc::new(next_cold_chunks);
         delta.generation = delta.generation.saturating_add(1);
@@ -304,6 +286,34 @@ impl Engine {
         txn_id: TxnId,
         chain: bool,
         timestamp_micros: u64,
+    ) -> Result<Option<TxnId>, ExecuteError> {
+        self.commit_transaction_delta_inner(txn_id, chain, timestamp_micros, None)
+    }
+
+    pub(crate) fn commit_claimed_transaction_delta(
+        &self,
+        txn_id: TxnId,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        timestamp_micros: u64,
+    ) -> Result<(), ExecuteError> {
+        let snapshot = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        let _statement = snapshot
+            .statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        self.commit_transaction_delta_inner(txn_id, false, timestamp_micros, Some(request_digest))?;
+        Ok(())
+    }
+
+    fn commit_transaction_delta_inner(
+        &self,
+        txn_id: TxnId,
+        chain: bool,
+        timestamp_micros: u64,
+        request_digest_override: Option<gpu_db_wal::CanonicalDigest>,
     ) -> Result<Option<TxnId>, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
@@ -330,23 +340,25 @@ impl Engine {
                 "transaction id {txn_id} was already claimed by another write strategy while the explicit transaction was active"
             ))));
         }
-        let (deltas, catalog_command, catalog_base) = {
+        let (operations, catalog_command, catalog_base) = {
             let delta = snapshot
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
-                delta.deltas.clone(),
+                delta.operations.clone(),
                 delta.catalog_command.clone(),
                 delta.catalog_base.clone(),
             )
         };
-        if deltas.is_empty() && catalog_command.is_none() {
+        if operations.is_empty() && catalog_command.is_none() {
             drop(commit);
             return self
                 .finish_transaction_context(txn_id, true, chain)
                 .map_err(ExecuteError::Txn);
         }
+        let all_deltas = transaction_row_deltas(&operations);
+        let (deltas, table_resets) = final_transaction_operations(&operations);
         if let Some(catalog_command) = &catalog_command {
             let base = catalog_base.ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
@@ -375,6 +387,22 @@ impl Engine {
                 }
             }
         }
+        let published_catalog = self.read_state.latest_catalog();
+        for delta in &deltas {
+            if let Some((name, expected)) =
+                delta.catalog_dependencies.iter().find(|(name, expected)| {
+                    snapshot.catalog.relational_catalog.get(name.as_str()) == Some(*expected)
+                        && published_catalog.relational_catalog.get(name.as_str())
+                            != Some(*expected)
+                })
+            {
+                return Err(ExecuteError::Serialization(format!(
+                    "catalog dependency \"{name}\" changed stable identity or schema before transaction commit (expected OID {})",
+                    expected.oid
+                )));
+            }
+        }
+        self.validate_transaction_table_resets(&published_catalog, &table_resets, &commit.ledger)?;
         let staged_tables = deltas
             .iter()
             .map(|delta| match &delta.mutation {
@@ -382,6 +410,7 @@ impl Engine {
                 | PreparedMutation::Update { table, .. }
                 | PreparedMutation::Delete { table, .. } => table,
             })
+            .chain(table_resets.iter().map(|reset| &reset.table))
             .collect::<BTreeSet<_>>();
         if let Some(table) = staged_tables.iter().find(|table| {
             snapshot
@@ -412,7 +441,7 @@ impl Engine {
         // A later statement may update/delete a row inserted earlier in this transaction. Its
         // provisional row key is not a real conflict point: nobody outside this transaction can
         // observe that entity, and COMMIT assigns it a fresh globally-claimed identity.
-        let provisional_inserts = Self::transaction_insert_identities(&deltas)?;
+        let provisional_inserts = Self::transaction_insert_identities(&all_deltas)?;
         self.validate_transaction_device_row_conflicts(&snapshot, &deltas, &provisional_inserts)?;
 
         // The canonical commit mutex excludes every other row-id claimant. Use its current value as
@@ -427,6 +456,7 @@ impl Engine {
             ))
         })?;
         let mut record = Self::resolved_transaction_record(
+            &all_deltas,
             &deltas,
             &provisional_inserts,
             final_base,
@@ -435,7 +465,48 @@ impl Engine {
         if let Some(catalog_command) = catalog_command {
             record.catalog_commands.push(catalog_command.command);
         }
-        self.validate_transaction_device_unique_conflicts(&snapshot, &deltas, &record)?;
+        record.table_resets = table_resets
+            .iter()
+            .map(StagedTableReset::to_binary)
+            .collect();
+        record.table_identities = record
+            .mutations
+            .iter()
+            .map(|mutation| match mutation {
+                BinaryTransactionMutation::Insert { table, .. }
+                | BinaryTransactionMutation::Update { table, .. }
+                | BinaryTransactionMutation::Delete { table, .. } => table,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|table_name| {
+                let table = transaction_catalog
+                    .relational_catalog
+                    .get(table_name)
+                    .ok_or_else(|| {
+                        ExecuteError::Serialization(format!(
+                            "transaction mutation relation \"{table_name}\" left its catalog before WAL binding"
+                        ))
+                    })?;
+                Ok((
+                    table_name.clone(),
+                    BinaryTransactionTableIdentity {
+                        table_oid: table.oid,
+                        schema_digest: table_schema_digest(table)?,
+                    },
+                ))
+            })
+            .collect::<Result<_, ExecuteError>>()?;
+        let reset_tables = table_resets
+            .iter()
+            .map(|reset| reset.table.clone())
+            .collect::<BTreeSet<_>>();
+        self.validate_transaction_device_unique_conflicts(
+            &snapshot,
+            &deltas,
+            &record,
+            &reset_tables,
+        )?;
         self.validate_transaction_device_foreign_key_conflicts(
             &snapshot,
             &deltas,
@@ -470,6 +541,7 @@ impl Engine {
                         _ => None,
                     }),
             )
+            .chain(record.table_resets.iter().map(|reset| reset.table.clone()))
             .collect::<BTreeSet<_>>();
         let named_index_publication = self
             .read_state
@@ -478,6 +550,8 @@ impl Engine {
         self.reserve_transaction_canonical_publication(&snapshot, &transaction_catalog, &record)?;
         let affected_rows =
             Self::canonical_affected_rows(&payload).map_err(ExecuteError::Engine)?;
+        let request_digest = request_digest_override
+            .unwrap_or_else(|| gpu_db_wal::canonical_request_digest(&payload));
 
         let wal_len_before = commit.wal.len();
         let token = match commit.repl.propose(Arc::clone(&payload)) {
@@ -497,13 +571,14 @@ impl Engine {
                 ));
             }
         };
-        let record = match Self::canonical_wal_record_with_isolation(
+        let record = match Self::canonical_wal_record_with_isolation_and_request_digest(
             &commit,
             txn_id,
             token.index,
             0,
             &payload,
             isolation,
+            request_digest,
         ) {
             Ok(record) => record,
             Err(err) => {
@@ -525,7 +600,7 @@ impl Engine {
         }
         if let Err(error) = commit.record_transaction_status_digest_outcome(
             txn_id,
-            gpu_db_wal::canonical_request_digest(&payload),
+            request_digest,
             token.index,
             affected_rows,
         ) {
@@ -533,6 +608,9 @@ impl Engine {
             return Err(ExecuteError::Indeterminate(format!(
                 "explicit transaction {txn_id} became durable but terminal status installation failed: {error}; restart recovery must resolve it"
             )));
+        }
+        if request_digest_override.is_some() {
+            self.release_pending_transaction_claim(txn_id, request_digest);
         }
         commit.record_commit_timestamp(txn_id, timestamp_micros);
         // The durable resolved record is now the sole source of truth. Retire transaction-private
@@ -670,7 +748,8 @@ impl Engine {
     }
 
     pub(crate) fn resolved_transaction_record(
-        deltas: &[WriteDelta],
+        all_deltas: &[WriteDelta],
+        final_deltas: &[WriteDelta],
         provisional_inserts: &BTreeSet<(String, u64)>,
         final_base: u64,
         allocator_high_water: u64,
@@ -682,19 +761,22 @@ impl Engine {
             .collect::<BTreeMap<_, _>>();
         let mut mutations = Vec::new();
         let mut sequence_advances = BTreeMap::new();
-        for delta in deltas {
+        for delta in all_deltas {
+            if let PreparedMutation::Insert { seq_advances, .. } = &delta.mutation {
+                sequence_advances.extend(
+                    seq_advances
+                        .iter()
+                        .map(|(sequence, state)| (sequence.clone(), *state)),
+                );
+            }
+        }
+        for delta in final_deltas {
             match &delta.mutation {
                 PreparedMutation::Insert {
                     table,
                     inserted_rows,
-                    seq_advances,
                     ..
                 } => {
-                    sequence_advances.extend(
-                        seq_advances
-                            .iter()
-                            .map(|(sequence, state)| (sequence.clone(), *state)),
-                    );
                     let prefix = relational_key_prefix(table);
                     for (key, row) in inserted_rows {
                         let provisional =
@@ -782,7 +864,9 @@ impl Engine {
         Ok(BinaryTransactionRecord {
             allocator_high_water,
             catalog_commands: Vec::new(),
+            table_resets: Vec::new(),
             sequence_advances,
+            table_identities: BTreeMap::new(),
             mutations,
         })
     }
@@ -973,6 +1057,7 @@ impl Engine {
         snapshot: &TransactionSnapshot,
         deltas: &[WriteDelta],
         record: &BinaryTransactionRecord,
+        reset_tables: &BTreeSet<String>,
     ) -> Result<(), ExecuteError> {
         // Every UPDATE/DELETE identity retires its old unique-key ownership at this transaction's
         // single publish boundary. Candidate final rows (including INSERTs) must exclude the whole
@@ -1031,17 +1116,25 @@ impl Engine {
                 .relational_catalog
                 .get(table_name)
                 .expect("transaction record table remains in retained catalog");
+            if reset_tables.contains(table_name) {
+                continue;
+            }
             if !table.indexes.iter().any(|index| index.unique)
                 || !snapshot.catalog.relational_catalog.contains_key(table_name)
             {
                 continue;
             }
-            match self.device_unique_rows_conflict(table, &rows, delta.read_snapshot) {
+            let conflict_boundary = self.transaction_table_conflict_boundary(
+                snapshot,
+                table_name,
+                delta.read_snapshot,
+            )?;
+            match self.device_unique_rows_conflict(table, &rows, conflict_boundary) {
                 Some(false) => {}
                 Some(true) => {
                     return Err(ExecuteError::Serialization(format!(
                         "device unique conflict: write history changed in relation \"{table_name}\" after snapshot {}",
-                        delta.read_snapshot
+                        conflict_boundary
                     )))
                 }
                 None => {
@@ -1074,6 +1167,9 @@ impl Engine {
                 .relational_catalog
                 .get(table_name)
                 .expect("transaction record table remains in retained catalog");
+            if reset_tables.contains(table_name) {
+                continue;
+            }
             if !snapshot.catalog.relational_catalog.contains_key(table_name) {
                 continue;
             }
@@ -1225,15 +1321,14 @@ impl Engine {
         ledger: &RecentCommitsLedger,
     ) -> Result<(), ExecuteError> {
         for delta in deltas {
-            if let Some(table) = delta
-                .foreign_key_dependencies
-                .iter()
-                .find(|table| ledger.table_changed_after(table, delta.read_snapshot))
-            {
-                return Err(ExecuteError::Serialization(format!(
-                    "foreign-key dependency relation \"{table}\" changed after transaction statement snapshot {}",
-                    delta.read_snapshot
-                )));
+            for table in &delta.foreign_key_dependencies {
+                let conflict_boundary =
+                    self.transaction_table_conflict_boundary(snapshot, table, delta.read_snapshot)?;
+                if ledger.table_changed_after(table, conflict_boundary) {
+                    return Err(ExecuteError::Serialization(format!(
+                        "foreign-key dependency relation \"{table}\" changed after transaction conflict boundary {conflict_boundary}"
+                    )));
+                }
             }
         }
         type IdentityRows = BTreeMap<String, Vec<(u64, Vec<SqlValue>)>>;
@@ -1483,7 +1578,7 @@ impl Engine {
     /// Keep BEGIN-generation preparation and its cheap conflict verdict available to the CPU
     /// parity oracle, but require an actual retained device generation before publishing a private
     /// delta. The CPU store is not a transaction-execution fallback for a conflict-free statement.
-    fn validate_transaction_delta_residency(
+    pub(crate) fn validate_transaction_delta_residency(
         &self,
         table: &RelationalTable,
         existed_at_transaction_base: bool,
@@ -1492,6 +1587,12 @@ impl Engine {
         // There cannot be a published shard for that relation yet; the private append below builds
         // its first device shard, and canonical apply/replay installs the final committed shard.
         if !existed_at_transaction_base {
+            return Ok(());
+        }
+        if self
+            .current_transaction_read_snapshot()
+            .is_some_and(|snapshot| snapshot.table_has_typed_empty_root(&table.name))
+        {
             return Ok(());
         }
         if self.table_chunk_authoritative(&table.name).is_some() {

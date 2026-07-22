@@ -59,6 +59,9 @@ pub(crate) struct CommitWaveItem {
     /// per-item `encode_relational_row` + `try_encode_binary_insert`) and uses the result verbatim
     /// as the reuse-eligible delta's WAL payload. `None` = the classic per-item encode path.
     pub(super) binary_wal_template: Option<(Arc<[u8]>, u32)>,
+    /// Shared stable-OID lease owned by the queued work through terminal apply/cancel. A caller
+    /// ticket may be dropped independently; the mutation item remains the reset-exclusion owner.
+    pub(crate) table_access: Option<Arc<crate::table_access::TableAccessLease>>,
     pub(super) outcome: CommitWaveOutcome,
 }
 
@@ -140,6 +143,8 @@ pub(crate) struct LaneIntent {
     pub(crate) template: Arc<[u8]>,
     pub(crate) values: Vec<SqlValue>,
     pub(crate) outcome: CommitWaveOutcome,
+    /// Shared table/dependency lease retained by the lane item until its terminal outcome.
+    pub(crate) table_access: Option<Arc<crate::table_access::TableAccessLease>>,
     /// Stable request identity plus the one shared admission-to-WAL reservation registry used by
     /// every queued write strategy. Durable terminal status belongs to the canonical
     /// `CommitState` transaction index.

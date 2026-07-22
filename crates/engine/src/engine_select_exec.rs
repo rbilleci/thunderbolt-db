@@ -174,6 +174,7 @@ impl Engine {
             .map_err(ExecuteError::Engine)?;
         self.ensure_transaction_snapshot_current(txn_id, snapshot)?;
         on_statement_locked();
+        self.acquire_transaction_table_access(snapshot, [select.table.clone()])?;
         let _scope = self.enter_transaction_read(Arc::clone(snapshot));
         self.execute_relational_select(select)
     }
@@ -300,12 +301,14 @@ impl Engine {
         let statement_snapshot = if self.current_transaction_read_snapshot().is_none()
             && !self.mvcc_read_skips_leader_check()
         {
+            let _pre_capture_access = self.acquire_autocommit_table_access(&select.table)?;
             self.transition_oversized_device_table_to_streaming_repair(&select.table)
                 .map_err(ExecuteError::Engine)?;
             let commit = self.commit_state();
             self.ensure_commit_path_available()
                 .map_err(ExecuteError::Engine)?;
             let snapshot = self.capture_statement_snapshot(self.committed_seq());
+            self.acquire_transaction_table_access(&snapshot, [select.table.clone()])?;
             drop(commit);
             Some(snapshot)
         } else {
@@ -346,6 +349,18 @@ impl Engine {
         // runs, so `catalog_as_of(s)` never falls back to a too-new generation.
         let s = self.read_snapshot_boundary();
         let catalog = self.read_catalog_as_of(s);
+        if self
+            .current_transaction_read_snapshot()
+            .is_some_and(|snapshot| snapshot.table_has_typed_empty_root(&select.table))
+        {
+            let table = catalog
+                .relational_catalog
+                .get(&select.table)
+                .cloned()
+                .ok_or_else(|| ExecuteError::UndefinedRelation(select.table.clone()))?;
+            on_pinned();
+            return self.execute_transient_rows_via_general(select, table, Vec::new(), s);
+        }
         if let Some(view) = catalog.relational_views.get(&select.table).cloned() {
             if !select_is_plain_view_scan(select) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -409,12 +424,14 @@ impl Engine {
         // continue through their retained resident source below (or fail loud when unavailable).
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
             let transaction_shards = snapshot.transaction_shards();
-            let captured_empty_without_residency = snapshot.boundary == s
-                && !snapshot.table_versions.contains_key(&select.table)
-                && !snapshot.resident_snapshots.contains_key(&select.table)
-                && transaction_shards
-                    .get(&select.table)
-                    .is_none_or(|shards| shards.is_empty());
+            let private_empty_reset = snapshot.table_has_typed_empty_root(&select.table);
+            let captured_empty_without_residency = private_empty_reset
+                || (snapshot.boundary == s
+                    && !snapshot.table_versions.contains_key(&select.table)
+                    && !snapshot.resident_snapshots.contains_key(&select.table)
+                    && transaction_shards
+                        .get(&select.table)
+                        .is_none_or(|shards| shards.is_empty()));
             if captured_empty_without_residency {
                 if let Some(table) = catalog.relational_catalog.get(&select.table).cloned() {
                     on_pinned();
@@ -489,6 +506,9 @@ impl Engine {
         select: &Select,
         copin_s: Index,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            self.acquire_transaction_table_access(&snapshot, [select.table.clone()])?;
+        }
         let catalog = self.read_catalog_as_of(copin_s);
         if let Some(view) = catalog.relational_views.get(&select.table).cloned() {
             if !select_is_plain_view_scan(select) {
@@ -497,6 +517,17 @@ impl Engine {
                 )));
             }
             return self.execute_relational_view_at(&view.query, copin_s);
+        }
+        if self
+            .current_transaction_read_snapshot()
+            .is_some_and(|snapshot| snapshot.table_has_typed_empty_root(&select.table))
+        {
+            let table = catalog
+                .relational_catalog
+                .get(&select.table)
+                .cloned()
+                .ok_or_else(|| ExecuteError::UndefinedRelation(select.table.clone()))?;
+            return self.execute_transient_rows_via_general(select, table, Vec::new(), copin_s);
         }
         if let Some(result) = self.try_streaming_select_at(select, copin_s) {
             return result;
@@ -824,6 +855,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        let _table_access = self.acquire_autocommit_table_access(&select.table)?;
         if self.is_commit_path_poisoned() {
             return Err(ExecuteError::Engine(EngineError::Durability(
                 "commit path is wedged; restart recovery required".to_string(),
@@ -845,6 +877,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        let _table_access = self.acquire_autocommit_table_access(&select.table)?;
         if self.is_commit_path_poisoned() {
             return Err(ExecuteError::Engine(EngineError::Durability(
                 "commit path is wedged; restart recovery required".to_string(),

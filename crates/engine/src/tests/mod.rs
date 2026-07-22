@@ -35,6 +35,8 @@ mod sql_catalog; // numeric coercion, pg_catalog, GPU bridge, constraints
 mod sql_dml; // relational SQL CRUD, COPY, ALTER COLUMN, sequences, matviews
 mod sql_pg; // SQL -> ResidentExpr binding via libpg_query (general GPU executor, Charter rule 2)
 mod streaming_exec; // STRATA S-E.1: out-of-core streaming scalar reductions (ADR-012)
+mod table_reset_catalog; // PRODUCT-001 typed root reset catalog/recovery behavior
+mod table_reset_guards; // PRODUCT-001 stable-OID ownership across deferred/raw mutation surfaces
 mod text_batching; // execute_text/read, batching, transactions, replication-role gating
 mod text_point_read; // compact GPU int4-filter/text projection semantics
 mod write_half; // SI ledger, active snapshots, concurrent DML, stage-0 replay

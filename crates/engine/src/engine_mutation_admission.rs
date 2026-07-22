@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::engine_dml_concurrent::command_has_returning;
+use crate::engine_transaction_reset::final_transaction_operations;
 
 pub struct MutationRequest {
     parsed: gpu_db_sql::ParsedCommand,
@@ -397,25 +398,17 @@ impl Engine {
                 self.set_empty_transaction_characteristics(txn_id, characteristics)?;
                 Ok(TransactionAdmissionResult::Command)
             }
-            Command::TruncateTable(truncate)
-                if self.transaction_snapshot_handle(txn_id).is_some()
-                    && !truncate.restart_identity =>
-            {
+            Command::TruncateTable(truncate) => {
                 reject_prepared_hook(on_prepared)?;
-                // Archive workers use CONTINUE IDENTITY before COPY; reuse the transaction-private
-                // full-table GPU DELETE. RESTART IDENTITY is excluded because it owns sequence state.
-                self.execute_prepared_dml_in_transaction_with_result(
-                    txn_id,
-                    Command::Delete(Delete {
-                        table: truncate.name,
-                        filter: None,
-                        filters: Vec::new(),
-                        filter_groups: Vec::new(),
-                        returning: Vec::new(),
-                    }),
-                    expected_catalog_version,
-                    true,
-                )?;
+                if self.transaction_snapshot_handle(txn_id).is_some() {
+                    self.execute_truncate_in_transaction(
+                        txn_id,
+                        truncate,
+                        expected_catalog_version,
+                    )?;
+                } else {
+                    self.execute_truncate_autocommit(txn_id, truncate, expected_catalog_version)?;
+                }
                 Ok(TransactionAdmissionResult::Command)
             }
             command @ (Command::Insert(_) | Command::Update(_) | Command::Delete(_)) => {
@@ -425,7 +418,6 @@ impl Engine {
                         txn_id,
                         command,
                         expected_catalog_version,
-                        false,
                     )?
                 } else if self.is_concurrent_dml_command(&command) {
                     match on_prepared {
@@ -484,7 +476,6 @@ impl Engine {
         txn_id: TxnId,
         command: Command,
         expected: Option<u64>,
-        full_table_delete: bool,
     ) -> Result<DmlExecutionResult, ExecuteError> {
         let snapshot = self
             .transaction_snapshot_handle(txn_id)
@@ -519,13 +510,7 @@ impl Engine {
                 ));
             }
         }
-        if full_table_delete {
-            self.execute_full_table_delete_in_transaction_statement_locked(
-                txn_id, command, &snapshot,
-            )
-        } else {
-            self.execute_parsed_dml_in_transaction_statement_locked(txn_id, command, &snapshot)
-        }
+        self.execute_parsed_dml_in_transaction_statement_locked(txn_id, command, &snapshot)
     }
 
     fn submit_predeclared_transaction(
@@ -873,13 +858,14 @@ impl Engine {
         cold_accesses: u32,
         results: &[PredeclaredOperationResult],
     ) -> Result<TransactionResources, ExecuteError> {
-        let deltas = snapshot
+        let staged_operations = snapshot
             .delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .deltas
+            .operations
             .clone();
-        let has_staged_deltas = !deltas.is_empty();
+        let (deltas, table_resets) = final_transaction_operations(&staged_operations);
+        let has_staged_deltas = !deltas.is_empty() || !table_resets.is_empty();
         let provisional = Self::transaction_insert_identities(&deltas)?;
         let provisional_count = u64::try_from(provisional.len()).map_err(|_| {
             ExecuteError::Unsupported(
@@ -892,8 +878,17 @@ impl Engine {
                 "predeclared transaction provisional identity count overflow".to_string(),
             )
         })?;
-        let record =
-            Self::resolved_transaction_record(&deltas, &provisional, 1, allocator_high_water)?;
+        let mut record = Self::resolved_transaction_record(
+            &deltas,
+            &deltas,
+            &provisional,
+            1,
+            allocator_high_water,
+        )?;
+        record.table_resets = table_resets
+            .iter()
+            .map(StagedTableReset::to_binary)
+            .collect();
         let wal_bytes = if has_staged_deltas {
             let payload: Arc<[u8]> =
                 Arc::from(try_encode_binary_transaction(&record).ok_or_else(|| {

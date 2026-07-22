@@ -148,6 +148,11 @@ impl Engine {
                 {
                     gpu_db_wal::CanonicalFragmentKind::CatalogMutation
                 }
+                crate::wal_binary::BinaryWalRecord::Transaction(record)
+                    if !record.table_resets.is_empty() =>
+                {
+                    gpu_db_wal::CanonicalFragmentKind::TableReset
+                }
                 _ => gpu_db_wal::CanonicalFragmentKind::RowMutation,
             });
         }
@@ -420,6 +425,27 @@ impl Engine {
         payload: &Arc<[u8]>,
         isolation: gpu_db_wal::CanonicalIsolation,
     ) -> Result<WalRecord, EngineError> {
+        Self::canonical_wal_record_with_isolation_and_request_digest(
+            commit,
+            txn_id,
+            commit_seq,
+            lane_id,
+            payload,
+            isolation,
+            gpu_db_wal::canonical_request_digest(payload),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn canonical_wal_record_with_isolation_and_request_digest(
+        commit: &CommitState,
+        txn_id: TxnId,
+        commit_seq: Index,
+        lane_id: u32,
+        payload: &Arc<[u8]>,
+        isolation: gpu_db_wal::CanonicalIsolation,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<WalRecord, EngineError> {
         let (catalog_epoch, catalog_digest) =
             Self::canonical_catalog_boundary(commit.canonical_identity, commit.wal.last_record())?;
         Self::canonical_wal_record_with_boundary_and_outcome_isolation(
@@ -430,7 +456,7 @@ impl Engine {
             commit_seq,
             lane_id,
             payload,
-            gpu_db_wal::canonical_request_digest(payload),
+            request_digest,
             gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
             Self::canonical_affected_rows(payload)?,
             isolation,
@@ -472,7 +498,23 @@ impl Engine {
             if let crate::wal_binary::BinaryWalRecord::Transaction(record) =
                 decode_binary_record(payload)?
             {
-                return Ok(u32::from(!record.mutations.is_empty()));
+                let tables = record
+                    .table_resets
+                    .iter()
+                    .map(|reset| reset.table.as_str())
+                    .chain(record.mutations.iter().map(|mutation| match mutation {
+                        crate::wal_binary::BinaryTransactionMutation::Insert { table, .. }
+                        | crate::wal_binary::BinaryTransactionMutation::Update { table, .. }
+                        | crate::wal_binary::BinaryTransactionMutation::Delete { table, .. } => {
+                            table.as_str()
+                        }
+                    }))
+                    .collect::<BTreeSet<_>>();
+                return u32::try_from(tables.len()).map_err(|_| {
+                    EngineError::Durability(
+                        "canonical transaction table-block count exceeds u32".to_string(),
+                    )
+                });
             }
         }
         Ok(u32::from(matches!(

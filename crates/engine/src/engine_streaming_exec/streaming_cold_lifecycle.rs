@@ -3,6 +3,39 @@
 use super::*;
 
 impl Engine {
+    /// Validate a cold root selected as global reset authority without patching or falling back to
+    /// another representation. Durable reset proofs must never describe a stale cache entry.
+    pub(crate) fn global_cold_root_matches_reset_boundary(
+        &self,
+        table: &RelationalTable,
+        cold: &ColdTableChunks,
+        boundary: Index,
+    ) -> bool {
+        let current = self
+            .read_state
+            .mvcc
+            .table_rows(&table.name)
+            .generation_payload();
+        let signature = table
+            .columns
+            .iter()
+            .map(|column| (column.name.clone(), column.ty))
+            .collect::<Vec<_>>();
+        Arc::ptr_eq(&cold.generation, &current)
+            && cold.column_signature == signature
+            && match self
+                .read_state
+                .residency
+                .chunk_authoritative_tables
+                .load()
+                .get(&table.name)
+                .copied()
+            {
+                Some(freeze) => boundary >= freeze,
+                None => boundary >= cold.build_copin_s,
+            }
+    }
+
     /// STRATA S-E.5: stage one chunk — build its transient payload (host) and enqueue the upload on a
     /// private copy stream (async when the driver supports it). The caller computes the PREVIOUSLY
     /// staged chunk next, so this upload overlaps that compute and the subsequent host staging.

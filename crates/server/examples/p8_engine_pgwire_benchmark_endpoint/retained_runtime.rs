@@ -3,8 +3,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use gpu_db_engine::{ResidentDeviceNullBitmapLayout, ResidentDeviceTextColumnLayout};
-use gpu_db_execution::CudaResidentDeviceMemoryReadView;
+use gpu_db_engine::{
+    RelationalRetainedDeviceReadView, ResidentDeviceNullBitmapLayout,
+    ResidentDeviceTextColumnLayout,
+};
 use gpu_db_protocol::backend::{BackendColumn, BackendWriter};
 use gpu_db_protocol::{Select, SqlValue};
 
@@ -22,7 +24,7 @@ pub(in super::super) struct RetainedReadRuntimeRoute {
     pub(in super::super) int4_columns: Vec<String>,
     pub(in super::super) text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub(in super::super) null_columns: Vec<ResidentDeviceNullBitmapLayout>,
-    pub(in super::super) read_view: CudaResidentDeviceMemoryReadView,
+    pub(in super::super) read_view: RelationalRetainedDeviceReadView,
 }
 
 #[derive(Default)]

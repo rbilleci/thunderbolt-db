@@ -17,6 +17,7 @@ impl Engine {
     ) -> Result<RelationalRetainedReadTemplate, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let _table_access = self.acquire_autocommit_table_access(&select.table)?;
         let job = self.prepare_relational_retained_read_job(select)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let filter_groups = if !bound.filter_groups.is_empty() {
@@ -86,6 +87,7 @@ impl Engine {
     ) -> Result<RelationalRetainedReadSubmission, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let table_access = Some(self.acquire_autocommit_table_access(&template.table.name)?);
         let submit_started = Instant::now();
         if needles.is_empty() {
             return Ok(RelationalRetainedReadSubmission {
@@ -99,6 +101,7 @@ impl Engine {
                     .try_into()
                     .unwrap_or(u64::MAX),
                 commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                table_access,
                 inner: RelationalRetainedReadSubmissionInner::Ready(Vec::new()),
             });
         }
@@ -141,6 +144,7 @@ impl Engine {
                             .try_into()
                             .unwrap_or(u64::MAX),
                         commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                        table_access,
                         inner: RelationalRetainedReadSubmissionInner::ReadyBatched(Box::new(
                             RelationalPointBatchResult::new(
                                 Arc::new(template.result_columns.clone()),
@@ -189,6 +193,7 @@ impl Engine {
                     .try_into()
                     .unwrap_or(u64::MAX),
                 commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                table_access,
                 inner: RelationalRetainedReadSubmissionInner::Ready(results),
             });
         }
@@ -249,6 +254,7 @@ impl Engine {
                 .try_into()
                 .unwrap_or(u64::MAX),
             commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+            table_access,
             inner: RelationalRetainedReadSubmissionInner::PendingInt4Projection(Box::new(
                 RelationalRetainedInt4ProjectionSubmission {
                     table: template.table.clone(),

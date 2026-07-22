@@ -68,6 +68,32 @@ fn recent_commits_ledger_conflict_record_and_prune() {
     );
 }
 
+#[test]
+fn table_root_and_rewrite_fence_lifecycle_is_catalog_and_epoch_bounded() {
+    let mut ledger = RecentCommitsLedger::default();
+    ledger.tables.insert("before".to_string(), 7);
+    ledger.tables.insert("dropped".to_string(), 8);
+    let prior = BTreeMap::from([("before".to_string(), 41), ("dropped".to_string(), 42)]);
+    let current = BTreeMap::from([("after".to_string(), 41), ("dropped".to_string(), 99)]);
+    ledger.reconcile_table_roots(&prior, &current);
+    assert_eq!(ledger.table_root_index("after"), 7);
+    assert_eq!(ledger.table_root_index("before"), 0);
+    assert_eq!(
+        ledger.table_root_index("dropped"),
+        0,
+        "drop/recreate under one name must not inherit the old OID's root"
+    );
+
+    let read_state = ReadState::new();
+    read_state.publish_table_rewrite_fences([41, 42], 10);
+    read_state.prune_table_rewrite_fences(&BTreeSet::from([41]), 9);
+    assert_eq!(read_state.table_rewrite_fences.load().len(), 2);
+    read_state.prune_table_rewrite_fences(&BTreeSet::from([41]), 10);
+    let fences = read_state.table_rewrite_fences.load();
+    assert_eq!(fences.get(&41), Some(&10));
+    assert!(!fences.contains_key(&42));
+}
+
 /// E2.2(a) — the integer-keyed unique-slot conflict dimension. The intent fast path claims a slot
 /// as `(packed_id, i32)` with NO String allocation; the ledger must detect first-committer-wins on
 /// it EXACTLY like the String slot, and — crucially — a classic-path write (which claims BOTH the
@@ -150,7 +176,7 @@ fn active_snapshots_track_oldest_boundary() {
                 generation: 0,
                 resident_shards: Arc::new(BTreeMap::new()),
                 streaming_cold_chunks: Arc::new(BTreeMap::new()),
-                deltas: Vec::new(),
+                operations: Vec::new(),
                 write_set: WriteSet::default(),
                 next_row_id: 1,
                 sequence_state: BTreeMap::new(),
@@ -160,6 +186,8 @@ fn active_snapshots_track_oldest_boundary() {
                 private_gpu_bytes_by_gpu: BTreeMap::new(),
                 commit_gpu_bytes_by_gpu: BTreeMap::new(),
             })),
+            table_access: Arc::new(TableAccessRegistry::default()).lease(),
+            rewrite_fenced_tables: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             statement_lock: Arc::new(std::sync::Mutex::new(())),
             program_owned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             data_snapshot_acquired: Arc::new(std::sync::atomic::AtomicBool::new(true)),

@@ -16,14 +16,15 @@ impl Engine {
         exclude_keys: Option<&BTreeSet<String>>,
     ) -> Option<bool> {
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
-            if !snapshot
-                .catalog
-                .relational_catalog
-                .contains_key(&table.name)
-                && snapshot
-                    .transaction_shards()
-                    .get(&table.name)
-                    .is_some_and(Vec::is_empty)
+            if snapshot.table_has_typed_empty_root(&table.name)
+                || (!snapshot
+                    .catalog
+                    .relational_catalog
+                    .contains_key(&table.name)
+                    && snapshot
+                        .transaction_shards()
+                        .get(&table.name)
+                        .is_some_and(Vec::is_empty))
             {
                 // The transaction catalog owns an exact empty device relation before the first
                 // INSERT into a private CREATE. Compound keys have the same authoritative empty

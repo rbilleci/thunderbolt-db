@@ -426,6 +426,304 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
     panic!("table never entered elision on a GPU box");
 }
 
+/// PRODUCT-001: both deferred covered-write representations own their table lease. A root reset
+/// must conflict while a LaneIntent or classic CommitWaveItem is queued, then succeed immediately
+/// after that exact item reaches its terminal outcome.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_deferred_intent_items_retain_table_guard_until_terminal() {
+    let mut engine = Engine::new_local_test_engine();
+    let txn_ids = AtomicU64::new(100);
+    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
+        return;
+    };
+    let oid = engine.relational_catalog_table("t").unwrap().oid;
+
+    let mut lane_ticket = engine
+        .submit_covered_insert_intent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            &route,
+            &[2_000_001, 11],
+        )
+        .unwrap();
+    assert!(
+        engine.poll_intent(&mut lane_ticket).is_none(),
+        "lane fixture must still be queued"
+    );
+    let lane_reset = engine.table_access.lease();
+    assert!(matches!(
+        lane_reset.acquire_exclusive([oid]),
+        Err(ExecuteError::Serialization(_))
+    ));
+    loop {
+        engine.drive_commit_wave();
+        if let Some(result) = engine.poll_intent(&mut lane_ticket) {
+            assert_eq!(result.unwrap(), 1);
+            break;
+        }
+    }
+    lane_reset.acquire_exclusive([oid]).unwrap();
+    drop(lane_reset);
+
+    // Detaching the now-empty lane strategy selects the classic async CommitWaveItem arm without
+    // changing the resident route or canonical coordinator.
+    engine.intent_lanes = None;
+    let mut wave_ticket = engine
+        .submit_covered_insert_intent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            &route,
+            &[2_000_002, 12],
+        )
+        .unwrap();
+    assert!(
+        engine.poll_intent(&mut wave_ticket).is_none(),
+        "classic fixture must still be queued"
+    );
+    let wave_reset = engine.table_access.lease();
+    assert!(matches!(
+        wave_reset.acquire_exclusive([oid]),
+        Err(ExecuteError::Serialization(_))
+    ));
+    loop {
+        engine.drive_commit_wave();
+        if let Some(result) = engine.poll_intent(&mut wave_ticket) {
+            assert_eq!(result.unwrap(), 1);
+            break;
+        }
+    }
+    wave_reset.acquire_exclusive([oid]).unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
+    fn parsed(sql: &str) -> gpu_db_sql::ParsedCommand {
+        gpu_db_sql::ParsedCommand::parse(sql).unwrap()
+    }
+
+    fn settle(engine: &Engine, mut ticket: crate::IntentTicket) -> u64 {
+        loop {
+            engine.drive_commit_wave();
+            if let Some(result) = engine.poll_intent(&mut ticket) {
+                return result.unwrap();
+            }
+        }
+    }
+
+    fn terminal(engine: &Engine, mut ticket: crate::IntentTicket) -> u64 {
+        engine
+            .poll_intent(&mut ticket)
+            .expect("terminal retry must resolve without entering a new wave")
+            .unwrap()
+    }
+
+    let mut engine = Engine::new_local_test_engine();
+    let warm_ids = AtomicU64::new(100);
+    let Some(insert_route) = warm_intent_route(&mut engine, &warm_ids) else {
+        return;
+    };
+
+    const INSERT_TXN: u64 = 900_001;
+    const UPDATE_TXN: u64 = 900_002;
+    const DELETE_TXN: u64 = 900_003;
+    let insert_values = [2_000_001, 11];
+    assert_eq!(
+        settle(
+            &engine,
+            engine
+                .submit_covered_insert_intent(INSERT_TXN, &insert_route, &insert_values)
+                .unwrap(),
+        ),
+        1
+    );
+    assert_eq!(
+        engine.commit_state().ledger.table_root_index("t"),
+        engine.committed_seq(),
+        "lane INSERT must advance the canonical table root"
+    );
+    engine.submit_transaction(910_001, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(910_001, parsed("TRUNCATE t"))
+        .unwrap();
+    let wal_before_retry = engine.durable_wal_records().len();
+    assert_eq!(
+        terminal(
+            &engine,
+            engine
+                .submit_covered_insert_intent(INSERT_TXN, &insert_route, &insert_values)
+                .unwrap(),
+        ),
+        1
+    );
+    engine
+        .execute_covered_insert_intent(INSERT_TXN, &insert_route, &insert_values)
+        .expect("blocking exact intent retry has no fresh table access");
+    let insert_mismatch = engine
+        .submit_covered_insert_intent(INSERT_TXN, &insert_route, &[2_000_002, 11])
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        insert_mismatch.to_string().contains("different request"),
+        "identity mismatch must win over reset contention: {insert_mismatch}"
+    );
+    assert_eq!(engine.durable_wal_records().len(), wal_before_retry);
+    engine
+        .submit_transaction(910_001, parsed("COMMIT"))
+        .unwrap();
+
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    assert_eq!(
+        settle(
+            &engine,
+            engine
+                .submit_covered_insert_intent(900_010, &insert_route, &[3_000_001, 20])
+                .unwrap(),
+        ),
+        1
+    );
+    let update_route = engine.prepare_covered_update_route("t").unwrap();
+    let update_values = [3_000_001, 21];
+    assert_eq!(
+        settle(
+            &engine,
+            engine
+                .submit_covered_update_intent(UPDATE_TXN, &update_route, &update_values)
+                .unwrap(),
+        ),
+        1
+    );
+    assert_eq!(
+        engine.commit_state().ledger.table_root_index("t"),
+        engine.committed_seq(),
+        "nonempty lane UPDATE must advance the canonical table root"
+    );
+    engine.submit_transaction(910_002, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(910_002, parsed("TRUNCATE t"))
+        .unwrap();
+    assert_eq!(
+        terminal(
+            &engine,
+            engine
+                .submit_covered_update_intent(UPDATE_TXN, &update_route, &update_values)
+                .unwrap(),
+        ),
+        1
+    );
+    let update_mismatch = engine
+        .submit_covered_update_intent(UPDATE_TXN, &update_route, &[3_000_001, 22])
+        .map(|_| ())
+        .unwrap_err();
+    assert!(update_mismatch.to_string().contains("different request"));
+    engine
+        .submit_transaction(910_002, parsed("COMMIT"))
+        .unwrap();
+
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    assert_eq!(
+        settle(
+            &engine,
+            engine
+                .submit_covered_insert_intent(900_020, &insert_route, &[4_000_001, 30])
+                .unwrap(),
+        ),
+        1
+    );
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    assert_eq!(
+        settle(
+            &engine,
+            engine
+                .submit_covered_delete_intent(DELETE_TXN, &delete_route, 4_000_001)
+                .unwrap(),
+        ),
+        1
+    );
+    assert_eq!(
+        engine.commit_state().ledger.table_root_index("t"),
+        engine.committed_seq(),
+        "lane DELETE must advance the canonical table root"
+    );
+    engine.submit_transaction(910_003, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(910_003, parsed("TRUNCATE t"))
+        .unwrap();
+    assert_eq!(
+        terminal(
+            &engine,
+            engine
+                .submit_covered_delete_intent(DELETE_TXN, &delete_route, 4_000_001)
+                .unwrap(),
+        ),
+        1
+    );
+    let delete_mismatch = engine
+        .submit_covered_delete_intent(DELETE_TXN, &delete_route, 4_000_002)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(delete_mismatch.to_string().contains("different request"));
+    engine
+        .submit_transaction(910_003, parsed("COMMIT"))
+        .unwrap();
+
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    assert_eq!(
+        settle(
+            &engine,
+            engine
+                .submit_covered_delete_intent(900_030, &delete_route, 9_999_999)
+                .unwrap(),
+        ),
+        0
+    );
+    assert_eq!(
+        engine.commit_state().ledger.table_root_index("t"),
+        engine.committed_seq(),
+        "zero-row DELETE replay still carries a table mutation footprint"
+    );
+    engine.submit_transaction(910_004, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(910_004, parsed("TRUNCATE t"))
+        .unwrap();
+    engine
+        .submit_transaction(910_004, parsed("COMMIT"))
+        .unwrap();
+
+    let update_route = engine.prepare_covered_update_route("t").unwrap();
+    let root_before_zero_update = engine.commit_state().ledger.table_root_index("t");
+    assert_eq!(
+        settle(
+            &engine,
+            engine
+                .submit_covered_update_intent(900_040, &update_route, &[8_888_888, 40])
+                .unwrap(),
+        ),
+        0
+    );
+    assert_eq!(
+        engine.commit_state().ledger.table_root_index("t"),
+        root_before_zero_update,
+        "zero-row UPDATE replay carries no AppliedRowMutation and must not move the live root"
+    );
+    engine.submit_transaction(910_005, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(910_005, parsed("TRUNCATE t"))
+        .unwrap();
+    engine
+        .submit_transaction(910_005, parsed("COMMIT"))
+        .unwrap();
+
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert!(
+        recovered
+            .execute_relational_select_text("SELECT id FROM t")
+            .unwrap()
+            .rows
+            .is_empty(),
+        "every lane mutation/reset root pair must replay to the final empty generation"
+    );
+}
+
 /// Merely enabling the physical intent optimizer must not change the product write contract:
 /// classic/general mutations continue through the same canonical sequence and WAL.
 #[test]
@@ -472,6 +770,7 @@ fn central_commit_wedge_drains_queued_lane_intents() {
             template: std::sync::Arc::from(&b""[..]),
             values: Vec::new(),
             outcome: std::sync::Arc::clone(&outcome),
+            table_access: None,
             request_digest: [0; 32],
             transaction_claims: None,
             outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),

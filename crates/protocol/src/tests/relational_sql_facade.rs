@@ -851,10 +851,13 @@ default: Some(ColumnDefault::SequenceNextVal {
             restart_identity: true,
         })
     );
-    assert!(matches!(
-        parse_command("TRUNCATE TABLE people CONTINUE IDENTITY"),
-        Err(ParseError::InvalidRelationalSql)
-    ));
+    assert_eq!(
+        parse_command("TRUNCATE TABLE people CONTINUE IDENTITY").unwrap(),
+        Command::TruncateTable(TruncateTable {
+            name: "people".to_string(),
+            restart_identity: false,
+        })
+    );
     assert!(matches!(
         parse_command("TRUNCATE TABLE people CASCADE"),
         Err(ParseError::InvalidRelationalSql)

@@ -123,43 +123,40 @@ impl Engine {
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
-        // Stable transaction identity resolves before any state-sensitive device preparation.
-        // Otherwise an exact INSERT retry observes its already-inserted key and fabricates 23505
-        // instead of returning the recorded terminal outcome.
+        let table_name = match &cmd {
+            Command::Insert(insert) => insert.table.as_str(),
+            Command::Update(update) => update.table.as_str(),
+            Command::Delete(delete) => delete.table.as_str(),
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "concurrent DML admission received a non-DML command".to_string(),
+                )))
+            }
+        };
+        // Stable transaction identity resolves before fresh table access or state-sensitive
+        // device preparation. The shared helper also re-resolves after a raced lease failure: an
+        // identical request can become terminal between the first lookup and an intervening reset
+        // taking exclusivity.
         let request_digest = gpu_db_wal::canonical_request_digest(text.as_bytes());
-        let commit = self.commit_state();
-        match commit.resolve_transaction_retry_digest_outcome(txn_id, request_digest) {
-            Ok(Some((token, affected_rows))) if self.committed_seq() >= token.index => {
+        let _table_access = match self.acquire_autocommit_table_access_after_retry(
+            table_name,
+            txn_id,
+            request_digest,
+        )? {
+            StableRetryOr::Terminal(affected_rows) => {
                 if command_has_returning(&cmd) {
                     return Err(ExecuteError::Unsupported(
-                        "terminal retry of DML RETURNING is fail-closed until canonical status persists the returned frame"
-                            .to_string(),
-                    ));
+                            "terminal retry of DML RETURNING is fail-closed until canonical status persists the returned frame"
+                                .to_string(),
+                        ));
                 }
                 return Ok(DmlExecutionResult {
                     rows_affected: affected_rows,
                     returning: None,
                 });
             }
-            Ok(Some((token, _))) => {
-                return Err(ExecuteError::Indeterminate(format!(
-                    "transaction id {txn_id} has canonical commit sequence {} but publication has not reached it",
-                    token.index
-                )));
-            }
-            Err(error) => return Err(ExecuteError::Engine(error)),
-            Ok(None) => {}
-        }
-        match self.resolve_pending_transaction_claim(txn_id, request_digest) {
-            Ok(true) => {
-                return Err(ExecuteError::Indeterminate(format!(
-                    "transaction id {txn_id} is pending in canonical mutation admission"
-                )));
-            }
-            Err(error) => return Err(ExecuteError::Engine(error)),
-            Ok(false) => {}
-        }
-        drop(commit);
+            StableRetryOr::Fresh(access) => access,
+        };
         self.ensure_dml_device_generation(&cmd)?;
         let transaction_snapshot = self.transaction_snapshot_handle(txn_id);
         let read_snapshot = transaction_snapshot

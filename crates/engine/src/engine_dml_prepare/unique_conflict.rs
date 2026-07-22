@@ -175,20 +175,40 @@ impl Engine {
         table: &RelationalTable,
     ) -> Option<Index> {
         let entries = self.read_residency_snapshots();
-        let entry = entries.get(&table.name)?;
-        let descriptor = &entry.descriptor;
-        (descriptor.schema == table.schema
-            && descriptor.table == table.name
-            && descriptor.row_count == 0
-            && descriptor.is_valid()
-            && !self
-                .router
-                .runtime()
-                .snapshot()
-                .memory_pressured_gpu_ids
-                .contains(&descriptor.gpu_id)
-            && entry.device_memory.is_some())
-        .then_some(descriptor.valid_through_index)
+        let runtime = self.router.runtime().snapshot();
+        if let Some(entry) = entries.get(&table.name) {
+            let descriptor = &entry.descriptor;
+            return (descriptor.schema == table.schema
+                && descriptor.table == table.name
+                && descriptor.row_count == 0
+                && descriptor.is_valid()
+                && !runtime
+                    .memory_pressured_gpu_ids
+                    .contains(&descriptor.gpu_id)
+                && entry.device_memory.is_some())
+            .then_some(descriptor.valid_through_index);
+        }
+
+        // Sharded admission deliberately publishes an empty table as a real zero-row shard carrying
+        // the count header. Treat that representation as the same typed proof, but only when every
+        // descriptor belongs to one live empty generation. A private reset's placeholder `Vec::new()`
+        // has no device allocation and therefore does not satisfy this branch.
+        let shards = self.read_residency_shards();
+        let table_shards = shards.get(&table.name)?;
+        let boundary = table_shards.first()?.history_floor_index;
+        table_shards
+            .iter()
+            .all(|shard| {
+                shard.schema == table.schema
+                    && shard.table == table.name
+                    && shard.row_count == 0
+                    && shard.history_floor_index == boundary
+                    && shard.is_valid(runtime.memory_pressured_gpu_ids.contains(&shard.gpu_id))
+                    && shard.device_memory.as_ref().is_some_and(|memory| {
+                        self.shard_write_locate_cell_live(&table.name, shard.shard_id, memory)
+                    })
+            })
+            .then_some(boundary)
     }
 
     /// Return whether any unique key touched by `delta` was claimed or released after

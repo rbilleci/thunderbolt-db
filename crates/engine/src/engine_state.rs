@@ -337,6 +337,10 @@ pub struct ReadState {
     // so the concurrent commit critical section can bump it via `&self` (release-store, LAST — the
     // publish point) while lock-free readers acquire-load it once per statement (write-half Stage 4).
     pub(crate) committed_seq: AtomicU64,
+    /// Monotonic PostgreSQL-compatible non-MVCC rewrite fence keyed by stable table OID.
+    /// Readers acquire the table guard before sampling this map; an older retained boundary then
+    /// binds the typed empty root instead of traversing the retired generation.
+    pub(crate) table_rewrite_fences: ArcSwap<BTreeMap<u32, Index>>,
     // GPU-resident read-route metadata (device memory + — from Stage 3 — snapshot/shard maps).
     pub(crate) residency: ResidencyReadState,
     // Per-execution route telemetry the read path records through `&self` (Mutex + a test counter).
@@ -349,6 +353,7 @@ impl ReadState {
             catalog_history: ArcSwap::new(Arc::new(CatalogHistory::initial())),
             mvcc: MvccData::new(),
             committed_seq: AtomicU64::new(0),
+            table_rewrite_fences: ArcSwap::new(Arc::new(BTreeMap::new())),
             residency: ResidencyReadState::default(),
             route_telemetry: RouteTelemetry::default(),
         }
@@ -369,6 +374,38 @@ impl ReadState {
     /// constructor-time reads, or admin introspection that is not snapshot-pinned).
     pub(crate) fn latest_catalog(&self) -> Arc<CatalogSnapshot> {
         self.catalog_history.load().latest()
+    }
+
+    pub(crate) fn publish_table_rewrite_fences(
+        &self,
+        table_oids: impl IntoIterator<Item = u32>,
+        commit_seq: Index,
+    ) {
+        let current = self.table_rewrite_fences.load();
+        let mut next = (**current).clone();
+        for table_oid in table_oids {
+            next.entry(table_oid)
+                .and_modify(|fence| *fence = (*fence).max(commit_seq))
+                .or_insert(commit_seq);
+        }
+        self.table_rewrite_fences.store(Arc::new(next));
+    }
+
+    pub(crate) fn prune_table_rewrite_fences(
+        &self,
+        live_table_oids: &BTreeSet<u32>,
+        safe_boundary: Index,
+    ) {
+        let current = self.table_rewrite_fences.load();
+        if !current
+            .iter()
+            .any(|(oid, fence)| !live_table_oids.contains(oid) && *fence <= safe_boundary)
+        {
+            return;
+        }
+        let mut next = (**current).clone();
+        next.retain(|oid, fence| live_table_oids.contains(oid) || *fence > safe_boundary);
+        self.table_rewrite_fences.store(Arc::new(next));
     }
 }
 

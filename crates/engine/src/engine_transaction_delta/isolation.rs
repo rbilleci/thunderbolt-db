@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::engine_mutation_admission::validate_transaction_characteristics;
+use crate::engine_transaction_reset::{final_transaction_write_set, mutation_table};
 
 impl Engine {
     /// Replace only the characteristics of an explicit transaction that has not acquired a
@@ -49,6 +50,8 @@ impl Engine {
             device_authoritative_tables: Arc::clone(&current.device_authoritative_tables),
             chunk_authoritative_tables: Arc::clone(&current.chunk_authoritative_tables),
             delta: Arc::clone(&current.delta),
+            table_access: Arc::clone(&current.table_access),
+            rewrite_fenced_tables: Arc::clone(&current.rewrite_fenced_tables),
             statement_lock: Arc::clone(&current.statement_lock),
             program_owned: Arc::clone(&current.program_owned),
             data_snapshot_acquired: Arc::clone(&current.data_snapshot_acquired),
@@ -97,7 +100,7 @@ impl Engine {
             return Ok(Arc::clone(current));
         }
 
-        self.rebase_transaction_delta(current, &fresh)?;
+        let rewrite_fenced_tables = self.rebase_transaction_delta(current, &fresh)?;
         let replacement = Arc::new(TransactionSnapshot {
             characteristics: current.characteristics,
             boundary: fresh.boundary,
@@ -109,6 +112,8 @@ impl Engine {
             device_authoritative_tables: Arc::clone(&fresh.device_authoritative_tables),
             chunk_authoritative_tables: Arc::clone(&fresh.chunk_authoritative_tables),
             delta: Arc::clone(&current.delta),
+            table_access: Arc::clone(&current.table_access),
+            rewrite_fenced_tables,
             statement_lock: Arc::clone(&current.statement_lock),
             program_owned: Arc::clone(&current.program_owned),
             data_snapshot_acquired: Arc::clone(&current.data_snapshot_acquired),
@@ -136,7 +141,12 @@ impl Engine {
         &self,
         current: &Arc<TransactionSnapshot>,
         fresh: &Arc<TransactionSnapshot>,
-    ) -> Result<(), ExecuteError> {
+    ) -> Result<Arc<Mutex<BTreeSet<String>>>, ExecuteError> {
+        // Rewrite-fence membership is relative to one statement boundary. A READ COMMITTED rebase
+        // has captured the publication containing every earlier fence, and already-held table
+        // guards prevent a same-OID reset from crossing this replay. Start the fresh statement
+        // unmarked; its ordinary access acquisition will bind any reset that races after capture.
+        let rebased_rewrite_fenced_tables = Arc::new(Mutex::new(BTreeSet::new()));
         let (rebased_catalog_overlay, private_catalog_tables) = {
             let delta = current
                 .delta
@@ -174,20 +184,19 @@ impl Engine {
             }
         };
         let transaction_catalog = rebased_catalog_overlay.as_ref().unwrap_or(&fresh.catalog);
-        let (generation, mut deltas, write_set, sequence_state, old_private_gpu_bytes) = {
+        let (generation, mut operations, sequence_state, old_private_gpu_bytes) = {
             let delta = current
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
                 delta.generation,
-                delta.deltas.clone(),
-                delta.write_set.clone(),
+                delta.operations.clone(),
                 delta.sequence_state.clone(),
                 delta.private_gpu_bytes_by_gpu.clone(),
             )
         };
-        rekey_provisional_inserts(&mut deltas, fresh.next_row_id)?;
+        rekey_provisional_inserts(&mut operations, fresh.next_row_id)?;
 
         let mut next_shards = (*fresh.resident_shards).clone();
         // A transaction-created table has no globally published shard generation. Rebase starts
@@ -205,7 +214,7 @@ impl Engine {
             generation: 0,
             resident_shards: Arc::new(next_shards.clone()),
             streaming_cold_chunks: Arc::new(next_cold_chunks.clone()),
-            deltas: Vec::new(),
+            operations: Vec::new(),
             write_set: WriteSet::default(),
             next_row_id: fresh.next_row_id,
             sequence_state: BTreeMap::new(),
@@ -226,6 +235,8 @@ impl Engine {
             device_authoritative_tables: Arc::clone(&fresh.device_authoritative_tables),
             chunk_authoritative_tables: Arc::clone(&fresh.chunk_authoritative_tables),
             delta: Arc::clone(&scratch_delta),
+            table_access: Arc::clone(&current.table_access),
+            rewrite_fenced_tables: Arc::clone(&rebased_rewrite_fenced_tables),
             statement_lock: Arc::new(std::sync::Mutex::new(())),
             program_owned: Arc::new(AtomicBool::new(false)),
             data_snapshot_acquired: Arc::new(AtomicBool::new(true)),
@@ -235,47 +246,72 @@ impl Engine {
             _resident_gpu_charge: Arc::clone(&fresh._resident_gpu_charge),
         });
         let mut gpu_reservation = TransactionGpuReservation::new(self);
-        for delta in &deltas {
-            for (name, expected) in &delta.catalog_dependencies {
-                if transaction_catalog.relational_catalog.get(name) != Some(expected) {
-                    return Err(ExecuteError::Serialization(format!(
-                        "catalog dependency \"{name}\" changed after transaction statement snapshot {}",
-                        delta.read_snapshot
-                    )));
+        for operation in &operations {
+            match operation {
+                TransactionOperation::Row(delta) => {
+                    for (name, expected) in &delta.catalog_dependencies {
+                        if transaction_catalog.relational_catalog.get(name) != Some(expected) {
+                            return Err(ExecuteError::Serialization(format!(
+                                "catalog dependency \"{name}\" changed after transaction statement snapshot {}",
+                                delta.read_snapshot
+                            )));
+                        }
+                    }
+                    let table_name = mutation_table(&delta.mutation);
+                    let table = transaction_catalog
+                        .relational_catalog
+                        .get(table_name)
+                        .ok_or_else(|| {
+                            ExecuteError::Serialization(format!(
+                                "relation \"{table_name}\" changed before the next READ COMMITTED statement"
+                            ))
+                        })?;
+                    let _scope = self.enter_transaction_read(Arc::clone(&scratch));
+                    self.apply_transaction_private_delta(
+                        table,
+                        delta,
+                        fresh.boundary,
+                        &mut next_shards,
+                        &mut next_cold_chunks,
+                        &mut gpu_reservation,
+                    )
+                    .map_err(read_committed_rebase_error)?;
                 }
-            }
-            let table_name = match &delta.mutation {
-                PreparedMutation::Insert { table, .. }
-                | PreparedMutation::Update { table, .. }
-                | PreparedMutation::Delete { table, .. } => table,
-            };
-            let table = transaction_catalog
-                .relational_catalog
-                .get(table_name)
-                .ok_or_else(|| {
-                    ExecuteError::Serialization(format!(
-                        "relation \"{table_name}\" changed before the next READ COMMITTED statement"
-                    ))
-                })?;
-            {
-                let _scope = self.enter_transaction_read(Arc::clone(&scratch));
-                self.apply_transaction_private_delta(
-                    table,
-                    delta,
-                    fresh.boundary,
-                    &mut next_shards,
-                    &mut next_cold_chunks,
-                    &mut gpu_reservation,
-                )
-                .map_err(read_committed_rebase_error)?;
+                TransactionOperation::TableReset(reset) => {
+                    for (name, expected) in &reset.catalog_dependencies {
+                        if transaction_catalog.relational_catalog.get(name) != Some(expected) {
+                            return Err(ExecuteError::Serialization(format!(
+                                "table reset catalog dependency \"{name}\" changed after snapshot {}",
+                                reset.read_snapshot
+                            )));
+                        }
+                    }
+                    let table = transaction_catalog
+                        .relational_catalog
+                        .get(&reset.table)
+                        .ok_or_else(|| {
+                            ExecuteError::Serialization(format!(
+                                "relation \"{}\" changed before its table reset was rebased",
+                                reset.table
+                            ))
+                        })?;
+                    next_shards.insert(reset.table.clone(), Vec::new());
+                    next_cold_chunks.remove(&reset.table);
+                    self.append_transaction_empty_root(
+                        table,
+                        &mut next_shards,
+                        &mut gpu_reservation,
+                    )
+                    .map_err(read_committed_rebase_error)?;
+                }
             }
             let mut replay = scratch_delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             replay.resident_shards = Arc::new(next_shards.clone());
             replay.streaming_cold_chunks = Arc::new(next_cold_chunks.clone());
-            replay.deltas.push(delta.clone());
-            replay.write_set.extend_deduplicated(&delta.write_set);
+            replay.operations.push(operation.clone());
+            replay.write_set = final_transaction_write_set(&replay.operations);
             replay.generation = replay.generation.saturating_add(1);
         }
         let next_private_gpu_bytes =
@@ -283,8 +319,12 @@ impl Engine {
         gpu_reservation
             .ensure_replacement_admitted(&old_private_gpu_bytes, &next_private_gpu_bytes)?;
 
-        let rows_consumed = deltas.iter().try_fold(0u64, |total, delta| {
-            total.checked_add(delta.rows_consumed).ok_or_else(|| {
+        let rows_consumed = operations.iter().try_fold(0u64, |total, operation| {
+            let consumed = match operation {
+                TransactionOperation::Row(delta) => delta.rows_consumed,
+                TransactionOperation::TableReset(_) => 0,
+            };
+            total.checked_add(consumed).ok_or_else(|| {
                 ExecuteError::Unsupported(
                     "transaction provisional row identity count overflow".to_string(),
                 )
@@ -302,8 +342,8 @@ impl Engine {
         }
         state.resident_shards = Arc::new(next_shards);
         state.streaming_cold_chunks = Arc::new(next_cold_chunks);
-        state.deltas = deltas;
-        state.write_set = write_set;
+        state.operations = operations;
+        state.write_set = final_transaction_write_set(&state.operations);
         state.next_row_id = fresh
             .next_row_id
             .checked_add(rows_consumed)
@@ -319,7 +359,7 @@ impl Engine {
         }
         gpu_reservation
             .replace_charges(&mut state.private_gpu_bytes_by_gpu, next_private_gpu_bytes);
-        Ok(())
+        Ok(rebased_rewrite_fenced_tables)
     }
 }
 
@@ -333,10 +373,16 @@ fn read_committed_rebase_error(error: ExecuteError) -> ExecuteError {
     }
 }
 
-fn rekey_provisional_inserts(deltas: &mut [WriteDelta], new_base: u64) -> Result<(), ExecuteError> {
+fn rekey_provisional_inserts(
+    operations: &mut [TransactionOperation],
+    new_base: u64,
+) -> Result<(), ExecuteError> {
     let mut mapping = BTreeMap::<(String, u64), u64>::new();
     let mut next = new_base;
-    for delta in deltas.iter() {
+    for delta in operations.iter().filter_map(|operation| match operation {
+        TransactionOperation::Row(delta) => Some(delta),
+        TransactionOperation::TableReset(_) => None,
+    }) {
         let PreparedMutation::Insert {
             table,
             inserted_rows,
@@ -367,7 +413,13 @@ fn rekey_provisional_inserts(deltas: &mut [WriteDelta], new_base: u64) -> Result
         ));
     }
 
-    for delta in deltas {
+    for delta in operations
+        .iter_mut()
+        .filter_map(|operation| match operation {
+            TransactionOperation::Row(delta) => Some(delta),
+            TransactionOperation::TableReset(_) => None,
+        })
+    {
         let table = match &delta.mutation {
             PreparedMutation::Insert { table, .. }
             | PreparedMutation::Update { table, .. }

@@ -91,7 +91,7 @@ impl<'a> TransactionGpuReservation<'a> {
     /// Prove that the replacement graph cannot raise the retained private account above the
     /// prior generation plus this statement's admitted allocations. Call before publishing the
     /// replacement Arcs so an accounting-contract violation leaves the transaction unchanged.
-    pub(super) fn ensure_replacement_admitted(
+    pub(crate) fn ensure_replacement_admitted(
         &self,
         charged: &BTreeMap<u16, u64>,
         replacement: &BTreeMap<u16, u64>,
@@ -116,7 +116,7 @@ impl<'a> TransactionGpuReservation<'a> {
     /// carried-forward private payloads exactly once. The caller holds the transaction statement
     /// lock, swaps and releases the only permitted old-map statement pin, then reconciles under the
     /// allocation lock so global admission cannot observe a transiently reduced account.
-    pub(super) fn replace_charges(
+    pub(crate) fn replace_charges(
         &mut self,
         charged: &mut BTreeMap<u16, u64>,
         replacement: BTreeMap<u16, u64>,
@@ -239,6 +239,11 @@ impl Engine {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
+        let reset_tables = record
+            .table_resets
+            .iter()
+            .map(|reset| reset.table.as_str())
+            .collect::<BTreeSet<_>>();
         let appended_tables = record
             .mutations
             .iter()
@@ -247,7 +252,7 @@ impl Engine {
                 | BinaryTransactionMutation::Update { table, .. } => Some(table.as_str()),
                 BinaryTransactionMutation::Delete { .. } => None,
             })
-            .filter(|table| !created_tables.contains(table))
+            .filter(|table| !created_tables.contains(table) && !reset_tables.contains(table))
             .collect::<BTreeSet<_>>();
         let current_shards = self.read_residency_shards();
         for table_name in appended_tables {
@@ -302,7 +307,15 @@ impl Engine {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
+        let reset_tables = record
+            .table_resets
+            .iter()
+            .map(|reset| reset.table.clone())
+            .collect::<BTreeSet<_>>();
         let mut by_table = BTreeMap::<String, TransactionPublicationImages>::new();
+        for table in &reset_tables {
+            by_table.entry(table.clone()).or_default();
+        }
         for mutation in &record.mutations {
             let (table_name, row_id) = match mutation {
                 BinaryTransactionMutation::Insert { table, row_id, .. }
@@ -381,17 +394,16 @@ impl Engine {
                 .relational_catalog
                 .get(&table_name)
                 .expect("publication image table was resolved above");
-            if self.table_chunk_authoritative(&table_name).is_some() {
+            if self.table_chunk_authoritative(&table_name).is_some()
+                && !reset_tables.contains(&table_name)
+            {
                 continue;
             }
-            if created_tables.contains(&table_name) {
+            if created_tables.contains(&table_name) || reset_tables.contains(&table_name) {
                 if !images.old_rows.is_empty() {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "transaction-created relation \"{table_name}\" has a non-insert final mutation"
+                        "fresh transaction relation \"{table_name}\" has a non-insert final mutation"
                     ))));
-                }
-                if images.new_rows.is_empty() {
-                    continue;
                 }
                 let gpu_id = private_shards
                     .get(&table_name)
@@ -425,13 +437,13 @@ impl Engine {
                 let bytes = (payload.len() as u64)
                     .checked_add((row_count as u64).checked_mul(8).ok_or_else(|| {
                         ExecuteError::Engine(EngineError::ApplyFailed(
-                            "transaction-created row identity reservation overflowed".to_string(),
+                            "fresh transaction row identity reservation overflowed".to_string(),
                         ))
                     })?)
                     .and_then(|bytes| bytes.checked_add(index_bytes))
                     .ok_or_else(|| {
                         ExecuteError::Engine(EngineError::ApplyFailed(
-                            "transaction-created publication reservation overflowed".to_string(),
+                            "fresh transaction publication reservation overflowed".to_string(),
                         ))
                     })?;
                 add(gpu_id, bytes)?;
@@ -525,7 +537,7 @@ impl Engine {
 /// shard map defines globally-accounted identities; any distinct payload/sidecar/row-id pointer
 /// reachable from the replacement is private. Pointer dedup prevents structural sharing from
 /// being charged twice.
-pub(super) fn transaction_private_shard_bytes(
+pub(crate) fn transaction_private_shard_bytes(
     base: &BTreeMap<String, Vec<RelationalResidentShard>>,
     replacement: &BTreeMap<String, Vec<RelationalResidentShard>>,
 ) -> BTreeMap<u16, u64> {
@@ -624,6 +636,28 @@ impl Engine {
         if rows.is_empty() {
             return Ok(());
         }
+        self.append_transaction_delta_shard_inner(table, rows, row_ids, shards, gpu_reservation)
+    }
+
+    /// Install an allocation-backed, typed zero-row root for a private reset/fence. An empty Vec is
+    /// only a construction placeholder; it is never accepted as GPU authority or durable proof.
+    pub(crate) fn append_transaction_empty_root(
+        &self,
+        table: &RelationalTable,
+        shards: &mut BTreeMap<String, Vec<RelationalResidentShard>>,
+        gpu_reservation: &mut TransactionGpuReservation<'_>,
+    ) -> Result<(), ExecuteError> {
+        self.append_transaction_delta_shard_inner(table, &[], &[], shards, gpu_reservation)
+    }
+
+    fn append_transaction_delta_shard_inner(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+        row_ids: &[u64],
+        shards: &mut BTreeMap<String, Vec<RelationalResidentShard>>,
+        gpu_reservation: &mut TransactionGpuReservation<'_>,
+    ) -> Result<(), ExecuteError> {
         if rows.len() != row_ids.len() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "transaction delta rows and identities are not parallel".to_string(),
@@ -669,20 +703,25 @@ impl Engine {
         for row_id in row_ids {
             row_id_payload.extend_from_slice(&row_id.to_le_bytes());
         }
-        gpu_reservation.reserve(gpu_id, row_id_payload.len() as u64)?;
-        let row_id_region = self
-            .relational_residency_device_memory(gpu_id, &row_id_payload)
-            .map(Arc::new)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(
-                    "transaction delta identity allocation failed".to_string(),
-                ))
-            })?;
-        gpu_reservation.verify_allocation(
-            gpu_id,
-            row_id_payload.len() as u64,
-            row_id_region.metadata().allocated_bytes,
-        )?;
+        let row_id_region = if row_id_payload.is_empty() {
+            None
+        } else {
+            gpu_reservation.reserve(gpu_id, row_id_payload.len() as u64)?;
+            let region = self
+                .relational_residency_device_memory(gpu_id, &row_id_payload)
+                .map(Arc::new)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "transaction delta identity allocation failed".to_string(),
+                    ))
+                })?;
+            gpu_reservation.verify_allocation(
+                gpu_id,
+                row_id_payload.len() as u64,
+                region.metadata().allocated_bytes,
+            )?;
+            Some(region)
+        };
         let int4 = table
             .columns
             .iter()
@@ -757,7 +796,7 @@ impl Engine {
             device_memory: Some(memory),
             deleted_by_region: None,
             created_by_region: None,
-            row_id_region: Some(row_id_region),
+            row_id_region,
             max_created_by: 0,
         });
         Ok(())

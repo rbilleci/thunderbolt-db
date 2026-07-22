@@ -936,6 +936,13 @@ pub(super) fn gpu_primary_context(
     Ok(context)
 }
 
+#[cfg(test)]
+pub(super) fn distinct_gpu_primary_context_for_test(
+    gpu_id: u16,
+) -> Result<Arc<GpuPrimaryContext>, CudaRuntimeProbeError> {
+    Ok(Arc::new(GpuPrimaryContext::create(gpu_id)?))
+}
+
 pub(super) fn check_cuda(code: i32) -> Result<(), CudaRuntimeProbeError> {
     if code == 0 {
         Ok(())

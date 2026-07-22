@@ -175,10 +175,35 @@ impl Engine {
         prune_below: Index,
     ) {
         let generation = Self::catalog_snapshot_from_working(cat, commit_seq);
+        let live_table_oids = generation
+            .relational_catalog
+            .values()
+            .map(|table| table.oid)
+            .collect::<BTreeSet<_>>();
         let history = self.read_state.catalog_history.load();
         self.read_state
             .catalog_history
             .store(Arc::new(history.pushed(generation, prune_below)));
+        // A dropped OID's fence remains until every retained read boundary that can predate it has
+        // drained. Live OIDs keep their latest fence; dropped/recreated churn cannot grow the map.
+        self.read_state
+            .prune_table_rewrite_fences(&live_table_oids, prune_below);
+    }
+
+    pub(crate) fn table_root_identities(cat: &DdlCatalogState) -> BTreeMap<String, u32> {
+        cat.relational_catalog
+            .iter()
+            .map(|(name, table)| (name.clone(), table.oid))
+            .collect()
+    }
+
+    pub(crate) fn reconcile_table_root_ledger(
+        &self,
+        ledger: &mut RecentCommitsLedger,
+        prior_identities: &BTreeMap<String, u32>,
+        cat: &DdlCatalogState,
+    ) {
+        ledger.reconcile_table_roots(prior_identities, &Self::table_root_identities(cat));
     }
 
     /// The oldest active read snapshot's prune boundary for the catalog ring: generations strictly

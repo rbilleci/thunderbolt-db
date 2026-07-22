@@ -14,6 +14,48 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 typed transactional table reset — accepted 2026-07-22
+
+- Autocommit and explicit-transaction `TRUNCATE ... CONTINUE IDENTITY` now stage a typed empty-root barrier rather
+  than synthesizing one DELETE per visible row. `StagedTableReset` is statement ordered with private DML, so a final
+  reset shadows preceding mutations while later mutations survive; rollback publishes none. The canonical binary
+  transaction record carries the stable table identity, source root, dependency closure, GPU-derived source digest
+  and row count, and GPU-derived empty digest. Live apply and fresh replay validate and publish that one typed reset;
+  SQL text is not replay authority. `TRUNCATE ... RESTART IDENTITY`, multi-table/CASCADE shapes, and unclosed
+  transactional-catalog combinations still fail before effect under **PRODUCT-001**.
+- A transaction-lifetime table-access registry gives ordinary reads/writes shared stable-OID guards and upgrades a
+  reset plus its FK dependency closure to exclusive. Publication installs the monotonic ADR-014 rewrite fence with
+  the new empty root; a held old snapshot that first accesses the table sees empty, while a snapshot that already
+  retained the identity conflicts before rewrite. Cold and resident roots, retained/prepared/streaming reads,
+  catalog-bound reads, commit/replay, checkpoint restoration, and generation retirement obey the same fence. GPU
+  visibility-count and visible-content-digest kernels make the reset proof non-vacuously device derived.
+- Adversarial review found retry-before-guard, CUDA-context binding, root-ledger reconciliation,
+  READ COMMITTED/REPEATABLE READ fence, typed command-tag, and write-footprint gaps. The repaired tree resolves exact
+  terminal/pending mutation identity before fresh table access and records COPY, explicit-transaction,
+  classic-wave, and optimized-lane mutation roots with zero-row DELETE/UPDATE parity. The last rejection exposed
+  three remaining lookup-to-lease races in concurrent DML, queued admission, and the public COPY seam; all now use
+  the shared acquire/re-resolve helper, including exact-pending queue semantics, with deterministic sabotage tests.
+  Fresh product-semantics and runtime/recovery audits returned **ACCEPT** with no blockers on the frozen candidate.
+- Engine ordinary tests pass **548/548** with **579** GPU tests ignored. The final actual-GPU HAZARD matrix passes
+  **45/45** process runs and 135 successful result groups: nine cohorts, each three serial plus two concurrent, with
+  zero CUDA 700/716/717/719. It covers ordered reset/DML, rollback, table/FK races, old-snapshot fencing,
+  exact/mismatched retry,
+  root-ledger parity, COPY and explicit-transaction recovery, retained/read sabotage, device visibility count/digest,
+  and fresh-context replay. Full workspace all-target/all-feature tests, strict workspace Clippy, rustfmt, diff, and
+  source-size gates pass.
+- The standard isolated report card completes both layers and cache regimes. Layer 1 records `sum_i32` at
+  **1465.8 GB/s, p50 23us** in-L2 and **1440.4 GB/s, p50 186us** out-of-L2; the principal kernel ratios remain at
+  baseline. Layer 2 production point reads at batch 65,536 record **229.071M/s, p50 158us** in-L2 and
+  **196.210M/s, p50 202us** out-of-L2 after the 48M-row fixture builds in **2,143.5s** with zero final-residency time.
+  That card ran on reset candidate tree `2e898448c4e4b959aff2c6534a5ef5486c268d9e`; the final delta changes only
+  mutation retry ordering and write-root bookkeeping, not a read kernel, residency layout, result path, or the
+  report fixture route, so the evidence remains applicable.
+- The immutable accepted implementation is base `43549aeb7473165444773fb8d7a09070708c2692`, code/test tree
+  `0f1d46786fd9acaaa8cd112ff81179d2d27bd789`, and cached binary-diff SHA-256
+  `06106d6f1a5416dc4ca9ddea89594bd00f4784d3218c387d5da34bfe181a710c` across 74 code/test paths. **PRODUCT-001**
+  remains open: its active PLAN boundary is ordered multiple-catalog-command expansion, followed by remaining
+  compatibility/recovery proof, legacy/P8 deletion, ownership guards, and the two PLAN-owned source outliers.
+
 ## PRODUCT-001 transaction-private catalog generation proof — accepted 2026-07-22
 
 - A transaction-private `CREATE TABLE` no longer receives a false `40001` solely because an unrelated DML or KV
@@ -37,11 +79,10 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `f3db8416f31024edfda84d9d0ea28c4f060c75129782ef270e5f63d333ad2bae` across five engine paths. The fresh
   independent runtime audit returned **ACCEPT**. Its stale-comment residual was repaired; the first narrow re-audit
   rejected overbroad publisher prose, and the corrected comment-only tree then received **ACCEPT** with no residual.
-- **PRODUCT-001** remains open. Active-transaction `TRUNCATE ... CONTINUE IDENTITY` is still lowered to private
-  row deletes rather than the ADR-014 typed table-reset/rewrite-fence lifecycle; multiple transactional catalog
-  commands remain fail-closed. Those broader DDL facts, remaining SQLSTATE/type-codec and named-client coverage,
-  mixed recovery, legacy/P8 deletion, ownership guards, and the two PLAN-owned source outliers remain with
-  **PRODUCT-001**.
+- **PRODUCT-001** remains open. The later accepted typed-reset slice closes the row-delete emulation named by this
+  checkpoint. Multiple transactional catalog commands remain fail-closed; that ordered expansion, remaining
+  SQLSTATE/type-codec and named-client coverage, mixed recovery, legacy/P8 deletion, ownership guards, and the two
+  PLAN-owned source outliers remain with **PRODUCT-001**.
 
 ## PRODUCT-001 PostgreSQL 16 pg_dump/restore compatibility — accepted 2026-07-22
 
@@ -98,8 +139,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `2c1893091ed373e41c326f7a03695ff8684455f7f5d73f66ee8b236cc905babe` and repeatedly restored **227–230M/s**
   targeted throughput. The standard runner now builds in a fresh isolated target, records compiler and artifact
   identities, and invokes the hashed binaries directly, preventing shared native-build cache contamination. The
-  `engine_mutation_admission.rs` (**2,012**) and `engine_dml_concurrent.rs` (**2,083**) outliers have explicit
-  no-exception PRODUCT-001 dispositions in PLAN.
+  At that checkpoint `engine_mutation_admission.rs` was **2,012** lines and `engine_dml_concurrent.rs` was **2,083**;
+  both retain explicit no-exception PRODUCT-001 dispositions, with their current counts recorded in PLAN and the
+  newest STATUS section.
 - Two initial adversarial freeze rounds rejected fail-open recognizers, transaction/session-state errors, a
   live-catalog sequence race, filtered role state, unsafe harness startup/cleanup, cross-object ACL assertions, and
   stale source dispositions. A third architecture audit rejected the recognized routes for uploading already-final

@@ -359,6 +359,7 @@ impl Engine {
             #[cfg(test)]
             transaction_post_durable_hook: Mutex::new(None),
             active_snapshots: std::sync::Arc::new(Mutex::new(ActiveSnapshots::default())),
+            table_access: Arc::new(TableAccessRegistry::default()),
             transaction_private_gpu_bytes: Arc::new(Mutex::new(BTreeMap::new())),
             transaction_retained_gpu_allocations: Arc::new(Mutex::new(BTreeMap::new())),
             group_flush: GroupFlushState::default(),

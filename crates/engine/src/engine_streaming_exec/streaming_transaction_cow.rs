@@ -77,6 +77,7 @@ impl Engine {
         let mut by_table: BTreeMap<String, Vec<&AppliedRowMutation>> = BTreeMap::new();
         for mutation in applied {
             let table = match mutation {
+                AppliedRowMutation::TableReset { reset, .. } => &reset.table,
                 AppliedRowMutation::Insert { table, .. }
                 | AppliedRowMutation::Delete { table, .. }
                 | AppliedRowMutation::Update { table, .. } => table,
@@ -119,6 +120,7 @@ impl Engine {
                     }
                 }
                 working = match mutation {
+                    AppliedRowMutation::TableReset { .. } => None,
                     AppliedRowMutation::Insert { rows, row_ids, .. } => self
                         .append_transaction_cold_tail(
                             table,

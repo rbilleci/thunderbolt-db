@@ -417,10 +417,16 @@ impl Engine {
             let timestamp_micros =
                 wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
             commit.record_commit_timestamp(item.txn_id, timestamp_micros);
-            let write_set = crate::write_path::WriteSet {
+            let mut write_set = crate::write_path::WriteSet {
                 unique_slots_i32: vec![item.slot],
                 ..Default::default()
             };
+            // Keep the live canonical table-root oracle byte-for-byte aligned with binary replay:
+            // INSERT always publishes a row mutation; DELETE replay carries an AppliedRowMutation
+            // even for a missing key; UPDATE replay is the one 0-row arm that returns no mutation.
+            if item.op != LaneOpKind::Update || item.rows_affected != 0 {
+                write_set.tables.insert(item.table.to_string());
+            }
             commit.ledger.record(&write_set, commit_seq);
         }
         if let Some(error) = terminal_status_error {

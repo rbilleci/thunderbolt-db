@@ -1060,12 +1060,11 @@ impl EndpointState {
             "sql_visible_resident_device_memory_retained",
             snapshot.device_memory_proof.is_some(),
         )?;
-        if let (Some(handle), Some(read_view)) = (
-            self.engine
-                .relational_retained_snapshot_handle(&pending.copy.table),
-            self.engine
-                .relational_retained_device_read_view(&pending.copy.table),
-        ) {
+        if let Some(read_view) = self
+            .engine
+            .relational_retained_device_read_view(&pending.copy.table)
+        {
+            let handle = read_view.snapshot_handle().clone();
             let route = RetainedReadRuntimeRoute {
                 table: pending.copy.table.clone(),
                 generation: handle.generation,

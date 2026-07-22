@@ -104,6 +104,7 @@ impl Engine {
     ) -> Result<RelationalRetainedReadJob, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let _table_access = self.acquire_autocommit_table_access(&select.table)?;
         let decision = self.plan_relational_resident_route(select);
         if !decision.accepted {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -227,6 +228,8 @@ impl Engine {
     ) -> Result<RelationalRetainedReadSubmission, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let table_access =
+            Some(self.acquire_autocommit_table_accesses(jobs.iter().map(|job| job.table.clone()))?);
         for job in jobs {
             let query_shape = job.route_id.split(':').next().unwrap_or("unknown");
             if matches!(
@@ -313,12 +316,15 @@ impl Engine {
                     .try_into()
                     .unwrap_or(u64::MAX),
                 commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                table_access,
                 inner: RelationalRetainedReadSubmissionInner::Ready(results),
             });
         }
-        if let Some(submission) =
-            self.try_submit_relational_retained_int4_projection_jobs(jobs, submit_started)?
-        {
+        if let Some(submission) = self.try_submit_relational_retained_int4_projection_jobs(
+            jobs,
+            submit_started,
+            table_access.clone(),
+        )? {
             return Ok(submission);
         }
         let selects = jobs
@@ -346,6 +352,7 @@ impl Engine {
                 .try_into()
                 .unwrap_or(u64::MAX),
             commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+            table_access,
             inner: RelationalRetainedReadSubmissionInner::Ready(results),
         })
     }
@@ -356,6 +363,7 @@ impl Engine {
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         let origin_wedge = Arc::clone(&submission.commit_path_wedged);
         self.ensure_retained_submission_available(&origin_wedge)?;
+        let table_access = submission.table_access;
         let results = match submission.inner {
             RelationalRetainedReadSubmissionInner::Ready(results) => results,
             RelationalRetainedReadSubmissionInner::ReadyBatched(result) => {
@@ -368,6 +376,7 @@ impl Engine {
         #[cfg(test)]
         self.run_retained_completion_post_hook();
         self.ensure_retained_submission_available(&origin_wedge)?;
+        drop(table_access);
         Ok(results)
     }
 
@@ -375,6 +384,7 @@ impl Engine {
         &self,
         jobs: &[RelationalRetainedReadJob],
         submit_started: Instant,
+        table_access: Option<Arc<TableAccessLease>>,
     ) -> Result<Option<RelationalRetainedReadSubmission>, ExecuteError> {
         if jobs.is_empty() {
             return Ok(Some(RelationalRetainedReadSubmission {
@@ -388,6 +398,7 @@ impl Engine {
                     .try_into()
                     .unwrap_or(u64::MAX),
                 commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                table_access,
                 inner: RelationalRetainedReadSubmissionInner::Ready(Vec::new()),
             }));
         }
@@ -508,6 +519,7 @@ impl Engine {
                 .try_into()
                 .unwrap_or(u64::MAX),
             commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+            table_access,
             inner: RelationalRetainedReadSubmissionInner::PendingInt4Projection(Box::new(
                 RelationalRetainedInt4ProjectionSubmission {
                     table,
@@ -605,6 +617,7 @@ impl Engine {
         needles: &[i32],
     ) -> Result<Option<usize>, ExecuteError> {
         self.ensure_commit_path_available()?;
+        let _table_access = self.acquire_autocommit_table_access(table_name)?;
         let Some(table) = self.relational_catalog_table(table_name) else {
             return Ok(None);
         };
@@ -660,12 +673,20 @@ impl Engine {
         needles: &[i32],
     ) -> Result<Option<RelationalPointBatchResult>, ExecuteError> {
         self.ensure_commit_path_available()?;
+        let scoped_snapshot = self.current_transaction_read_snapshot();
+        if let Some(snapshot) = scoped_snapshot.as_ref() {
+            self.acquire_transaction_table_access(snapshot, [select.table.clone()])?;
+        }
         if !self.shard_batched_point_read_enabled() {
             return Ok(None);
         }
         let Ok((table, bound, copin_s)) = self.bind_relational_select_for_execution(select) else {
             return Ok(None);
         };
+        let _table_access = scoped_snapshot
+            .is_none()
+            .then(|| self.acquire_autocommit_table_read_access(&select.table, table.oid, copin_s))
+            .transpose()?;
         if self.resident_shard_count(&table.name) == 0 {
             return Ok(None); // not shard-resident -> the batcher's single-buffer / per-query path
         }
@@ -885,6 +906,7 @@ impl Engine {
     ) -> Result<RelationalRetainedBatchResult, ExecuteError> {
         let origin_wedge = Arc::clone(&submission.commit_path_wedged);
         self.ensure_retained_submission_available(&origin_wedge)?;
+        let table_access = submission.table_access;
         let result = match submission.inner {
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
                 Self::complete_int4_projection_batched_detached(*pending)?
@@ -897,6 +919,7 @@ impl Engine {
         #[cfg(test)]
         self.run_retained_completion_post_hook();
         self.ensure_retained_submission_available(&origin_wedge)?;
+        drop(table_access);
         Ok(result)
     }
 

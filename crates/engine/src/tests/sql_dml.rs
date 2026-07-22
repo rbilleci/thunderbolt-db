@@ -455,6 +455,9 @@ fn relational_copy_retry_is_exact_and_mismatch_is_rejected_without_a_second_comm
     );
     let committed_after_first = engine.committed_seq();
     let wal_after_first = engine.wal_buffered_count();
+    let reset = engine.table_access.lease();
+    let table_oid = engine.relational_catalog_table("copy_retry").unwrap().oid;
+    reset.acquire_exclusive([table_oid]).unwrap();
 
     assert_eq!(
         engine

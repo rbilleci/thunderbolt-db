@@ -47,6 +47,7 @@ impl Engine {
                 "compound prepared routes cannot be built inside an existing transaction snapshot",
             ));
         }
+        let _table_access = self.acquire_autocommit_table_access(table_name)?;
         if projection_columns.is_empty() || projection_columns.len() > 4 {
             return Err(compound_route_error(
                 "compound prepared routes require one to four fixed-width projection columns",
@@ -414,6 +415,7 @@ impl Engine {
                 "compound prepared route execution requires an autocommit statement snapshot",
             ));
         }
+        let _table_access = self.acquire_autocommit_table_access(&template.table)?;
         let commit = self.commit_state();
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;

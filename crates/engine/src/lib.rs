@@ -146,6 +146,9 @@ mod engine_streaming_exec;
 mod engine_transaction_catalog;
 mod engine_transaction_commit;
 mod engine_transaction_delta;
+mod engine_transaction_reset;
+mod table_access;
+use table_access::{TableAccessLease, TableAccessRegistry};
 mod engine_wal_archive;
 mod engine_write_apply;
 
@@ -353,6 +356,9 @@ const RESIDENT_SHARD_MEMORY_MISSING: &str = " has no retained device memory";
 struct PendingMutation {
     txn_id: u64,
     payload: std::sync::Arc<[u8]>,
+    /// Queue ownership, not the enqueue call, defines the lifetime of a table access. The lease
+    /// therefore survives time/count batching, retries, cancellation, and terminal apply/drop.
+    table_access: Option<Arc<TableAccessLease>>,
 }
 
 /// D3b (write-path assessment / scalability ledger #7) — group-commit flush coordination for the
@@ -446,6 +452,10 @@ pub struct Engine {
     /// for the oldest-active GC boundary. Autocommit prepare registers a scalar guard; explicit
     /// BEGIN registers one keyed, generation-owned catalog/MVCC/GPU-resource bundle.
     active_snapshots: std::sync::Arc<Mutex<ActiveSnapshots>>,
+    /// Stable-table-identity access guards. Explicit transactions retain their lease through
+    /// terminal control; statement snapshots retain one only for the statement. A table reset
+    /// upgrades its owner to exclusive and deterministic incompatible acquisition returns 40001.
+    table_access: Arc<TableAccessRegistry>,
     /// GPU bytes owned only by explicit-transaction private generations, by device. These
     /// allocations are not present in the globally published residency maps, so they must be
     /// charged separately against the same admission budget until the transaction snapshot drops.

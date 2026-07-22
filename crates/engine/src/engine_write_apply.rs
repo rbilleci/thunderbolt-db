@@ -6,6 +6,7 @@
 //! batcher (enqueue_set_text, tick_batching, flush_admin, apply_batch, plan_text).
 
 use super::*;
+use crate::engine_transaction_reset::StableRetryOr;
 
 type AppliedDelete = (
     String,
@@ -343,6 +344,14 @@ impl Engine {
         if crate::engine_dml_concurrent::command_has_returning(&cmd) {
             return Err(crate::engine_dml_concurrent::discarded_returning_error());
         }
+        if let Command::TruncateTable(truncate) = &cmd {
+            if self.transaction_snapshot_handle(txn_id).is_some() {
+                self.execute_truncate_in_transaction(txn_id, truncate.clone(), None)?;
+            } else {
+                self.execute_truncate_autocommit(txn_id, truncate.clone(), None)?;
+            }
+            return Ok(());
+        }
         if self.transaction_snapshot_handle(txn_id).is_some() {
             match &cmd {
                 Command::Insert(_) | Command::Update(_) | Command::Delete(_) => {
@@ -443,30 +452,24 @@ impl Engine {
                 }
                 let payload: std::sync::Arc<[u8]> = std::sync::Arc::from(text.as_bytes());
                 let request_digest = gpu_db_wal::canonical_request_digest(&payload);
-                let commit = self.commit_state();
-                if let Some((token, _)) = commit
-                    .resolve_transaction_retry_digest_outcome(txn_id, request_digest)
-                    .map_err(ExecuteError::Engine)?
-                {
-                    if self.committed_seq() < token.index {
-                        return Err(ExecuteError::Indeterminate(format!(
-                            "transaction id {txn_id} has canonical commit sequence {} but publication has not reached it",
-                            token.index
-                        )));
-                    }
-                    return Ok(());
-                }
-                if self
-                    .resolve_pending_transaction_claim(txn_id, request_digest)
-                    .map_err(ExecuteError::Engine)?
-                {
-                    return Ok(());
-                }
-                drop(commit);
+                // Resolve terminal/pending stable identity before acquiring a fresh relation
+                // claimant. An exact retry has no new table access and must not spuriously
+                // serialize against a later reset. Re-resolve after a raced lease failure as well:
+                // the queued API treats an exact pending claim as already accepted. Newly admitted
+                // work retains this guard through immediate completion or in the deferred item.
+                let table_access = match self
+                    .acquire_autocommit_command_table_access_after_retry_or_pending(
+                        &cmd,
+                        txn_id,
+                        request_digest,
+                    )? {
+                    StableRetryOr::Terminal(_) => return Ok(()),
+                    StableRetryOr::Fresh(access) => access,
+                };
                 self.preflight_unique_index_constraints(&cmd, txn_id)?;
                 if self.command_requires_immediate_unique_index_commit(&cmd) {
                     self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
-                    self.commit_mutation(txn_id, payload)?;
+                    self.commit_mutation_with_table_access(txn_id, payload, table_access.as_ref())?;
                     return Ok(());
                 }
 
@@ -515,7 +518,14 @@ impl Engine {
                             .reserve_pending_transaction_claim(txn_id, request_digest)
                             .map_err(ExecuteError::Engine)?;
                         debug_assert!(reserved, "pending retry was handled before admission");
-                        let maybe_batch = batcher.enqueue(PendingMutation { txn_id, payload }, now);
+                        let maybe_batch = batcher.enqueue(
+                            PendingMutation {
+                                txn_id,
+                                payload,
+                                table_access,
+                            },
+                            now,
+                        );
                         drop(batcher);
                         drop(commit);
                         if let Some(batch) = maybe_batch {
@@ -527,10 +537,18 @@ impl Engine {
                     }
                     RouteDecision::CpuFallback { reason, .. } => {
                         self.metrics.inc_gpu_fallback(reason);
-                        self.commit_mutation(txn_id, payload)?;
+                        self.commit_mutation_with_table_access(
+                            txn_id,
+                            payload,
+                            table_access.as_ref(),
+                        )?;
                     }
                     RouteDecision::Cpu => {
-                        self.commit_mutation(txn_id, payload)?;
+                        self.commit_mutation_with_table_access(
+                            txn_id,
+                            payload,
+                            table_access.as_ref(),
+                        )?;
                     }
                 }
             }
@@ -630,6 +648,9 @@ impl Engine {
 
         let items: Vec<BatchItem<PendingMutation>> = items.collect();
         for p in &items {
+            // Reading the owner documents and enforces that the collected queue item—not the
+            // transient enqueue stack frame—retains the lease through this terminal batch path.
+            let _table_access_owner = p.item.table_access.as_ref();
             // In no-GPU bootstrap mode, batched mutations represent the simulated
             // GPU-eligible write path. Track transfer and kernel timing envelopes
             // so telemetry contracts are stable before CUDA is wired in.

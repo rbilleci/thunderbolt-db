@@ -116,6 +116,42 @@ fn serialized_commit_apis_reject_returning_before_mutation() {
 }
 
 #[test]
+fn raw_commit_claimants_reject_legacy_sql_truncate_before_wal() {
+    let e = Engine::new_local_test_engine();
+    e.execute_text(1, "CREATE TABLE raw_truncate_t (id INT PRIMARY KEY)")
+        .unwrap();
+    let durable_before = e.durable_wal_records().len();
+    let truncate: Arc<[u8]> = Arc::from(&b"TRUNCATE TABLE raw_truncate_t"[..]);
+
+    for error in [
+        e.commit_mutation(2, Arc::clone(&truncate)).unwrap_err(),
+        e.commit_mutation_at(3, Arc::clone(&truncate), 123)
+            .unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("must enter typed transaction admission"),
+            "{error}"
+        );
+    }
+    let failure = e
+        .commit_mutation_batch(&[(4, Arc::clone(&truncate))])
+        .unwrap_err();
+    assert!(!failure.requeue, "legacy TRUNCATE is a semantic rejection");
+    assert!(
+        failure
+            .error
+            .to_string()
+            .contains("must enter typed transaction admission"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(e.durable_wal_records().len(), durable_before);
+    assert!(e.relational_catalog_table("raw_truncate_t").is_some());
+}
+
+#[test]
 fn execute_set_accepts_session_and_local_scope_aliases() {
     let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET SESSION balance=100").unwrap();
@@ -1015,11 +1051,7 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
         .unwrap();
     assert_eq!((sequence.last_value, sequence.is_called), (1, true));
 
-    let reset_and_rewrite = [
-        (
-            5,
-            std::sync::Arc::from(b"TRUNCATE TABLE working_batch".as_slice()),
-        ),
+    let rewrite = [
         (
             6,
             std::sync::Arc::from(
@@ -1039,23 +1071,24 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
             ),
         ),
     ];
-    if let Err(failure) = e.commit_mutation_batch(&reset_and_rewrite) {
-        panic!(
-            "working-catalog reset/rewrite batch failed: {}",
-            failure.error
-        );
+    if let Err(failure) = e.commit_mutation_batch(&rewrite) {
+        panic!("working-catalog rewrite batch failed: {}", failure.error);
     }
     let rows = e
         .execute_relational_select_text("SELECT id, value, extra FROM working_batch ORDER BY id")
         .unwrap()
         .rows;
-    assert_eq!(rows.len(), 2, "mixed reset/rewrite rows: {rows:?}");
+    assert_eq!(rows.len(), 3, "mixed rewrite rows: {rows:?}");
     assert_eq!(
         rows.row(0),
-        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
+        &[SqlValue::Int4(1), SqlValue::Int4(10), SqlValue::Int4(7)]
     );
     assert_eq!(
         rows.row(1),
+        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
+    );
+    assert_eq!(
+        rows.row(2),
         &[SqlValue::Int4(3), SqlValue::Int4(30), SqlValue::Int4(8)]
     );
 
@@ -1093,10 +1126,14 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
         ),
         (
             14,
-            std::sync::Arc::from(b"DROP TABLE transient_batch".as_slice()),
+            std::sync::Arc::from(b"INSERT INTO transient_batch VALUES (1)".as_slice()),
         ),
         (
             15,
+            std::sync::Arc::from(b"DROP TABLE transient_batch".as_slice()),
+        ),
+        (
+            16,
             std::sync::Arc::from(b"CREATE TABLE transient_batch (name TEXT)".as_slice()),
         ),
     ];
@@ -1106,6 +1143,42 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     let table = e.relational_catalog_table("transient_batch").unwrap();
     assert_eq!(table.columns.len(), 1);
     assert_eq!(table.columns[0].name, "name");
+    assert_eq!(
+        e.commit_state().ledger.table_root_index("transient_batch"),
+        0,
+        "a grouped drop/recreate must not attach the intermediate OID's root to its successor"
+    );
+
+    let rename = [
+        (
+            17,
+            std::sync::Arc::from(b"CREATE TABLE transient_source (id INT)".as_slice()),
+        ),
+        (
+            18,
+            std::sync::Arc::from(b"INSERT INTO transient_source VALUES (1)".as_slice()),
+        ),
+        (
+            19,
+            std::sync::Arc::from(
+                b"ALTER TABLE transient_source RENAME TO transient_destination".as_slice(),
+            ),
+        ),
+    ];
+    if let Err(failure) = e.commit_mutation_batch(&rename) {
+        panic!("create/insert/rename batch failed: {}", failure.error);
+    }
+    assert_eq!(
+        e.commit_state().ledger.table_root_index("transient_source"),
+        0
+    );
+    assert_ne!(
+        e.commit_state()
+            .ledger
+            .table_root_index("transient_destination"),
+        0,
+        "a grouped rename must carry the root by stable OID"
+    );
 
     let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
     assert!(recovered.relational_role("working_batch_reader").is_none());
@@ -1114,17 +1187,38 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
         .unwrap();
     assert_eq!(table.columns.len(), 1);
     assert_eq!(table.columns[0].name, "name");
+    assert_eq!(
+        recovered
+            .commit_state()
+            .ledger
+            .table_root_index("transient_batch"),
+        0
+    );
+    assert_eq!(
+        recovered
+            .commit_state()
+            .ledger
+            .table_root_index("transient_destination"),
+        e.commit_state()
+            .ledger
+            .table_root_index("transient_destination"),
+        "grouped live apply and record-at-a-time recovery must derive one root ledger"
+    );
     let rows = recovered
         .execute_relational_select_text("SELECT id, value, extra FROM working_batch ORDER BY id")
         .unwrap()
         .rows;
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(
         rows.row(0),
-        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
+        &[SqlValue::Int4(1), SqlValue::Int4(10), SqlValue::Int4(7)]
     );
     assert_eq!(
         rows.row(1),
+        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
+    );
+    assert_eq!(
+        rows.row(2),
         &[SqlValue::Int4(3), SqlValue::Int4(30), SqlValue::Int4(8)]
     );
 }

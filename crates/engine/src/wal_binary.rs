@@ -44,6 +44,14 @@ const OP_TRANSACTION: u8 = 4;
 /// PRODUCT-001: the same resolved explicit transaction, prefixed by typed catalog mutations. A
 /// distinct opcode preserves the exact v1 row-only layout and lets old durable records replay.
 const OP_COMPOSITE_TRANSACTION: u8 = 5;
+/// PRODUCT-001: a resolved transaction containing one or more typed table-root resets. Its
+/// reset-prefixed layout is distinct so opcodes 4/5 retain byte-for-byte compatibility.
+const OP_TABLE_RESET_TRANSACTION: u8 = 6;
+/// ADR-014: current row transactions bind every mutation table to stable OID + schema identity.
+/// Separate opcodes preserve byte-for-byte replay of legacy name-bound transaction records.
+const OP_IDENTITY_TRANSACTION: u8 = 7;
+const OP_IDENTITY_COMPOSITE_TRANSACTION: u8 = 8;
+const OP_IDENTITY_TABLE_RESET_TRANSACTION: u8 = 9;
 
 const TXN_INSERT: u8 = 1;
 const TXN_UPDATE: u8 = 2;
@@ -98,6 +106,26 @@ pub(crate) enum BinaryTransactionMutation {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryTransactionTableReset {
+    pub(crate) ordinal: u32,
+    pub(crate) table: String,
+    pub(crate) table_oid: u32,
+    pub(crate) schema_digest: gpu_db_wal::CanonicalDigest,
+    /// Last canonical publication that changed this table before the root replacement.
+    pub(crate) source_commit_seq: Index,
+    pub(crate) before_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) expected_rows: u64,
+    pub(crate) after_empty_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) dependency_identities: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryTransactionTableIdentity {
+    pub(crate) table_oid: u32,
+    pub(crate) schema_digest: gpu_db_wal::CanonicalDigest,
+}
+
 /// One durable explicit-transaction record. `allocator_high_water` is the row-id allocator value
 /// after the transaction's insert identities were claimed. Apply uses an idempotent max operation,
 /// so the live process (which preclaimed the ids before WAL encoding) and recovery converge.
@@ -108,9 +136,14 @@ pub(crate) struct BinaryTransactionRecord {
     /// publication boundary. The first compatibility slice admits one `CREATE TABLE`; retaining a
     /// vector makes the durable format ready for ordered catalog expansion without SQL replay.
     pub(crate) catalog_commands: Vec<Command>,
+    /// Surviving table-root barriers in canonical statement order. Old transaction opcodes decode
+    /// this as empty; reset records use their own opcode and keep row bodies after the reset block.
+    pub(crate) table_resets: Vec<BinaryTransactionTableReset>,
     /// Final catalog post-state for each sequence consumed by a transaction-private default.
     /// Entries are sorted by name (`BTreeMap`) for deterministic WAL bytes.
     pub(crate) sequence_advances: BTreeMap<String, (i64, bool)>,
+    /// Stable binding for every table named by `mutations`. Empty only for legacy opcodes 4/5/6.
+    pub(crate) table_identities: BTreeMap<String, BinaryTransactionTableIdentity>,
     pub(crate) mutations: Vec<BinaryTransactionMutation>,
 }
 
@@ -126,21 +159,63 @@ pub(crate) enum BinaryWalRecord {
 /// `None`; callers must fail the transaction rather than fall back to statement SQL records, which
 /// would lose atomicity and predicate-resolution identity.
 pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) -> Option<Vec<u8>> {
+    let reset_names = record
+        .table_resets
+        .iter()
+        .map(|reset| reset.table.as_str())
+        .collect::<BTreeSet<_>>();
+    let mutation_names = record
+        .mutations
+        .iter()
+        .map(|mutation| match mutation {
+            BinaryTransactionMutation::Insert { table, .. }
+            | BinaryTransactionMutation::Update { table, .. }
+            | BinaryTransactionMutation::Delete { table, .. } => table.as_str(),
+        })
+        .collect::<BTreeSet<_>>();
+    let identity_names = record
+        .table_identities
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let identity_bound = !record.table_identities.is_empty();
     if record.catalog_commands.len() > 1
+        || (!record.catalog_commands.is_empty() && !record.table_resets.is_empty())
+        || record.table_resets.len() > u32::MAX as usize
         || record.sequence_advances.len() > u32::MAX as usize
         || record.mutations.len() > u32::MAX as usize
+        || reset_names.len() != record.table_resets.len()
+        || (identity_bound && identity_names != mutation_names)
+        || record.mutations.iter().any(|mutation| match mutation {
+            BinaryTransactionMutation::Insert { .. } => false,
+            BinaryTransactionMutation::Update { table, .. }
+            | BinaryTransactionMutation::Delete { table, .. } => {
+                reset_names.contains(table.as_str())
+            }
+        })
     {
         return None;
     }
     let mut out = Vec::with_capacity(32 + record.mutations.len() * 96);
     out.push(WAL_BINARY_TAG);
     out.push(WAL_BINARY_VERSION);
-    out.push(if record.catalog_commands.is_empty() {
-        OP_TRANSACTION
-    } else {
-        OP_COMPOSITE_TRANSACTION
-    });
-    if !record.catalog_commands.is_empty() {
+    let op = match (
+        identity_bound,
+        !record.table_resets.is_empty(),
+        record.catalog_commands.is_empty(),
+    ) {
+        (true, true, _) => OP_IDENTITY_TABLE_RESET_TRANSACTION,
+        (true, false, true) => OP_IDENTITY_TRANSACTION,
+        (true, false, false) => OP_IDENTITY_COMPOSITE_TRANSACTION,
+        (false, true, _) => OP_TABLE_RESET_TRANSACTION,
+        (false, false, true) => OP_TRANSACTION,
+        (false, false, false) => OP_COMPOSITE_TRANSACTION,
+    };
+    out.push(op);
+    if matches!(
+        op,
+        OP_COMPOSITE_TRANSACTION | OP_IDENTITY_COMPOSITE_TRANSACTION
+    ) {
         out.extend_from_slice(&(record.catalog_commands.len() as u32).to_le_bytes());
         for command in &record.catalog_commands {
             if !matches!(command, Command::CreateTable(_)) {
@@ -152,6 +227,55 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             }
             out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
             out.extend_from_slice(&encoded);
+        }
+    }
+    if matches!(
+        op,
+        OP_TABLE_RESET_TRANSACTION | OP_IDENTITY_TABLE_RESET_TRANSACTION
+    ) {
+        out.extend_from_slice(&(record.table_resets.len() as u32).to_le_bytes());
+        let mut prior_ordinal = None;
+        let mut tables = BTreeSet::new();
+        for reset in &record.table_resets {
+            if prior_ordinal.is_some_and(|prior| reset.ordinal <= prior)
+                || !tables.insert(reset.table_oid)
+                || reset.table.len() > u16::MAX as usize
+                || reset.dependency_identities.len() > u32::MAX as usize
+                || reset.dependency_identities.get(&reset.table) != Some(&reset.table_oid)
+            {
+                return None;
+            }
+            prior_ordinal = Some(reset.ordinal);
+            out.extend_from_slice(&reset.ordinal.to_le_bytes());
+            out.extend_from_slice(&(reset.table.len() as u16).to_le_bytes());
+            out.extend_from_slice(reset.table.as_bytes());
+            out.extend_from_slice(&reset.table_oid.to_le_bytes());
+            out.extend_from_slice(&reset.schema_digest);
+            out.extend_from_slice(&reset.source_commit_seq.to_le_bytes());
+            out.extend_from_slice(&reset.before_digest);
+            out.extend_from_slice(&reset.expected_rows.to_le_bytes());
+            out.extend_from_slice(&reset.after_empty_digest);
+            out.extend_from_slice(&(reset.dependency_identities.len() as u32).to_le_bytes());
+            for (name, oid) in &reset.dependency_identities {
+                if name.len() > u16::MAX as usize {
+                    return None;
+                }
+                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(&oid.to_le_bytes());
+            }
+        }
+    }
+    if identity_bound {
+        out.extend_from_slice(&(record.table_identities.len() as u32).to_le_bytes());
+        for (table, identity) in &record.table_identities {
+            if table.len() > u16::MAX as usize {
+                return None;
+            }
+            out.extend_from_slice(&(table.len() as u16).to_le_bytes());
+            out.extend_from_slice(table.as_bytes());
+            out.extend_from_slice(&identity.table_oid.to_le_bytes());
+            out.extend_from_slice(&identity.schema_digest);
         }
     }
     out.extend_from_slice(&record.allocator_high_water.to_le_bytes());
@@ -293,7 +417,12 @@ pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, En
     let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
     match payload.get(2) {
         Some(&OP_INSERT) => decode_binary_insert(payload).map(BinaryWalRecord::Insert),
-        Some(&OP_TRANSACTION) | Some(&OP_COMPOSITE_TRANSACTION) => {
+        Some(&OP_TRANSACTION)
+        | Some(&OP_COMPOSITE_TRANSACTION)
+        | Some(&OP_TABLE_RESET_TRANSACTION)
+        | Some(&OP_IDENTITY_TRANSACTION)
+        | Some(&OP_IDENTITY_COMPOSITE_TRANSACTION)
+        | Some(&OP_IDENTITY_TABLE_RESET_TRANSACTION) => {
             decode_binary_transaction(payload).map(BinaryWalRecord::Transaction)
         }
         Some(&OP_UPDATE_BY_KEY) => {
@@ -395,11 +524,22 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         return Err(fail("unsupported version"));
     }
     let op = take(1)?[0];
-    if !matches!(op, OP_TRANSACTION | OP_COMPOSITE_TRANSACTION) {
+    if !matches!(
+        op,
+        OP_TRANSACTION
+            | OP_COMPOSITE_TRANSACTION
+            | OP_TABLE_RESET_TRANSACTION
+            | OP_IDENTITY_TRANSACTION
+            | OP_IDENTITY_COMPOSITE_TRANSACTION
+            | OP_IDENTITY_TABLE_RESET_TRANSACTION
+    ) {
         return Err(fail("op dispatch mismatch"));
     }
     let mut catalog_commands = Vec::new();
-    if op == OP_COMPOSITE_TRANSACTION {
+    if matches!(
+        op,
+        OP_COMPOSITE_TRANSACTION | OP_IDENTITY_COMPOSITE_TRANSACTION
+    ) {
         let command_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
         if command_count != 1 {
             return Err(fail(
@@ -419,6 +559,98 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                 return Err(fail("non-canonical typed catalog command"));
             }
             catalog_commands.push(command);
+        }
+    }
+    let mut table_resets = Vec::new();
+    if matches!(
+        op,
+        OP_TABLE_RESET_TRANSACTION | OP_IDENTITY_TABLE_RESET_TRANSACTION
+    ) {
+        let reset_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+        if reset_count == 0 {
+            return Err(fail("table-reset transaction requires at least one reset"));
+        }
+        table_resets.reserve(reset_count.min(1024));
+        let mut prior_ordinal = None;
+        let mut tables = BTreeSet::new();
+        for _ in 0..reset_count {
+            let ordinal = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+            if prior_ordinal.is_some_and(|prior| ordinal <= prior) {
+                return Err(fail("table resets are not in canonical ordinal order"));
+            }
+            prior_ordinal = Some(ordinal);
+            let table_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+            let table = std::str::from_utf8(take(table_len)?)
+                .map_err(|_| fail("non-utf8 reset table name"))?
+                .to_string();
+            let table_oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+            if !tables.insert(table_oid) {
+                return Err(fail("duplicate table reset identity"));
+            }
+            let schema_digest = take(32)?.try_into().expect("32 bytes");
+            let source_commit_seq = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+            let before_digest = take(32)?.try_into().expect("32 bytes");
+            let expected_rows = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+            let after_empty_digest = take(32)?.try_into().expect("32 bytes");
+            let dependency_count =
+                u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            let mut dependency_identities = BTreeMap::new();
+            for _ in 0..dependency_count {
+                let name_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+                let name = std::str::from_utf8(take(name_len)?)
+                    .map_err(|_| fail("non-utf8 reset dependency name"))?
+                    .to_string();
+                let oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+                if dependency_identities.insert(name, oid).is_some() {
+                    return Err(fail("duplicate table reset dependency"));
+                }
+            }
+            if dependency_identities.get(&table) != Some(&table_oid) {
+                return Err(fail(
+                    "table reset dependency closure omits its target identity",
+                ));
+            }
+            table_resets.push(BinaryTransactionTableReset {
+                ordinal,
+                table,
+                table_oid,
+                schema_digest,
+                source_commit_seq,
+                before_digest,
+                expected_rows,
+                after_empty_digest,
+                dependency_identities,
+            });
+        }
+    }
+    let identity_bound = matches!(
+        op,
+        OP_IDENTITY_TRANSACTION
+            | OP_IDENTITY_COMPOSITE_TRANSACTION
+            | OP_IDENTITY_TABLE_RESET_TRANSACTION
+    );
+    let mut table_identities = BTreeMap::new();
+    if identity_bound {
+        let identity_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+        for _ in 0..identity_count {
+            let name_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+            let table = std::str::from_utf8(take(name_len)?)
+                .map_err(|_| fail("non-utf8 transaction identity table"))?
+                .to_string();
+            let table_oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+            let schema_digest = take(32)?.try_into().expect("32 bytes");
+            if table_identities
+                .insert(
+                    table,
+                    BinaryTransactionTableIdentity {
+                        table_oid,
+                        schema_digest,
+                    },
+                )
+                .is_some()
+            {
+                return Err(fail("duplicate transaction table identity"));
+            }
         }
     }
     let allocator_high_water = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
@@ -481,10 +713,40 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
     if at != payload.len() {
         return Err(fail("trailing bytes"));
     }
+    let reset_names = table_resets
+        .iter()
+        .map(|reset| reset.table.as_str())
+        .collect::<BTreeSet<_>>();
+    let mutation_names = mutations
+        .iter()
+        .map(|mutation| match mutation {
+            BinaryTransactionMutation::Insert { table, .. }
+            | BinaryTransactionMutation::Update { table, .. }
+            | BinaryTransactionMutation::Delete { table, .. } => table.as_str(),
+        })
+        .collect::<BTreeSet<_>>();
+    let identity_names = table_identities
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if reset_names.len() != table_resets.len()
+        || (identity_bound && identity_names != mutation_names)
+        || mutations.iter().any(|mutation| match mutation {
+            BinaryTransactionMutation::Insert { .. } => false,
+            BinaryTransactionMutation::Update { table, .. }
+            | BinaryTransactionMutation::Delete { table, .. } => {
+                reset_names.contains(table.as_str())
+            }
+        })
+    {
+        return Err(fail("table reset has non-canonical post-reset mutations"));
+    }
     Ok(BinaryTransactionRecord {
         allocator_high_water,
         catalog_commands,
+        table_resets,
         sequence_advances,
+        table_identities,
         mutations,
     })
 }
@@ -622,7 +884,9 @@ mod tests {
         let row_only = BinaryTransactionRecord {
             allocator_high_water: 9,
             catalog_commands: Vec::new(),
+            table_resets: Vec::new(),
             sequence_advances,
+            table_identities: BTreeMap::new(),
             mutations: vec![BinaryTransactionMutation::Insert {
                 table: "t".to_string(),
                 row_id: 8,
@@ -659,7 +923,9 @@ mod tests {
         let composite = BinaryTransactionRecord {
             allocator_high_water: 8,
             catalog_commands: vec![command],
+            table_resets: Vec::new(),
             sequence_advances: BTreeMap::new(),
+            table_identities: BTreeMap::new(),
             mutations: vec![BinaryTransactionMutation::Insert {
                 table: "composite_codec".to_string(),
                 row_id: 7,
@@ -688,6 +954,102 @@ mod tests {
         let mut malformed = payload;
         malformed[3..7].copy_from_slice(&2_u32.to_le_bytes());
         assert!(decode_binary_record(&malformed).is_err());
+    }
+
+    #[test]
+    fn identity_bound_transaction_round_trips_and_covers_the_exact_mutation_set() {
+        let record = BinaryTransactionRecord {
+            allocator_high_water: 9,
+            catalog_commands: Vec::new(),
+            table_resets: Vec::new(),
+            sequence_advances: BTreeMap::new(),
+            table_identities: BTreeMap::from([(
+                "identity_rows".to_string(),
+                BinaryTransactionTableIdentity {
+                    table_oid: 42,
+                    schema_digest: [7; 32],
+                },
+            )]),
+            mutations: vec![BinaryTransactionMutation::Insert {
+                table: "identity_rows".to_string(),
+                row_id: 8,
+                row_encoded: "i:42".to_string(),
+            }],
+        };
+        let payload = try_encode_binary_transaction(&record).unwrap();
+        assert_eq!(
+            payload[..3],
+            [WAL_BINARY_TAG, WAL_BINARY_VERSION, OP_IDENTITY_TRANSACTION]
+        );
+        assert!(matches!(
+            decode_binary_record(&payload).unwrap(),
+            BinaryWalRecord::Transaction(decoded) if decoded == record
+        ));
+        assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+
+        let mut missing = record.clone();
+        missing.table_identities.clear();
+        missing.table_identities.insert(
+            "other_rows".to_string(),
+            BinaryTransactionTableIdentity {
+                table_oid: 43,
+                schema_digest: [8; 32],
+            },
+        );
+        assert!(try_encode_binary_transaction(&missing).is_none());
+    }
+
+    #[test]
+    fn typed_table_reset_round_trips_and_rejects_noncanonical_composition() {
+        let reset = BinaryTransactionTableReset {
+            ordinal: 3,
+            table: "accounts".to_string(),
+            table_oid: 42,
+            schema_digest: [1; 32],
+            source_commit_seq: 6,
+            before_digest: [2; 32],
+            expected_rows: 7,
+            after_empty_digest: [3; 32],
+            dependency_identities: BTreeMap::from([("accounts".to_string(), 42)]),
+        };
+        let record = BinaryTransactionRecord {
+            allocator_high_water: 11,
+            catalog_commands: Vec::new(),
+            table_resets: vec![reset],
+            sequence_advances: BTreeMap::new(),
+            table_identities: BTreeMap::new(),
+            mutations: vec![BinaryTransactionMutation::Insert {
+                table: "accounts".to_string(),
+                row_id: 10,
+                row_encoded: "i:9".to_string(),
+            }],
+        };
+        let payload = try_encode_binary_transaction(&record).unwrap();
+        assert_eq!(
+            payload[..3],
+            [
+                WAL_BINARY_TAG,
+                WAL_BINARY_VERSION,
+                OP_TABLE_RESET_TRANSACTION
+            ]
+        );
+        assert!(matches!(
+            decode_binary_record(&payload).unwrap(),
+            BinaryWalRecord::Transaction(decoded) if decoded == record
+        ));
+        assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+
+        let mut noncanonical = record.clone();
+        noncanonical.mutations = vec![BinaryTransactionMutation::Delete {
+            table: "accounts".to_string(),
+            row_id: 1,
+            old_row_encoded: "i:1".to_string(),
+        }];
+        assert!(try_encode_binary_transaction(&noncanonical).is_none());
+
+        let mut missing_target = record;
+        missing_target.table_resets[0].dependency_identities.clear();
+        assert!(try_encode_binary_transaction(&missing_target).is_none());
     }
 }
 

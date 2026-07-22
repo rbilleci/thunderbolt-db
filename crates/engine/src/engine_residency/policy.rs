@@ -396,6 +396,9 @@ impl Engine {
     /// `pub` for benchmark and qualification telemetry.
     pub fn table_device_authoritative(&self, table: &str) -> bool {
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            if snapshot.table_is_rewrite_fenced(table) {
+                return true;
+            }
             return snapshot.device_authoritative_tables.contains(table);
         }
         self.read_state

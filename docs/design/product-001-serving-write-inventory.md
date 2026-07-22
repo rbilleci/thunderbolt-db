@@ -76,9 +76,11 @@ back every predecessor and suppresses every successor. Multiple transactional DD
 PRODUCT-001. An intervening DML/KV commit no longer forces a retry when every catalog field plus the OID/column-ID
 allocator high-waters remains unchanged: READ COMMITTED rebinds the private overlay and GPU delta to the newer
 publication stamp, while REPEATABLE READ validates the same content proof at COMMIT. Real catalog or allocator
-drift remains a pre-WAL serialization failure. Active-transaction `TRUNCATE ... CONTINUE IDENTITY` is currently
-lowered to private full-table row deletion rather than a typed table-reset/rewrite-fence record, and `RESTART
-IDENTITY` remains pre-effect rejected; the broader transactional-DDL boundary remains owned by **PRODUCT-001**.
+drift remains a pre-WAL serialization failure. Autocommit and active-transaction `TRUNCATE ... CONTINUE IDENTITY`
+now use a typed, statement-ordered empty-root barrier with stable table/dependency guards, GPU source/empty proofs,
+binary WAL/replay, table-root ledger validation, and the ADR-014 monotonic non-MVCC rewrite fence. `RESTART
+IDENTITY` remains pre-effect rejected; composing reset with transaction-private catalog DDL and the broader ordered
+multiple-command catalog boundary remain owned by **PRODUCT-001**.
 
 ## Physical commit and publication owners
 

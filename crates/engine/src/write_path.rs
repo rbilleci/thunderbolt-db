@@ -214,6 +214,12 @@ pub(crate) enum PreparedMutation {
 /// older snapshot silently misses them — a lost update). `None` for every other command.
 #[derive(Debug, Clone)]
 pub(crate) enum AppliedRowMutation {
+    /// Typed non-MVCC table-root replacement. It participates in the same atomic transaction
+    /// publication batch as post-reset row images but never masquerades as a row DELETE.
+    TableReset {
+        reset: BinaryTransactionTableReset,
+        write_set: WriteSet,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<SqlValue>>,
@@ -252,7 +258,8 @@ impl AppliedRowMutation {
     /// prepare-computed [`WriteSet`] of the underlying delta, for SI ledger recording.
     pub(crate) fn write_set(&self) -> &WriteSet {
         match self {
-            Self::Insert { write_set, .. }
+            Self::TableReset { write_set, .. }
+            | Self::Insert { write_set, .. }
             | Self::Delete { write_set, .. }
             | Self::Update { write_set, .. } => write_set,
         }
@@ -262,6 +269,7 @@ impl AppliedRowMutation {
     /// terminal marker before a recovered engine is returned to service.
     pub(crate) fn rows_affected(&self) -> u64 {
         match self {
+            Self::TableReset { .. } => 0,
             Self::Insert { rows, .. } | Self::Delete { rows, .. } => rows.len() as u64,
             Self::Update { old_rows, .. } => old_rows.len() as u64,
         }
@@ -292,6 +300,35 @@ pub(crate) struct WriteDelta {
     pub(crate) foreign_key_dependencies: BTreeSet<String>,
     pub(crate) rows_consumed: u64,
     pub(crate) mutation: PreparedMutation,
+}
+
+/// One resolved table-root barrier retained in the transaction-private operation stream. The
+/// durable before-root proof is constant-size: the last canonical table publication plus a
+/// GPU-produced visible-row count. Transaction-private rows shadowed by the reset are deliberately
+/// excluded from that globally replayable proof.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedTableReset {
+    pub(crate) ordinal: u32,
+    pub(crate) table: String,
+    pub(crate) table_oid: u32,
+    pub(crate) schema_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) source_commit_seq: Index,
+    pub(crate) before_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) after_empty_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) expected_rows: u64,
+    pub(crate) read_snapshot: Index,
+    pub(crate) catalog_dependencies: BTreeMap<String, RelationalTable>,
+    pub(crate) foreign_key_dependencies: BTreeSet<String>,
+    pub(crate) dependency_identities: BTreeMap<String, u32>,
+}
+
+/// The statement-ordered private transaction stream. Keeping resets beside row operations makes
+/// shadowing structural: replay starts from the retained base, applies a reset as an empty-root
+/// replacement, then applies only the row operations that follow it.
+#[derive(Debug, Clone)]
+pub(crate) enum TransactionOperation {
+    Row(Box<WriteDelta>),
+    TableReset(Box<StagedTableReset>),
 }
 
 impl WriteDelta {
@@ -346,6 +383,13 @@ impl RecentCommitsLedger {
             .is_some_and(|&commit_seq| commit_seq > read_snapshot)
     }
 
+    /// Stable logical identity of the currently-published table root. Catalog publication rekeys
+    /// this high-water across rename and removes dropped identities, keeping it bounded by current
+    /// catalog cardinality; typed reset WAL uses it as its replay-stable source-root descriptor.
+    pub(crate) fn table_root_index(&self, table: &str) -> Index {
+        self.tables.get(table).copied().unwrap_or(0)
+    }
+
     #[cfg(test)]
     pub(crate) fn conflicts_unique(&self, write_set: &WriteSet, read_snapshot: Index) -> bool {
         write_set.unique_slots.iter().any(|key| {
@@ -379,10 +423,38 @@ impl RecentCommitsLedger {
         }
     }
 
+    pub(crate) fn reconcile_table_roots(
+        &mut self,
+        prior_identities: &BTreeMap<String, u32>,
+        current_identities: &BTreeMap<String, u32>,
+    ) {
+        let current_names_by_oid = current_identities
+            .iter()
+            .map(|(name, oid)| (*oid, name.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let mut next = BTreeMap::new();
+        for (name, commit_seq) in std::mem::take(&mut self.tables) {
+            let destination = match prior_identities.get(&name) {
+                Some(oid) => current_names_by_oid.get(oid).copied(),
+                None => current_identities
+                    .contains_key(&name)
+                    .then_some(name.as_str()),
+            };
+            if let Some(destination) = destination {
+                next.entry(destination.to_string())
+                    .and_modify(|prior: &mut Index| *prior = (*prior).max(commit_seq))
+                    .or_insert(commit_seq);
+            }
+        }
+        self.tables = next;
+    }
+
     /// Drop entries written at or before `boundary` (no active snapshot reads before it, so they can
     /// never win a future conflict). Keeps the ledger bounded by the active-snapshot window.
     pub(crate) fn prune_below(&mut self, boundary: Index) {
-        self.tables.retain(|_, &mut seq| seq > boundary);
+        // `tables` is the durable logical root oracle for typed non-MVCC rewrites. Catalog
+        // publication bounds it by live stable identities; temporal pruning here would erase the
+        // source-root high-water of a still-live relation.
         self.rows.retain(|_, &mut seq| seq > boundary);
         #[cfg(test)]
         {
@@ -424,6 +496,12 @@ pub(crate) struct TransactionSnapshot {
     /// private tombstone sidecars and INSERT/UPDATE post-images live in dense private shards.
     /// SELECT and later DML clone the published map, so no reader can observe half a statement.
     pub(crate) delta: Arc<std::sync::Mutex<TransactionDeltaState>>,
+    /// Shared/exclusive stable-OID guards retained for this statement or explicit transaction.
+    pub(crate) table_access: Arc<TableAccessLease>,
+    /// Stable table names whose current rewrite fence is newer than this retained boundary.
+    /// Membership grows within one retained statement/snapshot; READ COMMITTED replaces the set
+    /// when it rebases to a publication that already contains those prior fences.
+    pub(crate) rewrite_fenced_tables: Arc<Mutex<BTreeSet<String>>>,
     /// One explicit transaction is a sequential statement stream. Holding this guard for the full
     /// SELECT/DML/terminal-control operation prevents a DML replacement from retiring the exact
     /// GPU charge of a superseded private generation while a same-transaction reader still pins
@@ -526,7 +604,7 @@ pub(crate) struct TransactionDeltaState {
     /// cold map. SELECT and later DML therefore consume the same immutable private generation.
     pub(crate) streaming_cold_chunks:
         Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>>,
-    pub(crate) deltas: Vec<WriteDelta>,
+    pub(crate) operations: Vec<TransactionOperation>,
     pub(crate) write_set: WriteSet,
     pub(crate) next_row_id: u64,
     /// Transaction-local post-state for every sequence consumed by a column default. A later
@@ -611,7 +689,52 @@ impl TransactionSnapshot {
             .delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        delta.deltas.is_empty() && delta.catalog_command.is_none()
+        delta.operations.is_empty() && delta.catalog_command.is_none()
+    }
+
+    pub(crate) fn transaction_table_is_reset(&self, table: &str) -> bool {
+        self.delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .operations
+            .iter()
+            .rev()
+            .any(|operation| {
+                matches!(operation, TransactionOperation::TableReset(reset) if reset.table == table)
+            })
+    }
+
+    pub(crate) fn table_is_rewrite_fenced(&self, table: &str) -> bool {
+        self.rewrite_fenced_tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(table)
+    }
+
+    pub(crate) fn table_has_typed_empty_root(&self, table: &str) -> bool {
+        let rewrite_fenced = self.table_is_rewrite_fenced(table);
+        let delta = self
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reset = delta
+            .operations
+            .iter()
+            .rev()
+            .any(|operation| {
+                matches!(operation, TransactionOperation::TableReset(reset) if reset.table == table)
+            });
+        (rewrite_fenced || reset)
+            && delta.resident_shards.get(table).is_some_and(|shards| {
+                !shards.is_empty()
+                    && shards
+                        .iter()
+                        .all(|shard| shard.row_count == 0 && shard.device_memory.is_some())
+            })
+            && delta
+                .streaming_cold_chunks
+                .get(table)
+                .is_none_or(|chunks| chunks.chunks.is_empty())
     }
 
     pub(crate) fn transaction_catalog(&self) -> Arc<CatalogSnapshot> {

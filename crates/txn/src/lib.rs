@@ -94,6 +94,22 @@ impl TxnManager {
         self.transition_terminal(id, TxnState::Aborted)
     }
 
+    /// Release a clean, pre-durable internal transaction without terminalizing its caller-owned
+    /// stable request identity. Only an active transaction can be cancelled.
+    pub fn cancel(&mut self, id: TxnId) -> Result<Txn, TxnError> {
+        match self.states.get(&id) {
+            Some(TxnState::Active) => {}
+            Some(_) => return Err(TxnError::NotActive(id)),
+            None => return Err(TxnError::NotFound(id)),
+        }
+        self.states.remove(&id);
+        self.active_count = self.active_count.saturating_sub(1);
+        Ok(Txn {
+            id,
+            state: TxnState::Aborted,
+        })
+    }
+
     pub fn active_count(&self) -> usize {
         self.active_count
     }
@@ -179,6 +195,16 @@ mod tests {
         assert_eq!(committed.state, TxnState::Committed);
         assert_eq!(tm.state(t.id), Some(TxnState::Committed));
         assert_eq!(tm.active_count(), 0);
+    }
+
+    #[test]
+    fn cancel_releases_active_id_for_clean_retry_without_retained_terminal_state() {
+        let mut tm = TxnManager::default();
+        tm.begin_with_id(41).unwrap();
+        tm.cancel(41).unwrap();
+        assert_eq!(tm.state(41), None);
+        assert_eq!(tm.active_count(), 0);
+        tm.begin_with_id(41).unwrap();
     }
 
     #[test]

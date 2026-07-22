@@ -7,6 +7,7 @@ mod projection;
 mod rank_windows;
 mod reverse_gather;
 mod scalar_reductions;
+mod table_reset;
 mod views;
 
 /// Probe for a usable GPU by populating a throwaway table and checking the retained device proof, then

@@ -24,7 +24,8 @@ use cuda_context::{
 };
 #[cfg(test)]
 use cuda_context::{
-    gpu_primary_context, CudaDeviceAllocationGuard, CudaEventGuard, CudaModuleGuard,
+    distinct_gpu_primary_context_for_test, gpu_primary_context, CudaDeviceAllocationGuard,
+    CudaEventGuard, CudaModuleGuard,
 };
 pub use cuda_context::{
     CudaAllocationScope, CudaExternalAllocationReservation, PendingCudaResidentDeviceCopy,
@@ -42,6 +43,11 @@ pub use resident_memory::{
 };
 mod resident_header;
 use resident_header::launch_cuda_resident_row_count;
+mod resident_visibility_count;
+use resident_visibility_count::launch_cuda_resident_visible_count;
+mod resident_visible_digest;
+use resident_visible_digest::launch_cuda_resident_visible_digest;
+pub use resident_visible_digest::{CudaVisibleDigestColumn, CudaVisibleSourceDigest};
 mod resident_index_build;
 pub use resident_index_build::{
     resident_index_allocated_bytes, resident_index_hash_bytes, CudaResidentIndexStatus,

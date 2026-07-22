@@ -348,6 +348,7 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let _table_access = self.acquire_autocommit_table_access(&select.table)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let plan = compile_resident_plan(&table, &bound, select)?;
 
@@ -844,6 +845,7 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let _table_access = self.acquire_autocommit_table_access(&select.table)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
@@ -972,6 +974,7 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let _table_access = self.acquire_autocommit_table_access(&select.table)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
@@ -1116,6 +1119,8 @@ impl Engine {
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        let _table_access = self
+            .acquire_autocommit_table_accesses(selects.iter().map(|select| select.table.clone()))?;
         self.execute_relational_equality_multi_column_projection_batch_inner(selects, None, true)
     }
 

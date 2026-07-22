@@ -989,6 +989,17 @@ fn command_tags_are_neutral_until_adapter_formats_them() {
         }
     );
     assert_eq!(pg_adapter::command_complete_tag(&outcome), "CREATE TABLE");
+
+    let parsed_truncate = parse_command("TRUNCATE TABLE t CONTINUE IDENTITY").unwrap();
+    let truncate = command_tag(&parsed_truncate);
+    assert_eq!(truncate, CommandTag::Truncate);
+    assert_eq!(
+        pg_adapter::command_complete_tag(&QueryOutcome::Command {
+            tag: truncate,
+            rows_affected: None,
+        }),
+        "TRUNCATE TABLE"
+    );
 }
 
 #[test]

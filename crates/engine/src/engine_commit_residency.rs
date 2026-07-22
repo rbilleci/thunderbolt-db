@@ -24,6 +24,9 @@ impl Engine {
                         continue;
                     }
                     Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => {
+                        for reset in record.table_resets {
+                            tables.insert(reset.table);
+                        }
                         for command in record.catalog_commands {
                             match command {
                                 Command::CreateTable(create) => {
