@@ -154,11 +154,14 @@ does not delay the architecture evidence gate. The active sequence now starts at
    The accepted pg_dump/restore slice passes SQL 57, active engine 525, facade 75 plus the 13-test concurrency cohort,
    canonical server 76, protocol 71 + 127, all 18 pg_dump restore/metadata/privilege cases, and pg_dumpall globals
    restore. Workspace check, strict workspace Clippy, format/shell/diff, source inventory, actual-GPU sequence ABA,
-   and the complete application-driver aggregate are green. The mandatory repaired-tree card completes both layers
-   and cache regimes at 201.959M/s, p50 193us in-L2 and 174.844M/s, p50 241us out-of-L2 after a 2,138.3s build.
-   These match the immediate 202.024M/s in-L2 control and prior repaired-tree 177.974M/s out-of-L2 result; the fresh
-   evidence panel accepted the disclosed lower earlier-versus-current cross-run absolute and its same-host controls. Two
-   initial rejection rounds repaired recognition, transaction/session, snapshot, role, harness, and evidence
+   and the complete application-driver aggregate are green. The mandatory repaired-tree card's clean isolated build
+   completes both layers and cache regimes at 230.154M/s, p50 156us in-L2 and 198.870M/s, p50 201us out-of-L2 after
+   a 2,129.4s build. Against the prior accepted 229.397M/s and 200.834M/s card, that is +0.3%/-1.0% and not a
+   material regression. The former shared-target 201.959M/s/174.844M/s artifact reused a GCC-13.3-built AWS-LC
+   archive on the GCC 15.2 host; two exact-source clean builds were byte-identical and restored 227–230M/s targeted
+   throughput. The report-card runner now uses a fresh isolated target and records the compiler plus exact executable
+   hashes before direct invocation. The two initial rejection rounds repaired recognition, transaction/session,
+   snapshot, role, harness, and evidence
    defects. A third architecture audit then rejected the host-finalized dump catalog seam; the repair replaces
    query-time host filtering/join/count decisions with typed device plans and adds an actual-GPU cross-route
    differential. A fourth three-lane audit rejected host-derived subscription COUNT, sequence/default ACL fidelity,

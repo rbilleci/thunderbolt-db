@@ -53,15 +53,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   ignored** GPU-required tests, facade **75/15 ignored** plus concurrency **13/1 ignored**, canonical server **76/4
   ignored** plus pgwire **4/2 ignored**, SQLx **1**, tokio-postgres **1**, and protocol **71 + 127**. Both dump
   harnesses, the complete eight-driver aggregate, psql 04/06/07, workspace all-target/all-feature check, strict
-  workspace Clippy, rustfmt, shell syntax, and diff gates pass. The final repair tree's mandatory full report card
-  completes both layers and cache regimes: raw `sum_i32` rooflines are **1,423.0 GB/s at p50 24us** in-L2 and
-  **1,444.7 GB/s at p50 186us** out-of-L2; scalar COUNT compare is **0.89x/1.00x** those rooflines, and the
-  constant-mask path remains device-only at **1,138.9/1,486.3 GB/s**. Production point reads measure
-  **201.959M/s at p50 193us** in-L2 and **174.844M/s at p50 241us** out-of-L2 after a **2,138.3s + 0.0s** 48M-row
-  build/residency phase. Those figures match the immediate **202.024M/s at p50 193us** in-L2 control and the prior
-  repaired-tree **177.974M/s at p50 241us** out-of-L2 result within 1.8%; no point-route source changed in the ACL
-  or catalog-count repairs. The earlier same-day **197.548M/s at p50 198us** artifact remains a disclosed
-  cross-run absolute difference, while causal attribution rests on the flat same-host controls. The
+  workspace Clippy, rustfmt, shell syntax, and diff gates pass. A clean isolated rebuild of the final repair tree's
+  mandatory full report card completes both layers and cache regimes: raw `sum_i32` rooflines are **1,488.6 GB/s at
+  p50 23us** in-L2 and **1,438.0 GB/s at p50 187us** out-of-L2; scalar COUNT compare is **0.85x/1.00x** those
+  rooflines, and the constant-mask path remains device-only at **1,170.7/1,487.8 GB/s**. Production point reads
+  measure **230.154M/s at p50 156us** in-L2 and **198.870M/s at p50 201us** out-of-L2 after a **2,129.4s + 0.0s**
+  48M-row build/residency phase. Against the prior accepted **229.397M/s at p50 158us** and **200.834M/s at p50
+  200us** baseline, that is **+0.3%/-1.0%**, not a material regression.
+- The earlier **201.959M/s/174.844M/s** card was built from the shared `target/` and is invalid as final performance
+  evidence. Cargo had retained a 2026-06-14 `aws-lc-sys` native archive built by GCC 13.3 after the host moved to GCC
+  15.2; the dependency is not executed on point reads, but the stale native archive changed the final executable's
+  link layout. The stale executable SHA-256 was
+  `44fe659c4dba760f9e4db88c80b96fac0ee3a29411162205ff250b1dd44dbf1d`; two independent clean builds of the exact
+  final source were byte-identical at
+  `2c1893091ed373e41c326f7a03695ff8684455f7f5d73f66ee8b236cc905babe` and repeatedly restored **227–230M/s**
+  targeted throughput. The standard runner now builds in a fresh isolated target, records compiler and artifact
+  identities, and invokes the hashed binaries directly, preventing shared native-build cache contamination. The
   `engine_mutation_admission.rs` (**2,012**) and `engine_dml_concurrent.rs` (**2,083**) outliers have explicit
   no-exception PRODUCT-001 dispositions in PLAN.
 - Two initial adversarial freeze rounds rejected fail-open recognizers, transaction/session-state errors, a

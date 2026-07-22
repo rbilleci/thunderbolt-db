@@ -141,8 +141,17 @@ The roofline above is Layer 1 only. The canonical, recurring artifact is the **r
 ALWAYS reports BOTH layers x BOTH cache regimes, p50 latency + throughput on every line:
 
 ```
-scripts/benchmark_report_card.sh        # ~17-20 min; self-manages timeouts + GPU cool-downs
+scripts/benchmark_report_card.sh        # self-manages clean build, timeouts, target cleanup + GPU cool-downs
 ```
+
+The card deliberately ignores an ambient `CARGO_TARGET_DIR`: Cargo native build-script fingerprints do not
+necessarily invalidate when the compiler executable changes version, and a stale native archive can change the
+final executable's link layout enough to distort this latency-sensitive benchmark. By default the script builds both
+examples once in a fresh `target/benchmark-report-card.*`, records host/toolchain/git identity plus SHA-256 and size
+for both exact binaries and the AWS-LC native archive, invokes those binaries directly for every section, and removes
+the isolated target at exit. `BENCH_TARGET_DIR` is allowed only when the caller supplies an empty, caller-owned
+directory; `BENCH_KEEP_TARGET=1` retains an automatically created target for diagnosis. Do not accept a card built
+from a shared or pre-populated target.
 
 - **Layer 1 -- RAW READ KERNELS** (`read_kernel_roofline`, crates/execution): emits IN-L2 (32MB/col,
   8M rows) AND OUT-OF-L2 (256MB/col, 64M rows) in ONE invocation.
