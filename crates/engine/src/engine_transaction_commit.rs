@@ -613,6 +613,7 @@ impl Engine {
             catalog_commands,
             created_table_identities,
             catalog_output,
+            view_operations,
             operation_order,
             statement_digests,
             sequence_input_oids,
@@ -622,14 +623,15 @@ impl Engine {
             table_resets,
         } = record;
 
-        if catalog_commands.len() > 1
-            && (created_table_identities.is_empty()
-                || catalog_output.is_none()
-                || operation_order.is_empty())
-        {
+        if catalog_commands.len() > 1 && (catalog_output.is_none() || operation_order.is_empty()) {
             return Err(EngineError::Durability(
-                "ordered transaction WAL lost its statement or created-table identity closure"
+                "ordered transaction WAL lost its statement or catalog identity closure"
                     .to_string(),
+            ));
+        }
+        if !view_operations.is_empty() && (catalog_output.is_none() || operation_order.is_empty()) {
+            return Err(EngineError::Durability(
+                "transactional CREATE VIEW WAL lost its ordered catalog envelope".to_string(),
             ));
         }
 
@@ -787,21 +789,12 @@ impl Engine {
                 "ordered transaction WAL created-table identities are incomplete".to_string(),
             ));
         }
-        for operation in &catalog_commands {
-            let working =
-                Self::catalog_snapshot_from_working(&next_catalog, entry.index.saturating_sub(1));
-            match operation.command.clone() {
-                Command::CreateTable(create) => self.with_apply_catalog(Some(working), || {
-                    self.apply_create_table(&mut next_catalog, create)
-                })?,
-                _ => {
-                    return Err(EngineError::Durability(
-                        "transaction WAL record contains an unsupported catalog operation"
-                            .to_string(),
-                    ))
-                }
-            }
-        }
+        self.apply_transaction_catalog_envelope(
+            &mut next_catalog,
+            entry.index.saturating_sub(1),
+            &catalog_commands,
+            &view_operations,
+        )?;
         for (table_name, identity) in &created_table_identities {
             let table = next_catalog
                 .relational_catalog
@@ -883,7 +876,13 @@ impl Engine {
                             _ => None,
                         })
                         .collect::<BTreeSet<_>>(),
-                    _ => BTreeSet::new(),
+                    Command::CreateView(_) => BTreeSet::new(),
+                    _ => {
+                        return Err(EngineError::Durability(
+                            "ordered sequence closure names an unsupported catalog command"
+                                .to_string(),
+                        ))
+                    }
                 };
                 let input_names = inputs
                     .iter()

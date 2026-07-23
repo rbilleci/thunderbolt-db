@@ -1585,7 +1585,7 @@ fn transactional_unsupported_catalog_family_enters_failed_state_and_rollback_dis
     let error = submit_session_text(
         &shared,
         &mut session,
-        "CREATE VIEW unsupported_second_ddl AS SELECT id FROM failed_private_ddl",
+        "CREATE MATERIALIZED VIEW unsupported_second_ddl AS SELECT id FROM failed_private_ddl WITH NO DATA",
     )
     .unwrap_err();
     assert_eq!(error.category, ErrorCategory::Unsupported);
@@ -1608,7 +1608,7 @@ fn transactional_unsupported_catalog_family_enters_failed_state_and_rollback_dis
     submit_session_text(
         &shared,
         &mut session,
-        "CREATE VIEW unsupported_second_ddl AS SELECT id FROM failed_private_ddl",
+        "CREATE MATERIALIZED VIEW unsupported_second_ddl AS SELECT id FROM failed_private_ddl WITH NO DATA",
     )
     .unwrap();
 }

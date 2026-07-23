@@ -399,9 +399,9 @@ impl Engine {
                     "catalog contents changed after transactional DDL staging".to_string(),
                 ));
             }
-            debug_assert!(catalog_commands
-                .iter()
-                .all(|operation| matches!(operation.command, Command::CreateTable(_))));
+            debug_assert!(catalog_commands.iter().all(|operation| {
+                Self::transaction_catalog_command_is_supported(&operation.command)
+            }));
         }
         let transaction_catalog = snapshot.transaction_catalog();
         for delta in &deltas {
@@ -501,6 +501,13 @@ impl Engine {
             &table_resets,
             &transaction_catalog,
         )?;
+        if !record.catalog_commands.is_empty() {
+            self.validate_transaction_catalog_before_wal(
+                &record.catalog_commands,
+                &record.view_operations,
+                &transaction_catalog,
+            )?;
+        }
         let reset_tables = table_resets
             .iter()
             .map(|reset| reset.table.clone())
@@ -867,6 +874,7 @@ impl Engine {
             catalog_commands: Vec::new(),
             created_table_identities: BTreeMap::new(),
             catalog_output: None,
+            view_operations: Vec::new(),
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),

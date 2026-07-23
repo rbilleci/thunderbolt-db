@@ -2253,6 +2253,69 @@ async fn tokio_postgres_drives_the_async_extended_ingress() {
     let _ = server.await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_postgres_describes_transaction_private_view_and_forgets_it_on_rollback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_async_with_engine_batching(
+        listener,
+        std::sync::Arc::new(SharedEngine::new()),
+        2,
+        false,
+    ));
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host={} port={} user=postgres",
+            address.ip(),
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+
+    client
+        .batch_execute("CREATE TABLE prepared_view_source (id int4, note text)")
+        .await
+        .unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .batch_execute(
+            "CREATE VIEW prepared_private_view AS \
+             SELECT id, note FROM prepared_view_source",
+        )
+        .await
+        .unwrap();
+    let statement = client
+        .prepare("SELECT * FROM prepared_private_view")
+        .await
+        .unwrap();
+    assert_eq!(
+        statement
+            .columns()
+            .iter()
+            .map(|column| (column.name(), column.type_().name()))
+            .collect::<Vec<_>>(),
+        vec![("id", "int4"), ("note", "text")]
+    );
+
+    client.batch_execute("ROLLBACK").await.unwrap();
+    let error = client
+        .prepare("SELECT * FROM prepared_private_view")
+        .await
+        .expect_err("rolled-back private view must not remain describable");
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)
+    );
+
+    drop(client);
+    connection.await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
 #[test]
 fn blocking_simple_copy_from_to_abort_and_transaction_boundaries() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

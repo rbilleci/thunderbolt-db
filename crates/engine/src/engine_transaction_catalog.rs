@@ -7,6 +7,8 @@
 use super::*;
 use crate::engine_mutation_admission::validate_prepared_catalog_version;
 
+mod view_identity;
+
 impl Engine {
     pub(crate) fn execute_catalog_in_transaction(
         &self,
@@ -50,9 +52,10 @@ impl Engine {
         expected_catalog_version: Option<Index>,
         on_catalog_latched: impl FnOnce(),
     ) -> Result<(), ExecuteError> {
-        if !matches!(command, Command::CreateTable(_)) {
+        if !Self::transaction_catalog_command_is_supported(&command) {
             return Err(ExecuteError::Unsupported(
-                "transactional catalog staging currently supports CREATE TABLE only".to_string(),
+                "transactional catalog staging currently supports CREATE TABLE and CREATE VIEW only"
+                    .to_string(),
             ));
         }
         let snapshot = self
@@ -145,13 +148,28 @@ impl Engine {
         let mut working = catalog_guard.clone();
         for staged in &prior_commands {
             let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
-            self.with_apply_catalog(Some(scoped), || match &staged.command {
-                Command::CreateTable(create) => {
-                    self.apply_create_table(&mut working, create.clone())
-                }
-                _ => unreachable!("transactional catalog command was classified before staging"),
+            if let (Command::CreateView(create), Some(identity)) =
+                (&staged.command, &staged.view_identity)
+            {
+                Self::validate_transaction_view_before(&scoped, create, identity)
+                    .map_err(ExecuteError::Engine)?;
+            }
+            self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
+                self.apply_transaction_catalog_command(&mut working, staged.command.clone())
             })
             .map_err(ExecuteError::Engine)?;
+            if let (Command::CreateView(create), Some(identity)) =
+                (&staged.command, &staged.view_identity)
+            {
+                let applied =
+                    Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+                Self::validate_transaction_view_after(&applied, create, identity)
+                    .map_err(ExecuteError::Engine)?;
+            } else if matches!(staged.command, Command::CreateView(_)) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transactional CREATE VIEW lost its typed identity closure".to_string(),
+                )));
+            }
         }
         if let Some(expected) = prior_overlay.as_deref() {
             let reconstructed =
@@ -164,9 +182,8 @@ impl Engine {
             }
         }
         let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
-        self.with_apply_catalog(Some(scoped), || match command.clone() {
-            Command::CreateTable(create) => self.apply_create_table(&mut working, create),
-            _ => unreachable!("transactional catalog command was classified above"),
+        self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
+            self.apply_transaction_catalog_command(&mut working, command.clone())
         })
         .map_err(ExecuteError::Engine)?;
         // CREATE validation helpers resolve domains and sequence/default dependencies through the
@@ -189,7 +206,23 @@ impl Engine {
                 "transaction operation ordinal exceeds typed catalog framing".to_string(),
             )
         })?;
+        let command_index = u32::try_from(prior_commands.len()).map_err(|_| {
+            ExecuteError::Unsupported(
+                "transaction catalog operation count exceeds typed identity framing".to_string(),
+            )
+        })?;
         let statement_digest = transaction_statement_digest(&command)?;
+        let view_identity = match &command {
+            Command::CreateView(create) => Some(Self::transaction_view_operation_identity(
+                command_index,
+                ordinal,
+                &scoped,
+                &overlay,
+                create,
+            )?),
+            Command::CreateTable(_) => None,
+            _ => unreachable!("transactional catalog command was classified above"),
+        };
         if let Command::CreateTable(create) = &command {
             Arc::make_mut(&mut delta.resident_shards)
                 .entry(create.table.clone())
@@ -206,6 +239,7 @@ impl Engine {
                     ordinal,
                     statement_digest,
                     command,
+                    view_identity,
                 },
             )));
         delta.generation = delta.generation.saturating_add(1);
@@ -216,6 +250,10 @@ impl Engine {
 #[cfg(test)]
 #[path = "engine_transaction_catalog/ordered_tests.rs"]
 mod ordered_tests;
+
+#[cfg(test)]
+#[path = "engine_transaction_catalog/view_tests.rs"]
+mod view_tests;
 
 #[cfg(test)]
 mod tests {

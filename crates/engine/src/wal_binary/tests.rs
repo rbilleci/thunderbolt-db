@@ -44,6 +44,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         catalog_commands: Vec::new(),
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
+        view_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -91,6 +92,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         }],
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
+        view_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -146,6 +148,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
             relational_next_column_id: 3,
             created_sequence_oids: BTreeMap::new(),
         }),
+        view_operations: Vec::new(),
         operation_order: vec![
             BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
             BinaryTransactionOperationIdentity::Insert {
@@ -297,12 +300,98 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
 }
 
 #[test]
+fn transactional_view_uses_additive_opcode_and_exact_identity_closure() {
+    let command = parse_command("CREATE VIEW codec_view AS SELECT id FROM codec_source").unwrap();
+    let record = BinaryTransactionRecord {
+        allocator_high_water: 0,
+        catalog_commands: vec![BinaryTransactionCatalogCommand {
+            ordinal: 0,
+            command: command.clone(),
+        }],
+        created_table_identities: BTreeMap::new(),
+        catalog_output: Some(BinaryTransactionCatalogOutput {
+            relational_next_oid: 43,
+            relational_next_column_id: 7,
+            created_sequence_oids: BTreeMap::new(),
+        }),
+        view_operations: vec![BinaryTransactionViewOperationIdentity {
+            command_index: 0,
+            ordinal: 0,
+            target_before: None,
+            dependencies: BTreeMap::from([(
+                "codec_source".to_string(),
+                BinaryCatalogRelationIdentity {
+                    kind: BinaryCatalogRelationKind::Table,
+                    oid: 41,
+                    digest: [1; 32],
+                },
+            )]),
+            target_after: BinaryCatalogRelationIdentity {
+                kind: BinaryCatalogRelationKind::View,
+                oid: 42,
+                digest: [2; 32],
+            },
+        }],
+        operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
+        statement_digests: vec![transaction_statement_digest(&command).unwrap()],
+        sequence_input_oids: BTreeMap::new(),
+        table_resets: Vec::new(),
+        sequence_advances: BTreeMap::new(),
+        table_identities: BTreeMap::new(),
+        mutations: Vec::new(),
+    };
+    let payload = try_encode_binary_transaction(&record).unwrap();
+    assert_eq!(
+        payload[..3],
+        [
+            WAL_BINARY_TAG,
+            WAL_BINARY_VERSION,
+            OP_ORDERED_CATALOG_VIEW_TRANSACTION
+        ]
+    );
+    assert!(matches!(
+        decode_binary_record(&payload).unwrap(),
+        BinaryWalRecord::Transaction(decoded) if decoded == record
+    ));
+    assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+
+    let mut forged_legacy_opcode = payload.clone();
+    forged_legacy_opcode[2] = OP_ORDERED_CATALOG_TRANSACTION;
+    assert!(decode_binary_record(&forged_legacy_opcode).is_err());
+
+    let mut wrong_position = record.clone();
+    wrong_position.view_operations[0].ordinal = 1;
+    assert!(try_encode_binary_transaction(&wrong_position).is_none());
+    let mut missing_source = record.clone();
+    missing_source.view_operations[0].dependencies.clear();
+    assert!(try_encode_binary_transaction(&missing_source).is_none());
+    let mut wrong_target_kind = record.clone();
+    wrong_target_kind.view_operations[0].target_after.kind = BinaryCatalogRelationKind::Table;
+    assert!(try_encode_binary_transaction(&wrong_target_kind).is_none());
+
+    let mut replacement = record;
+    replacement.view_operations[0].target_before =
+        Some(replacement.view_operations[0].target_after.clone());
+    replacement.view_operations[0].target_after.digest = [3; 32];
+    replacement.catalog_commands[0].command =
+        parse_command("CREATE OR REPLACE VIEW codec_view AS SELECT id FROM codec_source").unwrap();
+    replacement.statement_digests[0] =
+        transaction_statement_digest(&replacement.catalog_commands[0].command).unwrap();
+    assert_ne!(
+        payload,
+        try_encode_binary_transaction(&replacement).unwrap(),
+        "replace request and postimage identity must change retry bytes"
+    );
+}
+
+#[test]
 fn identity_bound_transaction_round_trips_and_covers_the_exact_mutation_set() {
     let record = BinaryTransactionRecord {
         allocator_high_water: 9,
         catalog_commands: Vec::new(),
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
+        view_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -362,6 +451,7 @@ fn typed_table_reset_round_trips_and_rejects_noncanonical_composition() {
         catalog_commands: Vec::new(),
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
+        view_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),

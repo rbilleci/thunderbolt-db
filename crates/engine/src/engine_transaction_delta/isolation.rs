@@ -185,9 +185,14 @@ impl Engine {
                 overlay.commit_seq = fresh.catalog.commit_seq;
                 let private_tables = catalog_commands
                     .into_iter()
-                    .map(|catalog_command| match &catalog_command.command {
-                        Command::CreateTable(create) => create.table.clone(),
-                        _ => unreachable!("transactional catalog staging supports CREATE TABLE"),
+                    .filter_map(|catalog_command| match &catalog_command.command {
+                        Command::CreateTable(create) => Some(create.table.clone()),
+                        Command::CreateView(_) => None,
+                        _ => {
+                            unreachable!(
+                                "transactional catalog staging admitted an unsupported family"
+                            )
+                        }
                     })
                     .collect();
                 (Some(Arc::new(overlay)), private_tables)

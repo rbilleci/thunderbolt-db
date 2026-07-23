@@ -32,6 +32,7 @@ impl Engine {
                                 Command::CreateTable(create) => {
                                     tables.insert(create.table);
                                 }
+                                Command::CreateView(_) => {}
                                 _ => return None,
                             }
                         }

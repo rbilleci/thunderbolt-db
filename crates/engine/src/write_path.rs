@@ -681,6 +681,7 @@ pub(crate) struct StagedCatalogCommand {
     pub(crate) ordinal: u32,
     pub(crate) statement_digest: gpu_db_wal::CanonicalDigest,
     pub(crate) command: Command,
+    pub(crate) view_identity: Option<BinaryTransactionViewOperationIdentity>,
 }
 
 impl Drop for TransactionSnapshot {

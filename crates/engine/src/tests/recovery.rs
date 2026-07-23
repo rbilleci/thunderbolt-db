@@ -116,6 +116,7 @@ fn explicit_transaction_binary_record_is_one_atomic_recoverable_generation() {
         catalog_commands: Vec::new(),
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
+        view_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),

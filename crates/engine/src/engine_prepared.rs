@@ -210,6 +210,16 @@ fn prepared_select_table(
     if let Some(table) = catalog.relational_catalog.get(name) {
         return Ok(table.clone());
     }
+    if catalog.relational_views.contains_key(name) {
+        if !select_is_plain_view_scan(select) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                format!(
+                    "prepared SELECT over public relation {name:?} requires a supported base-table route"
+                ),
+            )));
+        }
+        return prepared_view_table(catalog, name, &mut BTreeSet::new());
+    }
     if select.public_only {
         return Err(ExecuteError::UndefinedRelation(format!("public.{name}")));
     }
@@ -221,6 +231,49 @@ fn prepared_select_table(
     synthesize_catalog_relation(name, catalog)
         .map(|(table, _rows)| table)
         .ok_or_else(|| ExecuteError::UndefinedRelation(name.to_string()))
+}
+
+fn prepared_view_table(
+    catalog: &CatalogSnapshot,
+    name: &str,
+    visiting: &mut BTreeSet<String>,
+) -> Result<RelationalTable, ExecuteError> {
+    if !visiting.insert(name.to_string()) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "view dependency cycle is unsupported".to_string(),
+        )));
+    }
+    let result = (|| {
+        let view = catalog
+            .relational_views
+            .get(name)
+            .ok_or_else(|| ExecuteError::UndefinedRelation(name.to_string()))?;
+        let source = if let Some(table) = catalog.relational_catalog.get(&view.query.table) {
+            table.clone()
+        } else if catalog.relational_views.contains_key(&view.query.table) {
+            if !select_is_plain_view_scan(&view.query) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "only plain SELECT * FROM view is supported for views".to_string(),
+                )));
+            }
+            prepared_view_table(catalog, &view.query.table, visiting)?
+        } else {
+            return Err(ExecuteError::UndefinedRelation(view.query.table.clone()));
+        };
+        let columns = bind_relational_select(&source, &view.query)?.selected_columns;
+        Ok(RelationalTable {
+            schema: view.schema.clone(),
+            name: view.name.clone(),
+            oid: view.oid,
+            columns,
+            indexes: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            acl: view.acl.clone(),
+        })
+    })();
+    visiting.remove(name);
+    result
 }
 
 fn prepared_table<'a>(

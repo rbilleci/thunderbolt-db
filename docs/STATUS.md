@@ -14,23 +14,74 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 transactional CREATE VIEW envelope — accepted 2026-07-23
+
+- `CREATE VIEW` and `CREATE OR REPLACE VIEW` now enter the existing transaction-private
+  `TransactionOperation` stream beside typed `CREATE TABLE`, DML, and table resets. Every staged view retains its
+  exact target preimage, stable relation kind/OID and definition digest, transitively resolved source-relation
+  closure, and exact target postimage. Repeated replacements reconstruct the private catalog in statement order;
+  private views and their metadata remain creator-only until commit, rollback publishes nothing, and unsupported
+  catalog families still reject before private, sequence, WAL, or database effects.
+- Additive binary WAL opcodes 12/13 encode the ordered view proof without changing the accepted opcode 4–11
+  representations. Decode, retry matching, live apply, and recovery reject noncanonical ordering, ordinals,
+  identities, dependency digests, truncation, trailing bytes, and operation smuggling. Admission and replay first
+  rebuild the complete catalog result on a clone, then the existing commit/WAL/publication owner installs one atomic
+  catalog/data generation. READ COMMITTED rebases byte-identical catalogs; REPEATABLE READ, target ABA, and any
+  transitive dependency drift fail before WAL. Post-durable apply failure remains recovery-owned and fresh replay
+  converges with the live catalog/data result.
+- Focused ordinary coverage proves transaction-private/global visibility, rollback, mixed table/view/DML/reset
+  orderings, repeated replace, exact retries, source and target ABA under both isolation modes, catalog-latch
+  concurrency, WAL tampering/canonicality, post-durable recovery, and real tokio-postgres Parse/Describe. Actual-GPU
+  tests exercise private and published view data reads plus GPU catalog joins. The exact six-test ordered-catalog GPU
+  cohort passes three serial and two paired-concurrent rounds (**42/42** result groups) on all-feature engine binary
+  SHA-256 `827f2263582f2f0de0845334b03daab9f835908608fd337c8283258fbb130917`
+  (313,975,736 bytes), with zero CUDA 700/716/717/719.
+- Workspace all-target/all-feature tests pass, including engine **561/561** with **582** ignored, facade **76/76**
+  with **15** ignored, and concurrency **13/13** with one ignored. Strict workspace Clippy, rustfmt, diff whitespace,
+  focused protocol/recovery/GPU gates, and source-size gates pass. Touched production/test maxima are 1,906/2,936
+  lines; new view owners are 321 and 694 lines. The unchanged PLAN-owned outliers remain
+  `engine_dml_concurrent.rs` at **2,170**, `engine_commit.rs` at **2,091**, and
+  `engine_mutation_admission.rs` at **2,010**.
+- The first clean report card exposed a generated-layout point-read regression. Moving the existing compact
+  production submission boundary out of its caller's inline body and into a stable Linux hot-text section repaired
+  it without adding a route or changing semantics. The final clean isolated card retained
+  `target/benchmark-report-card.IJRXho`: raw-kernel artifact SHA-256
+  `3545da5a1502be3519c5cce594e0e3f37ec422efa6dbc18bf5268c9b87cc8dcc` (1,218,632 bytes) and production
+  point-read artifact SHA-256 `7c002a284a403664fb1bab5bf535129700d9fb40030a1dcb2126fa4a8ebb445e`
+  (11,191,448 bytes). Layer 1 `sum_i32` is **1313.2 GB/s, p50 26us** in-L2 and **1428.8 GB/s, p50 188us**
+  out-of-L2; grouped execution is **1674.9 M-elem/s**. Layer 2 is **225.418M/s, p50 157us** in-L2 and
+  **195.955M/s, p50 206us** out-of-L2 after a **2,118.4s** 48M-row fixture build with zero final-residency work.
+  Against the accepted **228.889M/s, 158us** and **196.452M/s, 205us** baseline, throughput is **-1.5%/-0.3%**
+  and p50 is **-0.6%/+0.5%**, not a material regression.
+- The accepted code/test implementation is base `21eb94995fb25c63e3b1647f5f8bb9b5692c7ea5`, index tree
+  `ecf0372625a98f0b1b155eb777134c5109770170`, and cached binary-diff SHA-256
+  `b21b3b43480a5525b74c0b8ad7f43d0e30c08aa82a99861824a201c413613bc9` across 19 paths. Independent
+  product/semantics and runtime/recovery audits both returned **ACCEPT** on that exact candidate. The three inherited
+  PLAN-owned GPU defects reproduce with their unchanged durable-retry, classic-wave FK serialization, and
+  wide-unique violation signatures. **PRODUCT-001** remains open under PLAN for the remaining transactional catalog
+  families and its later compatibility, recovery, deletion, ownership, defect, and source-size closure gates.
+
 ## PRODUCT-001 ordered transactional catalog command envelope — accepted 2026-07-23
 
-- `TransactionOperation` is now the sole statement-order authority for catalog commands, row DML, and typed table
-  resets. Every currently admitted transaction-private catalog operation is a typed `CREATE TABLE`; each later
-  create reconstructs the working catalog from the exact published base plus all typed predecessors while holding
-  the catalog latch, then replaces one private overlay. DML, prepared Parse/Describe, GPU catalog joins, and typed
-  resets resolve through that overlay, including reset of a preceding private relation. Other catalog families
-  reject before any new private/database effect, and the focused sabotage proof leaves generation, operation count,
-  and WAL unchanged.
-- Current ordered WAL uses additive binary opcodes 10/11. It binds every catalog command to its global ordinal,
+- At this checkpoint, `TransactionOperation` became the sole statement-order authority for catalog commands, row
+  DML, and typed table resets. Every transaction-private catalog operation admitted by this checkpoint was a typed
+  `CREATE TABLE`; each later create reconstructed the working catalog from the exact published base plus all typed
+  predecessors while holding the catalog latch, then replaced one private overlay. DML, prepared Parse/Describe,
+  GPU catalog joins, and typed resets resolved through that overlay, including reset of a preceding private
+  relation. Catalog families not admitted by this checkpoint rejected before any new private/database effect, and
+  the focused sabotage proof left generation, operation count, and WAL unchanged. The transactional-view section
+  above records the later extension to `CREATE VIEW` and `CREATE OR REPLACE VIEW`.
+- This checkpoint's ordered WAL added binary opcodes 10/11. It binds every catalog command to its global ordinal,
   every operation to the canonical digest of its fully typed statement even when its relational effect is empty or
   later shadowed, every created table to its stable OID/schema digest, the exact catalog allocator post-state, every
   created or referenced sequence OID, the exact row-mutation family/target, surviving typed resets, and every
   existing row target's stable identity. Legacy transaction opcodes 4–9 retain their historical bytes and canonical
   table counts. Decode and apply validate the complete closure, rebuild all catalog commands on a clone, and only
-  then install one catalog epoch plus one table-batched data publication. READ COMMITTED rebases the complete stream
-  with copy-on-write row rekeying; REPEATABLE READ and direct COMMIT retain the full catalog/allocator content proof.
+  then install one catalog epoch plus one table-batched data publication. READ COMMITTED validates catalog/allocator
+  content equivalence, rebinds the existing private overlay to the newer publication, and copy-on-write
+  rekeys/replays only the GPU row delta; it does not replay catalog operations. REPEATABLE READ and direct COMMIT
+  retain the full catalog/allocator content proof. The later view slice extends this representation with opcodes
+  12/13.
 - The first independent audit round rejected historical table-count drift, effect-collapsing retry identity,
   table-only mutation matching, and incomplete sequence dependency closure. Literal opcode-5/8 recovery fixtures,
   typed statement digests, exact mutation-family identities, and per-ordinal sequence OIDs/advance validation repair
@@ -59,10 +110,10 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `0a6180e6157ed0b107872ab217106f33125e15ce0085eb0aed5850b709f7e6fa` across 28 paths. Independent
   product/semantics and runtime/recovery audits both returned **ACCEPT** on full candidate tree
   `71c602dddf94eed9fc8acc2b2e1b2cb8325ddc7d` and full binary-diff SHA-256
-  `6a62d320be2b4949843e245aaa6a539247b97c4f50ec75ffbecd7fc23c257a05` across 31 paths. **PRODUCT-001** remains
-  open for other catalog families, remaining SQLSTATE/type-codec, named-client, and mixed-recovery proof, legacy/P8
-  deletion, ownership guards, its three inherited GPU defects, and its PLAN-owned production outliers at 2,170,
-  2,091, and 2,010 lines.
+  `6a62d320be2b4949843e245aaa6a539247b97c4f50ec75ffbecd7fc23c257a05` across 31 paths. At this checkpoint,
+  **PRODUCT-001** remained open for other catalog families, remaining SQLSTATE/type-codec, named-client, and
+  mixed-recovery proof, legacy/P8 deletion, ownership guards, its three inherited GPU defects, and its PLAN-owned
+  production outliers at 2,170, 2,091, and 2,010 lines.
 
 ## PRODUCT-001 typed transactional table reset — accepted 2026-07-22
 

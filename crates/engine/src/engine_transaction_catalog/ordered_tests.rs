@@ -389,7 +389,9 @@ fn ordered_catalog_unsupported_family_is_rejected_without_new_effect() {
     let error = engine
         .submit_transaction(
             1_030,
-            parsed("CREATE VIEW ordered_unsupported AS SELECT id FROM ordered_supported"),
+            parsed(
+                "CREATE MATERIALIZED VIEW ordered_unsupported AS SELECT id FROM ordered_supported WITH NO DATA",
+            ),
         )
         .unwrap_err();
     assert!(matches!(error, ExecuteError::Unsupported(_)));
@@ -637,6 +639,15 @@ fn ordered_catalog_post_durable_failure_is_recovery_owned() {
         )
         .unwrap();
     engine
+        .submit_transaction(
+            1_050,
+            parsed(
+                "CREATE VIEW ordered_durable_view AS \
+                 SELECT id, value FROM ordered_durable_b",
+            ),
+        )
+        .unwrap();
+    engine
         .submit_transaction(1_050, parsed("INSERT INTO ordered_durable_b VALUES (1, 9)"))
         .unwrap();
     engine.fail_next_transaction_post_durable_apply();
@@ -653,13 +664,16 @@ fn ordered_catalog_post_durable_failure_is_recovery_owned() {
         .catalog_snapshot()
         .relational_catalog
         .contains_key("ordered_durable_a"));
+    let Command::Select(view_select) = parse_command("SELECT * FROM ordered_durable_view").unwrap()
+    else {
+        panic!("expected SELECT");
+    };
     assert_eq!(
         recovered
-            .execute_resident_expr_select_sql(
-                "SELECT id, value FROM ordered_durable_b ORDER BY id",
-            )
+            .execute_relational_select(&view_select)
             .unwrap()
-            .rows,
+            .rows
+            .into_boxed(),
         vec![vec![SqlValue::Int4(1), SqlValue::Int4(9)]]
     );
     let payload = operation_payload(&records[0]);

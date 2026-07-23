@@ -667,10 +667,14 @@ impl Engine {
 
     /// Production point-batcher entry. Dense all-present results keep an internal identity mapping and avoid
     /// the 8-byte-per-needle compatibility range allocation; runtime failures remain typed errors.
-    // This boundary is deliberately inlined into the production coalescer/example callers. Keeping the hot
-    // orchestration with its caller prevents unrelated transaction/WAL text growth from perturbing Layer-2
-    // instruction placement; the canonical report card is the permanent guard for this choice.
-    #[inline(always)]
+    // Keep the latency-critical orchestration in one hot code section shared by the production coalescer and
+    // direct prepared callers. A non-inlined boundary prevents unrelated transaction/WAL growth from changing
+    // each caller's inlined instruction placement; the canonical report card is the permanent guard.
+    #[inline(never)]
+    #[cfg_attr(
+        target_os = "linux",
+        unsafe(link_section = ".text.hot.gpu_db_sharded_point_read")
+    )]
     pub fn submit_sharded_point_lookups_batched_compact(
         &self,
         select: &Select,

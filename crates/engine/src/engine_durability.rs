@@ -1236,6 +1236,7 @@ mod tests {
             }],
             created_table_identities: BTreeMap::new(),
             catalog_output: None,
+            view_operations: Vec::new(),
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),

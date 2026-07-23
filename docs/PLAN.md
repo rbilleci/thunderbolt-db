@@ -214,6 +214,23 @@ does not delay the architecture evidence gate. The active sequence now starts at
    `71c602dddf94eed9fc8acc2b2e1b2cb8325ddc7d` and full binary-diff SHA-256
    `6a62d320be2b4949843e245aaa6a539247b97c4f50ec75ffbecd7fc23c257a05` across 31 paths.
 
+   The independently accepted transactional-view slice admits `CREATE VIEW` and `CREATE OR REPLACE VIEW` through
+   that same ordered transaction stream. Each view operation carries its exact target preimage, stable target
+   kind/OID and definition digest, complete transitively resolved source-relation closure, and exact target
+   postimage. Additive binary WAL opcodes 12/13 bind those proofs to the global operation ordinal without changing
+   legacy opcode 4–11 bytes. Admission, live apply, and replay rebuild every view operation on a catalog clone before
+   the sole WAL/publication owner installs anything. READ COMMITTED validates byte-identical catalog contents and
+   rebinds the existing private overlay to the newer publication, while REPEATABLE READ retains its held proof;
+   target or dependency ABA, malformed/smuggled WAL, and unsupported catalog families fail before effects.
+   Transaction-private visibility, repeated replacement, mixed ordering with table creation/DML/typed reset, prepared
+   Parse/Describe, GPU catalog joins, GPU data reads, rollback, retry identity, post-durable recovery, and concurrent
+   catalog-latch serialization are proven. The implementation adds no execution, commit, WAL, recovery, publication,
+   or host-relational product authority. The exact implementation is base
+   `21eb94995fb25c63e3b1647f5f8bb9b5692c7ea5`, code/test tree
+   `ecf0372625a98f0b1b155eb777134c5109770170`, and cached binary-diff SHA-256
+   `b21b3b43480a5525b74c0b8ad7f43d0e30c08aa82a99861824a201c413613bc9` across 19 paths. Independent
+   product/semantics and runtime/recovery audits both returned **ACCEPT** on that exact frozen candidate.
+
    The active next boundary remains within **PRODUCT-001**: close remaining transactional catalog families only with
    complete typed identity/dependency semantics, then complete the remaining SQLSTATE/type-codec breadth, named
    client suites, and mixed-recovery coverage for the canonical target. Only after those proofs are independently

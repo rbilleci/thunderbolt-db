@@ -12,6 +12,7 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         record.catalog_commands.clear();
         record.created_table_identities.clear();
+        record.view_operations.clear();
         for staged in catalog_commands {
             record
                 .catalog_commands
@@ -19,34 +20,49 @@ impl Engine {
                     ordinal: staged.ordinal,
                     command: staged.command.clone(),
                 });
-            let create = match &staged.command {
-                Command::CreateTable(create) => create,
-                _ => unreachable!("transactional catalog staging supports CREATE TABLE"),
-            };
-            let table = transaction_catalog
-                .relational_catalog
-                .get(&create.table)
-                .ok_or_else(|| {
-                    ExecuteError::Serialization(format!(
-                        "transaction-created relation \"{}\" left its private catalog before WAL binding",
-                        create.table
-                    ))
-                })?;
-            record.created_table_identities.insert(
-                create.table.clone(),
-                BinaryTransactionTableIdentity {
-                    table_oid: table.oid,
-                    schema_digest: table_schema_digest(table)?,
-                },
-            );
+            match &staged.command {
+                Command::CreateTable(create) => {
+                    let table = transaction_catalog
+                        .relational_catalog
+                        .get(&create.table)
+                        .ok_or_else(|| {
+                            ExecuteError::Serialization(format!(
+                                "transaction-created relation \"{}\" left its private catalog before WAL binding",
+                                create.table
+                            ))
+                        })?;
+                    record.created_table_identities.insert(
+                        create.table.clone(),
+                        BinaryTransactionTableIdentity {
+                            table_oid: table.oid,
+                            schema_digest: table_schema_digest(table)?,
+                        },
+                    );
+                    if staged.view_identity.is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional CREATE TABLE carries a view identity".to_string(),
+                        )));
+                    }
+                }
+                Command::CreateView(_) => {
+                    record
+                        .view_operations
+                        .push(staged.view_identity.clone().ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "transactional CREATE VIEW lost its typed identity closure"
+                                    .to_string(),
+                            ))
+                        })?);
+                }
+                _ => unreachable!("transactional catalog staging admitted an unsupported family"),
+            }
         }
 
         if !catalog_commands.is_empty() {
             let mut created_sequence_oids = BTreeMap::new();
             for staged in catalog_commands {
-                let create = match &staged.command {
-                    Command::CreateTable(create) => create,
-                    _ => unreachable!("transactional catalog staging supports CREATE TABLE"),
+                let Command::CreateTable(create) = &staged.command else {
+                    continue;
                 };
                 for column in &create.columns {
                     let Some(ColumnDefault::SequenceNextVal {
@@ -93,21 +109,21 @@ impl Engine {
 
                 let mut sequence_names = BTreeSet::new();
                 match operation {
-                    TransactionOperation::Catalog(staged) => {
-                        let create = match &staged.command {
-                            Command::CreateTable(create) => create,
-                            _ => {
-                                unreachable!("transactional catalog staging supports CREATE TABLE")
-                            }
-                        };
-                        for column in &create.columns {
-                            if let Some(ColumnDefault::SequenceNextVal { sequence, .. }) =
-                                &column.default
-                            {
-                                sequence_names.insert(sequence.as_str());
+                    TransactionOperation::Catalog(staged) => match &staged.command {
+                        Command::CreateTable(create) => {
+                            for column in &create.columns {
+                                if let Some(ColumnDefault::SequenceNextVal { sequence, .. }) =
+                                    &column.default
+                                {
+                                    sequence_names.insert(sequence.as_str());
+                                }
                             }
                         }
-                    }
+                        Command::CreateView(_) => {}
+                        _ => unreachable!(
+                            "transactional catalog staging admitted an unsupported family"
+                        ),
+                    },
                     TransactionOperation::Row(staged) => {
                         if let PreparedMutation::Insert { seq_advances, .. } = &staged.mutation {
                             sequence_names.extend(seq_advances.keys().map(String::as_str));
