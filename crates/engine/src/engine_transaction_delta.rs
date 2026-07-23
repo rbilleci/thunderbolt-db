@@ -505,6 +505,7 @@ impl Engine {
             self.validate_transaction_catalog_before_wal(
                 &record.catalog_commands,
                 &record.view_operations,
+                &record.view_lifecycle_operations,
                 &transaction_catalog,
             )?;
         }
@@ -875,6 +876,7 @@ impl Engine {
             created_table_identities: BTreeMap::new(),
             catalog_output: None,
             view_operations: Vec::new(),
+            view_lifecycle_operations: Vec::new(),
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),

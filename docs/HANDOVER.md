@@ -6,30 +6,29 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
 
 ## Current boundary
 
-- **PRODUCT-001** now has an independently accepted transactional-view boundary. `CREATE VIEW` and `CREATE OR
-  REPLACE VIEW` use the existing private `TransactionOperation` stream, exact target pre/post identities and
-  transitive source closure, additive WAL opcodes 12/13, clone-first live/replay validation, and the sole atomic
-  catalog/data publication owner. Private/global visibility, repeated replace, mixed table/DML/reset ordering,
-  prepared Parse/Describe, GPU catalog/data reads, rollback, isolation, target/source ABA, concurrency, retry
-  identity, durability, and recovery are proven; all other catalog families remain pre-effect refusals.
-- The accepted immutable implementation is base `21eb94995fb25c63e3b1647f5f8bb9b5692c7ea5`, code/test tree
-  `ecf0372625a98f0b1b155eb777134c5109770170`, and code/test binary-diff SHA-256
-  `b21b3b43480a5525b74c0b8ad7f43d0e30c08aa82a99861824a201c413613bc9` across 19 paths. Independent
-  product/semantics and runtime/recovery audits both returned **ACCEPT** on that exact frozen PRODUCT-001
-  candidate. The later point-read recovery changes only release code generation, exact-generation route
-  eligibility/result summaries, and their tests/docs; it adds no transaction, WAL, catalog, or publication owner.
-- Engine ordinary tests pass **561/561** with **582** GPU cases ignored; the exact six-test ordered-catalog cohort
-  passes three serial plus two paired-concurrent rounds (**42/42** result groups) with zero CUDA 700/716/717/719.
-  The current nine-test sharded-point and one-test dense-status GPU cohorts each pass three sequential plus two
-  paired-concurrent rounds with zero CUDA 700/716/717/719; workspace all-target/all-feature check, affected-crate
-  strict Clippy, scoped rustfmt, diff, and size gates pass. The latest clean isolated report card records Layer 1
-  rooflines of **1372.9 GB/s, p50 24us** in-L2 and **1440.7 GB/s, p50 186us** out-of-L2, plus Layer 2 production
-  point reads of **263.380M/s, p50 117us** and **233.844M/s, p50 137us**. The independently audited point-read
-  implementation diff is `ccfde70117fcf4d08c9c3991934a0c0e89fde1fd9b578128cb90c95139695fed`.
+- **PRODUCT-001** now has an independently accepted stored-view lifecycle boundary. `CREATE [OR REPLACE] VIEW`,
+  `ALTER VIEW ... RENAME TO ...`, and ordered multi-target `DROP VIEW [IF EXISTS]` share the existing private
+  `TransactionOperation` stream. Exact command/pre/post/OID/definition/dependency identities, byte-stable
+  create-only opcodes 12/13, additive lifecycle opcodes 14/15, clone-first live/replay validation, and the sole
+  atomic catalog/data publication owner are proven. Rename retains OID/ACL/comments; drop/recreate allocates a new
+  identity. Materialized-view lifecycle and every other unadmitted catalog family remain pre-effect refusals.
+- The accepted immutable implementation is base `eb4ffce51781d476bf123581c0b743ebdbdd9915`, code/test tree
+  `b934d5b1f80654768b1b4035f88e008bd710e866`, and code/test binary-diff SHA-256
+  `00dda15274382290086eac731dc0bdc68c433da047c8c8f410b3aac66a3f3a6d` across 18 paths. Independent
+  product/semantics and runtime/recovery audits both returned **ACCEPT** on that frozen candidate. The runtime
+  auditor also matched all 1,645 retained exported entries, artifact provenance, section markers, and the final
+  canonical report-card record before returning post-card **ACCEPT**.
+- Engine ordinary tests pass **568/568** with **583** GPU cases ignored; the exact seven-test ordered-catalog cohort
+  passes three serial plus two paired-concurrent rounds (**49/49** result groups) with zero CUDA
+  700/716/717/719. Workspace all-target/all-feature tests, strict Clippy, scoped rustfmt, NULL differential, actual
+  GPU lifecycle/recovery, diff, shell, dependency, and size gates pass. The canonical full card records Layer 1
+  rooflines of **1428.4 GB/s, p50 23us** in-L2 and **1439.4 GB/s, p50 186us** out-of-L2, plus Layer 2 production
+  point reads of **270.537M/s, p50 115us** and **245.753M/s, p50 139us**. Its exact final record is
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`.
 - Earlier accepted PRODUCT-001 SQLx/simple-query, COPY, TLS/SCRAM, cancellation, prepared/portal/session,
   psql/GPU-catalog/R2DBC, PostgreSQL 16 pg_dump/restore, transaction-private catalog-generation, typed-reset, and
-  ordered-catalog boundaries remain canonical. Three inherited GPU defects remain PLAN-owned with unchanged
-  signatures. The current source outliers are PLAN-owned `engine_dml_concurrent.rs` at **2,170** lines,
+  ordered-catalog/view-create boundaries remain canonical. Three inherited GPU defects remain PLAN-owned with
+  unchanged signatures. The current source outliers are PLAN-owned `engine_dml_concurrent.rs` at **2,170** lines,
   `engine_commit.rs` at **2,091**, and `engine_mutation_admission.rs` at **2,010**; none has an exception.
 
 ## Resume here

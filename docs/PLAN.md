@@ -231,6 +231,29 @@ does not delay the architecture evidence gate. The active sequence now starts at
    `b21b3b43480a5525b74c0b8ad7f43d0e30c08aa82a99861824a201c413613bc9` across 19 paths. Independent
    product/semantics and runtime/recovery audits both returned **ACCEPT** on that exact frozen candidate.
 
+   The independently accepted stored-view lifecycle slice extends that same transaction-owned catalog boundary to
+   `ALTER VIEW ... RENAME TO ...` and ordered multi-target `DROP VIEW [IF EXISTS]`. Typed lifecycle identities bind
+   every command ordinal, exact pre/post name, stable relation OID, semantic definition digest, transitive
+   dependencies, and typed target absence. Rename retains the relation OID, ACL, and comments; drop/recreate receives
+   a new OID without inheriting the removed object's ACL or comments. Create-only transactions retain the
+   byte-for-byte opcode 12/13 representation, while additive lifecycle opcodes 14/15 cover transactions containing
+   rename/drop and mixed table/DML/reset/view work. Live apply and replay reconstruct the complete result on a
+   catalog clone before installation; rollback, exact retry, READ COMMITTED rebind, REPEATABLE READ, target/dependency
+   ABA, the catalog latch, post-durable indeterminacy, and fresh recovery are proven without adding a second
+   execution, WAL, recovery, or publication owner. Materialized-view lifecycle remains a pre-effect refusal pending
+   its distinct data-snapshot/refresh semantics.
+
+   The exact stored-view lifecycle implementation is base
+   `eb4ffce51781d476bf123581c0b743ebdbdd9915`, code/test tree
+   `b934d5b1f80654768b1b4035f88e008bd710e866`, and cached binary-diff SHA-256
+   `00dda15274382290086eac731dc0bdc68c433da047c8c8f410b3aac66a3f3a6d` across 18 paths. Independent
+   product/semantics and runtime/recovery audits returned **ACCEPT** on that exact frozen candidate; the latter also
+   returned post-card **ACCEPT** after matching all 1,645 exported index entries and artifact provenance. The
+   canonical full report card completed A/B/C with its exact final marker: Layer 1 rooflines are 1428.4 GB/s, p50
+   23us in-L2 and 1439.4 GB/s, p50 186us out-of-L2; Layer 2 reaches 270.537M/s, p50 115us and 245.753M/s, p50
+   139us. Against the latest accepted baseline, throughput changes are +2.7%/+5.1%, the out-of-L2 p50 shift is
+   +2us, and no material regression is present.
+
    The active next boundary remains within **PRODUCT-001**: close remaining transactional catalog families only with
    complete typed identity/dependency semantics, then complete the remaining SQLSTATE/type-codec breadth, named
    client suites, and mixed-recovery coverage for the canonical target. Only after those proofs are independently

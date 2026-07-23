@@ -401,7 +401,7 @@ fn catalog_latch_makes_view_dependency_capture_atomic_with_concurrent_drop() {
         panic!("expected a catalog operation");
     };
     assert_eq!(
-        staged.view_identity.as_ref().unwrap().dependencies["latched_view_source"].oid,
+        staged.view_identity.as_ref().unwrap().targets[0].dependencies["latched_view_source"].oid,
         source_oid
     );
     drop(delta);
@@ -488,6 +488,7 @@ fn view_replay_rejects_every_typed_identity_tamper_before_catalog_effect() {
             .unwrap_err();
         assert!(
             error.to_string().contains("CREATE VIEW")
+                || error.to_string().contains("stored-view")
                 || error.to_string().contains("statement position"),
             "{error}"
         );

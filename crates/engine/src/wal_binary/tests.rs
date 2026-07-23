@@ -45,6 +45,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
         view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -93,6 +94,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
         view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -149,6 +151,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
             created_sequence_oids: BTreeMap::new(),
         }),
         view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
         operation_order: vec![
             BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
             BinaryTransactionOperationIdentity::Insert {
@@ -332,6 +335,7 @@ fn transactional_view_uses_additive_opcode_and_exact_identity_closure() {
                 digest: [2; 32],
             },
         }],
+        view_lifecycle_operations: Vec::new(),
         operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
         statement_digests: vec![transaction_statement_digest(&command).unwrap()],
         sequence_input_oids: BTreeMap::new(),
@@ -385,6 +389,160 @@ fn transactional_view_uses_additive_opcode_and_exact_identity_closure() {
 }
 
 #[test]
+fn transactional_view_lifecycle_uses_additive_opcode_and_canonical_targets() {
+    let create = parse_command("CREATE VIEW codec_view AS SELECT id FROM codec_source").unwrap();
+    let rename = parse_command("ALTER VIEW codec_view RENAME TO codec_renamed").unwrap();
+    let drop = parse_command("DROP VIEW IF EXISTS codec_renamed, missing_codec_view").unwrap();
+    let source = BinaryCatalogRelationIdentity {
+        kind: BinaryCatalogRelationKind::Table,
+        oid: 41,
+        digest: [1; 32],
+    };
+    let created = BinaryCatalogRelationIdentity {
+        kind: BinaryCatalogRelationKind::View,
+        oid: 42,
+        digest: [2; 32],
+    };
+    let renamed = BinaryCatalogRelationIdentity {
+        kind: BinaryCatalogRelationKind::View,
+        oid: 42,
+        digest: [3; 32],
+    };
+    let record = BinaryTransactionRecord {
+        allocator_high_water: 0,
+        catalog_commands: vec![
+            BinaryTransactionCatalogCommand {
+                ordinal: 0,
+                command: create.clone(),
+            },
+            BinaryTransactionCatalogCommand {
+                ordinal: 1,
+                command: rename.clone(),
+            },
+            BinaryTransactionCatalogCommand {
+                ordinal: 2,
+                command: drop.clone(),
+            },
+        ],
+        created_table_identities: BTreeMap::new(),
+        catalog_output: Some(BinaryTransactionCatalogOutput {
+            relational_next_oid: 43,
+            relational_next_column_id: 7,
+            created_sequence_oids: BTreeMap::new(),
+        }),
+        view_operations: Vec::new(),
+        view_lifecycle_operations: vec![
+            BinaryTransactionViewLifecycleOperationIdentity {
+                command_index: 0,
+                ordinal: 0,
+                targets: vec![BinaryTransactionViewLifecycleTargetIdentity {
+                    before_name: "codec_view".to_string(),
+                    target_before: None,
+                    dependencies: BTreeMap::from([("codec_source".to_string(), source.clone())]),
+                    after_name: Some("codec_view".to_string()),
+                    target_after: Some(created.clone()),
+                }],
+            },
+            BinaryTransactionViewLifecycleOperationIdentity {
+                command_index: 1,
+                ordinal: 1,
+                targets: vec![BinaryTransactionViewLifecycleTargetIdentity {
+                    before_name: "codec_view".to_string(),
+                    target_before: Some(created),
+                    dependencies: BTreeMap::from([("codec_source".to_string(), source.clone())]),
+                    after_name: Some("codec_renamed".to_string()),
+                    target_after: Some(renamed.clone()),
+                }],
+            },
+            BinaryTransactionViewLifecycleOperationIdentity {
+                command_index: 2,
+                ordinal: 2,
+                targets: vec![
+                    BinaryTransactionViewLifecycleTargetIdentity {
+                        before_name: "codec_renamed".to_string(),
+                        target_before: Some(renamed),
+                        dependencies: BTreeMap::from([("codec_source".to_string(), source)]),
+                        after_name: None,
+                        target_after: None,
+                    },
+                    BinaryTransactionViewLifecycleTargetIdentity {
+                        before_name: "missing_codec_view".to_string(),
+                        target_before: None,
+                        dependencies: BTreeMap::new(),
+                        after_name: None,
+                        target_after: None,
+                    },
+                ],
+            },
+        ],
+        operation_order: vec![
+            BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
+            BinaryTransactionOperationIdentity::Catalog { command_index: 1 },
+            BinaryTransactionOperationIdentity::Catalog { command_index: 2 },
+        ],
+        statement_digests: [&create, &rename, &drop]
+            .into_iter()
+            .map(|command| transaction_statement_digest(command).unwrap())
+            .collect(),
+        sequence_input_oids: BTreeMap::new(),
+        table_resets: Vec::new(),
+        sequence_advances: BTreeMap::new(),
+        table_identities: BTreeMap::new(),
+        mutations: Vec::new(),
+    };
+
+    let payload = try_encode_binary_transaction(&record).unwrap();
+    assert_eq!(
+        payload[..3],
+        [
+            WAL_BINARY_TAG,
+            WAL_BINARY_VERSION,
+            OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION,
+        ]
+    );
+    assert!(matches!(
+        decode_binary_record(&payload).unwrap(),
+        BinaryWalRecord::Transaction(decoded) if decoded == record
+    ));
+
+    let mut forged_legacy_opcode = payload.clone();
+    forged_legacy_opcode[2] = OP_ORDERED_CATALOG_VIEW_TRANSACTION;
+    assert!(decode_binary_record(&forged_legacy_opcode).is_err());
+
+    for mut tampered in [
+        {
+            let mut tampered = record.clone();
+            tampered.view_lifecycle_operations[1].targets[0].after_name =
+                Some("wrong_name".to_string());
+            tampered
+        },
+        {
+            let mut tampered = record.clone();
+            tampered.view_lifecycle_operations[2].targets.swap(0, 1);
+            tampered
+        },
+        {
+            let mut tampered = record.clone();
+            tampered.view_lifecycle_operations[2].targets[1]
+                .dependencies
+                .insert(
+                    "smuggled".to_string(),
+                    BinaryCatalogRelationIdentity {
+                        kind: BinaryCatalogRelationKind::Table,
+                        oid: 99,
+                        digest: [9; 32],
+                    },
+                );
+            tampered
+        },
+    ] {
+        assert!(try_encode_binary_transaction(&tampered).is_none());
+        tampered.view_lifecycle_operations.clear();
+        assert!(try_encode_binary_transaction(&tampered).is_none());
+    }
+}
+
+#[test]
 fn identity_bound_transaction_round_trips_and_covers_the_exact_mutation_set() {
     let record = BinaryTransactionRecord {
         allocator_high_water: 9,
@@ -392,6 +550,7 @@ fn identity_bound_transaction_round_trips_and_covers_the_exact_mutation_set() {
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
         view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -452,6 +611,7 @@ fn typed_table_reset_round_trips_and_rejects_noncanonical_composition() {
         created_table_identities: BTreeMap::new(),
         catalog_output: None,
         view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),

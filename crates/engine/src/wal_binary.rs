@@ -22,6 +22,15 @@
 
 use super::*;
 
+mod view_identity_codec;
+use view_identity_codec::*;
+pub(crate) use view_identity_codec::{
+    command_is_view_lifecycle, legacy_from_lifecycle_create, lifecycle_from_legacy_create,
+    valid_view_lifecycle_operation_identity, BinaryCatalogRelationIdentity,
+    BinaryCatalogRelationKind, BinaryTransactionViewLifecycleOperationIdentity,
+    BinaryTransactionViewLifecycleTargetIdentity, BinaryTransactionViewOperationIdentity,
+};
+
 /// Binary-record lead byte (invalid UTF-8 on purpose — see the module doc).
 pub(crate) const WAL_BINARY_TAG: u8 = 0xFF;
 /// Format version for forward evolution; bump on layout change.
@@ -61,6 +70,10 @@ const OP_IDENTITY_ORDERED_CATALOG_TRANSACTION: u8 = 11;
 /// these additive variants carry one exact preimage/dependency/postimage proof per CREATE VIEW.
 const OP_ORDERED_CATALOG_VIEW_TRANSACTION: u8 = 12;
 const OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION: u8 = 13;
+/// PRODUCT-001 complete stored-view lifecycle. Opcodes 12/13 remain byte-for-byte CREATE-only;
+/// these variants type CREATE/RENAME/multi-target DROP preimages, dependencies, and postimages.
+const OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION: u8 = 14;
+const OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION: u8 = 15;
 
 const TXN_INSERT: u8 = 1;
 const TXN_UPDATE: u8 = 2;
@@ -71,9 +84,6 @@ const TXN_OPERATION_INSERT: u8 = 2;
 const TXN_OPERATION_UPDATE: u8 = 3;
 const TXN_OPERATION_DELETE: u8 = 4;
 const TXN_OPERATION_TABLE_RESET: u8 = 5;
-
-const CATALOG_RELATION_TABLE: u8 = 1;
-const CATALOG_RELATION_VIEW: u8 = 2;
 
 /// The decoded form of a v1 binary INSERT record.
 pub(crate) struct BinaryInsertRecord {
@@ -158,88 +168,6 @@ pub(crate) struct BinaryTransactionCatalogOutput {
     pub(crate) created_sequence_oids: BTreeMap<String, u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BinaryCatalogRelationKind {
-    Table,
-    View,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BinaryCatalogRelationIdentity {
-    pub(crate) kind: BinaryCatalogRelationKind,
-    pub(crate) oid: u32,
-    pub(crate) digest: gpu_db_wal::CanonicalDigest,
-}
-
-/// Per-command identity closure for CREATE VIEW / CREATE OR REPLACE VIEW. This is a vector rather
-/// than a name map because one transaction may replace the same view more than once.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BinaryTransactionViewOperationIdentity {
-    pub(crate) command_index: u32,
-    pub(crate) ordinal: u32,
-    pub(crate) target_before: Option<BinaryCatalogRelationIdentity>,
-    pub(crate) dependencies: BTreeMap<String, BinaryCatalogRelationIdentity>,
-    pub(crate) target_after: BinaryCatalogRelationIdentity,
-}
-
-fn valid_catalog_identity(identity: &BinaryCatalogRelationIdentity) -> bool {
-    identity.oid != 0 && identity.digest != [0; 32]
-}
-
-fn valid_view_operation_identity(identity: &BinaryTransactionViewOperationIdentity) -> bool {
-    identity.target_before.as_ref().is_none_or(|before| {
-        before.kind == BinaryCatalogRelationKind::View && valid_catalog_identity(before)
-    }) && identity.target_after.kind == BinaryCatalogRelationKind::View
-        && valid_catalog_identity(&identity.target_after)
-        && !identity.dependencies.is_empty()
-        && identity.dependencies.len() <= u32::MAX as usize
-        && identity.dependencies.iter().all(|(name, dependency)| {
-            !name.is_empty()
-                && name.len() <= u16::MAX as usize
-                && valid_catalog_identity(dependency)
-        })
-}
-
-fn encode_catalog_identity(out: &mut Vec<u8>, identity: &BinaryCatalogRelationIdentity) {
-    out.push(match identity.kind {
-        BinaryCatalogRelationKind::Table => CATALOG_RELATION_TABLE,
-        BinaryCatalogRelationKind::View => CATALOG_RELATION_VIEW,
-    });
-    out.extend_from_slice(&identity.oid.to_le_bytes());
-    out.extend_from_slice(&identity.digest);
-}
-
-fn encode_optional_catalog_identity(
-    out: &mut Vec<u8>,
-    identity: Option<&BinaryCatalogRelationIdentity>,
-) {
-    match identity {
-        Some(identity) => {
-            out.push(1);
-            encode_catalog_identity(out, identity);
-        }
-        None => out.push(0),
-    }
-}
-
-fn decode_catalog_identity<'a>(
-    take: &mut impl FnMut(usize) -> Result<&'a [u8], EngineError>,
-) -> Result<BinaryCatalogRelationIdentity, EngineError> {
-    let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
-    let kind = match take(1)?[0] {
-        CATALOG_RELATION_TABLE => BinaryCatalogRelationKind::Table,
-        CATALOG_RELATION_VIEW => BinaryCatalogRelationKind::View,
-        other => return Err(fail(&format!("unsupported catalog relation kind {other}"))),
-    };
-    let oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
-    let digest = take(32)?.try_into().expect("32 bytes");
-    let identity = BinaryCatalogRelationIdentity { kind, oid, digest };
-    if !valid_catalog_identity(&identity) {
-        return Err(fail("empty catalog relation identity"));
-    }
-    Ok(identity)
-}
-
 /// Stable identity of every admitted statement in an ordered catalog transaction. Row payloads
 /// remain coalesced into `mutations`, but this vector preserves statements whose effects were
 /// shadowed by a later reset or folded to no final row mutation. Its vector index is the one
@@ -300,6 +228,9 @@ pub(crate) struct BinaryTransactionRecord {
     /// Exact CREATE VIEW preimage, transitive source, and postimage closure in catalog-command
     /// order. Empty for every historical opcode and for CREATE-TABLE-only opcodes 10/11.
     pub(crate) view_operations: Vec<BinaryTransactionViewOperationIdentity>,
+    /// Exact CREATE/RENAME/DROP VIEW lifecycle closure. Additive opcodes 14/15 use this field;
+    /// opcodes 12/13 continue to decode only into `view_operations`.
+    pub(crate) view_lifecycle_operations: Vec<BinaryTransactionViewLifecycleOperationIdentity>,
     /// Complete statement order for current catalog-bearing records. Legacy transaction opcodes
     /// decode this as empty and retain their historical resolved-state semantics.
     pub(crate) operation_order: Vec<BinaryTransactionOperationIdentity>,
@@ -322,6 +253,10 @@ pub(crate) struct BinaryTransactionRecord {
 }
 
 /// A decoded binary WAL record of any op (the tag dispatch for apply/replay consumers).
+// Keep the transaction record inline: live apply and replay immediately move it into the sole
+// transaction consumer, while boxing would add an allocation to every explicit transaction only
+// to shrink this transient decode dispatch enum.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum BinaryWalRecord {
     Insert(BinaryInsertRecord),
     DeleteByKey(BinaryDeleteByKeyRecord),
@@ -355,6 +290,7 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     let identity_bound = !record.table_identities.is_empty();
     let mut catalog_names = BTreeMap::<&str, u32>::new();
     let mut view_commands = Vec::new();
+    let mut requires_view_lifecycle_opcode = false;
     let mut created_sequence_names = BTreeSet::new();
     let mut prior_catalog_ordinal = None;
     for (command_index, operation) in record.catalog_commands.iter().enumerate() {
@@ -386,11 +322,12 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                     }
                 }
             }
-            Command::CreateView(create) => {
+            command if command_is_view_lifecycle(command) => {
+                requires_view_lifecycle_opcode |= command_requires_view_lifecycle_opcode(command);
                 view_commands.push((
                     u32::try_from(command_index).ok()?,
                     operation.ordinal,
-                    create.name.as_str(),
+                    command,
                 ));
             }
             _ => return None,
@@ -408,17 +345,48 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             || !record.table_resets.is_empty()
             || !record.created_table_identities.is_empty()
             || record.catalog_output.is_some()
-            || !record.view_operations.is_empty());
+            || !record.view_operations.is_empty()
+            || !record.view_lifecycle_operations.is_empty());
     let view_catalog = !view_commands.is_empty();
-    if view_catalog != !record.view_operations.is_empty()
-        || record.view_operations.len() != view_commands.len()
-        || record.view_operations.iter().zip(&view_commands).any(
-            |(identity, (command_index, ordinal, _))| {
-                identity.command_index != *command_index
-                    || identity.ordinal != *ordinal
-                    || !valid_view_operation_identity(identity)
-            },
-        )
+    let legacy_view_catalog = !record.view_operations.is_empty();
+    let view_lifecycle_catalog = !record.view_lifecycle_operations.is_empty();
+    if legacy_view_catalog && view_lifecycle_catalog {
+        return None;
+    }
+    if view_catalog
+        != if requires_view_lifecycle_opcode {
+            view_lifecycle_catalog
+        } else {
+            legacy_view_catalog
+        }
+    {
+        return None;
+    }
+    if legacy_view_catalog
+        && (record.view_operations.len() != view_commands.len()
+            || record.view_operations.iter().zip(&view_commands).any(
+                |(identity, (command_index, ordinal, command))| {
+                    identity.command_index != *command_index
+                        || identity.ordinal != *ordinal
+                        || !matches!(command, Command::CreateView(_))
+                        || !valid_legacy_view_operation_identity(identity)
+                },
+            ))
+    {
+        return None;
+    }
+    if view_lifecycle_catalog
+        && (!requires_view_lifecycle_opcode
+            || record.view_lifecycle_operations.len() != view_commands.len()
+            || record
+                .view_lifecycle_operations
+                .iter()
+                .zip(&view_commands)
+                .any(|(identity, (command_index, ordinal, command))| {
+                    identity.command_index != *command_index
+                        || identity.ordinal != *ordinal
+                        || !valid_view_lifecycle_operation_identity(command, identity)
+                }))
     {
         return None;
     }
@@ -473,7 +441,9 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                                 _ => None,
                             })
                             .collect::<BTreeSet<_>>(),
-                        Command::CreateView(_) => BTreeSet::new(),
+                        Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
+                            BTreeSet::new()
+                        }
                         _ => return None,
                     };
                     if sequence_names_by_ordinal
@@ -590,11 +560,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         || record.sequence_input_oids.len() > u32::MAX as usize
         || record.table_resets.len() > u32::MAX as usize
         || record.view_operations.len() > u32::MAX as usize
+        || record.view_lifecycle_operations.len() > u32::MAX as usize
         || record.sequence_advances.len() > u32::MAX as usize
         || record.mutations.len() > u32::MAX as usize
         || (record.catalog_commands.is_empty() && !record.created_table_identities.is_empty())
         || (record.catalog_commands.is_empty() && record.catalog_output.is_some())
         || (record.catalog_commands.is_empty() && !record.view_operations.is_empty())
+        || (record.catalog_commands.is_empty() && !record.view_lifecycle_operations.is_empty())
         || (ordered_catalog
             && created_identity_names != catalog_names.keys().copied().collect::<BTreeSet<_>>())
         || (!ordered_catalog && !record.created_table_identities.is_empty())
@@ -653,7 +625,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     out.push(WAL_BINARY_TAG);
     out.push(WAL_BINARY_VERSION);
     let op = if ordered_catalog {
-        if view_catalog {
+        if view_lifecycle_catalog {
+            if identity_bound {
+                OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            } else {
+                OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            }
+        } else if view_catalog {
             if identity_bound {
                 OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             } else {
@@ -699,6 +677,8 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             | OP_IDENTITY_ORDERED_CATALOG_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
+            | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
     ) {
         out.extend_from_slice(&(record.catalog_commands.len() as u32).to_le_bytes());
         for operation in &record.catalog_commands {
@@ -736,22 +716,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             op,
             OP_ORDERED_CATALOG_VIEW_TRANSACTION | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
         ) {
-            out.extend_from_slice(&(record.view_operations.len() as u32).to_le_bytes());
-            for identity in &record.view_operations {
-                out.extend_from_slice(&identity.command_index.to_le_bytes());
-                out.extend_from_slice(&identity.ordinal.to_le_bytes());
-                encode_optional_catalog_identity(&mut out, identity.target_before.as_ref());
-                out.extend_from_slice(&(identity.dependencies.len() as u32).to_le_bytes());
-                for (name, dependency) in &identity.dependencies {
-                    if name.len() > u16::MAX as usize {
-                        return None;
-                    }
-                    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                    out.extend_from_slice(name.as_bytes());
-                    encode_catalog_identity(&mut out, dependency);
-                }
-                encode_catalog_identity(&mut out, &identity.target_after);
-            }
+            encode_legacy_view_operations(&mut out, &record.view_operations)?;
+        } else if matches!(
+            op,
+            OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+                | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+        ) {
+            encode_view_lifecycle_operations(&mut out, &record.view_lifecycle_operations)?;
         }
         out.extend_from_slice(&(record.operation_order.len() as u32).to_le_bytes());
         for operation in &record.operation_order {
@@ -798,6 +769,8 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             | OP_IDENTITY_ORDERED_CATALOG_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
+            | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
     ) {
         out.extend_from_slice(&(record.table_resets.len() as u32).to_le_bytes());
         let mut prior_ordinal = None;
@@ -998,7 +971,9 @@ pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, En
         | Some(&OP_ORDERED_CATALOG_TRANSACTION)
         | Some(&OP_IDENTITY_ORDERED_CATALOG_TRANSACTION)
         | Some(&OP_ORDERED_CATALOG_VIEW_TRANSACTION)
-        | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION) => {
+        | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION)
+        | Some(&OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION)
+        | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION) => {
             decode_binary_transaction(payload).map(BinaryWalRecord::Transaction)
         }
         Some(&OP_UPDATE_BY_KEY) => {
@@ -1112,6 +1087,8 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
+            | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
     ) {
         return Err(fail("op dispatch mismatch"));
     }
@@ -1122,10 +1099,20 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
+            | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
     );
     let view_catalog = matches!(
         op,
-        OP_ORDERED_CATALOG_VIEW_TRANSACTION | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
+        OP_ORDERED_CATALOG_VIEW_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
+            | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+    );
+    let view_lifecycle_catalog = matches!(
+        op,
+        OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
     );
     if ordered_catalog
         || matches!(
@@ -1157,9 +1144,12 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             let bytes = take(len)?;
             let command: Command = serde_json::from_slice(bytes)
                 .map_err(|error| fail(&format!("typed catalog command decode failed: {error}")))?;
-            if !matches!(command, Command::CreateTable(_))
-                && !(view_catalog && matches!(command, Command::CreateView(_)))
-            {
+            let supported_view = if view_lifecycle_catalog {
+                command_is_view_lifecycle(&command)
+            } else {
+                view_catalog && matches!(command, Command::CreateView(_))
+            };
+            if !matches!(command, Command::CreateTable(_)) && !supported_view {
                 return Err(fail("unsupported composite catalog command"));
             }
             if serde_json::to_vec(&command).ok().as_deref() != Some(bytes) {
@@ -1171,6 +1161,7 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
     let mut created_table_identities = BTreeMap::new();
     let mut catalog_output = None;
     let mut view_operations = Vec::new();
+    let mut view_lifecycle_operations = Vec::new();
     let mut operation_order = Vec::new();
     let mut statement_digests = Vec::new();
     let mut sequence_input_oids = BTreeMap::new();
@@ -1288,17 +1279,30 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                 .iter()
                 .enumerate()
                 .filter_map(|(command_index, operation)| {
-                    matches!(&operation.command, Command::CreateView(_))
-                        .then_some((command_index, operation.ordinal))
+                    command_is_view_lifecycle(&operation.command).then_some((
+                        command_index,
+                        operation.ordinal,
+                        &operation.command,
+                    ))
                 })
                 .collect::<Vec<_>>();
-            if view_count == 0 || view_count != expected_views.len() {
+            if view_count == 0
+                || view_count != expected_views.len()
+                || (view_lifecycle_catalog
+                    != expected_views
+                        .iter()
+                        .any(|(_, _, command)| command_requires_view_lifecycle_opcode(command)))
+            {
                 return Err(fail(
-                    "view identities do not cover the exact CREATE VIEW command set",
+                    "view identities do not cover the exact stored-view command set",
                 ));
             }
-            view_operations.reserve(view_count.min(1024));
-            for (expected_command_index, expected_ordinal) in expected_views {
+            if view_lifecycle_catalog {
+                view_lifecycle_operations.reserve(view_count.min(1024));
+            } else {
+                view_operations.reserve(view_count.min(1024));
+            }
+            for (expected_command_index, expected_ordinal, command) in expected_views {
                 let command_index = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
                 let ordinal = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
                 if usize::try_from(command_index).ok() != Some(expected_command_index)
@@ -1308,42 +1312,24 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                         "view identity does not match its catalog command position",
                     ));
                 }
-                let target_before = match take(1)?[0] {
-                    0 => None,
-                    1 => Some(decode_catalog_identity(&mut take)?),
-                    _ => return Err(fail("invalid optional catalog identity flag")),
-                };
-                let dependency_count =
-                    u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
-                let mut dependencies = BTreeMap::new();
-                let mut prior_name = None;
-                for _ in 0..dependency_count {
-                    let name_len =
-                        u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
-                    let name = std::str::from_utf8(take(name_len)?)
-                        .map_err(|_| fail("non-utf8 view dependency name"))?
-                        .to_string();
-                    let dependency = decode_catalog_identity(&mut take)?;
-                    if name.is_empty()
-                        || prior_name.as_ref().is_some_and(|prior| prior >= &name)
-                        || dependencies.insert(name.clone(), dependency).is_some()
-                    {
-                        return Err(fail("non-canonical view dependency identity"));
+                if view_lifecycle_catalog {
+                    let identity =
+                        decode_view_lifecycle_operation(command_index, ordinal, &mut take, &fail)?;
+                    if !valid_view_lifecycle_operation_identity(command, &identity) {
+                        return Err(fail("invalid stored-view lifecycle identity closure"));
                     }
-                    prior_name = Some(name);
+                    view_lifecycle_operations.push(identity);
+                } else {
+                    if !matches!(command, Command::CreateView(_)) {
+                        return Err(fail("legacy view opcode carries a non-CREATE command"));
+                    }
+                    view_operations.push(decode_legacy_view_operation(
+                        command_index,
+                        ordinal,
+                        &mut take,
+                        &fail,
+                    )?);
                 }
-                let target_after = decode_catalog_identity(&mut take)?;
-                let identity = BinaryTransactionViewOperationIdentity {
-                    command_index,
-                    ordinal,
-                    target_before,
-                    dependencies,
-                    target_after,
-                };
-                if !valid_view_operation_identity(&identity) {
-                    return Err(fail("invalid CREATE VIEW identity closure"));
-                }
-                view_operations.push(identity);
             }
         }
         let operation_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
@@ -1487,6 +1473,7 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_TABLE_RESET_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
     );
     let mut table_identities = BTreeMap::new();
     if identity_bound {
@@ -1642,7 +1629,9 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                                 _ => None,
                             })
                             .collect::<BTreeSet<_>>(),
-                        Command::CreateView(_) => BTreeSet::new(),
+                        Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
+                            BTreeSet::new()
+                        }
                         _ => return Err(fail("unsupported ordered catalog command")),
                     };
                     if input_sequence_names != expected_sequences {
@@ -1800,6 +1789,7 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         created_table_identities,
         catalog_output,
         view_operations,
+        view_lifecycle_operations,
         operation_order,
         statement_digests,
         sequence_input_oids,

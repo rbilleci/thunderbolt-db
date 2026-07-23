@@ -52,6 +52,56 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   **230M/s** floor; against the preceding **225.418M/s/195.955M/s** card, throughput improves
   **16.8%/19.3%**.
 
+## PRODUCT-001 transactional stored-view lifecycle — accepted 2026-07-23
+
+- `ALTER VIEW ... RENAME TO ...` and ordered multi-target `DROP VIEW [IF EXISTS]` now join
+  `CREATE [OR REPLACE] VIEW`, typed table creation/reset, and DML in the existing transaction-private
+  `TransactionOperation` stream.
+  Every lifecycle command binds its exact ordinal, pre/post name, stable relation OID, semantic definition digest,
+  transitive dependencies, and typed target absence. Rename preserves the OID, ACL, and comments; drop/recreate
+  allocates a new OID and does not inherit the removed object's ACL or comments. Private/global visibility,
+  prepared Parse/Describe, rollback, exact retry, failed-transaction recovery, and statement-ordered mixed
+  rename/INSERT/drop/recreate behavior are proven. Materialized-view lifecycle remains a pre-effect refusal because
+  its stored-data and refresh semantics are outside this slice.
+- Create-only records remain byte-for-byte on additive WAL opcodes 12/13. Transactions containing rename/drop use
+  lifecycle opcodes 14/15, including the mixed table/DML/reset form, and carry typed identities for every view
+  command. Admission, live apply, and replay reconstruct the complete catalog result on a clone before the sole
+  commit/WAL/publication owner installs it. Canonical decode, READ COMMITTED rebind, REPEATABLE READ, target and
+  dependency ABA, catalog-latch serialization, malformed/tampered replay, post-durable indeterminacy, and
+  live/fresh recovery converge without partial catalog effects.
+- Workspace all-target/all-feature tests pass, including engine **568/568** with **583** GPU cases ignored, facade
+  **76/76** with **15** ignored, concurrency **13/13** with one ignored, canonical server library **78/78** with
+  four ignored, and the canonical server binary's **127/127** tests. The exact seven-test ordered-catalog cohort
+  passes three serial and two paired-concurrent HAZARD rounds (**49/49** result groups) on all-feature engine binary
+  SHA-256 `06ef0f0e132f5fdab503354e5897ce3815d6b01d6022be879079770e2d0f89e8`
+  (315,605,352 bytes), with zero CUDA 700/716/717/719. Its actual-GPU lifecycle case proves SQL NULL, private
+  old/new `pg_class` bindings, GPU execution, and live/fresh recovery. Strict workspace and final affected-crate
+  Clippy, scoped rustfmt, diff, shell, dependency, NULL-differential, and source-size gates pass. Touched
+  production/test maxima are **1,896/2,940** lines; the new codec and lifecycle test owners are **406/751** lines.
+- The accepted code/test implementation is base `eb4ffce51781d476bf123581c0b743ebdbdd9915`, index tree
+  `b934d5b1f80654768b1b4035f88e008bd710e866`, and cached binary-diff SHA-256
+  `00dda15274382290086eac731dc0bdc68c433da047c8c8f410b3aac66a3f3a6d` across 18 paths with no
+  unstaged/untracked drift. Independent product/semantics and runtime/recovery audits both returned **ACCEPT**. The
+  runtime auditor then independently matched all 1,645 retained exported index entries, exact artifact provenance,
+  one completion marker per section, and the canonical final marker before returning post-card **ACCEPT**.
+- The canonical full report card retained fresh isolated target `benchmark-report-card.ynD41i`. Its raw-kernel
+  artifact is SHA-256 `9e241b48ff9762cc384432dac92cbefe2aed7b423a5e9a4f35e879ced9517e22`
+  (1,120,256 bytes), its point-read artifact is
+  `a08012099edd196461870b254a5567ee17c8fc692e6e14e05d8d07d5bf93b53b` (9,242,320 bytes), and its
+  AWS-LC archive is `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61`
+  (7,156,488 bytes). Layer 1 is **1428.4 GB/s, p50 23us** in-L2 and **1439.4 GB/s, p50 186us**
+  out-of-L2; grouped execution is **1675.3 M-elem/s**. Layer 2 reaches **270.537M/s, p50 115us** in-L2 and
+  **245.753M/s, p50 139us** out-of-L2 after the fixed 48M-row fixture builds in **2,111.4s** with zero final
+  residency work. Against the latest accepted card, raw throughput is **+4.0%/-0.1%**, point-read throughput is
+  **+2.7%/+5.1%**, and p50 is **-2us/+2us**; this is not a material regression. The exact final record is
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`.
+- The three inherited PLAN-owned defects reproduce with their unchanged durable-retry, classic-wave FK
+  serialization, and wide-unique violation signatures. The unchanged source outliers remain PLAN-owned
+  `engine_dml_concurrent.rs` at **2,170**, `engine_commit.rs` at **2,091**, and
+  `engine_mutation_admission.rs` at **2,010**. **PRODUCT-001** remains open only under PLAN for the remaining
+  transactional catalog families and later SQLSTATE/type-codec, named-client, mixed-recovery, compatibility,
+  deletion, ownership, defect, and source-size closure gates.
+
 ## PRODUCT-001 transactional CREATE VIEW envelope — accepted 2026-07-23
 
 - `CREATE VIEW` and `CREATE OR REPLACE VIEW` now enter the existing transaction-private

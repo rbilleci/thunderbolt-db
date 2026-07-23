@@ -187,7 +187,9 @@ impl Engine {
                     .into_iter()
                     .filter_map(|catalog_command| match &catalog_command.command {
                         Command::CreateTable(create) => Some(create.table.clone()),
-                        Command::CreateView(_) => None,
+                        Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
+                            None
+                        }
                         _ => {
                             unreachable!(
                                 "transactional catalog staging admitted an unsupported family"

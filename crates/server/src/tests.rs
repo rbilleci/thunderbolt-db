@@ -8,6 +8,9 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "tests/view_lifecycle.rs"]
+mod view_lifecycle;
+
 /// Thread-3 default-on: an unset `GPU_DB_BATCHING` enables batching. A default-started
 /// async server (no env) therefore constructs a `PointLookupBatcher` and routes batchable
 /// point-lookups through it. (Decoded via the pure helper so the test does not mutate

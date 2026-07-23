@@ -54,7 +54,7 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         if !Self::transaction_catalog_command_is_supported(&command) {
             return Err(ExecuteError::Unsupported(
-                "transactional catalog staging currently supports CREATE TABLE and CREATE VIEW only"
+                "transactional catalog staging currently supports CREATE TABLE and stored-view lifecycle commands only"
                     .to_string(),
             ));
         }
@@ -148,26 +148,23 @@ impl Engine {
         let mut working = catalog_guard.clone();
         for staged in &prior_commands {
             let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
-            if let (Command::CreateView(create), Some(identity)) =
-                (&staged.command, &staged.view_identity)
-            {
-                Self::validate_transaction_view_before(&scoped, create, identity)
+            if let Some(identity) = &staged.view_identity {
+                Self::validate_transaction_view_before(&scoped, &staged.command, identity)
                     .map_err(ExecuteError::Engine)?;
             }
             self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
                 self.apply_transaction_catalog_command(&mut working, staged.command.clone())
             })
             .map_err(ExecuteError::Engine)?;
-            if let (Command::CreateView(create), Some(identity)) =
-                (&staged.command, &staged.view_identity)
-            {
+            if let Some(identity) = &staged.view_identity {
                 let applied =
                     Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
-                Self::validate_transaction_view_after(&applied, create, identity)
+                Self::validate_transaction_view_after(&applied, &staged.command, identity)
                     .map_err(ExecuteError::Engine)?;
-            } else if matches!(staged.command, Command::CreateView(_)) {
+            } else if command_is_view_lifecycle(&staged.command) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "transactional CREATE VIEW lost its typed identity closure".to_string(),
+                    "transactional stored-view operation lost its typed identity closure"
+                        .to_string(),
                 )));
             }
         }
@@ -212,16 +209,16 @@ impl Engine {
             )
         })?;
         let statement_digest = transaction_statement_digest(&command)?;
-        let view_identity = match &command {
-            Command::CreateView(create) => Some(Self::transaction_view_operation_identity(
+        let view_identity = if command_is_view_lifecycle(&command) {
+            Some(Self::transaction_view_operation_identity(
                 command_index,
                 ordinal,
                 &scoped,
                 &overlay,
-                create,
-            )?),
-            Command::CreateTable(_) => None,
-            _ => unreachable!("transactional catalog command was classified above"),
+                &command,
+            )?)
+        } else {
+            None
         };
         if let Command::CreateTable(create) = &command {
             Arc::make_mut(&mut delta.resident_shards)
@@ -254,6 +251,10 @@ mod ordered_tests;
 #[cfg(test)]
 #[path = "engine_transaction_catalog/view_tests.rs"]
 mod view_tests;
+
+#[cfg(test)]
+#[path = "engine_transaction_catalog/view_lifecycle_tests.rs"]
+mod view_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

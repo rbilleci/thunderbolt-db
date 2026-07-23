@@ -13,6 +13,13 @@ impl Engine {
         record.catalog_commands.clear();
         record.created_table_identities.clear();
         record.view_operations.clear();
+        record.view_lifecycle_operations.clear();
+        let view_lifecycle_record = catalog_commands.iter().any(|staged| {
+            matches!(
+                &staged.command,
+                Command::RenameView(_) | Command::DropView(_)
+            )
+        });
         for staged in catalog_commands {
             record
                 .catalog_commands
@@ -44,15 +51,30 @@ impl Engine {
                         )));
                     }
                 }
-                Command::CreateView(_) => {
-                    record
-                        .view_operations
-                        .push(staged.view_identity.clone().ok_or_else(|| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(
-                                "transactional CREATE VIEW lost its typed identity closure"
-                                    .to_string(),
-                            ))
-                        })?);
+                command if command_is_view_lifecycle(command) => {
+                    let identity = staged.view_identity.clone().ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional stored-view operation lost its typed identity closure"
+                                .to_string(),
+                        ))
+                    })?;
+                    if view_lifecycle_record {
+                        record.view_lifecycle_operations.push(identity);
+                    } else {
+                        let Command::CreateView(create) = command else {
+                            unreachable!("lifecycle record classification checked above");
+                        };
+                        record
+                            .view_operations
+                            .push(legacy_from_lifecycle_create(create, &identity).ok_or_else(
+                                || {
+                                    ExecuteError::Engine(EngineError::ApplyFailed(
+                                        "transactional CREATE VIEW identity cannot use the accepted legacy layout"
+                                            .to_string(),
+                                    ))
+                                },
+                            )?);
+                    }
                 }
                 _ => unreachable!("transactional catalog staging admitted an unsupported family"),
             }
@@ -119,7 +141,7 @@ impl Engine {
                                 }
                             }
                         }
-                        Command::CreateView(_) => {}
+                        Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {}
                         _ => unreachable!(
                             "transactional catalog staging admitted an unsupported family"
                         ),

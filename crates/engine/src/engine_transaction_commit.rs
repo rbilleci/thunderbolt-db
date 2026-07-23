@@ -614,6 +614,7 @@ impl Engine {
             created_table_identities,
             catalog_output,
             view_operations,
+            view_lifecycle_operations,
             operation_order,
             statement_digests,
             sequence_input_oids,
@@ -629,9 +630,11 @@ impl Engine {
                     .to_string(),
             ));
         }
-        if !view_operations.is_empty() && (catalog_output.is_none() || operation_order.is_empty()) {
+        if (!view_operations.is_empty() || !view_lifecycle_operations.is_empty())
+            && (catalog_output.is_none() || operation_order.is_empty())
+        {
             return Err(EngineError::Durability(
-                "transactional CREATE VIEW WAL lost its ordered catalog envelope".to_string(),
+                "transactional stored-view WAL lost its ordered catalog envelope".to_string(),
             ));
         }
 
@@ -794,6 +797,7 @@ impl Engine {
             entry.index.saturating_sub(1),
             &catalog_commands,
             &view_operations,
+            &view_lifecycle_operations,
         )?;
         for (table_name, identity) in &created_table_identities {
             let table = next_catalog
@@ -876,7 +880,9 @@ impl Engine {
                             _ => None,
                         })
                         .collect::<BTreeSet<_>>(),
-                    Command::CreateView(_) => BTreeSet::new(),
+                    Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
+                        BTreeSet::new()
+                    }
                     _ => {
                         return Err(EngineError::Durability(
                             "ordered sequence closure names an unsupported catalog command"
