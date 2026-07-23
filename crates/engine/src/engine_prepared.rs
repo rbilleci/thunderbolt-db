@@ -575,6 +575,15 @@ mod tests {
             .submit_transaction(
                 40,
                 gpu_db_sql::ParsedCommand::parse(
+                    "CREATE TABLE private_describe_predecessor (id int4)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        engine
+            .submit_transaction(
+                40,
+                gpu_db_sql::ParsedCommand::parse(
                     "CREATE TABLE private_describe (id int4 PRIMARY KEY, value text)",
                 )
                 .unwrap(),

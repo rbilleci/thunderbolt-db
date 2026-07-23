@@ -234,7 +234,7 @@ impl Engine {
         let created_tables = record
             .catalog_commands
             .iter()
-            .filter_map(|command| match command {
+            .filter_map(|operation| match &operation.command {
                 Command::CreateTable(create) => Some(create.table.as_str()),
                 _ => None,
             })
@@ -302,7 +302,7 @@ impl Engine {
         let created_tables = record
             .catalog_commands
             .iter()
-            .filter_map(|command| match command {
+            .filter_map(|operation| match &operation.command {
                 Command::CreateTable(create) => Some(create.table.clone()),
                 _ => None,
             })

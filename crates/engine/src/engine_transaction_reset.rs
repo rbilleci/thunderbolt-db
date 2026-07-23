@@ -326,6 +326,7 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(table) = delta.operations.iter().find_map(|operation| {
             let table = match operation {
+                TransactionOperation::Catalog(_) => return None,
                 TransactionOperation::Row(delta) => match &delta.mutation {
                     PreparedMutation::Insert { table, .. }
                     | PreparedMutation::Update { table, .. }
@@ -778,10 +779,33 @@ impl Engine {
         let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
         let catalog = snapshot.transaction_catalog();
         if let Some(expected) = expected_catalog_version {
-            let expected_catalog = self.read_state.catalog_as_of(expected);
-            let expected_table = expected_catalog.relational_catalog.get(&truncate.name);
             let actual_table = catalog.relational_catalog.get(&truncate.name);
-            if expected_table != actual_table {
+            let transaction_private_target = !snapshot
+                .catalog
+                .relational_catalog
+                .contains_key(&truncate.name)
+                && snapshot
+                    .delta
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .operations
+                    .iter()
+                    .any(|operation| {
+                        matches!(
+                            operation,
+                            TransactionOperation::Catalog(staged)
+                                if matches!(&staged.command, Command::CreateTable(create) if create.table == truncate.name)
+                        )
+                    });
+            let expected_table = (!transaction_private_target)
+                .then(|| self.read_state.catalog_as_of(expected))
+                .and_then(|expected_catalog| {
+                    expected_catalog
+                        .relational_catalog
+                        .get(&truncate.name)
+                        .cloned()
+                });
+            if !transaction_private_target && expected_table.as_ref() != actual_table {
                 return Err(ExecuteError::Unsupported(
                     "prepared TRUNCATE catalog identity changed at the transaction statement snapshot; re-Parse is required"
                         .to_string(),
@@ -893,19 +917,6 @@ impl Engine {
                 "cannot execute TRUNCATE in a READ ONLY transaction".to_string(),
             ));
         }
-        {
-            let delta = snapshot
-                .delta
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if delta.catalog_command.is_some() {
-                return Err(ExecuteError::Unsupported(
-                    "transactional TRUNCATE cannot yet compose with transactional catalog DDL"
-                        .to_string(),
-                ));
-            }
-        }
-
         let catalog = snapshot.transaction_catalog();
         if catalog.relational_views.contains_key(&truncate.name)
             || catalog
@@ -923,15 +934,30 @@ impl Engine {
             .get(&truncate.name)
             .cloned()
             .ok_or_else(|| ExecuteError::UndefinedRelation(truncate.name.clone()))?;
-        if !snapshot
+        let transaction_private = !snapshot
             .catalog
             .relational_catalog
-            .contains_key(&truncate.name)
-        {
-            return Err(ExecuteError::Unsupported(
-                "TRUNCATE of a transaction-private relation awaits ordered catalog expansion"
-                    .to_string(),
-            ));
+            .contains_key(&truncate.name);
+        if transaction_private {
+            let created_before_reset = snapshot
+                .delta
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .operations
+                .iter()
+                .any(|operation| {
+                    matches!(
+                        operation,
+                        TransactionOperation::Catalog(staged)
+                            if matches!(&staged.command, Command::CreateTable(create) if create.table == truncate.name)
+                    )
+                });
+            if !created_before_reset {
+                return Err(ExecuteError::Serialization(format!(
+                    "transaction-private reset target \"{}\" has no ordered CREATE operation",
+                    truncate.name
+                )));
+            }
         }
         if let Some((child, foreign_key)) = catalog.relational_catalog.values().find_map(|child| {
             child
@@ -957,19 +983,31 @@ impl Engine {
         // make live apply and replay compare against rows that can never exist globally. The
         // exclusive stable-OID guard freezes this published root through transaction termination.
         let published_catalog = self.read_state.latest_catalog();
-        if published_catalog.relational_catalog.get(&table.name) != Some(&table) {
-            return Err(ExecuteError::Serialization(format!(
-                "table reset target \"{}\" changed catalog identity before staging",
-                table.name
-            )));
-        }
-        if table_access_dependency_identities(&published_catalog.relational_catalog, &table)?
-            != dependency_identities
-        {
-            return Err(ExecuteError::Serialization(format!(
-                "table reset dependency closure for \"{}\" changed before staging",
-                table.name
-            )));
+        if transaction_private {
+            if published_catalog
+                .relational_catalog
+                .contains_key(&table.name)
+            {
+                return Err(ExecuteError::Serialization(format!(
+                    "transaction-private reset target \"{}\" collided with a published relation",
+                    table.name
+                )));
+            }
+        } else {
+            if published_catalog.relational_catalog.get(&table.name) != Some(&table) {
+                return Err(ExecuteError::Serialization(format!(
+                    "table reset target \"{}\" changed catalog identity before staging",
+                    table.name
+                )));
+            }
+            if table_access_dependency_identities(&published_catalog.relational_catalog, &table)?
+                != dependency_identities
+            {
+                return Err(ExecuteError::Serialization(format!(
+                    "table reset dependency closure for \"{}\" changed before staging",
+                    table.name
+                )));
+            }
         }
         // The exclusive stable-OID lease freezes this globally published root while we sample its
         // canonical publication identity and GPU-visible cardinality. No row image or row key is
@@ -978,7 +1016,17 @@ impl Engine {
             let commit = self
                 .commit_state_after_wave_quiescence()
                 .map_err(ExecuteError::Engine)?;
-            let source_commit_seq = commit.ledger.table_root_index(&table.name);
+            let source_commit_seq = if transaction_private {
+                if commit.ledger.table_root_index(&table.name) != 0 {
+                    return Err(ExecuteError::Serialization(format!(
+                        "transaction-private reset target \"{}\" collided with prior table-root history",
+                        table.name
+                    )));
+                }
+                0
+            } else {
+                commit.ledger.table_root_index(&table.name)
+            };
             let (expected_rows, before_digest) = self.table_reset_device_root_proof(
                 &table,
                 source_commit_seq,
@@ -1018,7 +1066,7 @@ impl Engine {
             )?
             .visible_rows;
         let _scope = self.enter_transaction_read(Arc::clone(snapshot));
-        self.validate_transaction_delta_residency(&table, true)?;
+        self.validate_transaction_delta_residency(&table, !transaction_private)?;
         let schema_digest = table_schema_digest(&table)?;
         let after_empty_digest = table_reset_empty_digest(table.oid, schema_digest);
 
@@ -1040,11 +1088,6 @@ impl Engine {
                 "concurrent statements attempted to publish the same transaction reset".to_string(),
             ));
         }
-        if delta.catalog_command.is_some() {
-            return Err(ExecuteError::Serialization(
-                "transaction catalog changed during TRUNCATE staging".to_string(),
-            ));
-        }
         gpu_reservation.ensure_replacement_admitted(
             &delta.private_gpu_bytes_by_gpu,
             &next_private_gpu_bytes,
@@ -1054,11 +1097,14 @@ impl Engine {
                 "transaction operation ordinal exceeds typed reset framing".to_string(),
             )
         })?;
+        let statement_digest =
+            transaction_statement_digest(&Command::TruncateTable(truncate.clone()))?;
         delta
             .operations
-            .push(TransactionOperation::TableReset(Box::new(
+            .push(TransactionOperation::TableReset(Arc::new(
                 StagedTableReset {
                     ordinal,
+                    statement_digest,
                     table: table.name.clone(),
                     table_oid: table.oid,
                     schema_digest,
@@ -1070,11 +1116,15 @@ impl Engine {
                     catalog_dependencies: dependency_identities
                         .keys()
                         .filter_map(|name| {
-                            published_catalog
-                                .relational_catalog
-                                .get(name)
-                                .cloned()
-                                .map(|dependency| (name.clone(), dependency))
+                            (if transaction_private {
+                                catalog.as_ref()
+                            } else {
+                                published_catalog.as_ref()
+                            })
+                            .relational_catalog
+                            .get(name)
+                            .cloned()
+                            .map(|dependency| (name.clone(), dependency))
                         })
                         .collect(),
                     foreign_key_dependencies: dependency_identities
@@ -1610,8 +1660,8 @@ pub(crate) fn transaction_row_deltas(operations: &[TransactionOperation]) -> Vec
     operations
         .iter()
         .filter_map(|operation| match operation {
-            TransactionOperation::Row(delta) => Some(delta.as_ref().clone()),
-            TransactionOperation::TableReset(_) => None,
+            TransactionOperation::Row(staged) => Some(staged.delta.clone()),
+            TransactionOperation::Catalog(_) | TransactionOperation::TableReset(_) => None,
         })
         .collect()
 }
@@ -1624,17 +1674,18 @@ pub(crate) fn final_transaction_operations(
         .enumerate()
         .filter_map(|(ordinal, operation)| match operation {
             TransactionOperation::TableReset(reset) => Some((reset.table.clone(), ordinal)),
-            TransactionOperation::Row(_) => None,
+            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
     let mut rows = Vec::new();
     let mut resets = Vec::new();
     for (ordinal, operation) in operations.iter().enumerate() {
         match operation {
-            TransactionOperation::Row(delta) => {
-                let table = mutation_table(&delta.mutation);
+            TransactionOperation::Catalog(_) => {}
+            TransactionOperation::Row(staged) => {
+                let table = mutation_table(&staged.mutation);
                 if last_resets.get(table).is_none_or(|reset| ordinal > *reset) {
-                    rows.push(delta.as_ref().clone());
+                    rows.push(staged.delta.clone());
                 }
             }
             TransactionOperation::TableReset(reset)
@@ -1656,9 +1707,7 @@ pub(crate) fn final_transaction_write_set(operations: &[TransactionOperation]) -
     }
     for reset in resets {
         write_set.tables.insert(reset.table);
-        write_set
-            .tables
-            .extend(reset.foreign_key_dependencies.into_iter());
+        write_set.tables.extend(reset.foreign_key_dependencies);
     }
     write_set
 }

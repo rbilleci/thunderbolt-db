@@ -1114,10 +1114,13 @@ fn transaction_private_create_is_dml_target(
         .delta
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    matches!(
-        delta.catalog_command.as_ref().map(|staged| &staged.command),
-        Some(Command::CreateTable(create)) if create.table == target_name
-    )
+    delta.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            TransactionOperation::Catalog(staged)
+                if matches!(&staged.command, Command::CreateTable(create) if create.table == target_name)
+        )
+    })
 }
 
 fn validate_predeclared_characteristics(

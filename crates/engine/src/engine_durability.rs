@@ -498,10 +498,26 @@ impl Engine {
             if let crate::wal_binary::BinaryWalRecord::Transaction(record) =
                 decode_binary_record(payload)?
             {
+                // Opcodes 4--9 predate the ordered statement vector and their acknowledged
+                // canonical envelopes counted only reset/mutation output tables. Preserve that
+                // exact header interpretation for upgrade replay. Opcodes 10/11 always decode a
+                // non-empty operation order and additionally cover catalog-only/private tables.
+                let ordered = !record.operation_order.is_empty();
                 let tables = record
-                    .table_resets
+                    .catalog_commands
                     .iter()
-                    .map(|reset| reset.table.as_str())
+                    .filter_map(|operation| match &operation.command {
+                        Command::CreateTable(create) if ordered => Some(create.table.as_str()),
+                        _ => None,
+                    })
+                    .chain(record.operation_order.iter().filter_map(|operation| {
+                        if ordered {
+                            operation.table()
+                        } else {
+                            None
+                        }
+                    }))
+                    .chain(record.table_resets.iter().map(|reset| reset.table.as_str()))
                     .chain(record.mutations.iter().map(|mutation| match mutation {
                         crate::wal_binary::BinaryTransactionMutation::Insert { table, .. }
                         | crate::wal_binary::BinaryTransactionMutation::Update { table, .. }
@@ -1122,6 +1138,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_transaction_reset::table_schema_digest;
 
     #[test]
     fn pre_product_002_typed_dml_bodies_remain_canonical() {
@@ -1147,6 +1164,127 @@ mod tests {
                 .expect("typed command");
             assert_eq!(serde_json::to_vec(&command).unwrap(), old_body);
         }
+    }
+
+    #[test]
+    fn pre_ordered_canonical_composite_envelopes_keep_historical_table_counts() {
+        // Literal opcode-5 payload captured from the pre-ordered composite codec. The command
+        // JSON, opcode, and fixed-width framing are deliberately not produced by today's encoder:
+        // this fixture must remain recoverable with the historical catalog-only table count 0.
+        const LEGACY_CREATE: &[u8] = br#"{"CreateTable":{"table":"composite_codec","columns":[{"name":"id","ty":"Int4","domain":null,"default":null}],"primary_key":null,"unique_constraints":[],"check_constraints":[]}}"#;
+        assert_eq!(LEGACY_CREATE.len(), 176);
+        let mut literal_opcode_5 = vec![
+            255, 1, 5, // binary tag, version, legacy composite opcode
+            1, 0, 0, 0, // one catalog command
+            176, 0, 0, 0, // literal typed-command length
+        ];
+        literal_opcode_5.extend_from_slice(LEGACY_CREATE);
+        literal_opcode_5.extend_from_slice(&8_u64.to_le_bytes());
+        literal_opcode_5.extend_from_slice(&0_u32.to_le_bytes()); // no sequence advances
+        literal_opcode_5.extend_from_slice(&0_u32.to_le_bytes()); // no row mutations
+        let BinaryWalRecord::Transaction(decoded) =
+            decode_binary_record(&literal_opcode_5).unwrap()
+        else {
+            panic!("literal opcode-5 fixture did not decode as a transaction");
+        };
+        assert!(decoded.operation_order.is_empty());
+        assert_eq!(decoded.catalog_commands.len(), 1);
+
+        let payload: Arc<[u8]> = Arc::from(literal_opcode_5);
+        let identity = Engine::fresh_canonical_identity();
+        let record = Engine::canonical_wal_record_with_boundary_and_request_digest(
+            identity,
+            0,
+            Engine::canonical_genesis_catalog_digest(identity),
+            6_901,
+            1,
+            0,
+            &payload,
+            gpu_db_wal::canonical_request_digest(&payload),
+        )
+        .unwrap();
+        let envelope = gpu_db_wal::decode_canonical_record_payload(&record.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.header.table_block_count, 0);
+        let recovered = Engine::recover_from_durable_wal(&[record]).unwrap();
+        assert!(recovered
+            .catalog_snapshot()
+            .relational_catalog
+            .contains_key("composite_codec"));
+
+        // Opcode 8 historically counted only its existing-table mutation output, not the table
+        // created by its catalog prefix. Exercise that exact canonical recovery shape as well.
+        let prefix = Engine::new_local();
+        prefix
+            .commit_mutation(
+                6_902,
+                Arc::from(&b"CREATE TABLE legacy_identity_rows (id int4)"[..]),
+            )
+            .unwrap();
+        let prefix_records = prefix.durable_wal_records();
+        let prefix_envelope =
+            gpu_db_wal::decode_canonical_record_payload(&prefix_records.last().unwrap().payload)
+                .unwrap()
+                .unwrap();
+        let table = prefix.catalog_snapshot().relational_catalog["legacy_identity_rows"].clone();
+        let legacy_identity = BinaryTransactionRecord {
+            allocator_high_water: 2,
+            catalog_commands: vec![BinaryTransactionCatalogCommand {
+                ordinal: 0,
+                command: parse_command("CREATE TABLE legacy_identity_created (id int4)").unwrap(),
+            }],
+            created_table_identities: BTreeMap::new(),
+            catalog_output: None,
+            operation_order: Vec::new(),
+            statement_digests: Vec::new(),
+            sequence_input_oids: BTreeMap::new(),
+            table_resets: Vec::new(),
+            sequence_advances: BTreeMap::new(),
+            table_identities: BTreeMap::from([(
+                table.name.clone(),
+                BinaryTransactionTableIdentity {
+                    table_oid: table.oid,
+                    schema_digest: table_schema_digest(&table).unwrap(),
+                },
+            )]),
+            mutations: vec![BinaryTransactionMutation::Insert {
+                table: table.name.clone(),
+                row_id: 1,
+                row_encoded: encode_relational_row(&[SqlValue::Int4(7)]),
+            }],
+        };
+        let legacy_payload: Arc<[u8]> =
+            Arc::from(try_encode_binary_transaction(&legacy_identity).unwrap());
+        assert_eq!(legacy_payload[..3], [255, 1, 8]);
+        let legacy_record = Engine::canonical_wal_record_with_boundary_and_request_digest(
+            prefix_envelope.header.identity,
+            prefix_envelope.header.catalog_after_epoch,
+            prefix_envelope.header.catalog_after_digest,
+            6_903,
+            2,
+            0,
+            &legacy_payload,
+            gpu_db_wal::canonical_request_digest(&legacy_payload),
+        )
+        .unwrap();
+        let legacy_envelope = gpu_db_wal::decode_canonical_record_payload(&legacy_record.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_envelope.header.table_block_count, 1);
+        let recovered =
+            Engine::recover_from_durable_wal(&[prefix_records[0].clone(), legacy_record]).unwrap();
+        assert!(recovered
+            .catalog_snapshot()
+            .relational_catalog
+            .contains_key("legacy_identity_created"));
+        assert_eq!(
+            recovered
+                .execute_relational_select_text("SELECT id FROM legacy_identity_rows")
+                .unwrap()
+                .rows,
+            vec![vec![SqlValue::Int4(7)]]
+        );
     }
 
     #[test]

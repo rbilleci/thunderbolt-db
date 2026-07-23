@@ -98,6 +98,12 @@ fn parse_and_describe_follow_only_the_session_private_catalog() {
     submit_text(
         &engine,
         &mut creator,
+        "CREATE TABLE private_extended_predecessor (id int4)",
+    )
+    .unwrap();
+    submit_text(
+        &engine,
+        &mut creator,
         "CREATE TABLE private_extended (id int4 PRIMARY KEY, value text)",
     )
     .unwrap();

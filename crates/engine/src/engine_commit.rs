@@ -789,7 +789,7 @@ impl Engine {
                     Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => record
                         .catalog_commands
                         .into_iter()
-                        .filter_map(|command| match command {
+                        .filter_map(|operation| match operation.command {
                             Command::CreateTable(create) => Some(create.table),
                             _ => None,
                         })

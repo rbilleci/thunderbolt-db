@@ -474,7 +474,6 @@ impl Engine {
                 write_set: WriteSet::default(),
                 next_row_id: self.read_state.mvcc.current_row_id(),
                 sequence_state: BTreeMap::new(),
-                catalog_command: None,
                 catalog_base: None,
                 catalog_overlay: None,
                 private_gpu_bytes_by_gpu: BTreeMap::new(),

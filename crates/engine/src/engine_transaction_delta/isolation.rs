@@ -152,10 +152,19 @@ impl Engine {
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(catalog_command) = delta.catalog_command.as_ref() {
+            let catalog_commands = delta
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    TransactionOperation::Catalog(staged) => Some(staged.as_ref()),
+                    TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
+                })
+                .collect::<Vec<_>>();
+            if !catalog_commands.is_empty() {
                 let base = delta.catalog_base.as_deref().ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
-                        "transactional catalog command lost its base generation".to_string(),
+                        "transactional catalog operation envelope lost its base generation"
+                            .to_string(),
                     ))
                 })?;
                 if !base.same_contents(fresh.catalog.as_ref()) {
@@ -166,7 +175,7 @@ impl Engine {
                 }
                 let mut overlay = delta.catalog_overlay.as_deref().cloned().ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
-                        "transactional catalog command lost its private catalog overlay"
+                        "transactional catalog operation envelope lost its private catalog overlay"
                             .to_string(),
                     ))
                 })?;
@@ -174,10 +183,13 @@ impl Engine {
                 // dependency are byte-identical, so the private overlay retains its stable
                 // identities and is rebound to the fresh READ COMMITTED statement boundary.
                 overlay.commit_seq = fresh.catalog.commit_seq;
-                let private_tables = match &catalog_command.command {
-                    Command::CreateTable(create) => vec![create.table.clone()],
-                    _ => unreachable!("transactional catalog staging supports CREATE TABLE"),
-                };
+                let private_tables = catalog_commands
+                    .into_iter()
+                    .map(|catalog_command| match &catalog_command.command {
+                        Command::CreateTable(create) => create.table.clone(),
+                        _ => unreachable!("transactional catalog staging supports CREATE TABLE"),
+                    })
+                    .collect();
                 (Some(Arc::new(overlay)), private_tables)
             } else {
                 (None, Vec::new())
@@ -218,7 +230,6 @@ impl Engine {
             write_set: WriteSet::default(),
             next_row_id: fresh.next_row_id,
             sequence_state: BTreeMap::new(),
-            catalog_command: None,
             catalog_base: None,
             catalog_overlay: rebased_catalog_overlay.clone(),
             private_gpu_bytes_by_gpu: BTreeMap::new(),
@@ -246,8 +257,16 @@ impl Engine {
             _resident_gpu_charge: Arc::clone(&fresh._resident_gpu_charge),
         });
         let mut gpu_reservation = TransactionGpuReservation::new(self);
-        for operation in &operations {
+        for (ordinal, operation) in operations.iter().enumerate() {
             match operation {
+                TransactionOperation::Catalog(staged) => {
+                    if usize::try_from(staged.ordinal).ok() != Some(ordinal) {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional catalog operation lost statement order during rebase"
+                                .to_string(),
+                        )));
+                    }
+                }
                 TransactionOperation::Row(delta) => {
                     for (name, expected) in &delta.catalog_dependencies {
                         if transaction_catalog.relational_catalog.get(name) != Some(expected) {
@@ -278,6 +297,12 @@ impl Engine {
                     .map_err(read_committed_rebase_error)?;
                 }
                 TransactionOperation::TableReset(reset) => {
+                    if usize::try_from(reset.ordinal).ok() != Some(ordinal) {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transaction table reset lost statement order during rebase"
+                                .to_string(),
+                        )));
+                    }
                     for (name, expected) in &reset.catalog_dependencies {
                         if transaction_catalog.relational_catalog.get(name) != Some(expected) {
                             return Err(ExecuteError::Serialization(format!(
@@ -321,6 +346,7 @@ impl Engine {
 
         let rows_consumed = operations.iter().try_fold(0u64, |total, operation| {
             let consumed = match operation {
+                TransactionOperation::Catalog(_) => 0,
                 TransactionOperation::Row(delta) => delta.rows_consumed,
                 TransactionOperation::TableReset(_) => 0,
             };
@@ -381,7 +407,7 @@ fn rekey_provisional_inserts(
     let mut next = new_base;
     for delta in operations.iter().filter_map(|operation| match operation {
         TransactionOperation::Row(delta) => Some(delta),
-        TransactionOperation::TableReset(_) => None,
+        TransactionOperation::Catalog(_) | TransactionOperation::TableReset(_) => None,
     }) {
         let PreparedMutation::Insert {
             table,
@@ -416,8 +442,8 @@ fn rekey_provisional_inserts(
     for delta in operations
         .iter_mut()
         .filter_map(|operation| match operation {
-            TransactionOperation::Row(delta) => Some(delta),
-            TransactionOperation::TableReset(_) => None,
+            TransactionOperation::Row(delta) => Some(Arc::make_mut(delta)),
+            TransactionOperation::Catalog(_) | TransactionOperation::TableReset(_) => None,
         })
     {
         let table = match &delta.mutation {

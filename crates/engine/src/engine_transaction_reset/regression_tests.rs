@@ -271,7 +271,7 @@ fn exact_reset_source_digest_rejects_same_cardinality_mutation_and_replay_mismat
         .iter()
         .find_map(|operation| match operation {
             TransactionOperation::TableReset(reset) => Some(reset.as_ref().clone()),
-            TransactionOperation::Row(_) => None,
+            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
         })
         .unwrap();
     assert_eq!(

@@ -1655,9 +1655,7 @@ impl Engine {
                 "device UPDATE old/new image cardinality mismatch".to_string(),
             ));
         }
-        for ((tuple_id, key, row), old_row) in
-            matches.into_iter().zip(resolved_old_rows.into_iter())
-        {
+        for ((tuple_id, key, row), old_row) in matches.into_iter().zip(resolved_old_rows) {
             let mut old_slots = WriteSet::default();
             old_slots.add_unique_slots(table, &old_row);
             released_unique_slots.append(&mut old_slots.unique_slots);

@@ -611,27 +611,189 @@ impl Engine {
         let BinaryTransactionRecord {
             allocator_high_water,
             catalog_commands,
+            created_table_identities,
+            catalog_output,
+            operation_order,
+            statement_digests,
+            sequence_input_oids,
             sequence_advances,
             table_identities,
             mutations,
             table_resets,
         } = record;
 
-        if catalog_commands.len() > 1 {
+        if catalog_commands.len() > 1
+            && (created_table_identities.is_empty()
+                || catalog_output.is_none()
+                || operation_order.is_empty())
+        {
             return Err(EngineError::Durability(
-                "transaction WAL v1 contains more than one catalog operation".to_string(),
+                "ordered transaction WAL lost its statement or created-table identity closure"
+                    .to_string(),
             ));
+        }
+
+        let ordered_envelope = !operation_order.is_empty();
+        if ordered_envelope != catalog_output.is_some() {
+            return Err(EngineError::Durability(
+                "ordered transaction WAL lost its catalog output closure".to_string(),
+            ));
+        }
+        if ordered_envelope {
+            if statement_digests.len() != operation_order.len()
+                || statement_digests.contains(&[0; 32])
+            {
+                return Err(EngineError::Durability(
+                    "ordered transaction statement digests do not cover its operation order"
+                        .to_string(),
+                ));
+            }
+        } else if !statement_digests.is_empty() || !sequence_input_oids.is_empty() {
+            return Err(EngineError::Durability(
+                "legacy transaction WAL carries ordered-only statement identity fields".to_string(),
+            ));
+        }
+        let created_ordinals = catalog_commands
+            .iter()
+            .filter_map(|operation| match &operation.command {
+                Command::CreateTable(create) => Some((create.table.clone(), operation.ordinal)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let created_sequence_names = catalog_commands
+            .iter()
+            .flat_map(|operation| match &operation.command {
+                Command::CreateTable(create) => create
+                    .columns
+                    .iter()
+                    .filter_map(|column| match &column.default {
+                        Some(ColumnDefault::SequenceNextVal {
+                            sequence,
+                            create_if_missing: true,
+                        }) => Some(sequence.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        if created_sequence_names.iter().collect::<BTreeSet<_>>().len()
+            != created_sequence_names.len()
+        {
+            return Err(EngineError::Durability(
+                "ordered transaction catalog repeats an implicit sequence identity".to_string(),
+            ));
+        }
+        let mut ordered_row_names = BTreeSet::new();
+        let mut ordered_reset_names = BTreeSet::new();
+        if ordered_envelope {
+            let mut next_catalog_index = 0usize;
+            for (ordinal, operation) in operation_order.iter().enumerate() {
+                let statement_digest = statement_digests.get(ordinal).ok_or_else(|| {
+                    EngineError::Durability(
+                        "ordered transaction operation has no statement digest".to_string(),
+                    )
+                })?;
+                match operation {
+                    BinaryTransactionOperationIdentity::Catalog { command_index } => {
+                        if usize::try_from(*command_index).ok() != Some(next_catalog_index)
+                            || catalog_commands
+                                .get(next_catalog_index)
+                                .is_none_or(|command| {
+                                    usize::try_from(command.ordinal).ok() != Some(ordinal)
+                                })
+                        {
+                            return Err(EngineError::Durability(
+                                "ordered transaction catalog identity does not match its statement position"
+                                    .to_string(),
+                            ));
+                        }
+                        if transaction_statement_digest(
+                            &catalog_commands[next_catalog_index].command,
+                        )
+                        .map_err(|error| EngineError::Durability(error.to_string()))?
+                            != *statement_digest
+                        {
+                            return Err(EngineError::Durability(
+                                "ordered transaction catalog statement digest mismatch".to_string(),
+                            ));
+                        }
+                        next_catalog_index += 1;
+                    }
+                    BinaryTransactionOperationIdentity::Insert { table }
+                    | BinaryTransactionOperationIdentity::Update { table }
+                    | BinaryTransactionOperationIdentity::Delete { table } => {
+                        if created_ordinals.get(table).is_some_and(|created| {
+                            usize::try_from(*created)
+                                .ok()
+                                .is_none_or(|created| created >= ordinal)
+                        }) {
+                            return Err(EngineError::Durability(format!(
+                                "ordered transaction row operation precedes relation \"{table}\""
+                            )));
+                        }
+                        ordered_row_names.insert(table.clone());
+                    }
+                    BinaryTransactionOperationIdentity::TableReset { table } => {
+                        if created_ordinals.get(table).is_some_and(|created| {
+                            usize::try_from(*created)
+                                .ok()
+                                .is_none_or(|created| created >= ordinal)
+                        }) {
+                            return Err(EngineError::Durability(format!(
+                                "ordered transaction reset precedes relation \"{table}\""
+                            )));
+                        }
+                        let command = Command::TruncateTable(TruncateTable {
+                            name: table.clone(),
+                            restart_identity: false,
+                        });
+                        if transaction_statement_digest(&command)
+                            .map_err(|error| EngineError::Durability(error.to_string()))?
+                            != *statement_digest
+                        {
+                            return Err(EngineError::Durability(
+                                "ordered transaction table-reset statement digest mismatch"
+                                    .to_string(),
+                            ));
+                        }
+                        ordered_reset_names.insert(table.clone());
+                    }
+                }
+            }
+            if next_catalog_index != catalog_commands.len() {
+                return Err(EngineError::Durability(
+                    "ordered transaction statement envelope omits a catalog operation".to_string(),
+                ));
+            }
         }
 
         // Decode and bind the complete record before touching any globally published state. This
         // makes malformed replay/live records all-or-nothing and leaves only infallible assignment
         // plus prevalidated COW publication after the staging pass.
         let mut next_catalog = cat.clone();
-        for command in catalog_commands {
-            match command {
-                Command::CreateTable(create) => {
-                    self.apply_create_table(&mut next_catalog, create)?
-                }
+        let created_names = created_ordinals
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if (ordered_envelope || !created_table_identities.is_empty())
+            && created_names
+                != created_table_identities
+                    .keys()
+                    .map(String::as_str)
+                    .collect()
+        {
+            return Err(EngineError::Durability(
+                "ordered transaction WAL created-table identities are incomplete".to_string(),
+            ));
+        }
+        for operation in &catalog_commands {
+            let working =
+                Self::catalog_snapshot_from_working(&next_catalog, entry.index.saturating_sub(1));
+            match operation.command.clone() {
+                Command::CreateTable(create) => self.with_apply_catalog(Some(working), || {
+                    self.apply_create_table(&mut next_catalog, create)
+                })?,
                 _ => {
                     return Err(EngineError::Durability(
                         "transaction WAL record contains an unsupported catalog operation"
@@ -640,14 +802,183 @@ impl Engine {
                 }
             }
         }
-        for sequence_name in sequence_advances.keys() {
-            if !next_catalog
-                .relational_sequences
-                .contains_key(sequence_name)
-            {
+        for (table_name, identity) in &created_table_identities {
+            let table = next_catalog
+                .relational_catalog
+                .get(table_name)
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "ordered transaction did not create relation \"{table_name}\""
+                    ))
+                })?;
+            let schema_digest = table_schema_digest(table)
+                .map_err(|error| EngineError::Durability(error.to_string()))?;
+            if table.oid != identity.table_oid || schema_digest != identity.schema_digest {
                 return Err(EngineError::Durability(format!(
-                    "transaction WAL record advances unknown sequence \"{sequence_name}\""
+                    "ordered transaction created relation \"{table_name}\" with a different stable identity"
                 )));
+            }
+        }
+        if let Some(output) = &catalog_output {
+            if next_catalog.relational_next_oid != output.relational_next_oid
+                || next_catalog.relational_next_column_id != output.relational_next_column_id
+                || output.created_sequence_oids.keys().collect::<BTreeSet<_>>()
+                    != created_sequence_names.iter().collect::<BTreeSet<_>>()
+            {
+                return Err(EngineError::Durability(
+                    "ordered transaction catalog allocator or generated-sequence closure changed"
+                        .to_string(),
+                ));
+            }
+            for (sequence_name, expected_oid) in &output.created_sequence_oids {
+                if next_catalog
+                    .relational_sequences
+                    .get(sequence_name)
+                    .is_none_or(|sequence| sequence.oid != *expected_oid)
+                {
+                    return Err(EngineError::Durability(format!(
+                        "ordered transaction generated sequence \"{sequence_name}\" with a different stable identity"
+                    )));
+                }
+            }
+        }
+        let mut validated_sequence_inputs = 0usize;
+        let mut insert_sequence_names = BTreeSet::new();
+        for (ordinal, operation) in operation_order.iter().enumerate() {
+            let Some(table_name) = operation.table() else {
+                if !matches!(
+                    operation,
+                    BinaryTransactionOperationIdentity::Catalog { .. }
+                ) {
+                    continue;
+                }
+                let ordinal = u32::try_from(ordinal).map_err(|_| {
+                    EngineError::Durability(
+                        "ordered transaction operation ordinal exceeds u32".to_string(),
+                    )
+                })?;
+                let inputs = sequence_input_oids
+                    .iter()
+                    .filter(|((input_ordinal, _), _)| *input_ordinal == ordinal)
+                    .collect::<Vec<_>>();
+                validated_sequence_inputs += inputs.len();
+                let BinaryTransactionOperationIdentity::Catalog { command_index } = operation
+                else {
+                    unreachable!("catalog operation checked above")
+                };
+                let command = &catalog_commands[usize::try_from(*command_index).map_err(|_| {
+                    EngineError::Durability(
+                        "ordered catalog command index exceeds usize".to_string(),
+                    )
+                })?]
+                .command;
+                let expected_names = match command {
+                    Command::CreateTable(create) => create
+                        .columns
+                        .iter()
+                        .filter_map(|column| match &column.default {
+                            Some(ColumnDefault::SequenceNextVal { sequence, .. }) => {
+                                Some(sequence.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeSet<_>>(),
+                    _ => BTreeSet::new(),
+                };
+                let input_names = inputs
+                    .iter()
+                    .map(|((_, sequence), _)| sequence.as_str())
+                    .collect::<BTreeSet<_>>();
+                if input_names != expected_names {
+                    return Err(EngineError::Durability(
+                        "ordered catalog sequence identities do not cover its exact defaults"
+                            .to_string(),
+                    ));
+                }
+                for ((_, sequence_name), expected_oid) in inputs {
+                    if next_catalog
+                        .relational_sequences
+                        .get(sequence_name)
+                        .is_none_or(|sequence| sequence.oid != *expected_oid)
+                    {
+                        return Err(EngineError::Durability(format!(
+                            "ordered catalog sequence input \"{sequence_name}\" changed stable identity"
+                        )));
+                    }
+                }
+                continue;
+            };
+            let table = next_catalog
+                .relational_catalog
+                .get(table_name)
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "ordered transaction operation targets unknown relation \"{table_name}\""
+                    ))
+                })?;
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                EngineError::Durability(
+                    "ordered transaction operation ordinal exceeds u32".to_string(),
+                )
+            })?;
+            let inputs = sequence_input_oids
+                .iter()
+                .filter(|((input_ordinal, _), _)| *input_ordinal == ordinal)
+                .collect::<Vec<_>>();
+            validated_sequence_inputs += inputs.len();
+            if matches!(operation, BinaryTransactionOperationIdentity::Insert { .. }) {
+                let allowed_names = table
+                    .columns
+                    .iter()
+                    .filter_map(|column| match &column.default {
+                        Some(ColumnDefault::SequenceNextVal { sequence, .. }) => {
+                            Some(sequence.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                for ((_, sequence_name), expected_oid) in inputs {
+                    if !allowed_names.contains(sequence_name.as_str())
+                        || next_catalog
+                            .relational_sequences
+                            .get(sequence_name)
+                            .is_none_or(|sequence| sequence.oid != *expected_oid)
+                    {
+                        return Err(EngineError::Durability(format!(
+                            "ordered INSERT sequence input \"{sequence_name}\" is not an exact default dependency of relation \"{table_name}\""
+                        )));
+                    }
+                    insert_sequence_names.insert(sequence_name.as_str());
+                }
+            } else if !inputs.is_empty() {
+                return Err(EngineError::Durability(
+                    "non-INSERT ordered operation carries a sequence input identity".to_string(),
+                ));
+            }
+        }
+        if ordered_envelope
+            && (validated_sequence_inputs != sequence_input_oids.len()
+                || insert_sequence_names
+                    != sequence_advances
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>())
+        {
+            return Err(EngineError::Durability(
+                "ordered INSERT sequence identities do not close over sequence advances"
+                    .to_string(),
+            ));
+        }
+        if !ordered_envelope {
+            for sequence_name in sequence_advances.keys() {
+                if !next_catalog
+                    .relational_sequences
+                    .contains_key(sequence_name)
+                {
+                    return Err(EngineError::Durability(format!(
+                        "transaction WAL record advances unknown sequence \"{sequence_name}\""
+                    )));
+                }
             }
         }
         let mutation_tables = mutations
@@ -662,9 +993,20 @@ impl Engine {
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        if !table_identities.is_empty() && mutation_tables != identity_tables {
+        let expected_identity_tables = if ordered_envelope {
+            ordered_row_names
+                .iter()
+                .filter(|table| !created_ordinals.contains_key(table.as_str()))
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        } else {
+            mutation_tables.clone()
+        };
+        if (ordered_envelope || !table_identities.is_empty())
+            && expected_identity_tables != identity_tables
+        {
             return Err(EngineError::Durability(
-                "identity-bound transaction WAL does not cover its exact mutation table set"
+                "identity-bound transaction WAL does not cover its exact ordered row table set"
                     .to_string(),
             ));
         }
@@ -684,6 +1026,58 @@ impl Engine {
                     "identity-bound transaction relation \"{table_name}\" changed from OID {} before apply",
                     identity.table_oid
                 )));
+            }
+        }
+        if ordered_envelope {
+            let reset_output_names = table_resets
+                .iter()
+                .map(|reset| reset.table.clone())
+                .collect::<BTreeSet<_>>();
+            if ordered_reset_names != reset_output_names
+                || !mutation_tables
+                    .iter()
+                    .all(|table| ordered_row_names.contains(*table))
+            {
+                return Err(EngineError::Durability(
+                    "ordered transaction outputs do not close over their statement identities"
+                        .to_string(),
+                ));
+            }
+            for reset in &table_resets {
+                if usize::try_from(reset.ordinal)
+                    .ok()
+                    .and_then(|ordinal| operation_order.get(ordinal))
+                    .is_none_or(|operation| {
+                        !matches!(operation, BinaryTransactionOperationIdentity::TableReset { table } if table == &reset.table)
+                    })
+                {
+                    return Err(EngineError::Durability(format!(
+                        "transaction reset output for \"{}\" lost its statement position",
+                        reset.table
+                    )));
+                }
+            }
+            for mutation in &mutations {
+                let table = match mutation {
+                    BinaryTransactionMutation::Insert { table, .. }
+                    | BinaryTransactionMutation::Update { table, .. }
+                    | BinaryTransactionMutation::Delete { table, .. } => table,
+                };
+                let last_reset = operation_order.iter().rposition(
+                    |operation| matches!(operation, BinaryTransactionOperationIdentity::TableReset { table: reset_table } if reset_table == table),
+                );
+                if !operation_order
+                    .iter()
+                    .enumerate()
+                    .any(|(ordinal, operation)| {
+                        operation.matches_mutation(mutation)
+                            && last_reset.is_none_or(|reset_ordinal| ordinal > reset_ordinal)
+                    })
+                {
+                    return Err(EngineError::Durability(format!(
+                        "resolved mutation for \"{table}\" has no row operation after its last reset"
+                    )));
+                }
             }
         }
         let mut validated_resets = Vec::with_capacity(table_resets.len());

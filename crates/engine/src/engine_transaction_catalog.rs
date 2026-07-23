@@ -1,8 +1,8 @@
 //! Transaction-private catalog staging.
 //!
-//! The compatibility path admits one database-local `CREATE TABLE` as a private catalog generation.
-//! Its typed operation composes with resolved DML in the canonical transaction envelope; multiple
-//! DDL statements remain fail-closed until the ordered catalog-operation expansion.
+//! Database-local `CREATE TABLE` operations share the transaction's statement-ordered operation
+//! envelope with DML and typed table resets. Each statement rebuilds the private catalog from the
+//! exact published base plus its typed predecessors, then atomically replaces the private overlay.
 
 use super::*;
 use crate::engine_mutation_admission::validate_prepared_catalog_version;
@@ -92,20 +92,42 @@ impl Engine {
                 "cannot execute DDL in a READ ONLY transaction".to_string(),
             ));
         }
-        {
+        if let Some(expected) = expected_catalog_version {
+            validate_prepared_catalog_version(expected, snapshot.catalog.commit_seq)?;
+        }
+
+        let (generation, prior_commands, prior_overlay, prior_base) = {
             let delta = snapshot
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if delta.catalog_command.is_some() {
-                return Err(ExecuteError::Unsupported(
-                    "multiple transactional DDL statements await the ordered composite envelope"
-                        .to_string(),
-                ));
-            }
+            (
+                delta.generation,
+                delta
+                    .operations
+                    .iter()
+                    .filter_map(|operation| match operation {
+                        TransactionOperation::Catalog(staged) => Some(staged.as_ref().clone()),
+                        TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
+                    })
+                    .collect::<Vec<_>>(),
+                delta.catalog_overlay.clone(),
+                delta.catalog_base.clone(),
+            )
+        };
+        if !prior_commands.is_empty() && (prior_overlay.is_none() || prior_base.is_none()) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "transactional catalog operation envelope lost its base or private overlay"
+                    .to_string(),
+            )));
         }
-        if let Some(expected) = expected_catalog_version {
-            validate_prepared_catalog_version(expected, snapshot.catalog.commit_seq)?;
+        if prior_base
+            .as_deref()
+            .is_some_and(|base| !base.same_contents(snapshot.catalog.as_ref()))
+        {
+            return Err(ExecuteError::Serialization(
+                "transactional catalog base changed before the next catalog statement".to_string(),
+            ));
         }
 
         // Validation works on a private clone. The exact published base must still match the
@@ -121,15 +143,35 @@ impl Engine {
         }
         on_catalog_latched();
         let mut working = catalog_guard.clone();
-        match command.clone() {
-            Command::CreateTable(create) => self
-                .apply_create_table(&mut working, create)
-                .map_err(ExecuteError::Engine)?,
-            _ => unreachable!("transactional catalog command was classified above"),
+        for staged in &prior_commands {
+            let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+            self.with_apply_catalog(Some(scoped), || match &staged.command {
+                Command::CreateTable(create) => {
+                    self.apply_create_table(&mut working, create.clone())
+                }
+                _ => unreachable!("transactional catalog command was classified before staging"),
+            })
+            .map_err(ExecuteError::Engine)?;
         }
-        // CREATE validation helpers still consult the engine's published catalog for domains and
-        // sequence/default dependencies. Retain the catalog latch through the entire private apply
-        // so those reads cannot observe a generation newer than the exact base checked above.
+        if let Some(expected) = prior_overlay.as_deref() {
+            let reconstructed =
+                Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+            if reconstructed.as_ref() != expected {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed transactional catalog operations no longer reconstruct their private overlay"
+                        .to_string(),
+                )));
+            }
+        }
+        let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+        self.with_apply_catalog(Some(scoped), || match command.clone() {
+            Command::CreateTable(create) => self.apply_create_table(&mut working, create),
+            _ => unreachable!("transactional catalog command was classified above"),
+        })
+        .map_err(ExecuteError::Engine)?;
+        // CREATE validation helpers resolve domains and sequence/default dependencies through the
+        // scoped working generation. Retain the catalog latch through reconstruction and the new
+        // private apply so no global catalog generation can cross the checked base.
         drop(catalog_guard);
         let overlay = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
 
@@ -137,23 +179,43 @@ impl Engine {
             .delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if delta.catalog_command.is_some() {
+        if delta.generation != generation {
             return Err(ExecuteError::Serialization(
                 "transaction catalog generation changed during statement staging".to_string(),
             ));
         }
+        let ordinal = u32::try_from(delta.operations.len()).map_err(|_| {
+            ExecuteError::Unsupported(
+                "transaction operation ordinal exceeds typed catalog framing".to_string(),
+            )
+        })?;
+        let statement_digest = transaction_statement_digest(&command)?;
         if let Command::CreateTable(create) = &command {
             Arc::make_mut(&mut delta.resident_shards)
                 .entry(create.table.clone())
                 .or_default();
         }
-        delta.catalog_base = Some(Arc::clone(&snapshot.catalog));
+        if prior_commands.is_empty() {
+            delta.catalog_base = Some(Arc::clone(&snapshot.catalog));
+        }
         delta.catalog_overlay = Some(overlay);
-        delta.catalog_command = Some(StagedCatalogCommand { command });
+        delta
+            .operations
+            .push(TransactionOperation::Catalog(Arc::new(
+                StagedCatalogCommand {
+                    ordinal,
+                    statement_digest,
+                    command,
+                },
+            )));
         delta.generation = delta.generation.saturating_add(1);
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "engine_transaction_catalog/ordered_tests.rs"]
+mod ordered_tests;
 
 #[cfg(test)]
 mod tests {
@@ -194,16 +256,15 @@ mod tests {
     }
 
     #[test]
-    fn rollback_and_later_statement_error_discard_private_catalog() {
+    fn rollback_discards_multiple_private_catalog_operations() {
         let engine = Engine::new_local();
         engine.submit_transaction(20, parsed("BEGIN")).unwrap();
         engine
             .submit_transaction(20, parsed("CREATE TABLE rolled_ddl (id int4)"))
             .unwrap();
-        let error = engine
+        engine
             .submit_transaction(20, parsed("CREATE TABLE second_ddl (id int4)"))
-            .unwrap_err();
-        assert!(matches!(error, ExecuteError::Unsupported(_)));
+            .unwrap();
         assert!(engine.durable_wal_records().is_empty());
         engine.submit_transaction(20, parsed("ROLLBACK")).unwrap();
         assert!(!engine
@@ -363,21 +424,36 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn create_insert_rollback_discards_catalog_rows_and_wal() {
+    fn ordered_catalog_create_reset_dml_rollback_discards_every_private_effect() {
         let engine = Engine::new_local();
         engine.set_shard_residency_enabled(true);
+        engine.set_auto_admit_on_commit(true);
         engine.submit_transaction(34, parsed("BEGIN")).unwrap();
         engine
             .submit_transaction(34, parsed("CREATE TABLE rolled_composite (id int4)"))
             .unwrap();
         engine
+            .submit_transaction(34, parsed("CREATE TABLE rolled_composite_peer (id int4)"))
+            .unwrap();
+        engine
             .submit_transaction(34, parsed("INSERT INTO rolled_composite VALUES (1)"))
             .unwrap();
+        engine
+            .submit_transaction(34, parsed("TRUNCATE rolled_composite"))
+            .unwrap();
+        engine
+            .submit_transaction(34, parsed("INSERT INTO rolled_composite VALUES (2)"))
+            .unwrap();
+        engine
+            .submit_transaction(34, parsed("INSERT INTO rolled_composite_peer VALUES (3)"))
+            .unwrap();
         engine.submit_transaction(34, parsed("ROLLBACK")).unwrap();
-        assert!(!engine
-            .catalog_snapshot()
-            .relational_catalog
-            .contains_key("rolled_composite"));
+        for table in ["rolled_composite", "rolled_composite_peer"] {
+            assert!(!engine
+                .catalog_snapshot()
+                .relational_catalog
+                .contains_key(table));
+        }
         assert!(engine.durable_wal_records().is_empty());
     }
 
@@ -949,7 +1025,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn durable_composite_remains_observer_invisible_until_one_publication() {
+    fn ordered_catalog_durable_composite_remains_observer_invisible_until_one_publication() {
         let engine = Arc::new(Engine::new_local());
         engine.set_shard_residency_enabled(true);
         engine.submit_transaction(355, parsed("BEGIN")).unwrap();
@@ -960,7 +1036,16 @@ mod tests {
             )
             .unwrap();
         engine
+            .submit_transaction(
+                355,
+                parsed("CREATE TABLE paused_composite_peer (id int4 PRIMARY KEY)"),
+            )
+            .unwrap();
+        engine
             .submit_transaction(355, parsed("INSERT INTO paused_composite VALUES (1, 9)"))
+            .unwrap();
+        engine
+            .submit_transaction(355, parsed("INSERT INTO paused_composite_peer VALUES (2)"))
             .unwrap();
         let (durable_tx, durable_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -971,6 +1056,10 @@ mod tests {
                 .catalog_snapshot()
                 .relational_catalog
                 .contains_key("paused_composite"));
+            assert!(!observing
+                .catalog_snapshot()
+                .relational_catalog
+                .contains_key("paused_composite_peer"));
             durable_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
@@ -993,11 +1082,15 @@ mod tests {
             .catalog_snapshot()
             .relational_catalog
             .contains_key("paused_composite"));
+        assert!(engine
+            .catalog_snapshot()
+            .relational_catalog
+            .contains_key("paused_composite_peer"));
     }
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn transaction_created_serial_post_state_matches_live_and_recovery() {
+    fn ordered_catalog_transaction_created_serial_post_state_matches_live_and_recovery() {
         let engine = Engine::new_local();
         engine.set_shard_residency_enabled(true);
         engine.submit_transaction(365, parsed("BEGIN")).unwrap();
@@ -1036,6 +1129,22 @@ mod tests {
         assert_eq!(
             (live_sequence.last_value, live_sequence.is_called),
             (2, true)
+        );
+        let BinaryWalRecord::Transaction(record) =
+            decode_binary_record(&engine.durable_wal_records()[0].payload).unwrap()
+        else {
+            panic!("serial catalog transaction did not use resolved binary WAL");
+        };
+        assert_eq!(
+            record.sequence_input_oids,
+            BTreeMap::from([
+                ((0, "private_serial_id_seq".to_string()), live_sequence.oid),
+                ((1, "private_serial_id_seq".to_string()), live_sequence.oid),
+            ])
+        );
+        assert_eq!(
+            record.sequence_advances,
+            BTreeMap::from([("private_serial_id_seq".to_string(), (2, true))])
         );
 
         let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();

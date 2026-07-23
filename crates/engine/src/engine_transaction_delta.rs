@@ -11,6 +11,7 @@ use crate::engine_transaction_reset::{
 
 pub(crate) mod gpu_accounting;
 mod isolation;
+mod ordered_wal;
 use gpu_accounting::transaction_private_shard_bytes;
 pub(crate) use gpu_accounting::TransactionGpuReservation;
 
@@ -177,6 +178,7 @@ impl Engine {
                 "cannot execute DML in a READ ONLY transaction".to_string(),
             ));
         }
+        let statement_digest = transaction_statement_digest(&command)?;
 
         let table_name = match &command {
             Command::Insert(insert) => insert.table.as_str(),
@@ -257,11 +259,19 @@ impl Engine {
             &delta.private_gpu_bytes_by_gpu,
             &next_private_gpu_bytes,
         )?;
+        u32::try_from(delta.operations.len()).map_err(|_| {
+            ExecuteError::Unsupported(
+                "transaction operation count exceeds typed WAL framing".to_string(),
+            )
+        })?;
         delta.next_row_id = delta.next_row_id.saturating_add(prepared.rows_consumed);
         delta.sequence_state.extend(prepared_sequence_state);
         delta
             .operations
-            .push(TransactionOperation::Row(Box::new(prepared)));
+            .push(TransactionOperation::Row(Arc::new(StagedRowOperation {
+                statement_digest,
+                delta: prepared,
+            })));
         delta.write_set = final_transaction_write_set(&delta.operations);
         delta.resident_shards = Arc::new(next_shards);
         delta.streaming_cold_chunks = Arc::new(next_cold_chunks);
@@ -340,29 +350,44 @@ impl Engine {
                 "transaction id {txn_id} was already claimed by another write strategy while the explicit transaction was active"
             ))));
         }
-        let (operations, catalog_command, catalog_base) = {
+        let (operations, catalog_base) = {
             let delta = snapshot
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                delta.operations.clone(),
-                delta.catalog_command.clone(),
-                delta.catalog_base.clone(),
-            )
+            (delta.operations.clone(), delta.catalog_base.clone())
         };
-        if operations.is_empty() && catalog_command.is_none() {
+        if operations.is_empty() {
             drop(commit);
             return self
                 .finish_transaction_context(txn_id, true, chain)
                 .map_err(ExecuteError::Txn);
         }
+        for (ordinal, operation) in operations.iter().enumerate() {
+            let stored = match operation {
+                TransactionOperation::Catalog(staged) => Some(staged.ordinal),
+                TransactionOperation::TableReset(reset) => Some(reset.ordinal),
+                TransactionOperation::Row(_) => None,
+            };
+            if stored.is_some_and(|stored| usize::try_from(stored).ok() != Some(ordinal)) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transaction operation lost its global statement ordinal".to_string(),
+                )));
+            }
+        }
+        let catalog_commands = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                TransactionOperation::Catalog(staged) => Some(staged.as_ref().clone()),
+                TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
+            })
+            .collect::<Vec<_>>();
         let all_deltas = transaction_row_deltas(&operations);
         let (deltas, table_resets) = final_transaction_operations(&operations);
-        if let Some(catalog_command) = &catalog_command {
+        if !catalog_commands.is_empty() {
             let base = catalog_base.ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
-                    "transactional catalog command lost its base generation".to_string(),
+                    "transactional catalog operation envelope lost its base generation".to_string(),
                 ))
             })?;
             if !self
@@ -374,7 +399,9 @@ impl Engine {
                     "catalog contents changed after transactional DDL staging".to_string(),
                 ));
             }
-            debug_assert!(matches!(catalog_command.command, Command::CreateTable(_)));
+            debug_assert!(catalog_commands
+                .iter()
+                .all(|operation| matches!(operation.command, Command::CreateTable(_))));
         }
         let transaction_catalog = snapshot.transaction_catalog();
         for delta in &deltas {
@@ -402,7 +429,12 @@ impl Engine {
                 )));
             }
         }
-        self.validate_transaction_table_resets(&published_catalog, &table_resets, &commit.ledger)?;
+        let reset_catalog = if catalog_commands.is_empty() {
+            published_catalog.as_ref()
+        } else {
+            transaction_catalog.as_ref()
+        };
+        self.validate_transaction_table_resets(reset_catalog, &table_resets, &commit.ledger)?;
         let staged_tables = deltas
             .iter()
             .map(|delta| match &delta.mutation {
@@ -462,41 +494,13 @@ impl Engine {
             final_base,
             allocator_high_water,
         )?;
-        if let Some(catalog_command) = catalog_command {
-            record.catalog_commands.push(catalog_command.command);
-        }
-        record.table_resets = table_resets
-            .iter()
-            .map(StagedTableReset::to_binary)
-            .collect();
-        record.table_identities = record
-            .mutations
-            .iter()
-            .map(|mutation| match mutation {
-                BinaryTransactionMutation::Insert { table, .. }
-                | BinaryTransactionMutation::Update { table, .. }
-                | BinaryTransactionMutation::Delete { table, .. } => table,
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|table_name| {
-                let table = transaction_catalog
-                    .relational_catalog
-                    .get(table_name)
-                    .ok_or_else(|| {
-                        ExecuteError::Serialization(format!(
-                            "transaction mutation relation \"{table_name}\" left its catalog before WAL binding"
-                        ))
-                    })?;
-                Ok((
-                    table_name.clone(),
-                    BinaryTransactionTableIdentity {
-                        table_oid: table.oid,
-                        schema_digest: table_schema_digest(table)?,
-                    },
-                ))
-            })
-            .collect::<Result<_, ExecuteError>>()?;
+        Self::bind_transaction_record_catalog_envelope(
+            &mut record,
+            &operations,
+            &catalog_commands,
+            &table_resets,
+            &transaction_catalog,
+        )?;
         let reset_tables = table_resets
             .iter()
             .map(|reset| reset.table.clone())
@@ -532,15 +536,12 @@ impl Engine {
                 | BinaryTransactionMutation::Update { table, .. }
                 | BinaryTransactionMutation::Delete { table, .. } => table.clone(),
             })
-            .chain(
-                record
-                    .catalog_commands
-                    .iter()
-                    .filter_map(|command| match command {
-                        Command::CreateTable(create) => Some(create.table.clone()),
-                        _ => None,
-                    }),
-            )
+            .chain(record.catalog_commands.iter().filter_map(
+                |operation| match &operation.command {
+                    Command::CreateTable(create) => Some(create.table.clone()),
+                    _ => None,
+                },
+            ))
             .chain(record.table_resets.iter().map(|reset| reset.table.clone()))
             .collect::<BTreeSet<_>>();
         let named_index_publication = self
@@ -864,6 +865,11 @@ impl Engine {
         Ok(BinaryTransactionRecord {
             allocator_high_water,
             catalog_commands: Vec::new(),
+            created_table_identities: BTreeMap::new(),
+            catalog_output: None,
+            operation_order: Vec::new(),
+            statement_digests: Vec::new(),
+            sequence_input_oids: BTreeMap::new(),
             table_resets: Vec::new(),
             sequence_advances,
             table_identities: BTreeMap::new(),

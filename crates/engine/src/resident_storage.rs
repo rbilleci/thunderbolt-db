@@ -877,7 +877,7 @@ impl Engine {
                     .iter()
                     .filter_map(|operation| match operation {
                         TransactionOperation::TableReset(reset) => Some(reset.table.clone()),
-                        TransactionOperation::Row(_) => None,
+                        TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
                     })
                     .collect::<BTreeSet<_>>();
                 if fenced.is_empty() && reset_tables.is_empty() {

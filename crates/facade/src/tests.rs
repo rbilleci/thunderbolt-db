@@ -1571,7 +1571,7 @@ fn facade_gpu_catalog_aggregate_alias_and_grouping_share_general_binding() {
 }
 
 #[test]
-fn transactional_create_error_enters_failed_state_and_rollback_discards_catalog() {
+fn transactional_unsupported_catalog_family_enters_failed_state_and_rollback_discards_catalog() {
     let shared = SharedEngine::new();
     let mut session = shared.open_session();
     submit_session_text(&shared, &mut session, "BEGIN").unwrap();
@@ -1585,7 +1585,7 @@ fn transactional_create_error_enters_failed_state_and_rollback_discards_catalog(
     let error = submit_session_text(
         &shared,
         &mut session,
-        "CREATE TABLE unsupported_second_ddl (id INT)",
+        "CREATE VIEW unsupported_second_ddl AS SELECT id FROM failed_private_ddl",
     )
     .unwrap_err();
     assert_eq!(error.category, ErrorCategory::Unsupported);
@@ -1608,7 +1608,7 @@ fn transactional_create_error_enters_failed_state_and_rollback_discards_catalog(
     submit_session_text(
         &shared,
         &mut session,
-        "CREATE TABLE unsupported_second_ddl (id INT)",
+        "CREATE VIEW unsupported_second_ddl AS SELECT id FROM failed_private_ddl",
     )
     .unwrap();
 }

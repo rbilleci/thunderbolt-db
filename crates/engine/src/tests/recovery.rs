@@ -114,6 +114,11 @@ fn explicit_transaction_binary_record_is_one_atomic_recoverable_generation() {
     let record = BinaryTransactionRecord {
         allocator_high_water: inserted_row_id + 1,
         catalog_commands: Vec::new(),
+        created_table_identities: BTreeMap::new(),
+        catalog_output: None,
+        operation_order: Vec::new(),
+        statement_digests: Vec::new(),
+        sequence_input_oids: BTreeMap::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),

@@ -706,6 +706,12 @@ mod tests {
         submit_text(
             &facade,
             &mut creator,
+            "CREATE TABLE private_prepare_predecessor (id int4)",
+        )
+        .unwrap();
+        submit_text(
+            &facade,
+            &mut creator,
             "CREATE TABLE private_prepare (id int4 PRIMARY KEY, value text)",
         )
         .unwrap();

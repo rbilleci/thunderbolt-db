@@ -309,6 +309,9 @@ pub(crate) struct WriteDelta {
 #[derive(Debug, Clone)]
 pub(crate) struct StagedTableReset {
     pub(crate) ordinal: u32,
+    /// Canonical identity of the fully typed/bound statement. This survives even when a later
+    /// operation shadows every relational effect of this reset.
+    pub(crate) statement_digest: gpu_db_wal::CanonicalDigest,
     pub(crate) table: String,
     pub(crate) table_oid: u32,
     pub(crate) schema_digest: gpu_db_wal::CanonicalDigest,
@@ -322,13 +325,62 @@ pub(crate) struct StagedTableReset {
     pub(crate) dependency_identities: BTreeMap<String, u32>,
 }
 
-/// The statement-ordered private transaction stream. Keeping resets beside row operations makes
-/// shadowing structural: replay starts from the retained base, applies a reset as an empty-root
-/// replacement, then applies only the row operations that follow it.
+/// Bind exact-retry identity to the admitted typed command rather than to its final relational
+/// effects. In particular, two zero-row predicates or two values later shadowed by TRUNCATE must
+/// remain different requests even though their resolved mutation sets are identical.
+pub(crate) fn transaction_statement_digest(
+    command: &Command,
+) -> Result<gpu_db_wal::CanonicalDigest, ExecuteError> {
+    let encoded = serde_json::to_vec(command).map_err(|error| {
+        ExecuteError::Engine(EngineError::Durability(format!(
+            "typed transaction statement cannot be encoded canonically: {error}"
+        )))
+    })?;
+    let encoded_len = u64::try_from(encoded.len()).map_err(|_| {
+        ExecuteError::Unsupported(
+            "typed transaction statement exceeds canonical digest framing".to_string(),
+        )
+    })?;
+    let mut body = Vec::with_capacity(40 + encoded.len());
+    body.extend_from_slice(b"GPUDBTXNSTATEMENT1");
+    body.extend_from_slice(&encoded_len.to_le_bytes());
+    body.extend_from_slice(&encoded);
+    Ok(gpu_db_wal::canonical_request_digest(&body))
+}
+
+/// One staged DML statement plus its request identity. Keeping this wrapper transaction-local
+/// avoids adding cold exact-retry metadata to the latency-sensitive ordinary `WriteDelta` path.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedRowOperation {
+    pub(crate) statement_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) delta: WriteDelta,
+}
+
+impl std::ops::Deref for StagedRowOperation {
+    type Target = WriteDelta;
+
+    fn deref(&self) -> &Self::Target {
+        &self.delta
+    }
+}
+
+impl std::ops::DerefMut for StagedRowOperation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.delta
+    }
+}
+
+/// The statement-ordered private transaction stream. Catalog operations, resets, and row
+/// operations share one ordinal authority. Keeping resets beside row operations makes shadowing
+/// structural: replay starts from the retained base, applies a reset as an empty-root replacement,
+/// then applies only the row operations that follow it.
 #[derive(Debug, Clone)]
 pub(crate) enum TransactionOperation {
-    Row(Box<WriteDelta>),
-    TableReset(Box<StagedTableReset>),
+    Row(Arc<StagedRowOperation>),
+    TableReset(Arc<StagedTableReset>),
+    // Keep new variants append-only: established discriminants feed large engine match tables,
+    // and changing them has previously moved latency-sensitive linked code measurably.
+    Catalog(Arc<StagedCatalogCommand>),
 }
 
 impl WriteDelta {
@@ -611,10 +663,9 @@ pub(crate) struct TransactionDeltaState {
     /// statement seeds its pure `nextval` scratch here, so values advance across private statements
     /// without mutating the published catalog before COMMIT.
     pub(crate) sequence_state: BTreeMap<String, (i64, bool)>,
-    /// One staged database-local CREATE TABLE plus the exact base and private catalog generations
-    /// it was validated against. The typed command joins resolved DML in the existing canonical
-    /// transaction envelope; multiple DDL statements remain fail-closed pending ordered expansion.
-    pub(crate) catalog_command: Option<StagedCatalogCommand>,
+    /// Exact published catalog generation beneath every ordered private catalog operation.
+    /// Catalog operations themselves live in `operations`, so mixed DDL/DML/reset programs retain
+    /// one statement-order authority rather than maintaining a parallel command stream.
     pub(crate) catalog_base: Option<Arc<CatalogSnapshot>>,
     pub(crate) catalog_overlay: Option<Arc<CatalogSnapshot>>,
     pub(crate) private_gpu_bytes_by_gpu: BTreeMap<u16, u64>,
@@ -627,6 +678,8 @@ pub(crate) struct TransactionDeltaState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedCatalogCommand {
+    pub(crate) ordinal: u32,
+    pub(crate) statement_digest: gpu_db_wal::CanonicalDigest,
     pub(crate) command: Command,
 }
 
@@ -689,7 +742,7 @@ impl TransactionSnapshot {
             .delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        delta.operations.is_empty() && delta.catalog_command.is_none()
+        delta.operations.is_empty()
     }
 
     pub(crate) fn transaction_table_is_reset(&self, table: &str) -> bool {

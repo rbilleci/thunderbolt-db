@@ -368,6 +368,11 @@ fn raw_binary_rows_derive_atomic_dependency_guards() {
     let record = BinaryTransactionRecord {
         allocator_high_water: 3,
         catalog_commands: Vec::new(),
+        created_table_identities: BTreeMap::new(),
+        catalog_output: None,
+        operation_order: Vec::new(),
+        statement_digests: Vec::new(),
+        sequence_input_oids: BTreeMap::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -412,6 +417,11 @@ fn raw_binary_table_reset_is_rejected_before_wal_claim() {
     let record = BinaryTransactionRecord {
         allocator_high_water: 1,
         catalog_commands: Vec::new(),
+        created_table_identities: BTreeMap::new(),
+        catalog_output: None,
+        operation_order: Vec::new(),
+        statement_digests: Vec::new(),
+        sequence_input_oids: BTreeMap::new(),
         table_resets: vec![BinaryTransactionTableReset {
             ordinal: 0,
             table: table.name.clone(),
@@ -462,6 +472,11 @@ fn identity_bound_row_apply_rejects_oid_and_schema_aba_before_state_changes() {
     let base = BinaryTransactionRecord {
         allocator_high_water: 2,
         catalog_commands: Vec::new(),
+        created_table_identities: BTreeMap::new(),
+        catalog_output: None,
+        operation_order: Vec::new(),
+        statement_digests: Vec::new(),
+        sequence_input_oids: BTreeMap::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::from([(

@@ -27,8 +27,8 @@ impl Engine {
                         for reset in record.table_resets {
                             tables.insert(reset.table);
                         }
-                        for command in record.catalog_commands {
-                            match command {
+                        for operation in record.catalog_commands {
+                            match operation.command {
                                 Command::CreateTable(create) => {
                                     tables.insert(create.table);
                                 }
