@@ -902,6 +902,8 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         .complete_detached_columnar_compact()
         .unwrap();
     assert_eq!(repaired.status(), &[1]);
+    assert!(repaired.all_present());
+    assert!(!repaired.has_duplicate());
 
     // Two separately valid shards may transiently expose the same visible key. Exercise the real multi-shard
     // kernel's status=3 contract directly: compact callers see the decline status, compatibility callers get a
@@ -953,6 +955,8 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         &[3],
         "the real GPU kernel declines a duplicate visible match"
     );
+    assert!(!duplicate_compact.all_present());
+    assert!(duplicate_compact.has_duplicate());
     assert_eq!(
         duplicate_resident_0
             .submit_prepared_multi_shard_i32_index_probe_dense(&duplicate_plan, &[7], 100)

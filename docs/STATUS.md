@@ -14,6 +14,44 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## Point-read performance recovery — accepted 2026-07-23
+
+- Permanent `probe-timing` instrumentation isolated the resident point kernel at roughly 10–16us and placed the
+  regression in host orchestration/generated release layout. The product release profile now uses one codegen unit.
+  The hot route also reuses the NULL-eligibility proof attached to an exact `(table, filter, projection,
+  point_route_generation)` cache entry instead of rebuilding a name set and walking every shard per batch. A miss
+  still checks every referenced device NULL layout and rechecks the table-generation token before preparation.
+  The mandatory post-D2H status-validation pass now derives `all_present` and `has_duplicate`; compact and
+  compatibility consumers reuse those summaries instead of rescanning the normal result. No SQL route, CPU
+  relational executor, CUDA ABI, kernel, synchronization, lease, or publication owner changed.
+- The actual-GPU NULL differential now warms and proves a NULL-free G0 cache hit, publishes a same-table
+  NULL-bearing G1, then proves G1 declines without reusing G0. The publication-race test also proved its
+  post-eligibility generation check non-vacuously: the intermediate implementation without that check failed the
+  test before the repaired candidate passed. The nine-test sharded-point cohort and the execution-layer dense-status
+  differential each pass three sequential plus two paired-concurrent HAZARD rounds with zero CUDA
+  700/716/717/719. Execution ordinary tests pass **52/52** with **77** ignored; engine ordinary tests pass
+  **561/561** with **582** ignored. Workspace all-target/all-feature check, affected-crate all-target/all-feature
+  strict Clippy, scoped rustfmt, and diff whitespace pass. Touched production/test files remain below mandatory
+  disposition thresholds at **1,525/1,735** lines.
+- An independent adversarial audit returned **ACCEPT** with no high- or medium-severity findings on implementation
+  diff SHA-256 `ccfde70117fcf4d08c9c3991934a0c0e89fde1fd9b578128cb90c95139695fed`; its two local
+  observations produced the compatibility scan removal and direct warmed-route NULL-generation proof above. The
+  audit also confirmed that single-codegen-unit release optimization applies to normal product artifacts rather
+  than a benchmark-only configuration.
+- The final standard report card built in fresh isolated target `benchmark-report-card.4jCVsa`, emitted all three
+  complete sections plus the end marker, and removed the target at exit. Its raw-kernel artifact is SHA-256
+  `f09f932dfbbc4431808027eaf67a95040efab111b516bc026a35a65178be8a1f` (1,119,408 bytes), its
+  production point-read artifact is SHA-256
+  `93d2b049ce65db703c957205b994bad0e83f89fd30839a76d3785e83b8742622` (9,210,096 bytes), and
+  its AWS-LC archive is SHA-256
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61`. Layer 1 `sum_i32`
+  remains healthy at **1372.9 GB/s, p50 24us** in-L2 and **1440.7 GB/s, p50 186us** out-of-L2;
+  grouped execution is **1674.6 M-elem/s**. Layer 2 production compact point reads reach
+  **263.380M/s, p50 117us** in-L2 and **233.844M/s, p50 137us** out-of-L2 after the 48M-row,
+  24,001-shard fixture builds in **2,125.6s** with zero final-residency work. Both exceed the requested
+  **230M/s** floor; against the preceding **225.418M/s/195.955M/s** card, throughput improves
+  **16.8%/19.3%**.
+
 ## PRODUCT-001 transactional CREATE VIEW envelope — accepted 2026-07-23
 
 - `CREATE VIEW` and `CREATE OR REPLACE VIEW` now enter the existing transaction-private

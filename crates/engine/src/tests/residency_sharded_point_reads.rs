@@ -504,6 +504,44 @@ fn sharded_point_batch_declines_on_null_bearing() {
         .is_some(),
         "NULL-free table: batched gather SERVES (the decline is null-specific, not always-None)"
     );
+    let cache_before = f.sharded_point_route_cache_hits();
+    assert!(
+        f.gather_sharded_int4_point_lookups_batched(
+            f.committed_seq(),
+            &tf,
+            idf,
+            &[idf, balf],
+            &[5]
+        )
+        .expect("cached NULL-free batched GPU route completed")
+        .is_some(),
+        "the exact NULL-free generation remains cache eligible"
+    );
+    assert!(
+        f.sharded_point_route_cache_hits() > cache_before,
+        "the NULL-free G0 route was warmed before same-table publication"
+    );
+    f.execute_text(3, "INSERT INTO nf (id, balance) VALUES (9,NULL)")
+        .unwrap();
+    let cache_after_warm = f.sharded_point_route_cache_hits();
+    let nullable_tf = f.relational_catalog_table("nf").unwrap();
+    assert!(
+        f.gather_sharded_int4_point_lookups_batched(
+            f.committed_seq(),
+            &nullable_tf,
+            idf,
+            &[idf, balf],
+            &[9],
+        )
+        .expect("same-table NULL generation eligibility completed")
+        .is_none(),
+        "NULL-bearing G1 cannot reuse the warmed NULL-free G0 route"
+    );
+    assert_eq!(
+        f.sharded_point_route_cache_hits(),
+        cache_after_warm,
+        "same-table generation rotation rejects the stale cached route before its NULL-free proof"
+    );
 
     // A NULL in an UNREFERENCED column must not disable the raw-i32 route: SELECT id reads only
     // the non-null key/projection column. Selecting the nullable column still declines because

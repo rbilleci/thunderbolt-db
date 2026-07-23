@@ -39,6 +39,8 @@ pub struct CudaI32DenseBatchProjection {
     values: Vec<i32>,
     projection_count: usize,
     status: Vec<u8>,
+    all_present: bool,
+    has_duplicate: bool,
 }
 
 impl CudaI32DenseBatchProjection {
@@ -51,6 +53,18 @@ impl CudaI32DenseBatchProjection {
         self.projection_count
     }
 
+    /// Summary computed during the mandatory status-validation pass after D2H. Compact engine consumers use
+    /// it instead of rescanning every needle solely to rediscover the all-present fast-path condition.
+    pub fn all_present(&self) -> bool {
+        self.all_present
+    }
+
+    /// Whether any needle observed more than one visible match. The compact engine route declines this
+    /// malformed/non-unique shape; compatibility locates the exact needle only on that rare error path.
+    pub fn has_duplicate(&self) -> bool {
+        self.has_duplicate
+    }
+
     /// Decompose into `(values, projection_count, status)`. Status values are `1` found, `2` not found, and
     /// `3` duplicate visible match / unique-route decline; compatibility maps `3` to
     /// [`CudaRuntimeProbeError::DuplicatePointReadMatch`].
@@ -59,11 +73,13 @@ impl CudaI32DenseBatchProjection {
     }
 
     fn into_compat(self) -> Result<CudaI32BatchProjectionColumns, CudaRuntimeProbeError> {
-        if let Some(needle_index) = self.status.iter().position(|status| *status == 3) {
+        if self.has_duplicate {
+            let needle_index = self
+                .status
+                .iter()
+                .position(|status| *status == 3)
+                .expect("validated dense status summary must identify its duplicate needle");
             return Err(CudaRuntimeProbeError::DuplicatePointReadMatch(needle_index));
-        }
-        if let Some(status) = self.status.iter().find(|status| !matches!(**status, 1 | 2)) {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(*status as usize));
         }
         Ok(CudaI32BatchProjectionColumns {
             values: self.values,
@@ -1427,21 +1443,33 @@ impl CudaI32IndexProbeDenseSubmission {
         }
         probe.lap("point_multi_result_host_copy");
 
-        if let Some(status) = status_bytes
-            .iter()
-            .find(|status| !matches!(**status, 1..=3))
-        {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(*status as usize));
+        let mut all_present = true;
+        let mut has_duplicate = false;
+        for &status in &status_bytes {
+            match status {
+                1 => {}
+                2 => all_present = false,
+                3 => {
+                    all_present = false;
+                    has_duplicate = true;
+                }
+                invalid => {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(invalid as usize));
+                }
+            }
         }
 
         // Return the DENSE LAYOUT as-is (NO compaction here): `values_raw` is one slot per needle (gaps) +
         // `status`. The engine's `assemble_batched_rows` compacts it in ONE sequential pass — compacting here
-        // AND letting the engine re-scatter would be two passes (measured slower than the atomic scatter). The
-        // compatibility conversion and engine assembly each validate status before consuming a slot.
+        // AND letting the engine re-scatter would be two passes (measured slower than the atomic scatter).
+        // Status is validated and summarized exactly once above; compatibility scans only when it needs the
+        // exact duplicate needle for its public error.
         let columns = CudaI32DenseBatchProjection {
             values: values_raw,
             projection_count: proj,
             status: status_bytes,
+            all_present,
+            has_duplicate,
         };
         probe.lap("point_multi_completion_frame");
         Ok((columns, elapsed_us))
@@ -1485,6 +1513,8 @@ mod validation_tests {
             values: vec![41],
             projection_count: 1,
             status: vec![3],
+            all_present: false,
+            has_duplicate: true,
         }
         .into_compat();
         assert_eq!(

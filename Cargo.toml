@@ -32,3 +32,8 @@ libloading = "0.8"
 imbl = "7"
 arc-swap = "1"
 tikv-jemallocator = "0.6"
+
+[profile.release]
+# Keep latency-critical host orchestration in one optimization/code-placement domain. The point-read report card
+# is sensitive to parallel codegen-unit layout even when the GPU kernel and source are unchanged.
+codegen-units = 1

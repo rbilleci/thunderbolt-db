@@ -15,13 +15,17 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
 - The accepted immutable implementation is base `21eb94995fb25c63e3b1647f5f8bb9b5692c7ea5`, code/test tree
   `ecf0372625a98f0b1b155eb777134c5109770170`, and code/test binary-diff SHA-256
   `b21b3b43480a5525b74c0b8ad7f43d0e30c08aa82a99861824a201c413613bc9` across 19 paths. Independent
-  product/semantics and runtime/recovery audits both returned **ACCEPT** on that exact frozen candidate; the
-  subsequent change is limited to this acceptance/status/PLAN/inventory baton.
+  product/semantics and runtime/recovery audits both returned **ACCEPT** on that exact frozen PRODUCT-001
+  candidate. The later point-read recovery changes only release code generation, exact-generation route
+  eligibility/result summaries, and their tests/docs; it adds no transaction, WAL, catalog, or publication owner.
 - Engine ordinary tests pass **561/561** with **582** GPU cases ignored; the exact six-test ordered-catalog cohort
   passes three serial plus two paired-concurrent rounds (**42/42** result groups) with zero CUDA 700/716/717/719.
-  Workspace all-target/all-feature tests, dedicated concurrency, strict Clippy, rustfmt, diff, and size gates pass.
-  The clean final report card records Layer 1 rooflines of **1313.2 GB/s, p50 26us** in-L2 and **1428.8 GB/s, p50
-  188us** out-of-L2, plus Layer 2 production point reads of **225.418M/s, p50 157us** and **195.955M/s, p50 206us**.
+  The current nine-test sharded-point and one-test dense-status GPU cohorts each pass three sequential plus two
+  paired-concurrent rounds with zero CUDA 700/716/717/719; workspace all-target/all-feature check, affected-crate
+  strict Clippy, scoped rustfmt, diff, and size gates pass. The latest clean isolated report card records Layer 1
+  rooflines of **1372.9 GB/s, p50 24us** in-L2 and **1440.7 GB/s, p50 186us** out-of-L2, plus Layer 2 production
+  point reads of **263.380M/s, p50 117us** and **233.844M/s, p50 137us**. The independently audited point-read
+  implementation diff is `ccfde70117fcf4d08c9c3991934a0c0e89fde1fd9b578128cb90c95139695fed`.
 - Earlier accepted PRODUCT-001 SQLx/simple-query, COPY, TLS/SCRAM, cancellation, prepared/portal/session,
   psql/GPU-catalog/R2DBC, PostgreSQL 16 pg_dump/restore, transaction-private catalog-generation, typed-reset, and
   ordered-catalog boundaries remain canonical. Three inherited GPU defects remain PLAN-owned with unchanged

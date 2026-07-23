@@ -317,36 +317,13 @@ impl Engine {
                 return Ok(None);
             }
         }
-        // M3-for-shards: the batched gather emits raw i32 with no validity
-        // channel, so a NULL in the FILTER or any PROJECTED column would surface as a phantom 0. NULLs in
-        // UNREFERENCED columns are irrelevant: neither the device index nor the result kernel reads those
-        // bytes. Decline iff a referenced column has a bitmap; the caller's per-query NULL-aware scan serves
-        // that shape. This metadata-only eligibility check performs no host relational decision.
-        let mut referenced_names: std::collections::BTreeSet<&str> = selected_indexes
-            .iter()
-            .filter_map(|&idx| table.columns.get(idx).map(|column| column.name.as_str()))
-            .collect();
-        let Some(filter_column) = table.columns.get(filter_idx) else {
-            return Ok(None);
-        };
-        referenced_names.insert(filter_column.name.as_str());
-        // Pin one exact shard-map publication for both NULL eligibility and route identity. Reloading inside
-        // the GPU helper would let a same-table publication introduce a NULL bitmap between the gate and
-        // descriptor capture, turning its raw placeholder zero into a phantom match/projection.
+        // Pin one exact shard-map publication for route identity and cache-miss NULL eligibility. Reloading
+        // inside the GPU helper would let a same-table publication introduce a NULL bitmap between the gate
+        // and descriptor capture, turning its raw placeholder zero into a phantom match/projection.
         let shards = self.read_state.residency.shards.load_full();
         let Some(table_shards) = shards.get(&table.name) else {
             return Ok(None);
         };
-        if table_shards.iter().any(|shard| {
-            shard
-                .resident_device_null_columns
-                .iter()
-                .any(|layout| referenced_names.contains(layout.name.as_str()))
-        }) {
-            return Ok(None);
-        }
-        #[cfg(test)]
-        self.run_sharded_point_after_eligibility_hook();
         self.gather_sharded_int4_point_lookups_batched_gpu(
             table,
             table_shards,
@@ -916,6 +893,47 @@ impl Engine {
                 .residency
                 .sharded_point_route_cache_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // M3-for-shards: the batched gather emits raw i32 with no validity channel, so a NULL in the
+            // filter or any projected column would surface as a phantom zero. The exact generation/shape
+            // route is published only after this metadata check; immutable generation identity therefore
+            // makes a cache hit a durable proof and avoids rebuilding this set plus scanning every shard on
+            // every batch. Unreferenced NULL columns are irrelevant because neither the index nor projector
+            // reads them. This metadata-only eligibility check performs no host relational decision.
+            let mut referenced_names: std::collections::BTreeSet<&str> = selected_indexes
+                .iter()
+                .filter_map(|&idx| table.columns.get(idx).map(|column| column.name.as_str()))
+                .collect();
+            let Some(filter_column) = table.columns.get(filter_idx) else {
+                return Ok(None);
+            };
+            referenced_names.insert(filter_column.name.as_str());
+            if table_shards.iter().any(|shard| {
+                shard
+                    .resident_device_null_columns
+                    .iter()
+                    .any(|layout| referenced_names.contains(layout.name.as_str()))
+            }) {
+                return Ok(None);
+            }
+            #[cfg(test)]
+            self.run_sharded_point_after_eligibility_hook();
+            // Eligibility may walk a large shard generation. A publisher that wins during that walk (or the
+            // deterministic test pause above) must make this miss transient; do not prepare or execute the
+            // captured generation after the table token changed.
+            let generation_is_current = self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(&table.name)
+                .and_then(|current| current.first())
+                .is_some_and(|current| {
+                    Arc::ptr_eq(&table_generation, &current.point_route_generation)
+                });
+            if !generation_is_current {
+                return Ok(None);
+            }
         }
         probe.lap("point_shard_route_prepare");
         let prepared_route = if let Some((_, launch_resident, plan, epoch, prepared_epoch)) =
@@ -1281,17 +1299,7 @@ impl Engine {
                     cols.status().len()
                 ))));
             }
-            if cols
-                .status()
-                .iter()
-                .any(|&status| status == 0 || status > 3)
-            {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "GPU prepared shard point-route returned an invalid/unwritten status slot"
-                        .to_string(),
-                )));
-            }
-            if cols.status().contains(&3) {
+            if cols.has_duplicate() {
                 // A cross-shard duplicate is a legitimate unique-index route decline; the general GPU scan
                 // remains the semantic authority for that malformed/non-unique shape.
                 return Ok(None);
@@ -1302,7 +1310,7 @@ impl Engine {
                     cols.projection_count()
                 ))));
             }
-            let all_present = cols.status().iter().all(|&status| status == 1);
+            let all_present = cols.all_present();
             let (raw_values, _projection_count, status) = cols.into_parts();
             let (values, needle_ranges) = if all_present {
                 // Internal compact result: dense output is already needle-ordered, so the mapping is the
