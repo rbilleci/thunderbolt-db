@@ -36,7 +36,8 @@ scripts/run_application_driver_smokes.sh
 Read/residency/result-path changes use the canonical report card:
 
 ```bash
-scripts/benchmark_report_card.sh
+scripts/benchmark_report_card.sh --quick  # development screen: Sections A+B, never acceptance evidence
+scripts/benchmark_report_card.sh --full   # frozen-candidate acceptance card: Sections A+B+C
 ```
 
 GPU tests must use bounded timeouts and serial sweeps. Never use `--gpu-reset`. Follow `AGENTS.md` for the full

@@ -80,6 +80,33 @@ Do not create `part1`/`part2` shards, catch-all modules, dependency cycles, or b
 split compile. Keep behavior changes separate from structural extraction and run the gates prescribed by the
 standard and the affected subsystem.
 
+## Development gate order
+
+Quality attaches to the exact accepted candidate, not to repeated full-card runs on intermediate repairs. Use this
+order for every independently reviewable slice:
+
+1. Use the preceding accepted comparable card as the before-baseline. Rerun the base revision only when the device,
+   driver/runtime, Rust/C toolchain, release profile, lockfile/native inputs, report-card harness, or calibrated
+   workload changed enough to make the accepted artifact non-comparable.
+2. Iterate with focused correctness/static gates, required NULL differential and HAZARD coverage, and
+   `scripts/benchmark_report_card.sh --quick` when read performance may move. Quick mode is a clean-build A+B screen;
+   it is never acceptance evidence.
+3. Freeze the candidate, run the independent read-only adversarial audit over implementation, focused gates, and
+   sabotage evidence, and repair/re-audit findings before paying for the full card. A canonical full run permits
+   staged changes but rejects unstaged or untracked files, builds an exported snapshot of the exact staged tree,
+   and invalidates itself if the candidate changes.
+4. Run `scripts/benchmark_report_card.sh --full` exactly once for the provisionally accepted candidate whenever the
+   full card is applicable. The auditor then verifies completeness, provenance, and baseline comparison before final
+   ACCEPT. A card is complete evidence, not an automatic performance verdict.
+5. Any code repair after the full card creates a new candidate. Rerun affected gates and audit; rerun the card when
+   the repair touches a read kernel, residency/layout, successful point-read route, result path, allocator/runtime
+   dependency, release/link/code-placement setting, or benchmark harness. Otherwise record why the existing card
+   remains applicable, as with a documentation-only or fail-path-only repair.
+
+Do not weaken the full card to accelerate development: keep its fresh target, both layers, both cache regimes,
+calibrated row/batch counts, exact artifact identities, GPU cool-downs, and exclusive GPU run. The speedup comes from
+screening early, auditing before Section C, reusing a comparable accepted baseline, and running the full seal once.
+
 ## Read-path performance regression benchmark (standard)
 
 There is ONE standard read-kernel benchmark; run it before/after any change that touches a
@@ -137,11 +164,11 @@ return toward the former ~3.3 GB/s / 10,106us IN-L2 / 80,271us OUT-OF-L2 behavio
 
 ### Standard benchmark report card (BOTH layers x BOTH cache regimes)
 
-The roofline above is Layer 1 only. The canonical, recurring artifact is the **report card**, which
+The roofline above is Layer 1 only. The canonical, recurring artifact is the **full report card**, which
 ALWAYS reports BOTH layers x BOTH cache regimes, p50 latency + throughput on every line:
 
 ```
-scripts/benchmark_report_card.sh        # self-manages clean build, timeouts, target cleanup + GPU cool-downs
+scripts/benchmark_report_card.sh --full # no arguments is a backward-compatible alias
 ```
 
 The card deliberately ignores an ambient `CARGO_TARGET_DIR`: Cargo native build-script fingerprints do not
@@ -151,7 +178,12 @@ examples once in a fresh `target/benchmark-report-card.*`, records host/toolchai
 for both exact binaries and the AWS-LC native archive, invokes those binaries directly for every section, and removes
 the isolated target at exit. `BENCH_TARGET_DIR` is allowed only when the caller supplies an empty, caller-owned
 directory; `BENCH_KEEP_TARGET=1` retains an automatically created target for diagnosis. Do not accept a card built
-from a shared or pre-populated target.
+from a shared or pre-populated target. The runner serializes report-card invocations with a process-wide GPU lock,
+forces the calibrated full-card workload regardless of ambient benchmark variables, requires configuration-bound
+machine-readable completion from each example, skips expensive Section C when A or B is incomplete or the candidate
+drifts, and returns nonzero for incomplete or candidate-drifted runs. Acceptance requires the final exact
+`report_card_execution_status=complete mode=full sections=A,B,C canonical=true` record; example and section
+`complete` markers alone are not acceptance evidence.
 
 - **Layer 1 -- RAW READ KERNELS** (`read_kernel_roofline`, crates/execution): emits IN-L2 (32MB/col,
   8M rows) AND OUT-OF-L2 (256MB/col, 64M rows) in ONE invocation.
@@ -168,6 +200,6 @@ each device-authoritative insert publication instead of late-converting the fini
 measured 1620.4s insert + 0.0s final residency, and the former 1200s limit expired during the build. Section C
 therefore gets `SECTION_C_TIMEOUT=2400` (Sections A/B keep 280). The INSERT-chunk size was measured
 non-helpful (250/1000/10000 all ~11 us/row -- the cost is the engine's per-row apply, not per-statement
-overhead), so the lever is the timeout, not the chunk. Tunables (env): `OUT_OF_L2_ROWS`,
-`OUT_OF_L2_BATCHES` (default 300; p50 stable there), `SECTION_{A,B,C}_TIMEOUT`, `GPU_GAP`. Never
-`--gpu-reset`.
+overhead), so the lever is the timeout, not the chunk. Full mode fixes 48M rows, 300 measured batches, and
+12-second cool-downs; operational timeout overrides can only make a section fail, not weaken its workload.
+`GPU_GAP` is a quick-screen-only diagnostic override. Never `--gpu-reset`.

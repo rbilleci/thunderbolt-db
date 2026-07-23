@@ -97,15 +97,10 @@ fn print_lat(label: &str, l: &Lat) {
 /// Load `rows` accounts (id 0..rows-1, balance derived) and make the table GPU-resident.
 /// Prints the build (INSERT-loop + residency) wall time -- at large row counts the SQL build is the
 /// dominant cost, so the report card's out-of-L2 sizing is driven by this number.
-fn build_resident_engine(rows: i64) -> Result<Engine, Box<dyn Error>> {
+fn build_resident_engine(rows: i64, chunk: i64) -> Result<Engine, Box<dyn Error>> {
     let t_build = Instant::now();
     // Rows per INSERT statement. At large row counts the SQL build dominates wall time; a bigger chunk
     // amortizes per-statement parse/txn overhead so the out-of-L2 table can be built inside the timeout.
-    let chunk: i64 = env::var("GPU_DB_BENCH_INSERT_CHUNK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&c| c > 0)
-        .unwrap_or(1000);
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
     let mut txn = 2u64;
@@ -299,6 +294,14 @@ fn parse_csv_usize(s: &str) -> Vec<usize> {
         .collect()
 }
 
+fn csv_usize(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let rows: i64 = env::var("GPU_DB_BENCH_ROWS")
         .ok()
@@ -326,6 +329,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let thread_counts = parse_csv_usize(
         &env::var("GPU_DB_BENCH_THREADS").unwrap_or_else(|_| "1,2,4,8".to_string()),
     );
+    let insert_chunk: i64 = env::var("GPU_DB_BENCH_INSERT_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(1000);
+    if rows <= 0 || batches == 0 {
+        println!(
+            "gpu_db_benchmark_status=incomplete benchmark=r2_wave_engine_ab \
+             rows={rows} measured_batches={batches} reason=invalid_workload"
+        );
+        return Ok(());
+    }
+    let batch_sizes_csv = csv_usize(&batch_sizes);
+    let thread_counts_csv = if thread_counts.is_empty() {
+        "none".to_string()
+    } else {
+        csv_usize(&thread_counts)
+    };
 
     println!(
         "# sharded point result paths  rows={rows}  batches={batch_sizes:?}  measured_batches={batches}  warmup={warmup}"
@@ -349,10 +370,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         step = (step % rows_u) + 1;
     }
 
-    let e = build_resident_engine(rows)?;
+    let e = build_resident_engine(rows, insert_chunk)?;
     let select = parse_select("SELECT id, balance FROM accounts WHERE id = 1");
     if !e.plan_relational_resident_route(&select).accepted {
         println!("rows={rows}: no GPU resident route accepted — skipping (no GPU?)");
+        println!(
+            "gpu_db_benchmark_status=incomplete benchmark=r2_wave_engine_ab rows={rows} reason=no_gpu_route"
+        );
         return Ok(());
     }
     let exec_target = format!(
@@ -470,5 +494,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    println!(
+        "gpu_db_benchmark_status=complete benchmark=r2_wave_engine_ab rows={rows} \
+         measured_batches={batches} warmup={warmup} batch_sizes={batch_sizes_csv} \
+         threads={thread_counts_csv} insert_chunk={insert_chunk}"
+    );
     Ok(())
 }

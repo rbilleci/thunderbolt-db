@@ -451,8 +451,9 @@ the final acceptance source.
 - WAL-before-visibility and `commit >= applied >= visible` monotonicity.
 - GPU execution must be non-vacuous; production relational decline/fault is fail-loud, never host fallback.
 - Relevant GPU tests use timeouts, run serially for sweeps, and never use `--gpu-reset`.
-- Read-kernel/residency/result changes run `scripts/benchmark_report_card.sh`; compare ratios, both layers,
-  and both cache regimes.
+- Read-kernel/residency/result changes may screen with `scripts/benchmark_report_card.sh --quick`, but acceptance
+  requires one frozen-candidate `--full` run after provisional audit; compare ratios, both layers, and both cache
+  regimes, then bind the independent final verdict to that exact candidate and artifact evidence.
 - Durability/HA changes include restart, torn/failing I/O, and acknowledged-commit recovery tests.
 - Documentation changes pass the single-plan audit described in `docs/README.md`.
 

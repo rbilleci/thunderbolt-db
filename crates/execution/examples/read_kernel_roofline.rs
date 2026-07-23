@@ -349,9 +349,19 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
+    if rows == 0 || rows_large == 0 || sort_n == 0 || iters == 0 || iters_large == 0 {
+        eprintln!(
+            "gpu_db_benchmark_status=incomplete benchmark=read_kernel_roofline reason=invalid_workload \
+             rows={rows} rows_large={rows_large} sort_n={sort_n} iters={iters} iters_large={iters_large}"
+        );
+        return;
+    }
 
     let Ok(runtime) = CudaDriverRuntime::probe() else {
         eprintln!("no local NVIDIA driver/GPU; skipping");
+        eprintln!(
+            "gpu_db_benchmark_status=incomplete benchmark=read_kernel_roofline reason=no_gpu"
+        );
         return;
     };
 
@@ -604,4 +614,15 @@ fn main() {
     println!("# section (1) is resident-input (kernel-clean, wall ~= kernel). gather/sort/join wall INCLUDES");
     println!("# a per-call input H2D the engine does NOT pay (inputs are device-resident); the GROUP BY line");
     println!("# shows the aggregate KERNEL (event-timed) vs its full result path.");
+    if roof_in_l2.is_some() && roof_out_l2.is_some() {
+        println!(
+            "gpu_db_benchmark_status=complete benchmark=read_kernel_roofline \
+             cache_regimes=in_l2,out_of_l2 rows={rows} rows_large={rows_large} sort_n={sort_n} \
+             iters={iters} iters_large={iters_large}"
+        );
+    } else {
+        println!(
+            "gpu_db_benchmark_status=incomplete benchmark=read_kernel_roofline reason=missing_cache_regime"
+        );
+    }
 }

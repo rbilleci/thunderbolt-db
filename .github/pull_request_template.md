@@ -20,4 +20,6 @@
 ## Validation
 - [ ] Unit tests
 - [ ] Integration tests
-- [ ] Benchmark or perf note (if execution path changed)
+- [ ] Performance applicability declared: full card, carried comparable card with rationale, or not applicable
+- [ ] `--quick` used only as a development screen, never cited as acceptance evidence
+- [ ] Applicable full-card artifact and independent final audit bind to the exact frozen candidate
