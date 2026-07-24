@@ -1,6 +1,7 @@
 .autoloop.lock
 
 target/
+.idea/
 .autoloop.summary
 
 # Python bytecode cache from scripts/ (e.g. aggregate_concurrency_runs.py)
