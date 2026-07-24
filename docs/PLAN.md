@@ -481,8 +481,9 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline had **30 files outside
 its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
 or tools over 3,000 lines. Every baseline outlier plus one subsequently crossed test threshold has a completed
-audited disposition. The standalone **STRUCT-001** queue is **zero files**; `engine_expr.rs` is the sole accepted
-registered exception. Four engine files are explicitly reopened and owned by active **PRODUCT-001** below;
+audited disposition. The standalone **STRUCT-001** queue is **zero files**; under the comment-excluded count in
+`CODE_SIZE.md`, `engine_expr.rs` no longer requires an exception. Four engine files are explicitly reopened and
+owned by active **PRODUCT-001** below;
 `engine_commit.rs` was already oversized at the accepted typed-reset base, while the other three crossed later. They
 are not a hidden STRUCT queue or accepted exceptions.
 

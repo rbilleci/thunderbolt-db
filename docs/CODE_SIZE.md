@@ -8,9 +8,13 @@ Line count is therefore an analysis trigger, not a license to split cohesive cod
 
 ## Size envelopes
 
-Count physical lines in tracked, human-maintained source files. Rust, PTX, CUDA/C/C++, Python, shell, JavaScript,
-and TypeScript are in scope. Markdown, lockfiles, vendored dependencies, build output, and machine-generated source
-are not. A generated file must be reproducible and clearly identified before it is excluded.
+Count physical lines in tracked, human-maintained source files, excluding comment-only lines. A comment-only line
+contains no source code other than a language's comment syntax and whitespace; this includes documentation comments
+and every line in a multi-line comment. A line that contains source code and an inline or trailing comment still
+counts, and blank lines still count. Use a language-aware counter so comment markers inside strings are not treated
+as comments. Rust, PTX, CUDA/C/C++, Python, shell, JavaScript, and TypeScript are in scope. Markdown, lockfiles,
+vendored dependencies, build output, and machine-generated source are not. A generated file must be reproducible and
+clearly identified before it is excluded.
 
 | File class | Preferred envelope | Required analysis | Critical outlier |
 |---|---:|---:|---:|
@@ -32,8 +36,9 @@ disposition.
 
 For every file outside the envelope:
 
-1. **Confirm the count and class.** Separate production, test, example/benchmark, tool, generated, vendored, and
-   archived code. Do not exempt a handwritten generator merely because its output is generated.
+1. **Confirm the policy count and class.** Exclude comment-only lines as defined above, then separate production,
+   test, example/benchmark, tool, generated, vendored, and archived code. Do not exempt a handwritten generator
+   merely because its output is generated.
 2. **Map responsibilities.** Inventory major types, functions, traits, tests, embedded kernels, and initialization
    sections. State the invariant each cluster owns and identify sections that change together.
 3. **Map coupling.** Record callers, imports, re-exports, feature gates, shared state, unsafe boundaries, generated
@@ -82,11 +87,11 @@ Add accepted exceptions to the table below. An exception records a current archi
 any proposed remediation belongs in `PLAN.md`. Re-review an exception when the file grows by 20%, gains a new
 responsibility, changes its public boundary, or reaches the stated trigger.
 
-| File | Class and current size | Cohesion rationale | Boundary that must remain intact | Re-review trigger |
-|---|---:|---|---|---|
-| `crates/engine/src/engine_expr.rs` | Production, 2,403 lines | After all independently stable contracts and execution phases moved to bounded leaves, the root contains exactly one cohesive resident SELECT/grouped GPU orchestration function | Keep group-key planning, derived device-buffer ownership, pass construction/execution, cross-pass alignment, and grouped result/HAVING framing together; ordinary SELECT terminal framing is isolated in bounded leaves without detaching grouped lifetime guards | Growth by 20% (~2,884 lines), a second production responsibility or method family, a stable grouped-pass contract, public-boundary change, or 5,000 lines |
+There are currently no accepted exceptions. Under the comment-excluded count, `crates/engine/src/engine_expr.rs`
+has 1,926 counted lines (2,403 physical lines less 477 comment-only lines), so its former exception is no longer
+needed. Its completed historical disposition remains in `PLAN.md` and `STATUS.md`.
 
-## Inventory command
+## Candidate inventory command
 
 Run from the repository root:
 
@@ -97,5 +102,7 @@ git ls-files -z -- '*.rs' '*.ptx' '*.cu' '*.cuh' '*.c' '*.h' '*.hpp' '*.cc' '*.c
   | sort -nr
 ```
 
-Review classifications manually. The command deliberately reports archived and generated candidates so they
-must prove their provenance rather than disappearing silently from the audit.
+This command is a raw physical-line screen only; it deliberately overcounts comments and must not be used to decide
+whether a file crosses a limit. Confirm policy counts with a language-aware counter, then review classifications
+manually. The screen deliberately reports archived and generated candidates so they must prove their provenance
+rather than disappearing from the audit.
