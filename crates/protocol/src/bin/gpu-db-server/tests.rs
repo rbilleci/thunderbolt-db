@@ -85,6 +85,42 @@ fn error_field_value(payload: &[u8], field_tag: u8) -> Option<String> {
     None
 }
 
+#[test]
+fn legacy_server_refuses_sequence_restart_without_mutating_its_host_catalog() {
+    let mut session = Session::default();
+    session.sequences.insert(
+        "legacy_sequence".to_string(),
+        Sequence {
+            oid: FIRST_USER_RELATION_OID,
+            name: "legacy_sequence".to_string(),
+            last_value: 9,
+            is_called: true,
+        },
+    );
+    let (mut writer, mut reader) = tcp_pair();
+
+    execute_statement(
+        &mut writer,
+        &mut session,
+        "ALTER SEQUENCE legacy_sequence RESTART WITH 41",
+        true,
+    )
+    .unwrap();
+
+    let messages = read_backend_messages(&mut reader, 1);
+    assert_eq!(messages[0].0, b'E');
+    assert_eq!(
+        error_field_value(&messages[0].1, b'C').as_deref(),
+        Some("0A000")
+    );
+    assert_eq!(
+        error_field_value(&messages[0].1, b'M').as_deref(),
+        Some("ALTER SEQUENCE RESTART is not supported by the legacy compatibility server")
+    );
+    let sequence = &session.sequences["legacy_sequence"];
+    assert_eq!((sequence.last_value, sequence.is_called), (9, true));
+}
+
 fn test_table(name: &str, rows: Vec<Vec<SqlValue>>) -> Table {
     Table {
         oid: FIRST_USER_RELATION_OID,

@@ -915,7 +915,9 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
             Err(error) => error,
             Ok(_) => panic!("an exact concurrent retry must not queue a second transaction"),
         };
-    assert!(exact_pending.to_string().contains("already pending"));
+    assert!(exact_pending
+        .to_string()
+        .contains("is pending in canonical mutation admission"));
     let mismatch_pending =
         match engine.submit_covered_insert_intent(pending_txn, &route, &[550_001, 1]) {
             Err(error) => error,

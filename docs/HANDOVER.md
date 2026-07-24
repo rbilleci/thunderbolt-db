@@ -6,46 +6,45 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
 
 ## Current boundary
 
-- **PRODUCT-001** now has an independently accepted transactional-index boundary. `CREATE INDEX`,
-  `ALTER INDEX ... RENAME TO ...`, and ordered multi-target `DROP INDEX [IF EXISTS]` share the existing private
-  `TransactionOperation` stream and sole WAL/publication owner. Complete table/index/OID/key/uniqueness/dependency
-  identity, private DML maintenance, GPU-only hot/cold validation, residency/accounting, rollback, isolation/ABA,
-  retry, and recovery semantics are proven. Additive opcodes 16/17 preserve legacy bytes; the typed current/legacy
-  epoch closes shared `pg_class` collisions without admitting transactional materialized-view or other catalog
-  families.
-- The audited code/test seal is base `c098b8471177519c01ef3743f7dc3c3d08b85f8f`, tree
-  `2613b26bd0b2f35e5bface7538ad83b860e38599`, and cached binary-diff SHA-256
-  `e034c830ec0eec1aafe720f227697aab524579e84ad8cc34d5d00bc94ecd11fc` across 76 paths. The implementation
-  audit returned **ACCEPT** after repairs. Workspace tests and strict static gates pass; the 20-test NULL/index/
-  accounting/grouped HAZARD cohort passed three serial plus two paired-concurrent rounds (**140/140**) without CUDA
-  700/716/717/719. The exact-seal quick card completed A/B with stable out-of-L2 roofline, grouped, and point-read
-  results.
-- The first documentation-inclusive full invocation completed A/B and built all 48M Section-C rows in **2304.0s**
-  with **0.0s** final residency, then returned incomplete at the default **2400s** operational timeout before
-  measurements. Paired current-toolchain 8M runs are effectively flat: candidate **95.4s/100.60s** build/total
-  versus accepted base **95.0s/100.30s**. The incomplete attempt is retained as evidence and must never be called
-  acceptance.
-- The independently re-audited documentation-only retry candidate is tree `2497b5fd00da8bee39f583a818e32e1da6952222`
-  with cached binary-diff SHA-256 `736653b742aed8be067f9623764ad9226694983f3448f50d2d754bffcdbb8575`.
-  Its one full invocation used the supported 2,700s operational timeout with every calibrated workload, cache,
-  cool-down, source, and fresh-build control fixed. The exact A/B/C canonical completion marker is present.
-  Out-of-L2 raw/grouped throughput is **1423.1 GB/s/1674.2 M-elem/s**; production point reads are
-  **264.394M/s, p50 118us** in-L2 and **244.127M/s, p50 140us** out-of-L2. No material regression is present.
-- Post-card provenance/performance audit returned **ACCEPT** on documentation closeout tree `c1d4b657...` /
-  cached binary-diff SHA-256 `5ab129cd...`, including artifact/configuration/marker provenance and docs-only card
-  applicability.
-- Earlier accepted PRODUCT-001 SQLx/simple-query, COPY, TLS/SCRAM, cancellation, prepared/portal/session,
-  psql/GPU-catalog/R2DBC, PostgreSQL 16 pg_dump/restore, transaction-private catalog-generation, typed-reset, and
-  ordered-catalog/view-lifecycle boundaries remain canonical. Three inherited GPU defects remain PLAN-owned with
-  unchanged signatures. The current source outliers are PLAN-owned `engine_dml_concurrent.rs` at **2,172** lines,
-  `engine_commit.rs` at **2,228**, and `engine_mutation_admission.rs` at **2,010**; none has an exception.
+- **PRODUCT-001** has a verified transactional-sequence candidate. `CREATE SEQUENCE`,
+  `ALTER SEQUENCE ... RESTART`, rename, ordered multi-target drop, and owned-sequence
+  `TRUNCATE ... RESTART IDENTITY` share the existing private `TransactionOperation` stream and sole
+  WAL/publication owner. Stable OIDs bind lifecycle, dependent defaults, DML advances, restart/reset barriers, and
+  recovery; additive opcodes 18/19 preserve opcode 4–17 bytes. Materialized views remain pre-effect refusal, and the
+  legacy host-backed server refuses sequence restart with `0A000`.
+- Ordinary/static gates are green: engine ordinary is **630/630** with **602** ignored. The complete
+  include-ignored engine sweep passes **1,229/1,232** and retains only
+  the three explicitly PLAN-owned base failures. Sequence NULL/lifecycle plus exact-budget publication each pass
+  three serial and two simultaneous HAZARD executions without CUDA 700/716/717; reset-before-rename and
+  generated-creator binding pass the same matrix. Non-vacuous restart sabotage fails `(24,false)` versus
+  `(23,false)`; stale reset dependencies/root proof and both generated-OID swap forms also fail before their
+  restored candidates and recovery pass. The repaired quick screen is flat:
+  out-of-L2 roofline/grouped **1440.7 GB/s/1675.9 M-elem/s** and in-L2 production point reads
+  **262.858M/s, p50 118us** versus the accepted **264.394M/s, p50 118us** baseline.
+- The first exact-tree audit rejected legacy replay drift, generated-SERIAL rename binding by final name, and
+  stable-value-only opcode-18 ownership. Each regression failed before repair and now passes: historical raw SQL
+  retains acknowledged defaults, generated sequences close by captured stable OID across rename, and opcodes 18/19
+  require a lifecycle/reset owner. The audit follow-up replaced a vacuous V2 post-boundary fixture with a genuine
+  V1 canonical record; complete/split rename/drop dependency coverage passes and current-policy sabotage fails. Two
+  later findings are repaired: a reset staged before owned-sequence rename now rebinds only its final output proof
+  under unchanged stable OID/dependency closure while preserving its reset ordinal, and generated SERIAL output is
+  cross-linked to each CREATE ordinal at encode/decode/apply plus creator-local stepwise replay.
+  Exact-tree implementation re-audit returned **ACCEPT**. The one canonical full A/B/C report card also completed
+  with final marker `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`: Layer 1 is
+  **1319.9/1442.8 GB/s** in/out of L2 with **1674.2 M-elem/s** grouped, and Layer 2 is
+  **260.853M/s, p50 117us** in-L2 plus **236.360M/s, p50 140us** out-of-L2 after the 48M-row fixture built in
+  **2243.6s**. Same-auditor post-card provenance/performance verification returned **ACCEPT** with no finding and
+  no rerun required on docs-closeout tree `a0d6a83a…` / diff `9c79c501…`.
+  Bounded roots include `wal_binary.rs` at **1,959**, `engine_transaction_catalog.rs` at **1,932**, and
+  `engine_durability.rs` at **1,962**; reset rebind is a **155**-line private owner.
+  Existing PLAN-owned source outliers are `engine_dml_concurrent.rs` at **2,175**,
+  `engine_commit.rs` at **2,244**, and `engine_mutation_admission.rs` at **2,010**; none has an exception.
 
 ## Resume here
 
-After landing, resume **PRODUCT-001** only at the PLAN current-focus boundary: any later transactional catalog
-family is a separately scoped slice with complete typed identity/dependency semantics; materialized views remain a
-pre-effect refusal at this boundary. Then close the PLAN-ordered SQLSTATE/type-codec, named-client, and
-mixed-recovery proofs. Only after those proofs are independently accepted should the legacy/P8
-compatibility-and-deletion slice re-inventory, migrate, or disposition the remaining psql/preflight/benchmark
-consumers and delete the legacy listener plus independently callable P8 protocol adapters in the same frozen,
-independently audited slice.
+After this candidate lands, resume **PRODUCT-001** at the PLAN-owned ordinary published-sequence boundary:
+`nextval`, sequence-backed defaults, and both `setval` forms on an unchanged published identity need one typed,
+exactly-once `SequenceValueTransition` that survives enclosing user rollback and preserves stable-identity retry,
+recovery, and `currval` semantics. Do not fold private CREATE/RESTART children into that transition. Materialized
+views remain a pre-effect refusal. Then close the PLAN-ordered SQLSTATE/type-codec, named-client, and mixed-recovery
+proofs before the legacy/P8 compatibility-and-deletion slice.

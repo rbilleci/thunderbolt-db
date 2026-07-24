@@ -65,7 +65,7 @@ impl Engine {
         account.retain(|_, bytes| *bytes != 0);
     }
 
-    fn active_transaction_commit_gpu_credit(gpu_id: u16) -> u64 {
+    pub(super) fn active_transaction_commit_gpu_credit(gpu_id: u16) -> u64 {
         TRANSACTION_COMMIT_GPU_CREDIT.with(|credits| {
             credits
                 .borrow()

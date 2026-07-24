@@ -1324,10 +1324,7 @@ fn repeatable_read_late_access_keeps_its_catalog_root_across_metadata_churn() {
         .submit_transaction(600, parsed("CREATE TABLE rr_catalog_anchor (id int4)"))
         .unwrap();
     engine
-        .submit_transaction(
-            601,
-            parsed("CREATE TABLE rr_catalog_target (id int4 PRIMARY KEY)"),
-        )
+        .submit_transaction(601, parsed("CREATE TABLE rr_catalog_target (id int4)"))
         .unwrap();
     engine
         .submit_transaction(602, parsed("INSERT INTO rr_catalog_anchor VALUES (1)"))
@@ -1353,10 +1350,7 @@ fn repeatable_read_late_access_keeps_its_catalog_root_across_metadata_churn() {
         )
         .unwrap();
     engine
-        .submit_transaction(
-            606,
-            parsed("CREATE TABLE rr_catalog_target (id int4 PRIMARY KEY)"),
-        )
+        .submit_transaction(606, parsed("CREATE TABLE rr_catalog_target (id int4)"))
         .unwrap();
     engine
         .submit_transaction(607, parsed("INSERT INTO rr_catalog_target VALUES (99)"))

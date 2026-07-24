@@ -17,6 +17,167 @@ fn operation_payload(record: &gpu_db_wal::WalRecord) -> Arc<[u8]> {
     Engine::decode_engine_operation(&operation.body).unwrap()
 }
 
+fn two_serial_create_record() -> BinaryTransactionRecord {
+    let engine = Engine::new_local();
+    engine.submit_transaction(1_090, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(
+            1_090,
+            parsed("CREATE TABLE serial_creator_a (id SERIAL PRIMARY KEY)"),
+        )
+        .unwrap();
+    engine
+        .submit_transaction(
+            1_090,
+            parsed("CREATE TABLE serial_creator_b (id SERIAL PRIMARY KEY)"),
+        )
+        .unwrap();
+    engine.submit_transaction(1_090, parsed("COMMIT")).unwrap();
+    let payload = operation_payload(engine.durable_wal_records().last().unwrap());
+    let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
+        panic!("two SERIAL creates must use typed transaction WAL");
+    };
+    record
+}
+
+fn replace_first_named_oid(payload: &mut [u8], name: &str, old_oid: u32, new_oid: u32) {
+    let mut needle = Vec::with_capacity(2 + name.len() + 4);
+    needle.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    needle.extend_from_slice(name.as_bytes());
+    needle.extend_from_slice(&old_oid.to_le_bytes());
+    let offset = payload
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .unwrap_or_else(|| panic!("encoded record has no identity for {name:?}"));
+    let oid_offset = offset + 2 + name.len();
+    payload[oid_offset..oid_offset + 4].copy_from_slice(&new_oid.to_le_bytes());
+}
+
+#[test]
+fn ordered_generated_sequence_output_rejects_statement_input_contradiction() {
+    let record = two_serial_create_record();
+    let first_name = "serial_creator_a_id_seq";
+    let second_name = "serial_creator_b_id_seq";
+    let first_oid = record
+        .catalog_output
+        .as_ref()
+        .unwrap()
+        .created_sequence_oids[first_name];
+    let second_oid = record
+        .catalog_output
+        .as_ref()
+        .unwrap()
+        .created_sequence_oids[second_name];
+
+    let mut contradictory = record.clone();
+    contradictory
+        .catalog_output
+        .as_mut()
+        .unwrap()
+        .created_sequence_oids
+        .insert(first_name.to_string(), second_oid);
+    contradictory
+        .catalog_output
+        .as_mut()
+        .unwrap()
+        .created_sequence_oids
+        .insert(second_name.to_string(), first_oid);
+    assert!(
+        try_encode_binary_transaction(&contradictory).is_none(),
+        "encoder admitted generated-sequence output OIDs that contradict their CREATE ordinals"
+    );
+
+    let mut encoded = try_encode_binary_transaction(&record).unwrap();
+    replace_first_named_oid(&mut encoded, first_name, first_oid, second_oid);
+    replace_first_named_oid(&mut encoded, second_name, second_oid, first_oid);
+    let error = match decode_binary_record(&encoded) {
+        Ok(_) => panic!("decoder accepted contradictory generated-sequence output OIDs"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("generated-sequence"),
+        "decoder accepted contradictory generated-sequence output OIDs: {error}"
+    );
+
+    let target = Engine::new_local();
+    let before = target.catalog_snapshot();
+    let mut catalog = target.ddl_catalog().clone();
+    let entry = LogEntry {
+        term: 1,
+        index: 1,
+        payload: Arc::from(&b""[..]),
+    };
+    let error = target
+        .apply_binary_transaction_record(&entry, &mut catalog, contradictory)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("generated sequence"),
+        "direct apply accepted contradictory generated-sequence output OIDs: {error}"
+    );
+    let after = Engine::catalog_snapshot_from_working(&catalog, before.commit_seq);
+    assert!(after.same_contents(before.as_ref()));
+}
+
+#[test]
+fn ordered_generated_sequence_replay_rejects_creator_assignment_drift() {
+    let record = two_serial_create_record();
+    let first_name = "serial_creator_a_id_seq";
+    let second_name = "serial_creator_b_id_seq";
+    let first_oid = record
+        .catalog_output
+        .as_ref()
+        .unwrap()
+        .created_sequence_oids[first_name];
+    let second_oid = record
+        .catalog_output
+        .as_ref()
+        .unwrap()
+        .created_sequence_oids[second_name];
+
+    let mut swapped = record;
+    swapped
+        .catalog_output
+        .as_mut()
+        .unwrap()
+        .created_sequence_oids
+        .insert(first_name.to_string(), second_oid);
+    swapped
+        .catalog_output
+        .as_mut()
+        .unwrap()
+        .created_sequence_oids
+        .insert(second_name.to_string(), first_oid);
+    swapped
+        .sequence_input_oids
+        .insert((0, first_name.to_string()), second_oid);
+    swapped
+        .sequence_input_oids
+        .insert((1, second_name.to_string()), first_oid);
+    let encoded = try_encode_binary_transaction(&swapped)
+        .expect("internally consistent tamper must reach the replay identity proof");
+    let BinaryWalRecord::Transaction(swapped) = decode_binary_record(&encoded).unwrap() else {
+        panic!("internally consistent tamper must remain a transaction record");
+    };
+
+    let target = Engine::new_local();
+    let before = target.catalog_snapshot();
+    let mut catalog = target.ddl_catalog().clone();
+    let entry = LogEntry {
+        term: 1,
+        index: 1,
+        payload: Arc::from(&b""[..]),
+    };
+    let error = target
+        .apply_binary_transaction_record(&entry, &mut catalog, swapped)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("creator"),
+        "replay accepted generated sequence OIDs assigned to the wrong creators: {error}"
+    );
+    let after = Engine::catalog_snapshot_from_working(&catalog, before.commit_seq);
+    assert!(after.same_contents(before.as_ref()));
+}
+
 #[test]
 fn ordered_catalog_multiple_create_binds_typed_identity_retry_and_replay() {
     let engine = Engine::new_local();

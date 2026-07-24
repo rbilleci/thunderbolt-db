@@ -323,6 +323,7 @@ pub(crate) struct StagedTableReset {
     pub(crate) catalog_dependencies: BTreeMap<String, RelationalTable>,
     pub(crate) foreign_key_dependencies: BTreeSet<String>,
     pub(crate) dependency_identities: BTreeMap<String, u32>,
+    pub(crate) sequence_reset_identity: Option<BinaryTransactionSequenceResetOperationIdentity>,
 }
 
 /// Bind exact-retry identity to the admitted typed command rather than to its final relational
@@ -353,6 +354,10 @@ pub(crate) fn transaction_statement_digest(
 #[derive(Debug, Clone)]
 pub(crate) struct StagedRowOperation {
     pub(crate) statement_digest: gpu_db_wal::CanonicalDigest,
+    /// Stable sequence identity resolved in this statement's private catalog generation. Names
+    /// may be renamed or reused later in the same transaction, so ordered WAL binding must never
+    /// recover these identities from the final name map.
+    pub(crate) sequence_input_oids: BTreeMap<String, u32>,
     pub(crate) delta: WriteDelta,
 }
 
@@ -674,6 +679,10 @@ pub(crate) struct TransactionDeltaState {
     /// statement seeds its pure `nextval` scratch here, so values advance across private statements
     /// without mutating the published catalog before COMMIT.
     pub(crate) sequence_state: BTreeMap<String, (i64, bool)>,
+    /// Stable-ID mirror of `sequence_state` used by transactional sequence lifecycle. The legacy
+    /// name map remains for byte-compatible row-only records; lifecycle statements can rename or
+    /// reuse a binding, so their private value state is authoritative only through this map.
+    pub(crate) sequence_state_by_oid: BTreeMap<u32, (i64, bool)>,
     /// Exact published catalog generation beneath every ordered private catalog operation.
     /// Catalog operations themselves live in `operations`, so mixed DDL/DML/reset programs retain
     /// one statement-order authority rather than maintaining a parallel command stream.
@@ -698,6 +707,11 @@ pub(crate) struct StagedCatalogCommand {
     pub(crate) index_epoch_transition: bool,
     pub(crate) view_identity: Option<BinaryTransactionViewLifecycleOperationIdentity>,
     pub(crate) index_identity: Option<BinaryTransactionIndexLifecycleOperationIdentity>,
+    pub(crate) sequence_identity: Option<BinaryTransactionSequenceLifecycleOperationIdentity>,
+    /// Exact sequence defaults resolved by this command in its own private catalog generation.
+    /// CREATE TABLE may create an implicit sequence while applying, so these identities are
+    /// captured from the command postimage instead of being re-resolved from the final catalog.
+    pub(crate) sequence_input_oids: BTreeMap<String, u32>,
 }
 
 impl Drop for TransactionSnapshot {

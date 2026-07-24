@@ -9,7 +9,22 @@ use crate::engine_mutation_admission::validate_prepared_catalog_version;
 
 mod index_identity;
 mod index_owner_generation;
+mod reset_rebind;
+mod sequence_identity;
 mod view_identity;
+
+#[derive(Clone, Copy)]
+pub(crate) struct TransactionCatalogEnvelopeSlices<'a> {
+    pub(crate) view_operations: &'a [BinaryTransactionViewOperationIdentity],
+    pub(crate) view_lifecycle_operations: &'a [BinaryTransactionViewLifecycleOperationIdentity],
+    pub(crate) index_lifecycle_operations: &'a [BinaryTransactionIndexLifecycleOperationIdentity],
+    pub(crate) sequence_lifecycle_operations:
+        &'a [BinaryTransactionSequenceLifecycleOperationIdentity],
+    pub(crate) sequence_reset_operations: &'a [BinaryTransactionSequenceResetOperationIdentity],
+    pub(crate) operation_order: &'a [BinaryTransactionOperationIdentity],
+    pub(crate) catalog_output: Option<&'a BinaryTransactionCatalogOutput>,
+    pub(crate) sequence_input_oids: &'a BTreeMap<(u32, String), u32>,
+}
 
 impl Engine {
     pub(crate) fn execute_catalog_in_transaction(
@@ -56,7 +71,7 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         if !Self::transaction_catalog_command_is_supported(&command) {
             return Err(ExecuteError::Unsupported(
-                "transactional catalog staging currently supports CREATE TABLE, stored-view lifecycle, and index lifecycle commands only"
+                "transactional catalog staging currently supports CREATE TABLE, stored-view lifecycle, index lifecycle, and sequence lifecycle commands only"
                     .to_string(),
             ));
         }
@@ -101,13 +116,14 @@ impl Engine {
             validate_prepared_catalog_version(expected, snapshot.catalog.commit_seq)?;
         }
 
-        let (generation, prior_commands, prior_overlay, prior_base) = {
+        let (generation, prior_operations, prior_commands, prior_overlay, prior_base) = {
             let delta = snapshot
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
                 delta.generation,
+                delta.operations.clone(),
                 delta
                     .operations
                     .iter()
@@ -120,7 +136,16 @@ impl Engine {
                 delta.catalog_base.clone(),
             )
         };
-        if !prior_commands.is_empty() && (prior_overlay.is_none() || prior_base.is_none()) {
+        let prior_has_sequence_reset = prior_operations.iter().any(|operation| {
+            matches!(
+                operation,
+                TransactionOperation::TableReset(reset)
+                    if reset.sequence_reset_identity.is_some()
+            )
+        });
+        if (!prior_commands.is_empty() || prior_has_sequence_reset)
+            && (prior_overlay.is_none() || prior_base.is_none())
+        {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "transactional catalog operation envelope lost its base or private overlay"
                     .to_string(),
@@ -151,6 +176,28 @@ impl Engine {
                 self.validate_transaction_unique_index_owner_generation(snapshot, create)?;
             }
         }
+        if command_is_sequence_lifecycle(&command) {
+            let access_catalog = prior_overlay
+                .as_deref()
+                .unwrap_or(snapshot.catalog.as_ref());
+            let names = match &command {
+                Command::CreateSequence(_) => Vec::new(),
+                Command::SequenceRestart(restart) => vec![restart.name.as_str()],
+                Command::RenameSequence(rename) => vec![rename.old_name.as_str()],
+                Command::DropSequence(drop) => drop.names.iter().map(String::as_str).collect(),
+                _ => unreachable!("sequence lifecycle classifier checked above"),
+            };
+            let identities = names
+                .into_iter()
+                .filter_map(|name| {
+                    access_catalog
+                        .relational_sequences
+                        .get(name)
+                        .map(|sequence| sequence.oid)
+                })
+                .collect::<BTreeSet<_>>();
+            snapshot.table_access.acquire_exclusive(identities)?;
+        }
 
         // Validation works on a private clone. The exact published base must still match the
         // statement snapshot; otherwise retryable serialization wins before any private state is
@@ -165,7 +212,20 @@ impl Engine {
         }
         on_catalog_latched();
         let mut working = catalog_guard.clone();
-        for staged in &prior_commands {
+        for operation in &prior_operations {
+            let TransactionOperation::Catalog(staged) = operation else {
+                if let TransactionOperation::TableReset(reset) = operation {
+                    if let Some(identity) = &reset.sequence_reset_identity {
+                        Self::apply_transaction_sequence_reset_identity(
+                            &mut working,
+                            snapshot.catalog.commit_seq,
+                            identity,
+                        )
+                        .map_err(ExecuteError::Engine)?;
+                    }
+                }
+                continue;
+            };
             let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
             if let Some(identity) = &staged.view_identity {
                 Self::validate_transaction_view_before(&scoped, &staged.command, identity)
@@ -173,6 +233,10 @@ impl Engine {
             }
             if let Some(identity) = &staged.index_identity {
                 Self::validate_transaction_index_before(&scoped, &staged.command, identity)
+                    .map_err(ExecuteError::Engine)?;
+            }
+            if let Some(identity) = &staged.sequence_identity {
+                Self::validate_transaction_sequence_before(&scoped, &staged.command, identity)
                     .map_err(ExecuteError::Engine)?;
             }
             self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
@@ -198,6 +262,16 @@ impl Engine {
             } else if command_is_index_lifecycle(&staged.command) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "transactional index operation lost its typed identity closure".to_string(),
+                )));
+            }
+            if let Some(identity) = &staged.sequence_identity {
+                let applied =
+                    Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+                Self::validate_transaction_sequence_after(&applied, &staged.command, identity)
+                    .map_err(ExecuteError::Engine)?;
+            } else if command_is_sequence_lifecycle(&staged.command) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transactional sequence operation lost its typed identity closure".to_string(),
                 )));
             }
         }
@@ -226,6 +300,12 @@ impl Engine {
         if let Command::CreateIndex(create) = &command {
             self.validate_transaction_create_index_device(snapshot, &overlay, create)?;
         }
+        let rebound_resets = self.rebind_transaction_table_reset_outputs(
+            &prior_operations,
+            &scoped,
+            &overlay,
+            &command,
+        )?;
 
         let mut delta = snapshot
             .delta
@@ -269,12 +349,130 @@ impl Engine {
         } else {
             None
         };
+        let sequence_identity = if command_is_sequence_lifecycle(&command) {
+            Some(Self::transaction_sequence_operation_identity(
+                command_index,
+                ordinal,
+                &scoped,
+                &overlay,
+                &command,
+            )?)
+        } else {
+            None
+        };
+        let sequence_input_oids = match &command {
+            Command::CreateTable(create) => create
+                .columns
+                .iter()
+                .filter_map(|column| match &column.default {
+                    Some(ColumnDefault::SequenceNextVal { sequence, .. }) => Some(sequence),
+                    _ => None,
+                })
+                .map(|name| {
+                    overlay
+                        .relational_sequences
+                        .get(name)
+                        .map(|sequence| (name.clone(), sequence.oid))
+                        .ok_or_else(|| {
+                            ExecuteError::Serialization(format!(
+                                "transaction catalog sequence input \"{name}\" left its command postimage"
+                            ))
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?,
+            _ => BTreeMap::new(),
+        };
         if let Command::CreateTable(create) = &command {
             let mut resident_shards = delta.resident_shards.as_ref().clone();
             resident_shards.entry(create.table.clone()).or_default();
             delta.publish_resident_shards(Arc::new(resident_shards));
+            for (name, oid) in &sequence_input_oids {
+                if create.columns.iter().any(|column| {
+                    matches!(
+                        &column.default,
+                        Some(ColumnDefault::SequenceNextVal {
+                            sequence,
+                            create_if_missing: true,
+                        }) if sequence == name
+                    )
+                }) {
+                    delta.sequence_state.insert(name.clone(), (1, false));
+                    delta.sequence_state_by_oid.insert(*oid, (1, false));
+                }
+            }
         }
-        if prior_commands.is_empty() {
+        match &command {
+            Command::CreateSequence(create) => {
+                let sequence = overlay
+                    .relational_sequences
+                    .get(&create.name)
+                    .expect("CREATE SEQUENCE postimage contains its target");
+                delta.sequence_state.insert(
+                    create.name.clone(),
+                    (sequence.last_value, sequence.is_called),
+                );
+                delta
+                    .sequence_state_by_oid
+                    .insert(sequence.oid, (sequence.last_value, sequence.is_called));
+            }
+            Command::SequenceRestart(restart) => {
+                let sequence = overlay
+                    .relational_sequences
+                    .get(&restart.name)
+                    .expect("SEQUENCE RESTART postimage contains its target");
+                delta.sequence_state.insert(
+                    restart.name.clone(),
+                    (sequence.last_value, sequence.is_called),
+                );
+                delta
+                    .sequence_state_by_oid
+                    .insert(sequence.oid, (sequence.last_value, sequence.is_called));
+            }
+            Command::RenameSequence(rename) => {
+                if let Some(state) = delta.sequence_state.remove(&rename.old_name) {
+                    delta.sequence_state.insert(rename.new_name.clone(), state);
+                }
+            }
+            Command::DropSequence(_) => {
+                if let Some(identity) = &sequence_identity {
+                    for target in &identity.targets {
+                        delta.sequence_state.remove(&target.before_name);
+                        if let Some(after_name) = &target.after_name {
+                            delta.sequence_state.remove(after_name);
+                        }
+                        if let Some(target_before) = &target.target_before {
+                            delta.sequence_state_by_oid.remove(&target_before.oid);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let rebind_owners = delta
+            .operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    TransactionOperation::TableReset(reset)
+                        if rebound_resets.contains_key(&reset.ordinal)
+                )
+            })
+            .count();
+        if rebind_owners != rebound_resets.len() {
+            return Err(ExecuteError::Serialization(
+                "transaction reset output rebind lost its statement owner".to_string(),
+            ));
+        }
+        for operation in &mut delta.operations {
+            let TransactionOperation::TableReset(reset) = operation else {
+                continue;
+            };
+            if let Some(rebound) = rebound_resets.get(&reset.ordinal) {
+                *reset = Arc::new(rebound.clone());
+            }
+        }
+        if delta.catalog_base.is_none() {
             delta.catalog_base = Some(Arc::clone(&snapshot.catalog));
         }
         delta.catalog_overlay = Some(overlay);
@@ -288,6 +486,8 @@ impl Engine {
                     index_epoch_transition,
                     view_identity,
                     index_identity,
+                    sequence_identity,
+                    sequence_input_oids,
                 },
             )));
         delta.generation = delta.generation.saturating_add(1);
@@ -310,6 +510,10 @@ mod view_lifecycle_tests;
 #[cfg(test)]
 #[path = "engine_transaction_catalog/index_lifecycle_tests.rs"]
 mod index_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "engine_transaction_catalog/sequence_lifecycle_tests.rs"]
+mod sequence_lifecycle_tests;
 
 #[cfg(test)]
 #[path = "engine_transaction_catalog/index_owner_generation_tests.rs"]
@@ -961,9 +1165,10 @@ mod tests {
         assert_eq!(engine.durable_wal_records().len(), wal_before);
         assert!(engine.transaction_snapshot_handle(354).is_some());
 
-        // The private dense payload and row-id buffer are publication credit. Canonical rollover
-        // additionally retains exactly one u64 created-by slot for this one-row text shard.
-        let exact_peak = private_peak + 8;
+        // The private dense payload is publication credit. Canonical rollover additionally
+        // retains one u64 created-by slot and one u64 stable row-id slot for this one-row text
+        // shard; both allocations are sized before WAL.
+        let exact_peak = private_peak + 16;
         engine.set_relational_residency_budget_bytes(0, exact_peak);
         engine.submit_transaction(354, parsed("COMMIT")).unwrap();
         assert!(engine.relational_resident_bytes_for_gpu(0) <= exact_peak);
@@ -1704,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_truncate_restart_identity_remains_pre_effect() {
+    fn transaction_truncate_restart_identity_without_owned_sequence_is_private() {
         let engine = Engine::new_local();
         engine
             .submit_transaction(94, parsed("CREATE TABLE restart_target (id int4)"))
@@ -1712,15 +1917,16 @@ mod tests {
         engine.submit_transaction(95, parsed("BEGIN")).unwrap();
         let wal_before = engine.durable_wal_records().len();
 
-        let error = engine
+        engine
             .submit_transaction(95, parsed("TRUNCATE restart_target RESTART IDENTITY"))
-            .unwrap_err();
-        assert!(matches!(error, ExecuteError::Unsupported(_)));
+            .unwrap();
         assert_eq!(engine.durable_wal_records().len(), wal_before);
-        assert!(engine
+        assert!(!engine
             .transaction_snapshot_handle(95)
             .unwrap()
             .transaction_delta_is_empty());
         engine.submit_transaction(95, parsed("ROLLBACK")).unwrap();
+        assert!(engine.relational_catalog_table("restart_target").is_some());
+        assert_eq!(engine.durable_wal_records().len(), wal_before);
     }
 }

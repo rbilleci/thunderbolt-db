@@ -8,11 +8,13 @@ use super::*;
 
 const CATALOG_RELATION_TABLE: u8 = 1;
 const CATALOG_RELATION_VIEW: u8 = 2;
+const CATALOG_RELATION_SEQUENCE: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinaryCatalogRelationKind {
     Table,
     View,
+    Sequence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +89,10 @@ fn valid_dependencies(dependencies: &BTreeMap<String, BinaryCatalogRelationIdent
         && dependencies.iter().all(|(name, dependency)| {
             !name.is_empty()
                 && name.len() <= u16::MAX as usize
+                && matches!(
+                    dependency.kind,
+                    BinaryCatalogRelationKind::Table | BinaryCatalogRelationKind::View
+                )
                 && valid_catalog_identity(dependency)
         })
 }
@@ -170,6 +176,7 @@ fn encode_catalog_identity(out: &mut Vec<u8>, identity: &BinaryCatalogRelationId
     out.push(match identity.kind {
         BinaryCatalogRelationKind::Table => CATALOG_RELATION_TABLE,
         BinaryCatalogRelationKind::View => CATALOG_RELATION_VIEW,
+        BinaryCatalogRelationKind::Sequence => CATALOG_RELATION_SEQUENCE,
     });
     out.extend_from_slice(&identity.oid.to_le_bytes());
     out.extend_from_slice(&identity.digest);
@@ -256,6 +263,7 @@ fn decode_catalog_identity<'a>(
     let kind = match take(1)?[0] {
         CATALOG_RELATION_TABLE => BinaryCatalogRelationKind::Table,
         CATALOG_RELATION_VIEW => BinaryCatalogRelationKind::View,
+        CATALOG_RELATION_SEQUENCE => BinaryCatalogRelationKind::Sequence,
         other => return Err(fail(&format!("unsupported catalog relation kind {other}"))),
     };
     let oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));

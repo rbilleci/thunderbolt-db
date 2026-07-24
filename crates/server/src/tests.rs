@@ -11,6 +11,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "tests/index_lifecycle.rs"]
 mod index_lifecycle;
 
+#[path = "tests/sequence_lifecycle.rs"]
+mod sequence_lifecycle;
+
 #[path = "tests/view_lifecycle.rs"]
 mod view_lifecycle;
 

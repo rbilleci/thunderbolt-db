@@ -4,14 +4,16 @@
 //! accessors.
 
 use super::*;
+use crate::engine_transaction_catalog::TransactionCatalogEnvelopeSlices;
 use crate::engine_transaction_reset::{
-    final_transaction_operations, final_transaction_write_set, table_access_dependency_identities,
-    table_schema_digest, transaction_row_deltas,
+    final_transaction_operations, final_transaction_row_operations, final_transaction_write_set,
+    table_access_dependency_identities, table_schema_digest, transaction_row_deltas,
 };
 
 pub(crate) mod gpu_accounting;
 mod isolation;
 mod ordered_wal;
+mod record;
 use gpu_accounting::transaction_private_shard_bytes;
 pub(crate) use gpu_accounting::TransactionGpuReservation;
 
@@ -201,6 +203,20 @@ impl Engine {
         // RR reads retain their historical catalog/OID binding, but writes may not target an
         // object that has since been renamed, dropped, or recreated under the same name.
         self.acquire_transaction_write_table_access_identities(snapshot, &access_identities)?;
+        let sequence_access_identities = table
+            .columns
+            .iter()
+            .filter_map(|column| match &column.default {
+                Some(ColumnDefault::SequenceNextVal { sequence, .. }) => transaction_catalog
+                    .relational_sequences
+                    .get(sequence)
+                    .map(|sequence| sequence.oid),
+                None | Some(ColumnDefault::Literal(_)) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        snapshot
+            .table_access
+            .acquire_shared(sequence_access_identities)?;
         let _scope = self.enter_transaction_read(Arc::clone(snapshot));
 
         let (generation, next_row_id) = {
@@ -219,6 +235,31 @@ impl Engine {
             PreparedMutation::Insert { seq_advances, .. } => seq_advances.clone(),
             PreparedMutation::Update { .. } | PreparedMutation::Delete { .. } => BTreeMap::new(),
         };
+        let sequence_input_oids = prepared_sequence_state
+            .keys()
+            .map(|name| {
+                transaction_catalog
+                    .relational_sequences
+                    .get(name)
+                    .map(|sequence| (name.clone(), sequence.oid))
+                    .ok_or_else(|| {
+                        ExecuteError::Serialization(format!(
+                            "transaction sequence input \"{name}\" left its private catalog generation"
+                        ))
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let prepared_sequence_state_by_oid = prepared_sequence_state
+            .iter()
+            .map(|(name, state)| {
+                (
+                    *sequence_input_oids
+                        .get(name)
+                        .expect("captured every prepared sequence input"),
+                    *state,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let rows_affected = prepared.rows_affected();
         let returning = self.project_dml_returning(&command, &prepared, snapshot.boundary)?;
 
@@ -267,9 +308,13 @@ impl Engine {
         delta.next_row_id = delta.next_row_id.saturating_add(prepared.rows_consumed);
         delta.sequence_state.extend(prepared_sequence_state);
         delta
+            .sequence_state_by_oid
+            .extend(prepared_sequence_state_by_oid);
+        delta
             .operations
             .push(TransactionOperation::Row(Arc::new(StagedRowOperation {
                 statement_digest,
+                sequence_input_oids,
                 delta: prepared,
             })));
         delta.write_set = final_transaction_write_set(&delta.operations);
@@ -384,7 +429,15 @@ impl Engine {
             .collect::<Vec<_>>();
         let all_deltas = transaction_row_deltas(&operations);
         let (deltas, table_resets) = final_transaction_operations(&operations);
-        if !catalog_commands.is_empty() {
+        let final_staged_rows = final_transaction_row_operations(&operations);
+        let has_sequence_resets = operations.iter().any(|operation| {
+            matches!(
+                operation,
+                TransactionOperation::TableReset(reset)
+                    if reset.sequence_reset_identity.is_some()
+            )
+        });
+        if !catalog_commands.is_empty() || has_sequence_resets {
             let base = catalog_base.ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
                     "transactional catalog operation envelope lost its base generation".to_string(),
@@ -404,13 +457,20 @@ impl Engine {
             }));
         }
         let transaction_catalog = snapshot.transaction_catalog();
-        for delta in &deltas {
+        for staged in &final_staged_rows {
+            let delta = &staged.delta;
             for (name, expected) in &delta.catalog_dependencies {
                 if transaction_catalog
                     .relational_catalog
                     .get(name)
                     .is_none_or(|observed| {
-                        !same_transaction_row_catalog_dependency(expected, observed)
+                        !same_transaction_row_catalog_dependency(
+                            expected,
+                            observed,
+                            &staged.sequence_input_oids,
+                            &transaction_catalog,
+                            &catalog_commands,
+                        )
                     })
                 {
                     return Err(ExecuteError::Serialization(format!(
@@ -435,7 +495,7 @@ impl Engine {
                 )));
             }
         }
-        let reset_catalog = if catalog_commands.is_empty() {
+        let reset_catalog = if catalog_commands.is_empty() && !has_sequence_resets {
             published_catalog.as_ref()
         } else {
             transaction_catalog.as_ref()
@@ -513,13 +573,20 @@ impl Engine {
             .flat_map(|operation| &operation.targets)
             .filter_map(|target| target.owner_name.clone())
             .collect::<BTreeSet<_>>();
-        if !record.catalog_commands.is_empty() {
+        if !record.catalog_commands.is_empty() || !record.sequence_reset_operations.is_empty() {
             self.validate_transaction_catalog_before_wal(
                 record.catalog_epoch,
                 &record.catalog_commands,
-                &record.view_operations,
-                &record.view_lifecycle_operations,
-                &record.index_lifecycle_operations,
+                TransactionCatalogEnvelopeSlices {
+                    view_operations: &record.view_operations,
+                    view_lifecycle_operations: &record.view_lifecycle_operations,
+                    index_lifecycle_operations: &record.index_lifecycle_operations,
+                    sequence_lifecycle_operations: &record.sequence_lifecycle_operations,
+                    sequence_reset_operations: &record.sequence_reset_operations,
+                    operation_order: &record.operation_order,
+                    catalog_output: record.catalog_output.as_ref(),
+                    sequence_input_oids: &record.sequence_input_oids,
+                },
                 &transaction_catalog,
             )?;
         }
@@ -778,173 +845,6 @@ impl Engine {
         drop(private_shards);
         drop(private_cold_chunks);
         credit
-    }
-
-    pub(crate) fn transaction_insert_identities(
-        deltas: &[WriteDelta],
-    ) -> Result<BTreeSet<(String, u64)>, ExecuteError> {
-        let mut identities = BTreeSet::new();
-        for delta in deltas {
-            let PreparedMutation::Insert {
-                table,
-                inserted_rows,
-                ..
-            } = &delta.mutation
-            else {
-                continue;
-            };
-            let prefix = relational_key_prefix(table);
-            for (key, _) in inserted_rows {
-                let row_id = crate::engine_residency::parse_relational_row_id(key, &prefix)
-                    .ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(
-                            "transaction INSERT lost provisional entity identity".to_string(),
-                        ))
-                    })?;
-                if !identities.insert((table.clone(), row_id)) {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "transaction reused a provisional entity identity".to_string(),
-                    )));
-                }
-            }
-        }
-        Ok(identities)
-    }
-
-    pub(crate) fn resolved_transaction_record(
-        all_deltas: &[WriteDelta],
-        final_deltas: &[WriteDelta],
-        provisional_inserts: &BTreeSet<(String, u64)>,
-        final_base: u64,
-        allocator_high_water: u64,
-    ) -> Result<BinaryTransactionRecord, ExecuteError> {
-        let final_ids = provisional_inserts
-            .iter()
-            .cloned()
-            .zip(final_base..)
-            .collect::<BTreeMap<_, _>>();
-        let mut mutations = Vec::new();
-        let mut sequence_advances = BTreeMap::new();
-        for delta in all_deltas {
-            if let PreparedMutation::Insert { seq_advances, .. } = &delta.mutation {
-                sequence_advances.extend(
-                    seq_advances
-                        .iter()
-                        .map(|(sequence, state)| (sequence.clone(), *state)),
-                );
-            }
-        }
-        for delta in final_deltas {
-            match &delta.mutation {
-                PreparedMutation::Insert {
-                    table,
-                    inserted_rows,
-                    ..
-                } => {
-                    let prefix = relational_key_prefix(table);
-                    for (key, row) in inserted_rows {
-                        let provisional =
-                            crate::engine_residency::parse_relational_row_id(key, &prefix)
-                                .ok_or_else(|| {
-                                    ExecuteError::Engine(EngineError::ApplyFailed(
-                                        "transaction INSERT lost entity identity".to_string(),
-                                    ))
-                                })?;
-                        let row_id = *final_ids
-                            .get(&(table.clone(), provisional))
-                            .expect("insert identity map covers every inserted row");
-                        mutations.push(BinaryTransactionMutation::Insert {
-                            table: table.clone(),
-                            row_id,
-                            row_encoded: encode_relational_row(row),
-                        });
-                    }
-                }
-                PreparedMutation::Update {
-                    table,
-                    installs,
-                    updated_old_rows,
-                    ..
-                } => {
-                    if installs.len() != updated_old_rows.len() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "transaction UPDATE is not a resolved resident mutation".to_string(),
-                        )));
-                    }
-                    let prefix = relational_key_prefix(table);
-                    for ((_, key, new_row), old_row) in installs.iter().zip(updated_old_rows) {
-                        let provisional =
-                            crate::engine_residency::parse_relational_row_id(key, &prefix)
-                                .ok_or_else(|| {
-                                    ExecuteError::Engine(EngineError::ApplyFailed(
-                                        "transaction UPDATE lost entity identity".to_string(),
-                                    ))
-                                })?;
-                        let row_id = final_ids
-                            .get(&(table.clone(), provisional))
-                            .copied()
-                            .unwrap_or(provisional);
-                        mutations.push(BinaryTransactionMutation::Update {
-                            table: table.clone(),
-                            row_id,
-                            old_row_encoded: encode_relational_row(old_row),
-                            new_row_encoded: encode_relational_row(new_row),
-                        });
-                    }
-                }
-                PreparedMutation::Delete {
-                    table,
-                    deleted_rows,
-                    ..
-                } => {
-                    if delta.write_set.rows.len() != deleted_rows.len() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "transaction DELETE is not a resolved resident mutation".to_string(),
-                        )));
-                    }
-                    let prefix = relational_key_prefix(table);
-                    for (key, old_row) in delta.write_set.rows.iter().zip(deleted_rows) {
-                        let provisional =
-                            crate::engine_residency::parse_relational_row_id(&key.row_key, &prefix)
-                                .ok_or_else(|| {
-                                    ExecuteError::Engine(EngineError::ApplyFailed(
-                                        "transaction DELETE lost entity identity".to_string(),
-                                    ))
-                                })?;
-                        let row_id = final_ids
-                            .get(&(table.clone(), provisional))
-                            .copied()
-                            .unwrap_or(provisional);
-                        mutations.push(BinaryTransactionMutation::Delete {
-                            table: table.clone(),
-                            row_id,
-                            old_row_encoded: encode_relational_row(old_row),
-                        });
-                    }
-                }
-            }
-        }
-        let mutations = Self::coalesce_transaction_mutations(mutations)?;
-        Ok(BinaryTransactionRecord {
-            // Row-only opcodes predate the catalog epoch. Ordered WAL binding upgrades this to
-            // `IndexIdentityV1` iff the transaction actually carries catalog commands.
-            catalog_epoch: BinaryTransactionCatalogEpoch::Legacy,
-            allocator_high_water,
-            catalog_commands: Vec::new(),
-            created_table_identities: BTreeMap::new(),
-            created_table_index_identities: BTreeMap::new(),
-            catalog_output: None,
-            view_operations: Vec::new(),
-            view_lifecycle_operations: Vec::new(),
-            index_lifecycle_operations: Vec::new(),
-            operation_order: Vec::new(),
-            statement_digests: Vec::new(),
-            sequence_input_oids: BTreeMap::new(),
-            table_resets: Vec::new(),
-            sequence_advances,
-            table_identities: BTreeMap::new(),
-            mutations,
-        })
     }
 
     fn validate_transaction_device_row_conflicts(
@@ -1972,11 +1872,41 @@ impl Engine {
 fn same_transaction_row_catalog_dependency(
     expected: &RelationalTable,
     observed: &RelationalTable,
+    sequence_input_oids: &BTreeMap<String, u32>,
+    transaction_catalog: &CatalogSnapshot,
+    catalog_commands: &[StagedCatalogCommand],
 ) -> bool {
     if expected == observed {
         return true;
     }
     let mut normalized = expected.clone();
     normalized.indexes = observed.indexes.clone();
+    for column in &mut normalized.columns {
+        let Some(ColumnDefault::SequenceNextVal { sequence, .. }) = &mut column.default else {
+            continue;
+        };
+        let expected_oid = sequence_input_oids.get(sequence).copied().or_else(|| {
+            catalog_commands
+                .iter()
+                .filter_map(|staged| staged.sequence_identity.as_ref())
+                .flat_map(|identity| &identity.targets)
+                .find_map(|target| {
+                    (target.before_name == *sequence)
+                        .then(|| target.target_before.as_ref().map(|identity| identity.oid))
+                        .flatten()
+                })
+        });
+        let Some(expected_oid) = expected_oid else {
+            continue;
+        };
+        let Some(current_name) = transaction_catalog
+            .relational_sequences
+            .iter()
+            .find_map(|(name, candidate)| (candidate.oid == expected_oid).then_some(name))
+        else {
+            return false;
+        };
+        *sequence = current_name.clone();
+    }
     &normalized == observed
 }

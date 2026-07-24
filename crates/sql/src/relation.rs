@@ -8,21 +8,52 @@ use super::{
     parse_create_sequence, parse_create_subscription, parse_create_tablespace, parse_create_view,
     parse_drop_database, parse_drop_domain, parse_drop_extension, parse_drop_function,
     parse_drop_materialized_view, parse_drop_publication, parse_drop_role, parse_drop_sequence,
-    parse_drop_subscription, parse_drop_tablespace, parse_drop_view,
+    parse_drop_subscription, parse_drop_tablespace, parse_drop_view, parse_i64_literal,
     parse_refresh_materialized_view, parse_rename_database, parse_rename_function,
-    parse_rename_materialized_view, parse_rename_sequence, parse_rename_tablespace,
-    parse_rename_view, parse_select, parse_select_filter, parse_select_filter_groups,
-    parse_select_function, parse_select_literal, parse_select_pg_dump_builtin,
-    parse_sequence_regclass_arg, parse_sequence_value_function, parse_sql_value,
-    parse_supported_sql_type_name, parse_typed_value_from_str, split_csv,
+    parse_rename_materialized_view, parse_rename_tablespace, parse_rename_view, parse_select,
+    parse_select_filter, parse_select_filter_groups, parse_select_function, parse_select_literal,
+    parse_select_pg_dump_builtin, parse_sequence_regclass_arg, parse_sequence_value_function,
+    parse_sql_value, parse_supported_sql_type_name, parse_typed_value_from_str, split_csv,
     strip_keyword_prefix_case_insensitive, strip_keyword_suffix_case_insensitive,
     AddCheckConstraint, AddColumn, AddForeignKey, AddPrimaryKey, AddUniqueConstraint,
     AlterColumnDefault, CheckConstraint, ColumnDef, ColumnDefault, Command, CreateIndex,
     CreateSchema, CreateTable, Delete, DropColumn, DropConstraint, DropIndex, DropSchema,
     DropTable, Insert, ParseError, PrimaryKey, RenameColumn, RenameConstraint, RenameIndex,
-    RenameTable, SelectFilter, SelectFilterOp, SqlType, SqlValue, TruncateTable, UniqueConstraint,
-    Update, UpdateAssignment,
+    RenameTable, SelectFilter, SelectFilterOp, SequenceRestart, SqlType, SqlValue, TruncateTable,
+    UniqueConstraint, Update, UpdateAssignment,
 };
+
+fn parse_alter_sequence(input: &str) -> Result<Command, ParseError> {
+    if let Ok(rename) = super::parse_rename_sequence(input) {
+        return Ok(Command::RenameSequence(rename));
+    }
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "SEQUENCE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "ALL").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "CURRENT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let restart_pos =
+        find_keyword_outside_quotes(rest, "RESTART").ok_or(ParseError::InvalidRelationalSql)?;
+    let name = normalize_relation_identifier(rest[..restart_pos].trim())?;
+    let tail = rest[restart_pos + "RESTART".len()..].trim();
+    let value = if tail.is_empty() {
+        1
+    } else {
+        let value = strip_keyword_prefix_case_insensitive(tail, "WITH")
+            .map(str::trim)
+            .unwrap_or(tail);
+        if value.is_empty() || value.split_whitespace().count() != 1 {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        parse_i64_literal(value)?
+    };
+    Ok(Command::SequenceRestart(SequenceRestart { name, value }))
+}
 
 pub(super) fn parse_relational_command(
     input: &str,
@@ -204,7 +235,7 @@ pub(super) fn parse_relational_command(
             .nth(1)
             .is_some_and(|second| second.eq_ignore_ascii_case("SEQUENCE"))
         {
-            return Some(parse_rename_sequence(input).map(Command::RenameSequence));
+            return Some(parse_alter_sequence(input));
         }
         if find_keyword_outside_quotes(input, "RENAME").is_some() {
             if parse_rename_constraint(input).is_ok() {
@@ -1495,6 +1526,50 @@ mod tests {
         );
         assert!(parse_truncate_table("TRUNCATE a, b CONTINUE IDENTITY").is_err());
         assert!(parse_truncate_table("TRUNCATE accounts CASCADE").is_err());
+    }
+
+    #[test]
+    fn parses_bounded_sequence_restart_and_rejects_near_misses() {
+        assert_eq!(
+            parse_relational_command("ALTER SEQUENCE public.order_ids RESTART", false)
+                .unwrap()
+                .unwrap(),
+            Command::SequenceRestart(crate::SequenceRestart {
+                name: "order_ids".to_string(),
+                value: 1,
+            })
+        );
+        assert_eq!(
+            parse_relational_command("ALTER SEQUENCE order_ids RESTART WITH 41", false)
+                .unwrap()
+                .unwrap(),
+            Command::SequenceRestart(crate::SequenceRestart {
+                name: "order_ids".to_string(),
+                value: 41,
+            })
+        );
+        assert_eq!(
+            parse_relational_command("ALTER SEQUENCE order_ids RESTART -7", false)
+                .unwrap()
+                .unwrap(),
+            Command::SequenceRestart(crate::SequenceRestart {
+                name: "order_ids".to_string(),
+                value: -7,
+            })
+        );
+        for invalid in [
+            "ALTER SEQUENCE order_ids RESTART WITH",
+            "ALTER SEQUENCE order_ids RESTART 1 2",
+            "ALTER SEQUENCE order_ids RESTART WITH 1 EXTRA",
+            "ALTER SEQUENCE order_ids RESTARTING 1",
+            "ALTER SEQUENCE IF EXISTS order_ids RESTART 1",
+            "ALTER SEQUENCE order_ids OWNER TO app",
+        ] {
+            assert!(
+                matches!(parse_relational_command(invalid, false), Some(Err(_))),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]

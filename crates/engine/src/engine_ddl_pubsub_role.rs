@@ -399,7 +399,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         rename: RenameSequence,
     ) -> Result<(), EngineError> {
-        self.apply_rename_sequence_with_replay_policy(cat, rename, false)
+        self.apply_rename_sequence_with_replay_policy(cat, rename, false, false)
     }
 
     pub(crate) fn apply_rename_sequence_legacy_replay(
@@ -407,16 +407,26 @@ impl Engine {
         cat: &mut DdlCatalogState,
         rename: RenameSequence,
     ) -> Result<(), EngineError> {
-        self.apply_rename_sequence_with_replay_policy(cat, rename, true)
+        self.apply_rename_sequence_with_replay_policy(cat, rename, true, true)
+    }
+
+    pub(crate) fn apply_rename_sequence_historical_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameSequence,
+        legacy_namespace: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_rename_sequence_with_replay_policy(cat, rename, legacy_namespace, true)
     }
 
     fn apply_rename_sequence_with_replay_policy(
         &self,
         cat: &mut DdlCatalogState,
         rename: RenameSequence,
-        legacy_replay: bool,
+        legacy_namespace: bool,
+        historical_replay: bool,
     ) -> Result<(), EngineError> {
-        let source_wrong_kind = if legacy_replay {
+        let source_wrong_kind = if legacy_namespace {
             cat.relational_catalog.contains_key(&rename.old_name)
                 || cat.relational_views.contains_key(&rename.old_name)
                 || cat
@@ -438,7 +448,7 @@ impl Engine {
                 rename.old_name
             )));
         }
-        let destination_exists = if legacy_replay {
+        let destination_exists = if legacy_namespace {
             cat.relational_catalog.contains_key(&rename.new_name)
                 || cat.relational_views.contains_key(&rename.new_name)
                 || cat
@@ -460,6 +470,21 @@ impl Engine {
         sequence.name = rename.new_name.clone();
         cat.relational_sequences
             .insert(rename.new_name.clone(), sequence);
+        if !historical_replay {
+            for table in cat.relational_catalog.values_mut() {
+                for column in &mut table.columns {
+                    if let Some(ColumnDefault::SequenceNextVal {
+                        sequence,
+                        create_if_missing: _,
+                    }) = &mut column.default
+                    {
+                        if *sequence == rename.old_name {
+                            *sequence = rename.new_name.clone();
+                        }
+                    }
+                }
+            }
+        }
 
         let old_target = RelationalCommentTarget::Sequence {
             sequence: rename.old_name,

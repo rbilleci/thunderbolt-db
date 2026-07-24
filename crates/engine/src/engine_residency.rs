@@ -649,6 +649,7 @@ impl Engine {
             .saturating_add(route_descriptors)
             .saturating_add(live_compound_routes)
             .saturating_add(private_bytes)
+            .saturating_sub(Self::active_transaction_commit_gpu_credit(gpu_id))
     }
 
     /// Actual retained allocation bytes attributable to one table on one GPU. Two-phase admission

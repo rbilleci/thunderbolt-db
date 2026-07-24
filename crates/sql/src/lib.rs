@@ -30,8 +30,8 @@ pub use ast::{
     PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
     RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
     RenameTablespace, RenameView, SelectFunction, SelectLiteral, SequenceCurrVal, SequenceNextVal,
-    SequenceSetVal, TransactionAccessMode, TransactionCharacteristics, TransactionIsolation,
-    TruncateTable, UniqueConstraint, Update, UpdateAssignment,
+    SequenceRestart, SequenceSetVal, TransactionAccessMode, TransactionCharacteristics,
+    TransactionIsolation, TruncateTable, UniqueConstraint, Update, UpdateAssignment,
 };
 pub use command::{
     is_select_statement, parse_command, parse_command_allowing_catalog, split_simple_query,

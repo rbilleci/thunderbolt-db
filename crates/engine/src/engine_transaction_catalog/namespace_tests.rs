@@ -508,7 +508,7 @@ fn post_boundary_legacy_neutral_sequence_record_uses_current_namespace_in_split_
     ));
     let suffix = {
         let commit = source.commit_state();
-        Engine::canonical_wal_record(
+        Engine::canonical_legacy_wal_record_for_test(
             &commit,
             9_722,
             source.committed_seq() + 1,
@@ -557,6 +557,104 @@ fn post_boundary_legacy_neutral_sequence_record_uses_current_namespace_in_split_
         .catalog_snapshot()
         .relational_sequences
         .contains_key("neutral_epoch_shadow"));
+}
+
+#[test]
+fn post_boundary_legacy_sequence_rename_and_drop_keep_historical_default_bindings() {
+    for (ordinal, sequence, table, action, renamed_sequence) in [
+        (
+            0,
+            "post_epoch_legacy_rename_sequence",
+            "post_epoch_legacy_rename_owner",
+            "ALTER SEQUENCE post_epoch_legacy_rename_sequence \
+             RENAME TO post_epoch_legacy_renamed_sequence",
+            Some("post_epoch_legacy_renamed_sequence"),
+        ),
+        (
+            10,
+            "post_epoch_legacy_drop_sequence",
+            "post_epoch_legacy_drop_owner",
+            "DROP SEQUENCE post_epoch_legacy_drop_sequence",
+            None,
+        ),
+    ] {
+        let txn_base = 9_730 + ordinal;
+        let source = Engine::new_local();
+        source
+            .execute_text(txn_base, &format!("CREATE SEQUENCE {sequence}"))
+            .unwrap();
+        source
+            .execute_text(
+                txn_base + 1,
+                &format!(
+                    "CREATE TABLE {table} \
+                     (id int4 DEFAULT nextval('{sequence}'::regclass), code int4)"
+                ),
+            )
+            .unwrap();
+        source
+            .execute_text(
+                txn_base + 2,
+                &format!("CREATE INDEX {table}_epoch_boundary ON {table} (code)"),
+            )
+            .unwrap();
+
+        let legacy_command = parse_command(action).unwrap();
+        let legacy_payload =
+            Engine::encode_legacy_replay_command_for_test(&legacy_command).unwrap();
+        assert!(!Engine::engine_command_uses_current_index_semantics(
+            &legacy_payload
+        ));
+        let suffix = {
+            let commit = source.commit_state();
+            Engine::canonical_legacy_wal_record_for_test(
+                &commit,
+                txn_base + 3,
+                source.committed_seq() + 1,
+                0,
+                &legacy_payload,
+            )
+            .unwrap()
+        };
+        let mut complete = source.durable_wal_records();
+        complete.push(suffix);
+
+        let assert_historical_binding = |engine: &Engine| {
+            let catalog = engine.catalog_snapshot();
+            assert!(!catalog.relational_sequences.contains_key(sequence));
+            if let Some(renamed_sequence) = renamed_sequence {
+                assert!(catalog.relational_sequences.contains_key(renamed_sequence));
+            }
+            let default = catalog.relational_catalog[table]
+                .columns
+                .iter()
+                .find_map(|column| match &column.default {
+                    Some(ColumnDefault::SequenceNextVal { sequence, .. }) => {
+                        Some(sequence.as_str())
+                    }
+                    _ => None,
+                });
+            assert_eq!(
+                default,
+                Some(sequence),
+                "post-epoch legacy replay must keep its acknowledged default text"
+            );
+        };
+
+        let recovered = Engine::recover_from_durable_wal(&complete).unwrap();
+        assert_historical_binding(&recovered);
+
+        let split = complete.len() - 1;
+        let chunked = Engine::new_local();
+        chunked
+            .prepare_legacy_index_oid_recovery(&complete)
+            .unwrap();
+        chunked.begin_recovery_replay();
+        chunked.replay_durable_records(&complete[..split]).unwrap();
+        chunked.replay_durable_records(&complete[split..]).unwrap();
+        chunked.finish_recovery_replay().unwrap();
+        assert_historical_binding(&chunked);
+    }
 }
 
 #[test]
@@ -871,6 +969,9 @@ fn legacy_opcode_12_preserves_an_acknowledged_view_index_shadow() {
         }],
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
         statement_digests: vec![transaction_statement_digest(&command).unwrap()],
         sequence_input_oids: BTreeMap::new(),
@@ -1005,6 +1106,9 @@ fn post_boundary_byte_stable_opcode_12_rejects_a_legacy_ambiguous_dependency() {
         }],
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
         statement_digests: vec![transaction_statement_digest(&command).unwrap()],
         sequence_input_oids: BTreeMap::new(),

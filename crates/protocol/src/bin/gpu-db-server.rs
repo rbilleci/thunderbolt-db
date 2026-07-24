@@ -1435,6 +1435,17 @@ fn execute_statement(
         ) => {
             return execute_function_command(stream, session, command, include_row_description);
         }
+        Ok(Command::SequenceRestart(_)) => {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "0A000",
+                    message:
+                        "ALTER SEQUENCE RESTART is not supported by the legacy compatibility server",
+                    position: None,
+                },
+            );
+        }
         Ok(
             command @ (Command::CreateSequence(_)
             | Command::SequenceNextVal(_)
@@ -1549,6 +1560,7 @@ fn execute_statement(
             | Command::SequenceNextVal(_)
             | Command::SequenceCurrVal(_)
             | Command::SequenceSetVal(_)
+            | Command::SequenceRestart(_)
             | Command::RenameSequence(_)
             | Command::DropSequence(_) => {
                 unreachable!("sequence commands are routed by the preceding parse arm")

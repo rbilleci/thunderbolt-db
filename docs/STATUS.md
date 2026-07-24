@@ -14,6 +14,93 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 transactional sequence lifecycle — verified candidate 2026-07-24
+
+- `CREATE SEQUENCE`, `ALTER SEQUENCE ... RESTART`, `ALTER SEQUENCE ... RENAME TO ...`, ordered multi-target
+  `DROP SEQUENCE [IF EXISTS]`, and owned-sequence `TRUNCATE ... RESTART IDENTITY` use the existing
+  transaction-private catalog/data operation stream. Each command carries its exact ordinal, stable sequence OID,
+  pre/post descriptor, dependent column-default identity, and target absence. Rename retains OID/comments and
+  rewrites defaults; drop refuses live default dependencies atomically; drop/recreate receives a new OID. Private
+  visibility, rollback, READ COMMITTED rebase, REPEATABLE READ rejection, guard concurrency, name/OID ABA, retry,
+  post-durable indeterminacy, and live/fresh recovery are covered.
+- Default advances and restart/reset barriers are keyed by stable sequence OID, so DML on either side of rename and
+  restart cannot be redirected by names. Additive WAL opcodes 18/19 bind lifecycle/reset operations, exact
+  statement order, stable-OID value post-state, allocator closure, and table/default dependencies without changing
+  opcode 4–17 bytes. Decode, live apply, and replay reject malformed or incomplete closure and reconstruct on
+  catalog clones before the sole commit/WAL/publication owner installs anything.
+- Shared transaction-lifetime guards cover default-consuming INSERT and existing-sequence value access; lifecycle
+  and owned-sequence reset take exclusive guards. The grouped CREATE-then-value path defers only the unpublished
+  OID binding to its evolving working catalog. The canonical pgwire server proves private restart/rename/rollback,
+  NULL-bearing defaults, reset, and recovery. The legacy host-backed server explicitly refuses restart with
+  `0A000` before changing its host sequence state.
+- The complete engine run passes **630/630** ordinary tests with **602** ignored. The include-ignored sweep passes
+  **1,229/1,232**; its only failures are the three PLAN-owned base defects with unchanged classic-wave FK,
+  wide-unique, and recovered transaction-ID signatures. Four stale ignored fixtures exposed by the sweep now match
+  accepted canonical sidecar accounting, shared index namespace, pending-admission wording, and globally unique
+  transaction IDs. The accounting fixture also exposed and closed a real gap: replacement-table admission now
+  subtracts the transaction's already-reserved GPU publication credit just like the aggregate budget reader, so an
+  exact pre-WAL reservation cannot fail after durability while installing an empty sibling table.
+- SQL passes **59/59**, canonical server **80/80** with four ignored, facade **76/76** with 15 ignored, and protocol
+  library/binary **71/128**. Workspace all-target check, strict workspace Clippy, scoped rustfmt, diff whitespace,
+  and source-size gates pass. Every newly crossed root was split by invariant and is below 2,000 lines:
+  SQL/WAL/transaction-delta/transaction-reset roots are **1,995/1,959/1,912/1,919**; catalog/durability roots are
+  **1,932/1,962**, the catalog-local reset-rebind owner is **155**, and the sequence lifecycle test owner is
+  **1,545**. Existing PLAN-owned `engine_commit.rs`, `engine_dml_concurrent.rs`, and
+  `engine_mutation_admission.rs` remain **2,244/2,175/2,010** without exceptions.
+- The sequence NULL differential and exact-budget publication regression each pass three sequential plus two
+  simultaneous HAZARD executions with no CUDA 700/716/717. Initial restart-barrier sabotage proved the broader NULL
+  differential was vacuous because a later INSERT overwrote the corrupt state; the added final-restart regression
+  then failed non-vacuously at `(24,false)` versus `(23,false)` before the restored candidate passed it and recovery.
+  The reset-before-owned-sequence-rename and generated-sequence creator-binding regressions also each pass three
+  sequential plus two simultaneous rounds. Stale rebound reset dependencies and before-root digest both fail before
+  commit/rebase; output-only and internally consistent two-SERIAL OID swaps fail at canonical admission and
+  creator-local replay respectively.
+  The repaired-tree non-canonical quick card completed A/B: out-of-L2 roofline is **1440.7 GB/s, p50 186us**,
+  grouped execution **1675.9 M-elem/s**, and production batch-65,536 point reads **262.858M/s, p50 118us**,
+  effectively flat against
+  the accepted **264.394M/s, p50 118us** in-L2 baseline.
+- The first independent frozen-tree audit returned **NOT ACCEPT** with three actionable findings, each reproduced
+  by a regression before repair. Generated `CREATE TABLE ... SERIAL` output now binds its statement-captured OID and
+  validates that identity across a later private rename; historical generic-SQL rename/drop replay preserves its
+  acknowledged dangling default behavior independently of whether recovery has crossed the shared-index OID epoch;
+  and stable-OID value state may accompany opcodes 18/19 only when a lifecycle or reset identity owns the family.
+  The forged zero-command stable-value-only decoder form is rejected. Audit follow-up also found that the earlier
+  post-epoch legacy test helper re-encoded its V1 input as V2. The replacement emits a genuine V1 canonical
+  operation and proves current-namespace inheritance plus historical rename/drop default bindings through complete
+  and split recovery; forcing current rename/drop policy fails that focused test non-vacuously. A subsequent audit
+  found that a table reset staged before its owned sequence was renamed retained a stale statement-time output
+  schema/root proof. Catalog-local rebind now permits only metadata-authorized output changes with unchanged stable
+  table/dependency OIDs, refreshes the final schema/root/dependency closure, and preserves the earlier sequence-reset
+  ordinal; READ COMMITTED rebase, recovery, and both sabotage checks pass. Final closure review found that generated
+  SERIAL OIDs were checked only for final existence. Encoder, post-decode validation, clone-first apply, and
+  stepwise replay now cross-link generated output to each CREATE ordinal's captured input and immediately validate
+  every generated or existing sequence default by creator-local name/OID. Both swap regressions failed before
+  repair and now pass. Focused regressions, full ordinary/static gates, all HAZARD families, and the complete
+  include-ignored inventory pass as described above; exact audit and report-card acceptance evidence follows.
+- Exact-tree implementation re-audit returned **ACCEPT** on base
+  `2587052d7fd62635adbffdf16fcc7af8c9fe1be5`, index tree
+  `7703ee8a3bc7f768a803acf89fabe9c7a0fe56d3`, and cached binary-diff SHA-256
+  `f76ffc740cf62a8ad71c9dfdb386fd97d15f0a5df5c54fe796096e1c64907d87` across 53 staged paths without
+  unstaged/untracked drift. The candidate's single canonical full report card then completed A/B/C under the
+  supported `SECTION_C_TIMEOUT=2700` override with every calibrated control intact. Artifacts are raw
+  `a1f053190a6b2e915837489d21bc521e9b0369f4145be4aea5c37c3d0001c234` (1,129,600 bytes), point
+  `c3873507c4ef972ff51ee0277fd67c40750cb1ec4588a75b998107f54a849111` (9,806,664 bytes), and AWS-LC
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61` (7,156,488 bytes). Layer 1 is
+  **1319.9 GB/s, p50 25us** in-L2, **1442.8 GB/s, p50 186us** out-of-L2, and
+  **1674.2 M-elem/s** grouped. Layer 2 is **260.853M/s, p50 117us** in-L2 and
+  **236.360M/s, p50 140us** out-of-L2; the 48M-row fixture built in **2243.6s** with zero final-residency work.
+  Relative to the latest accepted card, raw is **+1.1%/+1.4%**, grouped is flat, point throughput is
+  **-1.3%/-3.2%**, and point p50 is **-1us/unchanged**, with no material regression. The final record is
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`; the fresh isolated target was
+  removed. Same-auditor post-card provenance/performance verification returned **ACCEPT** with no finding and no
+  rerun required on documentation closeout tree `a0d6a83a8a7a5ec45eb229f4114bdeb3097de2ad` / cached binary-diff
+  SHA-256 `9c79c50170170066cfb839043d7d9791b9301669d87b5a74b313d61124fe3af4`; it independently matched the
+  exact artifacts, configurations, completion records/markers, target cleanup, and baseline comparison and
+  confirmed the post-card delta was PLAN/STATUS/HANDOVER only.
+- This candidate covers transactional lifecycle/reset state only. The separate ordinary published-sequence
+  `SequenceValueTransition` semantics remain in **PRODUCT-001** PLAN; no claim is made here that `nextval`, defaults,
+  or `setval` on an unchanged published identity already survive enclosing user rollback.
+
 ## Point-read performance recovery — accepted 2026-07-23
 
 - Permanent `probe-timing` instrumentation isolated the resident point kernel at roughly 10–16us and placed the

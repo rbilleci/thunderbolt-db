@@ -1,6 +1,7 @@
 //! Atomic explicit-transaction apply and GPU-residency publication helpers.
 
 use super::*;
+use crate::engine_transaction_catalog::TransactionCatalogEnvelopeSlices;
 use crate::engine_transaction_reset::{
     table_access_dependency_identities, table_reset_empty_digest, table_schema_digest,
 };
@@ -814,6 +815,9 @@ impl Engine {
             view_operations,
             view_lifecycle_operations,
             index_lifecycle_operations,
+            sequence_lifecycle_operations,
+            sequence_reset_operations,
+            sequence_advances_by_oid,
             operation_order,
             statement_digests,
             sequence_input_oids,
@@ -831,7 +835,10 @@ impl Engine {
         }
         if (!view_operations.is_empty()
             || !view_lifecycle_operations.is_empty()
-            || !index_lifecycle_operations.is_empty())
+            || !index_lifecycle_operations.is_empty()
+            || !sequence_lifecycle_operations.is_empty()
+            || !sequence_reset_operations.is_empty()
+            || !sequence_advances_by_oid.is_empty())
             && (catalog_output.is_none() || operation_order.is_empty())
         {
             return Err(EngineError::Durability(
@@ -888,6 +895,31 @@ impl Engine {
         {
             return Err(EngineError::Durability(
                 "ordered transaction catalog repeats an implicit sequence identity".to_string(),
+            ));
+        }
+        if let Some(output) = &catalog_output {
+            let generated =
+                generated_sequence_output_from_inputs(&catalog_commands, &sequence_input_oids)
+                    .ok_or_else(|| {
+                        EngineError::Durability(
+                            "ordered generated sequence has no matching CREATE statement input"
+                                .to_string(),
+                        )
+                    })?;
+            if output.created_sequence_oids != generated {
+                return Err(EngineError::Durability(
+                    "ordered generated sequence output contradicts its CREATE statement sequence input"
+                        .to_string(),
+                ));
+            }
+        }
+        let sequence_resets_by_ordinal = sequence_reset_operations
+            .iter()
+            .map(|identity| (identity.ordinal, identity))
+            .collect::<BTreeMap<_, _>>();
+        if sequence_resets_by_ordinal.len() != sequence_reset_operations.len() {
+            return Err(EngineError::Durability(
+                "ordered transaction repeats a sequence-reset statement ordinal".to_string(),
             ));
         }
         let mut ordered_row_names = BTreeSet::new();
@@ -952,7 +984,10 @@ impl Engine {
                         }
                         let command = Command::TruncateTable(TruncateTable {
                             name: table.clone(),
-                            restart_identity: false,
+                            restart_identity: u32::try_from(ordinal)
+                                .ok()
+                                .and_then(|ordinal| sequence_resets_by_ordinal.get(&ordinal))
+                                .is_some_and(|identity| identity.table == *table),
                         });
                         if transaction_statement_digest(&command)
                             .map_err(|error| EngineError::Durability(error.to_string()))?
@@ -1020,11 +1055,16 @@ impl Engine {
             catalog_epoch,
             entry.index,
             &catalog_commands,
-            (
-                &view_operations,
-                &view_lifecycle_operations,
-                &index_lifecycle_operations,
-            ),
+            TransactionCatalogEnvelopeSlices {
+                view_operations: &view_operations,
+                view_lifecycle_operations: &view_lifecycle_operations,
+                index_lifecycle_operations: &index_lifecycle_operations,
+                sequence_lifecycle_operations: &sequence_lifecycle_operations,
+                sequence_reset_operations: &sequence_reset_operations,
+                operation_order: &operation_order,
+                catalog_output: catalog_output.as_ref(),
+                sequence_input_oids: &sequence_input_oids,
+            },
         )?;
         let next_catalog_snapshot =
             Self::catalog_snapshot_from_working(&next_catalog, entry.index.saturating_sub(1));
@@ -1069,13 +1109,13 @@ impl Engine {
                 ));
             }
             for (sequence_name, expected_oid) in &output.created_sequence_oids {
-                if next_catalog
+                if !next_catalog
                     .relational_sequences
-                    .get(sequence_name)
-                    .is_none_or(|sequence| sequence.oid != *expected_oid)
+                    .values()
+                    .any(|sequence| sequence.oid == *expected_oid)
                 {
                     return Err(EngineError::Durability(format!(
-                        "ordered transaction generated sequence \"{sequence_name}\" with a different stable identity"
+                        "ordered transaction generated sequence \"{sequence_name}\" lost its stable identity"
                     )));
                 }
             }
@@ -1127,6 +1167,10 @@ impl Engine {
                     Command::CreateIndex(_) | Command::RenameIndex(_) | Command::DropIndex(_) => {
                         BTreeSet::new()
                     }
+                    Command::CreateSequence(_)
+                    | Command::SequenceRestart(_)
+                    | Command::RenameSequence(_)
+                    | Command::DropSequence(_) => BTreeSet::new(),
                     _ => {
                         return Err(EngineError::Durability(
                             "ordered sequence closure names an unsupported catalog command"
@@ -1145,10 +1189,10 @@ impl Engine {
                     ));
                 }
                 for ((_, sequence_name), expected_oid) in inputs {
-                    if next_catalog
+                    if !next_catalog
                         .relational_sequences
-                        .get(sequence_name)
-                        .is_none_or(|sequence| sequence.oid != *expected_oid)
+                        .values()
+                        .any(|sequence| sequence.oid == *expected_oid)
                     {
                         return Err(EngineError::Durability(format!(
                             "ordered catalog sequence input \"{sequence_name}\" changed stable identity"
@@ -1176,22 +1220,23 @@ impl Engine {
                 .collect::<Vec<_>>();
             validated_sequence_inputs += inputs.len();
             if matches!(operation, BinaryTransactionOperationIdentity::Insert { .. }) {
-                let allowed_names = table
+                let allowed_sequence_oids = table
                     .columns
                     .iter()
                     .filter_map(|column| match &column.default {
-                        Some(ColumnDefault::SequenceNextVal { sequence, .. }) => {
-                            Some(sequence.as_str())
-                        }
+                        Some(ColumnDefault::SequenceNextVal { sequence, .. }) => next_catalog
+                            .relational_sequences
+                            .get(sequence)
+                            .map(|sequence| sequence.oid),
                         _ => None,
                     })
                     .collect::<BTreeSet<_>>();
                 for ((_, sequence_name), expected_oid) in inputs {
-                    if !allowed_names.contains(sequence_name.as_str())
-                        || next_catalog
+                    if !allowed_sequence_oids.contains(expected_oid)
+                        || !next_catalog
                             .relational_sequences
-                            .get(sequence_name)
-                            .is_none_or(|sequence| sequence.oid != *expected_oid)
+                            .values()
+                            .any(|sequence| sequence.oid == *expected_oid)
                     {
                         return Err(EngineError::Durability(format!(
                             "ordered INSERT sequence input \"{sequence_name}\" is not an exact default dependency of relation \"{table_name}\""
@@ -1205,18 +1250,43 @@ impl Engine {
                 ));
             }
         }
-        if ordered_envelope
-            && (validated_sequence_inputs != sequence_input_oids.len()
-                || insert_sequence_names
-                    != sequence_advances
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<BTreeSet<_>>())
-        {
-            return Err(EngineError::Durability(
-                "ordered INSERT sequence identities do not close over sequence advances"
-                    .to_string(),
-            ));
+        if ordered_envelope {
+            let insert_sequence_oids = sequence_input_oids
+                .iter()
+                .filter_map(|((ordinal, _), oid)| {
+                    usize::try_from(*ordinal)
+                        .ok()
+                        .and_then(|ordinal| operation_order.get(ordinal))
+                        .and_then(|operation| {
+                            matches!(operation, BinaryTransactionOperationIdentity::Insert { .. })
+                                .then_some(*oid)
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            if validated_sequence_inputs != sequence_input_oids.len()
+                || if !sequence_advances_by_oid.is_empty()
+                    || !sequence_lifecycle_operations.is_empty()
+                    || !sequence_reset_operations.is_empty()
+                {
+                    !sequence_advances.is_empty()
+                        || insert_sequence_oids
+                            != sequence_advances_by_oid
+                                .keys()
+                                .copied()
+                                .collect::<BTreeSet<_>>()
+                } else {
+                    insert_sequence_names
+                        != sequence_advances
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<BTreeSet<_>>()
+                }
+            {
+                return Err(EngineError::Durability(
+                    "ordered INSERT sequence identities do not close over sequence advances"
+                        .to_string(),
+                ));
+            }
         }
         if !ordered_envelope {
             for sequence_name in sequence_advances.keys() {
@@ -1228,6 +1298,27 @@ impl Engine {
                         "transaction WAL record advances unknown sequence \"{sequence_name}\""
                     )));
                 }
+            }
+        }
+        for sequence_oid in sequence_advances_by_oid.keys() {
+            let exists_after = next_catalog
+                .relational_sequences
+                .values()
+                .any(|sequence| sequence.oid == *sequence_oid);
+            let dropped_by_lifecycle = sequence_lifecycle_operations
+                .iter()
+                .flat_map(|operation| &operation.targets)
+                .any(|target| {
+                    target
+                        .target_before
+                        .as_ref()
+                        .is_some_and(|before| before.oid == *sequence_oid)
+                        && target.target_after.is_none()
+                });
+            if !exists_after && !dropped_by_lifecycle {
+                return Err(EngineError::Durability(format!(
+                    "transaction WAL advances unknown stable sequence identity {sequence_oid}"
+                )));
             }
         }
         let mutation_tables = mutations
@@ -1587,6 +1678,20 @@ impl Engine {
                 .relational_sequences
                 .get_mut(&sequence_name)
                 .expect("transaction sequence set was prevalidated");
+            sequence.last_value = last_value;
+            sequence.is_called = is_called;
+        }
+        for (sequence_oid, (last_value, is_called)) in sequence_advances_by_oid {
+            // A value may precede DROP in the same ordered lifecycle. In that case the stable
+            // identity is intentionally absent from the final catalog and its private state dies
+            // with the object. Rename/recreate cannot redirect it because lookup is by OID.
+            let Some(sequence) = cat
+                .relational_sequences
+                .values_mut()
+                .find(|sequence| sequence.oid == sequence_oid)
+            else {
+                continue;
+            };
             sequence.last_value = last_value;
             sequence.is_called = is_called;
         }

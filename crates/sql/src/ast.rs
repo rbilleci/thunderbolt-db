@@ -170,6 +170,10 @@ pub enum Command {
     /// Bounded role-login mutation emitted by PostgreSQL 16 pg_dumpall. Keep append-only: command
     /// discriminant order is performance-sensitive.
     AlterRoleLogin(AlterRoleLogin),
+    /// Transactional sequence value-overlay reset. Keep append-only: command discriminant order
+    /// is performance-sensitive, and ordinary `setval` has deliberately different rollback
+    /// semantics.
+    SequenceRestart(SequenceRestart),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -443,6 +447,12 @@ pub struct SequenceSetVal {
     pub name: String,
     pub value: i64,
     pub is_called: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SequenceRestart {
+    pub name: String,
+    pub value: i64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

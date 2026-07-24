@@ -185,7 +185,7 @@ fn pg16_dump_typed_plans_apply_relational_semantics_on_device() {
     assert!(materialized_dependencies.rows.is_empty());
     let invalid_materialized_dependency = engine
         .execute_text(
-            13,
+            14,
             "CREATE MATERIALIZED VIEW dump_plan_invalid_mv AS \
              SELECT * FROM dump_plan_view WITH DATA",
         )

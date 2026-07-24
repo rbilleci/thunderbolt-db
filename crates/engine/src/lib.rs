@@ -39,9 +39,9 @@ use gpu_db_sql::{
     PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
     RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
     RenameTablespace, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction,
-    SelectLiteral, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
-    TablePrivilege, TablespacePrivilege, TransactionCharacteristics, TruncateTable, Update,
-    NUMERIC_DEFAULT_PRECISION, PROJECTION_WILDCARD_SENTINEL,
+    SelectLiteral, SelectProjection, SequenceNextVal, SequenceRestart, SequenceSetVal, SqlType,
+    SqlValue, TablePrivilege, TablespacePrivilege, TransactionCharacteristics, TruncateTable,
+    Update, NUMERIC_DEFAULT_PRECISION, PROJECTION_WILDCARD_SENTINEL,
 };
 #[cfg(test)]
 use gpu_db_storage::TupleVersion;
@@ -217,6 +217,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                 | Command::SequenceNextVal(_)
                 | Command::SequenceCurrVal(_)
                 | Command::SequenceSetVal(_)
+                | Command::SequenceRestart(_)
                 | Command::RenameSequence(_)
                 | Command::CreatePublication(_)
                 | Command::DropPublication(_)

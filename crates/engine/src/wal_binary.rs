@@ -24,7 +24,10 @@ use super::*;
 
 mod index_identity_codec;
 mod operation_identity;
+mod record_decode;
 mod row_codec;
+mod sequence_identity_codec;
+mod transaction_types;
 mod view_identity_codec;
 use index_identity_codec::*;
 pub(crate) use index_identity_codec::{
@@ -34,7 +37,33 @@ pub(crate) use index_identity_codec::{
     BinaryTransactionIndexLifecycleTargetIdentity,
 };
 pub(crate) use operation_identity::BinaryTransactionOperationIdentity;
+pub(crate) use record_decode::decode_binary_record;
 pub(crate) use row_codec::*;
+use sequence_identity_codec::*;
+pub(crate) use sequence_identity_codec::{
+    command_is_sequence_lifecycle, generated_sequence_names, generated_sequence_output_from_inputs,
+    generated_sequence_output_matches_inputs, valid_sequence_lifecycle_operation_identity,
+    valid_sequence_reset_operation_identity, BinarySequenceColumnDependencyIdentity,
+    BinaryTransactionSequenceLifecycleOperationIdentity,
+    BinaryTransactionSequenceLifecycleTargetIdentity,
+    BinaryTransactionSequenceResetOperationIdentity,
+};
+pub(crate) use transaction_types::{
+    BinaryTransactionCatalogCommand, BinaryTransactionCatalogEpoch, BinaryTransactionCatalogOutput,
+    BinaryTransactionMutation, BinaryTransactionRecord, BinaryTransactionTableIdentity,
+    BinaryTransactionTableReset, BinaryWalRecord, WAL_BINARY_TAG,
+};
+use transaction_types::{
+    OP_COMPOSITE_TRANSACTION, OP_DELETE_BY_KEY, OP_IDENTITY_COMPOSITE_TRANSACTION,
+    OP_IDENTITY_ORDERED_CATALOG_TRANSACTION,
+    OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION,
+    OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION, OP_IDENTITY_TABLE_RESET_TRANSACTION,
+    OP_IDENTITY_TRANSACTION, OP_INSERT, OP_ORDERED_CATALOG_TRANSACTION,
+    OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION, OP_ORDERED_CATALOG_VIEW_TRANSACTION,
+    OP_TABLE_RESET_TRANSACTION, OP_TRANSACTION, OP_UPDATE_BY_KEY, TXN_DELETE, TXN_INSERT,
+    TXN_OPERATION_CATALOG, TXN_OPERATION_DELETE, TXN_OPERATION_INSERT, TXN_OPERATION_TABLE_RESET,
+    TXN_OPERATION_UPDATE, TXN_UPDATE, WAL_BINARY_VERSION,
+};
 use view_identity_codec::*;
 pub(crate) use view_identity_codec::{
     command_is_view_lifecycle, legacy_from_lifecycle_create, lifecycle_from_legacy_create,
@@ -42,188 +71,6 @@ pub(crate) use view_identity_codec::{
     BinaryCatalogRelationKind, BinaryTransactionViewLifecycleOperationIdentity,
     BinaryTransactionViewLifecycleTargetIdentity, BinaryTransactionViewOperationIdentity,
 };
-
-/// Binary-record lead byte (invalid UTF-8 on purpose — see the module doc).
-pub(crate) const WAL_BINARY_TAG: u8 = 0xFF;
-/// Format version for forward evolution; bump on layout change.
-const WAL_BINARY_VERSION: u8 = 1;
-/// Op codes.
-const OP_INSERT: u8 = 1;
-/// W5b: a covered lane DELETE, logged BY KEY — replay re-resolves the key against the replayed
-/// state (deterministic: all ops on a key are lane-serialized in seq order, cross-key ops
-/// commute). WAL-FIRST: a 0-row delete DOES reach the WAL (the locate moved to apply), and its
-/// replay re-resolve to 0 rows is a legal no-op (not corruption).
-const OP_DELETE_BY_KEY: u8 = 2;
-/// U2 (W5b): a covered lane UPDATE, logged BY KEY + the new row image + the new version's row id.
-/// Replay re-resolves the key: a visible old version → tombstone it + append the new image at
-/// the old version's stable entity id. The legacy `new_row_id` field remains a consumed allocator
-/// reservation so v1 logs and allocator high-water replay stay compatible; it is not replacement identity.
-const OP_UPDATE_BY_KEY: u8 = 3;
-/// R3-003: one explicit transaction's ordered, resolved row mutations. Every operation carries
-/// stable entity identity plus the row image(s), so replay never re-evaluates SQL predicates.
-const OP_TRANSACTION: u8 = 4;
-/// PRODUCT-001: the same resolved explicit transaction, prefixed by typed catalog mutations. A
-/// distinct opcode preserves the exact v1 row-only layout and lets old durable records replay.
-const OP_COMPOSITE_TRANSACTION: u8 = 5;
-/// PRODUCT-001: a resolved transaction containing one or more typed table-root resets. Its
-/// reset-prefixed layout is distinct so opcodes 4/5 retain byte-for-byte compatibility.
-const OP_TABLE_RESET_TRANSACTION: u8 = 6;
-/// ADR-014: current row transactions bind every mutation table to stable OID + schema identity.
-/// Separate opcodes preserve byte-for-byte replay of legacy name-bound transaction records.
-const OP_IDENTITY_TRANSACTION: u8 = 7;
-const OP_IDENTITY_COMPOSITE_TRANSACTION: u8 = 8;
-const OP_IDENTITY_TABLE_RESET_TRANSACTION: u8 = 9;
-/// PRODUCT-001 ordered catalog envelope. Unlike opcodes 5/8, this layout carries the global
-/// statement ordinal of every catalog operation, its complete created-table identity set, and an
-/// optional ordered table-reset block. Old composite records remain byte-for-byte decodable.
-const OP_ORDERED_CATALOG_TRANSACTION: u8 = 10;
-const OP_IDENTITY_ORDERED_CATALOG_TRANSACTION: u8 = 11;
-/// PRODUCT-001 transactional view envelope. Opcodes 10/11 remain byte-for-byte CREATE-TABLE-only;
-/// these additive variants carry one exact preimage/dependency/postimage proof per CREATE VIEW.
-const OP_ORDERED_CATALOG_VIEW_TRANSACTION: u8 = 12;
-const OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION: u8 = 13;
-/// PRODUCT-001 complete stored-view lifecycle. Opcodes 12/13 remain byte-for-byte CREATE-only;
-/// these variants type CREATE/RENAME/multi-target DROP preimages, dependencies, and postimages.
-const OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION: u8 = 14;
-const OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION: u8 = 15;
-
-const TXN_INSERT: u8 = 1;
-const TXN_UPDATE: u8 = 2;
-const TXN_DELETE: u8 = 3;
-
-const TXN_OPERATION_CATALOG: u8 = 1;
-const TXN_OPERATION_INSERT: u8 = 2;
-const TXN_OPERATION_UPDATE: u8 = 3;
-const TXN_OPERATION_DELETE: u8 = 4;
-const TXN_OPERATION_TABLE_RESET: u8 = 5;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BinaryTransactionMutation {
-    Insert {
-        table: String,
-        row_id: u64,
-        row_encoded: String,
-    },
-    Update {
-        table: String,
-        row_id: u64,
-        old_row_encoded: String,
-        new_row_encoded: String,
-    },
-    Delete {
-        table: String,
-        row_id: u64,
-        old_row_encoded: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BinaryTransactionTableReset {
-    pub(crate) ordinal: u32,
-    pub(crate) table: String,
-    pub(crate) table_oid: u32,
-    pub(crate) schema_digest: gpu_db_wal::CanonicalDigest,
-    /// Last canonical publication that changed this table before the root replacement.
-    pub(crate) source_commit_seq: Index,
-    pub(crate) before_digest: gpu_db_wal::CanonicalDigest,
-    pub(crate) expected_rows: u64,
-    pub(crate) after_empty_digest: gpu_db_wal::CanonicalDigest,
-    pub(crate) dependency_identities: BTreeMap<String, u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BinaryTransactionTableIdentity {
-    pub(crate) table_oid: u32,
-    pub(crate) schema_digest: gpu_db_wal::CanonicalDigest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BinaryTransactionCatalogCommand {
-    pub(crate) ordinal: u32,
-    pub(crate) command: Command,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BinaryTransactionCatalogOutput {
-    /// Sole `pg_class.oid` high-water after applying the complete ordered catalog stream,
-    /// including every implicit or explicit index.
-    pub(crate) relational_next_oid: u32,
-    pub(crate) relational_next_column_id: u32,
-    /// Stable identities of implicit sequences created by admitted CREATE TABLE commands.
-    pub(crate) created_sequence_oids: BTreeMap<String, u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BinaryTransactionCatalogEpoch {
-    /// Opcodes 4--15: indexes had no durable stable-OID/output closure.
-    Legacy,
-    /// Opcodes 16/17: exact shared pg_class/index identities are bound.
-    IndexIdentityV1,
-}
-
-/// One durable explicit-transaction record. `allocator_high_water` is the row-id allocator value
-/// after the transaction's insert identities were claimed. Apply uses an idempotent max operation,
-/// so the live process (which preclaimed the ids before WAL encoding) and recovery converge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BinaryTransactionRecord {
-    /// Derived from the binary opcode on decode; live builders emit only `IndexIdentityV1` for a
-    /// catalog-bearing record. This field is not separately serialized.
-    pub(crate) catalog_epoch: BinaryTransactionCatalogEpoch,
-    pub(crate) allocator_high_water: u64,
-    /// Typed catalog operations and their positions in the complete transaction statement stream.
-    /// The command vector itself is canonical statement order; ordinals bind its gaps to DML and
-    /// table-reset operations without replaying SQL text.
-    pub(crate) catalog_commands: Vec<BinaryTransactionCatalogCommand>,
-    /// Stable output identity for every table created by `catalog_commands`. Current ordered
-    /// records require exact coverage; legacy opcode 5/8 records decode this as empty.
-    pub(crate) created_table_identities: BTreeMap<String, BinaryTransactionTableIdentity>,
-    /// Exact ordered postimage of every implicit PRIMARY KEY / UNIQUE index created with each
-    /// table.  The table schema v1 digest intentionally predates stable index OIDs, so current
-    /// opcodes bind these identities separately; an empty vector is itself an absence proof.
-    pub(crate) created_table_index_identities: BTreeMap<String, Vec<BinaryCatalogIndexIdentity>>,
-    /// Exact allocator post-state and implicit-sequence output closure for current ordered
-    /// catalog records. Table schema identities alone do not carry generated sequence OIDs.
-    pub(crate) catalog_output: Option<BinaryTransactionCatalogOutput>,
-    /// Exact CREATE VIEW preimage, transitive source, and postimage closure in catalog-command
-    /// order. Empty for every historical opcode and for CREATE-TABLE-only opcodes 10/11.
-    pub(crate) view_operations: Vec<BinaryTransactionViewOperationIdentity>,
-    /// Exact CREATE/RENAME/DROP VIEW lifecycle closure. Additive opcodes 14/15 use this field;
-    /// opcodes 12/13 continue to decode only into `view_operations`.
-    pub(crate) view_lifecycle_operations: Vec<BinaryTransactionViewLifecycleOperationIdentity>,
-    /// Exact CREATE/RENAME/DROP INDEX target transitions. Empty for historical opcodes.
-    pub(crate) index_lifecycle_operations: Vec<BinaryTransactionIndexLifecycleOperationIdentity>,
-    /// Complete statement order for current catalog-bearing records. Legacy transaction opcodes
-    /// decode this as empty and retain their historical resolved-state semantics.
-    pub(crate) operation_order: Vec<BinaryTransactionOperationIdentity>,
-    /// Canonical typed/bound request identity at every position in `operation_order`. Effects may
-    /// be coalesced or shadowed; request identity never is. Legacy opcodes decode this as empty.
-    pub(crate) statement_digests: Vec<gpu_db_wal::CanonicalDigest>,
-    /// Exact stable sequence identity consumed by an ordered catalog or INSERT statement, keyed
-    /// by `(statement ordinal, sequence name)`. Catalog entries cover every sequence default;
-    /// INSERT entries cover exactly the defaults that advanced `sequence_advances`.
-    pub(crate) sequence_input_oids: BTreeMap<(u32, String), u32>,
-    /// Surviving table-root barriers in canonical statement order. Old transaction opcodes decode
-    /// this as empty; reset records use their own opcode and keep row bodies after the reset block.
-    pub(crate) table_resets: Vec<BinaryTransactionTableReset>,
-    /// Final catalog post-state for each sequence consumed by a transaction-private default.
-    /// Entries are sorted by name (`BTreeMap`) for deterministic WAL bytes.
-    pub(crate) sequence_advances: BTreeMap<String, (i64, bool)>,
-    /// Stable binding for every table named by `mutations`. Empty only for legacy opcodes 4/5/6.
-    pub(crate) table_identities: BTreeMap<String, BinaryTransactionTableIdentity>,
-    pub(crate) mutations: Vec<BinaryTransactionMutation>,
-}
-
-/// A decoded binary WAL record of any op (the tag dispatch for apply/replay consumers).
-// Keep the transaction record inline: live apply and replay immediately move it into the sole
-// transaction consumer, while boxing would add an allocation to every explicit transaction only
-// to shrink this transient decode dispatch enum.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum BinaryWalRecord {
-    Insert(BinaryInsertRecord),
-    DeleteByKey(BinaryDeleteByKeyRecord),
-    UpdateByKey(BinaryUpdateByKeyRecord),
-    Transaction(BinaryTransactionRecord),
-}
 
 /// Encode one resolved explicit transaction as ONE WAL payload. Width overflow is reported as
 /// `None`; callers must fail the transaction rather than fall back to statement SQL records, which
@@ -252,6 +99,7 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     let mut catalog_names = BTreeMap::<&str, u32>::new();
     let mut view_commands = Vec::new();
     let mut index_commands = Vec::new();
+    let mut sequence_commands = Vec::new();
     let mut requires_view_lifecycle_opcode = false;
     let mut created_sequence_names = BTreeSet::new();
     let mut prior_catalog_ordinal = None;
@@ -299,6 +147,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                     command,
                 ));
             }
+            command if command_is_sequence_lifecycle(command) => {
+                sequence_commands.push((
+                    u32::try_from(command_index).ok()?,
+                    operation.ordinal,
+                    command,
+                ));
+            }
             _ => return None,
         }
     }
@@ -312,15 +167,18 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         .keys()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let ordered_catalog = !record.catalog_commands.is_empty()
-        && (!record.operation_order.is_empty()
-            || record.catalog_commands.len() != 1
-            || record.catalog_commands[0].ordinal != 0
-            || !record.table_resets.is_empty()
-            || !record.created_table_identities.is_empty()
-            || record.catalog_output.is_some()
-            || !record.view_operations.is_empty()
-            || !record.view_lifecycle_operations.is_empty());
+    let ordered_catalog = !record.sequence_reset_operations.is_empty()
+        || (!record.catalog_commands.is_empty()
+            && (!record.operation_order.is_empty()
+                || record.catalog_commands.len() != 1
+                || record.catalog_commands[0].ordinal != 0
+                || !record.table_resets.is_empty()
+                || !record.created_table_identities.is_empty()
+                || record.catalog_output.is_some()
+                || !record.view_operations.is_empty()
+                || !record.view_lifecycle_operations.is_empty()
+                || !record.index_lifecycle_operations.is_empty()
+                || !record.sequence_lifecycle_operations.is_empty()));
     let view_catalog = !view_commands.is_empty();
     let legacy_view_catalog = !record.view_operations.is_empty();
     let view_lifecycle_catalog = !record.view_lifecycle_operations.is_empty();
@@ -332,6 +190,9 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     let index_catalog =
         ordered_catalog && record.catalog_epoch == BinaryTransactionCatalogEpoch::IndexIdentityV1;
     let index_identity_catalog = !record.index_lifecycle_operations.is_empty();
+    let sequence_command_catalog = !sequence_commands.is_empty();
+    let sequence_identity_catalog = !record.sequence_lifecycle_operations.is_empty()
+        || !record.sequence_reset_operations.is_empty();
     let mut created_class_oids = BTreeSet::new();
     let created_index_closure_valid = if index_catalog {
         created_index_identity_names == catalog_names.keys().copied().collect::<BTreeSet<_>>()
@@ -369,6 +230,9 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     }
     if !created_index_closure_valid
         || index_command_catalog != index_identity_catalog
+        || sequence_command_catalog != !record.sequence_lifecycle_operations.is_empty()
+        || (!record.sequence_advances_by_oid.is_empty() && !sequence_identity_catalog)
+        || (sequence_identity_catalog && !index_catalog)
         || (index_semantics_required && !index_catalog)
         || (index_catalog && legacy_view_catalog)
         || (view_catalog
@@ -422,6 +286,30 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     {
         return None;
     }
+    if sequence_command_catalog
+        && (record.sequence_lifecycle_operations.len() != sequence_commands.len()
+            || record
+                .sequence_lifecycle_operations
+                .iter()
+                .zip(&sequence_commands)
+                .any(|(identity, (command_index, ordinal, command))| {
+                    identity.command_index != *command_index
+                        || identity.ordinal != *ordinal
+                        || !valid_sequence_lifecycle_operation_identity(command, identity)
+                }))
+    {
+        return None;
+    }
+    let mut sequence_resets_by_ordinal = BTreeMap::new();
+    for identity in &record.sequence_reset_operations {
+        if !valid_sequence_reset_operation_identity(identity)
+            || sequence_resets_by_ordinal
+                .insert(identity.ordinal, identity)
+                .is_some()
+        {
+            return None;
+        }
+    }
     let mut sequence_names_by_ordinal = BTreeMap::<u32, BTreeSet<&str>>::new();
     for ((ordinal, sequence), oid) in &record.sequence_input_oids {
         if sequence.len() > u16::MAX as usize || *oid == 0 {
@@ -435,6 +323,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     let mut ordered_row_names = BTreeSet::new();
     let mut ordered_reset_names = BTreeSet::new();
     if ordered_catalog {
+        if !generated_sequence_output_matches_inputs(
+            &record.catalog_commands,
+            &record.sequence_input_oids,
+            record.catalog_output.as_ref()?,
+        ) {
+            return None;
+        }
         if record.operation_order.is_empty()
             || record.statement_digests.len() != record.operation_order.len()
             || record.statement_digests.contains(&[0; 32])
@@ -479,6 +374,10 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                         Command::CreateIndex(_)
                         | Command::RenameIndex(_)
                         | Command::DropIndex(_) => BTreeSet::new(),
+                        Command::CreateSequence(_)
+                        | Command::SequenceRestart(_)
+                        | Command::RenameSequence(_)
+                        | Command::DropSequence(_) => BTreeSet::new(),
                         _ => return None,
                     };
                     if sequence_names_by_ordinal
@@ -521,7 +420,9 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                     }
                     let command = Command::TruncateTable(TruncateTable {
                         name: table.clone(),
-                        restart_identity: false,
+                        restart_identity: sequence_resets_by_ordinal
+                            .get(&ordinal_u32)
+                            .is_some_and(|identity| identity.table == *table),
                     });
                     if transaction_statement_digest(&command).ok().as_ref()
                         != Some(statement_digest)
@@ -563,16 +464,44 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                     })
             })
             .collect::<BTreeSet<_>>();
-        if insert_sequence_names
+        if sequence_identity_catalog {
+            let insert_sequence_oids = record
+                .sequence_input_oids
+                .iter()
+                .filter_map(|((ordinal, _), oid)| {
+                    usize::try_from(*ordinal)
+                        .ok()
+                        .and_then(|ordinal| record.operation_order.get(ordinal))
+                        .and_then(|operation| {
+                            matches!(operation, BinaryTransactionOperationIdentity::Insert { .. })
+                                .then_some(*oid)
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            if !record.sequence_advances.is_empty()
+                || insert_sequence_oids
+                    != record
+                        .sequence_advances_by_oid
+                        .keys()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+            {
+                return None;
+            }
+        } else if insert_sequence_names
             != record
                 .sequence_advances
                 .keys()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>()
+            || !record.sequence_advances_by_oid.is_empty()
         {
             return None;
         }
-    } else if !record.statement_digests.is_empty() || !record.sequence_input_oids.is_empty() {
+    } else if !record.statement_digests.is_empty()
+        || !record.sequence_input_oids.is_empty()
+        || !record.sequence_advances_by_oid.is_empty()
+    {
         return None;
     }
     let ordered_existing_row_names = ordered_row_names
@@ -602,14 +531,20 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         || record.view_operations.len() > u32::MAX as usize
         || record.view_lifecycle_operations.len() > u32::MAX as usize
         || record.index_lifecycle_operations.len() > u32::MAX as usize
+        || record.sequence_lifecycle_operations.len() > u32::MAX as usize
+        || record.sequence_reset_operations.len() > u32::MAX as usize
+        || record.sequence_advances_by_oid.len() > u32::MAX as usize
         || record.sequence_advances.len() > u32::MAX as usize
         || record.mutations.len() > u32::MAX as usize
         || (record.catalog_commands.is_empty() && !record.created_table_identities.is_empty())
         || (record.catalog_commands.is_empty() && !record.created_table_index_identities.is_empty())
-        || (record.catalog_commands.is_empty() && record.catalog_output.is_some())
+        || (record.catalog_commands.is_empty()
+            && record.sequence_reset_operations.is_empty()
+            && record.catalog_output.is_some())
         || (record.catalog_commands.is_empty() && !record.view_operations.is_empty())
         || (record.catalog_commands.is_empty() && !record.view_lifecycle_operations.is_empty())
         || (record.catalog_commands.is_empty() && !record.index_lifecycle_operations.is_empty())
+        || (record.catalog_commands.is_empty() && !record.sequence_lifecycle_operations.is_empty())
         || (ordered_catalog
             && created_identity_names != catalog_names.keys().copied().collect::<BTreeSet<_>>())
         || (!ordered_catalog && !record.created_table_identities.is_empty())
@@ -633,6 +568,20 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         return None;
     }
     if ordered_catalog {
+        if record.sequence_reset_operations.iter().any(|identity| {
+            usize::try_from(identity.ordinal)
+                .ok()
+                .and_then(|ordinal| record.operation_order.get(ordinal))
+                .is_none_or(|operation| {
+                    !matches!(
+                        operation,
+                        BinaryTransactionOperationIdentity::TableReset { table }
+                            if table == &identity.table
+                    )
+                })
+        }) {
+            return None;
+        }
         for reset in &record.table_resets {
             let operation = usize::try_from(reset.ordinal)
                 .ok()
@@ -669,7 +618,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     out.push(WAL_BINARY_TAG);
     out.push(WAL_BINARY_VERSION);
     let op = if ordered_catalog {
-        if index_catalog {
+        if sequence_identity_catalog {
+            if identity_bound {
+                OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            } else {
+                OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            }
+        } else if index_catalog {
             if identity_bound {
                 OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             } else {
@@ -731,6 +686,8 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     ) {
         out.extend_from_slice(&(record.catalog_commands.len() as u32).to_le_bytes());
         for operation in &record.catalog_commands {
@@ -797,9 +754,33 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             op,
             OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
                 | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+                | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+                | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
         ) {
             encode_view_lifecycle_operations(&mut out, &record.view_lifecycle_operations)?;
             encode_index_lifecycle_operations(&mut out, &record.index_lifecycle_operations)?;
+            if matches!(
+                op,
+                OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+                    | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            ) {
+                encode_sequence_lifecycle_operations(
+                    &mut out,
+                    &record.sequence_lifecycle_operations,
+                )?;
+                encode_sequence_reset_operations(&mut out, &record.sequence_reset_operations)?;
+                out.extend_from_slice(
+                    &(record.sequence_advances_by_oid.len() as u32).to_le_bytes(),
+                );
+                for (oid, (last_value, is_called)) in &record.sequence_advances_by_oid {
+                    if *oid == 0 {
+                        return None;
+                    }
+                    out.extend_from_slice(&oid.to_le_bytes());
+                    out.extend_from_slice(&last_value.to_le_bytes());
+                    out.push(u8::from(*is_called));
+                }
+            }
         }
         out.extend_from_slice(&(record.operation_order.len() as u32).to_le_bytes());
         for operation in &record.operation_order {
@@ -850,6 +831,8 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     ) {
         out.extend_from_slice(&(record.table_resets.len() as u32).to_le_bytes());
         let mut prior_ordinal = None;
@@ -954,126 +937,6 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     Some(out)
 }
 
-/// Decode ANY binary record (op dispatch). Errors are LOUD (`Durability`) — a tagged record
-/// that fails to decode is corruption-or-version-skew, never silently skipped.
-pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, EngineError> {
-    if let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(payload)? {
-        let operation = envelope
-            .fragments
-            .iter()
-            .find(|fragment| {
-                fragment.kind != gpu_db_wal::CanonicalFragmentKind::TransactionClaimStatus
-            })
-            .ok_or_else(|| {
-                EngineError::Durability(
-                    "canonical binary WAL record has no operation fragment".to_string(),
-                )
-            })?;
-        let inner = Engine::decode_engine_operation(&operation.body)?;
-        return decode_binary_record(&inner);
-    }
-    let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
-    match payload.get(2) {
-        Some(&OP_INSERT) => decode_binary_insert(payload).map(BinaryWalRecord::Insert),
-        Some(&OP_TRANSACTION)
-        | Some(&OP_COMPOSITE_TRANSACTION)
-        | Some(&OP_TABLE_RESET_TRANSACTION)
-        | Some(&OP_IDENTITY_TRANSACTION)
-        | Some(&OP_IDENTITY_COMPOSITE_TRANSACTION)
-        | Some(&OP_IDENTITY_TABLE_RESET_TRANSACTION)
-        | Some(&OP_ORDERED_CATALOG_TRANSACTION)
-        | Some(&OP_IDENTITY_ORDERED_CATALOG_TRANSACTION)
-        | Some(&OP_ORDERED_CATALOG_VIEW_TRANSACTION)
-        | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION)
-        | Some(&OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION)
-        | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION)
-        | Some(&OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION)
-        | Some(&OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION) => {
-            decode_binary_transaction(payload).map(BinaryWalRecord::Transaction)
-        }
-        Some(&OP_UPDATE_BY_KEY) => {
-            let mut at = 0usize;
-            let mut take = |n: usize| -> Result<&[u8], EngineError> {
-                let end = at.checked_add(n).ok_or_else(|| fail("length overflow"))?;
-                let slice = payload.get(at..end).ok_or_else(|| fail("truncated"))?;
-                at = end;
-                Ok(slice)
-            };
-            if take(1)?[0] != WAL_BINARY_TAG {
-                return Err(fail("missing tag"));
-            }
-            if take(1)?[0] != WAL_BINARY_VERSION {
-                return Err(fail("unsupported version"));
-            }
-            if take(1)?[0] != OP_UPDATE_BY_KEY {
-                return Err(fail("op dispatch mismatch"));
-            }
-            let table_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
-            let table = std::str::from_utf8(take(table_len)?)
-                .map_err(|_| fail("non-utf8 table name"))?
-                .to_string();
-            let column_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
-            let pk_column = std::str::from_utf8(take(column_len)?)
-                .map_err(|_| fail("non-utf8 column name"))?
-                .to_string();
-            let pk_value = i32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
-            let new_row_id = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
-            let enc_len = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
-            let new_row_encoded = std::str::from_utf8(take(enc_len)?)
-                .map_err(|_| fail("non-utf8 row encoding"))?
-                .to_string();
-            if at != payload.len() {
-                return Err(fail("trailing bytes"));
-            }
-            Ok(BinaryWalRecord::UpdateByKey(BinaryUpdateByKeyRecord {
-                table,
-                pk_column,
-                pk_value,
-                new_row_id,
-                new_row_encoded,
-            }))
-        }
-        Some(&OP_DELETE_BY_KEY) => {
-            let mut at = 0usize;
-            let mut take = |n: usize| -> Result<&[u8], EngineError> {
-                let end = at.checked_add(n).ok_or_else(|| fail("length overflow"))?;
-                let slice = payload.get(at..end).ok_or_else(|| fail("truncated"))?;
-                at = end;
-                Ok(slice)
-            };
-            if take(1)?[0] != WAL_BINARY_TAG {
-                return Err(fail("missing tag"));
-            }
-            let version = take(1)?[0];
-            if version != WAL_BINARY_VERSION {
-                return Err(fail(&format!("unsupported version {version}")));
-            }
-            if take(1)?[0] != OP_DELETE_BY_KEY {
-                return Err(fail("op dispatch mismatch"));
-            }
-            let table_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
-            let table = std::str::from_utf8(take(table_len)?)
-                .map_err(|_| fail("non-utf8 table name"))?
-                .to_string();
-            let column_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
-            let pk_column = std::str::from_utf8(take(column_len)?)
-                .map_err(|_| fail("non-utf8 column name"))?
-                .to_string();
-            let pk_value = i32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
-            if at != payload.len() {
-                return Err(fail("trailing bytes"));
-            }
-            Ok(BinaryWalRecord::DeleteByKey(BinaryDeleteByKeyRecord {
-                table,
-                pk_column,
-                pk_value,
-            }))
-        }
-        Some(op) => Err(fail(&format!("unsupported op {op}"))),
-        None => Err(fail("truncated header")),
-    }
-}
-
 fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, EngineError> {
     let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
     let mut at = 0usize;
@@ -1106,6 +969,8 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     ) {
         return Err(fail("op dispatch mismatch"));
     }
@@ -1120,11 +985,20 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     );
     let index_catalog = matches!(
         op,
         OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+    );
+    let sequence_catalog = matches!(
+        op,
+        OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     );
     let view_catalog = matches!(
         op,
@@ -1134,6 +1008,8 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     );
     let view_lifecycle_catalog = matches!(
         op,
@@ -1141,6 +1017,8 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     );
     if ordered_catalog
         || matches!(
@@ -1149,7 +1027,9 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         )
     {
         let command_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
-        if (!ordered_catalog && command_count != 1) || (ordered_catalog && command_count == 0) {
+        if (!ordered_catalog && command_count != 1)
+            || (ordered_catalog && command_count == 0 && !sequence_catalog)
+        {
             return Err(fail(
                 "catalog transaction contains a non-canonical operation count",
             ));
@@ -1178,7 +1058,12 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                 view_catalog && matches!(command, Command::CreateView(_))
             };
             let supported_index = index_catalog && command_is_index_lifecycle(&command);
-            if !matches!(command, Command::CreateTable(_)) && !supported_view && !supported_index {
+            let supported_sequence = sequence_catalog && command_is_sequence_lifecycle(&command);
+            if !matches!(command, Command::CreateTable(_))
+                && !supported_view
+                && !supported_index
+                && !supported_sequence
+            {
                 return Err(fail("unsupported composite catalog command"));
             }
             if serde_json::to_vec(&command).ok().as_deref() != Some(bytes) {
@@ -1193,6 +1078,9 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
     let mut view_operations = Vec::new();
     let mut view_lifecycle_operations = Vec::new();
     let mut index_lifecycle_operations = Vec::new();
+    let mut sequence_lifecycle_operations = Vec::new();
+    let mut sequence_reset_operations = Vec::new();
+    let mut sequence_advances_by_oid = BTreeMap::new();
     let mut operation_order = Vec::new();
     let mut statement_digests = Vec::new();
     let mut sequence_input_oids = BTreeMap::new();
@@ -1341,49 +1229,13 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                 return Err(fail("duplicate created-sequence identity"));
             }
         }
-        let expected_sequence_names = catalog_commands
-            .iter()
-            .flat_map(|operation| match &operation.command {
-                Command::CreateTable(create) => create
-                    .columns
-                    .iter()
-                    .filter_map(|column| match &column.default {
-                        Some(ColumnDefault::SequenceNextVal {
-                            sequence,
-                            create_if_missing: true,
-                        }) => Some(sequence.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            })
-            .collect::<BTreeSet<_>>();
-        if expected_sequence_names.len()
-            != catalog_commands
-                .iter()
-                .flat_map(|operation| match &operation.command {
-                    Command::CreateTable(create) => create
-                        .columns
-                        .iter()
-                        .filter(|column| {
-                            matches!(
-                                &column.default,
-                                Some(ColumnDefault::SequenceNextVal {
-                                    create_if_missing: true,
-                                    ..
-                                })
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
-                })
-                .count()
-            || expected_sequence_names
+        if generated_sequence_names(&catalog_commands).is_none_or(|expected| {
+            expected
                 != created_sequence_oids
                     .keys()
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>()
-        {
+        }) {
             return Err(fail(
                 "ordered catalog sequence identities do not cover the exact generated set",
             ));
@@ -1490,6 +1342,66 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                 index_lifecycle_operations.push(identity);
             }
         }
+        if sequence_catalog {
+            let sequence_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            let expected_sequences = catalog_commands
+                .iter()
+                .enumerate()
+                .filter_map(|(command_index, operation)| {
+                    command_is_sequence_lifecycle(&operation.command).then_some((
+                        command_index,
+                        operation.ordinal,
+                        &operation.command,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if sequence_count != expected_sequences.len() {
+                return Err(fail(
+                    "sequence identities do not cover the exact sequence command set",
+                ));
+            }
+            sequence_lifecycle_operations.reserve(sequence_count.min(1024));
+            for (expected_command_index, expected_ordinal, command) in expected_sequences {
+                let command_index = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+                let ordinal = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+                if usize::try_from(command_index).ok() != Some(expected_command_index)
+                    || ordinal != expected_ordinal
+                {
+                    return Err(fail(
+                        "sequence identity does not match its catalog command position",
+                    ));
+                }
+                let identity =
+                    decode_sequence_lifecycle_operation(command_index, ordinal, &mut take, &fail)?;
+                if !valid_sequence_lifecycle_operation_identity(command, &identity) {
+                    return Err(fail("invalid sequence lifecycle identity closure"));
+                }
+                sequence_lifecycle_operations.push(identity);
+            }
+            sequence_reset_operations = decode_sequence_reset_operations(&mut take, &fail)?;
+            let advance_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            for _ in 0..advance_count {
+                let oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+                let last_value = i64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+                let is_called = match take(1)?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(fail("invalid stable-ID sequence called flag")),
+                };
+                if oid == 0
+                    || sequence_advances_by_oid
+                        .insert(oid, (last_value, is_called))
+                        .is_some()
+                {
+                    return Err(fail("duplicate or invalid stable-ID sequence advancement"));
+                }
+            }
+            if sequence_lifecycle_operations.is_empty() && sequence_reset_operations.is_empty() {
+                return Err(fail(
+                    "sequence lifecycle opcode requires a lifecycle or reset identity",
+                ));
+            }
+        }
         let operation_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
         if operation_count == 0 {
             return Err(fail(
@@ -1558,6 +1470,17 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                 return Err(fail("non-canonical ordered sequence input identity"));
             }
             prior_sequence_key = Some(key);
+        }
+        if catalog_output.as_ref().is_none_or(|output| {
+            !generated_sequence_output_matches_inputs(
+                &catalog_commands,
+                &sequence_input_oids,
+                output,
+            )
+        }) {
+            return Err(fail(
+                "generated-sequence output contradicts its CREATE statement input",
+            ));
         }
     }
     let mut table_resets = Vec::new();
@@ -1633,6 +1556,7 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION
     );
     let mut table_identities = BTreeMap::new();
     if identity_bound {
@@ -1741,6 +1665,13 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
+    let sequence_resets_by_ordinal = sequence_reset_operations
+        .iter()
+        .map(|identity| (identity.ordinal, identity))
+        .collect::<BTreeMap<_, _>>();
+    if sequence_resets_by_ordinal.len() != sequence_reset_operations.len() {
+        return Err(fail("duplicate sequence reset operation ordinal"));
+    }
     let mut ordered_row_names = BTreeSet::new();
     let mut ordered_reset_names = BTreeSet::new();
     let mut next_catalog_index = 0usize;
@@ -1794,6 +1725,10 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                         Command::CreateIndex(_)
                         | Command::RenameIndex(_)
                         | Command::DropIndex(_) => BTreeSet::new(),
+                        Command::CreateSequence(_)
+                        | Command::SequenceRestart(_)
+                        | Command::RenameSequence(_)
+                        | Command::DropSequence(_) => BTreeSet::new(),
                         _ => return Err(fail("unsupported ordered catalog command")),
                     };
                     if input_sequence_names != expected_sequences {
@@ -1829,7 +1764,9 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                     }
                     let command = Command::TruncateTable(TruncateTable {
                         name: table.clone(),
-                        restart_identity: false,
+                        restart_identity: sequence_resets_by_ordinal
+                            .get(&ordinal_u32)
+                            .is_some_and(|identity| identity.table == *table),
                     });
                     if transaction_statement_digest(&command)
                         .map_err(|error| fail(&error.to_string()))?
@@ -1875,11 +1812,36 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                     })
             })
             .collect::<BTreeSet<_>>();
-        if insert_sequence_names
+        if sequence_catalog {
+            let insert_sequence_oids = sequence_input_oids
+                .iter()
+                .filter_map(|((ordinal, _), oid)| {
+                    usize::try_from(*ordinal)
+                        .ok()
+                        .and_then(|ordinal| operation_order.get(ordinal))
+                        .and_then(|operation| {
+                            matches!(operation, BinaryTransactionOperationIdentity::Insert { .. })
+                                .then_some(*oid)
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            if !sequence_advances.is_empty()
+                || insert_sequence_oids
+                    != sequence_advances_by_oid
+                        .keys()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+            {
+                return Err(fail(
+                    "ordered INSERT stable sequence identities do not close over sequence advances",
+                ));
+            }
+        } else if insert_sequence_names
             != sequence_advances
                 .keys()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>()
+            || !sequence_advances_by_oid.is_empty()
         {
             return Err(fail(
                 "ordered INSERT sequence identities do not close over sequence advances",
@@ -1908,6 +1870,22 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         return Err(fail("table reset has non-canonical post-reset mutations"));
     }
     if ordered_catalog {
+        if sequence_reset_operations.iter().any(|identity| {
+            usize::try_from(identity.ordinal)
+                .ok()
+                .and_then(|ordinal| operation_order.get(ordinal))
+                .is_none_or(|operation| {
+                    !matches!(
+                        operation,
+                        BinaryTransactionOperationIdentity::TableReset { table }
+                            if table == &identity.table
+                    )
+                })
+        }) {
+            return Err(fail(
+                "sequence reset identity does not match an ordered table reset",
+            ));
+        }
         for reset in &table_resets {
             let Some(operation) = usize::try_from(reset.ordinal)
                 .ok()
@@ -1959,6 +1937,9 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         view_operations,
         view_lifecycle_operations,
         index_lifecycle_operations,
+        sequence_lifecycle_operations,
+        sequence_reset_operations,
+        sequence_advances_by_oid,
         operation_order,
         statement_digests,
         sequence_input_oids,

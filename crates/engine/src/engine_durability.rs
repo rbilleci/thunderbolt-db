@@ -481,6 +481,71 @@ impl Engine {
         Self::encode_replay_typed_command(command, ENGINE_TYPED_COMMAND_VERSION_LEGACY)
     }
 
+    #[cfg(test)]
+    pub(crate) fn canonical_legacy_wal_record_for_test(
+        commit: &CommitState,
+        txn_id: TxnId,
+        commit_seq: Index,
+        lane_id: u32,
+        payload: &Arc<[u8]>,
+    ) -> Result<WalRecord, EngineError> {
+        if payload.get(..2)
+            != Some(&[
+                ENGINE_TYPED_COMMAND_TAG,
+                ENGINE_TYPED_COMMAND_VERSION_LEGACY,
+            ])
+        {
+            return Err(EngineError::Durability(
+                "historical canonical test record requires a legacy typed command".to_string(),
+            ));
+        }
+        let command = Self::decode_engine_command(payload)?.ok_or_else(|| {
+            EngineError::Durability(
+                "historical canonical test record has no typed command".to_string(),
+            )
+        })?;
+        let canonical = serde_json::to_vec(&command).map_err(|error| {
+            EngineError::Durability(format!(
+                "historical canonical test command encode failed: {error}"
+            ))
+        })?;
+        let current = Self::canonical_wal_record(commit, txn_id, commit_seq, lane_id, payload)?;
+        let envelope =
+            gpu_db_wal::decode_canonical_record_payload(&current.payload)?.ok_or_else(|| {
+                EngineError::Durability(
+                    "historical canonical test record did not produce an envelope".to_string(),
+                )
+            })?;
+
+        let mut operation = Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + canonical.len());
+        operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
+        operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1);
+        operation.extend_from_slice(&[0; 3]);
+        operation.extend_from_slice(&(canonical.len() as u64).to_le_bytes());
+        operation.extend_from_slice(&canonical);
+
+        let mut fragments = envelope.fragments;
+        fragments[0].body = operation;
+        let mut header = envelope.header;
+        header.catalog_after_digest = Self::canonical_catalog_transition(
+            header.catalog_before_digest,
+            fragments[0].kind,
+            &fragments[0].body,
+        );
+        let mut outcome = envelope.outcome;
+        outcome.target_digest = gpu_db_wal::canonical_request_digest(&fragments[0].body);
+        let encoded = gpu_db_wal::encode_canonical_envelope(
+            envelope.physical,
+            &header,
+            &fragments,
+            &outcome,
+        )?;
+        Ok(WalRecord {
+            txn_id,
+            payload: Arc::from(gpu_db_wal::pack_canonical_record_payload(&encoded)?),
+        })
+    }
+
     fn encode_transaction_claim_status(
         identity: gpu_db_wal::CanonicalIdentity,
         txn_id: TxnId,
@@ -1486,6 +1551,9 @@ mod tests {
             view_operations: Vec::new(),
             view_lifecycle_operations: Vec::new(),
             index_lifecycle_operations: Vec::new(),
+            sequence_lifecycle_operations: Vec::new(),
+            sequence_reset_operations: Vec::new(),
+            sequence_advances_by_oid: BTreeMap::new(),
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),

@@ -474,6 +474,40 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn apply_restart_sequence(
+        &self,
+        cat: &mut DdlCatalogState,
+        restart: SequenceRestart,
+    ) -> Result<(), EngineError> {
+        match cat.pg_class_relation_kind(&restart.name)? {
+            Some(PgClassRelationKind::Sequence) => {}
+            Some(_) => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a sequence",
+                    restart.name
+                )))
+            }
+            None => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "sequence \"{}\" does not exist",
+                    restart.name
+                )))
+            }
+        }
+        let sequence = cat
+            .relational_sequences
+            .get_mut(&restart.name)
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "catalog sequence binding {:?} disappeared",
+                    restart.name
+                ))
+            })?;
+        sequence.last_value = restart.value;
+        sequence.is_called = false;
+        Ok(())
+    }
+
     pub(crate) fn preflight_create_domain(&self, create: &CreateDomain) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         if cat.relational_catalog.contains_key(&create.name)
@@ -728,27 +762,32 @@ impl Engine {
             ColumnDefault::Literal(value) => Ok(value.clone()),
             ColumnDefault::SequenceNextVal { sequence, .. } => {
                 self.preflight_sequence_target(sequence)?;
+                let scoped_snapshot = self.current_transaction_read_snapshot();
+                let scoped_catalog = scoped_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.transaction_catalog())
+                    .unwrap_or_else(|| self.catalog_snapshot());
+                let resolved = scoped_catalog
+                    .relational_sequences
+                    .get(sequence)
+                    .expect("sequence target preflighted");
+                let sequence_oid = resolved.oid;
+                let published_state = (resolved.last_value, resolved.is_called);
                 let entry = seq_state.entry(sequence.clone()).or_insert_with(|| {
-                    if let Some(state) =
-                        self.current_transaction_read_snapshot()
-                            .and_then(|snapshot| {
-                                snapshot
-                                    .delta
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .sequence_state
-                                    .get(sequence)
-                                    .copied()
-                            })
-                    {
+                    if let Some(state) = scoped_snapshot.as_ref().and_then(|snapshot| {
+                        let delta = snapshot
+                            .delta
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        delta
+                            .sequence_state_by_oid
+                            .get(&sequence_oid)
+                            .copied()
+                            .or_else(|| delta.sequence_state.get(sequence).copied())
+                    }) {
                         return state;
                     }
-                    let catalog = self.catalog_snapshot();
-                    let seq = catalog
-                        .relational_sequences
-                        .get(sequence)
-                        .expect("sequence target preflighted");
-                    (seq.last_value, seq.is_called)
+                    published_state
                 });
                 let (last_value, is_called) = *entry;
                 let value = if is_called {
@@ -1136,7 +1175,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         drop: DropSequence,
     ) -> Result<(), EngineError> {
-        self.apply_drop_sequence_with_replay_policy(cat, drop, false)
+        self.apply_drop_sequence_with_replay_policy(cat, drop, false, false)
     }
 
     pub(crate) fn apply_drop_sequence_legacy_replay(
@@ -1144,20 +1183,30 @@ impl Engine {
         cat: &mut DdlCatalogState,
         drop: DropSequence,
     ) -> Result<(), EngineError> {
-        self.apply_drop_sequence_with_replay_policy(cat, drop, true)
+        self.apply_drop_sequence_with_replay_policy(cat, drop, true, true)
+    }
+
+    pub(crate) fn apply_drop_sequence_historical_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropSequence,
+        legacy_namespace: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_drop_sequence_with_replay_policy(cat, drop, legacy_namespace, true)
     }
 
     fn apply_drop_sequence_with_replay_policy(
         &self,
         cat: &mut DdlCatalogState,
         drop: DropSequence,
-        legacy_replay: bool,
+        legacy_namespace: bool,
+        historical_replay: bool,
     ) -> Result<(), EngineError> {
-        if legacy_replay {
-            self.preflight_drop_sequence_legacy_replay(&drop)?;
-        } else {
-            self.preflight_drop_sequence(&drop)?;
-        }
+        self.preflight_drop_sequence_with_replay_policy(
+            &drop,
+            legacy_namespace,
+            historical_replay,
+        )?;
         for name in &drop.names {
             if cat.relational_sequences.remove(name).is_none() {
                 continue;

@@ -110,18 +110,14 @@ fn relational_catalog_truncates_table_and_replays_from_wal() {
     assert_eq!(restart_seq.last_value, 2);
     assert!(restart_seq.is_called);
     let wal_before_restart = e.durable_wal_records().len();
-    let restart_error = e
-        .execute_text(14, "TRUNCATE TABLE public.restart_people RESTART IDENTITY")
-        .unwrap_err();
-    assert!(matches!(restart_error, ExecuteError::Unsupported(_)));
-    assert_eq!(e.durable_wal_records().len(), wal_before_restart);
+    e.execute_text(14, "TRUNCATE TABLE public.restart_people RESTART IDENTITY")
+        .unwrap();
+    assert_eq!(e.durable_wal_records().len(), wal_before_restart + 1);
     let restart_seq = e
         .relational_catalog_sequence("restart_people_id_seq")
         .unwrap();
-    assert_eq!(restart_seq.last_value, 2);
-    assert!(restart_seq.is_called);
-    e.execute_text(15, "TRUNCATE TABLE public.restart_people CONTINUE IDENTITY")
-        .unwrap();
+    assert_eq!(restart_seq.last_value, 1);
+    assert!(!restart_seq.is_called);
     e.execute_text(16, "INSERT INTO restart_people (name) VALUES ('Linus')")
         .unwrap();
     let Command::Select(restart_select) =
@@ -131,7 +127,7 @@ fn relational_catalog_truncates_table_and_replays_from_wal() {
     };
     assert_eq!(
         e.execute_relational_select(&restart_select).unwrap().rows,
-        vec![vec![SqlValue::Int4(3), SqlValue::Text("Linus".to_string())]]
+        vec![vec![SqlValue::Int4(1), SqlValue::Text("Linus".to_string())]]
     );
     let recovered_restart = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
     assert_eq!(
@@ -139,12 +135,12 @@ fn relational_catalog_truncates_table_and_replays_from_wal() {
             .execute_relational_select(&restart_select)
             .unwrap()
             .rows,
-        vec![vec![SqlValue::Int4(3), SqlValue::Text("Linus".to_string())]]
+        vec![vec![SqlValue::Int4(1), SqlValue::Text("Linus".to_string())]]
     );
     let recovered_seq = recovered_restart
         .relational_catalog_sequence("restart_people_id_seq")
         .unwrap();
-    assert_eq!(recovered_seq.last_value, 3);
+    assert_eq!(recovered_seq.last_value, 1);
     assert!(recovered_seq.is_called);
 
     let missing_truncate = e

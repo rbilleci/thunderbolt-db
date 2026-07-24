@@ -91,6 +91,7 @@ impl Planner {
             | Command::CreateDomain(_)
             | Command::SequenceNextVal(_)
             | Command::SequenceSetVal(_)
+            | Command::SequenceRestart(_)
             | Command::RenameSequence(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)

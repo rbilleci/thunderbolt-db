@@ -160,7 +160,14 @@ impl Engine {
                     TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
                 })
                 .collect::<Vec<_>>();
-            if !catalog_commands.is_empty() {
+            let has_sequence_resets = delta.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    TransactionOperation::TableReset(reset)
+                        if reset.sequence_reset_identity.is_some()
+                )
+            });
+            if !catalog_commands.is_empty() || has_sequence_resets {
                 let base = delta.catalog_base.as_deref().ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
                         "transactional catalog operation envelope lost its base generation"
@@ -193,6 +200,10 @@ impl Engine {
                         Command::CreateIndex(_)
                         | Command::RenameIndex(_)
                         | Command::DropIndex(_) => None,
+                        Command::CreateSequence(_)
+                        | Command::SequenceRestart(_)
+                        | Command::RenameSequence(_)
+                        | Command::DropSequence(_) => None,
                         _ => {
                             unreachable!(
                                 "transactional catalog staging admitted an unsupported family"
@@ -206,7 +217,13 @@ impl Engine {
             }
         };
         let transaction_catalog = rebased_catalog_overlay.as_ref().unwrap_or(&fresh.catalog);
-        let (generation, mut operations, sequence_state, old_private_gpu_bytes) = {
+        let (
+            generation,
+            mut operations,
+            sequence_state,
+            sequence_state_by_oid,
+            old_private_gpu_bytes,
+        ) = {
             let delta = current
                 .delta
                 .lock()
@@ -215,6 +232,7 @@ impl Engine {
                 delta.generation,
                 delta.operations.clone(),
                 delta.sequence_state.clone(),
+                delta.sequence_state_by_oid.clone(),
                 delta.private_gpu_bytes_by_gpu.clone(),
             )
         };
@@ -244,6 +262,7 @@ impl Engine {
             write_set: WriteSet::default(),
             next_row_id: fresh.next_row_id,
             sequence_state: BTreeMap::new(),
+            sequence_state_by_oid: BTreeMap::new(),
             catalog_base: None,
             catalog_overlay: rebased_catalog_overlay.clone(),
             private_gpu_bytes_by_gpu: BTreeMap::new(),
@@ -271,6 +290,13 @@ impl Engine {
             _resident_gpu_charge: Arc::clone(&fresh._resident_gpu_charge),
         });
         let mut gpu_reservation = TransactionGpuReservation::new(self);
+        let catalog_commands = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                TransactionOperation::Catalog(staged) => Some(staged.as_ref().clone()),
+                TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
+            })
+            .collect::<Vec<_>>();
         for (ordinal, operation) in operations.iter().enumerate() {
             match operation {
                 TransactionOperation::Catalog(staged) => {
@@ -287,7 +313,13 @@ impl Engine {
                             .relational_catalog
                             .get(name)
                             .is_none_or(|observed| {
-                                !same_transaction_row_catalog_dependency(expected, observed)
+                                !same_transaction_row_catalog_dependency(
+                                    expected,
+                                    observed,
+                                    &delta.sequence_input_oids,
+                                    transaction_catalog,
+                                    &catalog_commands,
+                                )
                             })
                         {
                             return Err(ExecuteError::Serialization(format!(
@@ -399,6 +431,7 @@ impl Engine {
                 )
             })?;
         state.sequence_state = sequence_state;
+        state.sequence_state_by_oid = sequence_state_by_oid;
         if let Some(overlay) = rebased_catalog_overlay {
             state.catalog_base = Some(Arc::clone(&fresh.catalog));
             state.catalog_overlay = Some(overlay);

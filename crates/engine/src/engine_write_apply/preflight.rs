@@ -974,6 +974,7 @@ impl Engine {
             Command::CreateDomain(create) => self.preflight_create_domain(create)?,
             Command::SequenceNextVal(nextval) => self.preflight_sequence_target(&nextval.name)?,
             Command::SequenceSetVal(setval) => self.preflight_sequence_target(&setval.name)?,
+            Command::SequenceRestart(restart) => self.preflight_sequence_target(&restart.name)?,
             Command::RenameSequence(rename) => {
                 if cat
                     .pg_class_relation_kind(&rename.old_name)?

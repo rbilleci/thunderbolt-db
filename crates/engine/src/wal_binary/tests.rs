@@ -49,6 +49,9 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -101,6 +104,9 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -161,6 +167,9 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: vec![
             BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
             BinaryTransactionOperationIdentity::Insert {
@@ -351,6 +360,9 @@ fn transactional_view_uses_additive_opcode_and_exact_identity_closure() {
         }],
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
         statement_digests: vec![transaction_statement_digest(&command).unwrap()],
         sequence_input_oids: BTreeMap::new(),
@@ -493,6 +505,9 @@ fn transactional_view_lifecycle_uses_additive_opcode_and_canonical_targets() {
             },
         ],
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: vec![
             BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
             BinaryTransactionOperationIdentity::Catalog { command_index: 1 },
@@ -572,6 +587,9 @@ fn identity_bound_transaction_round_trips_and_covers_the_exact_mutation_set() {
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -614,6 +632,253 @@ fn identity_bound_transaction_round_trips_and_covers_the_exact_mutation_set() {
 }
 
 #[test]
+fn transactional_sequence_lifecycle_uses_additive_stable_oid_opcodes() {
+    let create = parse_command("CREATE SEQUENCE codec_sequence").unwrap();
+    let sequence_identity = BinaryCatalogRelationIdentity {
+        kind: BinaryCatalogRelationKind::Sequence,
+        oid: 41,
+        digest: [1; 32],
+    };
+    let lifecycle = BinaryTransactionSequenceLifecycleOperationIdentity {
+        command_index: 0,
+        ordinal: 0,
+        targets: vec![BinaryTransactionSequenceLifecycleTargetIdentity {
+            before_name: "codec_sequence".to_string(),
+            target_before: None,
+            dependencies_before: BTreeMap::new(),
+            after_name: Some("codec_sequence".to_string()),
+            target_after: Some(sequence_identity),
+            dependencies_after: BTreeMap::new(),
+        }],
+    };
+    let catalog_only = BinaryTransactionRecord {
+        catalog_epoch: BinaryTransactionCatalogEpoch::IndexIdentityV1,
+        allocator_high_water: 0,
+        catalog_commands: vec![BinaryTransactionCatalogCommand {
+            ordinal: 0,
+            command: create.clone(),
+        }],
+        created_table_identities: BTreeMap::new(),
+        created_table_index_identities: BTreeMap::new(),
+        catalog_output: Some(BinaryTransactionCatalogOutput {
+            relational_next_oid: 42,
+            relational_next_column_id: 1,
+            created_sequence_oids: BTreeMap::new(),
+        }),
+        view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
+        index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: vec![lifecycle],
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
+        operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
+        statement_digests: vec![transaction_statement_digest(&create).unwrap()],
+        sequence_input_oids: BTreeMap::new(),
+        table_resets: Vec::new(),
+        sequence_advances: BTreeMap::new(),
+        table_identities: BTreeMap::new(),
+        mutations: Vec::new(),
+    };
+    let payload = try_encode_binary_transaction(&catalog_only).unwrap();
+    assert_eq!(
+        payload[..3],
+        [
+            WAL_BINARY_TAG,
+            WAL_BINARY_VERSION,
+            OP_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION,
+        ]
+    );
+    assert!(matches!(
+        decode_binary_record(&payload).unwrap(),
+        BinaryWalRecord::Transaction(decoded) if decoded == catalog_only
+    ));
+
+    let insert = parse_command("INSERT INTO codec_sequence_owner (payload) VALUES (7)").unwrap();
+    let identity_bound = BinaryTransactionRecord {
+        allocator_high_water: 8,
+        sequence_advances_by_oid: BTreeMap::from([(41, (1, true))]),
+        operation_order: vec![
+            BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
+            BinaryTransactionOperationIdentity::Insert {
+                table: "codec_sequence_owner".to_string(),
+            },
+        ],
+        statement_digests: vec![
+            transaction_statement_digest(&create).unwrap(),
+            transaction_statement_digest(&insert).unwrap(),
+        ],
+        sequence_input_oids: BTreeMap::from([((1, "codec_sequence".to_string()), 41)]),
+        table_identities: BTreeMap::from([(
+            "codec_sequence_owner".to_string(),
+            BinaryTransactionTableIdentity {
+                table_oid: 50,
+                schema_digest: [5; 32],
+            },
+        )]),
+        mutations: vec![BinaryTransactionMutation::Insert {
+            table: "codec_sequence_owner".to_string(),
+            row_id: 7,
+            row_encoded: "i:1".to_string(),
+        }],
+        ..catalog_only.clone()
+    };
+    let identity_payload = try_encode_binary_transaction(&identity_bound).unwrap();
+    assert_eq!(
+        identity_payload[..3],
+        [
+            WAL_BINARY_TAG,
+            WAL_BINARY_VERSION,
+            OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION,
+        ]
+    );
+    assert!(matches!(
+        decode_binary_record(&identity_payload).unwrap(),
+        BinaryWalRecord::Transaction(decoded) if decoded == identity_bound
+    ));
+    assert!(decode_binary_record(&identity_payload[..identity_payload.len() - 1]).is_err());
+
+    let mut forged_family = identity_payload;
+    forged_family[2] = OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION;
+    assert!(decode_binary_record(&forged_family).is_err());
+
+    let mut missing_stable_state = identity_bound.clone();
+    missing_stable_state.sequence_advances_by_oid.clear();
+    assert!(try_encode_binary_transaction(&missing_stable_state).is_none());
+    let mut wrong_input_oid = identity_bound.clone();
+    *wrong_input_oid
+        .sequence_input_oids
+        .values_mut()
+        .next()
+        .unwrap() = 42;
+    assert!(try_encode_binary_transaction(&wrong_input_oid).is_none());
+    let mut smuggled_legacy_state = identity_bound;
+    smuggled_legacy_state
+        .sequence_advances
+        .insert("codec_sequence".to_string(), (1, true));
+    assert!(try_encode_binary_transaction(&smuggled_legacy_state).is_none());
+}
+
+#[test]
+fn sequence_lifecycle_opcode_requires_a_lifecycle_or_reset_owner() {
+    let create =
+        parse_command("CREATE TABLE stable_only_owner (payload int4)").expect("valid CREATE TABLE");
+    let insert =
+        parse_command("INSERT INTO stable_only_owner (payload) VALUES (1)").expect("valid INSERT");
+    let stable_only = BinaryTransactionRecord {
+        catalog_epoch: BinaryTransactionCatalogEpoch::IndexIdentityV1,
+        allocator_high_water: 2,
+        catalog_commands: vec![BinaryTransactionCatalogCommand {
+            ordinal: 0,
+            command: create.clone(),
+        }],
+        created_table_identities: BTreeMap::from([(
+            "stable_only_owner".to_string(),
+            BinaryTransactionTableIdentity {
+                table_oid: 50,
+                schema_digest: [1; 32],
+            },
+        )]),
+        created_table_index_identities: BTreeMap::from([(
+            "stable_only_owner".to_string(),
+            Vec::new(),
+        )]),
+        catalog_output: Some(BinaryTransactionCatalogOutput {
+            relational_next_oid: 51,
+            relational_next_column_id: 2,
+            created_sequence_oids: BTreeMap::new(),
+        }),
+        view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
+        index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::from([(41, (1, true))]),
+        operation_order: vec![
+            BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
+            BinaryTransactionOperationIdentity::Insert {
+                table: "stable_only_owner".to_string(),
+            },
+        ],
+        statement_digests: vec![
+            transaction_statement_digest(&create).unwrap(),
+            transaction_statement_digest(&insert).unwrap(),
+        ],
+        sequence_input_oids: BTreeMap::from([((1, "unowned_sequence".to_string()), 41)]),
+        table_resets: Vec::new(),
+        sequence_advances: BTreeMap::new(),
+        table_identities: BTreeMap::new(),
+        mutations: vec![BinaryTransactionMutation::Insert {
+            table: "stable_only_owner".to_string(),
+            row_id: 1,
+            row_encoded: "i:1".to_string(),
+        }],
+    };
+    assert!(
+        try_encode_binary_transaction(&stable_only).is_none(),
+        "stable sequence values may accompany opcode 18, but cannot select that family"
+    );
+
+    // This is the formerly decoder-valid zero-catalog-command shape. It is deliberately assembled
+    // below the encoder so the decoder's own canonicality boundary is covered independently.
+    let mut forged = vec![
+        WAL_BINARY_TAG,
+        WAL_BINARY_VERSION,
+        OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION,
+    ];
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // catalog commands
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // created table identities
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // created table index identities
+    forged.extend_from_slice(&51_u32.to_le_bytes()); // catalog next OID
+    forged.extend_from_slice(&2_u32.to_le_bytes()); // catalog next column id
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // generated sequence OIDs
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // view lifecycle identities
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // index lifecycle identities
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // sequence lifecycle identities
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // sequence reset identities
+    forged.extend_from_slice(&1_u32.to_le_bytes()); // stable sequence advances
+    forged.extend_from_slice(&41_u32.to_le_bytes());
+    forged.extend_from_slice(&1_i64.to_le_bytes());
+    forged.push(1);
+    forged.extend_from_slice(&1_u32.to_le_bytes()); // operation order
+    forged.push(TXN_OPERATION_INSERT);
+    forged.extend_from_slice(&1_u16.to_le_bytes());
+    forged.extend_from_slice(b"t");
+    forged.extend_from_slice(&1_u32.to_le_bytes()); // statement digests
+    forged.extend_from_slice(&[1; 32]);
+    forged.extend_from_slice(&1_u32.to_le_bytes()); // sequence inputs
+    forged.extend_from_slice(&0_u32.to_le_bytes());
+    forged.extend_from_slice(&1_u16.to_le_bytes());
+    forged.extend_from_slice(b"s");
+    forged.extend_from_slice(&41_u32.to_le_bytes());
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // table resets
+    forged.extend_from_slice(&1_u32.to_le_bytes()); // table identities
+    forged.extend_from_slice(&1_u16.to_le_bytes());
+    forged.extend_from_slice(b"t");
+    forged.extend_from_slice(&50_u32.to_le_bytes());
+    forged.extend_from_slice(&[2; 32]);
+    forged.extend_from_slice(&2_u64.to_le_bytes()); // allocator high water
+    forged.extend_from_slice(&0_u32.to_le_bytes()); // legacy sequence advances
+    forged.extend_from_slice(&1_u32.to_le_bytes()); // mutations
+    forged.push(TXN_INSERT);
+    forged.extend_from_slice(&1_u16.to_le_bytes());
+    forged.extend_from_slice(b"t");
+    forged.extend_from_slice(&1_u64.to_le_bytes());
+    forged.extend_from_slice(&3_u32.to_le_bytes());
+    forged.extend_from_slice(b"i:1");
+
+    let error = match decode_binary_record(&forged) {
+        Ok(_) => panic!("stable-value-only opcode 18 must be rejected by the decoder"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("requires a lifecycle or reset identity"),
+        "{error}"
+    );
+}
+
+#[test]
 fn typed_table_reset_round_trips_and_rejects_noncanonical_composition() {
     let reset = BinaryTransactionTableReset {
         ordinal: 3,
@@ -636,6 +901,9 @@ fn typed_table_reset_round_trips_and_rejects_noncanonical_composition() {
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
         index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),

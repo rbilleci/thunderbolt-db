@@ -1880,9 +1880,10 @@ impl Engine {
         let Some(cmd) = Self::decode_engine_command(&entry.payload)? else {
             return Ok(Vec::new());
         };
-        let current_index_semantics =
-            Self::engine_command_uses_current_index_semantics(&entry.payload)
-                || cat.index_oid_epoch_current;
+        let command_uses_current_semantics =
+            Self::engine_command_uses_current_index_semantics(&entry.payload);
+        let current_index_semantics = command_uses_current_semantics || cat.index_oid_epoch_current;
+        let historical_command_replay = !command_uses_current_semantics;
         if current_index_semantics {
             // The codec/typed-command epoch is the durable one-way migration boundary, not the
             // command family. A current CREATE VIEW/SEQUENCE/etc. must lift the recovery-only
@@ -2072,8 +2073,17 @@ impl Engine {
                     self.apply_sequence_setval_legacy_replay(cat, setval)?;
                 }
             }
+            Command::SequenceRestart(restart) => {
+                self.apply_restart_sequence(cat, restart)?;
+            }
             Command::RenameSequence(rename) => {
-                if current_index_semantics {
+                if historical_command_replay {
+                    self.apply_rename_sequence_historical_replay(
+                        cat,
+                        rename,
+                        !current_index_semantics,
+                    )?;
+                } else if current_index_semantics {
                     self.apply_rename_sequence(cat, rename)?;
                 } else {
                     self.apply_rename_sequence_legacy_replay(cat, rename)?;
@@ -2105,7 +2115,13 @@ impl Engine {
                 }
             }
             Command::DropSequence(drop) => {
-                if current_index_semantics {
+                if historical_command_replay {
+                    self.apply_drop_sequence_historical_replay(
+                        cat,
+                        drop,
+                        !current_index_semantics,
+                    )?;
+                } else if current_index_semantics {
                     self.apply_drop_sequence(cat, drop)?;
                 } else {
                     self.apply_drop_sequence_legacy_replay(cat, drop)?;

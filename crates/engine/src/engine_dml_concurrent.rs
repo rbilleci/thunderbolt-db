@@ -476,6 +476,7 @@ impl Engine {
                 write_set: WriteSet::default(),
                 next_row_id: self.read_state.mvcc.current_row_id(),
                 sequence_state: BTreeMap::new(),
+                sequence_state_by_oid: BTreeMap::new(),
                 catalog_base: None,
                 catalog_overlay: None,
                 private_gpu_bytes_by_gpu: BTreeMap::new(),
@@ -1881,6 +1882,7 @@ impl Engine {
             | Command::CreateDomain(_)
             | Command::SequenceNextVal(_)
             | Command::SequenceSetVal(_)
+            | Command::SequenceRestart(_)
             | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
@@ -2094,6 +2096,7 @@ impl Engine {
             Command::CreateDomain(_) => Err(ExecuteError::NonReadCommand("CREATE DOMAIN")),
             Command::SequenceNextVal(_) => Err(ExecuteError::NonReadCommand("SELECT nextval")),
             Command::SequenceSetVal(_) => Err(ExecuteError::NonReadCommand("SELECT setval")),
+            Command::SequenceRestart(_) => Err(ExecuteError::NonReadCommand("ALTER SEQUENCE")),
             Command::RenameSequence(_) => Err(ExecuteError::NonReadCommand("ALTER SEQUENCE")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),

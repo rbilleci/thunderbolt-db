@@ -185,6 +185,7 @@ fn active_snapshots_track_oldest_boundary() {
                     write_set: WriteSet::default(),
                     next_row_id: 1,
                     sequence_state: BTreeMap::new(),
+                    sequence_state_by_oid: BTreeMap::new(),
                     catalog_base: None,
                     catalog_overlay: None,
                     private_gpu_bytes_by_gpu: BTreeMap::new(),

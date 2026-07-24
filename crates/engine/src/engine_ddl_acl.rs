@@ -666,20 +666,14 @@ impl Engine {
     }
 
     pub(crate) fn preflight_drop_sequence(&self, drop: &DropSequence) -> Result<(), EngineError> {
-        self.preflight_drop_sequence_with_replay_policy(drop, false)
+        self.preflight_drop_sequence_with_replay_policy(drop, false, false)
     }
 
-    pub(crate) fn preflight_drop_sequence_legacy_replay(
+    pub(crate) fn preflight_drop_sequence_with_replay_policy(
         &self,
         drop: &DropSequence,
-    ) -> Result<(), EngineError> {
-        self.preflight_drop_sequence_with_replay_policy(drop, true)
-    }
-
-    fn preflight_drop_sequence_with_replay_policy(
-        &self,
-        drop: &DropSequence,
-        legacy_replay: bool,
+        legacy_namespace: bool,
+        historical_replay: bool,
     ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
@@ -690,7 +684,7 @@ impl Engine {
                     name
                 )));
             }
-            if legacy_replay {
+            if legacy_namespace {
                 if cat.relational_catalog.contains_key(name)
                     || cat.relational_views.contains_key(name)
                     || cat.relational_materialized_views.contains_key(name)
@@ -722,6 +716,22 @@ impl Engine {
                         )))
                     }
                     None => {}
+                }
+            }
+            if !historical_replay {
+                if let Some((table, column)) = cat.relational_catalog.values().find_map(|table| {
+                    table.columns.iter().find_map(|column| {
+                        matches!(
+                            &column.default,
+                            Some(ColumnDefault::SequenceNextVal { sequence, .. })
+                                if sequence == name
+                        )
+                        .then_some((table.name.as_str(), column.name.as_str()))
+                    })
+                }) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "cannot drop sequence \"{name}\" because column \"{table}.{column}\" depends on it"
+                    )));
                 }
             }
         }

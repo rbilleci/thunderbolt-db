@@ -664,6 +664,66 @@ fn transition_selector_tamper_rejects_before_wal_without_catalog_effect() {
 }
 
 #[test]
+fn legacy_sequence_rename_and_drop_keep_historical_default_bindings() {
+    let records = [
+        (6_930, "CREATE SEQUENCE legacy_rename_sequence"),
+        (
+            6_931,
+            "CREATE TABLE legacy_rename_owner \
+             (id int4 DEFAULT nextval('legacy_rename_sequence'::regclass))",
+        ),
+        (
+            6_932,
+            "ALTER SEQUENCE legacy_rename_sequence \
+             RENAME TO legacy_renamed_sequence",
+        ),
+        (6_933, "CREATE SEQUENCE legacy_drop_sequence"),
+        (
+            6_934,
+            "CREATE TABLE legacy_drop_owner \
+             (id int4 DEFAULT nextval('legacy_drop_sequence'::regclass))",
+        ),
+        (6_935, "DROP SEQUENCE legacy_drop_sequence"),
+    ]
+    .into_iter()
+    .map(|(txn_id, sql)| WalRecord {
+        txn_id,
+        payload: Arc::from(sql.as_bytes()),
+    })
+    .collect::<Vec<_>>();
+
+    let recovered = Engine::recover_from_durable_wal(&records)
+        .expect("acknowledged generic-SQL WAL must retain its historical sequence semantics");
+    let catalog = recovered.catalog_snapshot();
+    assert!(!catalog
+        .relational_sequences
+        .contains_key("legacy_rename_sequence"));
+    assert!(catalog
+        .relational_sequences
+        .contains_key("legacy_renamed_sequence"));
+    assert!(!catalog
+        .relational_sequences
+        .contains_key("legacy_drop_sequence"));
+    for (table, expected_sequence) in [
+        ("legacy_rename_owner", "legacy_rename_sequence"),
+        ("legacy_drop_owner", "legacy_drop_sequence"),
+    ] {
+        let default = catalog.relational_catalog[table]
+            .columns
+            .iter()
+            .find_map(|column| match &column.default {
+                Some(ColumnDefault::SequenceNextVal { sequence, .. }) => Some(sequence.as_str()),
+                _ => None,
+            });
+        assert_eq!(
+            default,
+            Some(expected_sequence),
+            "legacy replay must not retroactively rewrite acknowledged default text"
+        );
+    }
+}
+
+#[test]
 fn split_checkpoint_replay_inherits_the_current_index_identity_epoch() {
     let legacy = WalRecord {
         txn_id: 6_920,

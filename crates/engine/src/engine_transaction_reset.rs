@@ -5,6 +5,7 @@
 //! transaction-visible root being cleared. Neither row set becomes DELETE bodies in the durable
 //! transaction record.
 
+mod access;
 mod digest;
 #[cfg(test)]
 #[path = "engine_transaction_reset/regression_tests.rs"]
@@ -485,59 +486,6 @@ impl Engine {
         Ok(fallback.max(fence))
     }
 
-    /// Retain every stable relation identity a parsed live mutation can observe or change. Row
-    /// mutations take their dependency closure; catalog mutations conservatively retain every
-    /// published relation because a rename/drop/constraint/default/ACL operation can change the
-    /// identity or schema proof of a concurrently staged table reset. DDL is not an OLTP hot path,
-    /// and this deliberately simple boundary avoids a command-by-command dependency oracle.
-    pub(crate) fn acquire_autocommit_command_table_access(
-        &self,
-        command: &Command,
-    ) -> Result<Option<Arc<TableAccessLease>>, ExecuteError> {
-        let tables = match command {
-            Command::Insert(insert) => Some(vec![insert.table.clone()]),
-            Command::Update(update) => Some(vec![update.table.clone()]),
-            Command::Delete(delete) => Some(vec![delete.table.clone()]),
-            Command::SessionControl {
-                access_share_relations,
-                ..
-            } if !access_share_relations.is_empty() => Some(access_share_relations.clone()),
-            command if Self::command_changes_catalog(command) => Some(
-                self.read_state
-                    .latest_catalog()
-                    .relational_catalog
-                    .keys()
-                    .cloned()
-                    .collect(),
-            ),
-            // Live TRUNCATE must acquire its exclusive dependency closure through the typed reset
-            // owner. Acquiring a second shared owner here would reject that owner's own upgrade.
-            Command::TruncateTable(_)
-            | Command::Begin { .. }
-            | Command::Commit { .. }
-            | Command::Rollback { .. }
-            | Command::Flush
-            | Command::ResetAll
-            | Command::SetRole { .. }
-            | Command::SetKv { .. }
-            | Command::DeleteKv { .. }
-            | Command::GetKv { .. }
-            | Command::SequenceNextVal(_)
-            | Command::SequenceCurrVal(_)
-            | Command::SequenceSetVal(_)
-            | Command::Select(_)
-            | Command::SelectFunction(_)
-            | Command::SelectLiteral(_)
-            | Command::ShowTransactionIsolation
-            | Command::SessionControl { .. }
-            | Command::PreparedCatalog(_) => None,
-            _ => unreachable!("catalog-changing commands are classified above"),
-        };
-        tables
-            .map(|tables| self.acquire_autocommit_table_accesses(tables))
-            .transpose()
-    }
-
     pub(crate) fn command_claims_canonical_mutation(command: &Command) -> bool {
         matches!(
             command,
@@ -590,6 +538,7 @@ impl Engine {
                 | Command::CreateExtension(_)
                 | Command::DropExtension(_)
                 | Command::CreateSequence(_)
+                | Command::SequenceRestart(_)
                 | Command::CreateDomain(_)
                 | Command::RenameSequence(_)
                 | Command::DropSequence(_)
@@ -637,6 +586,26 @@ impl Engine {
                     "live SQL TRUNCATE must enter typed transaction admission".to_string(),
                 ));
             }
+            // The crate-private group-commit seam deliberately admits statement-ordered catalog
+            // dependencies before any entry is published (for example CREATE SEQUENCE followed by
+            // nextval in the same durable flush group). There is no published OID to retain yet.
+            // A standalone raw claimant still runs serialized preflight before WAL, while grouped
+            // apply resolves the target from its evolving working catalog under the catalog latch.
+            let sequence_value_name = match &command {
+                Command::SequenceNextVal(nextval) => Some(nextval.name.as_str()),
+                Command::SequenceSetVal(setval) => Some(setval.name.as_str()),
+                _ => None,
+            };
+            if let Some(name) = sequence_value_name {
+                if self
+                    .read_state
+                    .latest_catalog()
+                    .pg_class_relation_kind(name)?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+            }
             return self
                 .acquire_autocommit_command_table_access(&command)
                 .map_err(|error| EngineError::ApplyFailed(error.to_string()));
@@ -663,6 +632,7 @@ impl Engine {
                 if !record.catalog_commands.is_empty()
                     || !record.table_resets.is_empty()
                     || !record.sequence_advances.is_empty()
+                    || !record.sequence_advances_by_oid.is_empty()
                 {
                     return Err(EngineError::ApplyFailed(
                         "raw binary transactions may contain resolved row mutations only; catalog, sequence, and table-reset effects require typed transaction admission"
@@ -761,12 +731,6 @@ impl Engine {
         truncate: TruncateTable,
         expected_catalog_version: Option<u64>,
     ) -> Result<(), ExecuteError> {
-        if truncate.restart_identity {
-            return Err(ExecuteError::Unsupported(
-                "TRUNCATE ... RESTART IDENTITY requires transactional private sequence resets"
-                    .to_string(),
-            ));
-        }
         let snapshot = self
             .transaction_snapshot_handle(txn_id)
             .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
@@ -976,6 +940,25 @@ impl Engine {
         snapshot
             .table_access
             .acquire_exclusive(dependency_identities.values().copied())?;
+        if truncate.restart_identity {
+            let owned_sequence_oids = table
+                .columns
+                .iter()
+                .filter_map(|column| match &column.default {
+                    Some(ColumnDefault::SequenceNextVal {
+                        sequence,
+                        create_if_missing: true,
+                    }) => catalog
+                        .relational_sequences
+                        .get(sequence)
+                        .map(|sequence| sequence.oid),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            snapshot
+                .table_access
+                .acquire_exclusive(owned_sequence_oids)?;
+        }
 
         // The durable proof describes the globally published root immediately before this reset,
         // not the transaction-private root. For INSERT;TRUNCATE, for example, the private INSERT
@@ -1035,12 +1018,24 @@ impl Engine {
             (source_commit_seq, expected_rows, before_digest)
         };
 
-        let generation = {
+        let (generation, operation_count) = {
             let delta = snapshot
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            delta.generation
+            (delta.generation, delta.operations.len())
+        };
+        let ordinal = u32::try_from(operation_count).map_err(|_| {
+            ExecuteError::Unsupported(
+                "transaction operation ordinal exceeds typed reset framing".to_string(),
+            )
+        })?;
+        let (next_catalog_overlay, sequence_reset_identity) = if truncate.restart_identity {
+            let (overlay, identity) =
+                Self::transaction_sequence_reset_overlay(ordinal, &table.name, &catalog)?;
+            (Some(overlay), Some(identity))
+        } else {
+            (None, None)
         };
         // Independently resolve the transaction-visible root. This proves the retained private GPU
         // generation can actually be reset, while its pre-reset private rows remain statement-local
@@ -1088,15 +1083,15 @@ impl Engine {
                 "concurrent statements attempted to publish the same transaction reset".to_string(),
             ));
         }
+        if delta.operations.len() != operation_count {
+            return Err(ExecuteError::Serialization(
+                "transaction operation order changed during table-reset staging".to_string(),
+            ));
+        }
         gpu_reservation.ensure_replacement_admitted(
             &delta.private_gpu_bytes_by_gpu,
             &next_private_gpu_bytes,
         )?;
-        let ordinal = u32::try_from(delta.operations.len()).map_err(|_| {
-            ExecuteError::Unsupported(
-                "transaction operation ordinal exceeds typed reset framing".to_string(),
-            )
-        })?;
         let statement_digest =
             transaction_statement_digest(&Command::TruncateTable(truncate.clone()))?;
         delta
@@ -1133,8 +1128,31 @@ impl Engine {
                         .cloned()
                         .collect(),
                     dependency_identities,
+                    sequence_reset_identity: sequence_reset_identity.clone(),
                 },
             )));
+        if let Some(overlay) = next_catalog_overlay {
+            if delta.catalog_base.is_none() {
+                delta.catalog_base = Some(Arc::clone(&snapshot.catalog));
+            }
+            for target in &sequence_reset_identity
+                .as_ref()
+                .expect("restart overlay has a reset identity")
+                .targets
+            {
+                let sequence_oid = target
+                    .target_after
+                    .as_ref()
+                    .or(target.target_before.as_ref())
+                    .expect("reset target retains one stable sequence identity")
+                    .oid;
+                delta
+                    .sequence_state
+                    .insert(target.before_name.clone(), (1, false));
+                delta.sequence_state_by_oid.insert(sequence_oid, (1, false));
+            }
+            delta.catalog_overlay = Some(overlay);
+        }
         delta.write_set = final_transaction_write_set(&delta.operations);
         delta.publish_resident_shards(Arc::new(next_shards));
         delta.publish_streaming_cold_chunks(Arc::new(next_cold_chunks));
@@ -1666,6 +1684,35 @@ pub(crate) fn transaction_row_deltas(operations: &[TransactionOperation]) -> Vec
         .collect()
 }
 
+pub(crate) fn final_transaction_row_operations(
+    operations: &[TransactionOperation],
+) -> Vec<Arc<StagedRowOperation>> {
+    let last_resets = operations
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, operation)| match operation {
+            TransactionOperation::TableReset(reset) => Some((reset.table.clone(), ordinal)),
+            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    operations
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, operation)| match operation {
+            TransactionOperation::Row(staged)
+                if last_resets
+                    .get(mutation_table(&staged.mutation))
+                    .is_none_or(|reset| ordinal > *reset) =>
+            {
+                Some(Arc::clone(staged))
+            }
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::Row(_)
+            | TransactionOperation::TableReset(_) => None,
+        })
+        .collect()
+}
+
 pub(crate) fn final_transaction_operations(
     operations: &[TransactionOperation],
 ) -> (Vec<WriteDelta>, Vec<StagedTableReset>) {
@@ -1677,17 +1724,14 @@ pub(crate) fn final_transaction_operations(
             TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
-    let mut rows = Vec::new();
+    let rows = final_transaction_row_operations(operations)
+        .into_iter()
+        .map(|staged| staged.delta.clone())
+        .collect();
     let mut resets = Vec::new();
     for (ordinal, operation) in operations.iter().enumerate() {
         match operation {
-            TransactionOperation::Catalog(_) => {}
-            TransactionOperation::Row(staged) => {
-                let table = mutation_table(&staged.mutation);
-                if last_resets.get(table).is_none_or(|reset| ordinal > *reset) {
-                    rows.push(staged.delta.clone());
-                }
-            }
+            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => {}
             TransactionOperation::TableReset(reset)
                 if last_resets.get(&reset.table) == Some(&ordinal) =>
             {

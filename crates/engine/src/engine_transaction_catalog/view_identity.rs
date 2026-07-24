@@ -3,12 +3,6 @@
 use super::*;
 use crate::engine_transaction_reset::table_schema_digest;
 
-pub(crate) type TransactionCatalogIdentitySlices<'a> = (
-    &'a [BinaryTransactionViewOperationIdentity],
-    &'a [BinaryTransactionViewLifecycleOperationIdentity],
-    &'a [BinaryTransactionIndexLifecycleOperationIdentity],
-);
-
 impl Engine {
     pub(crate) fn transaction_catalog_command_is_supported(command: &Command) -> bool {
         matches!(
@@ -20,6 +14,10 @@ impl Engine {
                 | Command::CreateIndex(_)
                 | Command::RenameIndex(_)
                 | Command::DropIndex(_)
+                | Command::CreateSequence(_)
+                | Command::SequenceRestart(_)
+                | Command::RenameSequence(_)
+                | Command::DropSequence(_)
         )
     }
 
@@ -41,6 +39,10 @@ impl Engine {
             Command::CreateIndex(create) => self.apply_create_index_transactional(working, create),
             Command::RenameIndex(rename) => self.apply_rename_index(working, rename),
             Command::DropIndex(drop) => self.apply_drop_index(working, drop),
+            Command::CreateSequence(create) => self.apply_create_sequence(working, create),
+            Command::SequenceRestart(restart) => self.apply_restart_sequence(working, restart),
+            Command::RenameSequence(rename) => self.apply_rename_sequence(working, rename),
+            Command::DropSequence(drop) => self.apply_drop_sequence(working, drop),
             _ => Err(EngineError::ApplyFailed(
                 "transaction catalog command is outside the admitted family".to_string(),
             )),
@@ -359,9 +361,39 @@ impl Engine {
         catalog_epoch: BinaryTransactionCatalogEpoch,
         record_seed: Index,
         commands: &[BinaryTransactionCatalogCommand],
-        identities: TransactionCatalogIdentitySlices<'_>,
+        envelope: TransactionCatalogEnvelopeSlices<'_>,
     ) -> Result<(), EngineError> {
-        let (view_operations, view_lifecycle_operations, index_lifecycle_operations) = identities;
+        let TransactionCatalogEnvelopeSlices {
+            view_operations,
+            view_lifecycle_operations,
+            index_lifecycle_operations,
+            sequence_lifecycle_operations,
+            sequence_reset_operations,
+            operation_order,
+            catalog_output,
+            sequence_input_oids,
+        } = envelope;
+        let mut prior_reset_ordinal = None;
+        for identity in sequence_reset_operations {
+            if !valid_sequence_reset_operation_identity(identity)
+                || prior_reset_ordinal.is_some_and(|prior| identity.ordinal <= prior)
+                || usize::try_from(identity.ordinal)
+                    .ok()
+                    .and_then(|ordinal| operation_order.get(ordinal))
+                    .is_none_or(|operation| {
+                        !matches!(
+                            operation,
+                            BinaryTransactionOperationIdentity::TableReset { table }
+                                if table == &identity.table
+                        )
+                    })
+            {
+                return Err(EngineError::Durability(
+                    "ordered transaction carries a misplaced sequence reset identity".to_string(),
+                ));
+            }
+            prior_reset_ordinal = Some(identity.ordinal);
+        }
         if !view_operations.is_empty() && !view_lifecycle_operations.is_empty() {
             return Err(EngineError::Durability(
                 "ordered transaction mixes legacy and lifecycle view identities".to_string(),
@@ -405,7 +437,28 @@ impl Engine {
             || working.index_oid_epoch_current;
         let mut next_view = 0usize;
         let mut next_index = 0usize;
+        let mut next_sequence = 0usize;
+        let mut next_sequence_reset = 0usize;
         for (command_index, operation) in commands.iter().enumerate() {
+            while sequence_reset_operations
+                .get(next_sequence_reset)
+                .is_some_and(|identity| identity.ordinal < operation.ordinal)
+            {
+                Self::apply_transaction_sequence_reset_identity(
+                    working,
+                    commit_seq,
+                    &sequence_reset_operations[next_sequence_reset],
+                )?;
+                next_sequence_reset += 1;
+            }
+            if sequence_reset_operations
+                .get(next_sequence_reset)
+                .is_some_and(|identity| identity.ordinal == operation.ordinal)
+            {
+                return Err(EngineError::Durability(
+                    "catalog command and sequence reset reuse one statement ordinal".to_string(),
+                ));
+            }
             let before = Self::catalog_snapshot_from_working(working, commit_seq);
             match &operation.command {
                 Command::CreateTable(_) => {
@@ -424,6 +477,16 @@ impl Engine {
                     {
                         return Err(EngineError::Durability(
                             "ordered CREATE TABLE carries an index identity".to_string(),
+                        ));
+                    }
+                    if sequence_lifecycle_operations
+                        .get(next_sequence)
+                        .is_some_and(|identity| {
+                            usize::try_from(identity.command_index).ok() == Some(command_index)
+                        })
+                    {
+                        return Err(EngineError::Durability(
+                            "ordered CREATE TABLE carries a sequence identity".to_string(),
                         ));
                     }
                 }
@@ -465,6 +528,27 @@ impl Engine {
                     }
                     Self::validate_transaction_index_before(&before, command, identity)?;
                 }
+                command
+                    if command_is_sequence_lifecycle(command)
+                        && catalog_epoch == BinaryTransactionCatalogEpoch::IndexIdentityV1 =>
+                {
+                    let identity = sequence_lifecycle_operations
+                        .get(next_sequence)
+                        .ok_or_else(|| {
+                            EngineError::Durability(
+                                "ordered sequence operation lost its typed identity closure"
+                                    .to_string(),
+                            )
+                        })?;
+                    if usize::try_from(identity.command_index).ok() != Some(command_index)
+                        || identity.ordinal != operation.ordinal
+                    {
+                        return Err(EngineError::Durability(
+                            "ordered sequence identity changed command position".to_string(),
+                        ));
+                    }
+                    Self::validate_transaction_sequence_before(&before, command, identity)?;
+                }
                 _ => {
                     return Err(EngineError::Durability(
                         "transaction WAL record contains an unsupported catalog operation"
@@ -484,6 +568,46 @@ impl Engine {
                     )
                 }
             })?;
+            if let (Some(output), Command::CreateTable(create)) =
+                (catalog_output, &operation.command)
+            {
+                for (sequence, generated) in
+                    create
+                        .columns
+                        .iter()
+                        .filter_map(|column| match &column.default {
+                            Some(ColumnDefault::SequenceNextVal {
+                                sequence,
+                                create_if_missing,
+                            }) => Some((sequence, *create_if_missing)),
+                            _ => None,
+                        })
+                {
+                    let expected_oid = sequence_input_oids
+                        .get(&(operation.ordinal, sequence.clone()))
+                        .ok_or_else(|| {
+                            EngineError::Durability(format!(
+                                "ordered CREATE TABLE sequence input \"{sequence}\" lost its creator-local identity"
+                            ))
+                        })?;
+                    if working
+                        .relational_sequences
+                        .get(sequence)
+                        .map(|observed| observed.oid)
+                        != Some(*expected_oid)
+                    {
+                        return Err(EngineError::Durability(format!(
+                            "ordered CREATE TABLE sequence input \"{sequence}\" changed creator-local stable identity"
+                        )));
+                    }
+                    if generated && output.created_sequence_oids.get(sequence) != Some(expected_oid)
+                    {
+                        return Err(EngineError::Durability(format!(
+                            "ordered CREATE TABLE generated sequence \"{sequence}\" changed creator-local output identity"
+                        )));
+                    }
+                }
+            }
             if command_is_view_lifecycle(&operation.command) {
                 let identity = &view_operations[next_view];
                 let after = Self::catalog_snapshot_from_working(working, commit_seq);
@@ -506,6 +630,18 @@ impl Engine {
                 Self::validate_transaction_index_after(&after, &operation.command, identity)?;
                 next_index += 1;
             }
+            if catalog_epoch == BinaryTransactionCatalogEpoch::IndexIdentityV1
+                && command_is_sequence_lifecycle(&operation.command)
+            {
+                let identity = &sequence_lifecycle_operations[next_sequence];
+                let after = Self::catalog_snapshot_from_working(working, commit_seq);
+                Self::validate_transaction_sequence_after(&after, &operation.command, identity)?;
+                next_sequence += 1;
+            }
+        }
+        while let Some(identity) = sequence_reset_operations.get(next_sequence_reset) {
+            Self::apply_transaction_sequence_reset_identity(working, commit_seq, identity)?;
+            next_sequence_reset += 1;
         }
         if next_view != view_operations.len() {
             return Err(EngineError::Durability(
@@ -517,6 +653,16 @@ impl Engine {
                 "ordered transaction carries an unbound index identity".to_string(),
             ));
         }
+        if next_sequence != sequence_lifecycle_operations.len() {
+            return Err(EngineError::Durability(
+                "ordered transaction carries an unbound sequence identity".to_string(),
+            ));
+        }
+        if next_sequence_reset != sequence_reset_operations.len() {
+            return Err(EngineError::Durability(
+                "ordered transaction carries an unbound sequence reset identity".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -524,15 +670,24 @@ impl Engine {
         &self,
         record_catalog_epoch: BinaryTransactionCatalogEpoch,
         commands: &[BinaryTransactionCatalogCommand],
-        view_operations: &[BinaryTransactionViewOperationIdentity],
-        view_lifecycle_operations: &[BinaryTransactionViewLifecycleOperationIdentity],
-        index_lifecycle_operations: &[BinaryTransactionIndexLifecycleOperationIdentity],
+        envelope: TransactionCatalogEnvelopeSlices<'_>,
         expected: &CatalogSnapshot,
     ) -> Result<(), ExecuteError> {
+        let TransactionCatalogEnvelopeSlices {
+            view_operations: _,
+            view_lifecycle_operations: _,
+            index_lifecycle_operations: _,
+            sequence_lifecycle_operations: _,
+            sequence_reset_operations,
+            operation_order: _,
+            catalog_output: _,
+            sequence_input_oids: _,
+        } = envelope;
         let mut working = self.ddl_catalog().clone();
-        let catalog_epoch = if commands
-            .iter()
-            .any(|operation| command_requires_index_catalog_opcode(&operation.command))
+        let catalog_epoch = if commands.iter().any(|operation| {
+            command_requires_index_catalog_opcode(&operation.command)
+                || command_is_sequence_lifecycle(&operation.command)
+        }) || !sequence_reset_operations.is_empty()
             || (!commands.is_empty() && !working.index_oid_epoch_current)
         {
             BinaryTransactionCatalogEpoch::IndexIdentityV1
@@ -551,11 +706,7 @@ impl Engine {
             catalog_epoch,
             expected.commit_seq,
             commands,
-            (
-                view_operations,
-                view_lifecycle_operations,
-                index_lifecycle_operations,
-            ),
+            envelope,
         )
         .map_err(ExecuteError::Engine)?;
         let reconstructed = Self::catalog_snapshot_from_working(&working, expected.commit_seq);
