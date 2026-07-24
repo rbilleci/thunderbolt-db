@@ -135,10 +135,12 @@ mod engine_resident_probe;
 mod engine_result_frame;
 mod engine_result_sort;
 mod engine_retained_read;
+mod engine_sequence_value;
 pub use engine_retained_read::{
     RelationalCompoundI32I64PointReadParam, RelationalCompoundI32I64PointReadTemplate,
     RelationalResidentIndexPublication, RelationalResidentIndexPublicationEntry,
 };
+pub use engine_sequence_value::SequenceValueOutcome;
 mod engine_select_bind;
 mod engine_select_exec;
 mod engine_sql_pg;
@@ -436,6 +438,15 @@ pub struct Engine {
     /// this shared registry only closes the admission-to-WAL interval and is removed on either
     /// clean rejection or terminal installation.
     pending_transaction_claims: Arc<Mutex<HashMap<TxnId, gpu_db_wal::CanonicalDigest>>>,
+    /// One allocator shared by facade-owned user envelopes and engine-owned ordinary sequence
+    /// transitions. A transition can therefore publish outside an active user transaction without
+    /// inventing a second transaction-id namespace.
+    transaction_id_allocator: Arc<AtomicU64>,
+    /// Exact resolved outcomes of ordinary sequence transitions. This is a recovered lookup index
+    /// over canonical WAL, not an execution authority; commit/WAL/status ownership remains in
+    /// `CommitState`.
+    sequence_value_outcomes:
+        Mutex<HashMap<TxnId, engine_sequence_value::AppliedSequenceValueTransition>>,
     /// Sticky fail-stop independent of mutex poisoning. A transaction whose WAL record crossed
     /// the durable/replicated boundary but could not be fully installed must never return to
     /// ordinary service: restart recovery is the only safe continuation.
@@ -1023,22 +1034,36 @@ impl CommitState {
 
 impl Engine {
     /// Allocate an explicit-transaction identity that is unclaimed by every durable or accepted
-    /// strategy. Callers hold the commit lock, so terminal status and the shared pending registry
-    /// are observed as one admission boundary.
+    /// strategy. Facade requests and engine-owned sequence transitions reserve from the same
+    /// checked allocator, so a chained successor cannot steal an identity already handed to an
+    /// in-flight facade request. Callers hold the commit lock, so terminal status, active
+    /// transactions, and the shared pending registry are observed as one admission boundary.
     fn begin_unclaimed_transaction(&self, commit: &mut CommitState) -> Result<TxnId, TxnError> {
         loop {
-            let txn = commit.txn_manager.begin()?;
+            let txn_id = self.allocate_transaction_id()?;
             let pending = self
                 .pending_transaction_claims
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let claimed =
-                commit.transaction_status.contains_key(&txn.id) || pending.contains_key(&txn.id);
+            let claimed = commit.transaction_status.contains_key(&txn_id)
+                || pending.contains_key(&txn_id)
+                || commit.txn_manager.state(txn_id).is_some();
             drop(pending);
             if !claimed {
-                return Ok(txn.id);
+                return commit.txn_manager.begin_with_id(txn_id).map(|txn| txn.id);
             }
-            commit.txn_manager.rollback(txn.id)?;
+        }
+    }
+
+    /// Cancel an `AND CHAIN` successor that was registered before the parent reached its terminal
+    /// boundary. Pre-registering the successor makes allocator exhaustion a pre-effect error; every
+    /// later commit failure must remove that provisional active identity before returning.
+    fn cancel_chained_successor(commit: &mut CommitState, successor: Option<TxnId>) {
+        if let Some(txn_id) = successor {
+            commit
+                .txn_manager
+                .cancel(txn_id)
+                .expect("pre-registered chained successor remained active under the commit lock");
         }
     }
 

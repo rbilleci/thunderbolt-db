@@ -25,21 +25,25 @@ fn compatibility_reads_stay_outside_mutation_admission() {
     let shared = SharedEngine::new();
     let mut session = shared.open_session();
     submit_text(&shared, &mut session, "SET answer=forty-two").unwrap();
+    submit_text(&shared, &mut session, "CREATE SEQUENCE seq").unwrap();
     let (visible_before, wal_before) = {
         let engine = shared.read_engine().unwrap();
         (engine.visible_up_to(), engine.durable_wal_records().len())
     };
 
-    for sql in [
-        "GET answer",
-        "SELECT pg_advisory_unlock_all()",
-        "SELECT currval('seq')",
-    ] {
+    for sql in ["GET answer", "SELECT pg_advisory_unlock_all()"] {
         assert!(matches!(
             submit_text(&shared, &mut session, sql).unwrap(),
             QueryOutcome::Command { .. }
         ));
     }
+    assert_eq!(
+        submit_text(&shared, &mut session, "SELECT currval('seq')")
+            .unwrap_err()
+            .category,
+        ErrorCategory::InvalidRequest,
+        "currval is a real WAL-neutral session read and is undefined before nextval"
+    );
     assert_eq!(
         submit_text(&shared, &mut session, "SELECT bounded_fn()")
             .unwrap_err()

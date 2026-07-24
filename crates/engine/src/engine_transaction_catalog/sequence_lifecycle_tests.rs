@@ -547,6 +547,74 @@ fn sequence_lifecycle_guards_value_users_and_release_on_rollback() {
 }
 
 #[test]
+fn ordinary_value_transitions_refuse_private_create_and_restart_before_wal() {
+    let engine = Engine::new_local_test_engine();
+
+    engine.submit_transaction(5_045, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(5_045, parsed("CREATE SEQUENCE private_created_sequence"))
+        .unwrap();
+    let private_create_wal = engine.durable_wal_records().len();
+    for sql in [
+        "SELECT nextval('private_created_sequence'::regclass)",
+        "SELECT setval('private_created_sequence'::regclass, 12, true)",
+    ] {
+        let error = engine.submit_transaction(5_045, parsed(sql)).unwrap_err();
+        assert!(matches!(&error, ExecuteError::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("transaction-private"), "{error}");
+        assert_eq!(engine.durable_wal_records().len(), private_create_wal);
+    }
+    engine
+        .submit_transaction(5_045, parsed("ROLLBACK"))
+        .unwrap();
+    assert!(engine
+        .relational_catalog_sequence("private_created_sequence")
+        .is_none());
+
+    engine
+        .submit_transaction(5_046, parsed("CREATE SEQUENCE private_restarted_sequence"))
+        .unwrap();
+    let published_before = engine
+        .relational_catalog_sequence("private_restarted_sequence")
+        .unwrap();
+    let private_restart_wal = engine.durable_wal_records().len();
+    engine.submit_transaction(5_047, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(
+            5_047,
+            parsed("ALTER SEQUENCE private_restarted_sequence RESTART WITH 20"),
+        )
+        .unwrap();
+    for sql in [
+        "SELECT nextval('private_restarted_sequence'::regclass)",
+        "SELECT setval('private_restarted_sequence'::regclass, 21, false)",
+    ] {
+        let error = engine.submit_transaction(5_047, parsed(sql)).unwrap_err();
+        assert!(matches!(&error, ExecuteError::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("transaction-private"), "{error}");
+        assert_eq!(engine.durable_wal_records().len(), private_restart_wal);
+    }
+    let published_after = engine
+        .relational_catalog_sequence("private_restarted_sequence")
+        .unwrap();
+    assert_eq!(
+        (
+            published_after.last_value,
+            published_after.is_called,
+            published_after.oid,
+        ),
+        (
+            published_before.last_value,
+            published_before.is_called,
+            published_before.oid,
+        )
+    );
+    engine
+        .submit_transaction(5_047, parsed("ROLLBACK"))
+        .unwrap();
+}
+
+#[test]
 fn sequence_lifecycle_rebases_without_losing_private_identity() {
     for (offset, begin) in [
         (0_u64, "BEGIN"),
@@ -1070,7 +1138,11 @@ fn dml_on_both_sides_of_rename_and_restart_binds_one_stable_sequence_oid() {
     );
 
     let records = engine.durable_wal_records();
-    assert_eq!(records.len(), wal_before + 1);
+    assert_eq!(
+        records.len(),
+        wal_before + 3,
+        "the two pre-RESTART defaults publish independently before the user envelope"
+    );
     let payload = operation_payload(records.last().unwrap());
     let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
         panic!("ordered sequence/DML transaction must decode");
@@ -1080,11 +1152,20 @@ fn dml_on_both_sides_of_rename_and_restart_binds_one_stable_sequence_oid() {
         BTreeMap::from([(sequence_oid, (40, true))])
     );
     assert!(record.sequence_advances.is_empty());
-    assert_eq!(record.sequence_input_oids.len(), 3);
+    assert_eq!(
+        record.sequence_input_oids.len(),
+        1,
+        "only the post-RESTART private default belongs to sequence_advances_by_oid"
+    );
     assert!(record
         .sequence_input_oids
         .values()
         .all(|oid| *oid == sequence_oid));
+    assert_eq!(record.sequence_value_references.len(), 2);
+    assert!(record
+        .sequence_value_references
+        .iter()
+        .all(|reference| reference.sequence_oid == sequence_oid));
     assert_eq!(record.sequence_lifecycle_operations.len(), 2);
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
@@ -1144,9 +1225,11 @@ fn restart_after_final_default_advance_is_a_durable_stable_oid_barrier() {
     let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
         panic!("restart barrier transaction must decode");
     };
+    assert!(record.sequence_advances_by_oid.is_empty());
+    assert_eq!(record.sequence_value_references.len(), 1);
     assert_eq!(
-        record.sequence_advances_by_oid,
-        BTreeMap::from([(sequence_oid, (23, false))])
+        record.sequence_value_references[0].sequence_oid,
+        sequence_oid
     );
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
@@ -1310,7 +1393,9 @@ fn transactional_sequence_lifecycle_gpu_null_differential() {
         let ids = if explicit {
             [txn_id; 5]
         } else {
-            [txn_id, txn_id + 1, txn_id + 2, txn_id + 3, txn_id + 4]
+            // Each omitted default publishes a separate system envelope from the same canonical
+            // allocator, so direct test-driver user identities leave room for those claims.
+            [txn_id, txn_id + 10, txn_id + 20, txn_id + 30, txn_id + 40]
         };
         if explicit {
             engine.submit_transaction(txn_id, parsed("BEGIN")).unwrap();

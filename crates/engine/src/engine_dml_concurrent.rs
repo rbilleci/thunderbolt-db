@@ -477,6 +477,7 @@ impl Engine {
                 next_row_id: self.read_state.mvcc.current_row_id(),
                 sequence_state: BTreeMap::new(),
                 sequence_state_by_oid: BTreeMap::new(),
+                sequence_value_references: Vec::new(),
                 catalog_base: None,
                 catalog_overlay: None,
                 private_gpu_bytes_by_gpu: BTreeMap::new(),
@@ -566,9 +567,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Finish an explicit transaction, releasing its lifetime snapshot. `AND CHAIN` creates the
-    /// successor while the same locks are held and registers a fresh boundary for that new identity,
-    /// so there is no un-fenced gap between the two transaction contexts.
+    /// Finish an explicit transaction, releasing its lifetime snapshot. `AND CHAIN` first allocates
+    /// and registers the successor while the same locks are held, so exhaustion is a pre-effect
+    /// error and there is no un-fenced gap between the two transaction contexts.
     pub(crate) fn finish_transaction_context(
         &self,
         txn_id: TxnId,
@@ -585,21 +586,26 @@ impl Engine {
                 TransactionCharacteristics::READ_COMMITTED_READ_WRITE,
                 |snapshot| snapshot.characteristics,
             );
-        if committed {
-            commit.txn_manager.commit(txn_id)?;
-        } else {
-            commit.txn_manager.rollback(txn_id)?;
-        }
-
-        let successor = if chain {
-            let next_id = self.begin_unclaimed_transaction(&mut commit)?;
-            Some((
-                next_id,
-                self.capture_transaction_snapshot(self.committed_seq(), characteristics),
-            ))
+        let successor_id = if chain {
+            Some(self.begin_unclaimed_transaction(&mut commit)?)
         } else {
             None
         };
+        let terminal = if committed {
+            commit.txn_manager.commit(txn_id)
+        } else {
+            commit.txn_manager.rollback(txn_id)
+        };
+        if let Err(error) = terminal {
+            Self::cancel_chained_successor(&mut commit, successor_id);
+            return Err(error);
+        };
+        let successor = successor_id.map(|next_id| {
+            (
+                next_id,
+                self.capture_transaction_snapshot(self.committed_seq(), characteristics),
+            )
+        });
         let mut active = self
             .active_snapshots
             .lock()
@@ -756,7 +762,9 @@ impl Engine {
         write_set: WriteSet,
         read_snapshot: Index,
         prepared_catalog_seq: Index,
-        expected_catalog_version: Option<Index>,
+        expected_catalog_version: Option<
+            crate::engine_mutation_admission::CatalogVersionExpectation,
+        >,
         offlock_delta: Option<crate::write_path::WriteDelta>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
         let item = CommitWaveItem {
@@ -1695,6 +1703,11 @@ impl Engine {
         timestamp_micros: u64,
         expected_catalog_version: Option<Index>,
     ) -> Result<(), ExecuteError> {
+        // Compatibility callers supply their own canonical identity rather than borrowing the
+        // facade allocator. Observe it before parsing/execution can publish an engine-owned
+        // sequence transition, so the two claimants cannot alias.
+        self.observe_transaction_id(txn_id);
+        self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
         let result = self.execute_parsed_text_at_timestamp_micros_inner(
             txn_id,
             command,

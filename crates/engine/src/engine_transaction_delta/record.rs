@@ -40,12 +40,40 @@ impl Engine {
         provisional_inserts: &BTreeSet<(String, u64)>,
         final_base: u64,
         allocator_high_water: u64,
+        sequence_value_references: &[BinarySequenceValueReference],
     ) -> Result<BinaryTransactionRecord, ExecuteError> {
         let final_ids = provisional_inserts
             .iter()
             .cloned()
             .zip(final_base..)
             .collect::<BTreeMap<_, _>>();
+        let mut final_ids_by_provisional = BTreeMap::new();
+        for ((_, provisional), final_id) in &final_ids {
+            if final_ids_by_provisional
+                .insert(*provisional, *final_id)
+                .is_some()
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transaction reused one provisional entity identity across relations"
+                        .to_string(),
+                )));
+            }
+        }
+        let mut sequence_value_references = sequence_value_references.to_vec();
+        for reference in sequence_value_references
+            .iter_mut()
+            .filter(|reference| reference.default_expression)
+        {
+            reference.row_id = final_ids_by_provisional
+                .get(&reference.row_id)
+                .copied()
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "sequence default reference {} lost its provisional INSERT identity",
+                        reference.transition_txn_id
+                    )))
+                })?;
+        }
         let mut mutations = Vec::new();
         let mut sequence_advances = BTreeMap::new();
         for delta in all_deltas {
@@ -166,6 +194,7 @@ impl Engine {
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),
+            sequence_value_references,
             table_resets: Vec::new(),
             sequence_advances,
             table_identities: BTreeMap::new(),

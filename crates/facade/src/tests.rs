@@ -107,6 +107,21 @@ fn submit_session_text(
         .into_immediate()
 }
 
+fn single_int8(outcome: QueryOutcome) -> i64 {
+    let QueryOutcome::Rows { columns, rows } = outcome else {
+        panic!("expected one sequence result row");
+    };
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].logical_type, LogicalType::Int8);
+    let [row] = rows.as_slice() else {
+        panic!("expected one sequence result row");
+    };
+    let [DbValue::Int8(value)] = row.as_slice() else {
+        panic!("expected one int8 sequence value");
+    };
+    *value
+}
+
 #[test]
 fn public_execution_surface_has_one_submission_boundary() {
     let facade_source = include_str!("lib.rs");
@@ -1016,6 +1031,97 @@ fn sessions_track_transaction_state_independent_of_connection() {
 }
 
 #[test]
+fn shared_transition_allocator_fails_closed_at_identity_exhaustion() {
+    let shared = SharedEngine::new();
+    shared.next_txn_id.store(u64::MAX, Ordering::Relaxed);
+    let error = shared.take_txn_id().unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Engine);
+    assert!(error.message.contains("exhausted"), "{error:?}");
+    assert_eq!(shared.next_txn_id.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+fn empty_commit_and_chain_does_not_steal_a_facade_reserved_identity() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    let reserved = shared.take_txn_id().unwrap();
+
+    submit_session_text(&shared, &mut session, "COMMIT AND CHAIN").unwrap();
+    assert_ne!(
+        session.active_txn_id,
+        Some(reserved),
+        "the chained successor must reserve from the shared allocator"
+    );
+
+    shared.engine.execute_text(reserved, "BEGIN").unwrap();
+    shared.engine.execute_text(reserved, "ROLLBACK").unwrap();
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn staged_commit_and_chain_does_not_steal_a_facade_reserved_identity() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE chained_allocator_owner (id INT)",
+    )
+    .unwrap();
+    let reserved = shared.take_txn_id().unwrap();
+
+    submit_session_text(&shared, &mut session, "COMMIT AND CHAIN").unwrap();
+    assert_ne!(
+        session.active_txn_id,
+        Some(reserved),
+        "the staged chained successor must reserve from the shared allocator"
+    );
+
+    shared.engine.execute_text(reserved, "BEGIN").unwrap();
+    shared.engine.execute_text(reserved, "ROLLBACK").unwrap();
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn chain_exhaustion_keeps_facade_and_engine_transaction_state_aligned() {
+    for (case, staged, control) in [
+        ("empty_commit", false, "COMMIT AND CHAIN"),
+        ("empty_rollback", false, "ROLLBACK AND CHAIN"),
+        ("staged_commit", true, "COMMIT AND CHAIN"),
+        ("staged_rollback", true, "ROLLBACK AND CHAIN"),
+    ] {
+        let shared = SharedEngine::new();
+        let mut session = shared.open_session();
+        submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+        let parent = session.active_txn_id.expect("BEGIN installs an identity");
+        let table = format!("chain_exhaustion_{case}");
+        if staged {
+            submit_session_text(
+                &shared,
+                &mut session,
+                &format!("CREATE TABLE {table} (id INT)"),
+            )
+            .unwrap();
+        }
+        shared.next_txn_id.store(u64::MAX, Ordering::Relaxed);
+
+        let error = submit_session_text(&shared, &mut session, control).unwrap_err();
+        assert_eq!(error.category, ErrorCategory::Engine);
+        assert!(error.message.contains("exhausted"), "{error:?}");
+        assert_eq!(session.active_txn_id, Some(parent));
+        assert!(session.in_transaction());
+        assert_eq!(shared.engine.active_txn_count(), 1);
+        assert!(shared.engine.relational_catalog_table(&table).is_none());
+
+        submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+        assert!(!session.in_transaction());
+        assert_eq!(shared.engine.active_txn_count(), 0);
+    }
+}
+
+#[test]
 fn session_close_rolls_back_engine_transaction_context() {
     let mut facade = MultiSessionHarness::new();
     let session = facade.open_session();
@@ -1329,6 +1435,293 @@ fn pg_dump_sequence_state_routing_uses_the_pinned_catalog_and_falls_through_for_
         QueryOutcome::Rows { rows, .. }
             if rows == vec![vec![DbValue::Int8(41), DbValue::Bool(true)]]
     ));
+}
+
+#[test]
+fn ordinary_sequence_values_and_currval_survive_user_rollback_by_stable_oid() {
+    let mut facade = MultiSessionHarness::new();
+    let first = facade.open_session();
+    let second = facade.open_session();
+    facade
+        .execute(first, "CREATE SEQUENCE durable_value")
+        .unwrap();
+
+    let undefined = facade
+        .execute(first, "SELECT currval('durable_value'::regclass)")
+        .unwrap_err();
+    assert_eq!(undefined.category, ErrorCategory::InvalidRequest);
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT nextval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT currval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        facade
+            .execute(second, "SELECT currval('durable_value'::regclass)")
+            .unwrap_err()
+            .category,
+        ErrorCategory::InvalidRequest
+    );
+
+    facade.execute(first, "BEGIN").unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT nextval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        2
+    );
+    facade.execute(first, "ROLLBACK").unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT currval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        2
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(second, "SELECT nextval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        3
+    );
+
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT setval('durable_value'::regclass, 10, false)",)
+                .unwrap()
+        ),
+        10
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT currval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        2,
+        "setval(..., false) must not change session currval"
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT nextval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        10
+    );
+    facade.execute(first, "BEGIN").unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT setval('durable_value'::regclass, 30, true)",)
+                .unwrap()
+        ),
+        30
+    );
+    facade.execute(first, "ROLLBACK").unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT currval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        30
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(first, "SELECT nextval('durable_value'::regclass)")
+                .unwrap()
+        ),
+        31
+    );
+}
+
+#[test]
+fn ordinary_sequence_defaults_materialize_before_failure_and_user_rollback() {
+    let mut facade = MultiSessionHarness::new();
+    let session = facade.open_session();
+    facade
+        .execute(session, "CREATE SEQUENCE default_value")
+        .unwrap();
+    facade
+        .execute(
+            session,
+            "CREATE TABLE default_rows \
+             (id INT DEFAULT nextval('default_value'::regclass), note INT)",
+        )
+        .unwrap();
+
+    facade.execute(session, "BEGIN").unwrap();
+    facade
+        .execute(session, "INSERT INTO default_rows (note) VALUES (NULL)")
+        .unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT currval('default_value'::regclass)")
+                .unwrap()
+        ),
+        1
+    );
+    facade.execute(session, "ROLLBACK").unwrap();
+    facade
+        .execute(session, "INSERT INTO default_rows (note) VALUES (7)")
+        .unwrap();
+    assert_eq!(
+        select_rows(
+            &mut facade,
+            session,
+            "SELECT id, note FROM default_rows ORDER BY id"
+        ),
+        vec![vec![DbValue::Int4(2), DbValue::Int4(7)]]
+    );
+
+    facade
+        .execute(
+            session,
+            "CREATE TABLE failing_default \
+             (id INT DEFAULT nextval('default_value'::regclass), required INT, \
+              marker INT DEFAULT 0)",
+        )
+        .unwrap();
+    let failed = facade
+        .execute(session, "INSERT INTO failing_default (marker) VALUES (9)")
+        .unwrap_err();
+    assert!(
+        failed.message.contains("provide every column"),
+        "{failed:?}"
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT currval('default_value'::regclass)")
+                .unwrap()
+        ),
+        3,
+        "a durable default remains consumed when later row preparation fails"
+    );
+    facade
+        .execute(
+            session,
+            "INSERT INTO failing_default (required) VALUES (11)",
+        )
+        .unwrap();
+    assert_eq!(
+        select_rows(
+            &mut facade,
+            session,
+            "SELECT id, required, marker FROM failing_default"
+        ),
+        vec![vec![DbValue::Int4(4), DbValue::Int4(11), DbValue::Int4(0)]]
+    );
+}
+
+#[test]
+fn renamed_published_sequence_transition_survives_rename_rollback_and_commit() {
+    let mut facade = MultiSessionHarness::new();
+    let session = facade.open_session();
+    facade
+        .execute(session, "CREATE SEQUENCE rename_value")
+        .unwrap();
+
+    facade.execute(session, "BEGIN").unwrap();
+    facade
+        .execute(
+            session,
+            "ALTER SEQUENCE rename_value RENAME TO private_name",
+        )
+        .unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT nextval('private_name'::regclass)")
+                .unwrap()
+        ),
+        1
+    );
+    facade.execute(session, "ROLLBACK").unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT currval('rename_value'::regclass)")
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT nextval('rename_value'::regclass)")
+                .unwrap()
+        ),
+        2
+    );
+
+    facade.execute(session, "BEGIN").unwrap();
+    facade
+        .execute(
+            session,
+            "ALTER SEQUENCE rename_value RENAME TO committed_name",
+        )
+        .unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT nextval('committed_name'::regclass)")
+                .unwrap()
+        ),
+        3
+    );
+    facade.execute(session, "COMMIT").unwrap();
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT currval('committed_name'::regclass)")
+                .unwrap()
+        ),
+        3,
+        "currval follows the stable OID across committed rename"
+    );
+    assert_eq!(
+        single_int8(
+            facade
+                .execute(session, "SELECT nextval('committed_name'::regclass)")
+                .unwrap()
+        ),
+        4
+    );
+    facade
+        .execute(session, "DROP SEQUENCE committed_name")
+        .unwrap();
+    facade
+        .execute(session, "CREATE SEQUENCE committed_name")
+        .unwrap();
+    assert_eq!(
+        facade
+            .execute(session, "SELECT currval('committed_name'::regclass)")
+            .unwrap_err()
+            .category,
+        ErrorCategory::InvalidRequest,
+        "drop/recreate must not inherit the old OID's session currval"
+    );
 }
 
 #[test]

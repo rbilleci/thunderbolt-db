@@ -28,6 +28,7 @@
 //!   MVCC, and GPU-residency generation. DML stages into a transaction-private GPU generation;
 //!   COMMIT publishes its resolved row mutations through one durable record and one commit index.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -234,7 +235,7 @@ pub enum SessionTransactionStatus {
 pub struct SharedEngine {
     engine: Arc<Engine>,
     identity: Arc<()>,
-    next_txn_id: AtomicU64,
+    next_txn_id: Arc<AtomicU64>,
 }
 
 /// One protocol-neutral request admitted through [`SharedEngine::submit`].
@@ -317,6 +318,9 @@ pub struct SharedSession {
     transaction_characteristics: Option<TransactionCharacteristics>,
     transaction_has_statement: bool,
     transaction_failed: bool,
+    /// PostgreSQL session-local sequence state, keyed by catalog-stable sequence OID. It is
+    /// intentionally neither transactional nor recovered from WAL.
+    sequence_currvals: BTreeMap<u32, i64>,
 }
 
 impl SharedSession {
@@ -379,11 +383,15 @@ impl SharedEngine {
     /// Internal constructor for tests that need read-only instrumentation from the same engine
     /// while driving all SQL through the canonical facade boundary.
     pub(crate) fn from_engine_arc(engine: Arc<Engine>) -> Self {
-        let next_txn_id = engine.next_durable_transaction_id_floor();
+        let next_txn_id = engine.shared_transaction_id_allocator();
+        next_txn_id.fetch_max(
+            engine.next_durable_transaction_id_floor(),
+            Ordering::Relaxed,
+        );
         Self {
             engine,
             identity: Arc::new(()),
-            next_txn_id: AtomicU64::new(next_txn_id),
+            next_txn_id,
         }
     }
 
@@ -396,6 +404,7 @@ impl SharedEngine {
             transaction_characteristics: None,
             transaction_has_statement: false,
             transaction_failed: false,
+            sequence_currvals: BTreeMap::new(),
         }
     }
 
@@ -477,11 +486,19 @@ impl SharedEngine {
             session.transaction_has_statement = false;
         }
         session.transaction_failed = false;
+        session.sequence_currvals.clear();
         Ok(QueryOutcome::Empty)
     }
 
-    fn take_txn_id(&self) -> u64 {
-        self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+    fn take_txn_id(&self) -> Result<u64, DbError> {
+        self.next_txn_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| DbError {
+                category: ErrorCategory::Engine,
+                message: "transaction identity space is exhausted".to_string(),
+            })
     }
 
     /// A shared façade over a **crash-durable** engine: opens (recovering) or creates the WAL
@@ -707,9 +724,10 @@ fn submit_copy_from(
         }
         return Err(error);
     }
-    let txn_id = session
-        .active_txn_id
-        .unwrap_or_else(|| shared.take_txn_id());
+    let txn_id = match session.active_txn_id {
+        Some(txn_id) => txn_id,
+        None => shared.take_txn_id()?,
+    };
     let rows = rows
         .iter()
         .map(|row| row.iter().map(map_db_value_to_sql).collect())
@@ -861,6 +879,7 @@ pub fn durable_wal_segment_from_env(value: Option<&std::ffi::OsStr>) -> Option<s
 /// [`ErrorCategory::Serialization`] (class-40) and the client retries.
 fn submit_autocommit_parsed_with_catalog(
     shared: &SharedEngine,
+    session: &mut SharedSession,
     parsed: ParsedCommand,
     expected_catalog_version: Option<u64>,
 ) -> Result<QueryOutcome, DbError> {
@@ -908,7 +927,10 @@ fn submit_autocommit_parsed_with_catalog(
         Command::Begin { .. } | Command::Commit { .. } | Command::Rollback { .. } => {
             Err(stateless_transaction_control_error())
         }
-        Command::GetKv { .. } | Command::SequenceCurrVal(_) => {
+        Command::SequenceCurrVal(currval) => {
+            sequence_currval_outcome(shared, session, currval.name.as_str())
+        }
+        Command::GetKv { .. } => {
             let tag = command_tag(parsed.command());
             engine
                 .execute_parsed_compatibility_read(parsed)
@@ -920,7 +942,8 @@ fn submit_autocommit_parsed_with_catalog(
         }
         other => {
             let tag = command_tag(other);
-            let txn_id = shared.take_txn_id();
+            let sequence_column = sequence_value_column(other);
+            let txn_id = shared.take_txn_id()?;
             if engine.is_commit_path_poisoned() {
                 return Err(poisoned_engine_error());
             }
@@ -928,11 +951,21 @@ fn submit_autocommit_parsed_with_catalog(
             if let Some(version) = expected_catalog_version {
                 request = request.with_expected_catalog_version(version);
             }
-            match engine
-                .submit_transaction(txn_id, request)
-                .map_err(map_execute_error)?
-            {
+            let admitted = engine.submit_transaction(txn_id, request);
+            capture_sequence_currval_effects(shared, session, txn_id);
+            match admitted.map_err(map_execute_error)? {
                 TransactionAdmissionResult::Dml(result) => Ok(map_dml_result(tag, result)),
+                TransactionAdmissionResult::SequenceValue(outcome) => {
+                    if outcome.currval_updated {
+                        session
+                            .sequence_currvals
+                            .insert(outcome.sequence_oid, outcome.value);
+                    }
+                    Ok(sequence_value_rows(
+                        sequence_column.unwrap_or("sequence_value"),
+                        outcome.value,
+                    ))
+                }
                 TransactionAdmissionResult::Command => Ok(QueryOutcome::Command {
                     tag,
                     rows_affected: None,
@@ -1199,7 +1232,7 @@ fn submit_parsed_inner(
                 if shared.engine.is_commit_path_poisoned() {
                     return Err(poisoned_engine_error());
                 }
-                let txn_id = shared.take_txn_id();
+                let txn_id = shared.take_txn_id()?;
                 let result = shared
                     .engine
                     .submit_transaction(txn_id, parsed)
@@ -1329,7 +1362,10 @@ fn submit_parsed_inner(
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
         }
-        Command::GetKv { .. } | Command::SequenceCurrVal(_) if session.active_txn_id.is_some() => {
+        Command::SequenceCurrVal(currval) if session.active_txn_id.is_some() => {
+            sequence_currval_outcome(shared, session, currval.name.as_str())
+        }
+        Command::GetKv { .. } if session.active_txn_id.is_some() => {
             // Compatibility reads remain unsequenced inside an explicit/implicit block just as
             // they are in autocommit. In particular asyncpg's pool reset begins with
             // pg_advisory_unlock_all(); routing it through mutation admission would both violate
@@ -1361,10 +1397,9 @@ fn submit_parsed_inner(
             if let Some(version) = expected_catalog_version {
                 request = request.with_expected_catalog_version(version);
             }
-            let admitted = shared
-                .engine
-                .submit_transaction(txn_id, request)
-                .map_err(map_execute_error)?;
+            let admitted = shared.engine.submit_transaction(txn_id, request);
+            capture_sequence_currval_effects(shared, session, txn_id);
+            let admitted = admitted.map_err(map_execute_error)?;
             let TransactionAdmissionResult::Dml(result) = admitted else {
                 return Err(invalid_mutation_result("transaction DML"));
             };
@@ -1378,23 +1413,35 @@ fn submit_parsed_inner(
                 .active_txn_id
                 .expect("guarded by transaction-active match arm");
             let tag = command_tag(parsed.command());
+            let sequence_column = sequence_value_column(parsed.command());
             let mut request = MutationRequest::new(parsed);
             if let Some(version) = expected_catalog_version {
                 request = request.with_expected_catalog_version(version);
             }
-            match shared
-                .engine
-                .submit_transaction(txn_id, request)
-                .map_err(map_execute_error)?
-            {
+            let admitted = shared.engine.submit_transaction(txn_id, request);
+            capture_sequence_currval_effects(shared, session, txn_id);
+            match admitted.map_err(map_execute_error)? {
                 TransactionAdmissionResult::Command => Ok(QueryOutcome::Command {
                     tag,
                     rows_affected: None,
                 }),
+                TransactionAdmissionResult::SequenceValue(outcome) => {
+                    if outcome.currval_updated {
+                        session
+                            .sequence_currvals
+                            .insert(outcome.sequence_oid, outcome.value);
+                    }
+                    Ok(sequence_value_rows(
+                        sequence_column.unwrap_or("sequence_value"),
+                        outcome.value,
+                    ))
+                }
                 _ => Err(invalid_mutation_result("transaction catalog command")),
             }
         }
-        _ => submit_autocommit_parsed_with_catalog(shared, parsed, expected_catalog_version),
+        _ => {
+            submit_autocommit_parsed_with_catalog(shared, session, parsed, expected_catalog_version)
+        }
     }
 }
 
@@ -1463,7 +1510,7 @@ fn submit_instrumented_dml(
                 .to_string(),
         });
     }
-    let txn_id = shared.take_txn_id();
+    let txn_id = shared.take_txn_id()?;
     let request = MutationRequest::new(parsed).with_prepared_hook(on_prepared);
     match engine
         .submit_transaction(txn_id, request)
@@ -1783,6 +1830,58 @@ fn map_relational_result(result: gpu_db_engine::RelationalSelectResult) -> Query
         .map(|row| row.iter().cloned().map(map_value).collect())
         .collect();
     QueryOutcome::Rows { columns, rows }
+}
+
+fn sequence_value_column(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::SequenceNextVal(_) => Some("nextval"),
+        Command::SequenceCurrVal(_) => Some("currval"),
+        Command::SequenceSetVal(_) => Some("setval"),
+        _ => None,
+    }
+}
+
+fn sequence_value_rows(column: &str, value: i64) -> QueryOutcome {
+    QueryOutcome::Rows {
+        columns: vec![ColumnMeta {
+            name: column.to_string(),
+            logical_type: LogicalType::Int8,
+        }],
+        rows: vec![vec![DbValue::Int8(value)]],
+    }
+}
+
+fn sequence_currval_outcome(
+    shared: &SharedEngine,
+    session: &SharedSession,
+    name: &str,
+) -> Result<QueryOutcome, DbError> {
+    if shared.engine.is_commit_path_poisoned() {
+        return Err(poisoned_engine_error());
+    }
+    let oid = shared
+        .engine
+        .sequence_oid_for_session(session.active_txn_id, name)
+        .map_err(map_execute_error)?;
+    let value = session
+        .sequence_currvals
+        .get(&oid)
+        .copied()
+        .ok_or_else(|| DbError {
+            category: ErrorCategory::InvalidRequest,
+            message: format!("currval of sequence \"{name}\" is not yet defined in this session"),
+        })?;
+    Ok(sequence_value_rows("currval", value))
+}
+
+fn capture_sequence_currval_effects(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    parent_txn_id: u64,
+) {
+    for (oid, value) in shared.engine.sequence_currval_effects(parent_txn_id) {
+        session.sequence_currvals.insert(oid, value);
+    }
 }
 
 fn map_dml_result(tag: CommandTag, result: gpu_db_engine::DmlExecutionResult) -> QueryOutcome {

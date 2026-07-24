@@ -55,6 +55,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances,
         table_identities: BTreeMap::new(),
@@ -110,6 +111,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -192,6 +194,7 @@ fn row_only_transaction_keeps_v1_opcode_and_composite_typed_catalog_round_trips(
             .unwrap(),
         ],
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         mutations: vec![BinaryTransactionMutation::Insert {
             table: "composite_codec_a".to_string(),
             row_id: 7,
@@ -366,6 +369,7 @@ fn transactional_view_uses_additive_opcode_and_exact_identity_closure() {
         operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
         statement_digests: vec![transaction_statement_digest(&command).unwrap()],
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -518,6 +522,7 @@ fn transactional_view_lifecycle_uses_additive_opcode_and_canonical_targets() {
             .map(|command| transaction_statement_digest(command).unwrap())
             .collect(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -593,6 +598,7 @@ fn identity_bound_transaction_round_trips_and_covers_the_exact_mutation_set() {
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::from([(
@@ -674,6 +680,7 @@ fn transactional_sequence_lifecycle_uses_additive_stable_oid_opcodes() {
         operation_order: vec![BinaryTransactionOperationIdentity::Catalog { command_index: 0 }],
         statement_digests: vec![transaction_statement_digest(&create).unwrap()],
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -708,6 +715,7 @@ fn transactional_sequence_lifecycle_uses_additive_stable_oid_opcodes() {
             transaction_statement_digest(&insert).unwrap(),
         ],
         sequence_input_oids: BTreeMap::from([((1, "codec_sequence".to_string()), 41)]),
+        sequence_value_references: Vec::new(),
         table_identities: BTreeMap::from([(
             "codec_sequence_owner".to_string(),
             BinaryTransactionTableIdentity {
@@ -804,6 +812,7 @@ fn sequence_lifecycle_opcode_requires_a_lifecycle_or_reset_owner() {
             transaction_statement_digest(&insert).unwrap(),
         ],
         sequence_input_oids: BTreeMap::from([((1, "unowned_sequence".to_string()), 41)]),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -907,6 +916,7 @@ fn typed_table_reset_round_trips_and_rejects_noncanonical_composition() {
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: vec![reset],
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -942,4 +952,163 @@ fn typed_table_reset_round_trips_and_rejects_noncanonical_composition() {
     let mut missing_target = record;
     missing_target.table_resets[0].dependency_identities.clear();
     assert!(try_encode_binary_transaction(&missing_target).is_none());
+}
+
+#[test]
+fn sequence_value_transition_codec_is_strict_and_identity_bound() {
+    let operation = BinarySequenceValueOperation::NextVal;
+    let parent_request_digest = [0x42; 32];
+    let input_digest = sequence_value_input_digest(SequenceValueInput {
+        parent_txn_id: 11,
+        parent_autocommit: false,
+        statement_ordinal: 2,
+        expression_ordinal: 3,
+        parent_request_digest,
+        source_name: "codec_value",
+        operation,
+        set_value: None,
+    });
+    let transition = BinarySequenceValueTransitionRecord {
+        transition_txn_id: 12,
+        parent_txn_id: 11,
+        parent_autocommit: false,
+        statement_ordinal: 2,
+        expression_ordinal: 3,
+        parent_request_digest,
+        input_digest,
+        sequence_oid: 41,
+        source_name: "codec_value".to_string(),
+        effective_name: "codec_value".to_string(),
+        published_name: "codec_value".to_string(),
+        base_catalog_generation: 7,
+        prior_last_value: 9,
+        prior_is_called: true,
+        new_last_value: 10,
+        new_is_called: true,
+        returned_value: 10,
+        private_descriptor_digest: None,
+        operation,
+    };
+    let payload = encode_sequence_value_transition(&transition).unwrap();
+    assert_eq!(
+        payload[..3],
+        [
+            WAL_BINARY_TAG,
+            WAL_BINARY_VERSION,
+            OP_SEQUENCE_VALUE_TRANSITION
+        ]
+    );
+    assert!(matches!(
+        decode_binary_record(&payload).unwrap(),
+        BinaryWalRecord::SequenceValueTransition(decoded) if decoded == transition
+    ));
+    assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+    let mut trailing = payload.clone();
+    trailing.push(0);
+    assert!(decode_binary_record(&trailing).is_err());
+    assert!(validate_sequence_envelope_transaction_id(&payload, 12).is_ok());
+    assert!(validate_sequence_envelope_transaction_id(&payload, 13).is_err());
+
+    let mut bad_prior = transition.clone();
+    bad_prior.prior_last_value = i64::MAX;
+    assert!(encode_sequence_value_transition(&bad_prior).is_none());
+    let mut bad_digest = transition;
+    bad_digest.input_digest[0] ^= 1;
+    assert!(encode_sequence_value_transition(&bad_digest).is_none());
+}
+
+#[test]
+fn sequence_reference_wrapper_round_trips_and_rejects_noncanonical_references() {
+    let input_digest = sequence_value_input_digest(SequenceValueInput {
+        parent_txn_id: 21,
+        parent_autocommit: false,
+        statement_ordinal: 0,
+        expression_ordinal: 0,
+        parent_request_digest: [0x24; 32],
+        source_name: "wrapped_value",
+        operation: BinarySequenceValueOperation::NextVal,
+        set_value: None,
+    });
+    let reference = BinarySequenceValueReference {
+        transition_txn_id: 22,
+        parent_txn_id: 21,
+        statement_ordinal: 0,
+        expression_ordinal: 0,
+        sequence_oid: 51,
+        returned_value: 1,
+        input_digest,
+        table_oid: 0,
+        column_id: 0,
+        staging_row_ordinal: 0,
+        row_id: 0,
+        final_value_overwritten: false,
+        default_expression: false,
+    };
+    let base = BinaryTransactionRecord {
+        catalog_epoch: BinaryTransactionCatalogEpoch::Legacy,
+        allocator_high_water: 1,
+        catalog_commands: Vec::new(),
+        created_table_identities: BTreeMap::new(),
+        created_table_index_identities: BTreeMap::new(),
+        catalog_output: None,
+        view_operations: Vec::new(),
+        view_lifecycle_operations: Vec::new(),
+        index_lifecycle_operations: Vec::new(),
+        sequence_lifecycle_operations: Vec::new(),
+        sequence_reset_operations: Vec::new(),
+        sequence_advances_by_oid: BTreeMap::new(),
+        operation_order: Vec::new(),
+        statement_digests: Vec::new(),
+        sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: vec![reference.clone()],
+        table_resets: Vec::new(),
+        sequence_advances: BTreeMap::new(),
+        table_identities: BTreeMap::new(),
+        mutations: Vec::new(),
+    };
+    let payload = try_encode_binary_transaction(&base).unwrap();
+    assert_eq!(
+        payload[..3],
+        [
+            WAL_BINARY_TAG,
+            WAL_BINARY_VERSION,
+            OP_SEQUENCE_REFERENCED_TRANSACTION
+        ]
+    );
+    assert!(matches!(
+        decode_binary_record(&payload).unwrap(),
+        BinaryWalRecord::Transaction(decoded) if decoded == base
+    ));
+    assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+    let wrapped_base_len =
+        usize::try_from(u64::from_le_bytes(payload[3..11].try_into().unwrap())).unwrap();
+    let reference_count_at = 11 + wrapped_base_len;
+    let mut huge_count = payload.clone();
+    huge_count[reference_count_at..reference_count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let huge_count_error = match decode_binary_record(&huge_count) {
+        Ok(_) => panic!("an oversized sequence-reference count must fail before allocation"),
+        Err(error) => error,
+    };
+    assert!(
+        huge_count_error
+            .to_string()
+            .contains("reference count does not match remaining bytes"),
+        "{huge_count_error}"
+    );
+    let mut trailing = payload;
+    trailing.push(0);
+    assert!(decode_binary_record(&trailing).is_err());
+
+    let mut invalid_default = base.clone();
+    invalid_default.sequence_value_references[0].default_expression = true;
+    assert!(try_encode_binary_transaction(&invalid_default).is_none());
+    let mut wrong_parent = base.clone();
+    wrong_parent.sequence_value_references[0].parent_txn_id = 23;
+    let wrong_parent_payload = try_encode_binary_transaction(&wrong_parent).unwrap();
+    assert!(validate_sequence_envelope_transaction_id(&wrong_parent_payload, 21).is_err());
+    let mut out_of_order = base;
+    let mut earlier = reference;
+    earlier.transition_txn_id = 20;
+    out_of_order.sequence_value_references.push(earlier);
+    assert!(try_encode_binary_transaction(&out_of_order).is_none());
 }

@@ -100,10 +100,12 @@ The result column says **closed** only at this decision level. `G:` names post-a
 | SEQ-09 | Object/row/transaction/commit allocator reaches its last valid value. | Reservation rejects before WAL when next/exclusive frontier would wrap or use `u64::MAX` as commit sequence; reads remain available and no ID is reused. | **closed**; current lane conversion/claim proof plus G: R3-003/DUR-002 |
 
 Live implementation coverage as of 2026-07-24 includes the transactional stable-OID CREATE/RESTART/RENAME/DROP
-and owned-reset database-state portions of SEQ-03/04/06. It does not claim the distinct ordinary published
-`SequenceValueTransition` or session-`currval` portions of SEQ-01/02/05/07; **PRODUCT-001** in PLAN is their sole
-implementation owner. The table above remains the accepted target trace review, not a substitute implementation
-status ledger.
+and owned-reset database-state portions of SEQ-03/04/06 plus the distinct ordinary published
+`SequenceValueTransition` and session-`currval` portions of SEQ-01/02/05/07. Additive typed WAL opcodes 20/21 bind
+stable-OID value outcomes and later user-envelope references; exact retry and recovery do not consume twice or
+reconstruct session-local state. **PRODUCT-001** in PLAN remains the sole owner of acceptance sequencing and
+remaining work. The table above remains the accepted target trace review, not a substitute implementation status
+ledger.
 
 ## Conveyor, publication, and acknowledgement traces
 

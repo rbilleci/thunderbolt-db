@@ -40,6 +40,12 @@ pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, En
         | Some(&OP_IDENTITY_ORDERED_CATALOG_SEQUENCE_LIFECYCLE_TRANSACTION) => {
             decode_binary_transaction(payload).map(BinaryWalRecord::Transaction)
         }
+        Some(&OP_SEQUENCE_VALUE_TRANSITION) => {
+            decode_sequence_value_transition(payload).map(BinaryWalRecord::SequenceValueTransition)
+        }
+        Some(&OP_SEQUENCE_REFERENCED_TRANSACTION) => {
+            decode_sequence_referenced_transaction(payload).map(BinaryWalRecord::Transaction)
+        }
         Some(&OP_UPDATE_BY_KEY) => {
             let mut at = 0usize;
             let mut take = |n: usize| -> Result<&[u8], EngineError> {

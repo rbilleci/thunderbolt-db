@@ -96,6 +96,42 @@ pub(crate) struct BinaryTransactionTableIdentity {
     pub(crate) schema_digest: gpu_db_wal::CanonicalDigest,
 }
 
+/// A durable user-envelope reference to an already-published ordinary sequence transition.
+///
+/// The value transition has its own canonical transaction identity and WAL record.  Keeping the
+/// exact returned value and input digest here makes the later INSERT envelope self-verifying
+/// without asking replay to re-evaluate `nextval`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinarySequenceValueReference {
+    pub(crate) transition_txn_id: TxnId,
+    pub(crate) parent_txn_id: TxnId,
+    pub(crate) statement_ordinal: u32,
+    pub(crate) expression_ordinal: u32,
+    pub(crate) sequence_oid: u32,
+    pub(crate) returned_value: i64,
+    pub(crate) input_digest: gpu_db_wal::CanonicalDigest,
+    /// Stable relation/column binding for a materialized default. Explicit sequence calls encode
+    /// zero in both fields; their durable `row_id` and transient staging ordinal are also zero.
+    pub(crate) table_oid: u32,
+    pub(crate) column_id: u32,
+    /// Statement-local row position used only while binding the prepared INSERT entity. It is
+    /// cleared before WAL framing and deliberately is not serialized; `row_id` is the durable
+    /// identity.
+    pub(crate) staging_row_ordinal: u32,
+    /// Stable entity identity assigned by the enclosing user envelope. During statement staging
+    /// this is the transaction-private provisional id; WAL binding rewrites it to the final
+    /// globally claimed id. Explicit sequence calls encode zero.
+    pub(crate) row_id: u64,
+    /// Whether a later statement in the same transaction replaced the materialized default value
+    /// or deleted its row. This preserves legal insert-then-update/delete programs while making
+    /// the final durable row disposition independently checkable during replay.
+    pub(crate) final_value_overwritten: bool,
+    /// True when the returned value is embedded in an INSERT row. False identifies an explicit
+    /// sequence call whose transition still belongs to this user transaction's retry/lifecycle
+    /// closure but does not occupy an INSERT expression.
+    pub(crate) default_expression: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BinaryTransactionCatalogCommand {
     pub(crate) ordinal: u32,
@@ -170,6 +206,10 @@ pub(crate) struct BinaryTransactionRecord {
     /// by `(statement ordinal, sequence name)`. Catalog entries cover every sequence default;
     /// INSERT entries cover exactly the defaults that advanced `sequence_advances`.
     pub(crate) sequence_input_oids: BTreeMap<(u32, String), u32>,
+    /// Ordinary published-sequence effects are separate durable transitions.  These references
+    /// bind their already-materialized values into the user transaction without folding the
+    /// sequence state into user rollback.
+    pub(crate) sequence_value_references: Vec<BinarySequenceValueReference>,
     /// Surviving table-root barriers in canonical statement order. Old transaction opcodes decode
     /// this as empty; reset records use their own opcode and keep row bodies after the reset block.
     pub(crate) table_resets: Vec<BinaryTransactionTableReset>,
@@ -192,4 +232,5 @@ pub(crate) enum BinaryWalRecord {
     DeleteByKey(BinaryDeleteByKeyRecord),
     UpdateByKey(BinaryUpdateByKeyRecord),
     Transaction(BinaryTransactionRecord),
+    SequenceValueTransition(BinarySequenceValueTransitionRecord),
 }

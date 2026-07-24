@@ -43,7 +43,8 @@ pub(crate) struct CommitWaveItem {
     /// Catalog generation revalidated for a protocol-neutral prepared execution. Unlike
     /// `prepared_catalog_seq` (the off-lock optimizer stamp), this is a correctness precondition:
     /// a mismatch must fail before WAL/apply rather than re-resolve under a changed row type.
-    pub(super) expected_catalog_version: Option<Index>,
+    pub(super) expected_catalog_version:
+        Option<crate::engine_mutation_admission::CatalogVersionExpectation>,
     /// DELTA-REUSE (B): the OFF-LOCK-prepared insert delta, carried forward for reuse-eligible
     /// items (elided, FK-free, no nextval). The under-lock re-resolve then only RE-KEYS it at the
     /// wave's `next_row_id` (`rekey_offlock_insert_delta`) instead of re-running the full

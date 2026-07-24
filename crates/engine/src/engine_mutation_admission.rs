@@ -73,6 +73,45 @@ pub(crate) fn validate_prepared_catalog_version(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogVersionExpectation {
+    Prepared(u64),
+    SequenceRoute(u64),
+}
+
+impl CatalogVersionExpectation {
+    fn version(self) -> u64 {
+        match self {
+            Self::Prepared(version) | Self::SequenceRoute(version) => version,
+        }
+    }
+
+    fn changed(self, detail: &str) -> ExecuteError {
+        match self {
+            Self::Prepared(_) => ExecuteError::Unsupported(format!(
+                "prepared command {detail}; re-Parse is required"
+            )),
+            Self::SequenceRoute(_) => ExecuteError::Serialization(format!(
+                "sequence-default route {detail}; retry the statement"
+            )),
+        }
+    }
+}
+
+pub(crate) fn validate_catalog_version_expectation(
+    expectation: CatalogVersionExpectation,
+    actual: u64,
+) -> Result<(), ExecuteError> {
+    let expected = expectation.version();
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(expectation.changed(&format!(
+            "catalog changed before execution (expected generation {expected}, current generation {actual})"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransactionResources {
     pub operations: u32,
     pub mutations: u32,
@@ -303,6 +342,7 @@ struct PredeclaredStageContext<'a, OnStaged> {
 pub enum TransactionAdmissionResult {
     Command,
     Dml(DmlExecutionResult),
+    SequenceValue(SequenceValueOutcome),
     Transaction(Option<TxnId>),
     Predeclared(PredeclaredTransactionResult),
 }
@@ -318,15 +358,23 @@ impl Engine {
         txn_id: TxnId,
         request: impl Into<TransactionRequest>,
     ) -> Result<TransactionAdmissionResult, ExecuteError> {
+        self.observe_transaction_id(txn_id);
         match request.into() {
             TransactionRequest::Statement(request) => self.submit_statement(txn_id, request),
-            TransactionRequest::Copy(request) => self.submit_copy(txn_id, request),
-            TransactionRequest::Predeclared(transaction) => self
-                .submit_predeclared_transaction(txn_id, transaction)
-                .map(TransactionAdmissionResult::Predeclared),
-            TransactionRequest::Prepared(transaction) => self
-                .submit_bound_prepared_transaction(txn_id, transaction)
-                .map(TransactionAdmissionResult::Predeclared),
+            TransactionRequest::Copy(request) => {
+                self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
+                self.submit_copy(txn_id, request)
+            }
+            TransactionRequest::Predeclared(transaction) => {
+                self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
+                self.submit_predeclared_transaction(txn_id, transaction)
+                    .map(TransactionAdmissionResult::Predeclared)
+            }
+            TransactionRequest::Prepared(transaction) => {
+                self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
+                self.submit_bound_prepared_transaction(txn_id, transaction)
+                    .map(TransactionAdmissionResult::Predeclared)
+            }
         }
     }
 
@@ -361,6 +409,7 @@ impl Engine {
             on_prepared,
         } = request.into_parts();
         let (command, source) = parsed.into_parts();
+        self.validate_sequence_autocommit_statement_parent(txn_id, &command)?;
         match command {
             Command::Select(_)
             | Command::SelectFunction(_)
@@ -374,6 +423,11 @@ impl Engine {
                 reject_prepared_hook(on_prepared)?;
                 self.execute_parsed_text(txn_id, Command::Begin { characteristics }, &source)?;
                 Ok(TransactionAdmissionResult::Transaction(Some(txn_id)))
+            }
+            command @ (Command::SequenceNextVal(_) | Command::SequenceSetVal(_)) => {
+                reject_prepared_hook(on_prepared)?;
+                self.execute_sequence_value_command(txn_id, &command)
+                    .map(TransactionAdmissionResult::SequenceValue)
             }
             Command::Commit { chain } => {
                 reject_prepared_hook(on_prepared)?;
@@ -417,40 +471,57 @@ impl Engine {
                     self.execute_prepared_dml_in_transaction_with_result(
                         txn_id,
                         command,
-                        expected_catalog_version,
+                        expected_catalog_version.map(CatalogVersionExpectation::Prepared),
+                        false,
                     )?
-                } else if self.is_concurrent_dml_command(&command) {
-                    match on_prepared {
-                        Some(on_prepared) => self
-                            .execute_parsed_dml_concurrent_instrumented_with_catalog(
+                } else {
+                    let (omits_published_sequence_default, route_catalog_version) =
+                        self.insert_sequence_default_route(&command);
+                    let catalog_expectation = expected_catalog_version
+                        .map(CatalogVersionExpectation::Prepared)
+                        .or_else(|| {
+                            route_catalog_version.map(CatalogVersionExpectation::SequenceRoute)
+                        });
+                    if omits_published_sequence_default {
+                        reject_prepared_hook(on_prepared)?;
+                        self.execute_sequence_default_autocommit(
+                            txn_id,
+                            command,
+                            catalog_expectation,
+                        )?
+                    } else if self.is_concurrent_dml_command(&command) {
+                        match on_prepared {
+                            Some(on_prepared) => self
+                                .execute_parsed_dml_concurrent_instrumented_with_catalog(
+                                    txn_id,
+                                    command,
+                                    &source,
+                                    catalog_expectation,
+                                    on_prepared,
+                                )?,
+                            None => self.execute_parsed_dml_concurrent_with_catalog(
                                 txn_id,
                                 command,
                                 &source,
-                                expected_catalog_version,
-                                on_prepared,
+                                catalog_expectation,
                             )?,
-                        None => self.execute_parsed_dml_concurrent_with_catalog(
+                        }
+                    } else {
+                        reject_prepared_hook(on_prepared)?;
+                        if command_has_returning(&command) {
+                            return Err(ExecuteError::Unsupported(
+                                "DML RETURNING requires the GPU-native concurrent mutation path"
+                                    .to_string(),
+                            ));
+                        }
+                        self.execute_parsed_text_with_catalog(
                             txn_id,
                             command,
                             &source,
-                            expected_catalog_version,
-                        )?,
+                            route_catalog_version,
+                        )?;
+                        return Ok(TransactionAdmissionResult::Command);
                     }
-                } else {
-                    reject_prepared_hook(on_prepared)?;
-                    if command_has_returning(&command) {
-                        return Err(ExecuteError::Unsupported(
-                            "DML RETURNING requires the GPU-native concurrent mutation path"
-                                .to_string(),
-                        ));
-                    }
-                    self.execute_parsed_text_with_catalog(
-                        txn_id,
-                        command,
-                        &source,
-                        expected_catalog_version,
-                    )?;
-                    return Ok(TransactionAdmissionResult::Command);
                 };
                 Ok(TransactionAdmissionResult::Dml(result))
             }
@@ -471,11 +542,12 @@ impl Engine {
         }
     }
 
-    fn execute_prepared_dml_in_transaction_with_result(
+    pub(crate) fn execute_prepared_dml_in_transaction_with_result(
         &self,
         txn_id: TxnId,
         command: Command,
-        expected: Option<u64>,
+        expectation: Option<CatalogVersionExpectation>,
+        sequence_parent_autocommit: bool,
     ) -> Result<DmlExecutionResult, ExecuteError> {
         let snapshot = self
             .transaction_snapshot_handle(txn_id)
@@ -487,7 +559,7 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
         let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
-        if let Some(expected) = expected {
+        if let Some(expectation) = expectation {
             let transaction_catalog = snapshot.transaction_catalog();
             // A prepared command targeting this transaction's own CREATE TABLE cannot be
             // resolved in the published catalog generation carried by the protocol descriptor:
@@ -498,19 +570,23 @@ impl Engine {
                 if transaction_private_create_is_dml_target(&snapshot, &command) {
                     prepared_dml_catalog_dependencies(&transaction_catalog, &command)?
                 } else {
-                    let expected_catalog = self.read_catalog_as_of(expected);
+                    let expected_catalog = self.read_catalog_as_of(expectation.version());
                     prepared_dml_catalog_dependencies(&expected_catalog, &command)?
                 };
             let actual_dependencies =
                 prepared_dml_catalog_dependencies(&transaction_catalog, &command)?;
             if expected_dependencies != actual_dependencies {
-                return Err(ExecuteError::Unsupported(
-                    "prepared command catalog dependencies changed at the transaction statement snapshot; re-Parse is required"
-                        .to_string(),
+                return Err(expectation.changed(
+                    "catalog dependencies changed at the transaction statement snapshot",
                 ));
             }
         }
-        self.execute_parsed_dml_in_transaction_statement_locked(txn_id, command, &snapshot)
+        self.execute_parsed_dml_in_transaction_statement_locked_with_sequence_parent(
+            txn_id,
+            command,
+            &snapshot,
+            sequence_parent_autocommit,
+        )
     }
 
     fn submit_predeclared_transaction(
@@ -884,6 +960,7 @@ impl Engine {
             &provisional,
             1,
             allocator_high_water,
+            &[],
         )?;
         record.table_resets = table_resets
             .iter()

@@ -27,6 +27,7 @@ mod operation_identity;
 mod record_decode;
 mod row_codec;
 mod sequence_identity_codec;
+mod sequence_value_codec;
 mod transaction_types;
 mod view_identity_codec;
 use index_identity_codec::*;
@@ -48,10 +49,16 @@ pub(crate) use sequence_identity_codec::{
     BinaryTransactionSequenceLifecycleTargetIdentity,
     BinaryTransactionSequenceResetOperationIdentity,
 };
+use sequence_value_codec::*;
+pub(crate) use sequence_value_codec::{
+    encode_sequence_value_transition, sequence_descriptor_digest, sequence_value_input_digest,
+    valid_sequence_value_transition, validate_sequence_envelope_transaction_id,
+    BinarySequenceValueOperation, BinarySequenceValueTransitionRecord, SequenceValueInput,
+};
 pub(crate) use transaction_types::{
-    BinaryTransactionCatalogCommand, BinaryTransactionCatalogEpoch, BinaryTransactionCatalogOutput,
-    BinaryTransactionMutation, BinaryTransactionRecord, BinaryTransactionTableIdentity,
-    BinaryTransactionTableReset, BinaryWalRecord, WAL_BINARY_TAG,
+    BinarySequenceValueReference, BinaryTransactionCatalogCommand, BinaryTransactionCatalogEpoch,
+    BinaryTransactionCatalogOutput, BinaryTransactionMutation, BinaryTransactionRecord,
+    BinaryTransactionTableIdentity, BinaryTransactionTableReset, BinaryWalRecord, WAL_BINARY_TAG,
 };
 use transaction_types::{
     OP_COMPOSITE_TRANSACTION, OP_DELETE_BY_KEY, OP_IDENTITY_COMPOSITE_TRANSACTION,
@@ -76,6 +83,12 @@ pub(crate) use view_identity_codec::{
 /// `None`; callers must fail the transaction rather than fall back to statement SQL records, which
 /// would lose atomicity and predicate-resolution identity.
 pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) -> Option<Vec<u8>> {
+    if !record.sequence_value_references.is_empty() {
+        let mut base = record.clone();
+        let references = std::mem::take(&mut base.sequence_value_references);
+        let base = try_encode_binary_transaction(&base)?;
+        return encode_sequence_referenced_transaction(&base, &references);
+    }
     let reset_names = record
         .table_resets
         .iter()
@@ -1943,6 +1956,7 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         operation_order,
         statement_digests,
         sequence_input_oids,
+        sequence_value_references: Vec::new(),
         table_resets,
         sequence_advances,
         table_identities,

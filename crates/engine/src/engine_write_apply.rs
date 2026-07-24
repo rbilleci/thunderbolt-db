@@ -341,6 +341,11 @@ impl Engine {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         let cmd = parse_command(text)?;
+        // This compatibility queue accepts caller-assigned identities. Observe the caller before
+        // BEGIN/AND CHAIN or any immediate fallback can allocate an engine-owned successor, and
+        // refuse reuse of an autocommit parent already claimed by a durable sequence outcome.
+        self.observe_transaction_id(txn_id);
+        self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
         if crate::engine_dml_concurrent::command_has_returning(&cmd) {
             return Err(crate::engine_dml_concurrent::discarded_returning_error());
         }

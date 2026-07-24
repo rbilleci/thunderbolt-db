@@ -683,6 +683,9 @@ pub(crate) struct TransactionDeltaState {
     /// name map remains for byte-compatible row-only records; lifecycle statements can rename or
     /// reuse a binding, so their private value state is authoritative only through this map.
     pub(crate) sequence_state_by_oid: BTreeMap<u32, (i64, bool)>,
+    /// Separately committed ordinary sequence-value outcomes referenced by this user envelope.
+    /// Their catalog state is not transaction-private and therefore survives rollback.
+    pub(crate) sequence_value_references: Vec<BinarySequenceValueReference>,
     /// Exact published catalog generation beneath every ordered private catalog operation.
     /// Catalog operations themselves live in `operations`, so mixed DDL/DML/reset programs retain
     /// one statement-order authority rather than maintaining a parallel command stream.
@@ -810,7 +813,7 @@ impl TransactionSnapshot {
             .delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        delta.operations.is_empty()
+        delta.operations.is_empty() && delta.sequence_value_references.is_empty()
     }
 
     pub(crate) fn transaction_table_is_reset(&self, table: &str) -> bool {

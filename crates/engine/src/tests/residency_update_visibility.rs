@@ -851,11 +851,12 @@ fn transaction_post_durable_apply_failure_is_sticky_fail_stop() {
     );
 }
 
-/// R3-003 transaction-owned sequence state: default evaluation advances across private statements,
-/// stays invisible on rollback, and is installed/replayed in the same atomic record as its rows.
+/// PRODUCT-001 ordinary published-sequence defaults: values publish independently before each
+/// private row statement, survive user rollback, and are referenced exactly by the later atomic
+/// user envelope. Transaction-private CREATE/RESTART coverage remains in the lifecycle suite.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn transaction_sequence_defaults_advance_privately_and_recover_atomically() {
+fn transaction_published_sequence_defaults_advance_independently_and_recover_atomically() {
     let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
@@ -903,17 +904,23 @@ fn transaction_sequence_defaults_advance_privately_and_recover_atomically() {
         ]
     );
     let sequence = e.relational_catalog_sequence("txn_ids").unwrap();
-    assert_eq!((sequence.last_value, sequence.is_called), (1, false));
+    assert_eq!((sequence.last_value, sequence.is_called), (3, true));
+    assert_eq!(
+        e.durable_wal_records().len(),
+        wal_before + 3,
+        "each ordinary default publishes before its private row"
+    );
 
     e.execute_text(90, "COMMIT").unwrap();
     let sequence = e.relational_catalog_sequence("txn_ids").unwrap();
     assert_eq!((sequence.last_value, sequence.is_called), (3, true));
     let durable = e.durable_wal_records();
-    assert_eq!(durable.len(), wal_before + 1);
+    assert_eq!(durable.len(), wal_before + 4);
     assert!(matches!(
         decode_binary_record(&durable.last().unwrap().payload).unwrap(),
         BinaryWalRecord::Transaction(record)
-            if record.sequence_advances.get("txn_ids") == Some(&(3, true))
+            if !record.sequence_advances.contains_key("txn_ids")
+                && record.sequence_value_references.len() == 3
                 && record.mutations.len() == 3
     ));
 
@@ -925,22 +932,23 @@ fn transaction_sequence_defaults_advance_privately_and_recover_atomically() {
     let sequence = recovered.relational_catalog_sequence("txn_ids").unwrap();
     assert_eq!((sequence.last_value, sequence.is_called), (3, true));
 
-    e.execute_text(91, "BEGIN").unwrap();
-    e.execute_dml_concurrent(91, "INSERT INTO serial_accounts (balance) VALUES (40)")
+    // Caller-assigned compatibility ids leave space for engine-owned transition identities.
+    e.execute_text(100, "BEGIN").unwrap();
+    e.execute_dml_concurrent(100, "INSERT INTO serial_accounts (balance) VALUES (40)")
         .unwrap();
-    e.execute_text(91, "ROLLBACK").unwrap();
+    e.execute_text(100, "ROLLBACK").unwrap();
     let sequence = e.relational_catalog_sequence("txn_ids").unwrap();
-    assert_eq!((sequence.last_value, sequence.is_called), (3, true));
-    e.execute_text(4, "INSERT INTO serial_accounts (balance) VALUES (40)")
+    assert_eq!((sequence.last_value, sequence.is_called), (4, true));
+    e.execute_text(110, "INSERT INTO serial_accounts (balance) VALUES (40)")
         .unwrap();
-    let id_four = match parse_command("SELECT balance FROM serial_accounts WHERE id = 4").unwrap() {
+    let id_five = match parse_command("SELECT balance FROM serial_accounts WHERE id = 5").unwrap() {
         Command::Select(select) => select,
         other => panic!("expected SELECT, got {other:?}"),
     };
     assert_eq!(
-        e.execute_relational_select(&id_four).unwrap().rows.row(0)[0],
+        e.execute_relational_select(&id_five).unwrap().rows.row(0)[0],
         SqlValue::Int4(40),
-        "rollback must not consume the transaction-private sequence value"
+        "rollback must not rewind the independently published sequence value"
     );
 }
 

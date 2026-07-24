@@ -324,6 +324,9 @@ impl Engine {
                 {
                     gpu_db_wal::CanonicalFragmentKind::TableReset
                 }
+                crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_) => {
+                    gpu_db_wal::CanonicalFragmentKind::SequenceValueTransition
+                }
                 _ => gpu_db_wal::CanonicalFragmentKind::RowMutation,
             });
         }
@@ -382,6 +385,7 @@ impl Engine {
                 .try_fold(record.allocator_high_water, |high, next| {
                     next.map(|next| high.max(next))
                 }),
+            crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_) => Ok(0),
         }
     }
 
@@ -741,6 +745,7 @@ impl Engine {
                 crate::wal_binary::BinaryWalRecord::Transaction(record) => {
                     Ok(record.mutations.len() as u64)
                 }
+                crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_) => Ok(0),
                 crate::wal_binary::BinaryWalRecord::DeleteByKey(_)
                 | crate::wal_binary::BinaryWalRecord::UpdateByKey(_) => {
                     Err(EngineError::Durability(
@@ -875,6 +880,7 @@ impl Engine {
                 crate::wal_binary::BinaryWalRecord::Transaction(record) => {
                     record.mutations.len() as u64
                 }
+                crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_) => 0,
                 crate::wal_binary::BinaryWalRecord::DeleteByKey(_)
                 | crate::wal_binary::BinaryWalRecord::UpdateByKey(_) => {
                     return Err(EngineError::Durability(
@@ -990,6 +996,7 @@ impl Engine {
                 "committed engine WAL cannot be encoded with an abort outcome".to_string(),
             ));
         }
+        validate_sequence_envelope_transaction_id(payload, txn_id)?;
         let operation_body = Self::encode_engine_operation(payload)?;
         let allocator_high_water = Self::canonical_allocator_high_water(payload)?;
         let operation_digest = gpu_db_wal::canonical_request_digest(&operation_body);
@@ -1100,6 +1107,7 @@ impl Engine {
                 let payload = if record.payload.first() == Some(&WAL_BINARY_TAG) {
                     // Binary opcodes carry their own durable catalog epoch.
                     decode_binary_record(&record.payload)?;
+                    validate_sequence_envelope_transaction_id(&record.payload, record.txn_id)?;
                     Arc::clone(&record.payload)
                 } else if record.payload.first() == Some(&ENGINE_TYPED_COMMAND_TAG) {
                     let command =
@@ -1213,6 +1221,7 @@ impl Engine {
                 envelope.header.request_digest,
             )?;
             let payload = Self::decode_engine_operation(&operation.body)?;
+            validate_sequence_envelope_transaction_id(&payload, record.txn_id)?;
             let operation_kind = Self::canonical_fragment_kind(&payload)?;
             let referenced_allocator_high_water = Self::canonical_allocator_high_water(&payload)?;
             if gpu_db_wal::canonical_request_digest(&operation.body)
@@ -1377,6 +1386,15 @@ impl Engine {
                 }
             }
         }
+        let next_txn_id = commit
+            .transaction_status
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.transaction_id_allocator
+            .fetch_max(next_txn_id, AtomicOrdering::Relaxed);
         Ok(())
     }
 
@@ -1557,6 +1575,7 @@ mod tests {
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),
+            sequence_value_references: Vec::new(),
             table_resets: Vec::new(),
             sequence_advances: BTreeMap::new(),
             table_identities: BTreeMap::from([(

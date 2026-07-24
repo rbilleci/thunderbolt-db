@@ -1800,6 +1800,11 @@ impl Engine {
                     "transaction WAL record reached the single-mutation applier".to_string(),
                 ));
             }
+            crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_) => {
+                return Err(EngineError::Durability(
+                    "sequence transition reached the single-row mutation applier".to_string(),
+                ));
+            }
         };
         let table = cat
             .relational_catalog
@@ -1871,6 +1876,10 @@ impl Engine {
             return match decode_binary_record(&entry.payload)? {
                 BinaryWalRecord::Transaction(record) => {
                     self.apply_binary_transaction_record(entry, cat, record)
+                }
+                BinaryWalRecord::SequenceValueTransition(record) => {
+                    self.apply_sequence_value_transition_record(entry, cat, record)?;
+                    Ok(Vec::new())
                 }
                 _ => self
                     .apply_binary_wal_entry(entry, cat)

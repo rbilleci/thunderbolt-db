@@ -2287,6 +2287,121 @@ fn commit_and_chain_propagates_txn_id_exhaustion() {
     let err = e.execute_text(u64::MAX, "COMMIT AND CHAIN").unwrap_err();
 
     assert!(matches!(err, ExecuteError::Txn(TxnError::IdExhausted)));
-    assert_eq!(e.active_txn_count(), 0);
+    assert_eq!(e.active_txn_count(), 1);
+    assert!(e.transaction_snapshot_handle(u64::MAX).is_some());
+    assert_eq!(e.active_snapshots_oldest(), Some(0));
     assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    e.execute_text(u64::MAX, "ROLLBACK").unwrap();
+    assert_eq!(e.active_txn_count(), 0);
+    assert!(e.transaction_snapshot_handle(u64::MAX).is_none());
+    assert_eq!(e.active_snapshots_oldest(), None);
+}
+
+#[test]
+fn rollback_and_chain_propagates_txn_id_exhaustion_before_terminal_effect() {
+    let e = Engine::new_local_test_engine();
+
+    e.execute_text(u64::MAX, "BEGIN").unwrap();
+    let err = e.execute_text(u64::MAX, "ROLLBACK AND CHAIN").unwrap_err();
+
+    assert!(matches!(err, ExecuteError::Txn(TxnError::IdExhausted)));
+    assert_eq!(e.active_txn_count(), 1);
+    assert!(e.transaction_snapshot_handle(u64::MAX).is_some());
+    assert_eq!(e.active_snapshots_oldest(), Some(0));
+    e.execute_text(u64::MAX, "ROLLBACK").unwrap();
+    assert_eq!(e.active_txn_count(), 0);
+    assert!(e.transaction_snapshot_handle(u64::MAX).is_none());
+    assert_eq!(e.active_snapshots_oldest(), None);
+}
+
+#[test]
+fn staged_chain_exhaustion_preserves_private_state_and_snapshot_until_terminal_retry() {
+    for (table, chain, terminal, publishes) in [
+        (
+            "exhausted_staged_commit",
+            "COMMIT AND CHAIN",
+            "COMMIT",
+            true,
+        ),
+        (
+            "exhausted_staged_rollback",
+            "ROLLBACK AND CHAIN",
+            "ROLLBACK",
+            false,
+        ),
+    ] {
+        let e = Engine::new_local_test_engine();
+        e.execute_text(u64::MAX, "BEGIN").unwrap();
+        e.submit_transaction(
+            u64::MAX,
+            gpu_db_sql::ParsedCommand::parse(&format!("CREATE TABLE {table} (id INT)")).unwrap(),
+        )
+        .unwrap();
+
+        let err = e.execute_text(u64::MAX, chain).unwrap_err();
+        assert!(matches!(err, ExecuteError::Txn(TxnError::IdExhausted)));
+        assert_eq!(e.active_txn_count(), 1);
+        assert!(e.transaction_snapshot_handle(u64::MAX).is_some());
+        assert_eq!(e.active_snapshots_oldest(), Some(0));
+        assert!(!e.catalog_snapshot().relational_catalog.contains_key(table));
+        assert!(e.durable_wal_records().is_empty());
+
+        e.execute_text(u64::MAX, terminal).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+        assert!(e.transaction_snapshot_handle(u64::MAX).is_none());
+        assert_eq!(e.active_snapshots_oldest(), None);
+        assert_eq!(
+            e.catalog_snapshot().relational_catalog.contains_key(table),
+            publishes
+        );
+    }
+}
+
+#[test]
+fn staged_chain_failure_cancels_the_pre_registered_successor_before_retry() {
+    let mut e = Engine::new_local_test_engine();
+    e.submit_transaction(1, gpu_db_sql::ParsedCommand::parse("BEGIN").unwrap())
+        .unwrap();
+    e.submit_transaction(
+        1,
+        gpu_db_sql::ParsedCommand::parse("CREATE TABLE failed_chain_successor_owner (id INT)")
+            .unwrap(),
+    )
+    .unwrap();
+    e.simulate_next_wal_flush_failure();
+
+    let error = e
+        .submit_transaction(
+            1,
+            gpu_db_sql::ParsedCommand::parse("COMMIT AND CHAIN").unwrap(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, ExecuteError::Engine(_)));
+    assert_eq!(e.active_txn_count(), 1);
+    assert!(e.transaction_snapshot_handle(1).is_some());
+    assert!(e.transaction_snapshot_handle(2).is_none());
+    assert!(e
+        .relational_catalog_table("failed_chain_successor_owner")
+        .is_none());
+    assert!(e.durable_wal_records().is_empty());
+
+    let retry = e
+        .submit_transaction(
+            1,
+            gpu_db_sql::ParsedCommand::parse("COMMIT AND CHAIN").unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        retry,
+        TransactionAdmissionResult::Transaction(Some(3))
+    ));
+    assert!(e.transaction_snapshot_handle(1).is_none());
+    assert!(e.transaction_snapshot_handle(3).is_some());
+    assert!(e
+        .relational_catalog_table("failed_chain_successor_owner")
+        .is_some());
+    e.submit_transaction(3, gpu_db_sql::ParsedCommand::parse("ROLLBACK").unwrap())
+        .unwrap();
+    assert_eq!(e.active_txn_count(), 0);
+    assert_eq!(e.active_snapshots_oldest(), None);
 }

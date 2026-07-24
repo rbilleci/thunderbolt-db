@@ -94,6 +94,9 @@ impl Engine {
                 type_oid: literal.ty.postgres_oid(),
                 type_size: literal.ty.type_size(),
             }],
+            Command::SequenceNextVal(_) => vec![sequence_result_column("nextval")],
+            Command::SequenceCurrVal(_) => vec![sequence_result_column("currval")],
+            Command::SequenceSetVal(_) => vec![sequence_result_column("setval")],
             Command::PreparedCatalog(program) => {
                 let parameter = match program {
                     PreparedCatalogProgram::Pg16DomainConstraints { type_oid }
@@ -175,6 +178,20 @@ impl Engine {
             parameter_types,
             result_columns,
         })
+    }
+}
+
+fn sequence_result_column(name: &str) -> RelationalColumn {
+    RelationalColumn {
+        id: 0,
+        table_oid: 0,
+        attnum: 0,
+        name: name.to_string(),
+        ty: SqlType::Int8,
+        domain: None,
+        default: None,
+        type_oid: SqlType::Int8.postgres_oid(),
+        type_size: SqlType::Int8.type_size(),
     }
 }
 
@@ -583,6 +600,28 @@ mod tests {
         assert_eq!(description.result_columns[0].ty, SqlType::Int4);
         assert_eq!(description.result_columns[0].table_oid, 0);
         assert_eq!(description.result_columns[0].attnum, 0);
+    }
+
+    #[test]
+    fn description_exposes_int8_sequence_value_columns() {
+        let engine = Engine::new_local();
+        for (sql, name) in [
+            ("SELECT nextval('described_sequence'::regclass)", "nextval"),
+            ("SELECT currval('described_sequence'::regclass)", "currval"),
+            (
+                "SELECT setval('described_sequence'::regclass, 9, false)",
+                "setval",
+            ),
+        ] {
+            let prepared = PreparedCommand::parse(sql).unwrap();
+            let description = engine.describe_prepared_command(&prepared, &[]).unwrap();
+            assert!(description.parameter_types.is_empty());
+            assert_eq!(description.result_columns.len(), 1);
+            assert_eq!(description.result_columns[0].name, name);
+            assert_eq!(description.result_columns[0].ty, SqlType::Int8);
+            assert_eq!(description.result_columns[0].table_oid, 0);
+            assert_eq!(description.result_columns[0].attnum, 0);
+        }
     }
 
     #[test]

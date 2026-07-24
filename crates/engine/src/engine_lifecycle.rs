@@ -354,6 +354,8 @@ impl Engine {
             }),
             commit_publication: Default::default(),
             pending_transaction_claims: Arc::new(Mutex::new(HashMap::new())),
+            transaction_id_allocator: Arc::new(AtomicU64::new(1)),
+            sequence_value_outcomes: Mutex::new(HashMap::new()),
             commit_path_wedged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_transaction_post_durable_apply: AtomicBool::new(false),

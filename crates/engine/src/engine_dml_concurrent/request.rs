@@ -38,17 +38,24 @@ impl Engine {
         txn_id: u64,
         command: Command,
         text: &str,
-        expected_catalog_version: Option<u64>,
+        expected_catalog_version: Option<
+            crate::engine_mutation_admission::CatalogVersionExpectation,
+        >,
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        // This compatibility entry accepts caller-assigned identities. An ordinary sequence
+        // default may claim its own transaction before the user DML record, so reserve the outer
+        // identity in the shared allocator first.
+        self.observe_transaction_id(txn_id);
+        self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.transaction_snapshot_handle(txn_id).is_some() {
-            if let Some(expected) = expected_catalog_version {
+            if let Some(expectation) = expected_catalog_version {
                 let snapshot = self
                     .transaction_snapshot_handle(txn_id)
                     .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
-                crate::engine_mutation_admission::validate_prepared_catalog_version(
-                    expected,
+                crate::engine_mutation_admission::validate_catalog_version_expectation(
+                    expectation,
                     snapshot.catalog.commit_seq,
                 )?;
             }
@@ -104,9 +111,13 @@ impl Engine {
         txn_id: u64,
         cmd: Command,
         text: &str,
-        expected_catalog_version: Option<u64>,
+        expected_catalog_version: Option<
+            crate::engine_mutation_admission::CatalogVersionExpectation,
+        >,
         on_prepared: impl FnOnce(),
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.observe_transaction_id(txn_id);
+        self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.is_commit_path_poisoned() {

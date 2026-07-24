@@ -597,10 +597,10 @@ impl Engine {
                 }
                 Ok(false) => {}
             }
-            if let Some(expected) = batch[position].expected_catalog_version {
+            if let Some(expectation) = batch[position].expected_catalog_version {
                 if let Err(error) =
-                    crate::engine_mutation_admission::validate_prepared_catalog_version(
-                        expected,
+                    crate::engine_mutation_admission::validate_catalog_version_expectation(
+                        expectation,
                         wave_catalog_seq,
                     )
                 {
@@ -1448,10 +1448,10 @@ impl Engine {
                     wave_history_conflicts.insert(position);
                 }
                 Ok(None) => {
-                    if let Some(expected) = item.expected_catalog_version {
+                    if let Some(expectation) = item.expected_catalog_version {
                         if let Err(error) =
-                            crate::engine_mutation_admission::validate_prepared_catalog_version(
-                                expected,
+                            crate::engine_mutation_admission::validate_catalog_version_expectation(
+                                expectation,
                                 serialized_catalog_seq,
                             )
                         {

@@ -372,6 +372,7 @@ impl Engine {
             operation_order,
             catalog_output,
             sequence_input_oids,
+            sequence_value_references,
         } = envelope;
         let mut prior_reset_ordinal = None;
         for identity in sequence_reset_operations {
@@ -399,6 +400,28 @@ impl Engine {
                 "ordered transaction mixes legacy and lifecycle view identities".to_string(),
             ));
         }
+        let sequence_lifecycle_oids = sequence_lifecycle_operations
+            .iter()
+            .flat_map(|identity| &identity.targets)
+            .chain(
+                sequence_reset_operations
+                    .iter()
+                    .flat_map(|identity| &identity.targets),
+            )
+            .filter_map(|target| {
+                target
+                    .target_before
+                    .as_ref()
+                    .or(target.target_after.as_ref())
+                    .map(|target| target.oid)
+            })
+            .collect::<BTreeSet<_>>();
+        let sequence_reference_records = self.prepare_sequence_lifecycle_reference_replay(
+            working,
+            sequence_value_references,
+            &sequence_lifecycle_oids,
+        )?;
+        let mut next_sequence_reference = 0usize;
         let legacy_lifecycle;
         let view_operations = if view_lifecycle_operations.is_empty() {
             legacy_lifecycle = view_operations
@@ -444,6 +467,12 @@ impl Engine {
                 .get(next_sequence_reset)
                 .is_some_and(|identity| identity.ordinal < operation.ordinal)
             {
+                Self::apply_sequence_lifecycle_references_through(
+                    &sequence_reference_records,
+                    &mut next_sequence_reference,
+                    sequence_reset_operations[next_sequence_reset].ordinal,
+                    working,
+                )?;
                 Self::apply_transaction_sequence_reset_identity(
                     working,
                     commit_seq,
@@ -459,6 +488,12 @@ impl Engine {
                     "catalog command and sequence reset reuse one statement ordinal".to_string(),
                 ));
             }
+            Self::apply_sequence_lifecycle_references_through(
+                &sequence_reference_records,
+                &mut next_sequence_reference,
+                operation.ordinal,
+                working,
+            )?;
             let before = Self::catalog_snapshot_from_working(working, commit_seq);
             match &operation.command {
                 Command::CreateTable(_) => {
@@ -640,8 +675,26 @@ impl Engine {
             }
         }
         while let Some(identity) = sequence_reset_operations.get(next_sequence_reset) {
+            Self::apply_sequence_lifecycle_references_through(
+                &sequence_reference_records,
+                &mut next_sequence_reference,
+                identity.ordinal,
+                working,
+            )?;
             Self::apply_transaction_sequence_reset_identity(working, commit_seq, identity)?;
             next_sequence_reset += 1;
+        }
+        Self::apply_sequence_lifecycle_references_through(
+            &sequence_reference_records,
+            &mut next_sequence_reference,
+            u32::MAX,
+            working,
+        )?;
+        if next_sequence_reference != sequence_reference_records.len() {
+            return Err(EngineError::Durability(
+                "ordered transaction did not consume every sequence lifecycle reference"
+                    .to_string(),
+            ));
         }
         if next_view != view_operations.len() {
             return Err(EngineError::Durability(
@@ -682,6 +735,7 @@ impl Engine {
             operation_order: _,
             catalog_output: _,
             sequence_input_oids: _,
+            sequence_value_references,
         } = envelope;
         let mut working = self.ddl_catalog().clone();
         let catalog_epoch = if commands.iter().any(|operation| {
@@ -710,7 +764,11 @@ impl Engine {
         )
         .map_err(ExecuteError::Engine)?;
         let reconstructed = Self::catalog_snapshot_from_working(&working, expected.commit_seq);
-        if !reconstructed.same_contents(expected) {
+        if !Self::catalogs_same_ignoring_referenced_sequence_values(
+            &reconstructed,
+            expected,
+            sequence_value_references,
+        ) {
             return Err(ExecuteError::Serialization(
                 "typed transactional catalog envelope no longer reconstructs its exact private post-state"
                     .to_string(),

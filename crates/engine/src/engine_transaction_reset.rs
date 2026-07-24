@@ -648,6 +648,11 @@ impl Engine {
                     add_table(table)?;
                 }
             }
+            BinaryWalRecord::SequenceValueTransition(_) => {
+                return Err(EngineError::ApplyFailed(
+                    "raw sequence transitions require typed sequence-value admission".to_string(),
+                ));
+            }
         }
         lease
             .acquire_shared(shared.values().copied())

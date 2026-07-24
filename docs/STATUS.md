@@ -14,6 +14,96 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 ordinary published-sequence transitions — accepted 2026-07-24
+
+- `nextval`, both `setval` forms, and omitted INSERT defaults on an unchanged published sequence now use one typed
+  `SequenceValueTransition` through the existing commit/WAL/status/publication authority. Each independently durable
+  record binds the transition and parent transaction identities, autocommit scope, statement/expression ordinals,
+  exact parent/input digests, stable sequence OID and published binding, prior/new value state, operation, and
+  returned value. Additive binary opcodes 20/21 preserve every earlier transaction layout: opcode 20 owns the
+  transition, while opcode 21 wraps the later user envelope with exact references to already-published outcomes.
+  Transaction-private CREATE/RESTART identities remain on the existing private lifecycle/default path; direct
+  ordinary transition admission refuses them, and materialized-view lifecycle remains pre-effect refusal.
+- A sequence transition publishes before its user statement or transaction outcome and survives statement failure,
+  rollback, disconnect, and recovery. Exact retries reuse the durable
+  `(parent, scope, statement, expression, request, input)` identity and never consume a second value; a mismatched
+  request, cross-family caller, reused transition ID, malformed record, or missing terminal claim fails closed.
+  Engine- and facade-owned work share one checked transaction-ID allocator; text/enqueue compatibility callers
+  advance its high water before work, `COMMIT AND CHAIN` reserves its successor from the same authority, and
+  exhaustion rejects without wrapping. Recovery reconstructs the typed outcome index before accepting retries or
+  referenced user envelopes.
+- Default references bind the stable table OID, column ID, final globally claimed row ID, returned value, and final
+  row disposition. Statement-local ordinals are removed before WAL framing. Commit and replay independently decode
+  the final row, verify the exact materialized value, and permit only a recorded later update/delete disposition.
+  READ COMMITTED rebase remaps provisional row identities alongside mutations. Catalog classification carries a
+  generation proof on both positive and negative INSERT routes, so ADD/DROP DEFAULT cannot switch semantics after
+  admission; internal route drift is retryable serialization, while a client-prepared contract still requires
+  re-Parse.
+- Facade sessions retain `currval` by stable sequence OID: `nextval` and a materialized default update it,
+  `setval(..., true)` updates it, and `setval(..., false)` does not. User rollback does not rewind that session
+  state; rename continues to resolve the same OID, while an absent or different identity cannot inherit it.
+  Prepared metadata reports sequence values as `int8`.
+- Ordinary engine tests pass **645/645** with **602** ignored; facade tests pass **83/83** with **15** ignored, and
+  the complete facade concurrency suite passes **13/13** with one GPU-only ignore. The serialized include-ignored
+  engine sweep passes **1,244/1,247** and retains exactly the same three PLAN-owned classic-wave FK, wide-unique,
+  and recovered-ID failures. The focused sequence cohort passes **49/49** with three ignored, and both the existing
+  transactional NULL differential and the new actual-GPU published-default rollback/recovery proof pass three
+  serial plus two simultaneous runs.
+- Workspace all-target/all-feature check, strict affected-crate Clippy, dependency direction, rustfmt, diff, and
+  source-size checks pass. New production owners are bounded at **1,346** lines
+  (`engine_sequence_value.rs`) and **575** lines (`wal_binary/sequence_value_codec.rs`).
+  `engine_mutation_admission.rs` is **2,087** lines and remains explicitly owned by **PRODUCT-001** without an
+  exception. The newly crossed **2,002**-line `engine_transaction_catalog.rs` is also explicitly PLAN-owned without
+  exception: its production owner is 567 lines and its separable inline corpus is 25 tests, with the exact
+  `engine_transaction_catalog/core_tests.rs` extraction and gates recorded in PLAN.
+- The final non-canonical clean-build quick screen completed A/B on the twice-repaired code tree: raw rooflines are
+  **1471.0/1428.5 GB/s** in/out of L2, grouped execution is **1673.2 M-elem/s**, and in-L2 production
+  batch-65,536 point reads are **268.255M/s, p50 117us**. Its point-read artifact is SHA-256
+  `de86c5ec4828efa3462517bb4037a10d1547c1608ff3b54802ae7e7548696524` (9,924,480 bytes).
+- The first frozen-tree audit correctly returned **REJECT** before the full card: `COMMIT AND CHAIN` could allocate
+  a facade-reserved identity from a second allocator, opcode 21 trusted a corrupt reference count before proving
+  its fixed-width payload bound, and direct negative-route plus transaction-private refusal sabotage was missing.
+  The repaired candidate uses the shared checked allocator for chained successors, validates exact fixed-width
+  reference bytes before fallible reservation, and adds both facade-reservation interleavings, recovery-level
+  count tamper, negative ADD DEFAULT drift, and private CREATE/RESTART `nextval`/`setval` proofs.
+- The next frozen-tree audit also correctly returned **REJECT** before the full card: chained-ID exhaustion occurred
+  after terminal commit/rollback and could strand the old lifetime snapshot, while the newly crossed catalog root
+  lacked its mandatory size disposition. Chained successors now allocate/register before the terminal boundary,
+  every later staged-commit failure cancels that provisional identity, and exhaustion leaves engine/facade parent
+  state aligned and retryable. Empty/staged COMMIT and ROLLBACK, snapshot/GC floor, facade state, WAL-flush
+  cancellation, and non-reused successor retry are direct tests. PLAN now owns the analyzed catalog-test
+  extraction.
+- The third exact-tree implementation re-audit returned **ACCEPT** with no remaining High or Medium finding on base
+  `5d1fc1890544453767e2f7ba0941acbfb63c0e21`, staged tree
+  `91ca526ee67a781d7889a23c479d65106292fffa`, and cached binary-diff SHA-256
+  `00a84dd60586de5d06db50658c27cde66d3a821485c5a5652b5edcb4c309296c` across 41 paths with no
+  unstaged/untracked drift. The auditor independently reran the WAL-flush cancellation/retry and facade four-case
+  exhaustion sabotage, verified every provisional-successor cancellation path, and accepted the catalog-root
+  disposition before authorizing the full card.
+- The candidate's single canonical full report card then completed A/B/C under
+  `SECTION_C_TIMEOUT=2700` with every calibrated control intact. Artifacts are raw
+  `a1f053190a6b2e915837489d21bc521e9b0369f4145be4aea5c37c3d0001c234` (1,129,600 bytes), point
+  `de86c5ec4828efa3462517bb4037a10d1547c1608ff3b54802ae7e7548696524` (9,924,480 bytes), and AWS-LC
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61` (7,156,488 bytes). Layer 1 is
+  **1391.7 GB/s, p50 24us** in-L2, **1433.8 GB/s, p50 187us** out-of-L2, and
+  **1674.2 M-elem/s** grouped. Layer 2 is **271.032M/s, p50 116us** in-L2 and
+  **249.569M/s, p50 139us** out-of-L2; the fixed 48M-row fixture built in **2328.7s** with zero
+  final-residency work.
+- Against the accepted transactional-sequence-lifecycle card, raw throughput is **+5.4%/-0.6%**, grouped is flat,
+  point throughput is **+3.9%/+5.6%**, point p50 improves by **1us/1us**, and fixture construction is **+3.8%**
+  slower; there is no material read-path regression. Sections A/B/C each emitted their configuration-bound complete
+  record and marker, the exact final record is
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`, and the fresh isolated target was
+  removed.
+- Same-auditor post-card audit returned **ACCEPT** with no High or Medium finding on documentation closeout tree
+  `915254c7bb9c92f6a2b2067d10dd04e417e6d389` and cached binary-diff SHA-256
+  `3e989cd4219edc409e51943563d43d0d7d693a977e483b9d53c56e5f69dcc1a2` across 43 staged paths without
+  drift. It independently matched full-card log SHA-256
+  `214fd92342f05c720d0fbac26172cf8eb96bce619f4d75d2cb5f6a6f01bef82b`, the exact pre-card seal,
+  artifact/configuration/completion provenance, target cleanup, and accepted baseline deltas. The post-card delta
+  was exactly PLAN, STATUS, HANDOVER, and the two factual design inventories; no implementation or qualifying
+  performance-path change occurred, so the single canonical card remains applicable without rerun.
+
 ## PRODUCT-001 transactional sequence lifecycle — verified candidate 2026-07-24
 
 - `CREATE SEQUENCE`, `ALTER SEQUENCE ... RESTART`, `ALTER SEQUENCE ... RENAME TO ...`, ordered multi-target

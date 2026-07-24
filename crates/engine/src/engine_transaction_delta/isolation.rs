@@ -174,7 +174,11 @@ impl Engine {
                             .to_string(),
                     ))
                 })?;
-                if !base.same_contents(fresh.catalog.as_ref()) {
+                if !Self::catalogs_same_ignoring_referenced_sequence_values(
+                    base,
+                    fresh.catalog.as_ref(),
+                    &delta.sequence_value_references,
+                ) {
                     return Err(ExecuteError::Serialization(
                         "published catalog contents changed after transactional DDL staging"
                             .to_string(),
@@ -186,9 +190,69 @@ impl Engine {
                             .to_string(),
                     ))
                 })?;
-                // Only the publication stamp changed. Object/column allocators and every catalog
-                // dependency are byte-identical, so the private overlay retains its stable
-                // identities and is rebound to the fresh READ COMMITTED statement boundary.
+                let private_barrier_oids = delta
+                    .operations
+                    .iter()
+                    .flat_map(|operation| match operation {
+                        TransactionOperation::Catalog(staged) => staged
+                            .sequence_identity
+                            .as_ref()
+                            .filter(|_| matches!(staged.command, Command::SequenceRestart(_)))
+                            .into_iter()
+                            .flat_map(|identity| &identity.targets)
+                            .filter_map(|target| {
+                                target
+                                    .target_before
+                                    .as_ref()
+                                    .or(target.target_after.as_ref())
+                                    .map(|target| target.oid)
+                            })
+                            .collect::<Vec<_>>(),
+                        TransactionOperation::TableReset(reset) => reset
+                            .sequence_reset_identity
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|identity| &identity.targets)
+                            .filter_map(|target| {
+                                target
+                                    .target_before
+                                    .as_ref()
+                                    .or(target.target_after.as_ref())
+                                    .map(|target| target.oid)
+                            })
+                            .collect::<Vec<_>>(),
+                        TransactionOperation::Row(_) => Vec::new(),
+                    })
+                    .collect::<BTreeSet<_>>();
+                for sequence_oid in delta
+                    .sequence_value_references
+                    .iter()
+                    .map(|reference| reference.sequence_oid)
+                    .collect::<BTreeSet<_>>()
+                {
+                    if private_barrier_oids.contains(&sequence_oid) {
+                        continue;
+                    }
+                    let Some(published) = fresh
+                        .catalog
+                        .relational_sequences
+                        .values()
+                        .find(|sequence| sequence.oid == sequence_oid)
+                    else {
+                        continue;
+                    };
+                    if let Some(private) = overlay
+                        .relational_sequences
+                        .values_mut()
+                        .find(|sequence| sequence.oid == sequence_oid)
+                    {
+                        private.last_value = published.last_value;
+                        private.is_called = published.is_called;
+                    }
+                }
+                // Object/column allocators and every descriptor dependency are byte-identical.
+                // Separately published ordinary sequence values are merged by stable OID unless a
+                // later private RESTART/reset barrier owns that value state.
                 overlay.commit_seq = fresh.catalog.commit_seq;
                 let private_tables = catalog_commands
                     .into_iter()
@@ -222,6 +286,7 @@ impl Engine {
             mut operations,
             sequence_state,
             sequence_state_by_oid,
+            mut sequence_value_references,
             old_private_gpu_bytes,
         ) = {
             let delta = current
@@ -233,10 +298,15 @@ impl Engine {
                 delta.operations.clone(),
                 delta.sequence_state.clone(),
                 delta.sequence_state_by_oid.clone(),
+                delta.sequence_value_references.clone(),
                 delta.private_gpu_bytes_by_gpu.clone(),
             )
         };
-        rekey_provisional_inserts(&mut operations, fresh.next_row_id)?;
+        rekey_provisional_inserts(
+            &mut operations,
+            &mut sequence_value_references,
+            fresh.next_row_id,
+        )?;
 
         let mut next_shards = (*fresh.resident_shards).clone();
         // A transaction-created table has no globally published shard generation. Rebase starts
@@ -263,6 +333,7 @@ impl Engine {
             next_row_id: fresh.next_row_id,
             sequence_state: BTreeMap::new(),
             sequence_state_by_oid: BTreeMap::new(),
+            sequence_value_references: Vec::new(),
             catalog_base: None,
             catalog_overlay: rebased_catalog_overlay.clone(),
             private_gpu_bytes_by_gpu: BTreeMap::new(),
@@ -432,6 +503,7 @@ impl Engine {
             })?;
         state.sequence_state = sequence_state;
         state.sequence_state_by_oid = sequence_state_by_oid;
+        state.sequence_value_references = sequence_value_references;
         if let Some(overlay) = rebased_catalog_overlay {
             state.catalog_base = Some(Arc::clone(&fresh.catalog));
             state.catalog_overlay = Some(overlay);
@@ -454,6 +526,7 @@ fn read_committed_rebase_error(error: ExecuteError) -> ExecuteError {
 
 fn rekey_provisional_inserts(
     operations: &mut [TransactionOperation],
+    sequence_value_references: &mut [BinarySequenceValueReference],
     new_base: u64,
 ) -> Result<(), ExecuteError> {
     let mut mapping = BTreeMap::<(String, u64), u64>::new();
@@ -490,6 +563,29 @@ fn rekey_provisional_inserts(
         return Err(ExecuteError::Unsupported(
             "transaction provisional row identity space exhausted".to_string(),
         ));
+    }
+    let mut row_id_mapping = BTreeMap::new();
+    for ((_, old), new) in &mapping {
+        if row_id_mapping.insert(*old, *new).is_some() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "transaction reused one provisional entity identity across relations during rebase"
+                    .to_string(),
+            )));
+        }
+    }
+    for reference in sequence_value_references
+        .iter_mut()
+        .filter(|reference| reference.default_expression)
+    {
+        reference.row_id = row_id_mapping
+            .get(&reference.row_id)
+            .copied()
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "sequence default reference {} lost its provisional INSERT during rebase",
+                    reference.transition_txn_id
+                )))
+            })?;
     }
 
     for delta in operations

@@ -159,6 +159,18 @@ impl Engine {
         command: Command,
         snapshot: &Arc<TransactionSnapshot>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.execute_parsed_dml_in_transaction_statement_locked_with_sequence_parent(
+            txn_id, command, snapshot, false,
+        )
+    }
+
+    pub(crate) fn execute_parsed_dml_in_transaction_statement_locked_with_sequence_parent(
+        &self,
+        txn_id: TxnId,
+        mut command: Command,
+        snapshot: &Arc<TransactionSnapshot>,
+        sequence_parent_autocommit: bool,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         self.ensure_commit_path_available()
@@ -183,15 +195,15 @@ impl Engine {
         let statement_digest = transaction_statement_digest(&command)?;
 
         let table_name = match &command {
-            Command::Insert(insert) => insert.table.as_str(),
-            Command::Update(update) => update.table.as_str(),
-            Command::Delete(delete) => delete.table.as_str(),
+            Command::Insert(insert) => insert.table.clone(),
+            Command::Update(update) => update.table.clone(),
+            Command::Delete(delete) => delete.table.clone(),
             _ => unreachable!("DML shape checked above"),
         };
         let transaction_catalog = snapshot.transaction_catalog();
         let table = transaction_catalog
             .relational_catalog
-            .get(table_name)
+            .get(&table_name)
             .cloned()
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -217,20 +229,58 @@ impl Engine {
         snapshot
             .table_access
             .acquire_shared(sequence_access_identities)?;
-        let _scope = self.enter_transaction_read(Arc::clone(snapshot));
 
-        let (generation, next_row_id) = {
+        let (generation, next_row_id, statement_ordinal, expression_ordinal_base) = {
             let delta = snapshot
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (delta.generation, delta.next_row_id)
+            (
+                delta.generation,
+                delta.next_row_id,
+                u32::try_from(delta.operations.len()).map_err(|_| {
+                    ExecuteError::Unsupported(
+                        "transaction operation count exceeds typed WAL framing".to_string(),
+                    )
+                })?,
+                u32::try_from(
+                    delta
+                        .sequence_value_references
+                        .iter()
+                        .filter(|reference| {
+                            usize::try_from(reference.statement_ordinal).ok()
+                                == Some(delta.operations.len())
+                        })
+                        .count(),
+                )
+                .map_err(|_| {
+                    ExecuteError::Unsupported(
+                        "transaction sequence expression count exceeds typed WAL framing"
+                            .to_string(),
+                    )
+                })?,
+            )
         };
+        let mut sequence_value_references = self.materialize_published_sequence_defaults(
+            snapshot,
+            &transaction_catalog,
+            &table,
+            &mut command,
+            crate::engine_sequence_value::SequenceDefaultStatementIdentity {
+                parent_txn_id: txn_id,
+                parent_autocommit: sequence_parent_autocommit,
+                statement_ordinal,
+                expression_ordinal_base,
+                parent_request_digest: statement_digest,
+            },
+        )?;
+        let _scope = self.enter_transaction_read(Arc::clone(snapshot));
         let dml_snapshot = DmlReadSnapshot {
             commit_seq: snapshot.boundary,
             next_row_id,
         };
         let prepared = self.prepare_dml(&command, dml_snapshot, InsertPrepareValidation::Full)?;
+        self.bind_sequence_default_insert_rows(&table, &prepared, &mut sequence_value_references)?;
         let prepared_sequence_state = match &prepared.mutation {
             PreparedMutation::Insert { seq_advances, .. } => seq_advances.clone(),
             PreparedMutation::Update { .. } | PreparedMutation::Delete { .. } => BTreeMap::new(),
@@ -265,7 +315,10 @@ impl Engine {
 
         self.validate_transaction_delta_residency(
             &table,
-            snapshot.catalog.relational_catalog.contains_key(table_name),
+            snapshot
+                .catalog
+                .relational_catalog
+                .contains_key(&table_name),
         )?;
 
         let current_shards = snapshot.transaction_shards();
@@ -310,6 +363,9 @@ impl Engine {
         delta
             .sequence_state_by_oid
             .extend(prepared_sequence_state_by_oid);
+        delta
+            .sequence_value_references
+            .extend(sequence_value_references);
         delta
             .operations
             .push(TransactionOperation::Row(Arc::new(StagedRowOperation {
@@ -395,14 +451,18 @@ impl Engine {
                 "transaction id {txn_id} was already claimed by another write strategy while the explicit transaction was active"
             ))));
         }
-        let (operations, catalog_base) = {
+        let (operations, catalog_base, sequence_value_references) = {
             let delta = snapshot
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (delta.operations.clone(), delta.catalog_base.clone())
+            (
+                delta.operations.clone(),
+                delta.catalog_base.clone(),
+                delta.sequence_value_references.clone(),
+            )
         };
-        if operations.is_empty() {
+        if operations.is_empty() && sequence_value_references.is_empty() {
             drop(commit);
             return self
                 .finish_transaction_context(txn_id, true, chain)
@@ -443,11 +503,11 @@ impl Engine {
                     "transactional catalog operation envelope lost its base generation".to_string(),
                 ))
             })?;
-            if !self
-                .read_state
-                .latest_catalog()
-                .same_contents(base.as_ref())
-            {
+            if !Self::catalogs_same_ignoring_referenced_sequence_values(
+                self.read_state.latest_catalog().as_ref(),
+                base.as_ref(),
+                &sequence_value_references,
+            ) {
                 return Err(ExecuteError::Serialization(
                     "catalog contents changed after transactional DDL staging".to_string(),
                 ));
@@ -559,6 +619,7 @@ impl Engine {
             &provisional_inserts,
             final_base,
             allocator_high_water,
+            &sequence_value_references,
         )?;
         Self::bind_transaction_record_catalog_envelope(
             &mut record,
@@ -567,6 +628,7 @@ impl Engine {
             &table_resets,
             &transaction_catalog,
         )?;
+        Self::bind_sequence_reference_final_dispositions(&mut record, &transaction_catalog)?;
         let cold_index_candidate_tables = record
             .index_lifecycle_operations
             .iter()
@@ -586,6 +648,7 @@ impl Engine {
                     operation_order: &record.operation_order,
                     catalog_output: record.catalog_output.as_ref(),
                     sequence_input_oids: &record.sequence_input_oids,
+                    sequence_value_references: &record.sequence_value_references,
                 },
                 &transaction_catalog,
             )?;
@@ -666,11 +729,23 @@ impl Engine {
                 ));
             }
         };
+        // Register the chained successor before the first durable effect. Allocator exhaustion is
+        // therefore a clean pre-WAL error that leaves the parent transaction and its lifetime
+        // snapshot active. Every later failure path cancels this provisional successor.
+        let successor_id = if chain {
+            Some(
+                self.begin_unclaimed_transaction(&mut commit)
+                    .map_err(ExecuteError::Txn)?,
+            )
+        } else {
+            None
+        };
 
         let wal_len_before = commit.wal.len();
         let token = match commit.repl.propose(Arc::clone(&payload)) {
             Ok(token) => token,
             Err(err) => {
+                Self::cancel_chained_successor(&mut commit, successor_id);
                 return Err(ExecuteError::Engine(err));
             }
         };
@@ -686,6 +761,7 @@ impl Engine {
             Ok(record) => record,
             Err(err) => {
                 commit.repl.rollback_unapplied_from(token.index);
+                Self::cancel_chained_successor(&mut commit, successor_id);
                 return Err(ExecuteError::Engine(err));
             }
         };
@@ -693,9 +769,11 @@ impl Engine {
         if let Err(err) = commit.wal.flush_all() {
             commit.repl.rollback_unapplied_from(token.index);
             commit.wal.truncate(wal_len_before);
+            Self::cancel_chained_successor(&mut commit, successor_id);
             return Err(ExecuteError::Engine(err));
         }
         if let Err(error) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
+            Self::cancel_chained_successor(&mut commit, successor_id);
             self.wedge_commit_path();
             return Err(ExecuteError::Indeterminate(format!(
                 "explicit transaction {txn_id} flushed WAL but commit confirmation failed: {error}; restart recovery must resolve it"
@@ -707,6 +785,7 @@ impl Engine {
             token.index,
             affected_rows,
         ) {
+            Self::cancel_chained_successor(&mut commit, successor_id);
             self.wedge_commit_path();
             return Err(ExecuteError::Indeterminate(format!(
                 "explicit transaction {txn_id} became durable but terminal status installation failed: {error}; restart recovery must resolve it"
@@ -755,6 +834,7 @@ impl Engine {
         drop(publication_owner);
         self.release_transaction_commit_gpu_credit(&commit_gpu_credit);
         if let Err(err) = apply_result {
+            Self::cancel_chained_successor(&mut commit, successor_id);
             self.wedge_commit_path();
             return Err(ExecuteError::Indeterminate(format!(
                 "explicit transaction {txn_id} is durable but could not be fully installed: {err}; engine restart recovery required"
@@ -770,15 +850,12 @@ impl Engine {
             .txn_manager
             .commit(txn_id)
             .expect("active transaction remained active under the commit lock");
-        let successor = if chain {
-            let next_id = self.begin_unclaimed_transaction(&mut commit)?;
-            Some((
+        let successor = successor_id.map(|next_id| {
+            (
                 next_id,
                 self.capture_transaction_snapshot(self.committed_seq(), snapshot.characteristics),
-            ))
-        } else {
-            None
-        };
+            )
+        });
         let mut active = self
             .active_snapshots
             .lock()

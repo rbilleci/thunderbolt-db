@@ -60,6 +60,9 @@ impl Engine {
                         }
                         continue;
                     }
+                    Ok(crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_)) => {
+                        continue;
+                    }
                     Err(_) => return None,
                 }
             }
@@ -119,6 +122,7 @@ impl Engine {
                     | crate::wal_binary::BinaryWalRecord::DeleteByKey(_)
                     | crate::wal_binary::BinaryWalRecord::UpdateByKey(_)
                     | crate::wal_binary::BinaryWalRecord::Transaction(_)
+                    | crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_)
             );
         }
         !matches!(
@@ -195,6 +199,9 @@ impl Engine {
                         has_other.insert(record.table);
                     }
                     Ok(crate::wal_binary::BinaryWalRecord::Transaction(_)) | Err(_) => {
+                        return BTreeSet::new();
+                    }
+                    Ok(crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_)) => {
                         return BTreeSet::new();
                     }
                 }

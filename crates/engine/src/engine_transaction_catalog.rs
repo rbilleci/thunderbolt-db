@@ -24,6 +24,7 @@ pub(crate) struct TransactionCatalogEnvelopeSlices<'a> {
     pub(crate) operation_order: &'a [BinaryTransactionOperationIdentity],
     pub(crate) catalog_output: Option<&'a BinaryTransactionCatalogOutput>,
     pub(crate) sequence_input_oids: &'a BTreeMap<(u32, String), u32>,
+    pub(crate) sequence_value_references: &'a [BinarySequenceValueReference],
 }
 
 impl Engine {
@@ -116,7 +117,14 @@ impl Engine {
             validate_prepared_catalog_version(expected, snapshot.catalog.commit_seq)?;
         }
 
-        let (generation, prior_operations, prior_commands, prior_overlay, prior_base) = {
+        let (
+            generation,
+            prior_operations,
+            prior_commands,
+            prior_overlay,
+            prior_base,
+            sequence_value_references,
+        ) = {
             let delta = snapshot
                 .delta
                 .lock()
@@ -134,6 +142,7 @@ impl Engine {
                     .collect::<Vec<_>>(),
                 delta.catalog_overlay.clone(),
                 delta.catalog_base.clone(),
+                delta.sequence_value_references.clone(),
             )
         };
         let prior_has_sequence_reset = prior_operations.iter().any(|operation| {
@@ -151,10 +160,13 @@ impl Engine {
                     .to_string(),
             )));
         }
-        if prior_base
-            .as_deref()
-            .is_some_and(|base| !base.same_contents(snapshot.catalog.as_ref()))
-        {
+        if prior_base.as_deref().is_some_and(|base| {
+            !Self::catalogs_same_ignoring_referenced_sequence_values(
+                base,
+                snapshot.catalog.as_ref(),
+                &sequence_value_references,
+            )
+        }) {
             return Err(ExecuteError::Serialization(
                 "transactional catalog base changed before the next catalog statement".to_string(),
             ));
@@ -212,7 +224,58 @@ impl Engine {
         }
         on_catalog_latched();
         let mut working = catalog_guard.clone();
-        for operation in &prior_operations {
+        let sequence_lifecycle_oids = prior_operations
+            .iter()
+            .flat_map(|operation| match operation {
+                TransactionOperation::Catalog(staged) => staged
+                    .sequence_identity
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|identity| &identity.targets)
+                    .filter_map(|target| {
+                        target
+                            .target_before
+                            .as_ref()
+                            .or(target.target_after.as_ref())
+                            .map(|target| target.oid)
+                    })
+                    .collect::<Vec<_>>(),
+                TransactionOperation::TableReset(reset) => reset
+                    .sequence_reset_identity
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|identity| &identity.targets)
+                    .filter_map(|target| {
+                        target
+                            .target_before
+                            .as_ref()
+                            .or(target.target_after.as_ref())
+                            .map(|target| target.oid)
+                    })
+                    .collect::<Vec<_>>(),
+                TransactionOperation::Row(_) => Vec::new(),
+            })
+            .collect::<BTreeSet<_>>();
+        let sequence_reference_records = self
+            .prepare_sequence_lifecycle_reference_replay(
+                &mut working,
+                &sequence_value_references,
+                &sequence_lifecycle_oids,
+            )
+            .map_err(ExecuteError::Engine)?;
+        let mut next_sequence_reference = 0usize;
+        for (ordinal, operation) in prior_operations.iter().enumerate() {
+            Self::apply_sequence_lifecycle_references_through(
+                &sequence_reference_records,
+                &mut next_sequence_reference,
+                u32::try_from(ordinal).map_err(|_| {
+                    ExecuteError::Unsupported(
+                        "transaction operation ordinal exceeds typed catalog framing".to_string(),
+                    )
+                })?,
+                &mut working,
+            )
+            .map_err(ExecuteError::Engine)?;
             let TransactionOperation::Catalog(staged) = operation else {
                 if let TransactionOperation::TableReset(reset) = operation {
                     if let Some(identity) = &reset.sequence_reset_identity {
@@ -275,6 +338,13 @@ impl Engine {
                 )));
             }
         }
+        Self::apply_sequence_lifecycle_references_through(
+            &sequence_reference_records,
+            &mut next_sequence_reference,
+            u32::MAX,
+            &mut working,
+        )
+        .map_err(ExecuteError::Engine)?;
         if let Some(expected) = prior_overlay.as_deref() {
             let reconstructed =
                 Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);

@@ -821,11 +821,14 @@ impl Engine {
             operation_order,
             statement_digests,
             sequence_input_oids,
+            sequence_value_references,
             sequence_advances,
             table_identities,
             mutations,
             table_resets,
         } = record;
+
+        self.validate_sequence_value_references(&sequence_value_references)?;
 
         if catalog_commands.len() > 1 && (catalog_output.is_none() || operation_order.is_empty()) {
             return Err(EngineError::Durability(
@@ -1064,10 +1067,130 @@ impl Engine {
                 operation_order: &operation_order,
                 catalog_output: catalog_output.as_ref(),
                 sequence_input_oids: &sequence_input_oids,
+                sequence_value_references: &sequence_value_references,
             },
         )?;
         let next_catalog_snapshot =
             Self::catalog_snapshot_from_working(&next_catalog, entry.index.saturating_sub(1));
+        for reference in sequence_value_references
+            .iter()
+            .filter(|reference| reference.default_expression)
+        {
+            let table = next_catalog
+                .relational_catalog
+                .values()
+                .find(|table| table.oid == reference.table_oid)
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "sequence default reference {} targets unknown table identity {}",
+                        reference.transition_txn_id, reference.table_oid
+                    ))
+                })?;
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.id == reference.column_id)
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "sequence default reference {} targets unknown column identity {}",
+                        reference.transition_txn_id, reference.column_id
+                    ))
+                })?;
+            let Some(ColumnDefault::SequenceNextVal { sequence, .. }) = &column.default else {
+                return Err(EngineError::Durability(format!(
+                    "sequence default reference {} does not target a sequence-backed column",
+                    reference.transition_txn_id
+                )));
+            };
+            if next_catalog
+                .relational_sequences
+                .get(sequence)
+                .map(|sequence| sequence.oid)
+                != Some(reference.sequence_oid)
+                || i32::try_from(reference.returned_value).is_err()
+            {
+                return Err(EngineError::Durability(format!(
+                    "sequence default reference {} changed its stable dependency or materialized int4 value",
+                    reference.transition_txn_id
+                )));
+            }
+            let statement_table = operation_order
+                .get(reference.statement_ordinal as usize)
+                .and_then(|operation| match operation {
+                    BinaryTransactionOperationIdentity::Insert { table } => Some(table.as_str()),
+                    _ => None,
+                });
+            if (!operation_order.is_empty() && statement_table != Some(table.name.as_str()))
+                || (operation_order.is_empty()
+                    && !reference.final_value_overwritten
+                    && !mutations.iter().any(|mutation| {
+                        matches!(
+                            mutation,
+                            BinaryTransactionMutation::Insert {
+                                table: mutation_table,
+                                ..
+                            } if mutation_table == &table.name
+                        )
+                    }))
+            {
+                return Err(EngineError::Durability(format!(
+                    "sequence default reference {} is not bound to its INSERT target",
+                    reference.transition_txn_id
+                )));
+            }
+            let column_index = table
+                .columns
+                .iter()
+                .position(|candidate| candidate.id == column.id)
+                .expect("stable column was resolved above");
+            let expected = SqlValue::Int4(
+                i32::try_from(reference.returned_value).expect("int4 range was validated above"),
+            );
+            let mut matching_rows = mutations.iter().filter_map(|mutation| match mutation {
+                BinaryTransactionMutation::Insert {
+                    table: mutation_table,
+                    row_id,
+                    row_encoded,
+                } if mutation_table == &table.name && *row_id == reference.row_id => {
+                    Some(row_encoded)
+                }
+                BinaryTransactionMutation::Update {
+                    table: mutation_table,
+                    row_id,
+                    new_row_encoded,
+                    ..
+                } if mutation_table == &table.name && *row_id == reference.row_id => {
+                    Some(new_row_encoded)
+                }
+                BinaryTransactionMutation::Insert { .. }
+                | BinaryTransactionMutation::Update { .. }
+                | BinaryTransactionMutation::Delete { .. } => None,
+            });
+            let value_retained = match (matching_rows.next(), matching_rows.next()) {
+                (Some(encoded), None) => {
+                    let row = decode_relational_row(encoded, &table.columns).map_err(|error| {
+                        EngineError::Durability(format!(
+                            "sequence default reference {} final row is invalid: {error}",
+                            reference.transition_txn_id
+                        ))
+                    })?;
+                    row.get(column_index) == Some(&expected)
+                }
+                (None, None) => false,
+                (Some(_), Some(_)) | (None, Some(_)) => {
+                    return Err(EngineError::Durability(format!(
+                        "sequence default reference {} has ambiguous final entity identity",
+                        reference.transition_txn_id
+                    )));
+                }
+            };
+            if reference.final_value_overwritten == value_retained {
+                return Err(EngineError::Durability(format!(
+                    "sequence default reference {} does not match its final row disposition",
+                    reference.transition_txn_id
+                )));
+            }
+        }
         for (table_name, identity) in &created_table_identities {
             let table = next_catalog
                 .relational_catalog

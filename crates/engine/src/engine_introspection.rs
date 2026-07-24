@@ -166,12 +166,15 @@ impl Engine {
     /// sequence-default INSERTs and every catalog command bind following entries to `cat`.
     pub(crate) fn entry_mutates_working_catalog(entry: &LogEntry, cat: &DdlCatalogState) -> bool {
         if is_binary_wal_record(&entry.payload) {
-            return matches!(
-                decode_binary_record(&entry.payload),
-                Ok(crate::wal_binary::BinaryWalRecord::Transaction(record))
-                    if !record.catalog_commands.is_empty()
+            return match decode_binary_record(&entry.payload) {
+                Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => {
+                    !record.catalog_commands.is_empty()
                         || !record.sequence_advances.is_empty()
-            );
+                        || !record.sequence_advances_by_oid.is_empty()
+                }
+                Ok(crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_)) => true,
+                _ => false,
+            };
         }
         let Ok(Some(command)) = Self::decode_engine_command(&entry.payload) else {
             return true;

@@ -267,8 +267,10 @@ fn terminal_serialized_and_ddl_retries_resolve_before_fresh_table_access() {
     engine
         .submit_transaction(21, parsed("INSERT INTO retry_guard (value) VALUES (10)"))
         .unwrap();
+    // The omitted SERIAL default is a separately durable sequence transition and claims the
+    // allocator's next canonical identity (22) before the enclosing INSERT publishes.
     engine
-        .submit_transaction(22, parsed("CREATE TABLE retry_guard_peer (id INT)"))
+        .submit_transaction(23, parsed("CREATE TABLE retry_guard_peer (id INT)"))
         .unwrap();
     let wal_after_commits = engine.durable_wal_records().len();
     let reset = engine.table_access.lease();
@@ -280,7 +282,7 @@ fn terminal_serialized_and_ddl_retries_resolve_before_fresh_table_access() {
         .submit_transaction(21, parsed("INSERT INTO retry_guard (value) VALUES (10)"))
         .expect("a sequence-default INSERT retry has no new table access");
     engine
-        .submit_transaction(22, parsed("CREATE TABLE retry_guard_peer (id INT)"))
+        .submit_transaction(23, parsed("CREATE TABLE retry_guard_peer (id INT)"))
         .expect("a terminal DDL retry resolves before its conservative catalog guard");
     let mismatch = engine
         .submit_transaction(21, parsed("INSERT INTO retry_guard (value) VALUES (11)"))
@@ -381,6 +383,7 @@ fn raw_binary_rows_derive_atomic_dependency_guards() {
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::new(),
@@ -438,6 +441,7 @@ fn raw_binary_table_reset_is_rejected_before_wal_claim() {
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: vec![BinaryTransactionTableReset {
             ordinal: 0,
             table: table.name.clone(),
@@ -501,6 +505,7 @@ fn identity_bound_row_apply_rejects_oid_and_schema_aba_before_state_changes() {
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
+        sequence_value_references: Vec::new(),
         table_resets: Vec::new(),
         sequence_advances: BTreeMap::new(),
         table_identities: BTreeMap::from([(
