@@ -48,7 +48,8 @@ When choosing between implementation approaches:
 
 ## Model and Agent Routing
 
-- The project default and every unspecified subagent use GPT-5.6 Terra with `xhigh` reasoning.
+- The primary agent inherits the model and reasoning selection from the active Codex session or host. Every
+  unspecified subagent uses GPT-5.6 Terra with `xhigh` reasoning.
 - Use the `worker` agent for bounded implementation, fixes, tests, and verification. It uses Terra with `xhigh`
   reasoning and may inherit the parent write permissions.
 - Use the `architect` agent for ambiguous, cross-subsystem architecture, transaction, WAL/recovery, concurrency,
