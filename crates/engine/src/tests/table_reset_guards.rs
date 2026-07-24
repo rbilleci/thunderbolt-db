@@ -366,12 +366,15 @@ fn raw_binary_rows_derive_atomic_dependency_guards() {
     reset.acquire_exclusive([oid_b]).unwrap();
 
     let record = BinaryTransactionRecord {
+        catalog_epoch: BinaryTransactionCatalogEpoch::IndexIdentityV1,
         allocator_high_water: 3,
         catalog_commands: Vec::new(),
         created_table_identities: BTreeMap::new(),
+        created_table_index_identities: BTreeMap::new(),
         catalog_output: None,
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
+        index_lifecycle_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -417,12 +420,15 @@ fn raw_binary_table_reset_is_rejected_before_wal_claim() {
     )
     .unwrap();
     let record = BinaryTransactionRecord {
+        catalog_epoch: BinaryTransactionCatalogEpoch::IndexIdentityV1,
         allocator_high_water: 1,
         catalog_commands: Vec::new(),
         created_table_identities: BTreeMap::new(),
+        created_table_index_identities: BTreeMap::new(),
         catalog_output: None,
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
+        index_lifecycle_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),
@@ -474,12 +480,15 @@ fn identity_bound_row_apply_rejects_oid_and_schema_aba_before_state_changes() {
     let table = engine.read_state.latest_catalog().relational_catalog["identity_apply"].clone();
     let schema_digest = crate::engine_transaction_reset::table_schema_digest(&table).unwrap();
     let base = BinaryTransactionRecord {
+        catalog_epoch: BinaryTransactionCatalogEpoch::IndexIdentityV1,
         allocator_high_water: 2,
         catalog_commands: Vec::new(),
         created_table_identities: BTreeMap::new(),
+        created_table_index_identities: BTreeMap::new(),
         catalog_output: None,
         view_operations: Vec::new(),
         view_lifecycle_operations: Vec::new(),
+        index_lifecycle_operations: Vec::new(),
         operation_order: Vec::new(),
         statement_digests: Vec::new(),
         sequence_input_oids: BTreeMap::new(),

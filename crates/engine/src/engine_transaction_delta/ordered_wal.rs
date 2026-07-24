@@ -10,10 +10,20 @@ impl Engine {
         table_resets: &[StagedTableReset],
         transaction_catalog: &CatalogSnapshot,
     ) -> Result<(), ExecuteError> {
+        let index_catalog_record = catalog_commands.iter().any(|staged| {
+            staged.index_epoch_transition || command_requires_index_catalog_opcode(&staged.command)
+        });
+        record.catalog_epoch = if index_catalog_record {
+            BinaryTransactionCatalogEpoch::IndexIdentityV1
+        } else {
+            BinaryTransactionCatalogEpoch::Legacy
+        };
         record.catalog_commands.clear();
         record.created_table_identities.clear();
+        record.created_table_index_identities.clear();
         record.view_operations.clear();
         record.view_lifecycle_operations.clear();
+        record.index_lifecycle_operations.clear();
         let view_lifecycle_record = catalog_commands.iter().any(|staged| {
             matches!(
                 &staged.command,
@@ -45,7 +55,16 @@ impl Engine {
                             schema_digest: table_schema_digest(table)?,
                         },
                     );
-                    if staged.view_identity.is_some() {
+                    if index_catalog_record {
+                        record.created_table_index_identities.insert(
+                            create.table.clone(),
+                            Self::transaction_created_table_implicit_index_identities(
+                                transaction_catalog,
+                                &create.table,
+                            )?,
+                        );
+                    }
+                    if staged.view_identity.is_some() || staged.index_identity.is_some() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "transactional CREATE TABLE carries a view identity".to_string(),
                         )));
@@ -58,7 +77,13 @@ impl Engine {
                                 .to_string(),
                         ))
                     })?;
-                    if view_lifecycle_record {
+                    if staged.index_identity.is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional stored-view operation carries an index identity"
+                                .to_string(),
+                        )));
+                    }
+                    if index_catalog_record || view_lifecycle_record {
                         record.view_lifecycle_operations.push(identity);
                     } else {
                         let Command::CreateView(create) = command else {
@@ -75,6 +100,26 @@ impl Engine {
                                 },
                             )?);
                     }
+                }
+                command if command_is_index_lifecycle(command) => {
+                    if staged.view_identity.is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional index operation carries a view identity".to_string(),
+                        )));
+                    }
+                    let identity = staged.index_identity.clone().ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional index operation lost its typed identity closure"
+                                .to_string(),
+                        ))
+                    })?;
+                    if !valid_index_lifecycle_operation_identity(command, &identity) {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional index operation carries a noncanonical identity"
+                                .to_string(),
+                        )));
+                    }
+                    record.index_lifecycle_operations.push(identity);
                 }
                 _ => unreachable!("transactional catalog staging admitted an unsupported family"),
             }
@@ -142,6 +187,9 @@ impl Engine {
                             }
                         }
                         Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {}
+                        Command::CreateIndex(_)
+                        | Command::RenameIndex(_)
+                        | Command::DropIndex(_) => {}
                         _ => unreachable!(
                             "transactional catalog staging admitted an unsupported family"
                         ),

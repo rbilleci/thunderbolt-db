@@ -33,6 +33,7 @@ mod shard_pruning;
 pub(crate) use shard_pruning::shard_point_lookup_int4_eq;
 
 mod grouped_values;
+pub(crate) use grouped_values::composite_group_has_duplicate;
 use grouped_values::{composite_group_count_reps, narrow_ordered_value};
 mod grouped_count_distinct;
 use grouped_count_distinct::count_distinct_groups;

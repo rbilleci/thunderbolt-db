@@ -273,8 +273,8 @@ impl Engine {
                 delta: prepared,
             })));
         delta.write_set = final_transaction_write_set(&delta.operations);
-        delta.resident_shards = Arc::new(next_shards);
-        delta.streaming_cold_chunks = Arc::new(next_cold_chunks);
+        delta.publish_resident_shards(Arc::new(next_shards));
+        delta.publish_streaming_cold_chunks(Arc::new(next_cold_chunks));
         delta.generation = delta.generation.saturating_add(1);
         // The transaction statement lock excludes every other same-transaction reader or writer.
         // Release this statement's old-map pin before dropping superseded allocation charges, then
@@ -406,7 +406,13 @@ impl Engine {
         let transaction_catalog = snapshot.transaction_catalog();
         for delta in &deltas {
             for (name, expected) in &delta.catalog_dependencies {
-                if transaction_catalog.relational_catalog.get(name) != Some(expected) {
+                if transaction_catalog
+                    .relational_catalog
+                    .get(name)
+                    .is_none_or(|observed| {
+                        !same_transaction_row_catalog_dependency(expected, observed)
+                    })
+                {
                     return Err(ExecuteError::Serialization(format!(
                         "catalog dependency \"{name}\" changed after transaction statement snapshot {}",
                         delta.read_snapshot
@@ -501,14 +507,28 @@ impl Engine {
             &table_resets,
             &transaction_catalog,
         )?;
+        let cold_index_candidate_tables = record
+            .index_lifecycle_operations
+            .iter()
+            .flat_map(|operation| &operation.targets)
+            .filter_map(|target| target.owner_name.clone())
+            .collect::<BTreeSet<_>>();
         if !record.catalog_commands.is_empty() {
             self.validate_transaction_catalog_before_wal(
+                record.catalog_epoch,
                 &record.catalog_commands,
                 &record.view_operations,
                 &record.view_lifecycle_operations,
+                &record.index_lifecycle_operations,
                 &transaction_catalog,
             )?;
         }
+        self.validate_transaction_surviving_created_unique_indexes_device(
+            &snapshot,
+            &transaction_catalog,
+            &record.catalog_commands,
+            &record.index_lifecycle_operations,
+        )?;
         let reset_tables = table_resets
             .iter()
             .map(|reset| reset.table.clone())
@@ -550,9 +570,16 @@ impl Engine {
                     _ => None,
                 },
             ))
+            .chain(
+                record
+                    .index_lifecycle_operations
+                    .iter()
+                    .flat_map(|operation| &operation.targets)
+                    .filter_map(|target| target.owner_name.clone()),
+            )
             .chain(record.table_resets.iter().map(|reset| reset.table.clone()))
             .collect::<BTreeSet<_>>();
-        let named_index_publication = self
+        let mut named_index_publication = self
             .read_state
             .residency
             .begin_transaction_named_index_publication(named_index_tables);
@@ -561,14 +588,6 @@ impl Engine {
             Self::canonical_affected_rows(&payload).map_err(ExecuteError::Engine)?;
         let request_digest = request_digest_override
             .unwrap_or_else(|| gpu_db_wal::canonical_request_digest(&payload));
-
-        let wal_len_before = commit.wal.len();
-        let token = match commit.repl.propose(Arc::clone(&payload)) {
-            Ok(token) => token,
-            Err(err) => {
-                return Err(ExecuteError::Engine(err));
-            }
-        };
         let isolation = match snapshot.characteristics.isolation {
             TransactionIsolation::ReadUncommitted | TransactionIsolation::ReadCommitted => {
                 gpu_db_wal::CanonicalIsolation::ReadCommitted
@@ -578,6 +597,14 @@ impl Engine {
                 return Err(ExecuteError::Unsupported(
                     "SERIALIZABLE transactions are not implemented".to_string(),
                 ));
+            }
+        };
+
+        let wal_len_before = commit.wal.len();
+        let token = match commit.repl.propose(Arc::clone(&payload)) {
+            Ok(token) => token,
+            Err(err) => {
+                return Err(ExecuteError::Engine(err));
             }
         };
         let record = match Self::canonical_wal_record_with_isolation_and_request_digest(
@@ -636,6 +663,11 @@ impl Engine {
         if let Some(hook) = post_durable_hook {
             hook();
         }
+        // From canonical apply's first allocation through acknowledgement, an external
+        // pressure/retirement request must outlive the final index publication. Owner-local
+        // replacement purges use the explicit during-transaction bypass and are not replayed.
+        named_index_publication.enter_final_publication();
+        let publication_owner = TransactionNamedIndexPublicationOwnerGuard::enter();
         #[cfg(test)]
         let apply_result = self.with_transaction_commit_gpu_credit(&commit_gpu_credit, || {
             if self
@@ -653,6 +685,7 @@ impl Engine {
         let apply_result = self.with_transaction_commit_gpu_credit(&commit_gpu_credit, || {
             self.apply_and_publish_committed(&mut commit, txn_id, token.index)
         });
+        drop(publication_owner);
         self.release_transaction_commit_gpu_credit(&commit_gpu_credit);
         if let Err(err) = apply_result {
             self.wedge_commit_path();
@@ -660,6 +693,10 @@ impl Engine {
                 "explicit transaction {txn_id} is durable but could not be fully installed: {err}; engine restart recovery required"
             )));
         }
+        #[cfg(test)]
+        self.read_state
+            .residency
+            .run_transaction_named_index_post_apply_hook();
         named_index_publication.complete();
 
         commit
@@ -688,6 +725,20 @@ impl Engine {
         drop(active);
         self.gc_transaction_created_by_regions();
         self.metrics.inc_commit();
+        drop(commit);
+
+        // Cold candidate directories are GPU structures, but spilled payload staging may issue
+        // positional NVMe reads. Lifecycle publication therefore retires the obsolete directories
+        // while holding the sole commit/publication lock, then rebuilds the final catalog's unique
+        // key candidates only after releasing it. COMMIT does not return until this best-effort
+        // priming pass finishes; a concurrent DML that reaches an unprimed spilled generation
+        // during this narrow interval fails closed instead of consulting any host index.
+        let cold_chunks = self.read_streaming_cold_chunks();
+        for table_name in cold_index_candidate_tables {
+            if let Some(entry) = cold_chunks.get(&table_name) {
+                self.prime_chunk_key_candidates(&table_name, entry);
+            }
+        }
         Ok(successor_id)
     }
 
@@ -700,14 +751,18 @@ impl Engine {
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let private_shards = std::mem::replace(
-                &mut delta.resident_shards,
-                Arc::clone(&snapshot.resident_shards),
+            assert!(
+                Arc::ptr_eq(&delta.resident_shards, &delta.resident_shards_authority)
+                    && Arc::ptr_eq(
+                        &delta.streaming_cold_chunks,
+                        &delta.streaming_cold_chunks_authority
+                    ),
+                "pre-WAL validation must seal the private GPU generation before retirement"
             );
-            let private_cold_chunks = std::mem::replace(
-                &mut delta.streaming_cold_chunks,
-                Arc::clone(&snapshot.base_streaming_cold_chunks),
-            );
+            let private_shards = Arc::clone(&delta.resident_shards);
+            let private_cold_chunks = Arc::clone(&delta.streaming_cold_chunks);
+            delta.publish_resident_shards(Arc::clone(&snapshot.resident_shards));
+            delta.publish_streaming_cold_chunks(Arc::clone(&snapshot.base_streaming_cold_chunks));
             let charges = std::mem::take(&mut delta.private_gpu_bytes_by_gpu);
             let commit_charges = std::mem::take(&mut delta.commit_gpu_bytes_by_gpu);
             (private_shards, private_cold_chunks, charges, commit_charges)
@@ -871,12 +926,17 @@ impl Engine {
         }
         let mutations = Self::coalesce_transaction_mutations(mutations)?;
         Ok(BinaryTransactionRecord {
+            // Row-only opcodes predate the catalog epoch. Ordered WAL binding upgrades this to
+            // `IndexIdentityV1` iff the transaction actually carries catalog commands.
+            catalog_epoch: BinaryTransactionCatalogEpoch::Legacy,
             allocator_high_water,
             catalog_commands: Vec::new(),
             created_table_identities: BTreeMap::new(),
+            created_table_index_identities: BTreeMap::new(),
             catalog_output: None,
             view_operations: Vec::new(),
             view_lifecycle_operations: Vec::new(),
+            index_lifecycle_operations: Vec::new(),
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),
@@ -1902,4 +1962,21 @@ impl Engine {
         let hi = *words.get(1)? as u32 as u64;
         Some(lo | (hi << 32))
     }
+}
+
+/// Row mutation decoding, FK closure, and typed value semantics are independent of the table's
+/// index list. An ordered transaction may therefore stage DML on both sides of its own index
+/// lifecycle commands. Those commands carry their own exact table/index before/after identities;
+/// accepting only an index-list difference here avoids making that typed owner compete with a
+/// second, stale full-table equality check.
+fn same_transaction_row_catalog_dependency(
+    expected: &RelationalTable,
+    observed: &RelationalTable,
+) -> bool {
+    if expected == observed {
+        return true;
+    }
+    let mut normalized = expected.clone();
+    normalized.indexes = observed.indexes.clone();
+    &normalized == observed
 }

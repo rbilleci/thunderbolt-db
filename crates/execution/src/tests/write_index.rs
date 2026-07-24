@@ -78,7 +78,10 @@ fn index_insert_kernel_extends_like_a_rebuild() {
     let version_status = index
         .submit_i32_index_insert_status(table_mask, hash_shift, &[30], 10)
         .expect("version-twin insert");
-    assert!(!version_status.declined, "same-key version twin must not decline");
+    assert!(
+        !version_status.declined,
+        "same-key version twin must not decline"
+    );
     assert!(
         version_status.created_posting,
         "same-key insert reports its posting"
@@ -231,6 +234,80 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
     assert_eq!(after_gc.slot[0], 1);
 }
 
+/// PRODUCT-001 NULLS DISTINCT: validity descriptors are device predicates, not fingerprint
+/// material. Physical zero placeholders for NULL rows must never enter the resident directory,
+/// while equal present values still produce the strict unique verdict.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn resident_typed_index_validity_predicate_omits_null_keys() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let build = |keys: &[i32], validity: u32, duplicate_tolerant: bool| {
+        let mut payload = keys
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let validity_offset = payload.len() as u64;
+        payload.extend_from_slice(&validity.to_le_bytes());
+        let source = runtime
+            .retain_device_memory_copy(0, &payload)
+            .expect("resident keys and validity");
+        let index = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_zeroed(0, resident_index_allocated_bytes(15, 4).unwrap())
+                .expect("zeroed validity index"),
+        );
+        let status = source
+            .submit_resident_typed_index_build_status(
+                &index,
+                15,
+                28,
+                &[
+                    CudaCompoundFoldColumn::Fixed {
+                        byte_offset: 0,
+                        width_words: 1,
+                    },
+                    CudaCompoundFoldColumn::Validity {
+                        bitmap_byte_offset: validity_offset,
+                    },
+                ],
+                keys.len(),
+                None,
+                0,
+                duplicate_tolerant,
+            )
+            .expect("validity-filtered resident build");
+        (index, status)
+    };
+
+    let (distinct, status) = build(&[0, 0, 7, 8], 0b1100, false);
+    assert_eq!(
+        status,
+        CudaResidentIndexStatus {
+            declined: false,
+            created_posting: false,
+        }
+    );
+    let hits = distinct
+        .submit_multi_shard_i32_write_locate(
+            &[WriteLocateShard {
+                index: std::sync::Arc::clone(&distinct),
+                table_mask: 15,
+                hash_shift: 28,
+                row_count: 4,
+            }],
+            &[0, 7, 8],
+            2,
+        )
+        .expect("probe validity-filtered index");
+    assert_eq!(hits.count, vec![0, 1, 1]);
+
+    let (_, duplicate) = build(&[0, 0, 7, 7], 0b1100, false);
+    assert!(
+        duplicate.declined,
+        "equal present keys still violate UNIQUE"
+    );
+}
+
 /// PRODUCT-002 adversarial boundary: a hot non-unique key and its MVCC versions are posting-chain
 /// entries, not open-addressing collisions. Counts well beyond the 256 distinct-key probe bound
 /// must build, incrementally extend, and enumerate without decline.
@@ -266,14 +343,7 @@ fn resident_index_posting_chain_exceeds_256_versions() {
     );
     let rebuilt_status = source
         .submit_resident_typed_index_build_status(
-            &rebuilt,
-            table_mask,
-            hash_shift,
-            &columns,
-            ROWS,
-            None,
-            0,
-            true,
+            &rebuilt, table_mask, hash_shift, &columns, ROWS, None, 0, true,
         )
         .expect("duplicate-tolerant build");
     assert!(!rebuilt_status.declined);
@@ -311,14 +381,7 @@ fn resident_index_posting_chain_exceeds_256_versions() {
     for index in [&extended, &extended_twin] {
         assert!(!source
             .submit_resident_typed_index_build(
-                index,
-                table_mask,
-                hash_shift,
-                &columns,
-                PREFIX,
-                None,
-                0,
-                true,
+                index, table_mask, hash_shift, &columns, PREFIX, None, 0, true,
             )
             .expect("posting prefix build"));
     }
@@ -355,7 +418,7 @@ fn resident_index_posting_chain_exceeds_256_versions() {
                 }],
                 &[77],
                 ROWS as u32,
-        )
+            )
             .expect("enumerate extended posting chain");
         assert_eq!(extended_hits.count, vec![ROWS as u32]);
         let mut slots = extended_hits.slot;
@@ -384,10 +447,7 @@ fn prepared_plan_posting_retry_follows_future_head_for_old_snapshot() {
     let hash_shift = 30;
     let index = std::sync::Arc::new(
         runtime
-            .retain_device_memory_zeroed(
-                0,
-                resident_index_allocated_bytes(table_mask, 2).unwrap(),
-            )
+            .retain_device_memory_zeroed(0, resident_index_allocated_bytes(table_mask, 2).unwrap())
             .expect("two-row posting index"),
     );
     let columns = [CudaCompoundFoldColumn::Fixed {
@@ -396,14 +456,7 @@ fn prepared_plan_posting_retry_follows_future_head_for_old_snapshot() {
     }];
     let initial = resident
         .submit_resident_typed_index_build_status(
-            &index,
-            table_mask,
-            hash_shift,
-            &columns,
-            1,
-            None,
-            0,
-            true,
+            &index, table_mask, hash_shift, &columns, 1, None, 0, true,
         )
         .expect("build singleton prefix");
     assert_eq!(
@@ -432,13 +485,7 @@ fn prepared_plan_posting_retry_follows_future_head_for_old_snapshot() {
 
     let appended = resident
         .submit_resident_typed_index_insert_status(
-            &index,
-            table_mask,
-            hash_shift,
-            &columns,
-            1,
-            1,
-            true,
+            &index, table_mask, hash_shift, &columns, 1, 1, true,
         )
         .expect("publish future same-key posting");
     assert!(appended.created_posting);

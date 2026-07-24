@@ -63,6 +63,10 @@ mod streaming_reduction_fold;
 mod streaming_select_route;
 mod streaming_transaction_cow;
 
+pub(crate) use streaming_cold_lifecycle::{
+    ColdIndexValidationWindow, COLD_INDEX_MAX_HOST_STAGING_BYTES,
+};
+
 /// The DEVICE payload bytes one row contributes to a transient chunk. Unlike the logical
 /// `relational_resident_value_bytes` (which is 0 for `NULL` and 0 for empty text), this counts the FIXED
 /// typed slot the columnar device layout allocates for EVERY row — a `NULL` still occupies its 4/8/16-byte
@@ -344,7 +348,93 @@ enum ColdPayload {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdPayloadRangeError {
+    OutOfBoundsOrIo,
+    Allocation,
+}
+
 impl ColdPayload {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ram(bytes) => bytes.len(),
+            Self::Spilled { len, .. } => *len,
+        }
+    }
+
+    fn read_array<const N: usize>(&self, byte_offset: usize) -> Result<[u8; N], ()> {
+        let mut bytes = [0u8; N];
+        self.read_exact_range(byte_offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Read one validated range into caller-owned bounded storage. This is the syscall-efficient
+    /// primitive for spill-backed structural scans: callers choose their fixed block size instead
+    /// of issuing one positional read per scalar.
+    fn read_exact_range(&self, byte_offset: usize, destination: &mut [u8]) -> Result<(), ()> {
+        let end = byte_offset.checked_add(destination.len()).ok_or(())?;
+        if end > self.len() {
+            return Err(());
+        }
+        match self {
+            Self::Ram(source) => destination.copy_from_slice(&source[byte_offset..end]),
+            Self::Spilled { file, offset, .. } => {
+                use std::os::unix::fs::FileExt;
+                let file_offset = offset
+                    .checked_add(u64::try_from(byte_offset).map_err(|_| ())?)
+                    .ok_or(())?;
+                file.read_exact_at(destination, file_offset)
+                    .map_err(|_| ())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_spilled(&self) -> bool {
+        matches!(self, Self::Spilled { .. })
+    }
+
+    /// Append exactly one validated byte range. Spill-backed callers never materialize the
+    /// original chunk: positional I/O writes straight into the caller's fallibly reserved output.
+    fn append_range(
+        &self,
+        byte_offset: usize,
+        len: usize,
+        destination: &mut Vec<u8>,
+    ) -> Result<(), ColdPayloadRangeError> {
+        let end = byte_offset
+            .checked_add(len)
+            .ok_or(ColdPayloadRangeError::OutOfBoundsOrIo)?;
+        if end > self.len() {
+            return Err(ColdPayloadRangeError::OutOfBoundsOrIo);
+        }
+        destination
+            .try_reserve_exact(len)
+            .map_err(|_| ColdPayloadRangeError::Allocation)?;
+        match self {
+            Self::Ram(source) => destination.extend_from_slice(&source[byte_offset..end]),
+            Self::Spilled { file, offset, .. } => {
+                use std::os::unix::fs::FileExt;
+                let destination_start = destination.len();
+                destination.resize(destination_start + len, 0);
+                let file_offset = offset
+                    .checked_add(
+                        u64::try_from(byte_offset)
+                            .map_err(|_| ColdPayloadRangeError::OutOfBoundsOrIo)?,
+                    )
+                    .ok_or(ColdPayloadRangeError::OutOfBoundsOrIo)?;
+                if file
+                    .read_exact_at(&mut destination[destination_start..], file_offset)
+                    .is_err()
+                {
+                    destination.truncate(destination_start);
+                    return Err(ColdPayloadRangeError::OutOfBoundsOrIo);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Materialize the payload bytes for a replay upload. A spill-read failure is an `Err` the
     /// caller turns into a MISS/defer — never a wrong answer.
     fn read(&self) -> Result<std::borrow::Cow<'_, [u8]>, ()> {

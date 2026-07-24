@@ -363,8 +363,8 @@ impl Engine {
             &delta.private_gpu_bytes_by_gpu,
             &next_private_gpu_bytes,
         )?;
-        delta.resident_shards = Arc::new(shards);
-        delta.streaming_cold_chunks = Arc::new(cold_chunks);
+        delta.publish_resident_shards(Arc::new(shards));
+        delta.publish_streaming_cold_chunks(Arc::new(cold_chunks));
         delta.generation = delta.generation.saturating_add(1);
         gpu_reservation
             .replace_charges(&mut delta.private_gpu_bytes_by_gpu, next_private_gpu_bytes);
@@ -1136,8 +1136,8 @@ impl Engine {
                 },
             )));
         delta.write_set = final_transaction_write_set(&delta.operations);
-        delta.resident_shards = Arc::new(next_shards);
-        delta.streaming_cold_chunks = Arc::new(next_cold_chunks);
+        delta.publish_resident_shards(Arc::new(next_shards));
+        delta.publish_streaming_cold_chunks(Arc::new(next_cold_chunks));
         delta.generation = delta.generation.saturating_add(1);
         drop(current_shards);
         drop(current_cold_chunks);

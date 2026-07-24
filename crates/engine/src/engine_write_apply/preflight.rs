@@ -5,9 +5,44 @@ use gpu_db_storage::Visibility as StorageVisibility;
 use gpu_db_types::{EngineError, TxnId};
 
 use crate::{
-    add_column_default_supported, coerce_column_default, sequence_defaults, DmlReadSnapshot,
-    Engine, PUBLIC_SCHEMA_NAME,
+    add_column_default_supported, coerce_column_default,
+    engine_ddl_table::{create_table_implicit_index_names, duplicate_index_key_column},
+    sequence_defaults, CatalogSnapshot, DmlReadSnapshot, Engine, PgClassRelationKind,
+    MAX_CATALOG_OID, PUBLIC_SCHEMA_NAME,
 };
+
+fn preflight_relational_oid_capacity(
+    catalog: &CatalogSnapshot,
+    allocations: usize,
+    first_exhausted_message: &'static str,
+) -> Result<(), EngineError> {
+    debug_assert!(allocations > 0);
+    let first_oid =
+        if !catalog.index_oid_epoch_current && catalog.legacy_recovery_index_oids_assigned {
+            catalog
+                .relational_next_oid
+                .max(catalog.legacy_recovery_next_index_oid)
+        } else {
+            catalog.relational_next_oid
+        };
+    if first_oid > MAX_CATALOG_OID {
+        return Err(EngineError::ApplyFailed(
+            first_exhausted_message.to_string(),
+        ));
+    }
+    let last_offset = u32::try_from(allocations - 1).map_err(|_| {
+        EngineError::ApplyFailed("relational catalog OID allocation exhausted".to_string())
+    })?;
+    if first_oid
+        .checked_add(last_offset)
+        .is_none_or(|last_oid| last_oid > MAX_CATALOG_OID)
+    {
+        return Err(EngineError::ApplyFailed(
+            "relational catalog OID allocation exhausted".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 impl Engine {
     pub(crate) fn preflight_unique_index_constraints(
@@ -183,6 +218,30 @@ impl Engine {
                 }
             }
             Command::CreateTable(create) => {
+                if cat.pg_class_relation_kind(&create.table)?.is_some()
+                    || cat.relational_domains.contains_key(&create.table)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        create.table
+                    )));
+                }
+                if let Some(column) = create
+                    .primary_key
+                    .iter()
+                    .map(|primary| &primary.columns)
+                    .chain(
+                        create
+                            .unique_constraints
+                            .iter()
+                            .map(|unique| &unique.columns),
+                    )
+                    .find_map(|columns| duplicate_index_key_column(columns))
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{column}\" appears twice in index definition"
+                    )));
+                }
                 // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE over i32-SECTION columns
                 // (Int4/Date/Int2) is device-native (folded to a fingerprint surrogate — see
                 // `compound_key_fingerprint`); a compound key touching any WIDER type stays REJECTED in
@@ -246,21 +305,51 @@ impl Engine {
                     }
                     self.preflight_column_default_target(default)?;
                 }
+                let implicit_index_names = create_table_implicit_index_names(create);
+                let mut new_relation_names = BTreeSet::from([create.table.clone()]);
+                for name in implicit_index_names.iter().chain(&implicit_sequences) {
+                    if !new_relation_names.insert(name.clone())
+                        || cat.pg_class_relation_kind(name)?.is_some()
+                    {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{name}\" already exists"
+                        )));
+                    }
+                }
+                preflight_relational_oid_capacity(
+                    cat.as_ref(),
+                    1 + implicit_sequences.len()
+                        + usize::from(create.primary_key.is_some())
+                        + create.unique_constraints.len(),
+                    "relational table OID allocation exhausted",
+                )?;
             }
-            Command::CreateIndex(create) if create.unique => {
-                if cat
-                    .relational_catalog
-                    .values()
-                    .any(|table| table.indexes.iter().any(|index| index.name == create.name))
-                    || cat.relational_catalog.contains_key(&create.name)
-                    || cat.relational_views.contains_key(&create.name)
-                    || cat.relational_materialized_views.contains_key(&create.name)
-                    || cat.relational_sequences.contains_key(&create.name)
-                {
+            Command::CreateIndex(create) => {
+                if let Some(column) = duplicate_index_key_column(&create.columns) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{column}\" appears twice in index definition"
+                    )));
+                }
+                if cat.pg_class_relation_kind(&create.name)?.is_some() {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         create.name
                     )));
+                }
+                match cat.pg_class_relation_kind(&create.table)? {
+                    Some(PgClassRelationKind::Table) => {}
+                    Some(_) => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a table",
+                            create.table
+                        )))
+                    }
+                    None => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            create.table
+                        )))
+                    }
                 }
                 let table = cat.relational_catalog.get(&create.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -285,7 +374,8 @@ impl Engine {
                             })
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
-                if column_idxs.len() > 1
+                if create.unique
+                    && column_idxs.len() > 1
                     && !column_idxs.iter().all(|&i| {
                         crate::engine_residency::compound_key_type_supported(table.columns[i].ty)
                     })
@@ -296,15 +386,27 @@ impl Engine {
                             .to_string(),
                     ));
                 }
-                let rows = self.visible_relational_rows(
-                    table,
-                    StorageVisibility {
-                        read_txn_id: self.committed_seq() as TxnId,
-                    },
+                if create.unique {
+                    let rows = self.visible_relational_rows(
+                        table,
+                        StorageVisibility {
+                            read_txn_id: self.committed_seq() as TxnId,
+                        },
+                    )?;
+                    Self::validate_unique_values_tuple(&rows, &column_idxs, &create.name)?;
+                }
+                preflight_relational_oid_capacity(
+                    cat.as_ref(),
+                    1,
+                    "relational catalog OID allocation exhausted",
                 )?;
-                Self::validate_unique_values_tuple(&rows, &column_idxs, &create.name)?;
             }
             Command::AddPrimaryKey(add) => {
+                if let Some(column) = duplicate_index_key_column(&add.columns) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{column}\" appears twice in index definition"
+                    )));
+                }
                 if cat
                     .relational_catalog
                     .values()
@@ -318,6 +420,21 @@ impl Engine {
                         "relation \"{}\" already exists",
                         add.name
                     )));
+                }
+                match cat.pg_class_relation_kind(&add.table)? {
+                    Some(PgClassRelationKind::Table) => {}
+                    Some(_) => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a table",
+                            add.table
+                        )))
+                    }
+                    None => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            add.table
+                        )))
+                    }
                 }
                 let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
@@ -376,8 +493,18 @@ impl Engine {
                     )));
                 }
                 Self::validate_unique_values_tuple(&rows, &column_idxs, &add.name)?;
+                preflight_relational_oid_capacity(
+                    cat.as_ref(),
+                    1,
+                    "relational catalog OID allocation exhausted",
+                )?;
             }
             Command::AddUniqueConstraint(add) => {
+                if let Some(column) = duplicate_index_key_column(&add.columns) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{column}\" appears twice in index definition"
+                    )));
+                }
                 if cat
                     .relational_catalog
                     .values()
@@ -391,6 +518,21 @@ impl Engine {
                         "relation \"{}\" already exists",
                         add.name
                     )));
+                }
+                match cat.pg_class_relation_kind(&add.table)? {
+                    Some(PgClassRelationKind::Table) => {}
+                    Some(_) => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a table",
+                            add.table
+                        )))
+                    }
+                    None => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            add.table
+                        )))
+                    }
                 }
                 let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
@@ -430,6 +572,11 @@ impl Engine {
                     },
                 )?;
                 Self::validate_unique_values_tuple(&rows, &column_idxs, &add.name)?;
+                preflight_relational_oid_capacity(
+                    cat.as_ref(),
+                    1,
+                    "relational catalog OID allocation exhausted",
+                )?;
             }
             Command::AddCheckConstraint(add) => self.preflight_add_check_constraint(add)?,
             Command::AddForeignKey(add) => self.preflight_add_foreign_key(add, txn_id)?,
@@ -474,33 +621,23 @@ impl Engine {
                 self.preflight_column_default_target(default)?;
             }
             Command::RenameTable(rename) => {
-                if cat.relational_views.contains_key(&rename.old_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.old_name)
-                    || cat.relational_sequences.contains_key(&rename.old_name)
-                {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "relation \"{}\" is not a table",
-                        rename.old_name
-                    )));
-                }
-                if !cat.relational_catalog.contains_key(&rename.old_name) {
-                    if rename.if_exists {
-                        return Ok(());
+                match cat.pg_class_relation_kind(&rename.old_name)? {
+                    Some(PgClassRelationKind::Table) => {}
+                    Some(_) => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a table",
+                            rename.old_name
+                        )))
                     }
-                    return Err(EngineError::ApplyFailed(format!(
-                        "relation \"{}\" does not exist",
-                        rename.old_name
-                    )));
+                    None if rename.if_exists => return Ok(()),
+                    None => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            rename.old_name
+                        )))
+                    }
                 }
-                if cat.relational_catalog.contains_key(&rename.new_name)
-                    || cat.relational_views.contains_key(&rename.new_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.new_name)
-                    || cat.relational_sequences.contains_key(&rename.new_name)
-                {
+                if cat.pg_class_relation_kind(&rename.new_name)?.is_some() {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
@@ -620,84 +757,109 @@ impl Engine {
                 }
             }
             Command::RenameIndex(rename) => {
-                if cat.relational_catalog.values().any(|table| {
+                match cat.pg_class_relation_kind(&rename.old_name)? {
+                    Some(PgClassRelationKind::Index) => {}
+                    Some(_) => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not an index",
+                            rename.old_name
+                        )))
+                    }
+                    None => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "index \"{}\" does not exist",
+                            rename.old_name
+                        )))
+                    }
+                }
+                if cat.pg_class_relation_kind(&rename.new_name)?.is_some() {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+                let Some((owner, index)) = cat.relational_catalog.values().find_map(|table| {
                     table
                         .indexes
                         .iter()
-                        .any(|index| index.name == rename.new_name)
-                }) || cat.relational_catalog.contains_key(&rename.new_name)
-                    || cat.relational_views.contains_key(&rename.new_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.new_name)
-                    || cat.relational_sequences.contains_key(&rename.new_name)
+                        .find(|index| index.name == rename.old_name)
+                        .map(|index| (table, index))
+                }) else {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "index \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                };
+                if (index.primary_key || index.unique_constraint)
+                    && (owner
+                        .check_constraints
+                        .iter()
+                        .any(|constraint| constraint.name == rename.new_name)
+                        || owner
+                            .foreign_keys
+                            .iter()
+                            .any(|constraint| constraint.name == rename.new_name))
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
                     )));
                 }
-                let Some(index) = cat
-                    .relational_catalog
-                    .values()
-                    .flat_map(|table| table.indexes.iter())
-                    .find(|index| index.name == rename.old_name)
-                else {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "index \"{}\" does not exist",
-                        rename.old_name
-                    )));
-                };
-                if index.primary_key || index.unique_constraint {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "cannot rename constraint-backed index \"{}\" with ALTER INDEX",
-                        rename.old_name
-                    )));
-                }
             }
             Command::CreateView(create) => {
-                if cat.relational_catalog.contains_key(&create.name)
-                    || cat.relational_materialized_views.contains_key(&create.name)
-                    || cat.relational_sequences.contains_key(&create.name)
-                    || (!create.or_replace && cat.relational_views.contains_key(&create.name))
+                let target_kind = cat.pg_class_relation_kind(&create.name)?;
+                if target_kind.is_some()
+                    && !(create.or_replace && target_kind == Some(PgClassRelationKind::View))
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         create.name
                     )));
                 }
-                if cat
-                    .relational_materialized_views
-                    .contains_key(&create.query.table)
-                {
-                    return Err(EngineError::ApplyFailed(
-                        "views over materialized views are unsupported".to_string(),
-                    ));
-                }
                 if create.or_replace && self.relational_view_has_dependents(&create.name) {
                     return Err(EngineError::ApplyFailed(
                         "cannot replace view because another view depends on it".to_string(),
                     ));
                 }
-                if cat.relational_views.contains_key(&create.query.table) {
-                    if self.relational_view_depends_on(&create.query.table, &create.name) {
-                        return Err(EngineError::ApplyFailed(
-                            "view dependency cycle is unsupported".to_string(),
-                        ));
+                match cat.pg_class_relation_kind(&create.query.table)? {
+                    Some(PgClassRelationKind::Table) => {}
+                    Some(PgClassRelationKind::View) => {
+                        if self.relational_view_depends_on(&create.query.table, &create.name) {
+                            return Err(EngineError::ApplyFailed(
+                                "view dependency cycle is unsupported".to_string(),
+                            ));
+                        }
                     }
-                } else if !cat.relational_catalog.contains_key(&create.query.table) {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "relation \"{}\" does not exist",
-                        create.query.table
-                    )));
+                    Some(PgClassRelationKind::MaterializedView) => {
+                        return Err(EngineError::ApplyFailed(
+                            "views over materialized views are unsupported".to_string(),
+                        ))
+                    }
+                    Some(_) => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" cannot be a stored-view dependency",
+                            create.query.table
+                        )))
+                    }
+                    None => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            create.query.table
+                        )))
+                    }
+                }
+                if target_kind.is_none() {
+                    preflight_relational_oid_capacity(
+                        cat.as_ref(),
+                        1,
+                        "relational view OID allocation exhausted",
+                    )?;
                 }
             }
             Command::RenameView(rename) => {
-                if cat.relational_catalog.contains_key(&rename.old_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.old_name)
-                    || cat.relational_sequences.contains_key(&rename.old_name)
+                if cat
+                    .pg_class_relation_kind(&rename.old_name)?
+                    .is_some_and(|kind| kind != PgClassRelationKind::View)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a view",
@@ -710,13 +872,7 @@ impl Engine {
                         rename.old_name
                     )));
                 }
-                if cat.relational_catalog.contains_key(&rename.new_name)
-                    || cat.relational_views.contains_key(&rename.new_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.new_name)
-                    || cat.relational_sequences.contains_key(&rename.new_name)
-                {
+                if cat.pg_class_relation_kind(&rename.new_name)?.is_some() {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
@@ -730,15 +886,20 @@ impl Engine {
                 }
             }
             Command::CreateMaterializedView(create) => {
-                self.preflight_create_materialized_view(create)?
+                self.preflight_create_materialized_view(create)?;
+                preflight_relational_oid_capacity(
+                    cat.as_ref(),
+                    1,
+                    "relational materialized view OID allocation exhausted",
+                )?;
             }
             Command::RefreshMaterializedView(refresh) => {
                 self.preflight_refresh_materialized_view(refresh)?
             }
             Command::RenameMaterializedView(rename) => {
-                if cat.relational_catalog.contains_key(&rename.old_name)
-                    || cat.relational_views.contains_key(&rename.old_name)
-                    || cat.relational_sequences.contains_key(&rename.old_name)
+                if cat
+                    .pg_class_relation_kind(&rename.old_name)?
+                    .is_some_and(|kind| kind != PgClassRelationKind::MaterializedView)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a materialized view",
@@ -754,13 +915,7 @@ impl Engine {
                         rename.old_name
                     )));
                 }
-                if cat.relational_catalog.contains_key(&rename.new_name)
-                    || cat.relational_views.contains_key(&rename.new_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.new_name)
-                    || cat.relational_sequences.contains_key(&rename.new_name)
-                {
+                if cat.pg_class_relation_kind(&rename.new_name)?.is_some() {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
@@ -808,16 +963,21 @@ impl Engine {
                     }
                 }
             }
-            Command::CreateSequence(create) => self.preflight_create_sequence(create)?,
+            Command::CreateSequence(create) => {
+                self.preflight_create_sequence(create)?;
+                preflight_relational_oid_capacity(
+                    cat.as_ref(),
+                    1,
+                    "relational sequence OID allocation exhausted",
+                )?;
+            }
             Command::CreateDomain(create) => self.preflight_create_domain(create)?,
             Command::SequenceNextVal(nextval) => self.preflight_sequence_target(&nextval.name)?,
             Command::SequenceSetVal(setval) => self.preflight_sequence_target(&setval.name)?,
             Command::RenameSequence(rename) => {
-                if cat.relational_catalog.contains_key(&rename.old_name)
-                    || cat.relational_views.contains_key(&rename.old_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.old_name)
+                if cat
+                    .pg_class_relation_kind(&rename.old_name)?
+                    .is_some_and(|kind| kind != PgClassRelationKind::Sequence)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a sequence",
@@ -830,13 +990,7 @@ impl Engine {
                         rename.old_name
                     )));
                 }
-                if cat.relational_catalog.contains_key(&rename.new_name)
-                    || cat.relational_views.contains_key(&rename.new_name)
-                    || cat
-                        .relational_materialized_views
-                        .contains_key(&rename.new_name)
-                    || cat.relational_sequences.contains_key(&rename.new_name)
-                {
+                if cat.pg_class_relation_kind(&rename.new_name)?.is_some() {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name

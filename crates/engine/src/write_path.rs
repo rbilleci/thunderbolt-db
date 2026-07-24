@@ -651,10 +651,21 @@ impl Drop for TransactionRetainedGpuCharge {
 pub(crate) struct TransactionDeltaState {
     pub(crate) generation: u64,
     pub(crate) resident_shards: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    /// Exact immutable generation witness for `resident_shards`. Every legitimate private-DML,
+    /// reset, or READ COMMITTED rebase publication installs the same newly-created Arc in both
+    /// fields. Consumers that can make a pre-WAL semantic claim require pointer identity, so a
+    /// torn map replacement, omitted shard, or substituted allocation cannot become an alternate
+    /// transaction authority merely by carrying locally self-consistent descriptors.
+    pub(crate) resident_shards_authority: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
     /// Transaction-private cold authority. Chunk-class INSERTs append device-format tail chunks
     /// here with a birth boundary visible to this transaction, never to the globally published
     /// cold map. SELECT and later DML therefore consume the same immutable private generation.
     pub(crate) streaming_cold_chunks:
+        Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>>,
+    /// Immutable-generation witness for the complete private cold map, parallel to
+    /// `resident_shards_authority`. Chunk-private DML publishes both Arcs together; UNIQUE
+    /// validation refuses any map whose chunk/entity set was replaced outside that publisher.
+    pub(crate) streaming_cold_chunks_authority:
         Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>>,
     pub(crate) operations: Vec<TransactionOperation>,
     pub(crate) write_set: WriteSet,
@@ -681,7 +692,12 @@ pub(crate) struct StagedCatalogCommand {
     pub(crate) ordinal: u32,
     pub(crate) statement_digest: gpu_db_wal::CanonicalDigest,
     pub(crate) command: Command,
+    /// This operation performed the one-way recovery-assigned-index -> shared pg_class allocator
+    /// transition. It selects the additive index-aware WAL epoch even when the statement itself is
+    /// index-neutral, so recovery cannot reassign old index OIDs around its postimage.
+    pub(crate) index_epoch_transition: bool,
     pub(crate) view_identity: Option<BinaryTransactionViewLifecycleOperationIdentity>,
+    pub(crate) index_identity: Option<BinaryTransactionIndexLifecycleOperationIdentity>,
 }
 
 impl Drop for TransactionSnapshot {
@@ -724,6 +740,43 @@ impl TransactionSnapshot {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .resident_shards,
         )
+    }
+
+    pub(crate) fn transaction_proven_resident_shards(
+        &self,
+    ) -> Option<Arc<BTreeMap<String, Vec<RelationalResidentShard>>>> {
+        let delta = self
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::ptr_eq(&delta.resident_shards, &delta.resident_shards_authority)
+            .then(|| Arc::clone(&delta.resident_shards))
+    }
+
+    pub(crate) fn transaction_proven_cold_chunks(
+        &self,
+    ) -> Option<Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>>> {
+        let delta = self
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::ptr_eq(
+            &delta.streaming_cold_chunks,
+            &delta.streaming_cold_chunks_authority,
+        )
+        .then(|| Arc::clone(&delta.streaming_cold_chunks))
+    }
+
+    pub(crate) fn transaction_private_authorities_proven(&self) -> bool {
+        let delta = self
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::ptr_eq(&delta.resident_shards, &delta.resident_shards_authority)
+            && Arc::ptr_eq(
+                &delta.streaming_cold_chunks,
+                &delta.streaming_cold_chunks_authority,
+            )
     }
 
     pub(crate) fn transaction_cold_chunks(
@@ -798,6 +851,24 @@ impl TransactionSnapshot {
             .catalog_overlay
             .clone()
             .unwrap_or_else(|| Arc::clone(&self.catalog))
+    }
+}
+
+impl TransactionDeltaState {
+    pub(crate) fn publish_resident_shards(
+        &mut self,
+        shards: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    ) {
+        self.resident_shards_authority = Arc::clone(&shards);
+        self.resident_shards = shards;
+    }
+
+    pub(crate) fn publish_streaming_cold_chunks(
+        &mut self,
+        chunks: Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>>,
+    ) {
+        self.streaming_cold_chunks_authority = Arc::clone(&chunks);
+        self.streaming_cold_chunks = chunks;
     }
 }
 

@@ -1,12 +1,36 @@
-//! Table / index / constraint DDL + row validation (P0 §9.6 decomposition,
-//! behavior-preserving): a focused `impl Engine` block for CREATE TABLE, indexes
-//! and constraints (primary key, unique, check, foreign key, drop/rename
-//! constraint), the constraint-validation helpers over resident rows
-//! (validate_unique_values/indexes, validate_check_constraints, validate_foreign_keys
-//! and their preflights), DROP/RENAME INDEX, RENAME/DROP/TRUNCATE TABLE, and the
-//! DROP appliers for view/materialized-view/sequence.
+//! Table/index/constraint DDL and row validation (P0 §9.6 decomposition): CREATE
+//! TABLE, indexes and constraints; resident-row constraint validation and
+//! preflights; DROP/RENAME INDEX; RENAME/DROP/TRUNCATE TABLE; and the stored-view
+//! DROP applier.
 
 use super::*;
+
+pub(crate) fn duplicate_index_key_column(columns: &[String]) -> Option<&str> {
+    let mut seen = BTreeSet::new();
+    columns
+        .iter()
+        .map(String::as_str)
+        .find(|column| !seen.insert(*column))
+}
+
+pub(crate) fn create_table_implicit_index_names(create: &CreateTable) -> Vec<String> {
+    create
+        .primary_key
+        .iter()
+        .map(|primary| {
+            primary
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}_pkey", create.table))
+        })
+        .chain(create.unique_constraints.iter().map(|unique| {
+            unique
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}_{}_key", create.table, unique.column))
+        }))
+        .collect()
+}
 
 impl Engine {
     pub(crate) fn apply_create_table(
@@ -14,20 +38,45 @@ impl Engine {
         cat: &mut DdlCatalogState,
         create: CreateTable,
     ) -> Result<(), EngineError> {
+        self.apply_create_table_with_index_epoch(cat, create, None)
+    }
+
+    pub(crate) fn apply_create_table_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateTable,
+        record_seed: Index,
+        command_ordinal: u32,
+    ) -> Result<(), EngineError> {
+        self.apply_create_table_with_index_epoch(cat, create, Some((record_seed, command_ordinal)))
+    }
+
+    fn apply_create_table_with_index_epoch(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateTable,
+        legacy_replay: Option<(Index, u32)>,
+    ) -> Result<(), EngineError> {
+        let implicit_index_names = create_table_implicit_index_names(&create);
         if !cat.relational_public_schema_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "schema \"{}\" does not exist",
                 PUBLIC_SCHEMA_NAME
             )));
         }
-        if cat.relational_catalog.contains_key(&create.table)
-            || cat.relational_views.contains_key(&create.table)
-            || cat
-                .relational_materialized_views
-                .contains_key(&create.table)
-            || cat.relational_sequences.contains_key(&create.table)
-            || cat.relational_domains.contains_key(&create.table)
-        {
+        let table_name_exists = if legacy_replay.is_some() {
+            cat.relational_catalog.contains_key(&create.table)
+                || cat.relational_views.contains_key(&create.table)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&create.table)
+                || cat.relational_sequences.contains_key(&create.table)
+                || cat.relational_domains.contains_key(&create.table)
+        } else {
+            cat.pg_class_relation_kind(&create.table)?.is_some()
+                || cat.relational_domains.contains_key(&create.table)
+        };
+        if table_name_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.table
@@ -42,10 +91,24 @@ impl Engine {
                 )));
             }
         }
-        let oid = cat.relational_next_oid;
-        let next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
-            EngineError::ApplyFailed("relational table OID allocation exhausted".to_string())
-        })?;
+        if legacy_replay.is_none() {
+            if let Some(column) = create
+                .primary_key
+                .iter()
+                .map(|primary| &primary.columns)
+                .chain(
+                    create
+                        .unique_constraints
+                        .iter()
+                        .map(|unique| &unique.columns),
+                )
+                .find_map(|columns| duplicate_index_key_column(columns))
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "column \"{column}\" appears twice in index definition"
+                )));
+            }
+        }
         let implicit_sequences = create
             .columns
             .iter()
@@ -57,8 +120,42 @@ impl Engine {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        if legacy_replay.is_none() {
+            let mut new_relation_names = BTreeSet::from([create.table.clone()]);
+            for name in implicit_index_names.iter().chain(&implicit_sequences) {
+                if !new_relation_names.insert(name.clone())
+                    || cat.pg_class_relation_kind(name)?.is_some()
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{name}\" already exists"
+                    )));
+                }
+            }
+        }
+        let mut oid_state = cat.clone();
+        let uses_shared_oid_allocator =
+            legacy_replay.is_none() || oid_state.index_oid_epoch_current;
+        let oid = if !uses_shared_oid_allocator {
+            let oid = oid_state.relational_next_oid;
+            if oid > MAX_CATALOG_OID || oid_state.relational_class_oid_in_use(oid) {
+                return Err(EngineError::ApplyFailed(
+                    "relational table OID allocation exhausted".to_string(),
+                ));
+            }
+            oid_state.relational_next_oid = oid.checked_add(1).ok_or_else(|| {
+                EngineError::ApplyFailed("relational table OID allocation exhausted".to_string())
+            })?;
+            oid
+        } else {
+            oid_state.finalize_legacy_index_oid_migration()?;
+            oid_state.allocate_relational_class_oid("relational table OID allocation exhausted")?
+        };
         for sequence in &implicit_sequences {
-            self.preflight_implicit_sequence_name(sequence)?;
+            if legacy_replay.is_some() {
+                self.preflight_implicit_sequence_name_legacy_replay(sequence)?;
+            } else {
+                self.preflight_implicit_sequence_name(sequence)?;
+            }
         }
         let mut columns = Vec::with_capacity(create.columns.len());
         let mut next_column_id = cat.relational_next_column_id;
@@ -68,7 +165,11 @@ impl Engine {
                 // Coerce a cross-type default literal to the column type (parity with INSERT),
                 // e.g. `bal NUMERIC DEFAULT 0` -> Numeric at the column scale.
                 let default = coerce_column_default(default, column.ty, &column.name)?;
-                self.preflight_column_default_target(&default)?;
+                if legacy_replay.is_some() {
+                    self.preflight_column_default_target_legacy_replay(&default)?;
+                } else {
+                    self.preflight_column_default_target(&default)?;
+                }
                 column.default = Some(default);
             }
             let attnum = i16::try_from(idx + 1).map_err(|_| {
@@ -86,7 +187,9 @@ impl Engine {
         let unique_constraints = create.unique_constraints.clone();
         let check_constraints = create.check_constraints.clone();
         let name = create.table;
+        let mut implicit_index_names = implicit_index_names.into_iter();
         let mut indexes = Vec::new();
+        let mut pending_legacy_oids = BTreeSet::new();
         let mut checks = Vec::new();
         // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE over SUPPORTED key-column types (i32-section
         // Int4/Date/Int2 + i64-section Int8/Timestamp) is device-native (each column's i32-word
@@ -115,8 +218,17 @@ impl Engine {
             ));
         }
         if let Some(primary_key) = primary_key {
-            let constraint_name = primary_key.name.unwrap_or_else(|| format!("{}_pkey", name));
+            let constraint_name = implicit_index_names
+                .next()
+                .expect("primary-key name was precomputed");
+            let index_oid = match legacy_replay {
+                Some(_) => oid_state.migrated_legacy_index_oid(&pending_legacy_oids)?,
+                None => oid_state
+                    .allocate_relational_class_oid("relational catalog OID allocation exhausted")?,
+            };
+            pending_legacy_oids.insert(index_oid);
             indexes.push(RelationalIndex {
+                oid: index_oid,
                 name: constraint_name,
                 table: name.clone(),
                 column: primary_key.column,
@@ -127,16 +239,23 @@ impl Engine {
             });
         }
         for unique in unique_constraints {
-            let constraint_name = unique
-                .name
-                .unwrap_or_else(|| format!("{}_{}_key", name, unique.column));
+            let constraint_name = implicit_index_names
+                .next()
+                .expect("unique-constraint name was precomputed");
             if indexes.iter().any(|index| index.name == constraint_name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" already exists",
                     constraint_name
                 )));
             }
+            let index_oid = match legacy_replay {
+                Some(_) => oid_state.migrated_legacy_index_oid(&pending_legacy_oids)?,
+                None => oid_state
+                    .allocate_relational_class_oid("relational catalog OID allocation exhausted")?,
+            };
+            pending_legacy_oids.insert(index_oid);
             indexes.push(RelationalIndex {
+                oid: index_oid,
                 name: constraint_name,
                 table: name.clone(),
                 column: unique.column,
@@ -182,12 +301,46 @@ impl Engine {
                 value: check.filter.value,
             });
         }
-        cat.relational_next_oid = next_oid;
         for sequence in &implicit_sequences {
-            self.create_implicit_sequence(cat, sequence)?;
+            if oid_state.relational_catalog.contains_key(sequence)
+                || oid_state.relational_views.contains_key(sequence)
+                || oid_state
+                    .relational_materialized_views
+                    .contains_key(sequence)
+                || oid_state.relational_sequences.contains_key(sequence)
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{sequence}\" already exists"
+                )));
+            }
+            let sequence_oid = if legacy_replay.is_some() {
+                let oid = oid_state.relational_next_oid;
+                oid_state.relational_next_oid = oid_state
+                    .relational_next_oid
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(
+                            "relational sequence OID allocation exhausted".to_string(),
+                        )
+                    })?;
+                oid
+            } else {
+                oid_state
+                    .allocate_relational_class_oid("relational sequence OID allocation exhausted")?
+            };
+            oid_state.relational_sequences.insert(
+                sequence.clone(),
+                RelationalSequence {
+                    schema: PUBLIC_SCHEMA_NAME.to_string(),
+                    name: sequence.clone(),
+                    oid: sequence_oid,
+                    last_value: 1,
+                    is_called: false,
+                    acl: BTreeMap::new(),
+                },
+            );
         }
-        let next_oid = cat.relational_next_oid.max(next_oid);
-        cat.relational_catalog.insert(
+        oid_state.relational_catalog.insert(
             name.clone(),
             RelationalTable {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -200,8 +353,8 @@ impl Engine {
                 acl: cat.relational_default_table_acl.clone(),
             },
         );
-        cat.relational_next_oid = next_oid;
-        cat.relational_next_column_id = next_column_id;
+        oid_state.relational_next_column_id = next_column_id;
+        *cat = oid_state;
         Ok(())
     }
 
@@ -241,7 +394,30 @@ impl Engine {
             columns: add.columns,
             unique: true,
         };
-        self.apply_create_index_with_constraint_flags(cat, create, true, false)
+        self.apply_create_index_with_constraint_flags(cat, create, true, false, true, None)
+    }
+
+    pub(crate) fn apply_add_primary_key_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        add: gpu_db_sql::AddPrimaryKey,
+        record_seed: Index,
+    ) -> Result<(), EngineError> {
+        let create = CreateIndex {
+            name: add.name,
+            table: add.table,
+            column: add.column,
+            columns: add.columns,
+            unique: true,
+        };
+        self.apply_create_index_with_constraint_flags(
+            cat,
+            create,
+            true,
+            false,
+            true,
+            Some((record_seed, 0)),
+        )
     }
 
     pub(crate) fn apply_create_index(
@@ -249,7 +425,36 @@ impl Engine {
         cat: &mut DdlCatalogState,
         create: CreateIndex,
     ) -> Result<(), EngineError> {
-        self.apply_create_index_with_constraint_flags(cat, create, false, false)
+        self.apply_create_index_with_constraint_flags(cat, create, false, false, true, None)
+    }
+
+    /// Catalog-only half used by the ordered transaction owner. Structural validation and stable
+    /// identity allocation happen here; the transaction path separately obtains the unique verdict
+    /// from its final private GPU snapshot before WAL.
+    pub(crate) fn apply_create_index_transactional(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateIndex,
+    ) -> Result<(), EngineError> {
+        self.apply_create_index_with_constraint_flags(cat, create, false, false, false, None)
+    }
+
+    pub(crate) fn apply_create_index_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateIndex,
+        record_seed: Index,
+        command_ordinal: u32,
+        validate_existing_rows: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_create_index_with_constraint_flags(
+            cat,
+            create,
+            false,
+            false,
+            validate_existing_rows,
+            Some((record_seed, command_ordinal)),
+        )
     }
 
     fn apply_create_index_with_constraint_flags(
@@ -258,7 +463,16 @@ impl Engine {
         create: CreateIndex,
         primary_key: bool,
         unique_constraint: bool,
+        validate_existing_rows: bool,
+        legacy_replay: Option<(Index, u32)>,
     ) -> Result<(), EngineError> {
+        if legacy_replay.is_none() {
+            if let Some(column) = duplicate_index_key_column(&create.columns) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "column \"{column}\" appears twice in index definition"
+                )));
+            }
+        }
         if create.columns.is_empty()
             || create.columns.len() > 32
             || create.columns.first() != Some(&create.column)
@@ -267,19 +481,39 @@ impl Engine {
                 "indexes require between 1 and 32 ordered key columns".to_string(),
             ));
         }
-        if cat
-            .relational_catalog
-            .values()
-            .any(|table| table.indexes.iter().any(|index| index.name == create.name))
-            || cat.relational_catalog.contains_key(&create.name)
-            || cat.relational_views.contains_key(&create.name)
-            || cat.relational_materialized_views.contains_key(&create.name)
-            || cat.relational_sequences.contains_key(&create.name)
-        {
+        let destination_exists = if legacy_replay.is_some() {
+            cat.relational_catalog
+                .values()
+                .any(|table| table.indexes.iter().any(|index| index.name == create.name))
+                || cat.relational_catalog.contains_key(&create.name)
+                || cat.relational_views.contains_key(&create.name)
+                || cat.relational_materialized_views.contains_key(&create.name)
+                || cat.relational_sequences.contains_key(&create.name)
+        } else {
+            cat.pg_class_relation_kind(&create.name)?.is_some()
+        };
+        if destination_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
+        }
+        if legacy_replay.is_none() {
+            match cat.pg_class_relation_kind(&create.table)? {
+                Some(PgClassRelationKind::Table) => {}
+                Some(_) => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a table",
+                        create.table
+                    )))
+                }
+                None => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        create.table
+                    )))
+                }
+            }
         }
         let table = cat
             .relational_catalog
@@ -321,7 +555,7 @@ impl Engine {
                 ));
             }
         }
-        if create.unique {
+        if create.unique && validate_existing_rows {
             let visibility = StorageVisibility {
                 read_txn_id: self.committed_seq() as TxnId,
             };
@@ -341,11 +575,19 @@ impl Engine {
             }
             Self::validate_unique_values_tuple(&rows, &column_idxs, &create.name)?;
         }
+        let index_oid = match legacy_replay {
+            Some(_) => cat.migrated_legacy_index_oid(&BTreeSet::new())?,
+            None => {
+                cat.finalize_legacy_index_oid_migration()?;
+                cat.allocate_relational_class_oid("relational catalog OID allocation exhausted")?
+            }
+        };
         cat.relational_catalog
             .get_mut(&create.table)
             .expect("table existence validated")
             .indexes
             .push(RelationalIndex {
+                oid: index_oid,
                 name: create.name,
                 table: create.table,
                 column: create.column,
@@ -369,7 +611,30 @@ impl Engine {
             columns: add.columns,
             unique: true,
         };
-        self.apply_create_index_with_constraint_flags(cat, create, false, true)
+        self.apply_create_index_with_constraint_flags(cat, create, false, true, true, None)
+    }
+
+    pub(crate) fn apply_add_unique_constraint_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        add: AddUniqueConstraint,
+        record_seed: Index,
+    ) -> Result<(), EngineError> {
+        let create = CreateIndex {
+            name: add.name,
+            table: add.table,
+            column: add.column,
+            columns: add.columns,
+            unique: true,
+        };
+        self.apply_create_index_with_constraint_flags(
+            cat,
+            create,
+            false,
+            true,
+            true,
+            Some((record_seed, 0)),
+        )
     }
 
     pub(crate) fn apply_add_check_constraint(
@@ -906,7 +1171,46 @@ impl Engine {
         cat: &mut DdlCatalogState,
         drop: DropIndex,
     ) -> Result<(), EngineError> {
-        if !drop.if_exists {
+        self.apply_drop_index_with_dependency_policy(cat, drop, true)
+    }
+
+    pub(crate) fn apply_drop_index_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropIndex,
+    ) -> Result<(), EngineError> {
+        self.apply_drop_index_with_dependency_policy(cat, drop, false)
+    }
+
+    fn apply_drop_index_with_dependency_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropIndex,
+        enforce_constraint_dependency: bool,
+    ) -> Result<(), EngineError> {
+        if drop.names.is_empty() {
+            return Err(EngineError::ApplyFailed(
+                "DROP INDEX requires at least one target".to_string(),
+            ));
+        }
+        if enforce_constraint_dependency {
+            let mut unique_names = BTreeSet::new();
+            if let Some(duplicate) = drop
+                .names
+                .iter()
+                .find(|name| !unique_names.insert((*name).clone()))
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "index \"{}\" specified more than once",
+                    duplicate
+                )));
+            }
+        }
+        if enforce_constraint_dependency {
+            Self::validate_current_drop_index_targets(&drop, |name| {
+                cat.pg_class_relation_kind(name)
+            })?;
+        } else if !drop.if_exists {
             for name in &drop.names {
                 if !cat
                     .relational_catalog
@@ -921,9 +1225,26 @@ impl Engine {
             }
         }
         let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
-        let mut dropped_constraints = Vec::new();
-        for table in cat.relational_catalog.values_mut() {
-            dropped_constraints.extend(
+        if enforce_constraint_dependency {
+            if let Some(index) = cat
+                .relational_catalog
+                .values()
+                .flat_map(|table| table.indexes.iter())
+                .find(|index| {
+                    drop_names.contains(&index.name)
+                        && (index.primary_key || index.unique_constraint)
+                })
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "cannot drop constraint-backed index \"{}\" with DROP INDEX",
+                    index.name
+                )));
+            }
+        }
+        let dropped_constraint_targets = cat
+            .relational_catalog
+            .values()
+            .flat_map(|table| {
                 table
                     .indexes
                     .iter()
@@ -931,8 +1252,13 @@ impl Engine {
                         drop_names.contains(&index.name)
                             && (index.primary_key || index.unique_constraint)
                     })
-                    .map(|index| (index.table.clone(), index.name.clone())),
-            );
+                    .map(|index| RelationalCommentTarget::Constraint {
+                        table: table.name.clone(),
+                        constraint: index.name.clone(),
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        for table in cat.relational_catalog.values_mut() {
             table
                 .indexes
                 .retain(|index| !drop_names.contains(&index.name));
@@ -943,40 +1269,69 @@ impl Engine {
                     index: name.clone(),
                 });
         }
-        for (table, constraint) in dropped_constraints {
-            cat.relational_comments
-                .remove(&RelationalCommentTarget::Constraint { table, constraint });
+        for target in dropped_constraint_targets {
+            cat.relational_comments.remove(&target);
+        }
+        Ok(())
+    }
+
+    fn validate_current_drop_index_targets(
+        drop: &DropIndex,
+        mut relation_kind: impl FnMut(&str) -> Result<Option<PgClassRelationKind>, EngineError>,
+    ) -> Result<(), EngineError> {
+        for name in &drop.names {
+            match relation_kind(name)? {
+                Some(PgClassRelationKind::Index) => continue,
+                Some(_) => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not an index",
+                        name
+                    )))
+                }
+                None if !drop.if_exists => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "index \"{}\" does not exist",
+                        name
+                    )))
+                }
+                None => {}
+            }
         }
         Ok(())
     }
 
     pub(crate) fn preflight_drop_index(&self, drop: &DropIndex) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
-        if drop.if_exists {
-            return Ok(());
-        }
-        for name in &drop.names {
-            if !cat
-                .relational_catalog
-                .values()
-                .any(|table| table.indexes.iter().any(|index| index.name == *name))
-            {
-                return Err(EngineError::ApplyFailed(format!(
-                    "index \"{}\" does not exist",
-                    name
-                )));
-            }
-        }
-        let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
-        if cat.relational_catalog.values().any(|table| {
-            table.foreign_keys.iter().any(|constraint| {
-                drop_names.contains(&table.name)
-                    || drop_names.contains(&constraint.referenced_table)
-            })
-        }) {
+        if drop.names.is_empty() {
             return Err(EngineError::ApplyFailed(
-                "cannot drop table because a foreign key constraint depends on it".to_string(),
+                "DROP INDEX requires at least one target".to_string(),
             ));
+        }
+        let mut unique_names = BTreeSet::new();
+        if let Some(duplicate) = drop
+            .names
+            .iter()
+            .find(|name| !unique_names.insert((*name).clone()))
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "index \"{}\" specified more than once",
+                duplicate
+            )));
+        }
+        Self::validate_current_drop_index_targets(drop, |name| cat.pg_class_relation_kind(name))?;
+        let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
+        if let Some(index) = cat
+            .relational_catalog
+            .values()
+            .flat_map(|table| table.indexes.iter())
+            .find(|index| {
+                drop_names.contains(&index.name) && (index.primary_key || index.unique_constraint)
+            })
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "cannot drop constraint-backed index \"{}\" with DROP INDEX",
+                index.name
+            )));
         }
         Ok(())
     }
@@ -986,11 +1341,74 @@ impl Engine {
         cat: &mut DdlCatalogState,
         rename: RenameIndex,
     ) -> Result<(), EngineError> {
-        if cat.relational_catalog.values().any(|table| {
-            table
-                .indexes
+        self.apply_rename_index_with_dependency_policy(cat, rename, true)
+    }
+
+    pub(crate) fn apply_rename_index_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameIndex,
+    ) -> Result<(), EngineError> {
+        self.apply_rename_index_with_dependency_policy(cat, rename, false)
+    }
+
+    fn apply_rename_index_with_dependency_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameIndex,
+        current_semantics: bool,
+    ) -> Result<(), EngineError> {
+        if current_semantics {
+            match cat.pg_class_relation_kind(&rename.old_name)? {
+                Some(PgClassRelationKind::Index) => {}
+                Some(_) => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not an index",
+                        rename.old_name
+                    )))
+                }
+                None => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "index \"{}\" does not exist",
+                        rename.old_name
+                    )))
+                }
+            }
+        }
+        let destination_exists = if current_semantics {
+            cat.pg_class_relation_kind(&rename.new_name)?.is_some()
+        } else {
+            cat.relational_catalog.values().any(|table| {
+                table
+                    .indexes
+                    .iter()
+                    .any(|index| index.name == rename.new_name)
+            })
+        };
+        if destination_exists {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let constraint_backed_owner = cat.relational_catalog.values().find(|table| {
+            table.indexes.iter().any(|index| {
+                index.name == rename.old_name && (index.primary_key || index.unique_constraint)
+            })
+        });
+        // Index relation names occupy the schema-wide relation namespace (checked above and by
+        // command preflight), while CHECK/FK constraint names are local to their owner relation.
+        // Renaming a PK/UNIQUE backing index therefore conflicts only with constraints on that
+        // index's table; an unrelated table may legitimately use the same constraint name.
+        if constraint_backed_owner.is_some_and(|owner| {
+            owner
+                .check_constraints
                 .iter()
-                .any(|index| index.name == rename.new_name)
+                .any(|constraint| constraint.name == rename.new_name)
+                || owner
+                    .foreign_keys
+                    .iter()
+                    .any(|constraint| constraint.name == rename.new_name)
         }) {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -1006,23 +1424,34 @@ impl Engine {
             else {
                 continue;
             };
-            if index.primary_key || index.unique_constraint {
-                return Err(EngineError::ApplyFailed(format!(
-                    "cannot rename constraint-backed index \"{}\" with ALTER INDEX",
-                    rename.old_name
-                )));
-            }
+            let constraint_backed = index.primary_key || index.unique_constraint;
+            let table_name = index.table.clone();
             index.name = rename.new_name.clone();
             let old_target = RelationalCommentTarget::Index {
-                index: rename.old_name,
+                index: rename.old_name.clone(),
             };
             if let Some(comment) = cat.relational_comments.remove(&old_target) {
                 cat.relational_comments.insert(
                     RelationalCommentTarget::Index {
-                        index: rename.new_name,
+                        index: rename.new_name.clone(),
                     },
                     comment,
                 );
+            }
+            if constraint_backed {
+                let old_target = RelationalCommentTarget::Constraint {
+                    table: table_name.clone(),
+                    constraint: rename.old_name,
+                };
+                if let Some(comment) = cat.relational_comments.remove(&old_target) {
+                    cat.relational_comments.insert(
+                        RelationalCommentTarget::Constraint {
+                            table: table_name,
+                            constraint: rename.new_name,
+                        },
+                        comment,
+                    );
+                }
             }
             return Ok(());
         }
@@ -1038,34 +1467,49 @@ impl Engine {
         cat: &mut DdlCatalogState,
         rename: RenameTable,
         txn_id: TxnId,
+        current_index_semantics: bool,
     ) -> Result<(), EngineError> {
-        if cat.relational_views.contains_key(&rename.old_name)
+        let source_kind = if current_index_semantics {
+            cat.pg_class_relation_kind(&rename.old_name)?
+        } else if cat.relational_views.contains_key(&rename.old_name)
             || cat
                 .relational_materialized_views
                 .contains_key(&rename.old_name)
             || cat.relational_sequences.contains_key(&rename.old_name)
         {
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" is not a table",
-                rename.old_name
-            )));
-        }
-        if !cat.relational_catalog.contains_key(&rename.old_name) {
-            if rename.if_exists {
-                return Ok(());
+            Some(PgClassRelationKind::View)
+        } else if cat.relational_catalog.contains_key(&rename.old_name) {
+            Some(PgClassRelationKind::Table)
+        } else {
+            None
+        };
+        match source_kind {
+            Some(PgClassRelationKind::Table) => {}
+            Some(_) => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a table",
+                    rename.old_name
+                )))
             }
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" does not exist",
-                rename.old_name
-            )));
+            None if rename.if_exists => return Ok(()),
+            None => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" does not exist",
+                    rename.old_name
+                )))
+            }
         }
-        if cat.relational_catalog.contains_key(&rename.new_name)
-            || cat.relational_views.contains_key(&rename.new_name)
-            || cat
-                .relational_materialized_views
-                .contains_key(&rename.new_name)
-            || cat.relational_sequences.contains_key(&rename.new_name)
-        {
+        let destination_exists = if current_index_semantics {
+            cat.pg_class_relation_kind(&rename.new_name)?.is_some()
+        } else {
+            cat.relational_catalog.contains_key(&rename.new_name)
+                || cat.relational_views.contains_key(&rename.new_name)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&rename.new_name)
+                || cat.relational_sequences.contains_key(&rename.new_name)
+        };
+        if destination_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
@@ -1492,49 +1936,34 @@ impl Engine {
         cat: &mut DdlCatalogState,
         drop: DropView,
     ) -> Result<(), EngineError> {
-        self.preflight_drop_view(&drop)?;
+        self.apply_drop_view_with_replay_policy(cat, drop, false)
+    }
+
+    pub(crate) fn apply_drop_view_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropView,
+    ) -> Result<(), EngineError> {
+        self.apply_drop_view_with_replay_policy(cat, drop, true)
+    }
+
+    fn apply_drop_view_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        if legacy_replay {
+            self.preflight_drop_view_legacy_replay(&drop)?;
+        } else {
+            self.preflight_drop_view(&drop)?;
+        }
         for name in &drop.names {
             if cat.relational_views.remove(name).is_none() {
                 continue;
             }
             cat.relational_comments
                 .remove(&RelationalCommentTarget::View { view: name.clone() });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply_drop_materialized_view(
-        &self,
-        cat: &mut DdlCatalogState,
-        drop: DropMaterializedView,
-    ) -> Result<(), EngineError> {
-        self.preflight_drop_materialized_view(&drop)?;
-        for name in &drop.names {
-            if cat.relational_materialized_views.remove(name).is_none() {
-                continue;
-            }
-            cat.relational_comments
-                .remove(&RelationalCommentTarget::MaterializedView {
-                    materialized_view: name.clone(),
-                });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply_drop_sequence(
-        &self,
-        cat: &mut DdlCatalogState,
-        drop: DropSequence,
-    ) -> Result<(), EngineError> {
-        self.preflight_drop_sequence(&drop)?;
-        for name in &drop.names {
-            if cat.relational_sequences.remove(name).is_none() {
-                continue;
-            }
-            cat.relational_comments
-                .remove(&RelationalCommentTarget::Sequence {
-                    sequence: name.clone(),
-                });
         }
         Ok(())
     }

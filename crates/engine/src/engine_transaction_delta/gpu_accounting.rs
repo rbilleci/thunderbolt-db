@@ -222,13 +222,16 @@ impl Engine {
         Ok(())
     }
 
-    /// Restore any previously enrolled existing-table indexes before WAL. The lifecycle guard
-    /// acquired by the caller defers destructive purges until canonical apply completes, so this
-    /// proof cannot disappear in the durability interval. Empty generations need no restoration:
-    /// rollover publication will build the first non-empty shard from its exact reserved geometry.
+    /// Restore any previously enrolled existing-table indexes before WAL. Use the public snapshot
+    /// manifest rather than transaction-private lifecycle changes: preflight may build missing
+    /// device allocations, but must not publish an uncommitted rename/create/drop manifest.
+    /// The lifecycle guard acquired by the caller defers destructive purges until canonical apply
+    /// completes, so this proof cannot disappear in the durability interval. Empty generations
+    /// need no restoration: rollover publication will build the first non-empty shard from its
+    /// exact reserved geometry.
     fn restore_transaction_named_indexes_before_wal(
         &self,
-        transaction_catalog: &CatalogSnapshot,
+        snapshot: &TransactionSnapshot,
         record: &BinaryTransactionRecord,
     ) -> Result<(), ExecuteError> {
         let created_tables = record
@@ -256,13 +259,14 @@ impl Engine {
             .collect::<BTreeSet<_>>();
         let current_shards = self.read_residency_shards();
         for table_name in appended_tables {
-            let table = transaction_catalog
+            let table = snapshot
+                .catalog
                 .relational_catalog
                 .get(table_name)
                 .ok_or_else(|| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "transaction index restoration targets unknown relation \"{table_name}\""
-                    )))
+                    ExecuteError::Serialization(format!(
+                        "transaction index restoration lost public relation \"{table_name}\""
+                    ))
                 })?;
             if self.table_chunk_authoritative(table_name).is_some()
                 || !self.relational_named_index_publication_required(table)
@@ -312,8 +316,14 @@ impl Engine {
             .iter()
             .map(|reset| reset.table.clone())
             .collect::<BTreeSet<_>>();
+        let index_tables = record
+            .index_lifecycle_operations
+            .iter()
+            .flat_map(|operation| &operation.targets)
+            .filter_map(|target| target.owner_name.clone())
+            .collect::<BTreeSet<_>>();
         let mut by_table = BTreeMap::<String, TransactionPublicationImages>::new();
-        for table in &reset_tables {
+        for table in created_tables.iter().chain(&reset_tables) {
             by_table.entry(table.clone()).or_default();
         }
         for mutation in &record.mutations {
@@ -379,6 +389,7 @@ impl Engine {
 
         let private_shards = snapshot.transaction_shards();
         let current_shards = self.read_residency_shards();
+        let cold_chunks = self.read_streaming_cold_chunks();
         let mut bytes_by_gpu = BTreeMap::<u16, u64>::new();
         let mut add = |gpu_id: u16, bytes: u64| -> Result<(), ExecuteError> {
             let slot = bytes_by_gpu.entry(gpu_id).or_default();
@@ -490,9 +501,126 @@ impl Engine {
                 }
             }
             if !images.new_rows.is_empty() {
-                let (gpu_id, bytes) =
-                    self.transaction_resident_append_allocation_bytes(table, &images.new_rows)?;
+                let final_named_indexes_required =
+                    index_tables.contains(&table_name) && !table.indexes.is_empty();
+                let (gpu_id, bytes) = self.transaction_resident_append_allocation_bytes(
+                    table,
+                    &images.new_rows,
+                    final_named_indexes_required,
+                )?;
                 add(gpu_id, bytes)?;
+            }
+        }
+        let gc_boundary = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .oldest()
+            .unwrap_or_else(|| self.committed_seq());
+        let index_cache = self
+            .read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for table_name in &index_tables {
+            if created_tables.contains(table_name)
+                || reset_tables.contains(table_name)
+                || self.table_chunk_authoritative(table_name).is_some()
+            {
+                continue;
+            }
+            let after = transaction_catalog
+                .relational_catalog
+                .get(table_name)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "transaction index owner \"{table_name}\" left its final catalog"
+                    )))
+                })?;
+            let without_resident_shards = current_shards
+                .get(table_name)
+                .is_none_or(|shards| shards.is_empty());
+            let device_authoritative = snapshot.device_authoritative_tables.contains(table_name);
+            let exact_zero_row_generation = without_resident_shards
+                && self.zero_row_resident_generation_boundary(after).is_some();
+            if device_authoritative && without_resident_shards && !exact_zero_row_generation {
+                return Err(ExecuteError::Serialization(format!(
+                    "transaction index owner \"{table_name}\" lost its device-authoritative resident generation before WAL"
+                )));
+            }
+            let cold_without_resident_shards = !device_authoritative
+                && cold_chunks.contains_key(table_name)
+                && without_resident_shards;
+            if cold_without_resident_shards {
+                continue;
+            }
+            if exact_zero_row_generation {
+                // The allocation-backed count-header generation is already the complete empty
+                // relation. Index lifecycle publication changes enrollment metadata only; there
+                // are no shard keys or device allocations to reserve.
+                continue;
+            }
+            let shards = current_shards.get(table_name).ok_or_else(|| {
+                ExecuteError::Serialization(format!(
+                    "transaction index owner \"{table_name}\" lost resident shards before publication"
+                ))
+            })?;
+            let key_ids = after
+                .indexes
+                .iter()
+                .enumerate()
+                .map(|(ordinal, index)| {
+                    crate::engine_residency::index_probe_key_id(after, index, ordinal).ok_or_else(
+                        || {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "index \"{}\" has no exact resident device key id",
+                                index.name
+                            )))
+                        },
+                    )
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            for shard in shards.iter().filter(|shard| shard.row_count != 0) {
+                let resident_ptr = shard
+                    .device_memory
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ExecuteError::Serialization(format!(
+                            "transaction index owner \"{table_name}\" lost shard {} device memory before publication",
+                            shard.shard_id
+                        ))
+                    })?
+                    .device_ptr();
+                // Charge the exact final physical key set absent from this immutable shard, not
+                // merely the catalog before→after delta. A catalog index may never have been
+                // enrolled, and rename preserves an OID/key while still requiring its first
+                // allocation. Pointer, extent, and GC checks mirror the publication cache hit.
+                let missing = key_ids
+                    .iter()
+                    .filter(|&&key_id| {
+                        !index_cache
+                            .get(&(table_name.clone(), shard.shard_id, key_id))
+                            .is_some_and(|entry| {
+                                entry.resident_device_ptr == resident_ptr
+                                    && entry.row_count >= shard.row_count
+                                    && entry.gc_boundary <= gc_boundary
+                                    && entry.device_index.is_some()
+                            })
+                    })
+                    .count() as u64;
+                let bytes =
+                    crate::engine_residency::estimated_named_index_key_bytes_for_shard(
+                        shard.row_count,
+                        shard.capacity,
+                    )
+                    .and_then(|bytes| bytes.checked_mul(missing))
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "relation \"{table_name}\" has unsupported transactional index allocation geometry"
+                        )))
+                    })?;
+                add(shard.gpu_id, bytes)?;
             }
         }
         Ok(bytes_by_gpu)
@@ -504,7 +632,13 @@ impl Engine {
         transaction_catalog: &CatalogSnapshot,
         record: &BinaryTransactionRecord,
     ) -> Result<(), ExecuteError> {
-        self.restore_transaction_named_indexes_before_wal(transaction_catalog, record)?;
+        if !snapshot.transaction_private_authorities_proven() {
+            return Err(ExecuteError::Serialization(
+                "transaction private GPU authority changed outside its generation publisher"
+                    .to_string(),
+            ));
+        }
+        self.restore_transaction_named_indexes_before_wal(snapshot, record)?;
         let required = self.transaction_canonical_publication_gpu_bytes(
             snapshot,
             transaction_catalog,

@@ -147,8 +147,10 @@ use resident_aggregate::{
     launch_cuda_resident_i64_sum_at_indices_i128,
 };
 mod resident_group;
-pub use resident_group::GroupByI32Row;
-use resident_group::{launch_cuda_group_by_i32_count_sum, launch_cuda_group_by_kernel_timed};
+pub use resident_group::{group_by_duplicate_scratch_bytes, GroupByI32Row};
+use resident_group::{
+    launch_cuda_group_by_i32_count_sum, launch_cuda_group_by_kernel_timed, GroupByLaunchResult,
+};
 mod group_input;
 use group_input::{validate_group_input, ValidatedGroupInput};
 pub use group_input::{
@@ -299,13 +301,29 @@ fn launch_validated_group_by(
     two_level: bool,
     agg_mask: u32,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
+    launch_validated_group_result(resident, input, indices, two_level, agg_mask, true)
+        .map(|result| result.rows)
+}
+
+fn launch_validated_group_result(
+    resident: &CudaResidentDeviceMemory,
+    input: CudaGroupByInput<'_>,
+    indices: &[u32],
+    two_level: bool,
+    agg_mask: u32,
+    emit_rows: bool,
+) -> Result<GroupByLaunchResult, CudaRuntimeProbeError> {
     if indices.is_empty() {
-        return Ok(Vec::new());
+        return Ok(GroupByLaunchResult {
+            rows: Vec::new(),
+            has_duplicate: false,
+        });
     }
     let ValidatedGroupInput {
         key_byte_offset,
         value_byte_offset,
         value_is_int8,
+        value_is_unused,
         key_is_int8,
         value_is_numeric,
         value_is_uuid,
@@ -326,13 +344,12 @@ fn launch_validated_group_by(
         value_null_off,
         key_null_off,
     } = validate_group_input(resident, input, indices)?;
-    if matches!(input.value, CudaGroupValueSource::Unused { .. })
-        && (agg_mask & !grouped_agg_mask::COUNT) != 0
-    {
+    if value_is_unused && agg_mask != grouped_agg_mask::COUNT {
         return Err(CudaRuntimeProbeError::InvalidInputLength(agg_mask as usize));
     }
     if two_level
-        && (value_is_int8
+        && (value_is_unused
+            || value_is_int8
             || key_is_int8
             || value_is_numeric
             || value_is_uuid
@@ -358,6 +375,7 @@ fn launch_validated_group_by(
         } else {
             c"gpu_db_group_by_i32_count_sum"
         },
+        value_is_unused,
         value_is_int8,
         key_is_int8,
         value_is_numeric,
@@ -379,6 +397,7 @@ fn launch_validated_group_by(
         value_null_off,
         key_null_off,
         agg_mask,
+        emit_rows,
     )
 }
 
@@ -962,6 +981,17 @@ impl CudaResidentDeviceMemory {
         agg_mask: u32,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_validated_group_by(self, input, indices, false, agg_mask)
+    }
+
+    /// Return a byte-bounded device verdict for whether any exact GROUP BY key occurs more than
+    /// once. The slot counts and `count > 1` decision stay on-device; only one flag crosses D2H.
+    pub fn group_by_has_duplicate_from_payload(
+        &self,
+        input: CudaGroupByInput<'_>,
+        indices: &[u32],
+    ) -> Result<bool, CudaRuntimeProbeError> {
+        launch_validated_group_result(self, input, indices, false, grouped_agg_mask::COUNT, false)
+            .map(|result| result.has_duplicate)
     }
 
     /// Benchmark entry: run GROUP BY with the chosen kernel (`two_level` selects the shared-mem

@@ -5,6 +5,37 @@ use crate::{
     CudaRuntimeProbeError,
 };
 
+const COMPOUND_FOLD_VALIDITY_WIDTH: u32 = u32::MAX - 1;
+
+fn validate_index_fold_columns(
+    columns: &[CudaCompoundFoldColumn],
+) -> Result<(), CudaRuntimeProbeError> {
+    let mut data_columns = 0usize;
+    let mut saw_validity = false;
+    let mut validity_offsets = Vec::new();
+    for column in columns {
+        match column {
+            CudaCompoundFoldColumn::Validity { bitmap_byte_offset } => {
+                saw_validity = true;
+                if validity_offsets.contains(bitmap_byte_offset) {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
+                }
+                validity_offsets.push(*bitmap_byte_offset);
+            }
+            _ if saw_validity => {
+                // The raw-key fast path relies on the first descriptor being data. Keeping every
+                // predicate descriptor as a suffix also makes the device ABI canonical.
+                return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
+            }
+            _ => data_columns += 1,
+        }
+    }
+    if data_columns == 0 || validity_offsets.len() > data_columns {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
+    }
+    Ok(())
+}
+
 /// Bytes occupied by the open-addressed key directory. The posting/version links immediately
 /// follow this prefix in the same allocation.
 pub fn resident_index_hash_bytes(table_mask: u32) -> Option<u64> {
@@ -55,7 +86,7 @@ const RESIDENT_INDEX_BUILD_PTX: &[u8] = br#"
     .param .u64 decline_ptr
 )
 {
-    .reg .pred %p<16>;
+    .reg .pred %p<18>;
     .reg .b32 %r<48>;
     .reg .b64 %rd<56>;
 
@@ -87,17 +118,52 @@ const RESIDENT_INDEX_BUILD_PTX: &[u8] = br#"
     // A missing deleted_by region means all-live. Otherwise omit only rows dead no later than the
     // oldest active snapshot; newer tombstones remain indexed for old pinned readers.
     setp.eq.u64 %p10, %rd40, 0;
-    @%p10 bra KEYMODE;
+    @%p10 bra VALIDITYSTART;
     mul.wide.u32 %rd43, %r40, 8;
     add.u64 %rd44, %rd40, %rd43;
     ld.global.u64 %rd45, [%rd44];
     setp.le.u64 %p11, %rd45, %rd41;
     @%p11 bra DONE;
 
+    // Validity descriptors carry the reserved width 0xfffffffe and are appended after the typed
+    // key descriptors. They are predicates, not key material: one NULL in a compound key omits the
+    // complete row from the directory (SQL NULLS DISTINCT). Count only data descriptors when
+    // selecting the raw single-i32 ABI.
+VALIDITYSTART:
+    mov.u32 %r45, 0;
+    mov.u32 %r46, 0;
+VALIDITYLOOP:
+    setp.ge.u32 %p16, %r45, %r1;
+    @%p16 bra KEYMODE;
+    mul.wide.u32 %rd5, %r45, 4;
+    add.u64 %rd6, %rd3, %rd5;
+    ld.global.u32 %r9, [%rd6];
+    setp.eq.u32 %p17, %r9, 4294967294;
+    @!%p17 bra VALIDDATA;
+    mul.wide.u32 %rd5, %r45, 8;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.u64 %rd7, [%rd6];
+    shr.u32 %r19, %r40, 3;
+    and.b32 %r20, %r40, 7;
+    add.u64 %rd35, %rd1, %rd7;
+    cvt.u64.u32 %rd38, %r19;
+    add.u64 %rd35, %rd35, %rd38;
+    ld.global.u8 %r21, [%rd35];
+    shr.u32 %r21, %r21, %r20;
+    and.b32 %r21, %r21, 1;
+    setp.eq.u32 %p17, %r21, 0;
+    @%p17 bra DONE;
+    bra VALIDNEXT;
+VALIDDATA:
+    add.u32 %r46, %r46, 1;
+VALIDNEXT:
+    add.u32 %r45, %r45, 1;
+    bra VALIDITYLOOP;
+
 KEYMODE:
     // The unflagged single i32/date/int2 ABI stores the resident word verbatim. Every other shape
     // (multi-column, wide fixed, BOOL, TEXT) uses the canonical FNV/rotate fingerprint below.
-    setp.ne.u32 %p12, %r1, 1;
+    setp.ne.u32 %p12, %r46, 1;
     @%p12 bra FOLDINIT;
     ld.global.u32 %r33, [%rd3];
     setp.ne.u32 %p12, %r33, 1;
@@ -120,6 +186,8 @@ FOLDLOOP:
     mul.wide.u32 %rd8, %r8, 4;
     add.u64 %rd9, %rd3, %rd8;
     ld.global.u32 %r9, [%rd9];
+    setp.eq.u32 %p4, %r9, 4294967294;
+    @%p4 bra NEXTCOL;
     setp.eq.u32 %p4, %r9, 0;
     @%p4 bra TEXTCOL;
     setp.eq.u32 %p4, %r9, 4294967295;
@@ -329,8 +397,42 @@ const RESIDENT_MULTI_INDEX_INSERT_PTX: &[u8] = br#"
     mul.wide.u32 %rd11, %r1, 24;
     add.u64 %rd12, %rd2, %rd11;
 
+    // Validity descriptors (reserved width 0xfffffffe) are predicates, not key material. Omit the
+    // index/row work item when any indexed column is NULL and count only data descriptors when
+    // choosing the raw single-i32 ABI.
+    mov.u32 %r43, 0;
+    mov.u32 %r44, 0;
+VALIDITYLOOP:
+    setp.ge.u32 %p13, %r43, %r15;
+    @%p13 bra KEYMODE;
+    add.u32 %r45, %r14, %r43;
+    mul.wide.u32 %rd44, %r45, 32;
+    add.u64 %rd45, %rd12, %rd44;
+    ld.global.u64 %rd46, [%rd45+8];
+    cvt.u32.u64 %r46, %rd46;
+    setp.eq.u32 %p13, %r46, 4294967294;
+    @!%p13 bra VALIDDATA;
+    ld.global.u64 %rd46, [%rd45];
+    shr.u32 %r26, %r11, 3;
+    and.b32 %r27, %r11, 7;
+    add.u64 %rd47, %rd1, %rd46;
+    cvt.u64.u32 %rd48, %r26;
+    add.u64 %rd47, %rd47, %rd48;
+    ld.global.u8 %r28, [%rd47];
+    shr.u32 %r28, %r28, %r27;
+    and.b32 %r28, %r28, 1;
+    setp.eq.u32 %p13, %r28, 0;
+    @%p13 bra DONE;
+    bra VALIDNEXT;
+VALIDDATA:
+    add.u32 %r44, %r44, 1;
+VALIDNEXT:
+    add.u32 %r43, %r43, 1;
+    bra VALIDITYLOOP;
+
+KEYMODE:
     // One raw i32 column retains the established key ABI. All other shapes use the canonical fold.
-    setp.ne.u32 %p2, %r15, 1;
+    setp.ne.u32 %p2, %r44, 1;
     @%p2 bra FOLDINIT;
     mul.wide.u32 %rd13, %r14, 32;
     add.u64 %rd14, %rd12, %rd13;
@@ -356,6 +458,8 @@ FOLDLOOP:
     ld.global.u64 %rd16, [%rd14];
     ld.global.u64 %rd15, [%rd14+8];
     cvt.u32.u64 %r20, %rd15;
+    setp.eq.u32 %p3, %r20, 4294967294;
+    @%p3 bra NEXTCOL;
     setp.eq.u32 %p3, %r20, 0;
     @%p3 bra TEXTCOL;
     setp.eq.u32 %p3, %r20, 4294967295;
@@ -699,6 +803,7 @@ impl CudaResidentDeviceMemory {
             {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(0));
             }
+            validate_index_fold_columns(&request.columns)?;
             let table_size = u64::from(request.table_mask) + 1;
             let expected_shift = 32_u32.checked_sub(table_size.trailing_zeros()).ok_or(
                 CudaRuntimeProbeError::InvalidInputLength(table_size as usize),
@@ -755,6 +860,20 @@ impl CudaResidentDeviceMemory {
                         0,
                         bitmap_byte_offset.checked_add(end_row.div_ceil(8) as u64),
                     ),
+                    CudaCompoundFoldColumn::Validity { bitmap_byte_offset } => {
+                        if !bitmap_byte_offset.is_multiple_of(4) {
+                            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                                bitmap_byte_offset as usize,
+                            ));
+                        }
+                        (
+                            bitmap_byte_offset,
+                            u64::from(COMPOUND_FOLD_VALIDITY_WIDTH),
+                            0,
+                            0,
+                            bitmap_byte_offset.checked_add(end_row.div_ceil(8) as u64),
+                        )
+                    }
                     CudaCompoundFoldColumn::Text {
                         offsets_byte_offset,
                         bytes_byte_offset,
@@ -919,6 +1038,7 @@ impl CudaResidentDeviceMemory {
         if row_count == 0 || columns.is_empty() || self.context() != index.context() {
             return Err(CudaRuntimeProbeError::InvalidInputLength(row_count));
         }
+        validate_index_fold_columns(columns)?;
         let table_size = u64::from(table_mask) + 1;
         let expected_shift = 32_u32.checked_sub(table_size.trailing_zeros()).ok_or(
             CudaRuntimeProbeError::InvalidInputLength(table_size as usize),
@@ -987,6 +1107,21 @@ impl CudaResidentDeviceMemory {
                     }
                     offsets.push(bitmap_byte_offset);
                     widths.push(u32::MAX);
+                    blob_offsets.push(0);
+                    blob_lens.push(0);
+                }
+                CudaCompoundFoldColumn::Validity { bitmap_byte_offset } => {
+                    let bytes = end_row.div_ceil(8) as u64;
+                    let end = bitmap_byte_offset
+                        .checked_add(bytes)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    if !bitmap_byte_offset.is_multiple_of(4)
+                        || end > self.metadata().allocated_bytes
+                    {
+                        return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
+                    }
+                    offsets.push(bitmap_byte_offset);
+                    widths.push(COMPOUND_FOLD_VALIDITY_WIDTH);
                     blob_offsets.push(0);
                     blob_lens.push(0);
                 }

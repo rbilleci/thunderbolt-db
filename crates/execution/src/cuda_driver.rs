@@ -4,8 +4,8 @@ use std::sync::Arc;
 use libloading::Library;
 
 use crate::cuda_context::{
-    check_cuda, gpu_primary_context, CudaDeviceAllocationGuard, GpuPrimaryContext,
-    PendingCopyTransport,
+    check_cuda, gpu_primary_context, CudaAllocationScope, CudaDeviceAllocationGuard,
+    GpuPrimaryContext, PendingCopyTransport,
 };
 use crate::staged_filter::launch_cuda_smoke_add_one;
 use crate::{
@@ -108,6 +108,45 @@ impl CudaDriverRuntime {
             resident.device_ptr,
             resident.primary,
         ))
+    }
+
+    /// Transaction/query-scoped analogue of [`Self::retain_device_memory_copy`]. The exact raw
+    /// allocation is reserved against the active [`CudaAllocationScope`] before `cuMemAlloc`, and
+    /// the charge follows the retained allocation/read-view lifetime.
+    pub fn retain_device_memory_copy_scoped(
+        &self,
+        gpu_id: u16,
+        payload: &[u8],
+    ) -> Result<CudaResidentDeviceMemory, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+        if payload.is_empty() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let reservation = CudaAllocationScope::reserve_external(payload.len())?;
+        let device = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| device.id == gpu_id)
+            .cloned()
+            .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
+        let resident = launch_cuda_resident_device_memory(gpu_id, payload)?;
+        Ok(
+            CudaResidentDeviceMemory::from_raw_parts_with_scope_reservation(
+                CudaDeviceMemoryProof {
+                    gpu_id,
+                    device_name: device.name,
+                    allocated_bytes: payload.len() as u64,
+                    copied_bytes: payload.len() as u64,
+                    retained: true,
+                },
+                resident.device_ptr,
+                resident.primary,
+                Some(reservation),
+            ),
+        )
     }
 
     /// Allocate a retained device buffer and initialize every byte with `cuMemsetD8`. This is the
@@ -380,6 +419,56 @@ impl CudaDriverRuntime {
             resident.device_ptr,
             resident.primary,
         ))
+    }
+
+    /// Scoped transient form of [`Self::retain_device_memory_recompacted`]. It reserves the exact
+    /// destination extent before allocation and holds that reservation until the unified device
+    /// source is dropped.
+    pub fn retain_device_memory_recompacted_scoped(
+        &self,
+        gpu_id: u16,
+        allocated_bytes: u64,
+        header: &[u8],
+        fills: &[RecompactFill],
+        segments: &[RecompactSegment],
+    ) -> Result<CudaResidentDeviceMemory, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+        if allocated_bytes == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let allocated_len = usize::try_from(allocated_bytes)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let reservation = CudaAllocationScope::reserve_external(allocated_len)?;
+        let device = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| device.id == gpu_id)
+            .cloned()
+            .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
+        let resident = launch_cuda_resident_device_memory_recompacted(
+            gpu_id,
+            allocated_len,
+            header,
+            fills,
+            segments,
+        )?;
+        Ok(
+            CudaResidentDeviceMemory::from_raw_parts_with_scope_reservation(
+                CudaDeviceMemoryProof {
+                    gpu_id,
+                    device_name: device.name,
+                    allocated_bytes,
+                    copied_bytes: allocated_bytes,
+                    retained: true,
+                },
+                resident.device_ptr,
+                resident.primary,
+                Some(reservation),
+            ),
+        )
     }
 }
 

@@ -84,7 +84,7 @@ responsibility, changes its public boundary, or reaches the stated trigger.
 
 | File | Class and current size | Cohesion rationale | Boundary that must remain intact | Re-review trigger |
 |---|---:|---|---|---|
-| `crates/engine/src/engine_expr.rs` | Production, 2,400 lines | After all independently stable contracts and execution phases moved to bounded leaves, the root contains exactly one cohesive resident SELECT/grouped GPU orchestration function | Keep group-key planning, derived device-buffer ownership, pass construction/execution, cross-pass alignment, and grouped result/HAVING framing together; ordinary SELECT terminal framing is isolated in bounded leaves without detaching grouped lifetime guards | Growth by 20% (~2,880 lines), a second production responsibility or method family, a stable grouped-pass contract, public-boundary change, or 5,000 lines |
+| `crates/engine/src/engine_expr.rs` | Production, 2,403 lines | After all independently stable contracts and execution phases moved to bounded leaves, the root contains exactly one cohesive resident SELECT/grouped GPU orchestration function | Keep group-key planning, derived device-buffer ownership, pass construction/execution, cross-pass alignment, and grouped result/HAVING framing together; ordinary SELECT terminal framing is isolated in bounded leaves without detaching grouped lifetime guards | Growth by 20% (~2,884 lines), a second production responsibility or method family, a stable grouped-pass contract, public-boundary change, or 5,000 lines |
 
 ## Inventory command
 

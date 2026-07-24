@@ -1999,6 +1999,51 @@ fn gpu_ordered_i32_compaction_preflight_fails_closed_then_reuses_context() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn cuda_grouped_int4_full_result_retains_complete_compaction_key_scratch() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let row_count = 65_536usize;
+    let value_off = row_count * std::mem::size_of::<i32>();
+    let mut payload = Vec::with_capacity(value_off * 2);
+    for key in 0..row_count as i32 {
+        payload.extend_from_slice(&key.to_le_bytes());
+    }
+    for _ in 0..row_count {
+        payload.extend_from_slice(&1_i32.to_le_bytes());
+    }
+    let resident = runtime
+        .retain_device_memory_chunks(
+            0,
+            payload.len() as u64,
+            &[CudaDeviceMemoryChunk {
+                byte_offset: 0,
+                bytes: &payload,
+            }],
+        )
+        .expect("resident full-result grouped payload");
+    let indices = (0..row_count as u32).collect::<Vec<_>>();
+
+    let mut groups = resident
+        .group_by_i32_count_sum_from_payload(
+            CudaGroupByInput::resident_i32(0, value_off as u64, row_count as u64),
+            &indices,
+            grouped_agg_mask::ALL,
+        )
+        .expect("ordinary int4 full-result compaction must stay allocation-bounded");
+    groups.sort_unstable_by_key(|group| group.key);
+    assert_eq!(groups.len(), row_count);
+    assert_eq!((groups[0].key, groups[0].count, groups[0].sum), (0, 1, 1));
+    assert_eq!(
+        (
+            groups[row_count - 1].key,
+            groups[row_count - 1].count,
+            groups[row_count - 1].sum,
+        ),
+        (row_count as i64 - 1, 1, 1)
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn cuda_grouped_inputs_reject_or_fail_closed_then_reuse_context() {
     let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
     let row_count = 3u64;

@@ -13,11 +13,7 @@ impl Engine {
         create: &CreateSequence,
     ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
-        if cat.relational_catalog.contains_key(&create.name)
-            || cat.relational_views.contains_key(&create.name)
-            || cat.relational_materialized_views.contains_key(&create.name)
-            || cat.relational_sequences.contains_key(&create.name)
-        {
+        if cat.pg_class_relation_kind(&create.name)?.is_some() {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
@@ -27,6 +23,25 @@ impl Engine {
     }
 
     pub(crate) fn preflight_sequence_target(&self, name: &str) -> Result<(), EngineError> {
+        if self.apply_uses_legacy_index_semantics() {
+            return self.preflight_sequence_target_legacy_replay(name);
+        }
+        let cat = self.catalog_snapshot();
+        match cat.pg_class_relation_kind(name)? {
+            Some(PgClassRelationKind::Sequence) => Ok(()),
+            Some(_) => Err(EngineError::ApplyFailed(format!(
+                "relation \"{name}\" is not a sequence"
+            ))),
+            None => Err(EngineError::ApplyFailed(format!(
+                "sequence \"{name}\" does not exist"
+            ))),
+        }
+    }
+
+    pub(crate) fn preflight_sequence_target_legacy_replay(
+        &self,
+        name: &str,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         if cat.relational_catalog.contains_key(name)
             || cat.relational_views.contains_key(name)
@@ -423,31 +438,73 @@ impl Engine {
         &self,
         create: &CreateMaterializedView,
     ) -> Result<(), EngineError> {
+        self.preflight_create_materialized_view_with_replay_policy(create, false)
+    }
+
+    pub(crate) fn preflight_create_materialized_view_legacy_replay(
+        &self,
+        create: &CreateMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.preflight_create_materialized_view_with_replay_policy(create, true)
+    }
+
+    fn preflight_create_materialized_view_with_replay_policy(
+        &self,
+        create: &CreateMaterializedView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
-        if cat.relational_catalog.contains_key(&create.name)
-            || cat.relational_views.contains_key(&create.name)
-            || cat.relational_materialized_views.contains_key(&create.name)
-            || cat.relational_sequences.contains_key(&create.name)
-        {
+        let target_exists = if legacy_replay {
+            cat.relational_catalog.contains_key(&create.name)
+                || cat.relational_views.contains_key(&create.name)
+                || cat.relational_materialized_views.contains_key(&create.name)
+                || cat.relational_sequences.contains_key(&create.name)
+        } else {
+            cat.pg_class_relation_kind(&create.name)?.is_some()
+        };
+        if target_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
         }
-        if cat.relational_views.contains_key(&create.query.table)
-            || cat
-                .relational_materialized_views
-                .contains_key(&create.query.table)
-        {
-            return Err(EngineError::ApplyFailed(
-                "materialized views over views are unsupported".to_string(),
-            ));
-        }
-        if !cat.relational_catalog.contains_key(&create.query.table) {
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" does not exist",
-                create.query.table
-            )));
+        if legacy_replay {
+            if cat.relational_views.contains_key(&create.query.table)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&create.query.table)
+            {
+                return Err(EngineError::ApplyFailed(
+                    "materialized views over views are unsupported".to_string(),
+                ));
+            }
+            if !cat.relational_catalog.contains_key(&create.query.table) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" does not exist",
+                    create.query.table
+                )));
+            }
+        } else {
+            match cat.pg_class_relation_kind(&create.query.table)? {
+                Some(PgClassRelationKind::Table) => {}
+                Some(PgClassRelationKind::View | PgClassRelationKind::MaterializedView) => {
+                    return Err(EngineError::ApplyFailed(
+                        "materialized views over views are unsupported".to_string(),
+                    ))
+                }
+                Some(_) => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" cannot be a materialized-view dependency",
+                        create.query.table
+                    )))
+                }
+                None => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        create.query.table
+                    )))
+                }
+            }
         }
         Ok(())
     }
@@ -456,11 +513,31 @@ impl Engine {
         &self,
         refresh: &RefreshMaterializedView,
     ) -> Result<(), EngineError> {
+        self.preflight_refresh_materialized_view_with_replay_policy(refresh, false)
+    }
+
+    pub(crate) fn preflight_refresh_materialized_view_legacy_replay(
+        &self,
+        refresh: &RefreshMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.preflight_refresh_materialized_view_with_replay_policy(refresh, true)
+    }
+
+    fn preflight_refresh_materialized_view_with_replay_policy(
+        &self,
+        refresh: &RefreshMaterializedView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
-        if cat.relational_catalog.contains_key(&refresh.name)
-            || cat.relational_views.contains_key(&refresh.name)
-            || cat.relational_sequences.contains_key(&refresh.name)
-        {
+        let wrong_kind = if legacy_replay {
+            cat.relational_catalog.contains_key(&refresh.name)
+                || cat.relational_views.contains_key(&refresh.name)
+                || cat.relational_sequences.contains_key(&refresh.name)
+        } else {
+            cat.pg_class_relation_kind(&refresh.name)?
+                .is_some_and(|kind| kind != PgClassRelationKind::MaterializedView)
+        };
+        if wrong_kind {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a materialized view",
                 refresh.name
@@ -479,6 +556,21 @@ impl Engine {
     }
 
     pub(crate) fn preflight_drop_view(&self, drop: &DropView) -> Result<(), EngineError> {
+        self.preflight_drop_view_with_replay_policy(drop, false)
+    }
+
+    pub(crate) fn preflight_drop_view_legacy_replay(
+        &self,
+        drop: &DropView,
+    ) -> Result<(), EngineError> {
+        self.preflight_drop_view_with_replay_policy(drop, true)
+    }
+
+    fn preflight_drop_view_with_replay_policy(
+        &self,
+        drop: &DropView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
@@ -489,19 +581,15 @@ impl Engine {
                     name
                 )));
             }
-            if cat.relational_catalog.contains_key(name) {
-                return Err(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" is not a view",
-                    name
-                )));
-            }
-            if cat.relational_sequences.contains_key(name) {
-                return Err(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" is not a view",
-                    name
-                )));
-            }
-            if cat.relational_materialized_views.contains_key(name) {
+            let wrong_kind = if legacy_replay {
+                cat.relational_catalog.contains_key(name)
+                    || cat.relational_materialized_views.contains_key(name)
+                    || cat.relational_sequences.contains_key(name)
+            } else {
+                cat.pg_class_relation_kind(name)?
+                    .is_some_and(|kind| kind != PgClassRelationKind::View)
+            };
+            if wrong_kind {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a view",
                     name
@@ -529,6 +617,21 @@ impl Engine {
         &self,
         drop: &DropMaterializedView,
     ) -> Result<(), EngineError> {
+        self.preflight_drop_materialized_view_with_replay_policy(drop, false)
+    }
+
+    pub(crate) fn preflight_drop_materialized_view_legacy_replay(
+        &self,
+        drop: &DropMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.preflight_drop_materialized_view_with_replay_policy(drop, true)
+    }
+
+    fn preflight_drop_materialized_view_with_replay_policy(
+        &self,
+        drop: &DropMaterializedView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
@@ -538,10 +641,15 @@ impl Engine {
                     name
                 )));
             }
-            if cat.relational_catalog.contains_key(name)
-                || cat.relational_views.contains_key(name)
-                || cat.relational_sequences.contains_key(name)
-            {
+            let wrong_kind = if legacy_replay {
+                cat.relational_catalog.contains_key(name)
+                    || cat.relational_views.contains_key(name)
+                    || cat.relational_sequences.contains_key(name)
+            } else {
+                cat.pg_class_relation_kind(name)?
+                    .is_some_and(|kind| kind != PgClassRelationKind::MaterializedView)
+            };
+            if wrong_kind {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a materialized view",
                     name
@@ -558,6 +666,21 @@ impl Engine {
     }
 
     pub(crate) fn preflight_drop_sequence(&self, drop: &DropSequence) -> Result<(), EngineError> {
+        self.preflight_drop_sequence_with_replay_policy(drop, false)
+    }
+
+    pub(crate) fn preflight_drop_sequence_legacy_replay(
+        &self,
+        drop: &DropSequence,
+    ) -> Result<(), EngineError> {
+        self.preflight_drop_sequence_with_replay_policy(drop, true)
+    }
+
+    fn preflight_drop_sequence_with_replay_policy(
+        &self,
+        drop: &DropSequence,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
@@ -567,20 +690,39 @@ impl Engine {
                     name
                 )));
             }
-            if cat.relational_catalog.contains_key(name)
-                || cat.relational_views.contains_key(name)
-                || cat.relational_materialized_views.contains_key(name)
-            {
-                return Err(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" is not a sequence",
-                    name
-                )));
-            }
-            if !drop.if_exists && !cat.relational_sequences.contains_key(name) {
-                return Err(EngineError::ApplyFailed(format!(
-                    "sequence \"{}\" does not exist",
-                    name
-                )));
+            if legacy_replay {
+                if cat.relational_catalog.contains_key(name)
+                    || cat.relational_views.contains_key(name)
+                    || cat.relational_materialized_views.contains_key(name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a sequence",
+                        name
+                    )));
+                }
+                if !drop.if_exists && !cat.relational_sequences.contains_key(name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "sequence \"{}\" does not exist",
+                        name
+                    )));
+                }
+            } else {
+                match cat.pg_class_relation_kind(name)? {
+                    Some(PgClassRelationKind::Sequence) => {}
+                    Some(_) => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a sequence",
+                            name
+                        )))
+                    }
+                    None if !drop.if_exists => {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "sequence \"{}\" does not exist",
+                            name
+                        )))
+                    }
+                    None => {}
+                }
             }
         }
         Ok(())
@@ -591,24 +733,50 @@ impl Engine {
         cat: &mut DdlCatalogState,
         rename: RenameView,
     ) -> Result<(), EngineError> {
-        if cat.relational_catalog.contains_key(&rename.old_name)
-            || cat
-                .relational_materialized_views
-                .contains_key(&rename.old_name)
-            || cat.relational_sequences.contains_key(&rename.old_name)
-        {
+        self.apply_rename_view_with_replay_policy(cat, rename, false)
+    }
+
+    pub(crate) fn apply_rename_view_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameView,
+    ) -> Result<(), EngineError> {
+        self.apply_rename_view_with_replay_policy(cat, rename, true)
+    }
+
+    fn apply_rename_view_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        let source_wrong_kind = if legacy_replay {
+            cat.relational_catalog.contains_key(&rename.old_name)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&rename.old_name)
+                || cat.relational_sequences.contains_key(&rename.old_name)
+        } else {
+            cat.pg_class_relation_kind(&rename.old_name)?
+                .is_some_and(|kind| kind != PgClassRelationKind::View)
+        };
+        if source_wrong_kind {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a view",
                 rename.old_name
             )));
         }
-        if cat.relational_catalog.contains_key(&rename.new_name)
-            || cat.relational_views.contains_key(&rename.new_name)
-            || cat
-                .relational_materialized_views
-                .contains_key(&rename.new_name)
-            || cat.relational_sequences.contains_key(&rename.new_name)
-        {
+        let destination_exists = if legacy_replay {
+            cat.relational_catalog.contains_key(&rename.new_name)
+                || cat.relational_views.contains_key(&rename.new_name)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&rename.new_name)
+                || cat.relational_sequences.contains_key(&rename.new_name)
+        } else {
+            cat.pg_class_relation_kind(&rename.new_name)?.is_some()
+        };
+        if destination_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name

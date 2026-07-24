@@ -15,15 +15,32 @@ thread_local! {
     static APPLY_WORKING_CATALOG:
         std::cell::RefCell<Vec<(*const Engine, Arc<CatalogSnapshot>)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    /// Serialized replay policy for nested sequence/default helpers. Historical engine-command
+    /// records resolved sequence maps before indexes joined the shared `pg_class` namespace; a
+    /// genuine pre-boundary prefix must retain that behavior. Once the working catalog crosses the
+    /// index epoch, even byte-stable neutral records use the current central namespace.
+    static APPLY_CURRENT_INDEX_SEMANTICS:
+        std::cell::RefCell<Vec<(*const Engine, bool)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
 }
 
 struct ApplyWorkingCatalogGuard;
+pub(crate) struct ApplyIndexSemanticsGuard;
 
 impl Drop for ApplyWorkingCatalogGuard {
     fn drop(&mut self) {
         APPLY_WORKING_CATALOG.with(|catalogs| {
             let popped = catalogs.borrow_mut().pop();
             debug_assert!(popped.is_some(), "working catalog scope must be balanced");
+        });
+    }
+}
+
+impl Drop for ApplyIndexSemanticsGuard {
+    fn drop(&mut self) {
+        APPLY_CURRENT_INDEX_SEMANTICS.with(|policies| {
+            let popped = policies.borrow_mut().pop();
+            debug_assert!(popped.is_some(), "index-semantics scope must be balanced");
         });
     }
 }
@@ -96,6 +113,24 @@ impl Engine {
         apply()
     }
 
+    pub(crate) fn enter_apply_index_semantics(&self, current: bool) -> ApplyIndexSemanticsGuard {
+        APPLY_CURRENT_INDEX_SEMANTICS.with(|policies| {
+            policies.borrow_mut().push((self, current));
+        });
+        ApplyIndexSemanticsGuard
+    }
+
+    pub(crate) fn apply_uses_legacy_index_semantics(&self) -> bool {
+        APPLY_CURRENT_INDEX_SEMANTICS.with(|policies| {
+            policies
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(engine, _)| std::ptr::eq(*engine, self))
+                .is_some_and(|(_, current)| !current)
+        })
+    }
+
     pub(crate) fn catalog_snapshot_from_working(
         cat: &DdlCatalogState,
         commit_seq: Index,
@@ -119,6 +154,9 @@ impl Engine {
             relational_default_table_acl: cat.relational_default_table_acl.clone(),
             relational_comments: cat.relational_comments.clone(),
             relational_next_oid: cat.relational_next_oid,
+            index_oid_epoch_current: cat.index_oid_epoch_current,
+            legacy_recovery_index_oids_assigned: cat.legacy_recovery_index_oids_assigned,
+            legacy_recovery_next_index_oid: cat.legacy_recovery_next_index_oid,
             relational_next_column_id: cat.relational_next_column_id,
         })
     }

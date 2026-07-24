@@ -469,7 +469,9 @@ impl Engine {
             delta: Arc::new(std::sync::Mutex::new(TransactionDeltaState {
                 generation: 0,
                 resident_shards: Arc::clone(&resident_shards),
+                resident_shards_authority: Arc::clone(&resident_shards),
                 streaming_cold_chunks: Arc::clone(&streaming_cold_chunks),
+                streaming_cold_chunks_authority: Arc::clone(&streaming_cold_chunks),
                 operations: Vec::new(),
                 write_set: WriteSet::default(),
                 next_row_id: self.read_state.mvcc.current_row_id(),

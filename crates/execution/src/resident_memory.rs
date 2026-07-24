@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use libloading::Library;
 
-use crate::cuda_context::{check_cuda, GpuPrimaryContext};
+use crate::cuda_context::{check_cuda, CudaExternalAllocationReservation, GpuPrimaryContext};
 use crate::{
     launch_cuda_resident_row_count, launch_cuda_resident_visible_count,
     launch_cuda_resident_visible_digest, CudaDeviceMemoryProof, CudaRuntimeProbeError,
@@ -35,6 +35,10 @@ pub struct CudaResidentDeviceMemoryReadView {
 pub(super) struct CudaResidentDeviceAllocation {
     device_ptr: u64,
     primary: Arc<GpuPrimaryContext>,
+    /// Present only for an explicitly scoped transient retained allocation. Long-lived residency
+    /// keeps using the engine's canonical accounting; transactional cold validation opts into this
+    /// owner so its source/recompaction bytes share one allocator-backed scratch high-water.
+    _scope_reservation: Option<CudaExternalAllocationReservation>,
 }
 
 /// Test-only non-owning witness for the exact resident allocation. This lets lifetime regressions
@@ -225,9 +229,19 @@ impl CudaResidentDeviceMemory {
         device_ptr: u64,
         primary: Arc<GpuPrimaryContext>,
     ) -> Self {
+        Self::from_raw_parts_with_scope_reservation(metadata, device_ptr, primary, None)
+    }
+
+    pub(super) fn from_raw_parts_with_scope_reservation(
+        metadata: CudaDeviceMemoryProof,
+        device_ptr: u64,
+        primary: Arc<GpuPrimaryContext>,
+        scope_reservation: Option<CudaExternalAllocationReservation>,
+    ) -> Self {
         let allocation = Arc::new(CudaResidentDeviceAllocation {
             device_ptr,
             primary: Arc::clone(&primary),
+            _scope_reservation: scope_reservation,
         });
         Self {
             metadata,

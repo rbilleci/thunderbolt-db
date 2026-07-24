@@ -254,10 +254,43 @@ does not delay the architecture evidence gate. The active sequence now starts at
    139us. Against the latest accepted baseline, throughput changes are +2.7%/+5.1%, the out-of-L2 p50 shift is
    +2us, and no material regression is present.
 
-   The active next boundary remains within **PRODUCT-001**: close remaining transactional catalog families only with
-   complete typed identity/dependency semantics, then complete the remaining SQLSTATE/type-codec breadth, named
-   client suites, and mixed-recovery coverage for the canonical target. Only after those proofs are independently
-   accepted does the legacy/P8 compatibility-and-deletion slice re-inventory the still-live
+   The independently accepted transactional-index slice extends that same ordered stream to `CREATE INDEX`,
+   `ALTER INDEX ... RENAME TO ...`, and ordered multi-target `DROP INDEX [IF EXISTS]`. Stable table/index
+   identities, exact key/uniqueness/dependency and target-absence proofs, statement-ordered private DML/index
+   maintenance, GPU-only hot/cold uniqueness validation, residency/accounting, rollback, retry, isolation/ABA, and
+   recovery all remain behind the sole commit/WAL/publication owner. Additive WAL opcodes 16/17 carry the complete
+   lifecycle proof; legacy bytes remain stable. The current shared `pg_class` OID epoch closes index/table and
+   sequence/materialized-view namespace collisions, while a typed legacy selector preserves old replay bytes and
+   policy. This reverse-family collision guard does not admit transactional sequence or materialized-view lifecycle;
+   those and all other catalog families remain outside this slice and fail before transactional effects. The exact
+   audited code/test seal is base `c098b8471177519c01ef3743f7dc3c3d08b85f8f`, tree
+   `2613b26bd0b2f35e5bface7538ad83b860e38599`, and cached binary-diff SHA-256
+   `e034c830ec0eec1aafe720f227697aab524579e84ad8cc34d5d00bc94ecd11fc` across 76 paths. Its final quick screen
+   completed A/B without a material regression. The first documentation-inclusive full-card candidate
+   (`59fcbf532d01abfd244cf90ff3520531699bcede` /
+   `cb91816f6a4a0d8c5c3d9d4e6bd3932207624a1b77cb74852469bc3e2fc77d35`) completed A/B, built all 48M
+   Section-C rows in 2304.0s with 0.0s final residency, then correctly returned incomplete at the default 2400s
+   operational timeout before measurements. It is not acceptance evidence. Exact current-toolchain 8M diagnostics
+   then measured the candidate at 95.4s build / 100.60s total and the accepted-base artifact at 95.0s / 100.30s,
+   ruling out a material candidate regression at 4,001 shards. The independently audited documentation-only retry
+   candidate is tree `2497b5fd00da8bee39f583a818e32e1da6952222` with cached binary-diff SHA-256
+   `736653b742aed8be067f9623764ad9226694983f3448f50d2d754bffcdbb8575`. Its one full invocation used
+   `SECTION_C_TIMEOUT=2700`, changing no calibrated rows, batches, warmups, cache regimes, cool-down, source, or
+   fresh-build control. It completed A/B/C with the exact canonical marker after a 2290.1s Section-C build and
+   0.0s final residency. Layer 1 measured 1305.1 GB/s, p50 26us in-L2; 1423.1 GB/s, p50 189us out-of-L2; and
+   1674.2 M-elem/s grouped. Layer 2 measured 264.394M/s, p50 118us in-L2 and 244.127M/s, p50 140us out-of-L2.
+   Against the latest accepted card, honest out-of-L2 raw/grouped throughput is -1.1%/-0.1% and point throughput
+   is -2.3%/-0.7%, with +3us/+1us point p50; no material regression is present. Post-card provenance/performance
+   audit returned **ACCEPT** on the documentation closeout tree
+   `c1d4b657c85ad19b7abadb6f7671c92193616b95` / cached binary-diff SHA-256
+   `5ab129cd2d073b56d854d0ffea68837520bc2d330801831853fd30c77198a143`, confirming exact artifact/configuration/
+   marker provenance and that the final docs-only update leaves the card applicable.
+
+   After that seal, the active next boundary remains within **PRODUCT-001**: any later transactional catalog family
+   is a separately scoped slice requiring complete typed identity/dependency semantics; materialized views remain a
+   pre-effect refusal here. Then complete the remaining SQLSTATE/type-codec breadth, named client suites, and
+   mixed-recovery coverage for the canonical target. Only after those proofs are independently accepted does the
+   legacy/P8 compatibility-and-deletion slice re-inventory the still-live
    psql/preflight/benchmark consumers,
    migrate or explicitly disposition each behavior, and delete the superseded listener plus independently callable
    P8 protocol adapters in the same audited slice. Do not retain a second product-like execution or write owner as
@@ -394,8 +427,8 @@ facades, unless one is a safe leaf extraction that directly reduces an earlier w
 
 | Lines | File | Disposition / evidence |
 |---:|---|---|
-| 2,170 | `crates/engine/src/engine_dml_concurrent.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The accepted STRUCT-001IW/IX/IY split left this facade at 1,761 lines. PRODUCT-001's transaction-isolation, canonical-admission, transaction-private catalog, composite-publication, prepared compatibility, pg_dump command-exhaustiveness, and typed-reset retry/root proofs added the current snapshot capture, program ownership, catalog stamps, coordinator integration, retry classification, and typed compatibility routing, crossing the 2,000-line analysis threshold. The active PRODUCT-001 unification row owns removal or extraction of that transitional control-plane surface while it deletes the old callable write paths; this file must return below 2,000 lines before PRODUCT-001 closes. Existing `wave.rs`, `lane.rs`, and `lane_apply.rs` ownership remains unchanged, and a permanent size exception is not accepted. |
-| 2,091 | `crates/engine/src/engine_commit.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The current inventory found this pure-production commit/recovery facade already above the 2,000-line analysis threshold at the accepted typed-reset base; the ordered-catalog slice changes only two wrapper-field adaptations and does not cause the outlier. The file owns serialized apply/recovery dispatch plus commit-residency bookkeeping, so the active PRODUCT-001 ownership/deletion boundary must remove obsolete compatibility arms or extract an invariant-owned private leaf and return it below 2,000 lines before PRODUCT-001 closes. Do not split the sole commit/publication authority or accept a permanent exception merely to clear the count. |
+| 2,172 | `crates/engine/src/engine_dml_concurrent.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The accepted STRUCT-001IW/IX/IY split left this facade at 1,761 lines. PRODUCT-001's transaction-isolation, canonical-admission, transaction-private catalog, composite-publication, prepared compatibility, pg_dump command-exhaustiveness, and typed-reset retry/root proofs added the current snapshot capture, program ownership, catalog stamps, coordinator integration, retry classification, and typed compatibility routing, crossing the 2,000-line analysis threshold. The active PRODUCT-001 unification row owns removal or extraction of that transitional control-plane surface while it deletes the old callable write paths; this file must return below 2,000 lines before PRODUCT-001 closes. Existing `wave.rs`, `lane.rs`, and `lane_apply.rs` ownership remains unchanged, and a permanent size exception is not accepted. |
+| 2,228 | `crates/engine/src/engine_commit.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The transactional-index slice extends this sole serialized apply/recovery dispatcher with epoch-aware current/legacy index, sequence, and materialized-view routing plus exact catalog/data residency bookkeeping. It still owns one cohesive commit/recovery authority; the reverse-family arms only preserve shared-namespace and legacy-replay policy and do not admit another transactional catalog family. The active PRODUCT-001 ownership/deletion boundary must remove obsolete compatibility arms or extract a private invariant-owned leaf and return the facade below 2,000 lines before PRODUCT-001 closes. Do not split the sole commit/publication authority or accept a permanent exception merely to clear the count. |
 | 2,010 | `crates/engine/src/engine_mutation_admission.rs` | **DISPOSITION REOPENED UNDER PRODUCT-001 — no exception.** The accepted bounded admission owner crossed the production analysis threshold when PRODUCT-001 added typed session-control admission and the atomic same-transaction characteristic replacement needed by canonical pg_dump. It still owns one cohesive parsed-command admission match and its closest boundary tests, but the active PRODUCT-001 legacy/API deletion slice must remove obsolete arms or extract a private invariant-owned child and return this file below 2,000 lines before PRODUCT-001 closes. No public execution boundary, catch-all shard, or permanent size exception is accepted. |
 | 1,952 | `crates/engine/src/mvcc_read_exec.rs` | **DISPOSITION COMPLETE — bounded GPU-native MVCC read root below 2,000 lines; no exception.** STRUCT-001IZ/JA/JB/JC isolated exact row-operation (1,441), source-resolution (400), query-capability (347), and CUDA filter (594) owners behind stable crate facades. The final JC slice passed 39 sequential plus 26 concurrent actual-CUDA filter executions, both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, fresh inventory, and independent audit. Dependencies remain one-way, backend contracts remain root-owned, and no CPU hot path or API drift was introduced. |
 | 1,606 | `crates/engine/src/engine_retained_read.rs` | **DISPOSITION COMPLETE — bounded retained-read facade below 2,000 lines; no exception.** STRUCT-001JD–JI isolated exact prepared-template (145), cached wave-index (133), payload-submission (150), device-index append (167), wave-locate (383), and complete sharded point-lookup backend (1,388) owners. JI retained exactly two existing `pub(crate)` contracts, six private helpers, and three narrow parent/sibling bridges; its 24-route matrix passed 24 sequential plus 48 concurrent CUDA executions, the independent audit added 60, both 505/487 modes and the complete 992 suite pass, and fresh inventory reduced to 18 actionable outliers. The root cohesively owns retained job preparation/submission/completion, public benchmark adapters, row assembly, and small cache-source/type/test contracts. |

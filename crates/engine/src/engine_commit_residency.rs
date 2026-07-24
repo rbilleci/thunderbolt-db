@@ -24,6 +24,15 @@ impl Engine {
                         continue;
                     }
                     Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => {
+                        for target in record
+                            .index_lifecycle_operations
+                            .iter()
+                            .flat_map(|operation| &operation.targets)
+                        {
+                            if let Some(owner) = &target.owner_name {
+                                tables.insert(owner.clone());
+                            }
+                        }
                         for reset in record.table_resets {
                             tables.insert(reset.table);
                         }
@@ -35,6 +44,9 @@ impl Engine {
                                 Command::CreateView(_)
                                 | Command::RenameView(_)
                                 | Command::DropView(_) => {}
+                                Command::CreateIndex(_)
+                                | Command::RenameIndex(_)
+                                | Command::DropIndex(_) => {}
                                 _ => return None,
                             }
                         }

@@ -1,6 +1,6 @@
 use super::{
-    shard_fixed_width_key_offset, shard_key_column_blob_len, shard_key_column_blob_offset, Engine,
-    SqlValue,
+    shard_fixed_width_key_offset, shard_key_column_blob_len, shard_key_column_blob_offset,
+    shard_key_column_validity_offset, Engine, SqlValue,
 };
 
 impl Engine {
@@ -192,7 +192,14 @@ impl Engine {
             else {
                 continue;
             };
-            let columns = widths
+            let Some(validity_offsets) = positions
+                .iter()
+                .map(|&position| shard_key_column_validity_offset(shard, table, position))
+                .collect::<Option<Vec<Option<u64>>>>()
+            else {
+                continue;
+            };
+            let mut columns = widths
                 .iter()
                 .enumerate()
                 .map(|(idx, &width_words)| {
@@ -214,6 +221,19 @@ impl Engine {
                     }
                 })
                 .collect::<Vec<_>>();
+            let mut seen_validity = std::collections::BTreeSet::new();
+            columns.extend(
+                validity_offsets
+                    .iter()
+                    .flatten()
+                    .filter_map(|&bitmap_byte_offset| {
+                        seen_validity.insert(bitmap_byte_offset).then_some(
+                            gpu_db_execution::CudaCompoundFoldColumn::Validity {
+                                bitmap_byte_offset,
+                            },
+                        )
+                    }),
+            );
             let key = (table_name.to_string(), shard_id, key_id);
             let basis = {
                 let cache = self

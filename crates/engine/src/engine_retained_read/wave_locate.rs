@@ -1,7 +1,7 @@
 use super::{
-    shard_fixed_width_key_offset, shard_key_column_blob_len, shard_key_column_blob_offset, Arc,
-    CudaResidentDeviceMemory, Engine, RelationalTable, ShardDeviceIndexKey, VisibleLocateShard,
-    WaveVisibleLocate, WriteLocateShard,
+    shard_fixed_width_key_offset, shard_key_column_blob_len, shard_key_column_blob_offset,
+    shard_key_column_validity_offset, Arc, CudaResidentDeviceMemory, Engine, RelationalTable,
+    ShardDeviceIndexKey, VisibleLocateShard, WaveVisibleLocate, WriteLocateShard,
 };
 
 impl Engine {
@@ -194,6 +194,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_key_column_blob_len(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
+            let validity_offsets = positions
+                .iter()
+                .map(|&p| shard_key_column_validity_offset(shard, table, p))
+                .collect::<Option<Vec<Option<u64>>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // The descriptor flag alone cannot observe a concurrent generation replacement;
             // require the captured buffer to remain the authoritative device cell.
@@ -213,6 +217,7 @@ impl Engine {
                             offsets: &offsets,
                             blob_offsets: &blob_offsets,
                             blob_lens: &blob_lens,
+                            validity_offsets: &validity_offsets,
                         },
                         row_count: shard.row_count,
                         capacity_rows: shard.capacity as u64,
@@ -315,6 +320,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_key_column_blob_len(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
+            let validity_offsets = positions
+                .iter()
+                .map(|&p| shard_key_column_validity_offset(shard, table, p))
+                .collect::<Option<Vec<Option<u64>>>>()?;
             let device_memory = shard.device_memory.clone()?;
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
@@ -332,6 +341,7 @@ impl Engine {
                             offsets: &offsets,
                             blob_offsets: &blob_offsets,
                             blob_lens: &blob_lens,
+                            validity_offsets: &validity_offsets,
                         },
                         row_count: shard.row_count,
                         capacity_rows: shard.capacity as u64,

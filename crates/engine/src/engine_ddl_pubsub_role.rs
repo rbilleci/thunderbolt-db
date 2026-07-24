@@ -399,12 +399,34 @@ impl Engine {
         cat: &mut DdlCatalogState,
         rename: RenameSequence,
     ) -> Result<(), EngineError> {
-        if cat.relational_catalog.contains_key(&rename.old_name)
-            || cat.relational_views.contains_key(&rename.old_name)
-            || cat
-                .relational_materialized_views
-                .contains_key(&rename.old_name)
-        {
+        self.apply_rename_sequence_with_replay_policy(cat, rename, false)
+    }
+
+    pub(crate) fn apply_rename_sequence_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameSequence,
+    ) -> Result<(), EngineError> {
+        self.apply_rename_sequence_with_replay_policy(cat, rename, true)
+    }
+
+    fn apply_rename_sequence_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameSequence,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        let source_wrong_kind = if legacy_replay {
+            cat.relational_catalog.contains_key(&rename.old_name)
+                || cat.relational_views.contains_key(&rename.old_name)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&rename.old_name)
+        } else {
+            cat.pg_class_relation_kind(&rename.old_name)?
+                .is_some_and(|kind| kind != PgClassRelationKind::Sequence)
+        };
+        if source_wrong_kind {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a sequence",
                 rename.old_name
@@ -416,13 +438,17 @@ impl Engine {
                 rename.old_name
             )));
         }
-        if cat.relational_catalog.contains_key(&rename.new_name)
-            || cat.relational_views.contains_key(&rename.new_name)
-            || cat
-                .relational_materialized_views
-                .contains_key(&rename.new_name)
-            || cat.relational_sequences.contains_key(&rename.new_name)
-        {
+        let destination_exists = if legacy_replay {
+            cat.relational_catalog.contains_key(&rename.new_name)
+                || cat.relational_views.contains_key(&rename.new_name)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&rename.new_name)
+                || cat.relational_sequences.contains_key(&rename.new_name)
+        } else {
+            cat.pg_class_relation_kind(&rename.new_name)?.is_some()
+        };
+        if destination_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
@@ -454,22 +480,48 @@ impl Engine {
         cat: &mut DdlCatalogState,
         rename: RenameMaterializedView,
     ) -> Result<(), EngineError> {
-        if cat.relational_catalog.contains_key(&rename.old_name)
-            || cat.relational_views.contains_key(&rename.old_name)
-            || cat.relational_sequences.contains_key(&rename.old_name)
-        {
+        self.apply_rename_materialized_view_with_replay_policy(cat, rename, false)
+    }
+
+    pub(crate) fn apply_rename_materialized_view_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.apply_rename_materialized_view_with_replay_policy(cat, rename, true)
+    }
+
+    fn apply_rename_materialized_view_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameMaterializedView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        let source_wrong_kind = if legacy_replay {
+            cat.relational_catalog.contains_key(&rename.old_name)
+                || cat.relational_views.contains_key(&rename.old_name)
+                || cat.relational_sequences.contains_key(&rename.old_name)
+        } else {
+            cat.pg_class_relation_kind(&rename.old_name)?
+                .is_some_and(|kind| kind != PgClassRelationKind::MaterializedView)
+        };
+        if source_wrong_kind {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a materialized view",
                 rename.old_name
             )));
         }
-        if cat.relational_catalog.contains_key(&rename.new_name)
-            || cat.relational_views.contains_key(&rename.new_name)
-            || cat
-                .relational_materialized_views
-                .contains_key(&rename.new_name)
-            || cat.relational_sequences.contains_key(&rename.new_name)
-        {
+        let destination_exists = if legacy_replay {
+            cat.relational_catalog.contains_key(&rename.new_name)
+                || cat.relational_views.contains_key(&rename.new_name)
+                || cat
+                    .relational_materialized_views
+                    .contains_key(&rename.new_name)
+                || cat.relational_sequences.contains_key(&rename.new_name)
+        } else {
+            cat.pg_class_relation_kind(&rename.new_name)?.is_some()
+        };
+        if destination_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name

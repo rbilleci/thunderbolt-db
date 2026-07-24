@@ -369,12 +369,13 @@ pub(crate) fn compound_key_fingerprint(vals: &[i32]) -> i32 {
 
 /// FINGERPRINT INDEXES: the device-probe "key id" that identifies WHICH unique index a probe/gather
 /// targets. A raw single-column i32-section index keeps its catalog COLUMN INDEX verbatim
-/// (byte-compatible with every existing cache entry and offset computation). A fingerprint-backed index
-/// encodes `FLAG | ordinal` where `ordinal` is the index's position in `table.indexes` — a small,
-/// per-index-UNIQUE, collision-free discriminator. This includes compound indexes and single-column
-/// wider/text indexes. A probabilistic hash of the column set could alias two indexes and silently serve
-/// the wrong index buffer = a MISSED-duplicate correctness bug, so the ordinal is used, not a hash. The
-/// flag bit (the top usize bit) can never collide with a real column index (`< usize::MAX >> 1`).
+/// (byte-compatible with every existing cache entry and offset computation). A fingerprint-backed
+/// index encodes `FLAG | stable_index_oid`, a per-index-unique discriminator that survives rename
+/// and catalog reorder. This includes compound indexes and single-column wider/text indexes. A
+/// probabilistic hash of the column set could alias two indexes and silently serve the wrong index
+/// buffer = a MISSED-duplicate correctness bug, so the catalog-stable identity is used, not a hash.
+/// The flag bit (the top usize bit) can never collide with a real column index
+/// (`< usize::MAX >> 1`).
 pub(crate) const COMPOUND_KEY_ID_FLAG: usize = 1_usize << (usize::BITS - 1);
 
 /// COMPOUND KEYS: `true` when `index` spans more than one key column.
@@ -434,25 +435,16 @@ pub(crate) fn index_all_key_columns_foldable(
         })
 }
 
-/// The device-probe key id for `index` (see [`COMPOUND_KEY_ID_FLAG`]). `ordinal` is the index's
-/// position in `table.indexes`. Raw single-i32 -> the key column's catalog index; fingerprint-backed ->
-/// `FLAG | ordinal`. Returns `None` if the raw single key column can't be resolved.
-///
-/// CACHE SAFETY (audit): the ordinal is also the discriminator for the per-shard PK device-index
-/// cache `(table, shard_id, key_id)`, and DROP CONSTRAINT / DROP INDEX SHIFT ordinals. This is sound
-/// because EVERY index-shape DDL (CREATE/DROP INDEX, ADD/DROP PRIMARY KEY / UNIQUE) is an "other DDL"
-/// in `residency_invalidation_scope` -> the conservative GLOBAL `invalidate_relational_residency`,
-/// which runs `invalidate_relational_residency_table` for every resident table and thereby
-/// `purge_shard_pk_index_for_table` (engine_commit.rs). So no cache entry survives an ordinal shift;
-/// the next probe rebuilds against the current ordinals. Regression:
-/// `gpu_compound_drop_constraint_shifts_ordinal_without_aliasing_the_device_index`.
+/// The device-probe key id for `index` (see [`COMPOUND_KEY_ID_FLAG`]). Raw single-i32 -> the key
+/// column's catalog index; fingerprint-backed -> `FLAG | stable_index_oid`. The stable OID closes
+/// DROP/recreate and ordinal-shift ABA without relying on a global residency purge for correctness.
 pub(crate) fn index_probe_key_id(
     table: &RelationalTable,
     index: &RelationalIndex,
-    ordinal: usize,
+    _ordinal: usize,
 ) -> Option<usize> {
     if index_uses_fingerprint(table, index) {
-        Some(COMPOUND_KEY_ID_FLAG | ordinal)
+        Some(COMPOUND_KEY_ID_FLAG | index.oid as usize)
     } else {
         table.columns.iter().position(|c| c.name == index.column)
     }
@@ -460,12 +452,12 @@ pub(crate) fn index_probe_key_id(
 
 /// Decode a device-probe `key_id` (see [`index_probe_key_id`]) back to the ordered catalog positions
 /// of its key column(s). A raw single-i32 key id IS the column index (`[key_id]`); a fingerprint key id
-/// (`COMPOUND_KEY_ID_FLAG | ordinal`) resolves `table.indexes[ordinal].key_columns`.
-/// `None` if the ordinal / a named key column is out of range (a torn catalog -> the caller declines).
+/// (`COMPOUND_KEY_ID_FLAG | stable_index_oid`) resolves the matching catalog index.
+/// `None` if the OID / a named key column is absent (a torn catalog -> the caller declines).
 pub(crate) fn probe_key_id_positions(table: &RelationalTable, key_id: usize) -> Option<Vec<usize>> {
     if key_id & COMPOUND_KEY_ID_FLAG != 0 {
-        let ordinal = key_id & !COMPOUND_KEY_ID_FLAG;
-        index_key_column_positions(table, table.indexes.get(ordinal)?)
+        let oid = u32::try_from(key_id & !COMPOUND_KEY_ID_FLAG).ok()?;
+        index_key_column_positions(table, table.indexes.iter().find(|index| index.oid == oid)?)
     } else {
         Some(vec![key_id])
     }

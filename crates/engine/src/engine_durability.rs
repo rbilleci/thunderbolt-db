@@ -6,9 +6,14 @@ const ENGINE_OPERATION_MAGIC: &[u8; 8] = b"GPUDBOP1";
 const TRANSACTION_STATUS_MAGIC: &[u8; 12] = b"GPUDBSTATUS1";
 const ENGINE_OPERATION_CODEC_LEGACY_SQL: u8 = 1;
 const ENGINE_OPERATION_CODEC_RESOLVED_BINARY: u8 = 2;
-const ENGINE_OPERATION_CODEC_TYPED_COMMAND: u8 = 3;
+/// Historical canonical typed commands contain bare canonical JSON and replay with pre-PRODUCT-001
+/// catalog semantics.
+const ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1: u8 = 3;
+/// Additive discriminator for commands emitted after stable index OIDs/dependency policy landed.
+const ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2: u8 = 4;
 const ENGINE_TYPED_COMMAND_TAG: u8 = 0xfe;
-const ENGINE_TYPED_COMMAND_VERSION: u8 = 1;
+const ENGINE_TYPED_COMMAND_VERSION_LEGACY: u8 = 1;
+const ENGINE_TYPED_COMMAND_VERSION_CURRENT: u8 = 2;
 static CANONICAL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl Engine {
@@ -101,6 +106,7 @@ impl Engine {
         base: &std::path::Path,
         records: &[WalRecord],
     ) -> Result<(), EngineError> {
+        self.prepare_legacy_index_oid_recovery(records)?;
         let mut record_identity = None;
         for record in records {
             let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)?
@@ -136,6 +142,171 @@ impl Engine {
             ))),
             (None, None) => self.install_fresh_durable_identity(base),
         }
+    }
+
+    fn recovery_scan_payload(record: &WalRecord) -> Result<Arc<[u8]>, EngineError> {
+        if let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)? {
+            let operation = envelope.fragments.first().ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "canonical WAL record {} has no operation fragment",
+                    record.txn_id
+                ))
+            })?;
+            return Self::decode_engine_operation(&operation.body);
+        }
+        if record.payload.first() == Some(&WAL_BINARY_TAG)
+            || record.payload.first() == Some(&ENGINE_TYPED_COMMAND_TAG)
+        {
+            return Ok(Arc::clone(&record.payload));
+        }
+        let command = Self::decode_engine_command(&record.payload)?.ok_or_else(|| {
+            EngineError::Durability(format!(
+                "legacy WAL record {} has no engine command",
+                record.txn_id
+            ))
+        })?;
+        Self::encode_replay_typed_command(&command, ENGINE_TYPED_COMMAND_VERSION_LEGACY)
+    }
+
+    fn legacy_catalog_oid_allocations(command: &Command) -> Result<u32, EngineError> {
+        let count = match command {
+            Command::CreateTable(create) => 1usize.saturating_add(
+                create
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        matches!(
+                            column.default,
+                            Some(ColumnDefault::SequenceNextVal {
+                                create_if_missing: true,
+                                ..
+                            })
+                        )
+                    })
+                    .count(),
+            ),
+            Command::CreateView(_)
+            | Command::CreateMaterializedView(_)
+            | Command::CreateFunction(_)
+            | Command::CreateSequence(_)
+            | Command::CreateDomain(_)
+            | Command::CreateDatabase(_)
+            | Command::CreateTablespace(_)
+            | Command::CreatePublication(_)
+            | Command::CreateSubscription(_)
+            | Command::CreateRole(_) => 1,
+            _ => 0,
+        };
+        u32::try_from(count).map_err(|_| {
+            EngineError::Durability(
+                "historical catalog operation has too many implicit OID allocations".to_string(),
+            )
+        })
+    }
+
+    /// Inspect the complete historical prefix before replay can synthesize any index identity.
+    /// Pre-PRODUCT-001 indexes did not consume `relational_next_oid`, so a one-pass replay could
+    /// otherwise assign an index OID that a later old table record still owns.  This read-only pass
+    /// establishes a conservative low-range high-water first; replay then uses a separate
+    /// recovery-only cursor and folds it into the shared allocator at the first current epoch.
+    pub(crate) fn prepare_legacy_index_oid_recovery(
+        &self,
+        records: &[WalRecord],
+    ) -> Result<(), EngineError> {
+        // File/lane recovery binds and scans the complete durable source first, then replays its
+        // checkpoint/prefix and suffix in separate calls. Once an earlier replay chunk has crossed
+        // the one-way index-identity boundary, a later chunk must inherit that fact: byte-stable
+        // index-neutral legacy opcodes remain legal, but they must not be reclassified as an old
+        // low-OID prefix. A fresh engine also starts `index_oid_epoch_current=true`, so only trust
+        // the value after the complete-source floor has been prepared.
+        let mut current_epoch_seen = {
+            let catalog = self.ddl_catalog();
+            catalog.legacy_recovery_floor_prepared && catalog.index_oid_epoch_current
+        };
+        let mut low_oid_high_water = FIRST_USER_RELATION_OID;
+        let mut has_legacy_prefix = false;
+        for record in records {
+            let payload = Self::recovery_scan_payload(record)?;
+            if payload.first() == Some(&WAL_BINARY_TAG) {
+                let BinaryWalRecord::Transaction(transaction) = decode_binary_record(&payload)?
+                else {
+                    continue;
+                };
+                if transaction.catalog_commands.is_empty() {
+                    continue;
+                }
+                match transaction.catalog_epoch {
+                    BinaryTransactionCatalogEpoch::IndexIdentityV1 => {
+                        current_epoch_seen = true;
+                    }
+                    BinaryTransactionCatalogEpoch::Legacy => {
+                        let requires_index_epoch =
+                            transaction.catalog_commands.iter().any(|operation| {
+                                command_requires_index_catalog_opcode(&operation.command)
+                            });
+                        if current_epoch_seen && requires_index_epoch {
+                            return Err(EngineError::Durability(
+                                "legacy transaction catalog record follows the PRODUCT-001 index identity boundary"
+                                    .to_string(),
+                            ));
+                        }
+                        if current_epoch_seen {
+                            // Byte-stable index-neutral opcodes remain legal after the one-way
+                            // migration. They execute against the already-current shared
+                            // allocator and cannot synthesize another legacy index identity.
+                            continue;
+                        }
+                        has_legacy_prefix |= requires_index_epoch;
+                        if let Some(output) = &transaction.catalog_output {
+                            low_oid_high_water = low_oid_high_water.max(output.relational_next_oid);
+                        } else {
+                            for operation in &transaction.catalog_commands {
+                                low_oid_high_water = low_oid_high_water
+                                    .checked_add(Self::legacy_catalog_oid_allocations(
+                                        &operation.command,
+                                    )?)
+                                    .ok_or_else(|| {
+                                        EngineError::Durability(
+                                            "historical catalog OID prefix overflows".to_string(),
+                                        )
+                                    })?;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            let command = Self::decode_engine_command(&payload)?.ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "WAL record {} has no typed catalog command",
+                    record.txn_id
+                ))
+            })?;
+            if Self::engine_command_uses_current_index_semantics(&payload) {
+                current_epoch_seen = true;
+                continue;
+            }
+            if current_epoch_seen && command_requires_index_catalog_opcode(&command) {
+                return Err(EngineError::Durability(
+                    "legacy typed command follows the PRODUCT-001 index identity boundary"
+                        .to_string(),
+                ));
+            }
+            if current_epoch_seen {
+                continue;
+            }
+            has_legacy_prefix |= command_requires_index_catalog_opcode(&command);
+            low_oid_high_water = low_oid_high_water
+                .checked_add(Self::legacy_catalog_oid_allocations(&command)?)
+                .ok_or_else(|| {
+                    EngineError::Durability("historical catalog OID prefix overflows".to_string())
+                })?;
+        }
+        let mut catalog = self.ddl_catalog();
+        catalog.prepare_legacy_index_oid_recovery_floor(
+            low_oid_high_water.max(FIRST_LEGACY_RECOVERY_INDEX_OID),
+            has_legacy_prefix,
+        )
     }
 
     fn canonical_fragment_kind(
@@ -231,7 +402,7 @@ impl Engine {
                     "canonical WAL typed command encode failed: {error}"
                 ))
             })?;
-            (ENGINE_OPERATION_CODEC_TYPED_COMMAND, bytes)
+            (ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2, bytes)
         };
         let len = u64::try_from(canonical_payload.len()).map_err(|_| {
             EngineError::Durability("canonical WAL operation length overflow".to_string())
@@ -261,7 +432,12 @@ impl Engine {
                 EngineError::Durability(format!("engine command parse failed: {error}"))
             });
         }
-        if payload.len() < 10 || payload[1] != ENGINE_TYPED_COMMAND_VERSION {
+        if payload.len() < 10
+            || !matches!(
+                payload[1],
+                ENGINE_TYPED_COMMAND_VERSION_LEGACY | ENGINE_TYPED_COMMAND_VERSION_CURRENT
+            )
+        {
             return Err(EngineError::Durability(
                 "typed engine command has an unsupported or truncated header".to_string(),
             ));
@@ -276,6 +452,33 @@ impl Engine {
         serde_json::from_slice(body).map(Some).map_err(|error| {
             EngineError::Durability(format!("typed engine command decode failed: {error}"))
         })
+    }
+
+    pub(crate) fn engine_command_uses_current_index_semantics(payload: &[u8]) -> bool {
+        payload.first() != Some(&ENGINE_TYPED_COMMAND_TAG)
+            || payload.get(1) == Some(&ENGINE_TYPED_COMMAND_VERSION_CURRENT)
+    }
+
+    fn encode_replay_typed_command(
+        command: &Command,
+        version: u8,
+    ) -> Result<Arc<[u8]>, EngineError> {
+        let canonical = serde_json::to_vec(command).map_err(|error| {
+            EngineError::Durability(format!("typed replay command encode failed: {error}"))
+        })?;
+        let mut replay = Vec::with_capacity(10 + canonical.len());
+        replay.push(ENGINE_TYPED_COMMAND_TAG);
+        replay.push(version);
+        replay.extend_from_slice(&(canonical.len() as u64).to_le_bytes());
+        replay.extend_from_slice(&canonical);
+        Ok(Arc::from(replay))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encode_legacy_replay_command_for_test(
+        command: &Command,
+    ) -> Result<Arc<[u8]>, EngineError> {
+        Self::encode_replay_typed_command(command, ENGINE_TYPED_COMMAND_VERSION_LEGACY)
     }
 
     fn encode_transaction_claim_status(
@@ -335,7 +538,8 @@ impl Engine {
             codec,
             ENGINE_OPERATION_CODEC_LEGACY_SQL
                 | ENGINE_OPERATION_CODEC_RESOLVED_BINARY
-                | ENGINE_OPERATION_CODEC_TYPED_COMMAND
+                | ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1
+                | ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2
         ) || body[ENGINE_OPERATION_MAGIC.len() + 1..ENGINE_OPERATION_MAGIC.len() + 4] != [0; 3]
         {
             return Err(EngineError::Durability(
@@ -366,14 +570,14 @@ impl Engine {
                         "legacy canonical SQL operation is not UTF-8".to_string(),
                     )
                 })?;
-                parse_command(text).map_err(|error| {
+                let command = parse_command(text).map_err(|error| {
                     EngineError::Durability(format!(
                         "legacy canonical SQL operation is invalid: {error}"
                     ))
                 })?;
-                Ok(Arc::from(payload))
+                Self::encode_replay_typed_command(&command, ENGINE_TYPED_COMMAND_VERSION_LEGACY)
             }
-            ENGINE_OPERATION_CODEC_TYPED_COMMAND => {
+            ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1 | ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2 => {
                 let command: Command = serde_json::from_slice(payload).map_err(|error| {
                     EngineError::Durability(format!(
                         "canonical typed command decode failed: {error}"
@@ -389,12 +593,14 @@ impl Engine {
                         "canonical typed command uses a non-canonical serialization".to_string(),
                     ));
                 }
-                let mut replay = Vec::with_capacity(10 + canonical.len());
-                replay.push(ENGINE_TYPED_COMMAND_TAG);
-                replay.push(ENGINE_TYPED_COMMAND_VERSION);
-                replay.extend_from_slice(&(canonical.len() as u64).to_le_bytes());
-                replay.extend_from_slice(&canonical);
-                Ok(Arc::from(replay))
+                Self::encode_replay_typed_command(
+                    &command,
+                    if codec == ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1 {
+                        ENGINE_TYPED_COMMAND_VERSION_LEGACY
+                    } else {
+                        ENGINE_TYPED_COMMAND_VERSION_CURRENT
+                    },
+                )
             }
             _ => unreachable!("codec checked above"),
         }
@@ -822,11 +1028,51 @@ impl Engine {
             else {
                 if canonical_seen {
                     return Err(EngineError::Durability(format!(
-                        "legacy WAL record {} follows the canonical migration barrier",
+                        "legacy WAL record {} follows the canonical migration boundary",
                         record.txn_id
                     )));
                 }
-                replay.push(record.clone());
+                let payload = if record.payload.first() == Some(&WAL_BINARY_TAG) {
+                    // Binary opcodes carry their own durable catalog epoch.
+                    decode_binary_record(&record.payload)?;
+                    Arc::clone(&record.payload)
+                } else if record.payload.first() == Some(&ENGINE_TYPED_COMMAND_TAG) {
+                    let command =
+                        Self::decode_engine_command(&record.payload)?.ok_or_else(|| {
+                            EngineError::Durability(
+                                "typed WAL record has no engine command".to_string(),
+                            )
+                        })?;
+                    let canonical = Self::encode_replay_typed_command(
+                        &command,
+                        if Self::engine_command_uses_current_index_semantics(&record.payload) {
+                            ENGINE_TYPED_COMMAND_VERSION_CURRENT
+                        } else {
+                            ENGINE_TYPED_COMMAND_VERSION_LEGACY
+                        },
+                    )?;
+                    if canonical.as_ref() != record.payload.as_ref() {
+                        return Err(EngineError::Durability(
+                            "typed WAL record uses a non-canonical serialization".to_string(),
+                        ));
+                    }
+                    canonical
+                } else {
+                    let command =
+                        Self::decode_engine_command(&record.payload)?.ok_or_else(|| {
+                            EngineError::Durability(
+                                "legacy WAL record has no typed engine command".to_string(),
+                            )
+                        })?;
+                    Self::encode_replay_typed_command(
+                        &command,
+                        ENGINE_TYPED_COMMAND_VERSION_LEGACY,
+                    )?
+                };
+                replay.push(WalRecord {
+                    txn_id: record.txn_id,
+                    payload,
+                });
                 expected_commit_seq = expected_commit_seq.checked_add(1).ok_or_else(|| {
                     EngineError::Durability(
                         "WAL commit sequence overflow during recovery".to_string(),
@@ -982,6 +1228,9 @@ impl Engine {
     }
 
     pub(crate) fn replay_durable_records(&self, records: &[WalRecord]) -> Result<(), EngineError> {
+        // `bind_durable_identity_for_recovery` supplies the complete multi-lane/file source.
+        // In-memory and test recovery enter here directly with their complete source.
+        self.prepare_legacy_index_oid_recovery(records)?;
         let mut claims = Vec::new();
         let mut outcomes = Vec::with_capacity(records.len());
         for record in records {
@@ -1140,6 +1389,9 @@ mod tests {
     use super::*;
     use crate::engine_transaction_reset::table_schema_digest;
 
+    #[path = "product_001_tests.rs"]
+    mod product_001_tests;
+
     #[test]
     fn pre_product_002_typed_dml_bodies_remain_canonical() {
         const OLD_BODIES: [&[u8]; 3] = [
@@ -1152,7 +1404,7 @@ mod tests {
             let mut operation =
                 Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + old_body.len());
             operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
-            operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND);
+            operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1);
             operation.extend_from_slice(&[0; 3]);
             operation.extend_from_slice(&(old_body.len() as u64).to_le_bytes());
             operation.extend_from_slice(old_body);
@@ -1215,29 +1467,25 @@ mod tests {
 
         // Opcode 8 historically counted only its existing-table mutation output, not the table
         // created by its catalog prefix. Exercise that exact canonical recovery shape as well.
-        let prefix = Engine::new_local();
-        prefix
-            .commit_mutation(
-                6_902,
-                Arc::from(&b"CREATE TABLE legacy_identity_rows (id int4)"[..]),
-            )
-            .unwrap();
-        let prefix_records = prefix.durable_wal_records();
-        let prefix_envelope =
-            gpu_db_wal::decode_canonical_record_payload(&prefix_records.last().unwrap().payload)
-                .unwrap()
-                .unwrap();
+        let prefix_records = vec![WalRecord {
+            txn_id: 6_902,
+            payload: Arc::from(&b"CREATE TABLE legacy_identity_rows (id int4)"[..]),
+        }];
+        let prefix = Engine::recover_from_durable_wal(&prefix_records).unwrap();
         let table = prefix.catalog_snapshot().relational_catalog["legacy_identity_rows"].clone();
         let legacy_identity = BinaryTransactionRecord {
+            catalog_epoch: BinaryTransactionCatalogEpoch::Legacy,
             allocator_high_water: 2,
             catalog_commands: vec![BinaryTransactionCatalogCommand {
                 ordinal: 0,
                 command: parse_command("CREATE TABLE legacy_identity_created (id int4)").unwrap(),
             }],
             created_table_identities: BTreeMap::new(),
+            created_table_index_identities: BTreeMap::new(),
             catalog_output: None,
             view_operations: Vec::new(),
             view_lifecycle_operations: Vec::new(),
+            index_lifecycle_operations: Vec::new(),
             operation_order: Vec::new(),
             statement_digests: Vec::new(),
             sequence_input_oids: BTreeMap::new(),
@@ -1259,10 +1507,11 @@ mod tests {
         let legacy_payload: Arc<[u8]> =
             Arc::from(try_encode_binary_transaction(&legacy_identity).unwrap());
         assert_eq!(legacy_payload[..3], [255, 1, 8]);
+        let legacy_identity_anchor = Engine::fresh_canonical_identity();
         let legacy_record = Engine::canonical_wal_record_with_boundary_and_request_digest(
-            prefix_envelope.header.identity,
-            prefix_envelope.header.catalog_after_epoch,
-            prefix_envelope.header.catalog_after_digest,
+            legacy_identity_anchor,
+            0,
+            Engine::canonical_genesis_catalog_digest(legacy_identity_anchor),
             6_903,
             2,
             0,
@@ -1299,7 +1548,7 @@ mod tests {
         for old_body in OLD_BODIES {
             let mut typed = Vec::with_capacity(10 + old_body.len());
             typed.push(ENGINE_TYPED_COMMAND_TAG);
-            typed.push(ENGINE_TYPED_COMMAND_VERSION);
+            typed.push(ENGINE_TYPED_COMMAND_VERSION_LEGACY);
             typed.extend_from_slice(&(old_body.len() as u64).to_le_bytes());
             typed.extend_from_slice(old_body);
             let command = Engine::decode_engine_command(&typed)
@@ -1316,7 +1565,7 @@ mod tests {
             let mut operation =
                 Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + old_body.len());
             operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
-            operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND);
+            operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1);
             operation.extend_from_slice(&[0; 3]);
             operation.extend_from_slice(&(old_body.len() as u64).to_le_bytes());
             operation.extend_from_slice(old_body);
@@ -1345,7 +1594,7 @@ mod tests {
         let mut current_operation =
             Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + current_body.len());
         current_operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
-        current_operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND);
+        current_operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2);
         current_operation.extend_from_slice(&[0; 3]);
         current_operation.extend_from_slice(&(current_body.len() as u64).to_le_bytes());
         current_operation.extend_from_slice(&current_body);
@@ -1481,7 +1730,7 @@ mod tests {
             Ok(_) => panic!("legacy suffix crossed the canonical migration barrier"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("migration barrier"), "{error}");
+        assert!(error.to_string().contains("boundary"), "{error}");
 
         // Re-encode a self-consistent envelope with a forged logical catalog boundary. Byte-level
         // checksums alone cannot detect this; recovery must bind it to the preceding record.

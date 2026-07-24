@@ -34,6 +34,10 @@ pub struct RelationalColumn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalIndex {
+    /// Catalog-stable index identity. Unlike the compatibility catalog's former sorted-position
+    /// synthesis, this survives rename/reorder and is never reused after DROP, closing index-name
+    /// ABA for transactional catalog replay and retained prepared routes.
+    pub oid: u32,
     pub name: String,
     pub table: String,
     /// The FIRST key column (== `key_columns[0]`). Kept for the many single-column call sites

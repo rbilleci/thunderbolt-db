@@ -613,8 +613,251 @@ struct DdlCatalogState {
     // The value-index and the relational row-id allocator are now folded into `mvcc`
     // (per-table `TableVersionData::value_index` + `MvccData::next_row_id`).
     relational_resident_cache: RelationalResidentCache,
+    /// Sole `pg_class.oid` allocation authority for tables, indexes, views, sequences, and every
+    /// other relation-shaped catalog object.
     relational_next_oid: u32,
+    /// Recovery-only cursor for stable identities synthesized for pre-PRODUCT-001 indexes.  It is
+    /// initialized above every low-range OID the complete historical prefix can allocate, starts at
+    /// 20,000 for ordinary databases, and is retired into `relational_next_oid` at the first
+    /// current-format command.  It is never a live/product allocation path.
+    legacy_recovery_next_index_oid: u32,
+    legacy_recovery_index_oids_assigned: bool,
+    /// Set only after recovery has inspected the complete durable prefix.  Legacy index
+    /// identities must never be synthesized from a partial chunk whose unseen suffix can still
+    /// allocate a low-range `pg_class` OID.
+    legacy_recovery_floor_prepared: bool,
+    index_oid_epoch_current: bool,
     relational_next_column_id: u32,
+}
+
+const FIRST_LEGACY_RECOVERY_INDEX_OID: u32 = 20_000;
+const MAX_CATALOG_OID: u32 = i32::MAX as u32;
+
+/// Exact `pg_class`-style relation kind for the shared public-schema name authority. Domains and
+/// functions live in distinct PostgreSQL namespaces; table-backed indexes do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PgClassRelationKind {
+    Table,
+    Index,
+    View,
+    MaterializedView,
+    Sequence,
+}
+
+fn resolve_pg_class_relation_kind(
+    name: &str,
+    table: bool,
+    index_count: usize,
+    view: bool,
+    materialized_view: bool,
+    sequence: bool,
+) -> Result<Option<PgClassRelationKind>, EngineError> {
+    if index_count > 1 {
+        return Err(EngineError::Durability(format!(
+            "catalog contains multiple indexes named \"{name}\""
+        )));
+    }
+    let candidates = [
+        table.then_some(PgClassRelationKind::Table),
+        (index_count == 1).then_some(PgClassRelationKind::Index),
+        view.then_some(PgClassRelationKind::View),
+        materialized_view.then_some(PgClassRelationKind::MaterializedView),
+        sequence.then_some(PgClassRelationKind::Sequence),
+    ];
+    let mut found = None;
+    for candidate in candidates.into_iter().flatten() {
+        if found.replace(candidate).is_some() {
+            return Err(EngineError::Durability(format!(
+                "catalog contains multiple pg_class relations named \"{name}\""
+            )));
+        }
+    }
+    Ok(found)
+}
+
+impl DdlCatalogState {
+    fn pg_class_relation_kind(
+        &self,
+        name: &str,
+    ) -> Result<Option<PgClassRelationKind>, EngineError> {
+        resolve_pg_class_relation_kind(
+            name,
+            self.relational_catalog.contains_key(name),
+            self.relational_catalog
+                .values()
+                .map(|table| {
+                    table
+                        .indexes
+                        .iter()
+                        .filter(|index| index.name == name)
+                        .count()
+                })
+                .sum(),
+            self.relational_views.contains_key(name),
+            self.relational_materialized_views.contains_key(name),
+            self.relational_sequences.contains_key(name),
+        )
+    }
+
+    fn relational_class_oid_in_use(&self, oid: u32) -> bool {
+        self.relational_catalog
+            .values()
+            .any(|table| table.oid == oid || table.indexes.iter().any(|index| index.oid == oid))
+            || self
+                .relational_views
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_materialized_views
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_functions
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_sequences
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_domains
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_publications
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_subscriptions
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_roles
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_databases
+                .values()
+                .any(|relation| relation.oid == oid)
+            || self
+                .relational_tablespaces
+                .values()
+                .any(|relation| relation.oid == oid)
+    }
+
+    /// Sole allocator for every newly admitted relation-shaped identity.
+    fn allocate_relational_class_oid(
+        &mut self,
+        exhausted_message: &'static str,
+    ) -> Result<u32, EngineError> {
+        let oid = self.relational_next_oid;
+        if !self.index_oid_epoch_current
+            || oid > MAX_CATALOG_OID
+            || self.relational_class_oid_in_use(oid)
+        {
+            return Err(EngineError::ApplyFailed(exhausted_message.to_string()));
+        }
+        self.relational_next_oid = oid
+            .checked_add(1)
+            .ok_or_else(|| EngineError::ApplyFailed(exhausted_message.to_string()))?;
+        Ok(oid)
+    }
+
+    /// Sequentially assign the compatibility identity that the original PRODUCT-001 migration used
+    /// for a pre-slice index.  The cursor has already been placed above the complete old prefix's
+    /// relation high-water, so these identities cannot collide with a later historical table.
+    fn migrated_legacy_index_oid(&mut self, pending: &BTreeSet<u32>) -> Result<u32, EngineError> {
+        if !self.legacy_recovery_floor_prepared {
+            return Err(EngineError::Durability(
+                "legacy index identity migration has no complete-prefix OID floor".to_string(),
+            ));
+        }
+        if self.index_oid_epoch_current {
+            return Err(EngineError::Durability(
+                "legacy index catalog record follows the PRODUCT-001 OID migration boundary"
+                    .to_string(),
+            ));
+        }
+        let mut candidate = self
+            .legacy_recovery_next_index_oid
+            .max(FIRST_LEGACY_RECOVERY_INDEX_OID);
+        loop {
+            if candidate > MAX_CATALOG_OID {
+                return Err(EngineError::ApplyFailed(
+                    "historical index OID migration exceeds the GPU catalog Int4 domain"
+                        .to_string(),
+                ));
+            }
+            if !pending.contains(&candidate) && !self.relational_class_oid_in_use(candidate) {
+                self.legacy_recovery_next_index_oid =
+                    candidate.checked_add(1).ok_or_else(|| {
+                        EngineError::ApplyFailed(
+                            "historical index OID migration range is exhausted".to_string(),
+                        )
+                    })?;
+                self.legacy_recovery_index_oids_assigned = true;
+                return Ok(candidate);
+            }
+            candidate = candidate.checked_add(1).ok_or_else(|| {
+                EngineError::ApplyFailed(
+                    "historical index OID migration range is exhausted".to_string(),
+                )
+            })?;
+        }
+    }
+
+    /// One-way transition from replay-only index identities to the sole shared live allocator.
+    fn finalize_legacy_index_oid_migration(&mut self) -> Result<(), EngineError> {
+        if self.index_oid_epoch_current {
+            return Ok(());
+        }
+        if self.legacy_recovery_index_oids_assigned {
+            self.relational_next_oid = self
+                .relational_next_oid
+                .max(self.legacy_recovery_next_index_oid);
+        }
+        if self.relational_next_oid > MAX_CATALOG_OID + 1 {
+            return Err(EngineError::ApplyFailed(
+                "relational catalog OID migration exceeds the GPU catalog Int4 domain".to_string(),
+            ));
+        }
+        self.index_oid_epoch_current = true;
+        Ok(())
+    }
+
+    fn prepare_legacy_index_oid_recovery_floor(
+        &mut self,
+        floor: u32,
+        has_legacy_prefix: bool,
+    ) -> Result<(), EngineError> {
+        let exhausted_high_water = MAX_CATALOG_OID + 1;
+        if floor > exhausted_high_water || (has_legacy_prefix && floor > MAX_CATALOG_OID) {
+            return Err(EngineError::Durability(
+                "historical catalog OID prefix exceeds the GPU catalog Int4 domain".to_string(),
+            ));
+        }
+        if self.legacy_recovery_floor_prepared {
+            if self.legacy_recovery_index_oids_assigned
+                && floor > self.legacy_recovery_next_index_oid
+            {
+                return Err(EngineError::Durability(
+                    "legacy index OID floor changed after recovery assigned identities".to_string(),
+                ));
+            }
+            self.legacy_recovery_next_index_oid = self.legacy_recovery_next_index_oid.max(floor);
+            return Ok(());
+        }
+        self.legacy_recovery_floor_prepared = true;
+        if !has_legacy_prefix {
+            return Ok(());
+        }
+        self.index_oid_epoch_current = false;
+        self.legacy_recovery_next_index_oid = self
+            .legacy_recovery_next_index_oid
+            .max(FIRST_LEGACY_RECOVERY_INDEX_OID)
+            .max(floor);
+        Ok(())
+    }
 }
 
 /// The commit-critical mutable substate bundled behind the engine's commit_mutex (write-half MVCC,

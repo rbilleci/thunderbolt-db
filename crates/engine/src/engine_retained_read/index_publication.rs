@@ -67,16 +67,51 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_named_index_publication_post_publish_hook(
+        &self,
+        reached: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .read_state
+            .residency
+            .named_index_publication_post_publish_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, resume));
+    }
+
+    #[cfg(test)]
+    fn run_named_index_publication_post_publish_hook(&self) {
+        let hook = self
+            .read_state
+            .residency
+            .named_index_publication_post_publish_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((reached, resume)) = hook {
+            reached.wait();
+            resume.wait();
+        }
+    }
+
     pub(crate) fn relational_named_index_publication_required(
         &self,
         table: &RelationalTable,
     ) -> bool {
-        self.read_state
-            .residency
-            .named_index_publications
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&table.oid)
+        // The catalog supplied by the active apply scope is authoritative. A DROP-all transaction
+        // can retain the pre-commit publication marker until lifecycle maintenance retires it, but
+        // that stale marker must never make a concurrent DML rollover rebuild indexes absent from
+        // the transaction's final catalog (or reserve their device bytes before WAL).
+        !table.indexes.is_empty()
+            && self
+                .read_state
+                .residency
+                .named_index_publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&table.oid)
     }
 
     /// Build/reuse every named primary and secondary index directly from one authoritative resident
@@ -258,18 +293,6 @@ impl Engine {
                     .residency
                     .named_index_publication_shard_visits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if positions.iter().any(|&position| {
-                    let column_name = table.columns[position].name.as_str();
-                    shard
-                        .resident_device_null_columns
-                        .iter()
-                        .any(|layout| layout.name == column_name)
-                }) {
-                    return Err(publication_error(format!(
-                        "index \"{}\" contains a NULL key; resident named-index NULL postings are not yet supported",
-                        index.name
-                    )));
-                }
                 let offsets = positions
                     .iter()
                     .map(|&position| shard_fixed_width_key_offset(shard, table, position))
@@ -300,6 +323,16 @@ impl Engine {
                             index.name
                         ))
                     })?;
+                let validity_offsets = positions
+                    .iter()
+                    .map(|&position| shard_key_column_validity_offset(shard, table, position))
+                    .collect::<Option<Vec<Option<u64>>>>()
+                    .ok_or_else(|| {
+                        publication_error(format!(
+                            "index \"{}\" has an unavailable resident validity section",
+                            index.name
+                        ))
+                    })?;
                 let resident = shard.device_memory.clone().ok_or_else(|| {
                     publication_error(format!(
                         "index \"{}\" shard {} has no device allocation",
@@ -325,6 +358,7 @@ impl Engine {
                                 offsets: &offsets,
                                 blob_offsets: &blob_offsets,
                                 blob_lens: &blob_lens,
+                                validity_offsets: &validity_offsets,
                             },
                             row_count: shard.row_count,
                             capacity_rows: shard.capacity as u64,
@@ -478,6 +512,12 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(table.oid, table.indexes.clone());
+        drop(coverage);
+        drop(cache);
+        drop(_route_publish);
+
+        #[cfg(test)]
+        self.run_named_index_publication_post_publish_hook();
 
         Ok(RelationalResidentIndexPublication {
             table: table.name.clone(),

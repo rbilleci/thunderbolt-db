@@ -438,6 +438,9 @@ impl CatalogHistory {
                 relational_public_schema_exists: true,
                 relational_public_schema_implicit: true,
                 relational_next_oid: FIRST_USER_RELATION_OID,
+                index_oid_epoch_current: true,
+                legacy_recovery_index_oids_assigned: false,
+                legacy_recovery_next_index_oid: FIRST_LEGACY_RECOVERY_INDEX_OID,
                 relational_next_column_id: FIRST_USER_COLUMN_ID,
                 ..CatalogSnapshot::default()
             })],
@@ -537,10 +540,39 @@ pub(crate) struct CatalogSnapshot {
     /// are unchanged; otherwise replaying the staged command could silently assign different OIDs
     /// or column identities than the private catalog used by later statements.
     pub(crate) relational_next_oid: u32,
+    /// One-way stable-index identity migration state is part of the allocator proof. A transaction
+    /// may not rebase across this boundary or forget recovery-assigned identities while retaining
+    /// an otherwise byte-identical catalog.
+    pub(crate) index_oid_epoch_current: bool,
+    pub(crate) legacy_recovery_index_oids_assigned: bool,
+    pub(crate) legacy_recovery_next_index_oid: u32,
     pub(crate) relational_next_column_id: u32,
 }
 
 impl CatalogSnapshot {
+    pub(crate) fn pg_class_relation_kind(
+        &self,
+        name: &str,
+    ) -> Result<Option<PgClassRelationKind>, EngineError> {
+        resolve_pg_class_relation_kind(
+            name,
+            self.relational_catalog.contains_key(name),
+            self.relational_catalog
+                .values()
+                .map(|table| {
+                    table
+                        .indexes
+                        .iter()
+                        .filter(|index| index.name == name)
+                        .count()
+                })
+                .sum(),
+            self.relational_views.contains_key(name),
+            self.relational_materialized_views.contains_key(name),
+            self.relational_sequences.contains_key(name),
+        )
+    }
+
     /// Compare the complete catalog authority while deliberately ignoring only its publication
     /// sequence. Every commit republishes the unchanged working catalog at a newer sequence, so
     /// exact equality would spuriously serialize transaction-private DDL after ordinary DML/KV.
@@ -570,6 +602,41 @@ struct TransactionNamedIndexLifecycle {
     publication_active: bool,
     protected_tables: BTreeSet<String>,
     deferred_purges: BTreeSet<String>,
+    final_publication_tables: BTreeSet<String>,
+    post_publication_deferred_purges: BTreeSet<String>,
+}
+
+std::thread_local! {
+    static TRANSACTION_NAMED_INDEX_PUBLICATION_OWNER_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Marks the sole canonical apply thread so its own generation-replacement purges bypass the
+/// external-retirement deferral window. The marker is thread-local: pressure/retirement callers on
+/// any other thread remain deferred and are replayed after final publication.
+pub(crate) struct TransactionNamedIndexPublicationOwnerGuard;
+
+impl TransactionNamedIndexPublicationOwnerGuard {
+    pub(crate) fn enter() -> Self {
+        TRANSACTION_NAMED_INDEX_PUBLICATION_OWNER_ACTIVE.with(|active| {
+            debug_assert!(
+                !active.replace(true),
+                "transaction named-index publication owner cannot nest"
+            );
+        });
+        Self
+    }
+}
+
+impl Drop for TransactionNamedIndexPublicationOwnerGuard {
+    fn drop(&mut self) {
+        TRANSACTION_NAMED_INDEX_PUBLICATION_OWNER_ACTIVE.with(|active| {
+            debug_assert!(
+                active.replace(false),
+                "transaction named-index publication owner marker was lost"
+            );
+        });
+    }
 }
 
 /// A composite transaction has restored every enrolled index before WAL and is carrying that
@@ -577,14 +644,29 @@ struct TransactionNamedIndexLifecycle {
 /// the final guard releases and performs those purges only after device publication finishes.
 pub(crate) struct TransactionNamedIndexPublicationGuard<'a> {
     residency: &'a ResidencyReadState,
+    final_publication_entered: bool,
     finished: bool,
 }
 
 impl TransactionNamedIndexPublicationGuard<'_> {
-    /// Linearize a successful canonical generation publication. Purges deferred while the old
-    /// generation was authoritative are superseded by this new publication; dropping without
-    /// completion instead applies them to clean up an aborted preflight or failed apply.
+    /// Enter canonical apply's final-publication phase. A purge deferred before this point is
+    /// superseded by the pending publication. Every external purge from this point through guard
+    /// completion is conservatively replayed afterward, even when it overlaps an intermediate
+    /// rebuild; canonical owner's own retirements use the explicit during-transaction bypass.
+    pub(crate) fn enter_final_publication(&mut self) {
+        self.residency
+            .enter_transaction_named_index_final_publication();
+        self.final_publication_entered = true;
+    }
+
+    /// Complete a successful canonical generation publication. Purges deferred before its final
+    /// phase are superseded; final-phase purges retire the published generation. Dropping without
+    /// completion applies every request to clean up an aborted preflight or failed apply.
     pub(crate) fn complete(mut self) {
+        debug_assert!(
+            self.final_publication_entered,
+            "successful transaction index publication must enter its final phase"
+        );
         self.residency
             .finish_transaction_named_index_publication(true);
         self.finished = true;
@@ -676,6 +758,11 @@ pub(crate) struct ResidencyReadState {
     #[cfg(test)]
     pub(crate) named_index_publication_pre_linearize_hook:
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    /// Test-only interleaving seam after a named-index manifest is published but before its caller
+    /// resumes canonical apply.
+    #[cfg(test)]
+    pub(crate) named_index_publication_post_publish_hook:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     /// Generation-owned, GPU-resident multi-shard point route keyed by table/filter/projection shape.
     /// Exact Arc publication identity makes a route reusable without re-enumerating every shard per batch;
     /// a new publication misses and replaces it while in-flight readers keep the old plan pinned.
@@ -698,6 +785,11 @@ pub(crate) struct ResidencyReadState {
     /// publication marks one serialized writer and purgers defer only its affected table names,
     /// avoiding budget/route lock inversion while preserving mandatory coverage through the durable cut.
     transaction_named_index_lifecycle: Mutex<TransactionNamedIndexLifecycle>,
+    /// Test-only interleaving seam after canonical apply returns and before the lifecycle guard
+    /// drains final-publication-phase purge requests.
+    #[cfg(test)]
+    transaction_named_index_post_apply_hook:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     /// PERF-001: count of batches that reused an exact-generation GPU-resident shard descriptor plan.
     /// A nonzero value proves the hot route avoided per-batch shard enumeration and descriptor upload;
     /// generation replacement/purge still forces a miss and rebuild.
@@ -807,6 +899,29 @@ pub(crate) struct ResidencyReadState {
     /// residency of the fold). The out-of-core proof: this stays <= the configured budget even when the
     /// whole table's bytes dwarf it. `fetch_max`, monotonic across the process.
     pub(crate) streaming_fold_peak_chunk_bytes: std::sync::atomic::AtomicU64,
+    /// Test-only high-water of source windows staged by one bounded cold-index proof.
+    #[cfg(test)]
+    pub(crate) cold_index_validation_peak_staged_chunks: std::sync::atomic::AtomicU64,
+    /// Exact allocator-backed high-water for one transactional cold UNIQUE validation attempt.
+    /// Includes sliced cold payloads/tombstone sidecars, unified D2D source, and pooled operator
+    /// scratch; tests compare it directly with the configured residency headroom.
+    #[cfg(test)]
+    pub(crate) cold_index_validation_peak_device_bytes: std::sync::atomic::AtomicU64,
+    /// Exact fallible host payload/sidecar lease high-water for one cold validation window.
+    #[cfg(test)]
+    pub(crate) cold_index_validation_peak_host_staging_bytes: std::sync::atomic::AtomicU64,
+    /// Bounded-planner evidence: high-water window descriptors retained by one plan and exact
+    /// number of GPU subset proofs launched. A refusal test can force tiny batches without
+    /// manufacturing a table large enough to exhaust host memory.
+    #[cfg(test)]
+    pub(crate) cold_index_validation_peak_planned_windows: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) cold_index_validation_subset_proofs: std::sync::atomic::AtomicU64,
+    /// Engine-local test overrides (zero = production limit), isolated across concurrent engines.
+    #[cfg(test)]
+    pub(crate) cold_index_validation_batch_rows_override: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) cold_index_validation_max_batches_override: std::sync::atomic::AtomicUsize,
     /// ADR-012 streaming two-relation joins served as bounded chunk/block pairs.
     pub(crate) streaming_join_hits: std::sync::atomic::AtomicU64,
     pub(crate) streaming_join_block_pairs: std::sync::atomic::AtomicU64,
@@ -938,10 +1053,52 @@ impl ResidencyReadState {
         );
         lifecycle.publication_active = true;
         lifecycle.protected_tables = protected_tables;
+        lifecycle.deferred_purges.clear();
+        lifecycle.final_publication_tables.clear();
+        lifecycle.post_publication_deferred_purges.clear();
         drop(lifecycle);
         TransactionNamedIndexPublicationGuard {
             residency: self,
+            final_publication_entered: false,
             finished: false,
+        }
+    }
+
+    fn enter_transaction_named_index_final_publication(&self) {
+        let mut lifecycle = self
+            .transaction_named_index_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(lifecycle.publication_active);
+        lifecycle.final_publication_tables = lifecycle.protected_tables.clone();
+        // Canonical apply is one atomic publication. Requests recorded before its final phase are
+        // ordered before that publication. Once apply begins, external pressure/retirement must be
+        // replayed after success so no request that observed a newly allocated generation is lost.
+        lifecycle.post_publication_deferred_purges.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_transaction_named_index_post_apply_hook(
+        &self,
+        reached: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .transaction_named_index_post_apply_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_transaction_named_index_post_apply_hook(&self) {
+        let hook = self
+            .transaction_named_index_post_apply_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((reached, resume)) = hook {
+            reached.wait();
+            resume.wait();
         }
     }
 
@@ -954,17 +1111,22 @@ impl ResidencyReadState {
         lifecycle.publication_active = false;
         lifecycle.protected_tables.clear();
         let deferred = std::mem::take(&mut lifecycle.deferred_purges);
+        lifecycle.final_publication_tables.clear();
+        let post_publication = std::mem::take(&mut lifecycle.post_publication_deferred_purges);
         if publication_succeeded {
-            // Each deferred request observed the generation that canonical apply just replaced.
-            // The new publication is the later linearized owner, so replaying those requests would
-            // incorrectly purge its freshly built coverage.
-            return;
-        }
-        // Keep the lifecycle latch until cleanup completes. A new transaction therefore begins
-        // either before a purge request (and defers it) or after its full route/cache retirement;
-        // it can never capture the half-purged interval.
-        for table in deferred {
-            self.purge_shard_pk_index_for_table_inner(&table);
+            // Requests before the final cut observed a generation canonical apply superseded.
+            // Requests after it observed the final generation and must win even though the guard
+            // was still active while transaction acknowledgement was being completed.
+            for table in post_publication {
+                self.purge_shard_pk_index_for_table_inner(&table);
+            }
+        } else {
+            // Keep the lifecycle latch until cleanup completes. A new transaction therefore begins
+            // either before a purge request (and defers it) or after its full route/cache retirement;
+            // it can never capture the half-purged interval.
+            for table in deferred {
+                self.purge_shard_pk_index_for_table_inner(&table);
+            }
         }
     }
 
@@ -1026,12 +1188,94 @@ impl ResidencyReadState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if lifecycle.publication_active && lifecycle.protected_tables.contains(table) {
+            let canonical_owner =
+                TRANSACTION_NAMED_INDEX_PUBLICATION_OWNER_ACTIVE.with(std::cell::Cell::get);
+            if canonical_owner {
+                drop(lifecycle);
+                self.purge_shard_pk_index_for_table_inner(table);
+                return;
+            }
             lifecycle.deferred_purges.insert(table.to_string());
+            if lifecycle.final_publication_tables.contains(table) {
+                lifecycle
+                    .post_publication_deferred_purges
+                    .insert(table.to_string());
+            }
             return;
         }
         // Keep the state latch across the physical purge so a transaction cannot increment the
         // active counter between the zero observation and cache removal.
         self.purge_shard_pk_index_for_table_inner(table);
+    }
+
+    /// Canonical transaction publisher's in-window replacement path. The lifecycle guard remains
+    /// active, so external purge requests still defer; this owner may retire the protected old
+    /// manifest immediately before installing an empty/fresh final manifest.
+    pub(crate) fn purge_shard_pk_index_for_table_during_transaction(&self, table: &str) {
+        let lifecycle = self
+            .transaction_named_index_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(
+            !lifecycle.publication_active || lifecycle.protected_tables.contains(table),
+            "an active transaction index publisher may retire only its protected tables"
+        );
+        drop(lifecycle);
+        self.purge_shard_pk_index_for_table_inner(table);
+    }
+
+    /// Retire only cache identities absent from the transaction's final catalog after replacement
+    /// coverage has linearized. Surviving raw-column aliases and stable index-OID keys keep their
+    /// allocations; dropped/recreated OIDs cannot remain a hidden residency owner.
+    pub(crate) fn retain_shard_pk_indexes_for_table_during_transaction(
+        &self,
+        table: &str,
+        retained_key_ids: &BTreeSet<usize>,
+    ) {
+        let lifecycle = self
+            .transaction_named_index_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(
+            !lifecycle.publication_active || lifecycle.protected_tables.contains(table),
+            "an active transaction index publisher may retain only its protected tables"
+        );
+        drop(lifecycle);
+
+        // Route -> index is the cache ownership order. Every prepared route is catalog-shaped, so
+        // retire the table's routes even when its underlying stable key allocation survives rename.
+        let _publish = self
+            .sharded_point_route_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let current = self.sharded_point_routes.load();
+            if current
+                .keys()
+                .any(|(cached_table, _, _)| cached_table == table)
+            {
+                let mut next = (**current).clone();
+                next.retain(|(cached_table, _, _), _| cached_table != table);
+                self.sharded_point_routes.store(Arc::new(next));
+            }
+        }
+        {
+            let current = self.compound_point_routes.load();
+            if current
+                .keys()
+                .any(|(cached_table, _, _)| cached_table == table)
+            {
+                let mut next = (**current).clone();
+                next.retain(|(cached_table, _, _), _| cached_table != table);
+                self.compound_point_routes.store(Arc::new(next));
+            }
+        }
+        self.shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(cached_table, _, key_id), _| {
+                cached_table != table || retained_key_ids.contains(key_id)
+            });
     }
 
     fn purge_shard_pk_index_for_table_inner(&self, table: &str) {

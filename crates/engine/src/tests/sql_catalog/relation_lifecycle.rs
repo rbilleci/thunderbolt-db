@@ -5,6 +5,8 @@ use crate::{
 };
 use gpu_db_sql::{parse_command, Command, SelectFilterOp, SqlType, SqlValue};
 
+const FIRST_TABLE_INDEX_OID: u32 = FIRST_USER_RELATION_OID + 1;
+
 #[test]
 fn relational_catalog_assigns_stable_public_schema_and_type_metadata() {
     let e = Engine::new_local_test_engine();
@@ -63,6 +65,7 @@ fn relational_catalog_records_create_index_and_replays_from_wal() {
     assert_eq!(
         table.indexes,
         vec![RelationalIndex {
+            oid: FIRST_TABLE_INDEX_OID,
             name: "people_name_idx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
@@ -80,6 +83,7 @@ fn relational_catalog_records_create_index_and_replays_from_wal() {
             .unwrap()
             .indexes,
         vec![RelationalIndex {
+            oid: FIRST_TABLE_INDEX_OID,
             name: "people_name_idx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
@@ -125,6 +129,7 @@ fn relational_catalog_preserves_compound_secondary_index_order_across_recovery()
     .unwrap();
 
     let expected = RelationalIndex {
+        oid: FIRST_TABLE_INDEX_OID,
         name: "accounts_by_status".to_string(),
         table: "accounts".to_string(),
         column: "tenant_id".to_string(),
@@ -173,6 +178,7 @@ fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_fr
     assert_eq!(
         indexes,
         vec![RelationalIndex {
+            oid: FIRST_TABLE_INDEX_OID,
             name: "people_name_uidx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
@@ -266,6 +272,7 @@ fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
         indexes,
         vec![
             RelationalIndex {
+                oid: FIRST_TABLE_INDEX_OID,
                 name: "people_name_key".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
@@ -275,6 +282,7 @@ fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
                 unique_constraint: true,
             },
             RelationalIndex {
+                oid: FIRST_TABLE_INDEX_OID + 1,
                 name: "people_id_key".to_string(),
                 table: "people".to_string(),
                 column: "id".to_string(),
@@ -619,6 +627,7 @@ fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
     assert_eq!(
         indexes,
         vec![RelationalIndex {
+            oid: FIRST_TABLE_INDEX_OID,
             name: "people_pkey".to_string(),
             table: "people".to_string(),
             column: "id".to_string(),
@@ -787,6 +796,7 @@ fn relational_catalog_drops_index_and_replays_from_wal() {
     assert_eq!(
         table_indexes,
         vec![RelationalIndex {
+            oid: FIRST_TABLE_INDEX_OID,
             name: "people_pkey".to_string(),
             table: "people".to_string(),
             column: "id".to_string(),
@@ -844,6 +854,7 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
     assert_eq!(
         renamed_indexes,
         vec![RelationalIndex {
+            oid: FIRST_TABLE_INDEX_OID,
             name: "people_lookup_idx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
@@ -914,17 +925,54 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
     constrained
         .execute_text(1, "CREATE TABLE keyed_people (id INT PRIMARY KEY)")
         .unwrap();
-    let constraint_err = constrained
+    constrained
+        .execute_text(2, "COMMENT ON INDEX keyed_people_pkey IS 'primary lookup'")
+        .unwrap();
+    constrained
         .execute_text(
-            2,
+            3,
+            "COMMENT ON CONSTRAINT keyed_people_pkey ON keyed_people IS 'primary identity'",
+        )
+        .unwrap();
+    let original = constrained
+        .relational_catalog_table("keyed_people")
+        .unwrap()
+        .indexes[0]
+        .clone();
+    constrained
+        .execute_text(
+            4,
             "ALTER INDEX keyed_people_pkey RENAME TO keyed_people_id_idx",
         )
-        .unwrap_err()
-        .to_string();
-    assert!(
-        constraint_err.contains("cannot rename constraint-backed index"),
-        "{constraint_err}"
+        .unwrap();
+    let renamed = constrained
+        .relational_catalog_table("keyed_people")
+        .unwrap()
+        .indexes[0]
+        .clone();
+    assert_eq!(renamed.oid, original.oid);
+    assert_eq!(renamed.name, "keyed_people_id_idx");
+    assert!(renamed.primary_key);
+    assert_eq!(
+        constrained
+            .relational_index_comment("keyed_people_id_idx")
+            .as_deref(),
+        Some("primary lookup")
     );
+    assert_eq!(
+        constrained
+            .relational_constraint_comment("keyed_people", "keyed_people_id_idx")
+            .as_deref(),
+        Some("primary identity")
+    );
+    assert_eq!(
+        constrained.relational_constraint_comment("keyed_people", "keyed_people_pkey"),
+        None
+    );
+    let recovered = Engine::recover_from_durable_wal(&constrained.durable_wal_records()).unwrap();
+    assert!(recovered
+        .catalog_snapshot()
+        .same_contents(constrained.catalog_snapshot().as_ref()));
 }
 
 #[test]

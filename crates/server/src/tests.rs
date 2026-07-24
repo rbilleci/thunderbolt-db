@@ -8,6 +8,9 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "tests/index_lifecycle.rs"]
+mod index_lifecycle;
+
 #[path = "tests/view_lifecycle.rs"]
 mod view_lifecycle;
 

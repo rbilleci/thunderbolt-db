@@ -75,12 +75,17 @@
     // are checked on the host; every varlen span is checked here before any byte read.
     .param .u64 key_bytes_limit,
     .param .u64 value_bytes_limit,
-    .param .u64 input_error_flag
+    .param .u64 input_error_flag,
+    // Typed COUNT-only input: bypass every value-type dispatch/load. The key remains the complete
+    // grouping authority; there is deliberately no fake int4 value column.
+    .param .u64 value_is_unused
 )
 {
     .reg .u32 %aggm;
     .reg .u32 %aggt;
     .reg .pred %pagg;
+    .reg .u64 %vunused;
+    .reg .pred %pvunused;
     .reg .u64 %m3vnoff;
     .reg .u64 %m3vsent;
     .reg .u64 %m3vwd;
@@ -282,6 +287,7 @@
     ld.param.u64 %klimit, [key_bytes_limit];
     ld.param.u64 %vlimit, [value_bytes_limit];
     ld.param.u64 %inerr, [input_error_flag];
+    ld.param.u64 %vunused, [value_is_unused];
     mov.u64 %errone, 1;
     .reg .u64 %kbov;
     .reg .pred %pkbov;
@@ -504,6 +510,9 @@ wkey_hash_done:
     mov.u64 %keyhi, %thash;
     mov.b128 %key128, {%keylo, %keyhi};
 gb_kdone:
+    setp.ne.u64 %pvunused, %vunused, 0;
+    @%pvunused mov.u64 %val, 0;
+    @%pvunused bra gb_vdone;
     add.u64 %addr, %base, %soff;
     // Derived value column (bool MIN/MAX materialized to int4): a non-zero value_base_override replaces
     // base+soff with the derived buffer; the int4 idx*4 stride below applies. Override 0 -> byte-

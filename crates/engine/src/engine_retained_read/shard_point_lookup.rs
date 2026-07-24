@@ -2,10 +2,11 @@ use super::{
     resident_device_bool_column_offset, resident_device_int4_column_offset,
     resident_device_int8_column_offset, resident_device_numeric_column_offset,
     resident_device_text_column_layout, shard_fixed_width_key_offset, shard_key_column_blob_len,
-    shard_key_column_blob_offset, Arc, BatchedShardProjection, CachedShardPkDeviceIndex,
-    CachedShardedPointRoute, CudaCompoundFoldColumn, CudaResidentDeviceMemory, Engine, EngineError,
-    ExecuteError, Index, RelationalResidencySnapshot, RelationalTable, ShardDeviceIndexKey,
-    ShardPkHit, SqlType, WriteLocateShard, MAX_CACHED_SHARDED_POINT_ROUTES,
+    shard_key_column_blob_offset, shard_key_column_validity_offset, Arc, BatchedShardProjection,
+    CachedShardPkDeviceIndex, CachedShardedPointRoute, CudaCompoundFoldColumn,
+    CudaResidentDeviceMemory, Engine, EngineError, ExecuteError, Index,
+    RelationalResidencySnapshot, RelationalTable, ShardDeviceIndexKey, ShardPkHit, SqlType,
+    WriteLocateShard, MAX_CACHED_SHARDED_POINT_ROUTES,
 };
 use crate::RelationalResidentShard;
 
@@ -211,6 +212,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_key_column_blob_len(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
+            let validity_offsets = positions
+                .iter()
+                .map(|&p| shard_key_column_validity_offset(shard, table, p))
+                .collect::<Option<Vec<Option<u64>>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // The descriptor flag alone cannot observe a concurrent generation replacement;
             // require the captured buffer to remain the authoritative device cell.
@@ -232,6 +237,7 @@ impl Engine {
                             offsets: &offsets,
                             blob_offsets: &blob_offsets,
                             blob_lens: &blob_lens,
+                            validity_offsets: &validity_offsets,
                         },
                         row_count: shard.row_count,
                         capacity_rows: shard.capacity as u64,
@@ -347,9 +353,10 @@ impl Engine {
         shard_id: u32,
         device_memory: &Arc<CudaResidentDeviceMemory>,
         // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): `key_id` identifies WHICH unique index this index
-        // serves — a single-column key's catalog COLUMN INDEX (byte-compatible with every prior cache
-        // entry), or `COMPOUND_KEY_ID_FLAG | ordinal` for a compound key. `positions` are the ordered
-        // catalog indices of the key column(s); `offsets` are those columns' capacity-strided
+        // serves — a single-column key's catalog COLUMN INDEX (byte-compatible with every prior
+        // cache entry), or `COMPOUND_KEY_ID_FLAG | stable_index_oid` for a fingerprint key.
+        // `positions` are the ordered catalog indices of the key column(s); `offsets` are those
+        // columns' capacity-strided
         // i32-section byte offsets, caller-computed. NON-lanes builds from the caller's shard, so the
         // caller offsets are exact. UNDER LANES the rebuild reads the LIVE shard whose capacity a
         // concurrent re-admit may have GROWN since the caller's snapshot — so offsets are RECOMPUTED
@@ -383,10 +390,12 @@ impl Engine {
             offsets,
             blob_offsets,
             blob_lens,
+            validity_offsets,
         } = key;
         if positions.len() != offsets.len()
             || positions.len() != blob_offsets.len()
             || positions.len() != blob_lens.len()
+            || positions.len() != validity_offsets.len()
         {
             return Ok(None);
         }
@@ -497,6 +506,7 @@ impl Engine {
             build_offsets,
             build_blob_offsets,
             build_blob_lens,
+            build_validity_offsets,
             build_row_count,
             build_capacity_rows,
             build_deleted_by,
@@ -554,6 +564,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_key_column_blob_len(&live, table, p))
                 .collect::<Option<Vec<u64>>>());
+            let live_validity_offsets = some_or_decline!(positions
+                .iter()
+                .map(|&p| shard_key_column_validity_offset(&live, table, p))
+                .collect::<Option<Vec<Option<u64>>>>());
             // CAPACITY-SIZED INDEX: size the hash table once for the shard's
             // full capacity (clamped to the builder's 2^30 slot limit via the
             // sizing_rows argument), so capacity-exhaustion rebuilds are
@@ -565,6 +579,7 @@ impl Engine {
                 live_offsets,
                 live_blob_offsets,
                 live_blob_lens,
+                live_validity_offsets,
                 live_rows,
                 capacity_rows,
                 live.deleted_by_region.clone(),
@@ -577,6 +592,7 @@ impl Engine {
                 offsets.to_vec(),
                 blob_offsets.to_vec(),
                 blob_lens.to_vec(),
+                validity_offsets.to_vec(),
                 row_count,
                 capacity_rows,
                 deleted_by,
@@ -605,7 +621,7 @@ impl Engine {
             .iter()
             .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
             .collect::<Option<Vec<u32>>>());
-        let fold_columns = widths
+        let mut fold_columns = widths
             .iter()
             .enumerate()
             .map(|(idx, &width_words)| {
@@ -627,6 +643,14 @@ impl Engine {
                 }
             })
             .collect::<Vec<_>>();
+        let mut seen_validity = std::collections::BTreeSet::new();
+        fold_columns.extend(build_validity_offsets.iter().flatten().filter_map(
+            |&bitmap_byte_offset| {
+                seen_validity
+                    .insert(bitmap_byte_offset)
+                    .then_some(CudaCompoundFoldColumn::Validity { bitmap_byte_offset })
+            },
+        ));
         // U1: keep deleted stamps resident too. The build kernel skips only rows dead at/below the
         // oldest active boundary; no O(rows) stamp DtoH is needed.
         // Consume the sidecar from the same immutable descriptor generation as the payload. The global side map
@@ -973,6 +997,8 @@ impl Engine {
                     filter_idx
                 )
                 .ok());
+                let filter_validity_offset =
+                    some_or_decline!(shard_key_column_validity_offset(shard, table, filter_idx));
                 let device_memory = some_or_decline!(shard.device_memory.clone());
                 // The index builder's lane-aware miss path may intentionally switch to the newest live
                 // shard. Point reads must never combine that index with this captured payload generation.
@@ -992,6 +1018,7 @@ impl Engine {
                                 offsets: &[filter_offset],
                                 blob_offsets: &[0],
                                 blob_lens: &[0],
+                                validity_offsets: &[filter_validity_offset],
                             },
                             row_count: shard.row_count,
                             capacity_rows: shard.capacity as u64,

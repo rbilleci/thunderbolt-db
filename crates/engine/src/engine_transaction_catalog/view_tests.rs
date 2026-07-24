@@ -630,21 +630,27 @@ fn ordered_catalog_view_gpu_permutations_reset_and_recovery_are_nonvacuous() {
     let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
         panic!("mixed view transaction must use one typed transaction record");
     };
-    assert_eq!(record.view_operations.len(), 4);
+    // The private CREATE TABLE owns an implicit primary-key index, so the transaction uses the
+    // additive index-lifecycle envelope while the sole pg_class OID high-water binds both table
+    // and index identity. Stored-view identities retain their exact closure in that envelope.
+    assert!(record.view_operations.is_empty());
+    assert!(record.index_lifecycle_operations.is_empty());
+    assert!(record.catalog_output.as_ref().unwrap().relational_next_oid > 0);
+    assert_eq!(record.view_lifecycle_operations.len(), 4);
     assert_eq!(
         record
-            .view_operations
+            .view_lifecycle_operations
             .iter()
             .map(|identity| identity.ordinal)
             .collect::<Vec<_>>(),
         vec![0, 4, 5, 6]
     );
     assert_eq!(
-        record.view_operations[2].target_before,
-        Some(record.view_operations[1].target_after.clone())
+        record.view_lifecycle_operations[2].targets[0].target_before,
+        record.view_lifecycle_operations[1].targets[0].target_after
     );
     assert_eq!(
-        record.view_operations[3]
+        record.view_lifecycle_operations[3].targets[0]
             .dependencies
             .keys()
             .map(String::as_str)

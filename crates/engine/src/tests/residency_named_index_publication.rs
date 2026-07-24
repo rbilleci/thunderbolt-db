@@ -317,17 +317,20 @@ fn resident_named_indexes_publish_and_extend_without_rebuild() {
     );
 }
 
-/// Until resident index descriptors carry validity bitmaps, indexed NULLs must fail loudly. This
-/// preserves PostgreSQL's NULL-distinct unique semantics instead of indexing the physical zero
-/// placeholder as a real key.
+/// Resident index validity descriptors omit NULL-bearing keys without folding the physical zero
+/// placeholder. Publication and mandatory mutation coverage therefore preserve PostgreSQL
+/// NULLS-DISTINCT uniqueness entirely on-device.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn resident_named_index_publication_rejects_indexed_nulls() {
+fn resident_named_index_publication_and_mutation_omit_indexed_nulls() {
     let engine = Engine::new_local();
     engine.set_shard_residency_enabled(true);
     engine.set_auto_admit_on_commit(true);
     engine
-        .execute_text(1, "CREATE TABLE nullable_idx (id INT PRIMARY KEY, code INT)")
+        .execute_text(
+            1,
+            "CREATE TABLE nullable_idx (id INT PRIMARY KEY, code INT)",
+        )
         .unwrap();
     engine
         .execute_text(
@@ -341,22 +344,26 @@ fn resident_named_index_publication_rejects_indexed_nulls() {
             "CREATE UNIQUE INDEX nullable_idx_code ON nullable_idx (code)",
         )
         .expect("non-enrolled DDL preserves PostgreSQL NULL-distinct semantics");
-    let error = engine
+    let report = engine
         .publish_relational_resident_indexes("nullable_idx")
-        .expect_err("explicit indexed NULL publication must fail closed");
-    assert!(
-        !error.to_string().contains("duplicate key"),
-        "multiple NULLs must pass PostgreSQL unique validation: {error}"
-    );
+        .expect("explicit indexed NULL publication uses device validity predicates");
+    assert_eq!(report.indexed_rows, 3);
+    assert_eq!(report.indexes.len(), 2);
 
     let mutation = Engine::new_local();
     mutation.set_shard_residency_enabled(true);
     mutation.set_auto_admit_on_commit(true);
     mutation
-        .execute_text(1, "CREATE TABLE nullable_mut (id INT PRIMARY KEY, code INT)")
+        .execute_text(
+            1,
+            "CREATE TABLE nullable_mut (id INT PRIMARY KEY, code INT)",
+        )
         .unwrap();
     mutation
-        .execute_text(2, "CREATE UNIQUE INDEX nullable_mut_code ON nullable_mut (code)")
+        .execute_text(
+            2,
+            "CREATE UNIQUE INDEX nullable_mut_code ON nullable_mut (code)",
+        )
         .unwrap();
     mutation
         .execute_text(3, "INSERT INTO nullable_mut VALUES (1, 5)")
@@ -364,11 +371,25 @@ fn resident_named_index_publication_rejects_indexed_nulls() {
     mutation
         .publish_relational_resident_indexes("nullable_mut")
         .unwrap();
-    assert!(
+    mutation
+        .execute_text(4, "INSERT INTO nullable_mut VALUES (2, NULL)")
+        .expect("enrolled index omits the first NULL posting");
+    mutation
+        .execute_text(5, "INSERT INTO nullable_mut VALUES (3, NULL)")
+        .expect("enrolled unique index admits a second NULL posting");
+    assert!(mutation
+        .execute_text(6, "INSERT INTO nullable_mut VALUES (4, 5)")
+        .is_err());
+    assert_eq!(
         mutation
-            .execute_text(4, "INSERT INTO nullable_mut VALUES (2, NULL)")
-            .is_err(),
-        "an enrolled index cannot silently accept an unrepresented NULL posting"
+            .execute_relational_select_text("SELECT id, code FROM nullable_mut ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(5)],
+            vec![SqlValue::Int4(2), SqlValue::Null],
+            vec![SqlValue::Int4(3), SqlValue::Null],
+        ]
     );
 
     let lazy = Engine::new_local();
@@ -429,18 +450,17 @@ fn resident_named_index_publication_rejects_indexed_nulls() {
             lazy_shard.row_count,
             &[vec![SqlValue::Int4(3), SqlValue::Null]],
         ),
-        "a non-enrolled lazy index may retire an unrepresentable posting"
+        "a non-enrolled lazy index retires its pre-rollover cache before the validity bitmap exists"
     );
     assert!(
-        lazy
-            .read_state
+        lazy.read_state
             .residency
             .shard_pk_device_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keys()
             .all(|(table, _, _)| table != "nullable_lazy"),
-        "the unrepresentable lazy posting retires the stale best-effort cache"
+        "the pending nullable rollover retires the stale best-effort cache"
     );
     drop(lazy_shards);
     lazy.execute_dml_concurrent(5, "INSERT INTO nullable_lazy VALUES (3, NULL)")
@@ -480,7 +500,9 @@ fn resident_named_index_enrollment_survives_rename_and_shape_ddl_but_not_table_r
     engine
         .execute_text(3, "ALTER TABLE shape_idx RENAME TO renamed_shape_idx")
         .unwrap();
-    let renamed = engine.relational_catalog_table("renamed_shape_idx").unwrap();
+    let renamed = engine
+        .relational_catalog_table("renamed_shape_idx")
+        .unwrap();
     assert_eq!(renamed.oid, original_oid);
     assert!(
         engine.relational_named_index_publication_required(&renamed),
@@ -560,10 +582,8 @@ fn resident_named_index_publication_rejects_concurrent_cache_retirement() {
     let engine = Arc::new(engine);
     let reached = Arc::new(std::sync::Barrier::new(2));
     let resume = Arc::new(std::sync::Barrier::new(2));
-    engine.set_named_index_publication_pre_linearize_hook(
-        Arc::clone(&reached),
-        Arc::clone(&resume),
-    );
+    engine
+        .set_named_index_publication_pre_linearize_hook(Arc::clone(&reached), Arc::clone(&resume));
     let publisher = {
         let engine = Arc::clone(&engine);
         std::thread::spawn(move || engine.publish_relational_resident_indexes("publish_race"))
@@ -630,12 +650,8 @@ fn resident_named_index_survives_more_than_256_same_key_updates() {
         .find(|shard| shard.row_count != 0)
         .expect("non-empty version-chain shard")
         .shard_id;
-    let (before, _, _, _) = resident_named_index_cache_entry(
-        &engine,
-        "version_chain",
-        shard_id,
-        secondary_key_id,
-    );
+    let (before, _, _, _) =
+        resident_named_index_cache_entry(&engine, "version_chain", shard_id, secondary_key_id);
 
     for offset in 0..300_u64 {
         engine
@@ -646,23 +662,13 @@ fn resident_named_index_survives_more_than_256_same_key_updates() {
             .unwrap();
     }
 
-    let (after, table_mask, hash_shift, row_count) = resident_named_index_cache_entry(
-        &engine,
-        "version_chain",
-        shard_id,
-        secondary_key_id,
-    );
+    let (after, table_mask, hash_shift, row_count) =
+        resident_named_index_cache_entry(&engine, "version_chain", shard_id, secondary_key_id);
     assert!(Arc::ptr_eq(&before, &after));
     assert_eq!(row_count, 301);
     let key = crate::engine_residency::compound_key_fingerprint(&[7, 2]);
     assert_eq!(
-        resident_named_index_physical_hit_count(
-            &after,
-            table_mask,
-            hash_shift,
-            row_count,
-            key,
-        ),
+        resident_named_index_physical_hit_count(&after, table_mask, hash_shift, row_count, key,),
         301
     );
     let result = engine
@@ -740,12 +746,8 @@ fn resident_named_index_rollover_budget_denial_is_atomic() {
     let shard_count_before = shards["budget_idx"].len();
     let shard_id = shard.shard_id;
     let shard_ptr = shard.device_memory.as_ref().unwrap().device_ptr();
-    let (index_before, _, _, indexed_rows_before) = resident_named_index_cache_entry(
-        &engine,
-        "budget_idx",
-        shard_id,
-        secondary_key_id,
-    );
+    let (index_before, _, _, indexed_rows_before) =
+        resident_named_index_cache_entry(&engine, "budget_idx", shard_id, secondary_key_id);
     let live_before = engine.relational_resident_bytes_for_gpu(0);
     let declines_before = engine.rollover_budget_declines();
     engine.set_relational_residency_budget_bytes(0, live_before);
@@ -769,19 +771,11 @@ fn resident_named_index_rollover_budget_denial_is_atomic() {
         .find(|shard| shard.shard_id == shard_id)
         .expect("pre-denial shard remains published");
     assert_eq!(
-        same_shard
-            .device_memory
-            .as_ref()
-            .unwrap()
-            .device_ptr(),
+        same_shard.device_memory.as_ref().unwrap().device_ptr(),
         shard_ptr
     );
-    let (index_after, _, _, indexed_rows_after) = resident_named_index_cache_entry(
-        &engine,
-        "budget_idx",
-        shard_id,
-        secondary_key_id,
-    );
+    let (index_after, _, _, indexed_rows_after) =
+        resident_named_index_cache_entry(&engine, "budget_idx", shard_id, secondary_key_id);
     assert!(Arc::ptr_eq(&index_before, &index_after));
     assert_eq!(indexed_rows_after, indexed_rows_before);
     assert!(engine.is_commit_path_poisoned());
@@ -858,15 +852,15 @@ fn resident_named_index_publication_and_mutation_do_not_deadlock() {
                 .expect("publication/mutation lock order must make progress"),
         );
     }
-    assert_eq!(completed, std::collections::BTreeSet::from(["publisher", "writer"]));
+    assert_eq!(
+        completed,
+        std::collections::BTreeSet::from(["publisher", "writer"])
+    );
     publisher.join().unwrap();
     writer.join().unwrap();
     let report = engine
         .publish_relational_resident_indexes("lock_order_idx")
         .unwrap();
     assert_eq!(report.indexed_rows, 25);
-    assert!(report
-        .indexes
-        .iter()
-        .all(|index| index.indexed_rows == 25));
+    assert!(report.indexes.iter().all(|index| index.indexed_rows == 25));
 }

@@ -105,11 +105,11 @@ impl Engine {
         ));
     }
 
-    fn begin_recovery_replay(&self) {
+    pub(crate) fn begin_recovery_replay(&self) {
         self.set_auto_admit_on_commit(false);
     }
 
-    fn finish_recovery_replay(&self) -> Result<(), EngineError> {
+    pub(crate) fn finish_recovery_replay(&self) -> Result<(), EngineError> {
         #[cfg(test)]
         RECOVERY_CONTEXT_LOSS_INJECTIONS.with(|remaining| {
             if remaining.get() > 0 {
@@ -199,6 +199,7 @@ impl Engine {
 
     fn recover_from_durable_wal_once(records: &[WalRecord]) -> Result<Self, EngineError> {
         let engine = Self::new_local();
+        engine.prepare_legacy_index_oid_recovery(records)?;
         // Recovery reconstructs the durable host/store image first. Per-record admission would
         // repeatedly upload partial generations and can enter device-authoritative elision while
         // later WAL records still need the host image. Admit once, after the complete replay.
@@ -387,6 +388,10 @@ impl Engine {
                 relational_comments: BTreeMap::new(),
                 relational_resident_cache: RelationalResidentCache::default(),
                 relational_next_oid: FIRST_USER_RELATION_OID,
+                legacy_recovery_next_index_oid: FIRST_LEGACY_RECOVERY_INDEX_OID,
+                legacy_recovery_index_oids_assigned: false,
+                legacy_recovery_floor_prepared: false,
+                index_oid_epoch_current: true,
                 relational_next_column_id: FIRST_USER_COLUMN_ID,
             }),
             metrics: RuntimeMetrics::default(),

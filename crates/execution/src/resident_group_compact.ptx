@@ -53,7 +53,8 @@
     .param .u64 out_max_uuid_ptr,
     .param .u64 out_keyi128_ptr,
     .param .u64 out_isnull_ptr,
-    .param .u64 out_count_ptr
+    .param .u64 out_count_ptr,
+    .param .u64 duplicate_flag_ptr
 )
 {
     .shared .align 4 .b32 s_scan[96];
@@ -68,6 +69,8 @@
     .reg .pred %p_occ;
     .reg .pred %p_hash;
     .reg .pred %p_ded;
+    .reg .pred %p_dup;
+    .reg .pred %p_no_dup;
     .reg .u32 %thr;
     .reg .u32 %bdim;
     .reg .u32 %lane;
@@ -109,6 +112,7 @@
     .reg .u64 %o_ki128;
     .reg .u64 %o_isnull;
     .reg .u64 %ocnt;
+    .reg .u64 %dup;
     .reg .u64 %iter;
     .reg .u64 %stride;
     .reg .u64 %slot;
@@ -158,6 +162,7 @@
     ld.param.u64 %o_ki128, [out_keyi128_ptr];
     ld.param.u64 %o_isnull, [out_isnull_ptr];
     ld.param.u64 %ocnt, [out_count_ptr];
+    ld.param.u64 %dup, [duplicate_flag_ptr];
 
     mov.u64 %empty, 0x8000000000000000;  // i64::MIN == EMPTY == EMPTY128 hi limb
 
@@ -230,6 +235,14 @@ occ_dedicated:
     setp.ne.u64 %p_occ, %keyv, %empty;
 occ_have:
     selp.u32 %flag, 1, 0, %p_occ;
+    @!%p_occ bra after_dup;
+    setp.eq.u64 %p_no_dup, %dup, 0;
+    @%p_no_dup bra after_dup;
+    add.u64 %addr, %k_count, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    setp.gt.u64 %p_dup, %tmp64, 1;
+    @%p_dup atom.global.or.b64 %tmp64, [%dup], 1;
+after_dup:
 
 after_occ:
     // ---- two-level warp-shuffle inclusive scan of %flag (ascending slot order) ----
@@ -416,5 +429,59 @@ scompact_done:
     @%p bra sc_done;
     st.global.u64 [%ocnt], %running;
 sc_done:
+    ret;
+}
+
+// Verdict-only companion for UNIQUE-index validation. GROUP COUNT has already populated
+// slot_count; this kernel scans only that array and reduces `count > 1` into one device flag.
+// It deliberately does not require key occupancy or any dense GROUP result buffers.
+.visible .entry gpu_db_group_duplicate_verdict(
+    .param .u64 slot_count_ptr,
+    .param .u64 alloc_slots,
+    .param .u64 duplicate_flag_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pdup;
+    .reg .u32 %thread;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %count_ptr;
+    .reg .u64 %n;
+    .reg .u64 %flag_ptr;
+    .reg .u64 %offset;
+    .reg .u64 %addr;
+    .reg .u64 %value;
+    .reg .u64 %one;
+
+    ld.param.u64 %count_ptr, [slot_count_ptr];
+    ld.param.u64 %n, [alloc_slots];
+    ld.param.u64 %flag_ptr, [duplicate_flag_ptr];
+    mov.u64 %one, 1;
+
+    mov.u32 %thread, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %thread, %bid, %bdim, %thread;
+    mul.lo.u32 %bdim, %bdim, %gdim;
+    cvt.u64.u32 %i, %thread;
+    cvt.u64.u32 %stride, %bdim;
+
+duplicate_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra duplicate_done;
+    mul.lo.u64 %offset, %i, 8;
+    add.u64 %addr, %count_ptr, %offset;
+    ld.global.u64 %value, [%addr];
+    setp.gt.u64 %pdup, %value, 1;
+    @%pdup atom.global.or.b64 %value, [%flag_ptr], %one;
+    add.u64 %i, %i, %stride;
+    bra duplicate_loop;
+
+duplicate_done:
     ret;
 }

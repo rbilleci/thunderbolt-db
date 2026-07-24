@@ -172,6 +172,7 @@ impl Engine {
         &self,
         table: &RelationalTable,
         new_rows: &[Vec<SqlValue>],
+        final_named_indexes_required: bool,
     ) -> Result<(u16, u64), ExecuteError> {
         if new_rows.is_empty() {
             return Ok((self.planner.default_gpu_id(), 0));
@@ -291,7 +292,9 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let named_index_bytes = if self.relational_named_index_publication_required(table) {
+        let named_index_bytes = if final_named_indexes_required
+            || self.relational_named_index_publication_required(table)
+        {
             estimated_named_index_bytes_for_shard(table, k, new_capacity).ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has unsupported mandatory index allocation geometry",

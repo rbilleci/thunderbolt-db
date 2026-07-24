@@ -190,6 +190,9 @@ impl Engine {
                         Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
                             None
                         }
+                        Command::CreateIndex(_)
+                        | Command::RenameIndex(_)
+                        | Command::DropIndex(_) => None,
                         _ => {
                             unreachable!(
                                 "transactional catalog staging admitted an unsupported family"
@@ -229,10 +232,14 @@ impl Engine {
         // helpers resolve through the scoped snapshot, so each delta reads the exact captured
         // fresh base plus the replay prefix already installed in `next_shards`; they never consult
         // a newer global generation that may publish after capture.
+        let scratch_shards = Arc::new(next_shards.clone());
+        let scratch_cold_chunks = Arc::new(next_cold_chunks.clone());
         let scratch_delta = Arc::new(std::sync::Mutex::new(TransactionDeltaState {
             generation: 0,
-            resident_shards: Arc::new(next_shards.clone()),
-            streaming_cold_chunks: Arc::new(next_cold_chunks.clone()),
+            resident_shards: Arc::clone(&scratch_shards),
+            resident_shards_authority: scratch_shards,
+            streaming_cold_chunks: Arc::clone(&scratch_cold_chunks),
+            streaming_cold_chunks_authority: scratch_cold_chunks,
             operations: Vec::new(),
             write_set: WriteSet::default(),
             next_row_id: fresh.next_row_id,
@@ -276,7 +283,13 @@ impl Engine {
                 }
                 TransactionOperation::Row(delta) => {
                     for (name, expected) in &delta.catalog_dependencies {
-                        if transaction_catalog.relational_catalog.get(name) != Some(expected) {
+                        if transaction_catalog
+                            .relational_catalog
+                            .get(name)
+                            .is_none_or(|observed| {
+                                !same_transaction_row_catalog_dependency(expected, observed)
+                            })
+                        {
                             return Err(ExecuteError::Serialization(format!(
                                 "catalog dependency \"{name}\" changed after transaction statement snapshot {}",
                                 delta.read_snapshot
@@ -340,8 +353,8 @@ impl Engine {
             let mut replay = scratch_delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            replay.resident_shards = Arc::new(next_shards.clone());
-            replay.streaming_cold_chunks = Arc::new(next_cold_chunks.clone());
+            replay.publish_resident_shards(Arc::new(next_shards.clone()));
+            replay.publish_streaming_cold_chunks(Arc::new(next_cold_chunks.clone()));
             replay.operations.push(operation.clone());
             replay.write_set = final_transaction_write_set(&replay.operations);
             replay.generation = replay.generation.saturating_add(1);
@@ -373,8 +386,8 @@ impl Engine {
                     .to_string(),
             ));
         }
-        state.resident_shards = Arc::new(next_shards);
-        state.streaming_cold_chunks = Arc::new(next_cold_chunks);
+        state.publish_resident_shards(Arc::new(next_shards));
+        state.publish_streaming_cold_chunks(Arc::new(next_cold_chunks));
         state.operations = operations;
         state.write_set = final_transaction_write_set(&state.operations);
         state.next_row_id = fresh

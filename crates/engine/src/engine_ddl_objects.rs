@@ -1,8 +1,8 @@
 //! Non-table object DDL (P0 §9.6 decomposition, behavior-preserving): a focused
-//! `impl Engine` block for CREATE/DROP/RENAME of views and materialized views
-//! (with dependency tracking and refresh), functions, sequences (implicit
-//! sequences, nextval/setval, column-default evaluation), domains, schemas,
-//! databases, and tablespaces.
+//! `impl Engine` block for CREATE/RENAME of views and CREATE/DROP/RENAME of
+//! materialized views (with dependency tracking and refresh), functions,
+//! sequences (implicit sequences, nextval/setval, column-default evaluation,
+//! and DROP), domains, schemas, databases, and tablespaces.
 
 use super::*;
 
@@ -12,51 +12,111 @@ impl Engine {
         cat: &mut DdlCatalogState,
         create: CreateView,
     ) -> Result<(), EngineError> {
-        if cat.relational_catalog.contains_key(&create.name)
-            || cat.relational_materialized_views.contains_key(&create.name)
-            || cat.relational_sequences.contains_key(&create.name)
-            || (!create.or_replace && cat.relational_views.contains_key(&create.name))
-        {
+        self.apply_create_view_with_replay_policy(cat, create, false)
+    }
+
+    pub(crate) fn apply_create_view_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateView,
+    ) -> Result<(), EngineError> {
+        self.apply_create_view_with_replay_policy(cat, create, true)
+    }
+
+    fn apply_create_view_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        let target_conflicts = if legacy_replay {
+            cat.relational_catalog.contains_key(&create.name)
+                || cat.relational_materialized_views.contains_key(&create.name)
+                || cat.relational_sequences.contains_key(&create.name)
+                || (!create.or_replace && cat.relational_views.contains_key(&create.name))
+        } else {
+            let target_kind = cat.pg_class_relation_kind(&create.name)?;
+            target_kind.is_some()
+                && !(create.or_replace && target_kind == Some(PgClassRelationKind::View))
+        };
+        if target_conflicts {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
-        }
-        if cat
-            .relational_materialized_views
-            .contains_key(&create.query.table)
-        {
-            return Err(EngineError::ApplyFailed(
-                "views over materialized views are unsupported".to_string(),
-            ));
         }
         if create.or_replace && self.relational_view_has_dependents(&create.name) {
             return Err(EngineError::ApplyFailed(
                 "cannot replace view because another view depends on it".to_string(),
             ));
         }
-        if cat.relational_views.contains_key(&create.query.table) {
-            if self.relational_view_depends_on(&create.query.table, &create.name) {
+        if legacy_replay {
+            if cat
+                .relational_materialized_views
+                .contains_key(&create.query.table)
+            {
                 return Err(EngineError::ApplyFailed(
-                    "view dependency cycle is unsupported".to_string(),
+                    "views over materialized views are unsupported".to_string(),
                 ));
             }
-        } else if !cat.relational_catalog.contains_key(&create.query.table) {
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" does not exist",
-                create.query.table
-            )));
-        }
-        let (oid, acl) = if let Some(existing) = cat.relational_views.get(&create.name) {
-            (existing.oid, existing.acl.clone())
+            if cat.relational_views.contains_key(&create.query.table) {
+                if self.relational_view_depends_on(&create.query.table, &create.name) {
+                    return Err(EngineError::ApplyFailed(
+                        "view dependency cycle is unsupported".to_string(),
+                    ));
+                }
+            } else if !cat.relational_catalog.contains_key(&create.query.table) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" does not exist",
+                    create.query.table
+                )));
+            }
         } else {
-            let oid = cat.relational_next_oid;
-            cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
-                EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
-            })?;
+            match cat.pg_class_relation_kind(&create.query.table)? {
+                Some(PgClassRelationKind::Table) => {}
+                Some(PgClassRelationKind::View) => {
+                    if self.relational_view_depends_on(&create.query.table, &create.name) {
+                        return Err(EngineError::ApplyFailed(
+                            "view dependency cycle is unsupported".to_string(),
+                        ));
+                    }
+                }
+                Some(PgClassRelationKind::MaterializedView) => {
+                    return Err(EngineError::ApplyFailed(
+                        "views over materialized views are unsupported".to_string(),
+                    ))
+                }
+                Some(_) => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" cannot be a stored-view dependency",
+                        create.query.table
+                    )))
+                }
+                None => {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        create.query.table
+                    )))
+                }
+            }
+        }
+        let mut next = cat.clone();
+        let (oid, acl) = if let Some(existing) = next.relational_views.get(&create.name) {
+            (existing.oid, existing.acl.clone())
+        } else if legacy_replay {
+            let oid = next.relational_next_oid;
+            next.relational_next_oid =
+                next.relational_next_oid.checked_add(1).ok_or_else(|| {
+                    EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
+                })?;
+            (oid, BTreeMap::new())
+        } else {
+            next.finalize_legacy_index_oid_migration()?;
+            let oid =
+                next.allocate_relational_class_oid("relational view OID allocation exhausted")?;
             (oid, BTreeMap::new())
         };
-        cat.relational_views.insert(
+        next.relational_views.insert(
             create.name.clone(),
             RelationalView {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -67,6 +127,7 @@ impl Engine {
                 acl,
             },
         );
+        *cat = next;
         Ok(())
     }
 
@@ -106,7 +167,28 @@ impl Engine {
         cat: &mut DdlCatalogState,
         create: CreateMaterializedView,
     ) -> Result<(), EngineError> {
-        self.preflight_create_materialized_view(&create)?;
+        self.apply_create_materialized_view_with_replay_policy(cat, create, false)
+    }
+
+    pub(crate) fn apply_create_materialized_view_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.apply_create_materialized_view_with_replay_policy(cat, create, true)
+    }
+
+    fn apply_create_materialized_view_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateMaterializedView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        if legacy_replay {
+            self.preflight_create_materialized_view_legacy_replay(&create)?;
+        } else {
+            self.preflight_create_materialized_view(&create)?;
+        }
         // This SELECT runs INSIDE the commit critical section (the commit_mutex is held); suppress the
         // deep read executor's leader re-check on this thread so it does not self-deadlock re-locking it.
         let result = self
@@ -114,14 +196,24 @@ impl Engine {
                 engine.execute_relational_select(&create.query)
             })
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        let oid = cat.relational_next_oid;
-        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
-            EngineError::ApplyFailed(
-                "relational materialized view OID allocation exhausted".to_string(),
-            )
-        })?;
+        let mut next = cat.clone();
+        let oid = if legacy_replay {
+            let oid = next.relational_next_oid;
+            next.relational_next_oid =
+                next.relational_next_oid.checked_add(1).ok_or_else(|| {
+                    EngineError::ApplyFailed(
+                        "relational materialized view OID allocation exhausted".to_string(),
+                    )
+                })?;
+            oid
+        } else {
+            next.finalize_legacy_index_oid_migration()?;
+            next.allocate_relational_class_oid(
+                "relational materialized view OID allocation exhausted",
+            )?
+        };
         let mut columns = Vec::with_capacity(result.columns.len());
-        let mut next_column_id = cat.relational_next_column_id;
+        let mut next_column_id = next.relational_next_column_id;
         for (idx, column) in result.columns.iter().cloned().enumerate() {
             let attnum = i16::try_from(idx + 1).map_err(|_| {
                 EngineError::ApplyFailed(
@@ -146,13 +238,13 @@ impl Engine {
                 type_size: column.type_size,
             });
         }
-        cat.relational_next_column_id = next_column_id;
+        next.relational_next_column_id = next_column_id;
         let rows = if create.with_data {
             result.rows.into_boxed()
         } else {
             Vec::new()
         };
-        cat.relational_materialized_views.insert(
+        next.relational_materialized_views.insert(
             create.name.clone(),
             RelationalMaterializedView {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -165,6 +257,7 @@ impl Engine {
                 acl: BTreeMap::new(),
             },
         );
+        *cat = next;
         Ok(())
     }
 
@@ -173,7 +266,28 @@ impl Engine {
         cat: &mut DdlCatalogState,
         refresh: RefreshMaterializedView,
     ) -> Result<(), EngineError> {
-        self.preflight_refresh_materialized_view(&refresh)?;
+        self.apply_refresh_materialized_view_with_replay_policy(cat, refresh, false)
+    }
+
+    pub(crate) fn apply_refresh_materialized_view_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        refresh: RefreshMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.apply_refresh_materialized_view_with_replay_policy(cat, refresh, true)
+    }
+
+    fn apply_refresh_materialized_view_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        refresh: RefreshMaterializedView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        if legacy_replay {
+            self.preflight_refresh_materialized_view_legacy_replay(&refresh)?;
+        } else {
+            self.preflight_refresh_materialized_view(&refresh)?;
+        }
         let existing = cat
             .relational_materialized_views
             .get(&refresh.name)
@@ -300,21 +414,52 @@ impl Engine {
         cat: &mut DdlCatalogState,
         create: CreateSequence,
     ) -> Result<(), EngineError> {
-        if cat.relational_catalog.contains_key(&create.name)
-            || cat.relational_views.contains_key(&create.name)
-            || cat.relational_materialized_views.contains_key(&create.name)
-            || cat.relational_sequences.contains_key(&create.name)
-        {
+        self.apply_create_sequence_with_replay_policy(cat, create, false)
+    }
+
+    pub(crate) fn apply_create_sequence_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateSequence,
+    ) -> Result<(), EngineError> {
+        self.apply_create_sequence_with_replay_policy(cat, create, true)
+    }
+
+    fn apply_create_sequence_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateSequence,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        let target_exists = if legacy_replay {
+            cat.relational_catalog.contains_key(&create.name)
+                || cat.relational_views.contains_key(&create.name)
+                || cat.relational_materialized_views.contains_key(&create.name)
+                || cat.relational_sequences.contains_key(&create.name)
+        } else {
+            cat.pg_class_relation_kind(&create.name)?.is_some()
+        };
+        if target_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
         }
-        let oid = cat.relational_next_oid;
-        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
-            EngineError::ApplyFailed("relational sequence OID allocation exhausted".to_string())
-        })?;
-        cat.relational_sequences.insert(
+        let mut next = cat.clone();
+        let oid = if legacy_replay {
+            let oid = next.relational_next_oid;
+            next.relational_next_oid =
+                next.relational_next_oid.checked_add(1).ok_or_else(|| {
+                    EngineError::ApplyFailed(
+                        "relational sequence OID allocation exhausted".to_string(),
+                    )
+                })?;
+            oid
+        } else {
+            next.finalize_legacy_index_oid_migration()?;
+            next.allocate_relational_class_oid("relational sequence OID allocation exhausted")?
+        };
+        next.relational_sequences.insert(
             create.name.clone(),
             RelationalSequence {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -325,20 +470,8 @@ impl Engine {
                 acl: BTreeMap::new(),
             },
         );
+        *cat = next;
         Ok(())
-    }
-
-    pub(crate) fn create_implicit_sequence(
-        &self,
-        cat: &mut DdlCatalogState,
-        name: &str,
-    ) -> Result<(), EngineError> {
-        self.apply_create_sequence(
-            cat,
-            CreateSequence {
-                name: name.to_string(),
-            },
-        )
     }
 
     pub(crate) fn preflight_create_domain(&self, create: &CreateDomain) -> Result<(), EngineError> {
@@ -443,6 +576,22 @@ impl Engine {
     }
 
     pub(crate) fn preflight_implicit_sequence_name(&self, name: &str) -> Result<(), EngineError> {
+        if self.apply_uses_legacy_index_semantics() {
+            return self.preflight_implicit_sequence_name_legacy_replay(name);
+        }
+        let cat = self.catalog_snapshot();
+        if cat.pg_class_relation_kind(name)?.is_some() {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{name}\" already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_implicit_sequence_name_legacy_replay(
+        &self,
+        name: &str,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         if cat.relational_catalog.contains_key(name)
             || cat.relational_views.contains_key(name)
@@ -460,12 +609,35 @@ impl Engine {
         &self,
         default: &ColumnDefault,
     ) -> Result<(), EngineError> {
+        self.preflight_column_default_target_with_replay_policy(default, false)
+    }
+
+    pub(crate) fn preflight_column_default_target_legacy_replay(
+        &self,
+        default: &ColumnDefault,
+    ) -> Result<(), EngineError> {
+        self.preflight_column_default_target_with_replay_policy(default, true)
+    }
+
+    fn preflight_column_default_target_with_replay_policy(
+        &self,
+        default: &ColumnDefault,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
         match default {
             ColumnDefault::Literal(_) => Ok(()),
             ColumnDefault::SequenceNextVal {
                 sequence,
                 create_if_missing: true,
+            } if legacy_replay => self.preflight_implicit_sequence_name_legacy_replay(sequence),
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: true,
             } => self.preflight_implicit_sequence_name(sequence),
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: false,
+            } if legacy_replay => self.preflight_sequence_target_legacy_replay(sequence),
             ColumnDefault::SequenceNextVal {
                 sequence,
                 create_if_missing: false,
@@ -478,7 +650,29 @@ impl Engine {
         cat: &mut DdlCatalogState,
         nextval: SequenceNextVal,
     ) -> Result<i64, EngineError> {
-        self.preflight_sequence_target(&nextval.name)?;
+        let legacy_replay = self.apply_uses_legacy_index_semantics();
+        self.apply_sequence_nextval_with_replay_policy(cat, nextval, legacy_replay)
+    }
+
+    pub(crate) fn apply_sequence_nextval_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        nextval: SequenceNextVal,
+    ) -> Result<i64, EngineError> {
+        self.apply_sequence_nextval_with_replay_policy(cat, nextval, true)
+    }
+
+    fn apply_sequence_nextval_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        nextval: SequenceNextVal,
+        legacy_replay: bool,
+    ) -> Result<i64, EngineError> {
+        if legacy_replay {
+            self.preflight_sequence_target_legacy_replay(&nextval.name)?;
+        } else {
+            self.preflight_sequence_target(&nextval.name)?;
+        }
         let sequence = cat
             .relational_sequences
             .get_mut(&nextval.name)
@@ -579,7 +773,28 @@ impl Engine {
         cat: &mut DdlCatalogState,
         setval: SequenceSetVal,
     ) -> Result<i64, EngineError> {
-        self.preflight_sequence_target(&setval.name)?;
+        self.apply_sequence_setval_with_replay_policy(cat, setval, false)
+    }
+
+    pub(crate) fn apply_sequence_setval_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        setval: SequenceSetVal,
+    ) -> Result<i64, EngineError> {
+        self.apply_sequence_setval_with_replay_policy(cat, setval, true)
+    }
+
+    fn apply_sequence_setval_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        setval: SequenceSetVal,
+        legacy_replay: bool,
+    ) -> Result<i64, EngineError> {
+        if legacy_replay {
+            self.preflight_sequence_target_legacy_replay(&setval.name)?;
+        } else {
+            self.preflight_sequence_target(&setval.name)?;
+        }
         let sequence = cat
             .relational_sequences
             .get_mut(&setval.name)
@@ -873,6 +1088,84 @@ impl Engine {
                 tablespace: rename.new_name,
             };
             cat.relational_comments.insert(new_target, comment);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_drop_materialized_view(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.apply_drop_materialized_view_with_replay_policy(cat, drop, false)
+    }
+
+    pub(crate) fn apply_drop_materialized_view_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.apply_drop_materialized_view_with_replay_policy(cat, drop, true)
+    }
+
+    fn apply_drop_materialized_view_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropMaterializedView,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        if legacy_replay {
+            self.preflight_drop_materialized_view_legacy_replay(&drop)?;
+        } else {
+            self.preflight_drop_materialized_view(&drop)?;
+        }
+        for name in &drop.names {
+            if cat.relational_materialized_views.remove(name).is_none() {
+                continue;
+            }
+            cat.relational_comments
+                .remove(&RelationalCommentTarget::MaterializedView {
+                    materialized_view: name.clone(),
+                });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_drop_sequence(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropSequence,
+    ) -> Result<(), EngineError> {
+        self.apply_drop_sequence_with_replay_policy(cat, drop, false)
+    }
+
+    pub(crate) fn apply_drop_sequence_legacy_replay(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropSequence,
+    ) -> Result<(), EngineError> {
+        self.apply_drop_sequence_with_replay_policy(cat, drop, true)
+    }
+
+    fn apply_drop_sequence_with_replay_policy(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropSequence,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        if legacy_replay {
+            self.preflight_drop_sequence_legacy_replay(&drop)?;
+        } else {
+            self.preflight_drop_sequence(&drop)?;
+        }
+        for name in &drop.names {
+            if cat.relational_sequences.remove(name).is_none() {
+                continue;
+            }
+            cat.relational_comments
+                .remove(&RelationalCommentTarget::Sequence {
+                    sequence: name.clone(),
+                });
         }
         Ok(())
     }

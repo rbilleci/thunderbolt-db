@@ -46,6 +46,24 @@ struct ShardDeviceIndexKey<'a> {
     offsets: &'a [u64],
     blob_offsets: &'a [u64],
     blob_lens: &'a [u64],
+    /// Per-key-column SQL validity bitmap. `None` means the immutable shard proves every value
+    /// present; `Some(offset)` is appended as a device predicate descriptor and never folded.
+    validity_offsets: &'a [Option<u64>],
+}
+
+fn shard_key_column_validity_offset(
+    shard: &RelationalResidentShard,
+    table: &RelationalTable,
+    position: usize,
+) -> Option<Option<u64>> {
+    let column = table.columns.get(position)?;
+    Some(
+        shard
+            .resident_device_null_columns
+            .iter()
+            .find(|layout| layout.name == column.name)
+            .map(|layout| layout.bitmap_byte_offset),
+    )
 }
 
 impl Engine {

@@ -7,6 +7,8 @@
 use super::*;
 use crate::engine_mutation_admission::validate_prepared_catalog_version;
 
+mod index_identity;
+mod index_owner_generation;
 mod view_identity;
 
 impl Engine {
@@ -54,7 +56,7 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         if !Self::transaction_catalog_command_is_supported(&command) {
             return Err(ExecuteError::Unsupported(
-                "transactional catalog staging currently supports CREATE TABLE and stored-view lifecycle commands only"
+                "transactional catalog staging currently supports CREATE TABLE, stored-view lifecycle, and index lifecycle commands only"
                     .to_string(),
             ));
         }
@@ -132,6 +134,23 @@ impl Engine {
                 "transactional catalog base changed before the next catalog statement".to_string(),
             ));
         }
+        if command_is_index_lifecycle(&command) {
+            let access_catalog = prior_overlay
+                .as_deref()
+                .unwrap_or(snapshot.catalog.as_ref());
+            let identities = Self::transaction_index_table_identities(access_catalog, &command)?;
+            #[cfg(test)]
+            if matches!(&command, Command::CreateIndex(create) if create.unique) {
+                self.run_index_owner_pre_acquire_hook();
+            }
+            self.acquire_transaction_write_table_access_identities(snapshot, &identities)?;
+            snapshot
+                .table_access
+                .acquire_exclusive(identities.values().copied())?;
+            if let Command::CreateIndex(create) = &command {
+                self.validate_transaction_unique_index_owner_generation(snapshot, create)?;
+            }
+        }
 
         // Validation works on a private clone. The exact published base must still match the
         // statement snapshot; otherwise retryable serialization wins before any private state is
@@ -152,6 +171,10 @@ impl Engine {
                 Self::validate_transaction_view_before(&scoped, &staged.command, identity)
                     .map_err(ExecuteError::Engine)?;
             }
+            if let Some(identity) = &staged.index_identity {
+                Self::validate_transaction_index_before(&scoped, &staged.command, identity)
+                    .map_err(ExecuteError::Engine)?;
+            }
             self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
                 self.apply_transaction_catalog_command(&mut working, staged.command.clone())
             })
@@ -167,6 +190,16 @@ impl Engine {
                         .to_string(),
                 )));
             }
+            if let Some(identity) = &staged.index_identity {
+                let applied =
+                    Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+                Self::validate_transaction_index_after(&applied, &staged.command, identity)
+                    .map_err(ExecuteError::Engine)?;
+            } else if command_is_index_lifecycle(&staged.command) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transactional index operation lost its typed identity closure".to_string(),
+                )));
+            }
         }
         if let Some(expected) = prior_overlay.as_deref() {
             let reconstructed =
@@ -179,15 +212,20 @@ impl Engine {
             }
         }
         let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+        let index_epoch_before = working.index_oid_epoch_current;
         self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
             self.apply_transaction_catalog_command(&mut working, command.clone())
         })
         .map_err(ExecuteError::Engine)?;
+        let index_epoch_transition = !index_epoch_before && working.index_oid_epoch_current;
         // CREATE validation helpers resolve domains and sequence/default dependencies through the
         // scoped working generation. Retain the catalog latch through reconstruction and the new
         // private apply so no global catalog generation can cross the checked base.
         drop(catalog_guard);
         let overlay = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
+        if let Command::CreateIndex(create) = &command {
+            self.validate_transaction_create_index_device(snapshot, &overlay, create)?;
+        }
 
         let mut delta = snapshot
             .delta
@@ -220,10 +258,21 @@ impl Engine {
         } else {
             None
         };
+        let index_identity = if command_is_index_lifecycle(&command) {
+            Some(Self::transaction_index_operation_identity(
+                command_index,
+                ordinal,
+                &scoped,
+                &overlay,
+                &command,
+            )?)
+        } else {
+            None
+        };
         if let Command::CreateTable(create) = &command {
-            Arc::make_mut(&mut delta.resident_shards)
-                .entry(create.table.clone())
-                .or_default();
+            let mut resident_shards = delta.resident_shards.as_ref().clone();
+            resident_shards.entry(create.table.clone()).or_default();
+            delta.publish_resident_shards(Arc::new(resident_shards));
         }
         if prior_commands.is_empty() {
             delta.catalog_base = Some(Arc::clone(&snapshot.catalog));
@@ -236,7 +285,9 @@ impl Engine {
                     ordinal,
                     statement_digest,
                     command,
+                    index_epoch_transition,
                     view_identity,
+                    index_identity,
                 },
             )));
         delta.generation = delta.generation.saturating_add(1);
@@ -255,6 +306,14 @@ mod view_tests;
 #[cfg(test)]
 #[path = "engine_transaction_catalog/view_lifecycle_tests.rs"]
 mod view_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "engine_transaction_catalog/index_lifecycle_tests.rs"]
+mod index_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "engine_transaction_catalog/index_owner_generation_tests.rs"]
+mod index_owner_generation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -624,14 +683,23 @@ mod tests {
         engine
             .submit_transaction(35, parsed("INSERT INTO credited_ddl VALUES (1, 9)"))
             .unwrap();
-        let table = engine
-            .transaction_snapshot_handle(35)
-            .unwrap()
+        let snapshot = engine.transaction_snapshot_handle(35).unwrap();
+        let table = snapshot
             .transaction_catalog()
             .relational_catalog
             .get("credited_ddl")
             .cloned()
             .unwrap();
+        let private_payload = {
+            let shards = snapshot.transaction_shards();
+            let memory = shards["credited_ddl"]
+                .iter()
+                .find(|shard| shard.row_count != 0)
+                .and_then(|shard| shard.device_memory.as_ref())
+                .expect("private transaction shard owns its payload");
+            Arc::downgrade(memory)
+        };
+        drop(snapshot);
         let final_index_bytes =
             crate::engine_residency::estimated_named_index_bytes_for_shard(&table, 1, 1).unwrap();
         let exact_budget = engine
@@ -642,6 +710,10 @@ mod tests {
         let (durable_tx, durable_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         engine.set_transaction_post_durable_hook(move || {
+            assert!(
+                private_payload.upgrade().is_none(),
+                "live and authority witnesses must both release the private allocation before canonical apply"
+            );
             durable_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });

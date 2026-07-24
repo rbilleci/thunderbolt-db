@@ -59,7 +59,7 @@ const POOLED_OUTPUT_BYTES_CAP: usize = 1 << 30; // 1 GiB
 
 /// Round a buffer request up to its pool bucket (power of two, floored at
 /// `MIN_POOLED_BUFFER_BYTES`) so a release maps straight back to the bucket it came from.
-fn output_buffer_bucket(min_bytes: usize) -> usize {
+pub(super) fn output_buffer_bucket(min_bytes: usize) -> usize {
     min_bytes.max(MIN_POOLED_BUFFER_BYTES).next_power_of_two()
 }
 
@@ -139,6 +139,28 @@ impl CudaAllocationScope {
 
     pub fn peak_bytes(&self) -> u64 {
         self.tracker.peak.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fail closed when `bytes` of additional simultaneously-live device ownership would cross
+    /// this scope's hard limit, without retaining a charge. Callers use this immediately before a
+    /// compound operator whose individual pooled leases are still charged normally: it proves the
+    /// complete operator geometry fits before the first lease is acquired, while the leases remain
+    /// the source of truth for the measured high-water.
+    pub fn ensure_available(bytes: u64) -> Result<(), CudaRuntimeProbeError> {
+        CUDA_ALLOCATION_TRACKER.with(|slot| {
+            let Some(tracker) = slot.borrow().as_ref().cloned() else {
+                return Ok(());
+            };
+            let live = tracker.live.load(std::sync::atomic::Ordering::Relaxed);
+            if live.saturating_add(bytes) > tracker.limit {
+                return Err(CudaRuntimeProbeError::AllocationBudgetExceeded {
+                    requested: bytes,
+                    live,
+                    limit: tracker.limit,
+                });
+            }
+            Ok(())
+        })
     }
 
     pub fn reserve_external(

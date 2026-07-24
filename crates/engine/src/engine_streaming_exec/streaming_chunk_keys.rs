@@ -563,7 +563,7 @@ impl Engine {
 
     /// Build the complete candidate set after an ordinary cold capture has released the commit
     /// mutex. Spilled chunks may read NVMe here. Class entry later only verifies/reuses this set.
-    pub(super) fn prime_chunk_key_candidates(
+    pub(crate) fn prime_chunk_key_candidates(
         &self,
         table_name: &str,
         entry: &Arc<ColdTableChunks>,

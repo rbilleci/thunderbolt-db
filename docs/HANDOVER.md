@@ -6,36 +6,46 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
 
 ## Current boundary
 
-- **PRODUCT-001** now has an independently accepted stored-view lifecycle boundary. `CREATE [OR REPLACE] VIEW`,
-  `ALTER VIEW ... RENAME TO ...`, and ordered multi-target `DROP VIEW [IF EXISTS]` share the existing private
-  `TransactionOperation` stream. Exact command/pre/post/OID/definition/dependency identities, byte-stable
-  create-only opcodes 12/13, additive lifecycle opcodes 14/15, clone-first live/replay validation, and the sole
-  atomic catalog/data publication owner are proven. Rename retains OID/ACL/comments; drop/recreate allocates a new
-  identity. Materialized-view lifecycle and every other unadmitted catalog family remain pre-effect refusals.
-- The accepted immutable implementation is base `eb4ffce51781d476bf123581c0b743ebdbdd9915`, code/test tree
-  `b934d5b1f80654768b1b4035f88e008bd710e866`, and code/test binary-diff SHA-256
-  `00dda15274382290086eac731dc0bdc68c433da047c8c8f410b3aac66a3f3a6d` across 18 paths. Independent
-  product/semantics and runtime/recovery audits both returned **ACCEPT** on that frozen candidate. The runtime
-  auditor also matched all 1,645 retained exported entries, artifact provenance, section markers, and the final
-  canonical report-card record before returning post-card **ACCEPT**.
-- Engine ordinary tests pass **568/568** with **583** GPU cases ignored; the exact seven-test ordered-catalog cohort
-  passes three serial plus two paired-concurrent rounds (**49/49** result groups) with zero CUDA
-  700/716/717/719. Workspace all-target/all-feature tests, strict Clippy, scoped rustfmt, NULL differential, actual
-  GPU lifecycle/recovery, diff, shell, dependency, and size gates pass. The canonical full card records Layer 1
-  rooflines of **1428.4 GB/s, p50 23us** in-L2 and **1439.4 GB/s, p50 186us** out-of-L2, plus Layer 2 production
-  point reads of **270.537M/s, p50 115us** and **245.753M/s, p50 139us**. Its exact final record is
-  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`.
+- **PRODUCT-001** now has an independently accepted transactional-index boundary. `CREATE INDEX`,
+  `ALTER INDEX ... RENAME TO ...`, and ordered multi-target `DROP INDEX [IF EXISTS]` share the existing private
+  `TransactionOperation` stream and sole WAL/publication owner. Complete table/index/OID/key/uniqueness/dependency
+  identity, private DML maintenance, GPU-only hot/cold validation, residency/accounting, rollback, isolation/ABA,
+  retry, and recovery semantics are proven. Additive opcodes 16/17 preserve legacy bytes; the typed current/legacy
+  epoch closes shared `pg_class` collisions without admitting transactional materialized-view or other catalog
+  families.
+- The audited code/test seal is base `c098b8471177519c01ef3743f7dc3c3d08b85f8f`, tree
+  `2613b26bd0b2f35e5bface7538ad83b860e38599`, and cached binary-diff SHA-256
+  `e034c830ec0eec1aafe720f227697aab524579e84ad8cc34d5d00bc94ecd11fc` across 76 paths. The implementation
+  audit returned **ACCEPT** after repairs. Workspace tests and strict static gates pass; the 20-test NULL/index/
+  accounting/grouped HAZARD cohort passed three serial plus two paired-concurrent rounds (**140/140**) without CUDA
+  700/716/717/719. The exact-seal quick card completed A/B with stable out-of-L2 roofline, grouped, and point-read
+  results.
+- The first documentation-inclusive full invocation completed A/B and built all 48M Section-C rows in **2304.0s**
+  with **0.0s** final residency, then returned incomplete at the default **2400s** operational timeout before
+  measurements. Paired current-toolchain 8M runs are effectively flat: candidate **95.4s/100.60s** build/total
+  versus accepted base **95.0s/100.30s**. The incomplete attempt is retained as evidence and must never be called
+  acceptance.
+- The independently re-audited documentation-only retry candidate is tree `2497b5fd00da8bee39f583a818e32e1da6952222`
+  with cached binary-diff SHA-256 `736653b742aed8be067f9623764ad9226694983f3448f50d2d754bffcdbb8575`.
+  Its one full invocation used the supported 2,700s operational timeout with every calibrated workload, cache,
+  cool-down, source, and fresh-build control fixed. The exact A/B/C canonical completion marker is present.
+  Out-of-L2 raw/grouped throughput is **1423.1 GB/s/1674.2 M-elem/s**; production point reads are
+  **264.394M/s, p50 118us** in-L2 and **244.127M/s, p50 140us** out-of-L2. No material regression is present.
+- Post-card provenance/performance audit returned **ACCEPT** on documentation closeout tree `c1d4b657...` /
+  cached binary-diff SHA-256 `5ab129cd...`, including artifact/configuration/marker provenance and docs-only card
+  applicability.
 - Earlier accepted PRODUCT-001 SQLx/simple-query, COPY, TLS/SCRAM, cancellation, prepared/portal/session,
   psql/GPU-catalog/R2DBC, PostgreSQL 16 pg_dump/restore, transaction-private catalog-generation, typed-reset, and
-  ordered-catalog/view-create boundaries remain canonical. Three inherited GPU defects remain PLAN-owned with
-  unchanged signatures. The current source outliers are PLAN-owned `engine_dml_concurrent.rs` at **2,170** lines,
-  `engine_commit.rs` at **2,091**, and `engine_mutation_admission.rs` at **2,010**; none has an exception.
+  ordered-catalog/view-lifecycle boundaries remain canonical. Three inherited GPU defects remain PLAN-owned with
+  unchanged signatures. The current source outliers are PLAN-owned `engine_dml_concurrent.rs` at **2,172** lines,
+  `engine_commit.rs` at **2,228**, and `engine_mutation_admission.rs` at **2,010**; none has an exception.
 
 ## Resume here
 
-Resume **PRODUCT-001** only at the PLAN current-focus boundary: admit any remaining transactional catalog family
-only with complete typed identity and dependency semantics, then close the PLAN-ordered SQLSTATE/type-codec,
-named-client, and mixed-recovery proofs. Only after those proofs are independently accepted should the legacy/P8
+After landing, resume **PRODUCT-001** only at the PLAN current-focus boundary: any later transactional catalog
+family is a separately scoped slice with complete typed identity/dependency semantics; materialized views remain a
+pre-effect refusal at this boundary. Then close the PLAN-ordered SQLSTATE/type-codec, named-client, and
+mixed-recovery proofs. Only after those proofs are independently accepted should the legacy/P8
 compatibility-and-deletion slice re-inventory, migrate, or disposition the remaining psql/preflight/benchmark
 consumers and delete the legacy listener plus independently callable P8 protocol adapters in the same frozen,
-independently audited slice. Follow the complete sequence and deletion gates only from [`PLAN.md`](PLAN.md).
+independently audited slice.

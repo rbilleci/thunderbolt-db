@@ -2383,12 +2383,18 @@ fn relational_catalog_records_comments_and_replays_from_wal() {
     assert_eq!(e.relational_column_comment("people", 2), None);
     e.execute_text(21, "DROP INDEX people_name_idx").unwrap();
     assert_eq!(e.relational_index_comment("people_name_idx"), None);
-    e.execute_text(22, "DROP INDEX people_pkey").unwrap();
+    assert!(e
+        .execute_text(22, "DROP INDEX people_pkey")
+        .unwrap_err()
+        .to_string()
+        .contains("cannot drop constraint-backed index"));
+    e.execute_text(23, "ALTER TABLE people DROP CONSTRAINT people_pkey")
+        .unwrap();
     assert_eq!(
         e.relational_constraint_comment("people", "people_pkey"),
         None
     );
-    e.execute_text(23, "DROP VIEW people_lookup").unwrap();
+    e.execute_text(24, "DROP VIEW people_lookup").unwrap();
     assert_eq!(e.relational_view_comment("people_lookup"), None);
 
     let missing = Engine::new_local_test_engine();

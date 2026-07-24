@@ -43,6 +43,180 @@ struct TransactionTableMutationBatch {
 }
 
 impl Engine {
+    fn publish_transaction_cold_index_enrollment(&self, table: &RelationalTable) {
+        self.purge_chunk_key_indexes_for_table(&table.name);
+        self.purge_chunk_key_blooms_for_table(&table.name);
+        // Neither chunk-authoritative nor store-authoritative cold residency retains a
+        // per-index device directory between calls.  This OID-keyed entry is the exact enrollment
+        // intent consumed if the same catalog/table identity later becomes hot again.
+        let mut publications = self
+            .read_state
+            .residency
+            .named_index_publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if table.indexes.is_empty() {
+            publications.remove(&table.oid);
+        } else {
+            publications.insert(table.oid, table.indexes.clone());
+        }
+        drop(publications);
+        self.read_state
+            .residency
+            .named_index_coverage_complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&table.name);
+    }
+
+    pub(crate) fn maintain_transaction_index_lifecycle_residency(
+        &self,
+        cat: &DdlCatalogState,
+        tables: &BTreeSet<String>,
+        publish_index: Index,
+    ) -> Result<BTreeSet<String>, EngineError> {
+        let mut maintained = BTreeSet::new();
+        let resident_shards = self.read_residency_shards();
+        let cold_chunks = self.read_streaming_cold_chunks();
+        for table_name in tables {
+            let table = cat.relational_catalog.get(table_name).ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "transaction index lifecycle lost owner relation \"{table_name}\""
+                ))
+            })?;
+            let without_resident_shards = resident_shards
+                .get(table_name)
+                .is_none_or(|shards| shards.is_empty());
+            let exact_zero_row_generation = without_resident_shards
+                && self.zero_row_resident_generation_boundary(table).is_some();
+            let device_authoritative = self.table_device_authoritative(table_name);
+            if device_authoritative && without_resident_shards && !exact_zero_row_generation {
+                return Err(EngineError::ApplyFailed(format!(
+                    "transaction index owner \"{table_name}\" lost its device-authoritative resident generation after WAL"
+                )));
+            }
+            let cold_without_resident_shards = !device_authoritative
+                && cold_chunks.contains_key(table_name)
+                && without_resident_shards;
+            if self.table_chunk_authoritative(table_name).is_some() || cold_without_resident_shards
+            {
+                self.publish_transaction_cold_index_enrollment(table);
+                maintained.insert(table_name.clone());
+                continue;
+            }
+            if exact_zero_row_generation {
+                // A table created by this same transaction publishes a real zero-row device
+                // generation before its index metadata. Index-only DDL is data-neutral, so advance
+                // that immutable empty generation through this publication boundary before marking
+                // coverage. There are no shard keys to build and no host rows to consult.
+                self.read_state
+                    .residency
+                    .with_snapshots_mut(|snapshots| {
+                        let entry = snapshots.get_mut(table_name).ok_or_else(|| {
+                            EngineError::ApplyFailed(format!(
+                                "transaction index owner \"{table_name}\" lost its zero-row resident generation"
+                            ))
+                        })?;
+                        let descriptor = Arc::make_mut(&mut entry.descriptor);
+                        if descriptor.row_count != 0 || entry.device_memory.is_none() {
+                            return Err(EngineError::ApplyFailed(format!(
+                                "transaction index owner \"{table_name}\" changed its zero-row resident generation"
+                            )));
+                        }
+                        descriptor.valid_through_index =
+                            descriptor.valid_through_index.max(publish_index);
+                        Ok(())
+                    })?;
+                self.read_state
+                    .residency
+                    .purge_shard_pk_index_for_table_during_transaction(table_name);
+                let mut publications = self
+                    .read_state
+                    .residency
+                    .named_index_publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if table.indexes.is_empty() {
+                    publications.remove(&table.oid);
+                } else {
+                    publications.insert(table.oid, table.indexes.clone());
+                }
+                drop(publications);
+                let mut coverage = self
+                    .read_state
+                    .residency
+                    .named_index_coverage_complete
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if table.indexes.is_empty() {
+                    coverage.remove(table_name);
+                } else {
+                    coverage.insert(table_name.clone(), (table.oid, table.indexes.clone()));
+                }
+                maintained.insert(table_name.clone());
+                continue;
+            }
+            let shards = resident_shards.get(table_name).cloned().ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "transaction index owner \"{table_name}\" lost its resident generation"
+                ))
+            })?;
+            if table.indexes.is_empty() {
+                self.read_state
+                    .residency
+                    .purge_shard_pk_index_for_table_during_transaction(table_name);
+                self.read_state
+                    .residency
+                    .named_index_publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&table.oid);
+            } else if shards.iter().all(|shard| shard.row_count == 0) {
+                self.read_state
+                    .residency
+                    .purge_shard_pk_index_for_table_during_transaction(table_name);
+                self.read_state
+                    .residency
+                    .named_index_coverage_complete
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(table_name.clone(), (table.oid, table.indexes.clone()));
+                self.read_state
+                    .residency
+                    .named_index_publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(table.oid, table.indexes.clone());
+            } else {
+                self.publish_relational_resident_indexes_for_generation(
+                    table,
+                    &shards,
+                    publish_index,
+                    true,
+                    false,
+                    true,
+                )
+                .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+                let retained_key_ids = table
+                    .indexes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ordinal, index)| {
+                        crate::engine_residency::index_probe_key_id(table, index, ordinal)
+                    })
+                    .collect::<BTreeSet<_>>();
+                self.read_state
+                    .residency
+                    .retain_shard_pk_indexes_for_table_during_transaction(
+                        table_name,
+                        &retained_key_ids,
+                    );
+            }
+            maintained.insert(table_name.clone());
+        }
+        Ok(maintained)
+    }
+
     pub(crate) fn coalesce_transaction_mutations(
         mutations: Vec<BinaryTransactionMutation>,
     ) -> Result<Vec<BinaryTransactionMutation>, ExecuteError> {
@@ -217,6 +391,17 @@ impl Engine {
             .cloned()
             .chain(table_resets.keys().cloned())
             .collect::<BTreeSet<_>>();
+        for table_name in transaction_created_tables {
+            if current_shards
+                .get(table_name)
+                .is_none_or(|shards| shards.is_empty())
+            {
+                // CREATE TABLE with no surviving private INSERT still owns a typed, allocation-
+                // backed zero-row GPU generation. This lets catalog/index publication close over
+                // an exact device authority instead of treating missing shards as empty by fiat.
+                new_tables.entry(table_name.clone()).or_default();
+            }
+        }
         for mutation in applied {
             let table_name = Self::applied_mutation_table(mutation);
             if !fresh_tables.contains(&table_name) {
@@ -389,6 +574,17 @@ impl Engine {
                 Some(publish_index),
             )
             .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+            let maintained = self.maintain_transaction_index_lifecycle_residency(
+                cat,
+                &BTreeSet::from([table.name.clone()]),
+                publish_index,
+            )?;
+            if !maintained.contains(&table.name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "resolved transaction did not enroll the empty relation \"{}\" index generation",
+                    table.name
+                )));
+            }
             return Ok(());
         }
         let mut private_map = BTreeMap::from([(table.name.clone(), Vec::new())]);
@@ -609,12 +805,15 @@ impl Engine {
         record: BinaryTransactionRecord,
     ) -> Result<Vec<AppliedRowMutation>, EngineError> {
         let BinaryTransactionRecord {
+            catalog_epoch,
             allocator_high_water,
             catalog_commands,
             created_table_identities,
+            created_table_index_identities,
             catalog_output,
             view_operations,
             view_lifecycle_operations,
+            index_lifecycle_operations,
             operation_order,
             statement_digests,
             sequence_input_oids,
@@ -630,11 +829,13 @@ impl Engine {
                     .to_string(),
             ));
         }
-        if (!view_operations.is_empty() || !view_lifecycle_operations.is_empty())
+        if (!view_operations.is_empty()
+            || !view_lifecycle_operations.is_empty()
+            || !index_lifecycle_operations.is_empty())
             && (catalog_output.is_none() || operation_order.is_empty())
         {
             return Err(EngineError::Durability(
-                "transactional stored-view WAL lost its ordered catalog envelope".to_string(),
+                "transactional catalog-lifecycle WAL lost its ordered catalog envelope".to_string(),
             ));
         }
 
@@ -792,13 +993,41 @@ impl Engine {
                 "ordered transaction WAL created-table identities are incomplete".to_string(),
             ));
         }
+        match catalog_epoch {
+            BinaryTransactionCatalogEpoch::IndexIdentityV1
+                if created_names
+                    != created_table_index_identities
+                        .keys()
+                        .map(String::as_str)
+                        .collect() =>
+            {
+                return Err(EngineError::Durability(
+                    "current ordered transaction WAL created-table index identities are incomplete"
+                        .to_string(),
+                ));
+            }
+            BinaryTransactionCatalogEpoch::Legacy if !created_table_index_identities.is_empty() => {
+                return Err(EngineError::Durability(
+                    "legacy transaction WAL carries current created-table index identities"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
         self.apply_transaction_catalog_envelope(
             &mut next_catalog,
             entry.index.saturating_sub(1),
+            catalog_epoch,
+            entry.index,
             &catalog_commands,
-            &view_operations,
-            &view_lifecycle_operations,
+            (
+                &view_operations,
+                &view_lifecycle_operations,
+                &index_lifecycle_operations,
+            ),
         )?;
+        let next_catalog_snapshot =
+            Self::catalog_snapshot_from_working(&next_catalog, entry.index.saturating_sub(1));
         for (table_name, identity) in &created_table_identities {
             let table = next_catalog
                 .relational_catalog
@@ -814,6 +1043,18 @@ impl Engine {
                 return Err(EngineError::Durability(format!(
                     "ordered transaction created relation \"{table_name}\" with a different stable identity"
                 )));
+            }
+            if catalog_epoch == BinaryTransactionCatalogEpoch::IndexIdentityV1 {
+                let observed = Self::transaction_created_table_implicit_index_identities(
+                    &next_catalog_snapshot,
+                    table_name,
+                )
+                .map_err(|error| EngineError::Durability(error.to_string()))?;
+                if created_table_index_identities.get(table_name) != Some(&observed) {
+                    return Err(EngineError::Durability(format!(
+                        "ordered transaction created relation \"{table_name}\" with different implicit index identities"
+                    )));
+                }
             }
         }
         if let Some(output) = &catalog_output {
@@ -881,6 +1122,9 @@ impl Engine {
                         })
                         .collect::<BTreeSet<_>>(),
                     Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
+                        BTreeSet::new()
+                    }
+                    Command::CreateIndex(_) | Command::RenameIndex(_) | Command::DropIndex(_) => {
                         BTreeSet::new()
                     }
                     _ => {

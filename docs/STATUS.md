@@ -52,6 +52,88 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   **230M/s** floor; against the preceding **225.418M/s/195.955M/s** card, throughput improves
   **16.8%/19.3%**.
 
+## PRODUCT-001 transactional index lifecycle — accepted 2026-07-24
+
+- `CREATE INDEX`, `ALTER INDEX ... RENAME TO ...`, and ordered multi-target `DROP INDEX [IF EXISTS]` now use the
+  existing transaction-private `TransactionOperation` stream. Every command binds its ordinal, stable table and
+  index OIDs, exact pre/post name, key columns, uniqueness, dependency and target-absence proofs, and shared
+  `pg_class` allocation epoch. Rename preserves the index identity; drop/recreate receives a new identity.
+  Statement-ordered private DML observes and maintains private indexes, dropped indexes stop receiving maintenance,
+  rollback publishes nothing, and empty-table creation enrolls indexes in the same final-cut publication protocol.
+- UNIQUE validation remains GPU-native for resident and cold inputs, honors PostgreSQL NULL-distinct behavior, and
+  produces only bounded verdict/count readback. Hot data, maintained index state, tombstones, and the final catalog/
+  data generation publish together with exact residency and GPU-allocation accounting; failure retires provisional
+  owners without leaking a catalog or resident generation. There is no CPU index, CPU uniqueness executor, second
+  relational path, or second WAL/publication authority.
+- Additive WAL opcodes 16/17 encode complete index identities and lifecycle proofs. Current records allocate every
+  relation kind in the shared `pg_class` namespace; typed current/legacy epoch selection preserves old bytes while
+  preventing table/index/sequence/materialized-view OID collisions, including split replay and allocator-boundary
+  cases. The sequence/materialized-view reverse-family guard is compatibility and recovery policy only:
+  transactional materialized-view and other catalog-family lifecycle remain outside this slice and fail before
+  transactional effects.
+- Admission, live apply, retry, and replay derive their epoch selectors independently, reconstruct the complete
+  catalog/data result on clones, and install it only through the existing serialized owner. Focused coverage proves
+  READ COMMITTED rebasing, REPEATABLE READ rejection, name/OID/dependency ABA, catalog-latch concurrency, exact
+  retry matching, malformed/tampered WAL rejection, post-durable recovery ownership, fresh and split recovery,
+  private visibility, rollback, residency retirement, and non-vacuous sabotage at the relevant pre-WAL boundaries.
+- Workspace all-target/all-feature tests pass, including engine **608/608** with **601** GPU cases ignored,
+  execution **52/52** with **79** ignored, facade **76/76** with **15** ignored, and concurrency **13/13** with one
+  ignored. Focused namespace, lifecycle, durability, WAL-codec, relation-lifecycle, and client gates pass. The exact
+  20-test NULL/index/accounting/grouped cohort passes three serial plus two paired-concurrent HAZARD rounds
+  (**140/140** executions) on engine binary SHA-256
+  `3355a9d3b6378cf186936e68fe3bd3d8c793bb1c6dc6712862adf623e5c8d3f9` and execution binary SHA-256
+  `5173c692f57692e18e0aae42bab140de304168d666e06ce2932ee1b4b43a4ab7`, with zero CUDA
+  700/716/717/719. Strict workspace Clippy, scoped rustfmt, diff, NULL differential, HAZARD, and source-size gates
+  pass. The 1,519-line index identity/validation owner and 1,525-line resident-group owner are each a cohesive
+  invariant boundary just above the preferred 1,500-line envelope and below mandatory analysis; test owners remain
+  below 3,000 lines. PLAN retains the **2,172/2,228/2,010** production outlier dispositions.
+- The independently audited code/test seal is base `c098b8471177519c01ef3743f7dc3c3d08b85f8f`, index tree
+  `2613b26bd0b2f35e5bface7538ad83b860e38599`, and cached binary-diff SHA-256
+  `e034c830ec0eec1aafe720f227697aab524579e84ad8cc34d5d00bc94ecd11fc` across 76 paths with no
+  unstaged/untracked drift. The adversarial implementation audit returned **ACCEPT** after the shared-namespace,
+  epoch-selector, and grouped-result repairs. The exact-seal quick screen completed A/B with raw rooflines
+  **1363.4 GB/s, p50 25us** in-L2 and **1440.1 GB/s, p50 186us** out-of-L2, grouped execution
+  **1675.6 M-elem/s**, and Layer 2 **264.658M/s, p50 117us** at batch 65,536. It is a non-acceptance screen;
+  the successful canonical full report card below supersedes it.
+- The first full invocation matched documentation-inclusive staged tree
+  `59fcbf532d01abfd244cf90ff3520531699bcede` and cached binary-diff SHA-256
+  `cb91816f6a4a0d8c5c3d9d4e6bd3932207624a1b77cb74852469bc3e2fc77d35`. Sections A/B completed, but
+  Section C built all **48M** rows in **2304.0s** with **0.0s** final residency and then hit the default
+  **2400s** operational timeout before `executed_target`; its exact final record is
+  `report_card_execution_status=incomplete mode=full failed_sections=C:rc=124`. This is retained failure evidence,
+  not acceptance. Under the same current toolchain, the exact candidate artifact
+  `d93fb271600beba5e4c1de5e63b50486965131bb8e42ae66c9c7353dfccdc43e` and accepted-base artifact
+  `a08012099edd196461870b254a5567ee17c8fc692e6e14e05d8d07d5bf93b53b` were run serially at 8M rows /
+  4,001 shards: candidate build/total was **95.4s/100.60s**, base was **95.0s/100.30s**, and both produced
+  **20us/19us** compatibility/compact p50. The **+0.4%/+0.3%** delta rules out a material candidate regression at
+  that calibrated diagnostic scale. The original failed log remains `/tmp/product001-index-full-card.log`.
+- The independently re-audited documentation-only retry candidate is staged tree
+  `2497b5fd00da8bee39f583a818e32e1da6952222` with cached binary-diff SHA-256
+  `736653b742aed8be067f9623764ad9226694983f3448f50d2d754bffcdbb8575`. Its one full invocation used the
+  supported `SECTION_C_TIMEOUT=2700` operational override while preserving every calibrated row, batch, warmup,
+  cache, GPU-gap, source, and fresh-target control. All three benchmark completion records and section markers are
+  present, and the exact final record is
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`.
+- The retry's raw-kernel artifact is SHA-256
+  `a1f053190a6b2e915837489d21bc521e9b0369f4145be4aea5c37c3d0001c234` (1,129,600 bytes), its production
+  point-read artifact is `d93fb271600beba5e4c1de5e63b50486965131bb8e42ae66c9c7353dfccdc43e`
+  (9,593,000 bytes), and its AWS-LC archive is
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61` (7,156,488 bytes). Layer 1 is
+  **1305.1 GB/s, p50 26us** in-L2 and **1423.1 GB/s, p50 189us** out-of-L2; grouped execution is
+  **1674.2 M-elem/s**. Layer 2 reaches **264.394M/s, p50 118us** in-L2 and **244.127M/s, p50 140us**
+  out-of-L2 after the fixed 48M-row fixture builds in **2290.1s** with zero final-residency work. Against the latest
+  accepted card, honest out-of-L2 raw/grouped throughput is **-1.1%/-0.1%**, point throughput is
+  **-2.3%/-0.7%**, and point p50 is **+3us/+1us**; this is not a material regression.
+- Independent post-card provenance/performance audit returned **ACCEPT** on documentation closeout tree
+  `c1d4b657c85ad19b7abadb6f7671c92193616b95` / cached binary-diff SHA-256
+  `5ab129cd2d073b56d854d0ffea68837520bc2d330801831853fd30c77198a143`. It independently matched the card
+  candidate, fresh export/target, artifact hashes and sizes, fixed A/B/C configurations, exactly one completion
+  record and section marker per section, zero incomplete/drift/error records, and the final canonical marker. It
+  also confirmed that the post-card changes are documentation-only, the code seal remains exact, and the card
+  remains applicable without rerun.
+- The three inherited PLAN-owned defects reproduce with unchanged durable-retry, classic-wave FK serialization, and
+  wide-unique violation signatures; they are not mislabeled as regressions of this slice.
+
 ## PRODUCT-001 transactional stored-view lifecycle — accepted 2026-07-23
 
 - `ALTER VIEW ... RENAME TO ...` and ordered multi-target `DROP VIEW [IF EXISTS]` now join

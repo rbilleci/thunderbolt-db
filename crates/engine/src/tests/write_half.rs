@@ -172,18 +172,24 @@ fn active_snapshots_track_oldest_boundary() {
             resident_shards: Arc::new(BTreeMap::new()),
             device_authoritative_tables: Arc::new(BTreeSet::new()),
             chunk_authoritative_tables: Arc::new(BTreeMap::new()),
-            delta: Arc::new(std::sync::Mutex::new(TransactionDeltaState {
-                generation: 0,
-                resident_shards: Arc::new(BTreeMap::new()),
-                streaming_cold_chunks: Arc::new(BTreeMap::new()),
-                operations: Vec::new(),
-                write_set: WriteSet::default(),
-                next_row_id: 1,
-                sequence_state: BTreeMap::new(),
-                catalog_base: None,
-                catalog_overlay: None,
-                private_gpu_bytes_by_gpu: BTreeMap::new(),
-                commit_gpu_bytes_by_gpu: BTreeMap::new(),
+            delta: Arc::new(std::sync::Mutex::new({
+                let resident_shards = Arc::new(BTreeMap::new());
+                let streaming_cold_chunks = Arc::new(BTreeMap::new());
+                TransactionDeltaState {
+                    generation: 0,
+                    resident_shards: Arc::clone(&resident_shards),
+                    resident_shards_authority: resident_shards,
+                    streaming_cold_chunks: Arc::clone(&streaming_cold_chunks),
+                    streaming_cold_chunks_authority: streaming_cold_chunks,
+                    operations: Vec::new(),
+                    write_set: WriteSet::default(),
+                    next_row_id: 1,
+                    sequence_state: BTreeMap::new(),
+                    catalog_base: None,
+                    catalog_overlay: None,
+                    private_gpu_bytes_by_gpu: BTreeMap::new(),
+                    commit_gpu_bytes_by_gpu: BTreeMap::new(),
+                }
             })),
             table_access: Arc::new(TableAccessRegistry::default()).lease(),
             rewrite_fenced_tables: Arc::new(std::sync::Mutex::new(BTreeSet::new())),

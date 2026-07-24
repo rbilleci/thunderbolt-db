@@ -2,7 +2,860 @@
 
 use super::*;
 
+mod cold_index_validation_support;
+use cold_index_validation_support::{
+    cold_validation_descriptor_bytes, try_clone_cold_int4_stats, try_clone_cold_memory_proof,
+    try_clone_cold_string, try_clone_cold_strings, validate_cold_text_offsets_bounded,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColdIndexValidationWindow {
+    pub(crate) chunk_ordinal: usize,
+    pub(crate) row_start: usize,
+    pub(crate) row_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ColdFixedColumnWindow {
+    source_capacity: usize,
+    row_start: usize,
+    row_count: usize,
+}
+
+struct ColdValidationCopy<'a> {
+    source: &'a super::ColdPayload,
+    table: &'a str,
+    host_limit: usize,
+    required: usize,
+}
+
+struct ColdIndexValidationPayload {
+    resident_bytes: u64,
+    bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
+    text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    null_columns: Vec<ResidentDeviceNullBitmapLayout>,
+    payload: Vec<u8>,
+    deleted_by: Option<Vec<u8>>,
+    host_staging_bytes: usize,
+}
+
+pub(crate) const COLD_INDEX_MAX_HOST_STAGING_BYTES: usize = 256 * 1024 * 1024;
+const COLD_BITMAP_SCAN_BLOCK_BYTES: usize = 64 * 1024;
+
+fn cold_index_validation_error(message: impl Into<String>) -> ExecuteError {
+    ExecuteError::Engine(EngineError::ApplyFailed(message.into()))
+}
+
+fn cold_index_host_staging_exhausted(table: &str, required: usize, limit: usize) -> ExecuteError {
+    ExecuteError::ResourceExhausted(format!(
+        "transactional UNIQUE index validation for relation \"{table}\" requires {required} \
+         bytes of cold host staging above its bounded {limit}-byte lease; raise the GPU residency \
+         budget, compact/admit the relation, and retry"
+    ))
+}
+
+fn map_cold_payload_range_error(
+    table: &str,
+    required: usize,
+    limit: usize,
+    error: super::ColdPayloadRangeError,
+    truncated: &'static str,
+) -> ExecuteError {
+    match error {
+        super::ColdPayloadRangeError::Allocation => {
+            cold_index_host_staging_exhausted(table, required, limit)
+        }
+        super::ColdPayloadRangeError::OutOfBoundsOrIo => cold_index_validation_error(truncated),
+    }
+}
+
+fn read_cold_payload_u64(
+    payload: &super::ColdPayload,
+    byte_offset: usize,
+) -> Result<u64, ExecuteError> {
+    payload
+        .read_array(byte_offset)
+        .map(u64::from_le_bytes)
+        .map_err(|_| cold_index_validation_error("cold validation offset array is truncated"))
+}
+
+impl ColdValidationCopy<'_> {
+    fn append_fixed_columns(
+        &self,
+        destination: &mut Vec<u8>,
+        section_start: usize,
+        column_count: usize,
+        window: ColdFixedColumnWindow,
+        width: usize,
+    ) -> Result<usize, ExecuteError> {
+        let column_stride = window
+            .source_capacity
+            .checked_mul(width)
+            .ok_or_else(|| cold_index_validation_error("cold fixed-column stride overflowed"))?;
+        let slice_start = window
+            .row_start
+            .checked_mul(width)
+            .ok_or_else(|| cold_index_validation_error("cold fixed-column window overflowed"))?;
+        let slice_len = window
+            .row_count
+            .checked_mul(width)
+            .ok_or_else(|| cold_index_validation_error("cold fixed-column length overflowed"))?;
+        for ordinal in 0..column_count {
+            let start =
+                section_start
+                    .checked_add(ordinal.checked_mul(column_stride).ok_or_else(|| {
+                        cold_index_validation_error("cold column offset overflowed")
+                    })?)
+                    .and_then(|offset| offset.checked_add(slice_start))
+                    .ok_or_else(|| cold_index_validation_error("cold column offset overflowed"))?;
+            let end = start
+                .checked_add(slice_len)
+                .ok_or_else(|| cold_index_validation_error("cold column extent overflowed"))?;
+            self.source
+                .append_range(start, end - start, destination)
+                .map_err(|error| {
+                    map_cold_payload_range_error(
+                        self.table,
+                        self.required,
+                        self.host_limit,
+                        error,
+                        "cold fixed-column payload is truncated",
+                    )
+                })?;
+        }
+        section_start
+            .checked_add(
+                column_count
+                    .checked_mul(column_stride)
+                    .ok_or_else(|| cold_index_validation_error("cold section extent overflowed"))?,
+            )
+            .ok_or_else(|| cold_index_validation_error("cold section extent overflowed"))
+    }
+
+    fn append_bitmap(
+        &self,
+        destination: &mut Vec<u8>,
+        source_offset: u64,
+        source_capacity: usize,
+        row_start: usize,
+        row_count: usize,
+    ) -> Result<(u64, u64, u64), ExecuteError> {
+        let source_offset = usize::try_from(source_offset)
+            .map_err(|_| cold_index_validation_error("cold bitmap offset exceeds host framing"))?;
+        let source_bytes = source_capacity
+            .div_ceil(32)
+            .checked_mul(4)
+            .ok_or_else(|| cold_index_validation_error("cold bitmap extent overflowed"))?;
+        if source_offset
+            .checked_add(source_bytes)
+            .is_none_or(|end| end > self.source.len())
+        {
+            return Err(cold_index_validation_error(
+                "cold bitmap payload is truncated",
+            ));
+        }
+        let output_offset = u64::try_from(destination.len()).map_err(|_| {
+            cold_index_validation_error("cold bitmap output exceeds device framing")
+        })?;
+        let output_words = row_count.div_ceil(32);
+        destination
+            .try_reserve_exact(output_words.saturating_mul(4))
+            .map_err(|_| {
+                cold_index_host_staging_exhausted(self.table, self.required, self.host_limit)
+            })?;
+        let first_source_word = row_start / 32;
+        let source_word_count = row_count
+            .checked_add(row_start % 32)
+            .ok_or_else(|| cold_index_validation_error("cold bitmap window overflowed"))?
+            .div_ceil(32);
+        let mut block = [0u8; COLD_BITMAP_SCAN_BLOCK_BYTES];
+        let mut loaded_word_start = usize::MAX;
+        let mut loaded_word_count = 0usize;
+        let mut spill_reads = 0u64;
+        let mut spill_bytes = 0u64;
+        for output_word in 0..output_words {
+            let mut word = 0u32;
+            let local_start = output_word * 32;
+            let local_end = row_count.min(local_start + 32);
+            for local in local_start..local_end {
+                let source_row = row_start + local;
+                let source_word_ordinal = source_row / 32;
+                if source_word_ordinal < loaded_word_start
+                    || source_word_ordinal >= loaded_word_start.saturating_add(loaded_word_count)
+                {
+                    let consumed_words = source_word_ordinal
+                        .checked_sub(first_source_word)
+                        .ok_or_else(|| {
+                            cold_index_validation_error("cold bitmap window underflowed")
+                        })?;
+                    let remaining_words = source_word_count
+                        .checked_sub(consumed_words)
+                        .ok_or_else(|| {
+                            cold_index_validation_error("cold bitmap window overflowed")
+                        })?;
+                    loaded_word_count = remaining_words
+                        .min(COLD_BITMAP_SCAN_BLOCK_BYTES / std::mem::size_of::<u32>());
+                    let read_len = loaded_word_count
+                        .checked_mul(std::mem::size_of::<u32>())
+                        .ok_or_else(|| {
+                            cold_index_validation_error("cold bitmap range overflowed")
+                        })?;
+                    let read_offset = source_word_ordinal
+                        .checked_mul(std::mem::size_of::<u32>())
+                        .and_then(|offset| source_offset.checked_add(offset))
+                        .ok_or_else(|| {
+                            cold_index_validation_error("cold bitmap range overflowed")
+                        })?;
+                    self.source
+                        .read_exact_range(read_offset, &mut block[..read_len])
+                        .map_err(|_| {
+                            cold_index_validation_error("cold bitmap payload is truncated")
+                        })?;
+                    if self.source.is_spilled() {
+                        spill_reads = spill_reads.checked_add(1).ok_or_else(|| {
+                            cold_index_validation_error("cold bitmap read count overflowed")
+                        })?;
+                        spill_bytes =
+                            spill_bytes.checked_add(read_len as u64).ok_or_else(|| {
+                                cold_index_validation_error("cold bitmap read bytes overflowed")
+                            })?;
+                    }
+                    loaded_word_start = source_word_ordinal;
+                }
+                let block_offset = source_word_ordinal
+                    .checked_sub(loaded_word_start)
+                    .and_then(|word| word.checked_mul(std::mem::size_of::<u32>()))
+                    .ok_or_else(|| cold_index_validation_error("cold bitmap block underflowed"))?;
+                let source_word = u32::from_le_bytes(
+                    block[block_offset..block_offset + 4]
+                        .try_into()
+                        .expect("four-byte bitmap word"),
+                );
+                if source_word & (1u32 << (source_row % 32)) != 0 {
+                    word |= 1u32 << (local % 32);
+                }
+            }
+            destination.extend_from_slice(&word.to_le_bytes());
+        }
+        Ok((output_offset, spill_reads, spill_bytes))
+    }
+}
+
+/// Slice one immutable cold payload by row coordinates without decoding or evaluating relational
+/// values. Fixed columns byte-copy, bool/validity metadata bit-repacks, and text offset metadata is
+/// rebased around the selected blob span. The result is the same dense device format consumed by
+/// the shared resident executor; all NULL filtering and key equality remain GPU operations.
+fn slice_cold_index_validation_window(
+    chunk: &ColdChunk,
+    window: ColdIndexValidationWindow,
+    host_limit: usize,
+) -> Result<ColdIndexValidationPayload, ExecuteError> {
+    let source = &chunk.payload;
+    let table = chunk.snapshot.table.as_str();
+    let source_rows = usize::try_from(chunk.row_count)
+        .map_err(|_| cold_index_validation_error("cold row count exceeds host framing"))?;
+    let row_end = window
+        .row_start
+        .checked_add(window.row_count)
+        .ok_or_else(|| cold_index_validation_error("cold validation window overflowed"))?;
+    if window.row_count == 0
+        || row_end > source_rows
+        || chunk.snapshot.row_count != source_rows
+        || chunk.snapshot.capacity < source_rows
+    {
+        return Err(cold_index_validation_error(
+            "cold validation window is outside its immutable payload",
+        ));
+    }
+    if read_cold_payload_u64(source, 0)? != chunk.row_count {
+        return Err(cold_index_validation_error(
+            "cold validation payload header is torn",
+        ));
+    }
+
+    let capacity = chunk.snapshot.capacity;
+    let int4_count = chunk.snapshot.resident_device_int4_columns.len();
+    let int8_count = chunk.snapshot.resident_device_int8_columns.len();
+    let b128_count = chunk.snapshot.resident_device_numeric_columns.len();
+    let fixed_bytes = window
+        .row_count
+        .checked_mul(
+            int4_count
+                .checked_mul(4)
+                .and_then(|bytes| {
+                    int8_count
+                        .checked_mul(8)
+                        .and_then(|int8| bytes.checked_add(int8))
+                })
+                .and_then(|bytes| {
+                    b128_count
+                        .checked_mul(16)
+                        .and_then(|b128| bytes.checked_add(b128))
+                })
+                .ok_or_else(|| cold_index_validation_error("cold fixed geometry overflowed"))?,
+        )
+        .ok_or_else(|| cold_index_validation_error("cold fixed geometry overflowed"))?;
+    let output_bitmap_bytes = window
+        .row_count
+        .div_ceil(32)
+        .checked_mul(4)
+        .ok_or_else(|| cold_index_validation_error("cold bitmap geometry overflowed"))?;
+    let bitmap_count = chunk
+        .snapshot
+        .resident_device_bool_columns
+        .len()
+        .checked_add(chunk.snapshot.resident_device_null_columns.len())
+        .ok_or_else(|| cold_index_validation_error("cold bitmap geometry overflowed"))?;
+    let mut required_payload = 8usize
+        .checked_add(fixed_bytes)
+        .and_then(|bytes| {
+            output_bitmap_bytes
+                .checked_mul(bitmap_count)
+                .and_then(|bitmaps| bytes.checked_add(bitmaps))
+        })
+        .ok_or_else(|| cold_index_validation_error("cold payload geometry overflowed"))?;
+    for layout in &chunk.snapshot.resident_device_text_columns {
+        required_payload = required_payload
+            .checked_add((8usize.wrapping_sub(required_payload % 8)) % 8)
+            .ok_or_else(|| cold_index_validation_error("cold text geometry overflowed"))?;
+        let source_offsets = usize::try_from(layout.offsets_byte_offset)
+            .map_err(|_| cold_index_validation_error("cold text offsets exceed host framing"))?;
+        let base_offset = window
+            .row_start
+            .checked_mul(8)
+            .and_then(|offset| source_offsets.checked_add(offset))
+            .ok_or_else(|| cold_index_validation_error("cold text offset overflowed"))?;
+        let limit_offset = row_end
+            .checked_mul(8)
+            .and_then(|offset| source_offsets.checked_add(offset))
+            .ok_or_else(|| cold_index_validation_error("cold text offset overflowed"))?;
+        let base = read_cold_payload_u64(source, base_offset)?;
+        let limit = read_cold_payload_u64(source, limit_offset)?;
+        if base > limit || limit > layout.bytes_len {
+            return Err(cold_index_validation_error(
+                "cold text offsets are non-monotonic or out of bounds",
+            ));
+        }
+        let offsets_bytes = window
+            .row_count
+            .checked_add(1)
+            .and_then(|entries| entries.checked_mul(8))
+            .ok_or_else(|| cold_index_validation_error("cold text geometry overflowed"))?;
+        let blob_bytes = usize::try_from(limit - base)
+            .map_err(|_| cold_index_validation_error("cold text window exceeds host framing"))?;
+        required_payload = required_payload
+            .checked_add(offsets_bytes)
+            .and_then(|bytes| bytes.checked_add(blob_bytes))
+            .ok_or_else(|| cold_index_validation_error("cold text geometry overflowed"))?;
+    }
+    let sidecar_bytes = chunk
+        .deleted_by
+        .as_ref()
+        .map_or(0, |_| window.row_count.saturating_mul(8));
+    let host_staging_bytes = required_payload
+        .checked_add(sidecar_bytes)
+        .ok_or_else(|| cold_index_host_staging_exhausted(table, usize::MAX, host_limit))?;
+    if host_staging_bytes > host_limit {
+        return Err(cold_index_host_staging_exhausted(
+            table,
+            host_staging_bytes,
+            host_limit,
+        ));
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(required_payload)
+        .map_err(|_| cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit))?;
+    payload.extend_from_slice(&(window.row_count as u64).to_le_bytes());
+    let fixed_window = ColdFixedColumnWindow {
+        source_capacity: capacity,
+        row_start: window.row_start,
+        row_count: window.row_count,
+    };
+    let copy = ColdValidationCopy {
+        source,
+        table,
+        host_limit,
+        required: host_staging_bytes,
+    };
+    let mut section = 8usize;
+    section = copy.append_fixed_columns(&mut payload, section, int4_count, fixed_window, 4)?;
+    section = copy.append_fixed_columns(&mut payload, section, int8_count, fixed_window, 8)?;
+    let _fixed_end =
+        copy.append_fixed_columns(&mut payload, section, b128_count, fixed_window, 16)?;
+
+    let mut bool_columns = Vec::new();
+    bool_columns
+        .try_reserve_exact(chunk.snapshot.resident_device_bool_columns.len())
+        .map_err(|_| cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit))?;
+    for layout in &chunk.snapshot.resident_device_bool_columns {
+        let mut name = String::new();
+        name.try_reserve_exact(layout.name.len()).map_err(|_| {
+            cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit)
+        })?;
+        name.push_str(&layout.name);
+        bool_columns.push(ResidentDeviceBoolColumnLayout {
+            name,
+            bitmap_byte_offset: copy
+                .append_bitmap(
+                    &mut payload,
+                    layout.bitmap_byte_offset,
+                    capacity,
+                    window.row_start,
+                    window.row_count,
+                )?
+                .0,
+        });
+    }
+    let mut null_columns = Vec::new();
+    null_columns
+        .try_reserve_exact(chunk.snapshot.resident_device_null_columns.len())
+        .map_err(|_| cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit))?;
+    for layout in &chunk.snapshot.resident_device_null_columns {
+        let mut name = String::new();
+        name.try_reserve_exact(layout.name.len()).map_err(|_| {
+            cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit)
+        })?;
+        name.push_str(&layout.name);
+        null_columns.push(ResidentDeviceNullBitmapLayout {
+            name,
+            bitmap_byte_offset: copy
+                .append_bitmap(
+                    &mut payload,
+                    layout.bitmap_byte_offset,
+                    capacity,
+                    window.row_start,
+                    window.row_count,
+                )?
+                .0,
+        });
+    }
+    let mut text_columns = Vec::new();
+    text_columns
+        .try_reserve_exact(chunk.snapshot.resident_device_text_columns.len())
+        .map_err(|_| cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit))?;
+    for layout in &chunk.snapshot.resident_device_text_columns {
+        while !payload.len().is_multiple_of(8) {
+            payload.push(0);
+        }
+        let source_offsets = usize::try_from(layout.offsets_byte_offset)
+            .map_err(|_| cold_index_validation_error("cold text offsets exceed host framing"))?;
+        let source_bytes = usize::try_from(layout.bytes_byte_offset)
+            .map_err(|_| cold_index_validation_error("cold text bytes exceed host framing"))?;
+        let source_blob_len = usize::try_from(layout.bytes_len)
+            .map_err(|_| cold_index_validation_error("cold text blob exceeds host framing"))?;
+        let window_offsets_start = window
+            .row_start
+            .checked_mul(8)
+            .and_then(|offset| source_offsets.checked_add(offset))
+            .ok_or_else(|| cold_index_validation_error("cold text offset overflowed"))?;
+        let window_offsets_len = window
+            .row_count
+            .checked_add(1)
+            .and_then(|entries| entries.checked_mul(8))
+            .ok_or_else(|| cold_index_validation_error("cold text offset overflowed"))?;
+        let base = read_cold_payload_u64(source, window_offsets_start)?;
+        let limit = read_cold_payload_u64(
+            source,
+            row_end
+                .checked_mul(8)
+                .and_then(|offset| source_offsets.checked_add(offset))
+                .ok_or_else(|| cold_index_validation_error("cold text offset overflowed"))?,
+        )?;
+        if base > limit || limit > layout.bytes_len {
+            return Err(cold_index_validation_error(
+                "cold text offsets are non-monotonic or out of bounds",
+            ));
+        }
+        let offsets_byte_offset = payload.len() as u64;
+        let output_offsets_start = payload.len();
+        source
+            .append_range(window_offsets_start, window_offsets_len, &mut payload)
+            .map_err(|error| {
+                map_cold_payload_range_error(
+                    table,
+                    host_staging_bytes,
+                    host_limit,
+                    error,
+                    "cold text offsets are truncated",
+                )
+            })?;
+        let mut previous = base;
+        for encoded in payload[output_offsets_start..].chunks_exact_mut(std::mem::size_of::<u64>())
+        {
+            let offset = u64::from_le_bytes(encoded.try_into().expect("eight-byte offset"));
+            if offset < base || offset > limit {
+                return Err(cold_index_validation_error(
+                    "cold text window offsets are non-monotonic",
+                ));
+            }
+            if offset < previous {
+                return Err(cold_index_validation_error(
+                    "cold text window offsets are non-monotonic",
+                ));
+            }
+            previous = offset;
+            encoded.copy_from_slice(&(offset - base).to_le_bytes());
+        }
+        let bytes_byte_offset = payload.len() as u64;
+        let blob_start =
+            source_bytes
+                .checked_add(usize::try_from(base).map_err(|_| {
+                    cold_index_validation_error("cold text base exceeds host framing")
+                })?)
+                .ok_or_else(|| cold_index_validation_error("cold text base overflowed"))?;
+        let blob_end =
+            source_bytes
+                .checked_add(usize::try_from(limit).map_err(|_| {
+                    cold_index_validation_error("cold text limit exceeds host framing")
+                })?)
+                .ok_or_else(|| cold_index_validation_error("cold text limit overflowed"))?;
+        if source_bytes
+            .checked_add(source_blob_len)
+            .is_none_or(|end| end > source.len())
+        {
+            return Err(cold_index_validation_error("cold text blob is truncated"));
+        }
+        source
+            .append_range(blob_start, blob_end - blob_start, &mut payload)
+            .map_err(|error| {
+                map_cold_payload_range_error(
+                    table,
+                    host_staging_bytes,
+                    host_limit,
+                    error,
+                    "cold text window blob is truncated",
+                )
+            })?;
+        let mut name = String::new();
+        name.try_reserve_exact(layout.name.len()).map_err(|_| {
+            cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit)
+        })?;
+        name.push_str(&layout.name);
+        text_columns.push(ResidentDeviceTextColumnLayout {
+            name,
+            offsets_byte_offset,
+            bytes_byte_offset,
+            bytes_len: limit - base,
+        });
+    }
+
+    let deleted_by = chunk
+        .deleted_by
+        .as_ref()
+        .map(|sidecar| {
+            let start = window
+                .row_start
+                .checked_mul(8)
+                .ok_or_else(|| cold_index_validation_error("cold tombstone offset overflowed"))?;
+            let end = row_end
+                .checked_mul(8)
+                .ok_or_else(|| cold_index_validation_error("cold tombstone extent overflowed"))?;
+            let source = sidecar.get(start..end).ok_or_else(|| {
+                cold_index_validation_error("cold tombstone sidecar is truncated")
+            })?;
+            let mut window = Vec::new();
+            window.try_reserve_exact(source.len()).map_err(|_| {
+                cold_index_host_staging_exhausted(table, host_staging_bytes, host_limit)
+            })?;
+            window.extend_from_slice(source);
+            Ok::<Vec<u8>, ExecuteError>(window)
+        })
+        .transpose()?;
+    if payload.len() != required_payload {
+        return Err(cold_index_validation_error(
+            "cold validation payload geometry changed while slicing",
+        ));
+    }
+    Ok(ColdIndexValidationPayload {
+        resident_bytes: payload.len() as u64,
+        bool_columns,
+        text_columns,
+        null_columns,
+        payload,
+        deleted_by,
+        host_staging_bytes,
+    })
+}
+
 impl Engine {
+    #[cfg(test)]
+    pub(crate) fn clone_cold_without_chunk_for_test(
+        cold: &ColdTableChunks,
+        remove_at: usize,
+    ) -> Arc<ColdTableChunks> {
+        let clone_payload = |payload: &super::ColdPayload| match payload {
+            super::ColdPayload::Ram(bytes) => super::ColdPayload::Ram(Arc::clone(bytes)),
+            super::ColdPayload::Spilled { file, offset, len } => super::ColdPayload::Spilled {
+                file: Arc::clone(file),
+                offset: *offset,
+                len: *len,
+            },
+        };
+        let mut chunks = cold
+            .chunks
+            .iter()
+            .map(|chunk| super::ColdChunk {
+                payload: clone_payload(&chunk.payload),
+                snapshot: chunk.snapshot.clone(),
+                row_count: chunk.row_count,
+                entity_ids: Arc::clone(&chunk.entity_ids),
+                chunk_id: chunk.chunk_id,
+                tuple_range: chunk.tuple_range,
+                payload_copin_s: chunk.payload_copin_s,
+                deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),
+            })
+            .collect::<Vec<_>>();
+        chunks.remove(remove_at);
+        let total_payload_bytes = chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .payload
+                    .read()
+                    .expect("test sabotage retains readable cold payloads")
+                    .len() as u64
+                    + chunk
+                        .deleted_by
+                        .as_ref()
+                        .map_or(0, |sidecar| sidecar.len() as u64)
+            })
+            .sum();
+        Arc::new(ColdTableChunks {
+            generation: Arc::clone(&cold.generation),
+            column_signature: cold.column_signature.clone(),
+            build_copin_s: cold.build_copin_s,
+            chunk_target_bytes: cold.chunk_target_bytes,
+            total_payload_bytes,
+            spilled: cold.spilled,
+            entry_epoch: cold.entry_epoch,
+            chunks,
+        })
+    }
+
+    /// Prove that a transaction-selected cold entry is the complete immutable DEVICE-FORMAT
+    /// authority for `table` before UNIQUE validation is allowed to use its row count. This is a
+    /// structural proof only: SQL NULL/key semantics still execute exclusively through the GPU
+    /// predicate + GROUP path. In particular, even a zero/one-row shortcut must reject a stale
+    /// generation, a future-born chunk, or a torn payload instead of treating it as an empty table.
+    pub(crate) fn validate_transaction_cold_index_authority(
+        table: &RelationalTable,
+        cold: &ColdTableChunks,
+        expected_generation: &Arc<crate::resident_storage::TableVersionData>,
+        boundary: Index,
+        chunk_authority_floor: Option<Index>,
+    ) -> Result<u64, ExecuteError> {
+        let stale = || {
+            ExecuteError::Serialization(format!(
+                "cold relation \"{}\" changed before index validation",
+                table.name
+            ))
+        };
+        let expected_signature = table
+            .columns
+            .iter()
+            .map(|column| (column.name.clone(), column.ty))
+            .collect::<Vec<_>>();
+        if !Arc::ptr_eq(&cold.generation, expected_generation)
+            || cold.column_signature != expected_signature
+            || cold.build_copin_s > boundary
+            || chunk_authority_floor.is_some_and(|floor| boundary < floor)
+        {
+            return Err(stale());
+        }
+
+        let expected_int4 = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date))
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let expected_int8 = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let expected_b128 = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let expected_bool = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Bool))
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let expected_text = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Text))
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let column_ordinals = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, column)| (column.name.as_str(), ordinal))
+            .collect::<BTreeMap<_, _>>();
+        let bitmap_bytes = |capacity: usize| {
+            capacity
+                .div_ceil(32)
+                .checked_mul(std::mem::size_of::<u32>())
+        };
+
+        let mut total_rows = 0u64;
+        let mut total_payload_bytes = 0u64;
+        for chunk in &cold.chunks {
+            let row_count = usize::try_from(chunk.row_count).map_err(|_| stale())?;
+            if chunk.payload_copin_s > boundary
+                || chunk.snapshot.schema != table.schema
+                || chunk.snapshot.table != table.name
+                || chunk.snapshot.row_count != row_count
+                || chunk.snapshot.capacity != row_count
+                || chunk.snapshot.column_count != table.columns.len()
+                || chunk
+                    .snapshot
+                    .resident_device_int4_columns
+                    .iter()
+                    .map(String::as_str)
+                    .ne(expected_int4.iter().copied())
+                || chunk
+                    .snapshot
+                    .resident_device_int8_columns
+                    .iter()
+                    .map(String::as_str)
+                    .ne(expected_int8.iter().copied())
+                || chunk
+                    .snapshot
+                    .resident_device_numeric_columns
+                    .iter()
+                    .map(String::as_str)
+                    .ne(expected_b128.iter().copied())
+                || chunk
+                    .snapshot
+                    .resident_device_bool_columns
+                    .iter()
+                    .map(|layout| layout.name.as_str())
+                    .ne(expected_bool.iter().copied())
+                || chunk
+                    .snapshot
+                    .resident_device_text_columns
+                    .iter()
+                    .map(|layout| layout.name.as_str())
+                    .ne(expected_text.iter().copied())
+                || (chunk_authority_floor.is_some() && chunk.entity_ids.len() != row_count)
+            {
+                return Err(stale());
+            }
+
+            let mut last_null_ordinal = None;
+            for layout in &chunk.snapshot.resident_device_null_columns {
+                let ordinal = column_ordinals
+                    .get(layout.name.as_str())
+                    .copied()
+                    .ok_or_else(stale)?;
+                if last_null_ordinal.is_some_and(|last| ordinal <= last) {
+                    return Err(stale());
+                }
+                last_null_ordinal = Some(ordinal);
+            }
+
+            if read_cold_payload_u64(&chunk.payload, 0).map_err(|_| stale())? != chunk.row_count
+                || chunk.snapshot.resident_bytes != chunk.payload.len() as u64
+            {
+                return Err(stale());
+            }
+            let capacity = chunk.snapshot.capacity;
+            let mut cursor = 8usize
+                .checked_add(
+                    capacity
+                        .checked_mul(expected_int4.len())
+                        .and_then(|slots| slots.checked_mul(4))
+                        .ok_or_else(stale)?,
+                )
+                .and_then(|cursor| {
+                    capacity
+                        .checked_mul(expected_int8.len())
+                        .and_then(|slots| slots.checked_mul(8))
+                        .and_then(|bytes| cursor.checked_add(bytes))
+                })
+                .and_then(|cursor| {
+                    capacity
+                        .checked_mul(expected_b128.len())
+                        .and_then(|slots| slots.checked_mul(16))
+                        .and_then(|bytes| cursor.checked_add(bytes))
+                })
+                .ok_or_else(stale)?;
+            let bitmap_bytes = bitmap_bytes(capacity).ok_or_else(stale)?;
+            for layout in &chunk.snapshot.resident_device_bool_columns {
+                if usize::try_from(layout.bitmap_byte_offset).ok() != Some(cursor) {
+                    return Err(stale());
+                }
+                cursor = cursor.checked_add(bitmap_bytes).ok_or_else(stale)?;
+            }
+            for layout in &chunk.snapshot.resident_device_null_columns {
+                if usize::try_from(layout.bitmap_byte_offset).ok() != Some(cursor) {
+                    return Err(stale());
+                }
+                cursor = cursor.checked_add(bitmap_bytes).ok_or_else(stale)?;
+            }
+            for layout in &chunk.snapshot.resident_device_text_columns {
+                cursor = cursor
+                    .checked_add((8usize.wrapping_sub(cursor % 8)) % 8)
+                    .ok_or_else(stale)?;
+                if usize::try_from(layout.offsets_byte_offset).ok() != Some(cursor) {
+                    return Err(stale());
+                }
+                let offsets_bytes = row_count
+                    .checked_add(1)
+                    .and_then(|entries| entries.checked_mul(8))
+                    .ok_or_else(stale)?;
+                cursor = cursor.checked_add(offsets_bytes).ok_or_else(stale)?;
+                if usize::try_from(layout.bytes_byte_offset).ok() != Some(cursor) {
+                    return Err(stale());
+                }
+                let offsets_valid = validate_cold_text_offsets_bounded(
+                    &chunk.payload,
+                    usize::try_from(layout.offsets_byte_offset).map_err(|_| stale())?,
+                    row_count.checked_add(1).ok_or_else(stale)?,
+                    layout.bytes_len,
+                )
+                .map_err(|_| stale())?
+                .0;
+                if !offsets_valid {
+                    return Err(stale());
+                }
+                cursor = cursor
+                    .checked_add(usize::try_from(layout.bytes_len).map_err(|_| stale())?)
+                    .ok_or_else(stale)?;
+            }
+            if cursor != chunk.payload.len()
+                || chunk
+                    .deleted_by
+                    .as_ref()
+                    .is_some_and(|sidecar| sidecar.len() != row_count.saturating_mul(8))
+            {
+                return Err(stale());
+            }
+            total_rows = total_rows.checked_add(chunk.row_count).ok_or_else(stale)?;
+            total_payload_bytes = total_payload_bytes
+                .checked_add(chunk.payload.len() as u64)
+                .and_then(|bytes| {
+                    chunk.deleted_by.as_ref().map_or(Some(bytes), |sidecar| {
+                        bytes.checked_add(sidecar.len() as u64)
+                    })
+                })
+                .ok_or_else(stale)?;
+        }
+        if total_payload_bytes != cold.total_payload_bytes {
+            return Err(stale());
+        }
+        Ok(total_rows)
+    }
+
     /// Validate a cold root selected as global reset authority without patching or falling back to
     /// another representation. Durable reset proofs must never describe a stale cache entry.
     pub(crate) fn global_cold_root_matches_reset_boundary(
@@ -156,6 +1009,242 @@ impl Engine {
             row_count: chunk.row_count,
             visibility,
         })
+    }
+
+    /// Stage a bounded selection from one transaction-pinned cold relation as immutable shard
+    /// descriptors for the shared D2D unified-source builder. Transactional UNIQUE validation calls
+    /// this with either one chunk or one cross-chunk pair, so payload, tombstone, recompaction, and
+    /// GROUP BY scratch stay O(bounded batch) rather than O(table). Row values remain
+    /// device-resident and the ordinary NULL/text/MVCC kernels remain the sole relational
+    /// execution path.
+    pub(crate) fn stage_cold_index_validation_shards(
+        &self,
+        table: &RelationalTable,
+        cold: &ColdTableChunks,
+        boundary: Index,
+        gpu_id: u16,
+        windows: &[ColdIndexValidationWindow],
+        host_staging_limit: usize,
+    ) -> Result<Vec<RelationalResidentShard>, ExecuteError> {
+        let expected_signature = table
+            .columns
+            .iter()
+            .map(|column| (column.name.clone(), column.ty))
+            .collect::<Vec<_>>();
+        if cold.column_signature != expected_signature || cold.build_copin_s > boundary {
+            return Err(ExecuteError::Serialization(format!(
+                "cold relation \"{}\" changed before index validation",
+                table.name
+            )));
+        }
+        if windows.is_empty()
+            || windows.len() > 4096
+            || windows.windows(2).any(|pair| {
+                let left = (pair[0].chunk_ordinal, pair[0].row_start);
+                let right = (pair[1].chunk_ordinal, pair[1].row_start);
+                left >= right
+                    || (pair[0].chunk_ordinal == pair[1].chunk_ordinal
+                        && pair[0].row_start.saturating_add(pair[0].row_count) > pair[1].row_start)
+            })
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "cold index validation requires a nonempty bounded ordered window set".to_string(),
+            )));
+        }
+        #[cfg(test)]
+        self.read_state
+            .residency
+            .cold_index_validation_peak_staged_chunks
+            .fetch_max(windows.len() as u64, Ordering::Relaxed);
+        let descriptor_bytes = windows.iter().try_fold(0usize, |bytes, window| {
+            let chunk = cold.chunks.get(window.chunk_ordinal).ok_or_else(|| {
+                ExecuteError::Serialization(format!(
+                    "cold relation \"{}\" lost validation chunk {}",
+                    table.name, window.chunk_ordinal
+                ))
+            })?;
+            let window_bytes = cold_validation_descriptor_bytes(table, &chunk.snapshot)
+                .ok_or_else(|| {
+                    cold_index_host_staging_exhausted(&table.name, usize::MAX, host_staging_limit)
+                })?;
+            bytes.checked_add(window_bytes).ok_or_else(|| {
+                cold_index_host_staging_exhausted(&table.name, usize::MAX, host_staging_limit)
+            })
+        })?;
+        if descriptor_bytes >= host_staging_limit {
+            return Err(cold_index_host_staging_exhausted(
+                &table.name,
+                descriptor_bytes,
+                host_staging_limit,
+            ));
+        }
+        let payload_host_limit = host_staging_limit - descriptor_bytes;
+        let runtime = self.cuda_driver_probe_runtime();
+        let mut row_start = 0usize;
+        let mut shards = Vec::new();
+        shards.try_reserve_exact(windows.len()).map_err(|_| {
+            cold_index_host_staging_exhausted(&table.name, descriptor_bytes, host_staging_limit)
+        })?;
+        let point_route_generation = Arc::new(());
+        for (shard_ordinal, &window) in windows.iter().enumerate() {
+            let chunk_ordinal = window.chunk_ordinal;
+            let chunk = cold
+                .chunks
+                .get(chunk_ordinal)
+                .filter(|chunk| chunk.row_count != 0)
+                .ok_or_else(|| {
+                    ExecuteError::Serialization(format!(
+                        "cold relation \"{}\" lost validation chunk {chunk_ordinal}",
+                        table.name
+                    ))
+                })?;
+            if chunk.payload_copin_s > boundary
+                || chunk.snapshot.schema != table.schema
+                || chunk.snapshot.table != table.name
+                || chunk.snapshot.row_count != chunk.row_count as usize
+                || chunk.snapshot.capacity < chunk.snapshot.row_count
+            {
+                return Err(ExecuteError::Serialization(format!(
+                    "cold relation \"{}\" has a stale or torn chunk descriptor",
+                    table.name
+                )));
+            }
+            let ColdIndexValidationPayload {
+                resident_bytes,
+                bool_columns,
+                text_columns,
+                null_columns,
+                payload,
+                deleted_by,
+                host_staging_bytes,
+            } = slice_cold_index_validation_window(chunk, window, payload_host_limit)?;
+            let stage_host_staging_bytes = descriptor_bytes
+                .checked_add(host_staging_bytes)
+                .ok_or_else(|| {
+                    cold_index_host_staging_exhausted(&table.name, usize::MAX, host_staging_limit)
+                })?;
+            #[cfg(not(test))]
+            let _ = stage_host_staging_bytes;
+            #[cfg(test)]
+            self.read_state
+                .residency
+                .cold_index_validation_peak_host_staging_bytes
+                .fetch_max(
+                    stage_host_staging_bytes as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            let memory = Arc::new(
+                runtime
+                    .retain_device_memory_copy_scoped(gpu_id, &payload)
+                    .map_err(|error| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "cold relation \"{}\" GPU staging failed: {error}",
+                            table.name
+                        )))
+                    })?,
+            );
+            let deleted_by_region = deleted_by
+                .as_ref()
+                .map(|sidecar| {
+                    runtime
+                        .retain_device_memory_copy_scoped(gpu_id, sidecar)
+                        .map(Arc::new)
+                        .map_err(|error| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "cold relation \"{}\" tombstone staging failed: {error}",
+                                table.name
+                            )))
+                        })
+                })
+                .transpose()?;
+            let row_count = window.row_count;
+            let shard_id = u32::try_from(shard_ordinal).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "cold index-validation shard count exceeds device framing".to_string(),
+                ))
+            })?;
+            let allocated_bytes = memory.metadata().allocated_bytes;
+            let int4_stats = try_clone_cold_int4_stats(
+                &chunk.snapshot.resident_device_int4_column_stats,
+                &table.name,
+                stage_host_staging_bytes,
+                host_staging_limit,
+            )?;
+            let int4_columns = try_clone_cold_strings(
+                &chunk.snapshot.resident_device_int4_columns,
+                &table.name,
+                stage_host_staging_bytes,
+                host_staging_limit,
+            )?;
+            let int8_columns = try_clone_cold_strings(
+                &chunk.snapshot.resident_device_int8_columns,
+                &table.name,
+                stage_host_staging_bytes,
+                host_staging_limit,
+            )?;
+            let numeric_columns = try_clone_cold_strings(
+                &chunk.snapshot.resident_device_numeric_columns,
+                &table.name,
+                stage_host_staging_bytes,
+                host_staging_limit,
+            )?;
+            let schema = try_clone_cold_string(
+                &table.schema,
+                &table.name,
+                stage_host_staging_bytes,
+                host_staging_limit,
+            )?;
+            let table_name = try_clone_cold_string(
+                &table.name,
+                &table.name,
+                stage_host_staging_bytes,
+                host_staging_limit,
+            )?;
+            let device_memory_proof = Some(try_clone_cold_memory_proof(
+                memory.metadata(),
+                &table.name,
+                stage_host_staging_bytes,
+                host_staging_limit,
+            )?);
+            shards.push(RelationalResidentShard {
+                shard_id,
+                row_start,
+                row_count,
+                history_floor_index: 0,
+                capacity: row_count,
+                int4_appendable: false,
+                resident_device_int4_column_stats: int4_stats,
+                resident_bytes,
+                allocated_bytes,
+                count_header_byte_offset: 0,
+                resident_device_int4_columns: int4_columns,
+                resident_device_int8_columns: int8_columns,
+                resident_device_numeric_columns: numeric_columns,
+                resident_device_bool_columns: bool_columns,
+                resident_device_text_columns: text_columns,
+                resident_device_null_columns: null_columns,
+                gpu_id,
+                schema,
+                table: table_name,
+                point_route_generation: Arc::clone(&point_route_generation),
+                device_memory_proof,
+                invalidated_by_txn_id: None,
+                invalidated_at_index: None,
+                invalidated_by_memory_pressure: false,
+                memory_pressure_active: false,
+                device_memory: Some(memory),
+                deleted_by_region,
+                created_by_region: None,
+                row_id_region: None,
+                max_created_by: 0,
+            });
+            row_start = row_start.checked_add(row_count).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "cold index-validation row offset overflowed".to_string(),
+                ))
+            })?;
+        }
+        Ok(shards)
     }
 
     /// 6c-1: rebuild the visible rows of ONE effective TupleId range into cold chunks (payload +
@@ -621,7 +1710,12 @@ impl Engine {
             }
             return None;
         }
-        if cold.chunk_target_bytes != chunk_target_bytes {
+        let class_freeze = self.table_chunk_authoritative(table_name);
+        // Cache tiling follows the caller's current working-set target, but a chunk-authoritative
+        // table's tiling is physical record-of-truth state. A later budget change cannot turn that
+        // authority into a cache miss (the reclaimed tuple store has no alternate rows); explicit
+        // class rechunking is the only operation allowed to replace its geometry.
+        if class_freeze.is_none() && cold.chunk_target_bytes != chunk_target_bytes {
             return None;
         }
         // P4-3 — THE BORN GATE (design review C3): a CLASS table's entry boundary advances with
@@ -631,7 +1725,7 @@ impl Engine {
         // (`payload_copin_s > copin_s`) and the sidecar mask handles deletes — exact MVCC per
         // reader. Non-class entries keep the strict boundary rule (their chunks are rebuilt at
         // the entry boundary; no per-chunk born discipline exists for them).
-        match self.table_chunk_authoritative(table_name) {
+        match class_freeze {
             Some(freeze) => {
                 if copin_s < freeze {
                     return None;
@@ -714,6 +1808,15 @@ impl Engine {
             }
             Some(self.commit_state())
         };
+        // A chunk-authoritative entry is the table's representation of record and carries stable
+        // entity IDs plus post-freeze sidecars. A general scan capture (including one produced by
+        // a transaction-private read) has cache-only descriptors and empty entity IDs; allowing it
+        // to replace the class entry would create an ABA generation with the right payload pointer
+        // but no DML identity authority. The commit lock above serializes this check with class
+        // entry/exit. Class mutation and compaction publish through `install_streaming_cold_class`.
+        if self.table_chunk_authoritative(table_name).is_some() {
+            return false;
+        }
         let current = self
             .read_state
             .mvcc

@@ -72,8 +72,8 @@ pub enum CudaGroupKeySource<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum CudaGroupValueSource<'a> {
-    /// COUNT-only input. The current PTX performs one bounded, ignored int4 placeholder load from
-    /// resident offset zero before the aggregate mask suppresses value updates; preflight covers it.
+    /// COUNT-only input. The typed `value_is_unused` kernel flag bypasses value dispatch entirely;
+    /// no placeholder column, raw pointer, or resident-width assumption exists.
     Unused {
         row_count: u64,
     },
@@ -114,6 +114,7 @@ pub(super) struct ValidatedGroupInput {
     pub key_byte_offset: u64,
     pub value_byte_offset: u64,
     pub value_is_int8: bool,
+    pub value_is_unused: bool,
     pub key_is_int8: bool,
     pub value_is_numeric: bool,
     pub value_is_uuid: bool,
@@ -265,6 +266,7 @@ fn validate_group_input_parts(
         key_byte_offset: 0,
         value_byte_offset: 0,
         value_is_int8: false,
+        value_is_unused: false,
         key_is_int8: false,
         value_is_numeric: false,
         value_is_uuid: false,
@@ -356,12 +358,12 @@ fn validate_group_input_parts(
 
     match input.value {
         CudaGroupValueSource::Unused { row_count } => {
-            // The current PTX value dispatch loads an ignored int4 placeholder before the COUNT mask
-            // suppresses value aggregation. Keep that load total without exposing a fake raw pointer.
-            let end = checked_end(0, row_count, 4)?;
-            if end > resident_bytes || input.value_validity_bitmap_offset.is_some() {
-                return Err(invalid(end));
+            if max_index >= row_count || input.value_validity_bitmap_offset.is_some() {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    usize::try_from(max_index).unwrap_or(usize::MAX),
+                ));
             }
+            out.value_is_unused = true;
         }
         CudaGroupValueSource::Fixed(source)
         | CudaGroupValueSource::Numeric(source)
@@ -621,5 +623,20 @@ mod tests {
         );
         nullable_unused.value_validity_bitmap_offset = Some(76);
         assert!(validate_group_input_parts(80, 7, nullable_unused, &[1]).is_err());
+
+        let narrow_count_only = input(
+            CudaGroupKeySource::Composite {
+                fixed: Some(CudaGroupWideSource {
+                    buffer: CudaGroupDeviceView::new(0x3000, 1024 * 8, 7),
+                    row_width: 8,
+                    row_count: 1024,
+                }),
+                text: None,
+                row_count: 1024,
+            },
+            CudaGroupValueSource::Unused { row_count: 1024 },
+        );
+        let validated = validate_group_input_parts(16, 7, narrow_count_only, &[1023]).unwrap();
+        assert!(validated.value_is_unused);
     }
 }

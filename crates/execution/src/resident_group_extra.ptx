@@ -204,7 +204,8 @@ lo_done:
     .param .u64 agg_mask,
     .param .u64 key_bytes_limit_unused,
     .param .u64 value_bytes_limit_unused,
-    .param .u64 input_error_flag_unused
+    .param .u64 input_error_flag_unused,
+    .param .u64 value_is_unused_unused
 )
 {
     // slot_min_ptr / slot_max_ptr are accepted for a uniform launch signature but UNUSED here: the

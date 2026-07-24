@@ -774,7 +774,8 @@ impl Engine {
             // visibility cut. INSERT appends into open-shard headroom; UPDATE/DELETE stamps exact stable
             // identities and UPDATE appends its new version. A device decline is handled below by wedging
             // before acknowledgement; only DDL/recovery repair reaches conservative invalidation.
-            let handled = if applied.is_empty()
+            let handled = if !atomic_transaction
+                && applied.is_empty()
                 && to_apply.len() == 1
                 && Self::entry_is_relational_dml(&to_apply[0])
             {
@@ -785,26 +786,51 @@ impl Engine {
                 // already applied above and do not require a generation rewrite.
                 true
             } else if atomic_transaction {
-                let transaction_created_tables = match decode_binary_record(&to_apply[0].payload) {
-                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => record
-                        .catalog_commands
-                        .into_iter()
-                        .filter_map(|operation| match operation.command {
-                            Command::CreateTable(create) => Some(create.table),
-                            _ => None,
-                        })
-                        .collect(),
-                    _ => BTreeSet::new(),
-                };
-                maintained = self.try_maintain_transaction_residency(
-                    cat,
-                    &applied,
-                    publish_index,
-                    &transaction_created_tables,
-                )?;
+                let (transaction_created_tables, index_lifecycle_tables) =
+                    match decode_binary_record(&to_apply[0].payload) {
+                        Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => {
+                            let created = record
+                                .catalog_commands
+                                .into_iter()
+                                .filter_map(|operation| match operation.command {
+                                    Command::CreateTable(create) => Some(create.table),
+                                    _ => None,
+                                })
+                                .collect();
+                            let index_tables = record
+                                .index_lifecycle_operations
+                                .into_iter()
+                                .flat_map(|operation| operation.targets)
+                                .filter_map(|target| target.owner_name)
+                                .collect();
+                            (created, index_tables)
+                        }
+                        _ => (BTreeSet::new(), BTreeSet::new()),
+                    };
+                let final_catalog = Self::catalog_snapshot_from_working(cat, publish_index);
+                let (row_maintained, index_maintained) =
+                    self.with_apply_catalog(Some(final_catalog), || {
+                        let row_maintained = self.try_maintain_transaction_residency(
+                            cat,
+                            &applied,
+                            publish_index,
+                            &transaction_created_tables,
+                        )?;
+                        let index_maintained = self
+                            .maintain_transaction_index_lifecycle_residency(
+                                cat,
+                                &index_lifecycle_tables,
+                                publish_index,
+                            )?;
+                        Ok::<_, EngineError>((row_maintained, index_maintained))
+                    })?;
+                maintained = row_maintained;
+                maintained.extend(index_maintained);
                 let touched = applied
                     .iter()
                     .map(Self::applied_mutation_table)
+                    .chain(transaction_created_tables)
+                    .chain(index_lifecycle_tables)
                     .collect::<BTreeSet<_>>();
                 maintained == touched
             } else {
@@ -1854,6 +1880,17 @@ impl Engine {
         let Some(cmd) = Self::decode_engine_command(&entry.payload)? else {
             return Ok(Vec::new());
         };
+        let current_index_semantics =
+            Self::engine_command_uses_current_index_semantics(&entry.payload)
+                || cat.index_oid_epoch_current;
+        if current_index_semantics {
+            // The codec/typed-command epoch is the durable one-way migration boundary, not the
+            // command family. A current CREATE VIEW/SEQUENCE/etc. must lift the recovery-only
+            // index range before it can consume the next shared `pg_class` OID. Once lifted,
+            // byte-stable index-neutral legacy records use the current shared namespace too.
+            cat.finalize_legacy_index_oid_migration()?;
+        }
+        let _index_semantics = self.enter_apply_index_semantics(current_index_semantics);
         // Recovery and direct committed-entry apply bypass the user-facing preflight. Establish
         // the exact target/related device generations while the caller's commit+catalog locks are
         // already held, before any DML resolver or constraint probe runs.
@@ -1929,51 +1966,151 @@ impl Engine {
             Command::CreateTablespace(create) => self.apply_create_tablespace(cat, create)?,
             Command::DropTablespace(drop) => self.apply_drop_tablespace(cat, drop)?,
             Command::RenameTablespace(rename) => self.apply_rename_tablespace(cat, rename)?,
-            Command::CreateTable(create) => self.apply_create_table(cat, create)?,
-            Command::AddPrimaryKey(add) => self.apply_add_primary_key(cat, add)?,
-            Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(cat, add)?,
+            Command::CreateTable(create) => {
+                if current_index_semantics {
+                    self.apply_create_table(cat, create)?;
+                } else {
+                    self.apply_create_table_legacy_replay(cat, create, entry.index, 0)?;
+                }
+            }
+            Command::AddPrimaryKey(add) => {
+                if current_index_semantics {
+                    self.apply_add_primary_key(cat, add)?;
+                } else {
+                    self.apply_add_primary_key_legacy_replay(cat, add, entry.index)?;
+                }
+            }
+            Command::AddUniqueConstraint(add) => {
+                if current_index_semantics {
+                    self.apply_add_unique_constraint(cat, add)?;
+                } else {
+                    self.apply_add_unique_constraint_legacy_replay(cat, add, entry.index)?;
+                }
+            }
             Command::AddCheckConstraint(add) => self.apply_add_check_constraint(cat, add)?,
             Command::AddForeignKey(add) => self.apply_add_foreign_key(cat, add, commit_seq)?,
             Command::AddColumn(add) => self.apply_add_column(cat, add, commit_seq)?,
-            Command::RenameTable(rename) => self.apply_rename_table(cat, rename, commit_seq)?,
+            Command::RenameTable(rename) => {
+                self.apply_rename_table(cat, rename, commit_seq, current_index_semantics)?
+            }
             Command::RenameColumn(rename) => self.apply_rename_column(cat, rename)?,
             Command::RenameConstraint(rename) => self.apply_rename_constraint(cat, rename)?,
             Command::DropColumn(drop) => self.apply_drop_column(cat, drop, commit_seq)?,
             Command::DropConstraint(drop) => self.apply_drop_constraint(cat, drop)?,
-            Command::CreateIndex(create) => self.apply_create_index(cat, create)?,
-            Command::RenameIndex(rename) => self.apply_rename_index(cat, rename)?,
-            Command::CreateView(create) => self.apply_create_view(cat, create)?,
-            Command::RenameView(rename) => self.apply_rename_view(cat, rename)?,
+            Command::CreateIndex(create) => {
+                if current_index_semantics {
+                    self.apply_create_index(cat, create)?;
+                } else {
+                    self.apply_create_index_legacy_replay(cat, create, entry.index, 0, true)?;
+                }
+            }
+            Command::RenameIndex(rename) => {
+                if current_index_semantics {
+                    self.apply_rename_index(cat, rename)?;
+                } else {
+                    self.apply_rename_index_legacy_replay(cat, rename)?;
+                }
+            }
+            Command::CreateView(create) => {
+                if current_index_semantics {
+                    self.apply_create_view(cat, create)?;
+                } else {
+                    self.apply_create_view_legacy_replay(cat, create)?;
+                }
+            }
+            Command::RenameView(rename) => {
+                if current_index_semantics {
+                    self.apply_rename_view(cat, rename)?;
+                } else {
+                    self.apply_rename_view_legacy_replay(cat, rename)?;
+                }
+            }
             Command::CreateMaterializedView(create) => {
-                self.apply_create_materialized_view(cat, create)?
+                if current_index_semantics {
+                    self.apply_create_materialized_view(cat, create)?;
+                } else {
+                    self.apply_create_materialized_view_legacy_replay(cat, create)?;
+                }
             }
             Command::RefreshMaterializedView(refresh) => {
-                self.apply_refresh_materialized_view(cat, refresh)?
+                if current_index_semantics {
+                    self.apply_refresh_materialized_view(cat, refresh)?;
+                } else {
+                    self.apply_refresh_materialized_view_legacy_replay(cat, refresh)?;
+                }
             }
             Command::RenameMaterializedView(rename) => {
-                self.apply_rename_materialized_view(cat, rename)?
+                if current_index_semantics {
+                    self.apply_rename_materialized_view(cat, rename)?;
+                } else {
+                    self.apply_rename_materialized_view_legacy_replay(cat, rename)?;
+                }
             }
             Command::CreateFunction(create) => self.apply_create_function(cat, create)?,
             Command::RenameFunction(rename) => self.apply_rename_function(cat, rename)?,
             Command::DropFunction(drop) => self.apply_drop_function(cat, drop)?,
             Command::SelectFunction(_) | Command::SelectLiteral(_) => {}
-            Command::CreateSequence(create) => self.apply_create_sequence(cat, create)?,
+            Command::CreateSequence(create) => {
+                if current_index_semantics {
+                    self.apply_create_sequence(cat, create)?;
+                } else {
+                    self.apply_create_sequence_legacy_replay(cat, create)?;
+                }
+            }
             Command::CreateDomain(create) => self.apply_create_domain(cat, create)?,
             Command::SequenceNextVal(nextval) => {
-                self.apply_sequence_nextval(cat, nextval)?;
+                if current_index_semantics {
+                    self.apply_sequence_nextval(cat, nextval)?;
+                } else {
+                    self.apply_sequence_nextval_legacy_replay(cat, nextval)?;
+                }
             }
             Command::SequenceSetVal(setval) => {
-                self.apply_sequence_setval(cat, setval)?;
+                if current_index_semantics {
+                    self.apply_sequence_setval(cat, setval)?;
+                } else {
+                    self.apply_sequence_setval_legacy_replay(cat, setval)?;
+                }
             }
-            Command::RenameSequence(rename) => self.apply_rename_sequence(cat, rename)?,
+            Command::RenameSequence(rename) => {
+                if current_index_semantics {
+                    self.apply_rename_sequence(cat, rename)?;
+                } else {
+                    self.apply_rename_sequence_legacy_replay(cat, rename)?;
+                }
+            }
             Command::DropTable(drop) => self.apply_drop_table(cat, drop, commit_seq)?,
             Command::TruncateTable(truncate) => {
                 self.apply_truncate_table(cat, truncate, commit_seq)?
             }
-            Command::DropIndex(drop) => self.apply_drop_index(cat, drop)?,
-            Command::DropView(drop) => self.apply_drop_view(cat, drop)?,
-            Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(cat, drop)?,
-            Command::DropSequence(drop) => self.apply_drop_sequence(cat, drop)?,
+            Command::DropIndex(drop) => {
+                if current_index_semantics {
+                    self.apply_drop_index(cat, drop)?;
+                } else {
+                    self.apply_drop_index_legacy_replay(cat, drop)?;
+                }
+            }
+            Command::DropView(drop) => {
+                if current_index_semantics {
+                    self.apply_drop_view(cat, drop)?;
+                } else {
+                    self.apply_drop_view_legacy_replay(cat, drop)?;
+                }
+            }
+            Command::DropMaterializedView(drop) => {
+                if current_index_semantics {
+                    self.apply_drop_materialized_view(cat, drop)?;
+                } else {
+                    self.apply_drop_materialized_view_legacy_replay(cat, drop)?;
+                }
+            }
+            Command::DropSequence(drop) => {
+                if current_index_semantics {
+                    self.apply_drop_sequence(cat, drop)?;
+                } else {
+                    self.apply_drop_sequence_legacy_replay(cat, drop)?;
+                }
+            }
             Command::DropDomain(drop) => self.apply_drop_domain(cat, drop)?,
             Command::CreatePublication(create) => self.apply_create_publication(cat, create)?,
             Command::DropPublication(drop) => self.apply_drop_publication(cat, drop)?,

@@ -36,7 +36,7 @@ impl Engine {
     ) -> Result<ShardedUnifiedExecSource, ExecuteError> {
         // Load the table's resident shards in published order (sorted by (row_start, shard_id)).
         // Error text mirrors the retired probes.
-        let mut shards = self
+        let shards = self
             .read_residency_shards()
             .get(&table.name)
             .cloned()
@@ -46,6 +46,47 @@ impl Engine {
                     table.name
                 )))
             })?;
+        self.build_sharded_unified_exec_source_from_shards(table, predicate, copin_s, shards)
+    }
+
+    /// Exact-source variant used by pre-WAL DDL validation after cold chunks have been staged as
+    /// private immutable shards. It shares the complete D2D recompaction, NULL, text-offset, and
+    /// MVCC visibility implementation with ordinary reads; callers cannot introduce a second
+    /// relational execution path by assembling a parallel validator.
+    pub(crate) fn build_sharded_unified_exec_source_from_shards(
+        &self,
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        shards: Vec<RelationalResidentShard>,
+    ) -> Result<ShardedUnifiedExecSource, ExecuteError> {
+        self.build_sharded_unified_exec_source_from_shards_inner(
+            table, predicate, copin_s, shards, false,
+        )
+    }
+
+    /// Transactional UNIQUE-validation form: source shard ownership is already explicitly scoped,
+    /// and this routes the D2D unified allocation through the same scope before `cuMemAlloc`.
+    pub(crate) fn build_scoped_sharded_unified_exec_source_from_shards(
+        &self,
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        shards: Vec<RelationalResidentShard>,
+    ) -> Result<ShardedUnifiedExecSource, ExecuteError> {
+        self.build_sharded_unified_exec_source_from_shards_inner(
+            table, predicate, copin_s, shards, true,
+        )
+    }
+
+    fn build_sharded_unified_exec_source_from_shards_inner(
+        &self,
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        mut shards: Vec<RelationalResidentShard>,
+        scoped_allocation: bool,
+    ) -> Result<ShardedUnifiedExecSource, ExecuteError> {
         if shards.is_empty() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "relation \"{}\" has no resident shards",
@@ -633,13 +674,28 @@ impl Engine {
         // Recompact ON-DEVICE into one unified buffer, then build the whole-table descriptor + injected
         // source the executor runs over ONCE.
         let runtime = self.cuda_driver_probe_runtime();
-        let unified_mem = runtime
-            .retain_device_memory_recompacted(gpu_id, allocated_bytes, &header, &fills, &segments)
-            .map_err(|err| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "sharded resident recompaction into a unified device buffer failed: {err}"
-                )))
-            })?;
+        let unified_mem = (if scoped_allocation {
+            runtime.retain_device_memory_recompacted_scoped(
+                gpu_id,
+                allocated_bytes,
+                &header,
+                &fills,
+                &segments,
+            )
+        } else {
+            runtime.retain_device_memory_recompacted(
+                gpu_id,
+                allocated_bytes,
+                &header,
+                &fills,
+                &segments,
+            )
+        })
+        .map_err(|err| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "sharded resident recompaction into a unified device buffer failed: {err}"
+            )))
+        })?;
         let sidecar_source = |device_ptr: u64, byte_offset: u64| {
             shards
                 .iter()

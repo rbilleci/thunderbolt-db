@@ -2,7 +2,6 @@
 
 use super::*;
 
-const FIRST_USER_INDEX_OID: u32 = 20_000;
 const PG_CLASS_CLASS_OID: i32 = 1259;
 const PG_CONSTRAINT_CLASS_OID: i32 = 2606;
 const PG_NAMESPACE_CLASS_OID: i32 = 2615;
@@ -137,8 +136,7 @@ pub(crate) fn catalog_index_entries(catalog: &CatalogSnapshot) -> Vec<CatalogInd
     });
     indexed
         .into_iter()
-        .enumerate()
-        .filter_map(|(position, (table, index))| {
+        .filter_map(|(table, index)| {
             let attnums = index
                 .key_columns
                 .iter()
@@ -153,7 +151,7 @@ pub(crate) fn catalog_index_entries(catalog: &CatalogSnapshot) -> Vec<CatalogInd
             Some(CatalogIndexEntry {
                 table,
                 index,
-                index_oid: FIRST_USER_INDEX_OID + position as u32,
+                index_oid: index.oid,
                 attnums,
             })
         })

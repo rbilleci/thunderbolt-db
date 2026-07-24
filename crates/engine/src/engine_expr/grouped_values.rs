@@ -49,11 +49,56 @@ pub(super) fn composite_group_count_reps(
     row_count: u64,
     derived: Option<(gpu_db_execution::CudaGroupDeviceView<'_>, bool)>,
 ) -> Result<Vec<u32>, ExecuteError> {
+    composite_group_reduce(
+        snapshot,
+        table,
+        device_memory,
+        members,
+        indices,
+        row_count,
+        derived,
+        false,
+    )
+    .map(|(reps, _)| reps)
+}
+
+pub(crate) fn composite_group_has_duplicate(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
+    members: &[(usize, SqlType)],
+    indices: &[u32],
+    row_count: u64,
+) -> Result<bool, ExecuteError> {
+    composite_group_reduce(
+        snapshot,
+        table,
+        device_memory,
+        members,
+        indices,
+        row_count,
+        None,
+        true,
+    )
+    .map(|(_, duplicate)| duplicate)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_group_reduce(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
+    members: &[(usize, SqlType)],
+    indices: &[u32],
+    row_count: u64,
+    derived: Option<(gpu_db_execution::CudaGroupDeviceView<'_>, bool)>,
+    duplicate_verdict: bool,
+) -> Result<(Vec<u32>, bool), ExecuteError> {
     let map_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
         ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
     };
     if indices.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     // Fixed members -> the comp_w wide-key buffer (int 8B, numeric/uuid 16B); text -> the descriptor.
     // A derived member (the expr key) is prefixed at dst 0, so column members start at dst 8.
@@ -156,19 +201,27 @@ pub(super) fn composite_group_count_reps(
         text: _tdesc.as_ref().map(|buf| buf.descriptors()),
         row_count,
     };
+    let input = gpu_db_execution::CudaGroupByInput {
+        key,
+        value: gpu_db_execution::CudaGroupValueSource::Unused { row_count },
+        key_validity_bitmap_offset: None,
+        value_validity_bitmap_offset: None,
+    };
+    if duplicate_verdict {
+        return device_memory
+            .group_by_has_duplicate_from_payload(input, indices)
+            .map(|duplicate| (Vec::new(), duplicate))
+            .map_err(map_err);
+    }
     let groups = device_memory
         .group_by_i32_count_sum_minmax_from_payload(
-            gpu_db_execution::CudaGroupByInput {
-                key,
-                value: gpu_db_execution::CudaGroupValueSource::Unused { row_count },
-                key_validity_bitmap_offset: None,
-                value_validity_bitmap_offset: None,
-            },
+            input,
             indices,
-            // COUNT(DISTINCT) representative pass: reads only g.key_i128 (no stat field), so the mask is
-            // immaterial -- pass ALL (no prune, fully behavior-preserving for this internal pass).
             gpu_db_execution::grouped_agg_mask::COUNT,
         )
         .map_err(map_err)?;
-    Ok(groups.iter().map(|g| g.key_i128 as u64 as u32).collect())
+    Ok((
+        groups.iter().map(|g| g.key_i128 as u64 as u32).collect(),
+        false,
+    ))
 }

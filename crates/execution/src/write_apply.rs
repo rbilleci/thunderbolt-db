@@ -30,6 +30,11 @@ pub enum CudaCompoundFoldColumn {
     Bool {
         bitmap_byte_offset: u64,
     },
+    /// One-bit-per-row SQL validity bitmap (1 = present). This descriptor is not folded into the
+    /// key; index build/append skips the complete row when the bit is clear (NULLS DISTINCT).
+    Validity {
+        bitmap_byte_offset: u64,
+    },
 }
 
 fn checked_destination(
@@ -1196,6 +1201,12 @@ impl CudaResidentDeviceMemory {
                     widths.push(u32::MAX);
                     blob_offsets.push(0);
                     blob_lens.push(0);
+                }
+                CudaCompoundFoldColumn::Validity { .. } => {
+                    // Fingerprint materialization has one output per row and therefore cannot
+                    // express an omitted SQL-NULL key. Validity predicates are accepted only by
+                    // resident index build/append, whose output is sparse by construction.
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
                 }
             }
         }

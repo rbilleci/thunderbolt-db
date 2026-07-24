@@ -22,7 +22,19 @@
 
 use super::*;
 
+mod index_identity_codec;
+mod operation_identity;
+mod row_codec;
 mod view_identity_codec;
+use index_identity_codec::*;
+pub(crate) use index_identity_codec::{
+    command_is_index_lifecycle, command_requires_index_catalog_opcode,
+    valid_index_lifecycle_operation_identity, BinaryCatalogIndexIdentity,
+    BinaryTransactionIndexLifecycleOperationIdentity,
+    BinaryTransactionIndexLifecycleTargetIdentity,
+};
+pub(crate) use operation_identity::BinaryTransactionOperationIdentity;
+pub(crate) use row_codec::*;
 use view_identity_codec::*;
 pub(crate) use view_identity_codec::{
     command_is_view_lifecycle, legacy_from_lifecycle_create, lifecycle_from_legacy_create,
@@ -85,35 +97,6 @@ const TXN_OPERATION_UPDATE: u8 = 3;
 const TXN_OPERATION_DELETE: u8 = 4;
 const TXN_OPERATION_TABLE_RESET: u8 = 5;
 
-/// The decoded form of a v1 binary INSERT record.
-pub(crate) struct BinaryInsertRecord {
-    pub(crate) table: String,
-    /// `(row_id, encoded_row)` — the row image in `encode_relational_row`'s cell encoding
-    /// (the tuple store's canonical format; decoded against the catalog at apply time).
-    pub(crate) rows: Vec<(u64, String)>,
-}
-
-/// The decoded form of a W5b by-key DELETE record (U1).
-pub(crate) struct BinaryDeleteByKeyRecord {
-    pub(crate) table: String,
-    /// The unique key column NAME (catalog identity survives replays; the covered route
-    /// guarantees it is the single unique i32 index column).
-    pub(crate) pk_column: String,
-    pub(crate) pk_value: i32,
-}
-
-/// The decoded form of a W5b by-key UPDATE record (U2).
-pub(crate) struct BinaryUpdateByKeyRecord {
-    pub(crate) table: String,
-    pub(crate) pk_column: String,
-    pub(crate) pk_value: i32,
-    /// Legacy v1 allocator reservation. ADR-014 replay derives replacement identity from the
-    /// visible old version; this value is retained for framing and allocator high-water parity.
-    pub(crate) new_row_id: u64,
-    /// The new row image in `encode_relational_row`'s cell encoding (all columns, new values).
-    pub(crate) new_row_encoded: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BinaryTransactionMutation {
     Insert {
@@ -162,51 +145,20 @@ pub(crate) struct BinaryTransactionCatalogCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BinaryTransactionCatalogOutput {
+    /// Sole `pg_class.oid` high-water after applying the complete ordered catalog stream,
+    /// including every implicit or explicit index.
     pub(crate) relational_next_oid: u32,
     pub(crate) relational_next_column_id: u32,
     /// Stable identities of implicit sequences created by admitted CREATE TABLE commands.
     pub(crate) created_sequence_oids: BTreeMap<String, u32>,
 }
 
-/// Stable identity of every admitted statement in an ordered catalog transaction. Row payloads
-/// remain coalesced into `mutations`, but this vector preserves statements whose effects were
-/// shadowed by a later reset or folded to no final row mutation. Its vector index is the one
-/// transaction-wide ordinal authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BinaryTransactionOperationIdentity {
-    Catalog { command_index: u32 },
-    Insert { table: String },
-    Update { table: String },
-    Delete { table: String },
-    TableReset { table: String },
-}
-
-impl BinaryTransactionOperationIdentity {
-    pub(crate) fn table(&self) -> Option<&str> {
-        match self {
-            Self::Catalog { .. } => None,
-            Self::Insert { table }
-            | Self::Update { table }
-            | Self::Delete { table }
-            | Self::TableReset { table } => Some(table),
-        }
-    }
-
-    pub(crate) fn matches_mutation(&self, mutation: &BinaryTransactionMutation) -> bool {
-        matches!(
-            (self, mutation),
-            (
-                Self::Insert { table: operation_table },
-                BinaryTransactionMutation::Insert { table: mutation_table, .. }
-            ) | (
-                Self::Update { table: operation_table },
-                BinaryTransactionMutation::Update { table: mutation_table, .. }
-            ) | (
-                Self::Delete { table: operation_table },
-                BinaryTransactionMutation::Delete { table: mutation_table, .. }
-            ) if operation_table == mutation_table
-        )
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinaryTransactionCatalogEpoch {
+    /// Opcodes 4--15: indexes had no durable stable-OID/output closure.
+    Legacy,
+    /// Opcodes 16/17: exact shared pg_class/index identities are bound.
+    IndexIdentityV1,
 }
 
 /// One durable explicit-transaction record. `allocator_high_water` is the row-id allocator value
@@ -214,6 +166,9 @@ impl BinaryTransactionOperationIdentity {
 /// so the live process (which preclaimed the ids before WAL encoding) and recovery converge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BinaryTransactionRecord {
+    /// Derived from the binary opcode on decode; live builders emit only `IndexIdentityV1` for a
+    /// catalog-bearing record. This field is not separately serialized.
+    pub(crate) catalog_epoch: BinaryTransactionCatalogEpoch,
     pub(crate) allocator_high_water: u64,
     /// Typed catalog operations and their positions in the complete transaction statement stream.
     /// The command vector itself is canonical statement order; ordinals bind its gaps to DML and
@@ -222,6 +177,10 @@ pub(crate) struct BinaryTransactionRecord {
     /// Stable output identity for every table created by `catalog_commands`. Current ordered
     /// records require exact coverage; legacy opcode 5/8 records decode this as empty.
     pub(crate) created_table_identities: BTreeMap<String, BinaryTransactionTableIdentity>,
+    /// Exact ordered postimage of every implicit PRIMARY KEY / UNIQUE index created with each
+    /// table.  The table schema v1 digest intentionally predates stable index OIDs, so current
+    /// opcodes bind these identities separately; an empty vector is itself an absence proof.
+    pub(crate) created_table_index_identities: BTreeMap<String, Vec<BinaryCatalogIndexIdentity>>,
     /// Exact allocator post-state and implicit-sequence output closure for current ordered
     /// catalog records. Table schema identities alone do not carry generated sequence OIDs.
     pub(crate) catalog_output: Option<BinaryTransactionCatalogOutput>,
@@ -231,6 +190,8 @@ pub(crate) struct BinaryTransactionRecord {
     /// Exact CREATE/RENAME/DROP VIEW lifecycle closure. Additive opcodes 14/15 use this field;
     /// opcodes 12/13 continue to decode only into `view_operations`.
     pub(crate) view_lifecycle_operations: Vec<BinaryTransactionViewLifecycleOperationIdentity>,
+    /// Exact CREATE/RENAME/DROP INDEX target transitions. Empty for historical opcodes.
+    pub(crate) index_lifecycle_operations: Vec<BinaryTransactionIndexLifecycleOperationIdentity>,
     /// Complete statement order for current catalog-bearing records. Legacy transaction opcodes
     /// decode this as empty and retain their historical resolved-state semantics.
     pub(crate) operation_order: Vec<BinaryTransactionOperationIdentity>,
@@ -290,6 +251,7 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     let identity_bound = !record.table_identities.is_empty();
     let mut catalog_names = BTreeMap::<&str, u32>::new();
     let mut view_commands = Vec::new();
+    let mut index_commands = Vec::new();
     let mut requires_view_lifecycle_opcode = false;
     let mut created_sequence_names = BTreeSet::new();
     let mut prior_catalog_ordinal = None;
@@ -330,11 +292,23 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                     command,
                 ));
             }
+            command if command_is_index_lifecycle(command) => {
+                index_commands.push((
+                    u32::try_from(command_index).ok()?,
+                    operation.ordinal,
+                    command,
+                ));
+            }
             _ => return None,
         }
     }
     let created_identity_names = record
         .created_table_identities
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let created_index_identity_names = record
+        .created_table_index_identities
         .keys()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
@@ -350,15 +324,59 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     let view_catalog = !view_commands.is_empty();
     let legacy_view_catalog = !record.view_operations.is_empty();
     let view_lifecycle_catalog = !record.view_lifecycle_operations.is_empty();
+    let index_command_catalog = !index_commands.is_empty();
+    let index_semantics_required = record
+        .catalog_commands
+        .iter()
+        .any(|operation| command_requires_index_catalog_opcode(&operation.command));
+    let index_catalog =
+        ordered_catalog && record.catalog_epoch == BinaryTransactionCatalogEpoch::IndexIdentityV1;
+    let index_identity_catalog = !record.index_lifecycle_operations.is_empty();
+    let mut created_class_oids = BTreeSet::new();
+    let created_index_closure_valid = if index_catalog {
+        created_index_identity_names == catalog_names.keys().copied().collect::<BTreeSet<_>>()
+            && record.catalog_commands.iter().all(|operation| {
+                let Command::CreateTable(create) = &operation.command else {
+                    return true;
+                };
+                let Some(table_identity) = record.created_table_identities.get(&create.table)
+                else {
+                    return false;
+                };
+                let Some(index_identities) =
+                    record.created_table_index_identities.get(&create.table)
+                else {
+                    return false;
+                };
+                let expected_count =
+                    usize::from(create.primary_key.is_some()) + create.unique_constraints.len();
+                table_identity.table_oid != 0
+                    && table_identity.table_oid <= i32::MAX as u32
+                    && created_class_oids.insert(table_identity.table_oid)
+                    && index_identities.len() == expected_count
+                    && index_identities.iter().all(|identity| {
+                        identity.oid <= i32::MAX as u32
+                            && identity.table_oid == table_identity.table_oid
+                            && identity.digest != [0; 32]
+                            && created_class_oids.insert(identity.oid)
+                    })
+            })
+    } else {
+        record.created_table_index_identities.is_empty()
+    };
     if legacy_view_catalog && view_lifecycle_catalog {
         return None;
     }
-    if view_catalog
-        != if requires_view_lifecycle_opcode {
-            view_lifecycle_catalog
-        } else {
-            legacy_view_catalog
-        }
+    if !created_index_closure_valid
+        || index_command_catalog != index_identity_catalog
+        || (index_semantics_required && !index_catalog)
+        || (index_catalog && legacy_view_catalog)
+        || (view_catalog
+            != if index_catalog || requires_view_lifecycle_opcode {
+                view_lifecycle_catalog
+            } else {
+                legacy_view_catalog
+            })
     {
         return None;
     }
@@ -376,7 +394,7 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         return None;
     }
     if view_lifecycle_catalog
-        && (!requires_view_lifecycle_opcode
+        && ((!index_catalog && !requires_view_lifecycle_opcode)
             || record.view_lifecycle_operations.len() != view_commands.len()
             || record
                 .view_lifecycle_operations
@@ -386,6 +404,20 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                     identity.command_index != *command_index
                         || identity.ordinal != *ordinal
                         || !valid_view_lifecycle_operation_identity(command, identity)
+                }))
+    {
+        return None;
+    }
+    if index_command_catalog
+        && (record.index_lifecycle_operations.len() != index_commands.len()
+            || record
+                .index_lifecycle_operations
+                .iter()
+                .zip(&index_commands)
+                .any(|(identity, (command_index, ordinal, command))| {
+                    identity.command_index != *command_index
+                        || identity.ordinal != *ordinal
+                        || !valid_index_lifecycle_operation_identity(command, identity)
                 }))
     {
         return None;
@@ -444,6 +476,9 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                         Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
                             BTreeSet::new()
                         }
+                        Command::CreateIndex(_)
+                        | Command::RenameIndex(_)
+                        | Command::DropIndex(_) => BTreeSet::new(),
                         _ => return None,
                     };
                     if sequence_names_by_ordinal
@@ -546,6 +581,11 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         .collect::<BTreeSet<_>>();
     if record.catalog_commands.len() > u32::MAX as usize
         || record.created_table_identities.len() > u32::MAX as usize
+        || record.created_table_index_identities.len() > u32::MAX as usize
+        || record
+            .created_table_index_identities
+            .values()
+            .any(|identities| identities.len() > u32::MAX as usize)
         || record.catalog_output.as_ref().is_some_and(|output| {
             output.created_sequence_oids.len() > u32::MAX as usize
                 || output
@@ -561,15 +601,19 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         || record.table_resets.len() > u32::MAX as usize
         || record.view_operations.len() > u32::MAX as usize
         || record.view_lifecycle_operations.len() > u32::MAX as usize
+        || record.index_lifecycle_operations.len() > u32::MAX as usize
         || record.sequence_advances.len() > u32::MAX as usize
         || record.mutations.len() > u32::MAX as usize
         || (record.catalog_commands.is_empty() && !record.created_table_identities.is_empty())
+        || (record.catalog_commands.is_empty() && !record.created_table_index_identities.is_empty())
         || (record.catalog_commands.is_empty() && record.catalog_output.is_some())
         || (record.catalog_commands.is_empty() && !record.view_operations.is_empty())
         || (record.catalog_commands.is_empty() && !record.view_lifecycle_operations.is_empty())
+        || (record.catalog_commands.is_empty() && !record.index_lifecycle_operations.is_empty())
         || (ordered_catalog
             && created_identity_names != catalog_names.keys().copied().collect::<BTreeSet<_>>())
         || (!ordered_catalog && !record.created_table_identities.is_empty())
+        || (!index_catalog && !record.created_table_index_identities.is_empty())
         || (ordered_catalog != record.catalog_output.is_some())
         || (!ordered_catalog && !record.operation_order.is_empty())
         || reset_names.len() != record.table_resets.len()
@@ -625,7 +669,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     out.push(WAL_BINARY_TAG);
     out.push(WAL_BINARY_VERSION);
     let op = if ordered_catalog {
-        if view_lifecycle_catalog {
+        if index_catalog {
+            if identity_bound {
+                OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            } else {
+                OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            }
+        } else if view_lifecycle_catalog {
             if identity_bound {
                 OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             } else {
@@ -679,6 +729,8 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
     ) {
         out.extend_from_slice(&(record.catalog_commands.len() as u32).to_le_bytes());
         for operation in &record.catalog_commands {
@@ -699,6 +751,24 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             out.extend_from_slice(table.as_bytes());
             out.extend_from_slice(&identity.table_oid.to_le_bytes());
             out.extend_from_slice(&identity.schema_digest);
+        }
+        if index_catalog {
+            out.extend_from_slice(
+                &(record.created_table_index_identities.len() as u32).to_le_bytes(),
+            );
+            for (table, identities) in &record.created_table_index_identities {
+                if table.len() > u16::MAX as usize {
+                    return None;
+                }
+                out.extend_from_slice(&(table.len() as u16).to_le_bytes());
+                out.extend_from_slice(table.as_bytes());
+                out.extend_from_slice(&(identities.len() as u32).to_le_bytes());
+                for identity in identities {
+                    out.extend_from_slice(&identity.oid.to_le_bytes());
+                    out.extend_from_slice(&identity.table_oid.to_le_bytes());
+                    out.extend_from_slice(&identity.digest);
+                }
+            }
         }
         let catalog_output = record.catalog_output.as_ref()?;
         out.extend_from_slice(&catalog_output.relational_next_oid.to_le_bytes());
@@ -723,6 +793,13 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                 | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
         ) {
             encode_view_lifecycle_operations(&mut out, &record.view_lifecycle_operations)?;
+        } else if matches!(
+            op,
+            OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+                | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+        ) {
+            encode_view_lifecycle_operations(&mut out, &record.view_lifecycle_operations)?;
+            encode_index_lifecycle_operations(&mut out, &record.index_lifecycle_operations)?;
         }
         out.extend_from_slice(&(record.operation_order.len() as u32).to_le_bytes());
         for operation in &record.operation_order {
@@ -771,6 +848,8 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
     ) {
         out.extend_from_slice(&(record.table_resets.len() as u32).to_le_bytes());
         let mut prior_ordinal = None;
@@ -875,72 +954,6 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     Some(out)
 }
 
-/// Encode a W5b by-key DELETE record. `None` on width-exceeding names (caller falls back to the
-/// SQL-text record, same contract as the insert encoder).
-pub(crate) fn encode_binary_delete_by_key(
-    table: &str,
-    pk_column: &str,
-    pk_value: i32,
-) -> Option<Vec<u8>> {
-    if table.len() > u16::MAX as usize || pk_column.len() > u16::MAX as usize {
-        return None;
-    }
-    let mut out = Vec::with_capacity(3 + 2 + table.len() + 2 + pk_column.len() + 4);
-    out.push(WAL_BINARY_TAG);
-    out.push(WAL_BINARY_VERSION);
-    out.push(OP_DELETE_BY_KEY);
-    out.extend_from_slice(&(table.len() as u16).to_le_bytes());
-    out.extend_from_slice(table.as_bytes());
-    out.extend_from_slice(&(pk_column.len() as u16).to_le_bytes());
-    out.extend_from_slice(pk_column.as_bytes());
-    out.extend_from_slice(&pk_value.to_le_bytes());
-    Some(out)
-}
-
-/// Encode a W5b by-key UPDATE record (U2): table + pk column/value + the new version's row id +
-/// the new row image (all columns). `None` on width-exceeding shapes (caller falls back to SQL
-/// text). `new_row` is the full post-image in catalog order.
-pub(crate) fn encode_binary_update_by_key(
-    table: &str,
-    pk_column: &str,
-    pk_value: i32,
-    new_row_id: u64,
-    new_row: &[SqlValue],
-) -> Option<Vec<u8>> {
-    if table.len() > u16::MAX as usize || pk_column.len() > u16::MAX as usize {
-        return None;
-    }
-    let encoded = encode_relational_row(new_row);
-    let encoded_bytes = encoded.as_bytes();
-    if encoded_bytes.len() > u32::MAX as usize {
-        return None;
-    }
-    let mut out = Vec::with_capacity(
-        3 + 2 + table.len() + 2 + pk_column.len() + 4 + 8 + 4 + encoded_bytes.len(),
-    );
-    out.push(WAL_BINARY_TAG);
-    out.push(WAL_BINARY_VERSION);
-    out.push(OP_UPDATE_BY_KEY);
-    out.extend_from_slice(&(table.len() as u16).to_le_bytes());
-    out.extend_from_slice(table.as_bytes());
-    out.extend_from_slice(&(pk_column.len() as u16).to_le_bytes());
-    out.extend_from_slice(pk_column.as_bytes());
-    out.extend_from_slice(&pk_value.to_le_bytes());
-    out.extend_from_slice(&new_row_id.to_le_bytes());
-    out.extend_from_slice(&(encoded_bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(encoded_bytes);
-    Some(out)
-}
-
-/// U2: the byte offset of the 8-byte `new_row_id` field inside an `OP_UPDATE_BY_KEY` record for
-/// `(table, pk_column)` — the pump patches the row id it claims at wave formation here, exactly as
-/// an INSERT patches its row id at [`CoveredInsertRoute`]'s `binary_row_id_offset`. Layout:
-/// tag(1) + version(1) + op(1) + table_len(2) + table + pkcol_len(2) + pkcol + pk_value(4), then
-/// the `new_row_id`. Stable given the encoding above; a `debug_assert` in the pump cross-checks it.
-pub(crate) fn binary_update_new_row_id_offset(table: &str, pk_column: &str) -> usize {
-    3 + 2 + table.len() + 2 + pk_column.len() + 4
-}
-
 /// Decode ANY binary record (op dispatch). Errors are LOUD (`Durability`) — a tagged record
 /// that fails to decode is corruption-or-version-skew, never silently skipped.
 pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, EngineError> {
@@ -973,7 +986,9 @@ pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, En
         | Some(&OP_ORDERED_CATALOG_VIEW_TRANSACTION)
         | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION)
         | Some(&OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION)
-        | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION) => {
+        | Some(&OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION)
+        | Some(&OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION)
+        | Some(&OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION) => {
             decode_binary_transaction(payload).map(BinaryWalRecord::Transaction)
         }
         Some(&OP_UPDATE_BY_KEY) => {
@@ -1089,6 +1104,8 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
     ) {
         return Err(fail("op dispatch mismatch"));
     }
@@ -1101,6 +1118,13 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+    );
+    let index_catalog = matches!(
+        op,
+        OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
     );
     let view_catalog = matches!(
         op,
@@ -1108,11 +1132,15 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
     );
     let view_lifecycle_catalog = matches!(
         op,
         OP_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
     );
     if ordered_catalog
         || matches!(
@@ -1149,7 +1177,8 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             } else {
                 view_catalog && matches!(command, Command::CreateView(_))
             };
-            if !matches!(command, Command::CreateTable(_)) && !supported_view {
+            let supported_index = index_catalog && command_is_index_lifecycle(&command);
+            if !matches!(command, Command::CreateTable(_)) && !supported_view && !supported_index {
                 return Err(fail("unsupported composite catalog command"));
             }
             if serde_json::to_vec(&command).ok().as_deref() != Some(bytes) {
@@ -1159,9 +1188,11 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         }
     }
     let mut created_table_identities = BTreeMap::new();
+    let mut created_table_index_identities = BTreeMap::new();
     let mut catalog_output = None;
     let mut view_operations = Vec::new();
     let mut view_lifecycle_operations = Vec::new();
+    let mut index_lifecycle_operations = Vec::new();
     let mut operation_order = Vec::new();
     let mut statement_digests = Vec::new();
     let mut sequence_input_oids = BTreeMap::new();
@@ -1174,6 +1205,9 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                 .to_string();
             let table_oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
             let schema_digest = take(32)?.try_into().expect("32 bytes");
+            if table_oid == 0 || table_oid > i32::MAX as u32 || schema_digest == [0; 32] {
+                return Err(fail("invalid created-table stable identity"));
+            }
             if created_table_identities
                 .insert(
                     table,
@@ -1206,6 +1240,92 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             return Err(fail(
                 "ordered catalog identities do not cover the exact created-table set",
             ));
+        }
+        if index_catalog {
+            let table_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            if table_count != command_names.len() {
+                return Err(fail(
+                    "created-table index identities do not cover the exact table set",
+                ));
+            }
+            let mut prior_name = None;
+            let mut class_oids = created_table_identities
+                .values()
+                .map(|identity| identity.table_oid)
+                .collect::<BTreeSet<_>>();
+            if class_oids.len() != created_table_identities.len() {
+                return Err(fail("created tables reuse a pg_class OID"));
+            }
+            for _ in 0..table_count {
+                let name_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+                let table = std::str::from_utf8(take(name_len)?)
+                    .map_err(|_| fail("non-utf8 created-table index identity name"))?
+                    .to_string();
+                if prior_name.as_ref().is_some_and(|prior| prior >= &table) {
+                    return Err(fail(
+                        "created-table index identities are not in canonical name order",
+                    ));
+                }
+                prior_name = Some(table.clone());
+                let expected_count = catalog_commands
+                    .iter()
+                    .find_map(|operation| match &operation.command {
+                        Command::CreateTable(create) if create.table == table => Some(
+                            usize::from(create.primary_key.is_some())
+                                + create.unique_constraints.len(),
+                        ),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        fail("created-table index identity has no CREATE TABLE command")
+                    })?;
+                let index_count =
+                    u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+                if index_count != expected_count {
+                    return Err(fail(
+                        "created-table index identity count changed from CREATE TABLE",
+                    ));
+                }
+                let table_oid = created_table_identities
+                    .get(&table)
+                    .map(|identity| identity.table_oid)
+                    .ok_or_else(|| fail("created-table index identity lost its table"))?;
+                let mut identities = Vec::with_capacity(index_count.min(1024));
+                for _ in 0..index_count {
+                    let identity = BinaryCatalogIndexIdentity {
+                        oid: u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")),
+                        table_oid: u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")),
+                        digest: take(32)?.try_into().expect("32 bytes"),
+                    };
+                    if identity.oid == 0
+                        || identity.oid > i32::MAX as u32
+                        || identity.table_oid != table_oid
+                        || identity.digest == [0; 32]
+                        || !class_oids.insert(identity.oid)
+                    {
+                        return Err(fail(
+                            "created-table index identity is invalid or reuses a pg_class OID",
+                        ));
+                    }
+                    identities.push(identity);
+                }
+                if created_table_index_identities
+                    .insert(table, identities)
+                    .is_some()
+                {
+                    return Err(fail("duplicate created-table index identity"));
+                }
+            }
+            if created_table_index_identities
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                != command_names
+            {
+                return Err(fail(
+                    "created-table index identities do not cover the exact table set",
+                ));
+            }
         }
         let relational_next_oid = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
         let relational_next_column_id = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
@@ -1286,12 +1406,13 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                     ))
                 })
                 .collect::<Vec<_>>();
-            if view_count == 0
-                || view_count != expected_views.len()
-                || (view_lifecycle_catalog
-                    != expected_views
-                        .iter()
-                        .any(|(_, _, command)| command_requires_view_lifecycle_opcode(command)))
+            if view_count != expected_views.len()
+                || (!index_catalog
+                    && (view_count == 0
+                        || (view_lifecycle_catalog
+                            != expected_views.iter().any(|(_, _, command)| {
+                                command_requires_view_lifecycle_opcode(command)
+                            }))))
             {
                 return Err(fail(
                     "view identities do not cover the exact stored-view command set",
@@ -1330,6 +1451,43 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                         &fail,
                     )?);
                 }
+            }
+        }
+        if index_catalog {
+            let index_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            let expected_indexes = catalog_commands
+                .iter()
+                .enumerate()
+                .filter_map(|(command_index, operation)| {
+                    command_is_index_lifecycle(&operation.command).then_some((
+                        command_index,
+                        operation.ordinal,
+                        &operation.command,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if index_count != expected_indexes.len() {
+                return Err(fail(
+                    "index identities do not cover the exact index command set",
+                ));
+            }
+            index_lifecycle_operations.reserve(index_count.min(1024));
+            for (expected_command_index, expected_ordinal, command) in expected_indexes {
+                let command_index = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+                let ordinal = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+                if usize::try_from(command_index).ok() != Some(expected_command_index)
+                    || ordinal != expected_ordinal
+                {
+                    return Err(fail(
+                        "index identity does not match its catalog command position",
+                    ));
+                }
+                let identity =
+                    decode_index_lifecycle_operation(command_index, ordinal, &mut take, &fail)?;
+                if !valid_index_lifecycle_operation_identity(command, &identity) {
+                    return Err(fail("invalid index lifecycle identity closure"));
+                }
+                index_lifecycle_operations.push(identity);
             }
         }
         let operation_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
@@ -1474,6 +1632,7 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             | OP_IDENTITY_ORDERED_CATALOG_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_TRANSACTION
             | OP_IDENTITY_ORDERED_CATALOG_VIEW_LIFECYCLE_TRANSACTION
+            | OP_IDENTITY_ORDERED_CATALOG_INDEX_LIFECYCLE_TRANSACTION
     );
     let mut table_identities = BTreeMap::new();
     if identity_bound {
@@ -1632,6 +1791,9 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                         Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
                             BTreeSet::new()
                         }
+                        Command::CreateIndex(_)
+                        | Command::RenameIndex(_)
+                        | Command::DropIndex(_) => BTreeSet::new(),
                         _ => return Err(fail("unsupported ordered catalog command")),
                     };
                     if input_sequence_names != expected_sequences {
@@ -1784,12 +1946,19 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         }
     }
     Ok(BinaryTransactionRecord {
+        catalog_epoch: if index_catalog {
+            BinaryTransactionCatalogEpoch::IndexIdentityV1
+        } else {
+            BinaryTransactionCatalogEpoch::Legacy
+        },
         allocator_high_water,
         catalog_commands,
         created_table_identities,
+        created_table_index_identities,
         catalog_output,
         view_operations,
         view_lifecycle_operations,
+        index_lifecycle_operations,
         operation_order,
         statement_digests,
         sequence_input_oids,
@@ -1798,93 +1967,6 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
         table_identities,
         mutations,
     })
-}
-
-/// Encode a covered INSERT delta as a v1 binary record. `rows` are `(row_id, values)`.
-/// Returns `None` on width-exceeding shapes (table name > u16, cell encoding > u32 — no
-/// realistic statement, but the durability path must not silently wrap; the caller falls back
-/// to the SQL-text record).
-pub(crate) fn try_encode_binary_insert(
-    table: &str,
-    rows: &[(u64, &[SqlValue])],
-) -> Option<Vec<u8>> {
-    if table.len() > u16::MAX as usize || rows.len() > u32::MAX as usize {
-        return None;
-    }
-    let mut out = encode_binary_insert_unchecked(table, rows)?;
-    out.shrink_to_fit();
-    Some(out)
-}
-
-fn encode_binary_insert_unchecked(table: &str, rows: &[(u64, &[SqlValue])]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(64 + rows.len() * 48);
-    out.push(WAL_BINARY_TAG);
-    out.push(WAL_BINARY_VERSION);
-    out.push(OP_INSERT);
-    let table_bytes = table.as_bytes();
-    out.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
-    out.extend_from_slice(table_bytes);
-    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    for (row_id, values) in rows {
-        out.extend_from_slice(&row_id.to_le_bytes());
-        let encoded = encode_relational_row(values);
-        let encoded_bytes = encoded.as_bytes();
-        if encoded_bytes.len() > u32::MAX as usize {
-            return None;
-        }
-        out.extend_from_slice(&(encoded_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(encoded_bytes);
-    }
-    Some(out)
-}
-
-/// Whether `payload` is a binary WAL record (any version).
-pub(crate) fn is_binary_wal_record(payload: &[u8]) -> bool {
-    payload.first() == Some(&WAL_BINARY_TAG)
-}
-
-/// Decode a v1 binary record. Errors are LOUD (`Durability`): a tagged record that fails to
-/// decode is corruption-or-version-skew — never silently skipped (the silent-skip discipline is
-/// only for the UNTAGGED text consumers).
-pub(crate) fn decode_binary_insert(payload: &[u8]) -> Result<BinaryInsertRecord, EngineError> {
-    let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
-    let mut at = 0usize;
-    let mut take = |n: usize| -> Result<&[u8], EngineError> {
-        let end = at.checked_add(n).ok_or_else(|| fail("length overflow"))?;
-        let slice = payload.get(at..end).ok_or_else(|| fail("truncated"))?;
-        at = end;
-        Ok(slice)
-    };
-    if take(1)?[0] != WAL_BINARY_TAG {
-        return Err(fail("missing tag"));
-    }
-    let version = take(1)?[0];
-    if version != WAL_BINARY_VERSION {
-        return Err(fail(&format!("unsupported version {version}")));
-    }
-    if take(1)?[0] != OP_INSERT {
-        return Err(fail("unsupported op"));
-    }
-    let table_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
-    let table = std::str::from_utf8(take(table_len)?)
-        .map_err(|_| fail("non-utf8 table name"))?
-        .to_string();
-    let row_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
-    // Capacity clamp (audit 21eddaa7 C): don't trust the record's count for the allocation —
-    // a corrupt count fails loudly at `take` anyway; the clamp keeps the allocation bounded.
-    let mut rows = Vec::with_capacity(row_count.min(64 * 1024));
-    for _ in 0..row_count {
-        let row_id = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
-        let encoded_len = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
-        let encoded = std::str::from_utf8(take(encoded_len)?)
-            .map_err(|_| fail("non-utf8 row encoding"))?
-            .to_string();
-        rows.push((row_id, encoded));
-    }
-    if at != payload.len() {
-        return Err(fail("trailing bytes"));
-    }
-    Ok(BinaryInsertRecord { table, rows })
 }
 
 #[cfg(test)]
