@@ -1358,7 +1358,7 @@ impl Engine {
                     ))
                 })?;
             if violated {
-                return Err(EngineError::ApplyFailed(format!(
+                return Err(EngineError::CheckViolation(format!(
                     "new row for relation \"{}\" violates check constraint \"{}\"",
                     table.name, constraint.name
                 )));
@@ -1486,7 +1486,7 @@ impl Engine {
                     &row[child_idx],
                     None,
                 )? {
-                    return Err(EngineError::ApplyFailed(format!(
+                    return Err(EngineError::ForeignKeyViolation(format!(
                         "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
                         table.name, foreign_key.name
                     )));
@@ -1538,7 +1538,7 @@ impl Engine {
                         value,
                         child_exclusions,
                     )? {
-                        return Err(EngineError::ApplyFailed(format!(
+                        return Err(EngineError::ForeignKeyViolation(format!(
                             "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
                             child.name, foreign_key.name
                         )));

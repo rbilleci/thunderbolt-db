@@ -400,13 +400,45 @@ does not delay the architecture evidence gate. The active sequence now starts at
    performance-path change occurred, so the single canonical card remains applicable without rerun. This accepts
    the ordinary published-sequence transition boundary.
 
-   After this accepted seal, **PRODUCT-001** next owns the remaining SQLSTATE/type-codec breadth, named client
-   suites, and mixed-recovery coverage for the canonical target. Only after those proofs are independently accepted
-   does the legacy/P8 compatibility-and-deletion slice re-inventory the still-live psql/preflight/benchmark consumers,
-   migrate or explicitly disposition each behavior, and delete the superseded listener plus independently callable
-   P8 protocol adapters in the same audited slice. Do not retain a second product-like execution or write owner as
-   a compatibility shortcut. Bounded/offloaded response streaming remains SCALE-001 and must be explicit while the
-   async task still formats materialized results.
+   The independently accepted SQLSTATE/type-codec, named-client, and mixed-recovery slice now gives every facade
+   type (`int2`, `int4`, `int8`, `numeric`, `bool`, `text`/`varchar`, `date`, `timestamp`, and `uuid`) PostgreSQL
+   text and binary Bind/result codecs, carries NUMERIC precision/scale through Describe and the GPU catalog, and
+   distinguishes malformed text/binary input from numeric overflow. Engine errors carry typed not-null,
+   foreign-key, check, and numeric-range categories to `23502`, `23503`, `23514`, and `22003`; existing `23505`,
+   `25P02`, and `40001` behavior remains exact without message inspection. Tokio-postgres, SQLx, node-postgres,
+   asyncpg, psycopg, pgx, JDBC, and R2DBC all exercise native values, alternating NULLs, constraint SQLSTATEs,
+   failed-transaction recovery, and connection reuse against the sole canonical server. Process-level recovery
+   writes through W1, General, explicit transaction, COPY, and sequence routes, kills the server, and proves two
+   exact reopen cycles plus later append; deterministic pre-fsync and post-durable faults preserve retry and
+   indeterminate-recovery semantics.
+
+   Its first exact-tree audit correctly rejected four PostgreSQL 16 NUMERIC edges before the full card: radix/
+   underscore text, leading-zero binary weight normalization, signed `i128::MIN`, and reserved dscale
+   classification. The repaired 30-path code/test seal is base `e7333dc4a339468ae0fc9727b8858ecbe3acfc9f`,
+   index tree `ab1d4bffeb429413f238df3d786fdaa04281c146`, and cached binary-diff SHA-256
+   `a454ea91826d951775ed5f6b8e072f537806e8a51ab9ab08574af6665f8aace8`, with no unstaged/untracked drift.
+   All ten sabotage arms, the eight-driver aggregate, process recovery, workspace static gates, and the exact
+   alternating-NULL GPU route pass; its HAZARD matrix is three serial plus two simultaneous executions with zero
+   CUDA 700/716/717. Independent repaired-tree and post-card audits returned **ACCEPT** with no finding.
+
+   The first full invocation retained valid A/B evidence but is explicitly non-acceptance evidence because the
+   fixed 48M-row Section-C build took 2306.9s and the default 2400s operational cap expired before
+   `executed_target`. The same auditor authorized one workload-identical retry with `SECTION_C_TIMEOUT=2700`; no
+   calibrated row, batch, warmup, cache, cool-down, source-export, or fresh-target control changed. The retry
+   completed A/B/C with the canonical terminal marker. Its raw, point-read, and AWS-LC artifacts are respectively
+   `a1f053190a6b2e915837489d21bc521e9b0369f4145be4aea5c37c3d0001c234` (1,129,600 bytes),
+   `d68b6495ddb9293bca4ac9c7faa9a9ede557832f8845e220ca7ba492d7d107f3` (9,925,192 bytes), and
+   `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61` (7,156,488 bytes). Honest out-of-L2
+   raw throughput is 1442.5 GB/s, grouped execution is 1672.9 M-elem/s, and production point reads are
+   268.934M/s at p50 117us in-L2 and 244.560M/s at p50 139us out-of-L2. Against the preceding accepted card,
+   those point throughputs are -0.8%/-2.0% with +1us/unchanged p50; no material regression is present.
+
+   After this accepted seal, **PRODUCT-001** next owns the legacy/P8 compatibility-and-deletion slice. Re-inventory
+   the still-live psql/preflight/benchmark consumers, migrate or explicitly disposition each behavior, and delete
+   the superseded listener plus independently callable P8 protocol adapters in the same audited slice. Do not retain
+   a second product-like execution or write owner as a compatibility shortcut. The 2,002-line transaction-catalog
+   core-test extraction remains PRODUCT-001-owned before parent closure. Bounded/offloaded response streaming
+   remains SCALE-001 and must be explicit while the async task still formats materialized results.
 
    Before migration, inventory every legacy server behavior, product target, public write API, test suite, and live
    consumer. Deletion requires the canonical server to pass the existing psql golden, pg_dump/restore, tokio-

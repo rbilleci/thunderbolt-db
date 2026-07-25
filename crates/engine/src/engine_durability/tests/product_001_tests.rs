@@ -38,6 +38,178 @@ fn seed_legacy_index_cursor(engine: &Engine, next_oid: u32) {
     engine.publish_catalog_snapshot(&catalog, engine.committed_seq(), 0);
 }
 
+struct DurableFixture {
+    directory: std::path::PathBuf,
+    wal: std::path::PathBuf,
+}
+
+impl DurableFixture {
+    fn new(label: &str) -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "gpu-db-product-001-durability-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create durable fixture directory");
+        Self {
+            wal: directory.join("canonical.wal"),
+            directory,
+        }
+    }
+}
+
+impl Drop for DurableFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn durable_ids(engine: &Engine, table: &str) -> Vec<i32> {
+    let Command::Select(select) =
+        parse_command(&format!("SELECT id FROM {table} ORDER BY id")).expect("parse id query")
+    else {
+        panic!("expected SELECT")
+    };
+    engine
+        .execute_relational_select(&select)
+        .expect("execute id query")
+        .rows
+        .iter()
+        .map(|row| match row[0] {
+            SqlValue::Int4(id) => id,
+            ref other => panic!("expected int4 id, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn product_001_pre_fsync_failure_has_no_visibility_or_recovery_effect_and_retry_is_clean() {
+    let fixture = DurableFixture::new("pre-fsync");
+    let mut engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(71_000, "CREATE TABLE product_fsync (id INT PRIMARY KEY)")
+        .expect("durable fixture DDL");
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let flushed_before = engine.wal_flushed_count();
+
+    engine.simulate_next_wal_flush_failure();
+    let failure = engine.execute_text(71_001, "INSERT INTO product_fsync VALUES (1)");
+    assert!(
+        matches!(
+            failure,
+            Err(ExecuteError::Engine(EngineError::Durability(_)))
+        ),
+        "a pre-fsync failure must not acknowledge a mutation: {failure:?}"
+    );
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(engine.wal_flushed_count(), flushed_before);
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert!(durable_ids(&engine, "product_fsync").is_empty());
+
+    // Restart before retrying: recovery must see exactly the prefix acknowledged before the
+    // injected fsync failure, never a transient live row or a buffered failed record.
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal).expect("recover prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert!(durable_ids(&recovered, "product_fsync").is_empty());
+
+    recovered
+        .execute_text(71_001, "INSERT INTO product_fsync VALUES (1)")
+        .expect("the same unacknowledged transaction identity retries cleanly");
+    drop(recovered);
+    let reopened =
+        Engine::open_durable_wal_segment_auto(&fixture.wal).expect("recover acknowledged retry");
+    assert_eq!(durable_ids(&reopened, "product_fsync"), vec![1]);
+}
+
+#[test]
+fn product_001_post_durable_transaction_apply_failure_wedges_live_and_recovers_once() {
+    let fixture = DurableFixture::new("post-durable");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(
+            72_000,
+            "CREATE TABLE product_indeterminate (id INT PRIMARY KEY, value INT)",
+        )
+        .expect("durable fixture DDL");
+    engine
+        .submit_transaction(72_001, parsed("BEGIN"))
+        .expect("begin explicit transaction");
+    engine
+        .submit_transaction(
+            72_001,
+            parsed("INSERT INTO product_indeterminate VALUES (1, 10)"),
+        )
+        .expect("stage explicit write");
+    engine.fail_next_transaction_post_durable_apply();
+    let failure = engine
+        .submit_transaction(72_001, parsed("COMMIT"))
+        .expect_err("post-durable apply fault must be indeterminate");
+    assert!(
+        failure.is_indeterminate(),
+        "expected indeterminate failure: {failure}"
+    );
+    assert!(engine.is_commit_path_poisoned());
+    assert!(
+        engine
+            .execute_text(72_002, "INSERT INTO product_indeterminate VALUES (2, 20)")
+            .is_err(),
+        "a post-durable live engine must fail closed until restart recovery"
+    );
+
+    // The durable record owns the outcome: replay installs the explicit commit exactly once,
+    // clears the live wedge, and the recovered canonical WAL remains appendable.
+    drop(engine);
+    let recovered =
+        Engine::open_durable_wal_segment_auto(&fixture.wal).expect("recover indeterminate commit");
+    assert_eq!(durable_ids(&recovered, "product_indeterminate"), vec![1]);
+    let recovered_records = recovered.durable_wal_records();
+    let committed = recovered_records
+        .iter()
+        .find(|record| record.txn_id == 72_001)
+        .expect("post-durable explicit transaction remains in canonical WAL");
+    let request_digest = gpu_db_wal::canonical_request_digest(&operation_payload(committed));
+    assert_eq!(
+        recovered
+            .commit_state()
+            .resolve_transaction_retry_digest_outcome(72_001, request_digest)
+            .expect("recovery indexes the durable transaction retry outcome")
+            .expect("matching retry digest resolves")
+            .1,
+        1,
+        "the recovered terminal outcome reports one applied user row"
+    );
+    let records_before_second_reopen = recovered_records.len();
+    drop(recovered);
+    let recovered_again =
+        Engine::open_durable_wal_segment_auto(&fixture.wal).expect("repeat recovery is exact");
+    assert_eq!(
+        recovered_again.durable_wal_records().len(),
+        records_before_second_reopen,
+        "a second reopen must not append or duplicate the recovered explicit transaction"
+    );
+    assert_eq!(
+        durable_ids(&recovered_again, "product_indeterminate"),
+        vec![1]
+    );
+    recovered_again
+        .execute_text(72_002, "INSERT INTO product_indeterminate VALUES (2, 20)")
+        .expect("recovered engine continues appending");
+    drop(recovered_again);
+    let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("second recovery after continued append");
+    assert_eq!(durable_ids(&reopened, "product_indeterminate"), vec![1, 2]);
+    assert_eq!(
+        reopened.durable_wal_records().len(),
+        records_before_second_reopen + 1,
+        "only the acknowledged post-recovery append extends the canonical WAL"
+    );
+}
+
 #[test]
 fn literal_legacy_sql_and_typed_prefixes_cross_the_index_identity_boundary_once() {
     const LEGACY_TABLE: &[u8] = br#"{"CreateTable":{"table":"mixed_index_codec","columns":[{"name":"id","ty":"Int4","domain":null,"default":null},{"name":"code","ty":"Int4","domain":null,"default":null}],"primary_key":null,"unique_constraints":[],"check_constraints":[]}}"#;

@@ -307,6 +307,22 @@ impl ExecuteError {
     pub fn is_unique_violation(&self) -> bool {
         matches!(self, Self::Engine(EngineError::UniqueViolation(_)))
     }
+
+    pub fn is_not_null_violation(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::NotNullViolation(_)))
+    }
+
+    pub fn is_foreign_key_violation(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::ForeignKeyViolation(_)))
+    }
+
+    pub fn is_check_violation(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::CheckViolation(_)))
+    }
+
+    pub fn is_numeric_value_out_of_range(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::NumericValueOutOfRange(_)))
+    }
 }
 
 impl ExecuteError {

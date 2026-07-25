@@ -2,11 +2,14 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 import psycopg
 from psycopg import errors
-from psycopg.types.numeric import Int4
+from psycopg.types.numeric import Int2, Int4, Int8
 from psycopg_pool import ConnectionPool
 
 
@@ -108,6 +111,65 @@ def main(repo_root: Path) -> None:
                     prepare=True,
                 )
                 assert cur.fetchall() == []
+
+            conn.execute(
+                """
+                CREATE TABLE psycopg_all_types (
+                    row_id INT PRIMARY KEY, i2 SMALLINT, i4 INT, i8 BIGINT, amount NUMERIC(12,4),
+                    flag BOOL, note TEXT, day DATE, created_at TIMESTAMP, ident UUID
+                )
+                """
+            )
+            native_values = (
+                Int4(1), Int2(-7), Int4(42), Int8(-9), Decimal("12345.6700"), True, "Grüße",
+                date(1999, 12, 31), datetime(2000, 1, 1, 0, 0, 1, 234567),
+                UUID("550e8400-e29b-41d4-a716-446655440000"),
+            )
+            conn.execute(
+                "INSERT INTO psycopg_all_types VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                native_values,
+                prepare=True,
+            )
+            conn.execute(
+                "INSERT INTO psycopg_all_types VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (Int4(2), None, None, None, None, None, None, None, None, None),
+                prepare=True,
+            )
+            all_types = conn.execute(
+                "SELECT i2, i4, i8, amount, flag, note, day, created_at, ident "
+                "FROM psycopg_all_types WHERE row_id = %s::int4",
+                (Int4(1),),
+                prepare=True,
+            ).fetchone()
+            assert all_types == native_values[1:]
+            typed_nulls = conn.execute(
+                "SELECT i2, i4, i8, amount, flag, note, day, created_at, ident "
+                "FROM psycopg_all_types WHERE row_id = %s::int4",
+                (Int4(2),),
+                prepare=True,
+            ).fetchone()
+            assert typed_nulls == (None,) * 9
+
+            conn.execute("CREATE TABLE psycopg_fk_parent (id INT PRIMARY KEY)")
+            conn.execute("CREATE TABLE psycopg_fk_child (id INT PRIMARY KEY, parent_id INT)")
+            conn.execute(
+                "ALTER TABLE ONLY psycopg_fk_child ADD CONSTRAINT psycopg_fk_child_parent_fk "
+                "FOREIGN KEY (parent_id) REFERENCES psycopg_fk_parent(id)"
+            )
+            conn.execute("INSERT INTO psycopg_fk_parent VALUES (1)")
+            conn.execute("BEGIN")
+            try:
+                conn.execute("INSERT INTO psycopg_fk_child VALUES (1, 999)")
+                raise AssertionError("foreign-key violation unexpectedly succeeded")
+            except errors.ForeignKeyViolation as error:
+                assert error.sqlstate == "23503"
+            try:
+                conn.execute("SELECT 1")
+                raise AssertionError("foreign-key failure did not abort the explicit transaction")
+            except errors.InFailedSqlTransaction as error:
+                assert error.sqlstate == "25P02"
+            conn.execute("ROLLBACK")
+            conn.execute("INSERT INTO psycopg_fk_child VALUES (1, 1)")
 
             try:
                 conn.execute(

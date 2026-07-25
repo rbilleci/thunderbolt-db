@@ -1277,30 +1277,12 @@ fn validate_bind_shape(
 }
 
 fn validate_result_formats(columns: &[ColumnMeta], formats: &[i16]) -> Result<(), ExtendedError> {
-    for (index, column) in columns.iter().enumerate() {
+    for (index, _column) in columns.iter().enumerate() {
         let format = format_at(formats, index);
         if !matches!(format, 0 | 1) {
             return Err(ExtendedError::new(
                 "22023",
                 format!("unsupported result format code {format}"),
-            ));
-        }
-        if format == 1
-            && !matches!(
-                column.logical_type,
-                LogicalType::Int2
-                    | LogicalType::Int4
-                    | LogicalType::Int8
-                    | LogicalType::Text
-                    | LogicalType::Uuid
-            )
-        {
-            return Err(ExtendedError::new(
-                "0A000",
-                format!(
-                    "binary result encoding is not implemented for {:?}",
-                    column.logical_type
-                ),
             ));
         }
     }
@@ -1319,6 +1301,7 @@ fn codec_error(error: pg_adapter::PgValueCodecError, kind: &str) -> ExtendedErro
     let code = match &error {
         pg_adapter::PgValueCodecError::InvalidValue { format: 1, .. } => "22P03",
         pg_adapter::PgValueCodecError::InvalidValue { .. } => "22P02",
+        pg_adapter::PgValueCodecError::NumericValueOutOfRange { .. } => "22003",
         pg_adapter::PgValueCodecError::UnsupportedFormat(_) => "22023",
         _ => "0A000",
     };
@@ -1334,6 +1317,10 @@ fn backend_columns(columns: &[ColumnMeta]) -> Vec<BackendColumn> {
                 pg_adapter::logical_type_oid(column.logical_type),
                 pg_adapter::logical_type_size(column.logical_type),
             )
+            .with_type_modifier(pg_adapter::logical_type_typmod(
+                column.logical_type,
+                column.numeric_typmod,
+            ))
         })
         .collect()
 }

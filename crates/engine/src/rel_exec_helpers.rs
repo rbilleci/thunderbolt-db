@@ -67,7 +67,7 @@ pub(crate) fn coerce_insert_value(
     if let (SqlValue::Int4(v), SqlType::Int2) = (&value, ty) {
         return i16::try_from(*v)
             .map(SqlValue::Int2)
-            .map_err(|_| EngineError::ApplyFailed("smallint out of range".to_string()));
+            .map_err(|_| EngineError::NumericValueOutOfRange("smallint out of range".to_string()));
     }
 
     // A string literal assigned to a date/timestamp column is parsed as that type (PG coerces an
@@ -112,11 +112,11 @@ pub(crate) fn coerce_insert_value(
     }
     match (value, ty) {
         (SqlValue::Numeric(decimal), SqlType::Numeric { precision, scale }) => {
-            let rescaled = decimal
-                .rescale(scale)
-                .map_err(|_| EngineError::ApplyFailed("numeric field overflow".to_string()))?;
+            let rescaled = decimal.rescale(scale).map_err(|_| {
+                EngineError::NumericValueOutOfRange("numeric field overflow".to_string())
+            })?;
             if numeric_exceeds_precision(rescaled.mantissa, precision) {
-                return Err(EngineError::ApplyFailed(
+                return Err(EngineError::NumericValueOutOfRange(
                     "numeric field overflow".to_string(),
                 ));
             }

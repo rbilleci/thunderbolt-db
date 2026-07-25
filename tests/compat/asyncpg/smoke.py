@@ -3,7 +3,10 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 import asyncpg
 
@@ -100,6 +103,53 @@ async def main(repo_root: Path) -> None:
 
         empty_rows = await statement.fetch(99)
         assert empty_rows == []
+
+        await conn.execute(
+            """
+            CREATE TABLE asyncpg_all_types (
+                row_id INT PRIMARY KEY, i2 SMALLINT, i4 INT, i8 BIGINT, amount NUMERIC(12,4),
+                flag BOOL, note TEXT, day DATE, created_at TIMESTAMP, ident UUID
+            )
+            """
+        )
+        native_values = (
+            1, -7, 42, -9, Decimal("12345.6700"), True, "Grüße",
+            date(1999, 12, 31), datetime(2000, 1, 1, 0, 0, 1, 234567),
+            UUID("550e8400-e29b-41d4-a716-446655440000"),
+        )
+        await conn.execute(
+            "INSERT INTO asyncpg_all_types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            *native_values,
+        )
+        await conn.execute(
+            "INSERT INTO asyncpg_all_types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            2, None, None, None, None, None, None, None, None, None,
+        )
+        all_types = await conn.fetchrow(
+            "SELECT i2, i4, i8, amount, flag, note, day, created_at, ident "
+            "FROM asyncpg_all_types WHERE row_id = 1"
+        )
+        assert tuple(all_types.values()) == native_values[1:]
+        typed_nulls = await conn.fetchrow(
+            "SELECT i2, i4, i8, amount, flag, note, day, created_at, ident "
+            "FROM asyncpg_all_types WHERE row_id = 2"
+        )
+        assert tuple(typed_nulls.values()) == (None,) * 9
+
+        await conn.execute("CREATE TABLE asyncpg_not_null_contract (id INT PRIMARY KEY)")
+        await conn.execute("BEGIN")
+        try:
+            await conn.execute("INSERT INTO asyncpg_not_null_contract VALUES ($1)", None)
+            raise AssertionError("PRIMARY KEY NULL unexpectedly succeeded")
+        except asyncpg.PostgresError as error:
+            assert error.sqlstate == "23502"
+        try:
+            await conn.fetchval("SELECT 1")
+            raise AssertionError("constraint failure did not abort the explicit transaction")
+        except asyncpg.PostgresError as error:
+            assert error.sqlstate == "25P02"
+        await conn.execute("ROLLBACK")
+        await conn.execute("INSERT INTO asyncpg_not_null_contract VALUES ($1)", 1)
 
         try:
             await conn.execute("COPY asyncpg_people FROM STDIN WITH CSV HEADER DELIMITER ','")

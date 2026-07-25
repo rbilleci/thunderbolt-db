@@ -90,6 +90,140 @@ fn parse_bind_and_describe_are_effect_free_and_catalog_typed() {
 }
 
 #[test]
+fn describe_emits_canonical_oids_sizes_and_numeric_typmod_for_all_logical_types() {
+    let engine = SharedEngine::new();
+    let mut session = engine.open_session();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE numeric_metadata (\
+             i2 INT2, i4 INT4, i8 INT8, amount NUMERIC(12,4), active BOOL, note TEXT,\
+             day DATE, created_at TIMESTAMP, ident UUID\
+         )",
+    )
+    .unwrap();
+    let mut extended = ExtendedSession::default();
+    extended
+        .parse(
+            "numeric_lookup".to_string(),
+            "SELECT i2, i4, i8, amount, active, note, day, created_at, ident FROM numeric_metadata",
+            &[],
+            |sql, hints| engine.prepare_statement(&session, sql, hints),
+        )
+        .unwrap();
+    assert_eq!(
+        extended.statements["numeric_lookup"].columns,
+        vec![
+            ColumnMeta {
+                name: "i2".to_string(),
+                logical_type: LogicalType::Int2,
+                numeric_typmod: None
+            },
+            ColumnMeta {
+                name: "i4".to_string(),
+                logical_type: LogicalType::Int4,
+                numeric_typmod: None
+            },
+            ColumnMeta {
+                name: "i8".to_string(),
+                logical_type: LogicalType::Int8,
+                numeric_typmod: None
+            },
+            ColumnMeta {
+                name: "amount".to_string(),
+                logical_type: LogicalType::Numeric,
+                numeric_typmod: Some((12, 4))
+            },
+            ColumnMeta {
+                name: "active".to_string(),
+                logical_type: LogicalType::Bool,
+                numeric_typmod: None
+            },
+            ColumnMeta {
+                name: "note".to_string(),
+                logical_type: LogicalType::Text,
+                numeric_typmod: None
+            },
+            ColumnMeta {
+                name: "day".to_string(),
+                logical_type: LogicalType::Date,
+                numeric_typmod: None
+            },
+            ColumnMeta {
+                name: "created_at".to_string(),
+                logical_type: LogicalType::Timestamp,
+                numeric_typmod: None
+            },
+            ColumnMeta {
+                name: "ident".to_string(),
+                logical_type: LogicalType::Uuid,
+                numeric_typmod: None
+            },
+        ],
+        "Parse retains the facade's full typed result description before wire encoding"
+    );
+    let description = extended
+        .describe(
+            DescribeTarget::Statement,
+            "numeric_lookup",
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap();
+    let tags = message_tags(&description);
+    let row_description = message_payloads(&description)
+        .into_iter()
+        .zip(tags)
+        .find_map(|(payload, tag)| (tag == b'T').then_some(payload))
+        .expect("Describe statement must emit a RowDescription");
+    let field_count = i16::from_be_bytes(row_description[..2].try_into().unwrap());
+    assert_eq!(field_count, 9);
+    let mut offset = 2;
+    let mut actual = Vec::new();
+    for _ in 0..field_count {
+        let name_end = row_description[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|length| offset + length)
+            .expect("column-name terminator");
+        let name = std::str::from_utf8(&row_description[offset..name_end])
+            .unwrap()
+            .to_string();
+        offset = name_end + 1;
+        let table_oid = u32::from_be_bytes(row_description[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let attribute_number =
+            i16::from_be_bytes(row_description[offset..offset + 2].try_into().unwrap());
+        offset += 2;
+        let oid = u32::from_be_bytes(row_description[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let type_size = i16::from_be_bytes(row_description[offset..offset + 2].try_into().unwrap());
+        offset += 2;
+        let typmod = i32::from_be_bytes(row_description[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let format = i16::from_be_bytes(row_description[offset..offset + 2].try_into().unwrap());
+        offset += 2;
+        assert_eq!((table_oid, attribute_number, format), (0, 0, 0));
+        actual.push((name, oid, type_size, typmod));
+    }
+    assert_eq!(offset, row_description.len());
+    assert_eq!(
+        actual,
+        vec![
+            ("i2".to_string(), 21, 2, -1),
+            ("i4".to_string(), 23, 4, -1),
+            ("i8".to_string(), 20, 8, -1),
+            ("amount".to_string(), 1700, -1, 786_440),
+            ("active".to_string(), 16, 1, -1),
+            ("note".to_string(), 25, -1, -1),
+            ("day".to_string(), 1082, 4, -1),
+            ("created_at".to_string(), 1114, 8, -1),
+            ("ident".to_string(), 2950, 16, -1),
+        ],
+        "Describe must emit canonical PostgreSQL OIDs/type sizes, including numeric typmod"
+    );
+}
+
+#[test]
 fn parse_and_describe_follow_only_the_session_private_catalog() {
     let engine = SharedEngine::new();
     let mut creator = engine.open_session();
@@ -917,6 +1051,7 @@ fn execute_chunks_a_cached_result_and_never_requests_reexecution() {
                 columns: vec![ColumnMeta {
                     name: "id".to_string(),
                     logical_type: LogicalType::Int4,
+                    numeric_typmod: None,
                 }],
                 rows: vec![
                     vec![DbValue::Int4(1)],
@@ -946,6 +1081,7 @@ fn execute_chunks_a_cached_result_and_never_requests_reexecution() {
                 columns: vec![ColumnMeta {
                     name: "id".to_string(),
                     logical_type: LogicalType::Int4,
+                    numeric_typmod: None,
                 }],
                 rows: vec![vec![DbValue::Int4(1)], vec![DbValue::Int4(2)]],
             }),
@@ -961,7 +1097,7 @@ fn execute_chunks_a_cached_result_and_never_requests_reexecution() {
 }
 
 #[test]
-fn bind_rejects_unsupported_binary_results_after_supported_parameters() {
+fn bind_accepts_binary_bool_results_after_supported_parameters() {
     let engine = SharedEngine::new();
     let mut session = engine.open_session();
     submit_text(
@@ -980,19 +1116,20 @@ fn bind_rejects_unsupported_binary_results_after_supported_parameters() {
         )
         .unwrap();
     assert_eq!(
-        extended
-            .bind(
-                "portal".to_string(),
-                "insert_note",
-                &[],
-                &[Some(b"1".to_vec())],
-                &[1],
-            )
-            .unwrap_err()
-            .code,
-        "0A000"
+        message_tags(
+            &extended
+                .bind(
+                    "portal".to_string(),
+                    "insert_note",
+                    &[],
+                    &[Some(b"1".to_vec())],
+                    &[1],
+                )
+                .unwrap(),
+        ),
+        vec![b'2']
     );
-    assert!(extended.execution_request("portal").is_err());
+    assert!(extended.execution_request("portal").is_ok());
 }
 
 #[test]
@@ -1001,21 +1138,23 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
     let mut session = engine.open_session();
     submit_text(&engine, &mut session, "CREATE TABLE codec_rows (id int4)").unwrap();
     let mut extended = ExtendedSession::default();
-    extended
-        .parse("int_arg".to_string(), "BEGIN", &[23], |sql, hints| {
-            engine.prepare_statement(&session, sql, hints)
-        })
-        .unwrap();
-    extended
-        .parse("uuid_arg".to_string(), "BEGIN", &[2950], |sql, hints| {
-            engine.prepare_statement(&session, sql, hints)
-        })
-        .unwrap();
-    extended
-        .parse("text_arg".to_string(), "BEGIN", &[25], |sql, hints| {
-            engine.prepare_statement(&session, sql, hints)
-        })
-        .unwrap();
+    for (statement, oid) in [
+        ("int2_arg", 21),
+        ("int4_arg", 23),
+        ("int8_arg", 20),
+        ("numeric_arg", 1700),
+        ("bool_arg", 16),
+        ("text_arg", 25),
+        ("date_arg", 1082),
+        ("timestamp_arg", 1114),
+        ("uuid_arg", 2950),
+    ] {
+        extended
+            .parse(statement.to_string(), "BEGIN", &[oid], |sql, hints| {
+                engine.prepare_statement(&session, sql, hints)
+            })
+            .unwrap();
+    }
     extended
         .parse(
             "rows".to_string(),
@@ -1025,26 +1164,155 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
         )
         .unwrap();
 
-    for (portal, statement, formats, values, expected) in [
+    // Each facade logical type is exercised at the server codec boundary. Fixed-width values
+    // use a deliberately short binary payload; variable-width NUMERIC/TEXT use malformed wire
+    // shapes (short header / invalid UTF-8) because arbitrary payload widths are otherwise valid.
+    for (portal, statement, formats, values, expected) in vec![
         (
             "unsupported",
-            "int_arg",
+            "int4_arg",
             vec![2],
             vec![Some(b"7".to_vec())],
             "22023",
         ),
         (
-            "bad_text",
-            "int_arg",
+            "bad_int2_text",
+            "int2_arg",
             vec![0],
-            vec![Some(b"not-an-int".to_vec())],
+            vec![Some(b"int2?".to_vec())],
             "22P02",
         ),
         (
-            "bad_int_binary",
-            "int_arg",
+            "bad_int4_text",
+            "int4_arg",
+            vec![0],
+            vec![Some(b"int4?".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_int8_text",
+            "int8_arg",
+            vec![0],
+            vec![Some(b"int8?".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_numeric_text",
+            "numeric_arg",
+            vec![0],
+            vec![Some(b"numeric?".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_numeric_nondecimal_separator",
+            "numeric_arg",
+            vec![0],
+            vec![Some(b"0x__2".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_bool_text",
+            "bool_arg",
+            vec![0],
+            vec![Some(b"maybe".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_text_utf8",
+            "text_arg",
+            vec![0],
+            vec![Some(vec![0xff])],
+            "22P02",
+        ),
+        (
+            "bad_date_text",
+            "date_arg",
+            vec![0],
+            vec![Some(b"date?".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_timestamp_text",
+            "timestamp_arg",
+            vec![0],
+            vec![Some(b"timestamp?".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_uuid_text",
+            "uuid_arg",
+            vec![0],
+            vec![Some(b"uuid?".to_vec())],
+            "22P02",
+        ),
+        (
+            "bad_int2_binary",
+            "int2_arg",
             vec![1],
-            vec![Some(vec![0, 1, 2])],
+            vec![Some(vec![0])],
+            "22P03",
+        ),
+        (
+            "bad_int4_binary",
+            "int4_arg",
+            vec![1],
+            vec![Some(vec![0; 3])],
+            "22P03",
+        ),
+        (
+            "bad_int8_binary",
+            "int8_arg",
+            vec![1],
+            vec![Some(vec![0; 7])],
+            "22P03",
+        ),
+        (
+            "bad_numeric_binary",
+            "numeric_arg",
+            vec![1],
+            vec![Some(vec![0; 7])],
+            "22P03",
+        ),
+        (
+            "bad_numeric_dscale_reserved",
+            "numeric_arg",
+            vec![1],
+            vec![Some(vec![0, 0, 0, 0, 0, 0, 0x40, 0])],
+            "22P03",
+        ),
+        (
+            "numeric_dscale_out_of_range",
+            "numeric_arg",
+            vec![1],
+            vec![Some(vec![0, 0, 0, 0, 0, 0, 1, 0])],
+            "22003",
+        ),
+        (
+            "bad_bool_binary",
+            "bool_arg",
+            vec![1],
+            vec![Some(vec![])],
+            "22P03",
+        ),
+        (
+            "bad_text_binary",
+            "text_arg",
+            vec![1],
+            vec![Some(vec![0xff])],
+            "22P03",
+        ),
+        (
+            "bad_date_binary",
+            "date_arg",
+            vec![1],
+            vec![Some(vec![0; 3])],
+            "22P03",
+        ),
+        (
+            "bad_timestamp_binary",
+            "timestamp_arg",
+            vec![1],
+            vec![Some(vec![0; 7])],
             "22P03",
         ),
         (
@@ -1053,13 +1321,6 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
             vec![1],
             vec![Some(vec![0; 15])],
             "22P03",
-        ),
-        (
-            "bad_text_utf8",
-            "text_arg",
-            vec![0],
-            vec![Some(vec![0xff])],
-            "22P02",
         ),
         (
             "bad_text_binary_utf8",
@@ -1091,6 +1352,48 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
             expected
         );
     }
+    for (portal, value) in [
+        ("numeric_hex", b"0x2a".as_slice()),
+        ("numeric_decimal_underscores", b"1_500.25_00".as_slice()),
+        ("numeric_exponent_underscores", b"1e1_0".as_slice()),
+    ] {
+        assert!(
+            extended
+                .bind(
+                    portal.to_string(),
+                    "numeric_arg",
+                    &[0],
+                    &[Some(value.to_vec())],
+                    &[],
+                )
+                .is_ok(),
+            "server bind accepts PG16 finite NUMERIC text {value:?}"
+        );
+    }
+    for (portal, statement, value) in [
+        ("int2_range", "int2_arg", b"0x8_000".as_slice()),
+        ("int4_range", "int4_arg", b"0o2_000_000_0000".as_slice()),
+        (
+            "int8_range",
+            "int8_arg",
+            b"0x8000_0000_0000_0000".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            extended
+                .bind(
+                    portal.to_string(),
+                    statement,
+                    &[0],
+                    &[Some(value.to_vec())],
+                    &[]
+                )
+                .unwrap_err()
+                .code,
+            "22003",
+            "well-formed {statement} text outside its signed range must not become 22P02"
+        );
+    }
     assert_eq!(
         extended
             .bind("bad_result_count".to_string(), "rows", &[], &[], &[0, 0])
@@ -1102,7 +1405,7 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
         extended
             .bind(
                 "bad_binary_before_result_count".to_string(),
-                "int_arg",
+                "int4_arg",
                 &[1],
                 &[Some(vec![0, 1, 2])],
                 &[0, 0],
@@ -1186,6 +1489,81 @@ fn ddl_changed_returning_type_fails_before_the_prepared_write() {
     assert!(
         rows.is_empty(),
         "the rejected prepared write must be effect-free"
+    );
+}
+
+#[test]
+fn ddl_changed_numeric_typmod_rejects_stale_statement_and_portal_before_execution() {
+    let engine = SharedEngine::new();
+    let mut session = engine.open_session();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE prepared_numeric_shape (amount NUMERIC(12,2))",
+    )
+    .unwrap();
+    let mut extended = ExtendedSession::default();
+    extended
+        .parse(
+            "stale_numeric_insert".to_string(),
+            "INSERT INTO prepared_numeric_shape VALUES ($1) RETURNING amount",
+            &[],
+            |sql, hints| engine.prepare_statement(&session, sql, hints),
+        )
+        .unwrap();
+    extended
+        .bind(
+            "stale_numeric_portal".to_string(),
+            "stale_numeric_insert",
+            &[],
+            &[Some(b"1.00".to_vec())],
+            &[1],
+        )
+        .unwrap();
+
+    submit_text(&engine, &mut session, "DROP TABLE prepared_numeric_shape").unwrap();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE prepared_numeric_shape (amount NUMERIC(12,3))",
+    )
+    .unwrap();
+
+    for (target, name) in [
+        (DescribeTarget::Statement, "stale_numeric_insert"),
+        (DescribeTarget::Portal, "stale_numeric_portal"),
+    ] {
+        let error = extended
+            .describe_revalidated(
+                &engine,
+                &session,
+                target,
+                name,
+                SessionTransactionStatus::Idle,
+            )
+            .expect_err("a changed NUMERIC typmod must invalidate cached metadata");
+        assert_eq!(error.code, "0A000");
+    }
+
+    // The portal's immutable bound description is rechecked before engine admission, so a
+    // typmod-only schema change cannot mutate the replacement relation under stale metadata.
+    let request = extended
+        .execution_request("stale_numeric_portal")
+        .unwrap()
+        .unwrap();
+    let error = submit_prepared(&engine, &mut session, request.query_bound()).unwrap_err();
+    assert_eq!(error.category, gpu_db_facade::ErrorCategory::Unsupported);
+    let QueryOutcome::Rows { rows, .. } = submit_text(
+        &engine,
+        &mut session,
+        "SELECT amount FROM prepared_numeric_shape",
+    )
+    .unwrap() else {
+        panic!("SELECT must return rows");
+    };
+    assert!(
+        rows.is_empty(),
+        "stale portal must fail before write admission"
     );
 }
 

@@ -41,10 +41,13 @@ tokio = { version = "1", features = [
 ] }
 
 [dev-dependencies]
-tokio-postgres = "0.7"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"
 bytes = "1"
 futures-util = "0.3"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "chrono", "uuid", "bigdecimal"] }
+bigdecimal = "0.4"
 # For the GPU-retained benchmark example only: it builds + warms an Engine to GPU residency,
 # then serves it through the façade. The library itself never depends on the engine directly.
 gpu_db_engine = { path = "../engine" }

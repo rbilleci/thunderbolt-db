@@ -93,6 +93,12 @@ function connectionConfig(port, applicationName) {
   };
 }
 
+function localIsoTimestamp(value) {
+  const pad = (part, width = 2) => String(part).padStart(width, '0');
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`
+    + `T${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}.${pad(value.getMilliseconds(), 3)}Z`;
+}
+
 async function main() {
   const server = await startServer();
   try {
@@ -124,6 +130,81 @@ async function main() {
       values: [99],
     });
     assert.deepEqual(empty.rows, []);
+
+    await client.query(`
+      CREATE TABLE node_all_types (
+        row_id INT PRIMARY KEY, i2 SMALLINT, i4 INT, i8 BIGINT, amount NUMERIC(12,4),
+        flag BOOL, note TEXT, day DATE, created_at TIMESTAMP, ident UUID
+      )
+    `);
+    const day = '1999-12-31';
+    // node-postgres has no date-only/timestamp-without-time-zone native value; its normal
+    // PostgreSQL representation for those columns is their ISO text form.
+    const createdAt = '2000-01-01 00:00:01.234567';
+    const ident = '550e8400-e29b-41d4-a716-446655440000';
+    await client.query({
+      name: 'node_all_types_insert',
+      text: 'INSERT INTO node_all_types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+      values: [1, -7, 42, '-9', '12345.6700', true, 'Grüße', day, createdAt, ident],
+    });
+    await client.query({
+      name: 'node_all_types_insert',
+      text: 'INSERT INTO node_all_types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+      values: [2, null, null, null, null, null, null, null, null, null],
+    });
+    const allTypes = await client.query(
+      'SELECT i2, i4, i8, amount, flag, note, day, created_at, ident FROM node_all_types WHERE row_id = $1',
+      [1],
+    );
+    assert.deepEqual(
+      {
+        i2: allTypes.rows[0].i2,
+        i4: allTypes.rows[0].i4,
+        i8: allTypes.rows[0].i8,
+        amount: allTypes.rows[0].amount,
+        flag: allTypes.rows[0].flag,
+        note: allTypes.rows[0].note,
+        day: localIsoTimestamp(allTypes.rows[0].day).slice(0, 10),
+        createdAt: localIsoTimestamp(allTypes.rows[0].created_at),
+        ident: allTypes.rows[0].ident,
+      },
+      {
+        i2: -7,
+        i4: 42,
+        i8: '-9',
+        amount: '12345.6700',
+        flag: true,
+        note: 'Grüße',
+        day,
+        createdAt: '2000-01-01T00:00:01.234Z',
+        ident,
+      },
+    );
+    const typedNulls = await client.query(
+      'SELECT i2, i4, i8, amount, flag, note, day, created_at, ident FROM node_all_types WHERE row_id = $1',
+      [2],
+    );
+    assert.ok(Object.values(typedNulls.rows[0]).every((value) => value === null));
+
+    await client.query(`
+      CREATE TABLE node_check_contract (
+        id INT PRIMARY KEY, amount NUMERIC(4,2),
+        CONSTRAINT node_check_positive CHECK (amount > 0.00)
+      )
+    `);
+    await client.query('BEGIN');
+    await assert.rejects(
+      () => client.query('INSERT INTO node_check_contract VALUES ($1, $2)', [1, '-1.00']),
+      (error) => error.code === '23514',
+      'CHECK violation must preserve SQLSTATE 23514',
+    );
+    await assert.rejects(
+      () => client.query('SELECT 1'),
+      (error) => error.code === '25P02',
+      'CHECK failure must abort the explicit transaction',
+    );
+    await client.query('ROLLBACK');
+    await client.query('INSERT INTO node_check_contract VALUES ($1, $2)', [1, '1.00']);
 
     await assert.rejects(
       () => client.query("COPY node_people FROM STDIN WITH CSV HEADER DELIMITER ','"),

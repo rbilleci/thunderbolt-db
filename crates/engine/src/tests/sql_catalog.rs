@@ -292,6 +292,14 @@ fn engine_answers_pg_attribute_pg_type_and_information_schema() {
             vec![SqlValue::Text("name".to_string()), SqlValue::Int4(25)],
         ]
     );
+    assert_eq!(
+        run(
+            &e,
+            "SELECT atttypmod FROM pg_attribute WHERE attname = 'bal'"
+        ),
+        vec![vec![SqlValue::Int4(655_366)]],
+        "pg_attribute must retain NUMERIC(10,2)'s PostgreSQL typmod"
+    );
     // pg_type: the fixed base types (pg_type spells them int8, not bigint).
     assert_eq!(
         run(

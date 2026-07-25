@@ -296,6 +296,7 @@ mod tests {
                     columns: vec![ColumnMeta {
                         name: "one".to_string(),
                         logical_type: LogicalType::Int4,
+                        numeric_typmod: None,
                     }],
                     rows: vec![vec![DbValue::Int4(1)]],
                 },

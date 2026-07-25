@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -152,6 +154,103 @@ func main() {
 		panic("empty result query unexpectedly returned a row")
 	}
 	if err := rows.Err(); err != nil {
+		panic(err)
+	}
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE pgx_all_types (
+			row_id INT PRIMARY KEY, i2 SMALLINT, i4 INT, i8 BIGINT, amount NUMERIC(12,4),
+			flag BOOL, note TEXT, day DATE, created_at TIMESTAMP, ident UUID
+		)`)
+	if err != nil {
+		panic(err)
+	}
+	numeric := pgtype.Numeric{Int: big.NewInt(123456700), Exp: -4, Valid: true}
+	day := time.Date(1999, time.December, 31, 0, 0, 0, 0, time.UTC)
+	createdAt := time.Date(2000, time.January, 1, 0, 0, 1, 234567000, time.UTC)
+	ident := pgtype.UUID{Bytes: [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}, Valid: true}
+	_, err = conn.Exec(ctx,
+		"INSERT INTO pgx_all_types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+		int32(1), int16(-7), int32(42), int64(-9), numeric, true, "Grüße", day, createdAt, ident)
+	if err != nil {
+		panic(err)
+	}
+	_, err = conn.Exec(ctx,
+		"INSERT INTO pgx_all_types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+		int32(2), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	var gotI2 int16
+	var gotI4 int32
+	var gotI8 int64
+	var gotNumeric pgtype.Numeric
+	var gotBool bool
+	var gotText string
+	var gotDay time.Time
+	var gotTimestamp time.Time
+	var gotUUID pgtype.UUID
+	err = conn.QueryRow(ctx,
+		"SELECT i2, i4, i8, amount, flag, note, day, created_at, ident FROM pgx_all_types WHERE row_id = $1",
+		int32(1)).Scan(&gotI2, &gotI4, &gotI8, &gotNumeric, &gotBool, &gotText, &gotDay, &gotTimestamp, &gotUUID)
+	if err != nil {
+		panic(err)
+	}
+	requireEqual(gotI2, int16(-7), "all-types int2")
+	requireEqual(gotI4, int32(42), "all-types int4")
+	requireEqual(gotI8, int64(-9), "all-types int8")
+	requireEqual(gotNumeric.Valid, true, "all-types numeric validity")
+	requireEqual(gotNumeric.Exp, numeric.Exp, "all-types numeric scale")
+	requireEqual(gotNumeric.Int.Cmp(numeric.Int), 0, "all-types numeric value")
+	requireEqual(gotBool, true, "all-types bool")
+	requireEqual(gotText, "Grüße", "all-types text")
+	requireEqual(gotDay, day, "all-types date")
+	requireEqual(gotTimestamp, createdAt, "all-types timestamp")
+	requireEqual(gotUUID, ident, "all-types uuid")
+	var nullI2 *int16
+	var nullI4 *int32
+	var nullI8 *int64
+	var nullNumeric *pgtype.Numeric
+	var nullBool *bool
+	var nullText *string
+	var nullDay *time.Time
+	var nullTimestamp *time.Time
+	var nullUUID *pgtype.UUID
+	err = conn.QueryRow(ctx,
+		"SELECT i2, i4, i8, amount, flag, note, day, created_at, ident FROM pgx_all_types WHERE row_id = $1",
+		int32(2)).Scan(&nullI2, &nullI4, &nullI8, &nullNumeric, &nullBool, &nullText, &nullDay, &nullTimestamp, &nullUUID)
+	if err != nil {
+		panic(err)
+	}
+	if nullI2 != nil || nullI4 != nil || nullI8 != nil || nullNumeric != nil || nullBool != nil || nullText != nil || nullDay != nil || nullTimestamp != nil || nullUUID != nil {
+		panic("typed NULL row did not decode to nil driver values")
+	}
+
+	_, err = conn.Exec(ctx, "CREATE TABLE pgx_not_null_contract (id INT PRIMARY KEY)")
+	if err != nil {
+		panic(err)
+	}
+	_, err = conn.Exec(ctx, "BEGIN")
+	if err != nil {
+		panic(err)
+	}
+	_, err = conn.Exec(ctx, "INSERT INTO pgx_not_null_contract VALUES ($1)", nil)
+	var notNullErr *pgconn.PgError
+	if !errors.As(err, &notNullErr) || notNullErr.Code != "23502" {
+		panic(fmt.Sprintf("PRIMARY KEY NULL returned %T %[1]v, want SQLSTATE 23502", err))
+	}
+	var ignored int32
+	err = conn.QueryRow(ctx, "SELECT 1").Scan(&ignored)
+	var abortedErr *pgconn.PgError
+	if !errors.As(err, &abortedErr) || abortedErr.Code != "25P02" {
+		panic(fmt.Sprintf("failed transaction returned %T %[1]v, want SQLSTATE 25P02", err))
+	}
+	_, err = conn.Exec(ctx, "ROLLBACK")
+	if err != nil {
+		panic(err)
+	}
+	_, err = conn.Exec(ctx, "INSERT INTO pgx_not_null_contract VALUES ($1)", int32(1))
+	if err != nil {
 		panic(err)
 	}
 

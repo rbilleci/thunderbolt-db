@@ -426,8 +426,9 @@ pub(crate) fn synthesize_pg_attribute(
             ("attnum", SqlType::Int4),
             ("attlen", SqlType::Int4),
             ("attnotnull", SqlType::Bool),
-            // -1 = no type modifier (PG's atttypmod for unparameterized types); numeric typmod is a
-            // follow-up alongside format_type. attisdropped is always false (no column drops yet).
+            // -1 = no type modifier (PG's atttypmod for unparameterized types). Parameterized
+            // NUMERIC carries its PostgreSQL `4 + (precision << 16) + scale` typmod so catalog
+            // introspection agrees with RowDescription and prepared metadata.
             ("atttypmod", SqlType::Int4),
             ("attisdropped", SqlType::Bool),
             ("atthasdef", SqlType::Bool),
@@ -444,7 +445,7 @@ pub(crate) fn synthesize_pg_attribute(
             SqlValue::Int4(i32::from(col.attnum)),
             SqlValue::Int4(i32::from(col.type_size)),
             SqlValue::Bool(false),
-            SqlValue::Int4(-1),
+            SqlValue::Int4(pg_attribute_type_modifier(col.ty)),
             SqlValue::Bool(false),
             SqlValue::Bool(col.default.is_some()),
             SqlValue::Int4(0),
@@ -464,6 +465,15 @@ pub(crate) fn synthesize_pg_attribute(
         }
     }
     (table, rows)
+}
+
+fn pg_attribute_type_modifier(ty: SqlType) -> i32 {
+    match ty {
+        SqlType::Numeric { precision, scale } => {
+            4 + ((i32::from(precision) << 16) | i32::from(scale))
+        }
+        _ => -1,
+    }
 }
 
 /// `pg_catalog.pg_type` — the engine's fixed base types plus any user domains.

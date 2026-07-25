@@ -915,7 +915,7 @@ impl Engine {
         for row in rows {
             for &column_idx in &column_idxs {
                 if matches!(row[column_idx], SqlValue::Null) {
-                    return Err(EngineError::ApplyFailed(format!(
+                    return Err(EngineError::NotNullViolation(format!(
                         "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
                         table.columns[column_idx].name, table.name
                     )));
@@ -1013,7 +1013,7 @@ impl Engine {
                 continue;
             }
             if !parent_values.contains(&row[child_column_idx]) {
-                return Err(EngineError::ApplyFailed(format!(
+                return Err(EngineError::ForeignKeyViolation(format!(
                     "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
                     child_table.name, foreign_key.name
                 )));
@@ -1071,7 +1071,7 @@ impl Engine {
                 continue;
             }
             if !select_filter_matches(&row[column_idx], add.filter.op, &add.filter.value) {
-                return Err(EngineError::ApplyFailed(format!(
+                return Err(EngineError::CheckViolation(format!(
                     "check constraint \"{}\" is violated by some row",
                     add.name
                 )));

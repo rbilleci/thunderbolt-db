@@ -888,6 +888,8 @@ pub mod backend {
         pub name: String,
         pub oid: u32,
         pub type_size: i16,
+        /// PostgreSQL type modifier, or -1 when the type has none.
+        pub type_modifier: i32,
     }
 
     impl BackendColumn {
@@ -896,7 +898,13 @@ pub mod backend {
                 name: name.into(),
                 oid,
                 type_size,
+                type_modifier: -1,
             }
+        }
+
+        pub fn with_type_modifier(mut self, type_modifier: i32) -> Self {
+            self.type_modifier = type_modifier;
+            self
         }
     }
 
@@ -1113,7 +1121,7 @@ pub mod backend {
                 payload.extend_from_slice(&0_i16.to_be_bytes());
                 payload.extend_from_slice(&column.oid.to_be_bytes());
                 payload.extend_from_slice(&column.type_size.to_be_bytes());
-                payload.extend_from_slice(&(-1_i32).to_be_bytes());
+                payload.extend_from_slice(&column.type_modifier.to_be_bytes());
                 payload.extend_from_slice(&format_code_at(result_format_codes, idx).to_be_bytes());
             }
             self.message(b'T', &payload)

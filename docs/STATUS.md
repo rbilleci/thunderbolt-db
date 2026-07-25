@@ -14,6 +14,63 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 SQLSTATE/type codecs, named clients, and mixed recovery — accepted 2026-07-24
+
+- The facade now has PostgreSQL text and binary Bind/result codecs for all nine exposed logical types: `int2`,
+  `int4`, `int8`, finite `numeric`, `bool`, `text` (including VARCHAR Bind OID 1043), `date`, `timestamp`, and
+  `uuid`. NULL remains out-of-band. NUMERIC uses PostgreSQL's base-10000 wire format, preserves display scale,
+  normalizes legal leading-zero groups before its Decimal128 range check, truncates digits hidden by binary
+  dscale, and round-trips `i128::MIN`. PostgreSQL 16 signed radix forms and decimal/nondecimal/exponent underscores
+  are accepted with bounded accumulation; malformed input, reserved dscale bits, and finite-domain overflow remain
+  distinct. Precision/scale metadata survives prepare revalidation, RowDescription typmod, and GPU
+  `pg_attribute`.
+- Neutral engine errors now carry typed not-null, foreign-key, check, and numeric-range categories. The server maps
+  them to `23502`, `23503`, `23514`, and `22003` only at their semantic sites, retaining existing `23505`,
+  `25P02`, and `40001` behavior without message-text inspection. Text and binary codec failures remain `22P02`
+  and `22P03`, including reserved NUMERIC dscale classification.
+- Tokio-postgres, SQLx, node-postgres, asyncpg, psycopg, pgx, JDBC, and R2DBC all pass native all-type/non-NULL and
+  NULL rows, constraint SQLSTATEs, failed-transaction `25P02`, rollback, and connection/prepared-statement reuse
+  against `gpu-db-engine-server`. The aggregate gate records all eight canonical targets and R2DBC's GPU-catalog
+  autodetection route.
+- The process-level durability gate starts the canonical binary on an exact WAL path, writes through W1, General,
+  explicit-transaction, COPY, and sequence routes, sends SIGKILL, and proves exact data/catalog/NUMERIC-typmod/
+  sequence digests across two fresh reopen cycles plus a later append. Deterministic pre-fsync failure remains
+  invisible and retryable; post-durable apply failure remains indeterminate and recovery-owned. Fresh traffic
+  creates no retired lane files.
+- The exact alternating NULL/non-NULL all-type wire fixture passes across coarse and fine shard configurations on
+  GPU, and a separate keyed `accounts` read proves the specialized batch route and publication counters
+  non-vacuously. The exact binary passed three serial plus two simultaneous HAZARD executions with zero CUDA
+  700/716/717. The ordinary gates pass facade **89/89** with **15** ignored, canonical server **82/82** with **4**
+  ignored, pgwire **4/4** with **2** ignored, protocol **71 + 128**, engine **647/647** with **602** ignored,
+  process recovery **1/1**, and all eight application-driver suites. Workspace all-target/all-feature check,
+  warnings-denied Clippy, exact-file rustfmt, diff, and source-size gates pass; touched production/test maxima are
+  **1,989/2,841** lines.
+- The first frozen audit rejected PostgreSQL 16 radix/underscore NUMERIC text, binary leading-zero normalization,
+  the signed `i128::MIN` boundary, and reserved dscale SQLSTATE classification. All four were repaired with direct
+  facade/server regressions; sabotage arms 07–10 each fail at the protected assertion, while earlier arms 01–06
+  protect binary result bytes, NUMERIC typmod, NOT NULL SQLSTATE, pre-fsync, post-durable, and GPU route evidence.
+  The repaired code/test seal is base `e7333dc4a339468ae0fc9727b8858ecbe3acfc9f`, index tree
+  `ab1d4bffeb429413f238df3d786fdaa04281c146`, and cached binary-diff SHA-256
+  `a454ea91826d951775ed5f6b8e072f537806e8a51ab9ab08574af6665f8aace8` across 30 paths without drift.
+  Independent repaired-tree and post-card audits returned **ACCEPT** with no finding.
+- The default-timeout full invocation is retained failure evidence: A/B completed, the fixed 48M-row Section-C
+  fixture built in **2306.9s**, then the 2400s cap expired before `executed_target`; its log SHA-256 is
+  `3f7248bd3f6bd6909747ae856fcce5afce872f8b8e98343527b9ee9384cda71a`. The same auditor authorized one
+  workload-identical `SECTION_C_TIMEOUT=2700` retry. Its log SHA-256 is
+  `99608314fa3e90a2e9516efc58be6c71b1021232dc62d546ae7840eac71d55b8`; all A/B/C configuration-bound
+  markers and `report_card_execution_status=complete mode=full sections=A,B,C canonical=true` are present, and
+  the isolated target was removed.
+- The accepted card's raw, point-read, and AWS-LC artifacts are
+  `a1f053190a6b2e915837489d21bc521e9b0369f4145be4aea5c37c3d0001c234` (1,129,600 bytes),
+  `d68b6495ddb9293bca4ac9c7faa9a9ede557832f8845e220ca7ba492d7d107f3` (9,925,192 bytes), and
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61` (7,156,488 bytes). Layer 1 measured
+  **1303.6 GB/s, p50 26us** in-L2, **1442.5 GB/s, p50 186us** out-of-L2, and **1672.9 M-elem/s** grouped.
+  Layer 2 measured **268.934M/s, p50 117us** in-L2 and **244.560M/s, p50 139us** out-of-L2 after the fixed
+  fixture built in **2307.2s** with zero final-residency work. Versus the preceding accepted card, honest
+  out-of-L2 raw/grouped throughput is **+0.6%/-0.1%**, point throughput is **-0.8%/-2.0%**, point p50 is
+  **+1us/unchanged**, and fixture build is **-0.9%**; no material regression is present. The byte-identical raw
+  artifact and improved same-run in-L2 kernel ratios identify the lower cache-resident roofline as run variance.
+
 ## PRODUCT-001 ordinary published-sequence transitions — accepted 2026-07-24
 
 - `nextval`, both `setval` forms, and omitted INSERT defaults on an unchanged published sequence now use one typed

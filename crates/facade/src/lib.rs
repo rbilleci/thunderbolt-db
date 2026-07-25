@@ -95,6 +95,8 @@ pub enum DbValue {
 pub struct ColumnMeta {
     pub name: String,
     pub logical_type: LogicalType,
+    /// Precision and scale for numeric results, retained without carrying a wire typmod.
+    pub numeric_typmod: Option<(u8, u8)>,
 }
 
 /// Neutral COPY input metadata. Numeric typmod is retained because COPY text decoding must round
@@ -200,6 +202,10 @@ pub enum ErrorCategory {
     Cancelled,
     InFailedTransaction,
     UniqueViolation,
+    NotNullViolation,
+    ForeignKeyViolation,
+    CheckViolation,
+    NumericValueOutOfRange,
     Engine,
     Internal,
     /// A retryable Snapshot-Isolation write-write serialization conflict (write-half MVCC, Stage 4):
@@ -1219,6 +1225,7 @@ fn submit_parsed_inner(
                 columns: vec![ColumnMeta {
                     name: "transaction_isolation".to_string(),
                     logical_type: LogicalType::Text,
+                    numeric_typmod: None,
                 }],
                 rows: vec![vec![DbValue::Text(value.to_string())]],
             })
@@ -1762,12 +1769,18 @@ fn map_parse_error(err: ParseError) -> DbError {
 }
 
 fn map_execute_error(err: ExecuteError) -> DbError {
-    // `Serialization` maps to the retryable class-40 category (write-half MVCC, Stage 4 — the
-    // engine now exposes a typed `ExecuteError::Serialization` for SI write-write conflicts, so no
-    // message string-sniffing). The remaining `Engine`/`Txn`/`Storage` cases collapse to `Engine`
-    // (→ SQLSTATE XX000); finer categorization of those waits on typed engine errors (Phase 3).
+    // Protocol classification is based only on typed failures. Text remains diagnostic data, so
+    // invariant and durability faults continue to map to `Engine`/XX000.
     let category = if err.is_unique_violation() {
         ErrorCategory::UniqueViolation
+    } else if err.is_not_null_violation() {
+        ErrorCategory::NotNullViolation
+    } else if err.is_foreign_key_violation() {
+        ErrorCategory::ForeignKeyViolation
+    } else if err.is_check_violation() {
+        ErrorCategory::CheckViolation
+    } else if err.is_numeric_value_out_of_range() {
+        ErrorCategory::NumericValueOutOfRange
     } else {
         match &err {
             ExecuteError::Parse(_) => ErrorCategory::Syntax,
@@ -1808,6 +1821,10 @@ fn map_column(column: &RelationalColumn) -> ColumnMeta {
     ColumnMeta {
         name: column.name.clone(),
         logical_type: map_logical_type(column.ty),
+        numeric_typmod: match column.ty {
+            SqlType::Numeric { precision, scale } => Some((precision, scale)),
+            _ => None,
+        },
     }
 }
 
@@ -1846,6 +1863,7 @@ fn sequence_value_rows(column: &str, value: i64) -> QueryOutcome {
         columns: vec![ColumnMeta {
             name: column.to_string(),
             logical_type: LogicalType::Int8,
+            numeric_typmod: None,
         }],
         rows: vec![vec![DbValue::Int8(value)]],
     }

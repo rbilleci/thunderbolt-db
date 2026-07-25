@@ -6,43 +6,29 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
 
 ## Current boundary
 
-- **PRODUCT-001** has a verified ordinary published-sequence candidate. Existing published `nextval`, both
-  `setval` forms, and omitted INSERT defaults use a separate typed `SequenceValueTransition` in the sole
-  commit/WAL/status/publication order. Additive opcodes 20/21 bind stable OID, prior/new state, exact retry identity,
-  and later user-envelope references while preserving earlier bytes. A transition survives user rollback;
-  recovery and exact retry cannot consume it twice.
-- Default references bind table/column/final-row identity, materialized value, and later update/delete disposition.
-  Positive and negative route pins prevent ADD/DROP DEFAULT races from changing transition semantics. Facade
-  `currval` is stable-OID session state with PostgreSQL operation-specific behavior. A shared checked ID allocator
-  prevents facade, compatibility, parent-envelope, and transition aliases. Private CREATE/RESTART value children
-  remain outside this ordinary transition and materialized views remain pre-effect refusal.
-- Gates are green: engine **645/645** active, facade **83/83**, concurrency **13/13**, and the complete serialized
-  GPU sweep **1,244/1,247** with only the same three PLAN-owned failures. The transactional NULL differential and
-  published-default rollback/recovery test each pass three serial plus two simultaneous GPU runs. Workspace,
-  strict Clippy, dependency, format/diff, and source-size disposition gates pass. New production owners are
-  **1,346/575** lines; `engine_mutation_admission.rs` remains PLAN-owned at **2,087** lines, and the newly crossed
-  **2,002**-line transaction-catalog mixed root now has its analyzed no-exception core-test extraction in PLAN.
-  The final quick screen completed A/B at **1471.0/1428.5 GB/s** raw in/out of L2,
-  **1673.2 M-elem/s** grouped, and **268.255M/s, p50 117us** in-L2 production point reads.
-- The first audit withheld the full card and found the chained-transaction second allocator, corrupt
-  reference-count preallocation, and missing direct sabotage. A second audit withheld it for post-terminal chain
-  exhaustion/snapshot leakage and the missing catalog size disposition. All findings are repaired and fully
-  re-gated; chained successors now register pre-effect and cancel on later failure, with engine/facade/GC/WAL retry
-  sabotage. The third exact-tree audit returned **ACCEPT** on base `5d1fc1890544453767e2f7ba0941acbfb63c0e21`,
-  staged tree `91ca526ee67a781d7889a23c479d65106292fffa`, and cached binary-diff SHA-256
-  `00a84dd60586de5d06db50658c27cde66d3a821485c5a5652b5edcb4c309296c` across 41 paths without drift.
-- The candidate's single canonical full A/B/C card completed with the exact canonical marker. Raw rooflines are
-  **1391.7/1433.8 GB/s**, grouped is **1674.2 M-elem/s**, and production point reads are
-  **271.032M/s, p50 116us** in-L2 and **249.569M/s, p50 139us** out-of-L2. The 48M-row fixture built in
-  **2328.7s** with zero final-residency work; point throughput is **+3.9%/+5.6%** against the accepted card, and the
-  isolated target was removed. Same-auditor post-card audit returned **ACCEPT** with no High or Medium finding on
-  closeout tree `915254c7bb9c92f6a2b2067d10dd04e417e6d389` / cached binary-diff SHA-256
-  `3e989cd4219edc409e51943563d43d0d7d693a977e483b9d53c56e5f69dcc1a2`; it matched full-card log
-  SHA-256 `214fd92342f05c720d0fbac26172cf8eb96bce619f4d75d2cb5f6a6f01bef82b`, provenance, cleanup, and
-  baseline deltas. The ordinary published-sequence slice is accepted without a card rerun.
+- **PRODUCT-001** has an accepted SQLSTATE/type-codec, named-client, and mixed-recovery slice. Every facade type has
+  PostgreSQL text/binary codecs; NUMERIC carries typmod and PostgreSQL 16 finite grammar/wire semantics; typed
+  constraint/range errors map to `23502`/`23503`/`23514`/`22003` while `23505`, `25P02`, and `40001` remain exact.
+  All eight native driver suites cover non-NULL/NULL values, SQLSTATEs, rollback, and reuse on the canonical server.
+- Process recovery covers W1, General, explicit transaction, COPY, and sequence traffic across SIGKILL, two fresh
+  reopen cycles, and later append. The alternating-NULL all-type GPU fixture plus separate keyed point route pass
+  three serial and two simultaneous runs with zero CUDA 700/716/717. Facade, canonical server, pgwire, protocol,
+  engine, recovery, eight-driver, workspace, Clippy, rustfmt, diff, and source-size gates are green.
+- The first frozen audit rejected four NUMERIC edges; direct repairs and sabotage 07–10 close radix/underscore text,
+  binary leading-zero normalization, `i128::MIN`, and reserved dscale classification. Repaired-tree and post-card
+  audits returned **ACCEPT** on base `e7333dc4a339468ae0fc9727b8858ecbe3acfc9f`, code/test tree
+  `ab1d4bffeb429413f238df3d786fdaa04281c146`, and cached binary-diff SHA-256
+  `a454ea91826d951775ed5f6b8e072f537806e8a51ab9ab08574af6665f8aace8` across 30 paths without drift.
+- The default 2400s full card is preserved as incomplete timeout evidence after its fixed Section-C build consumed
+  2306.9s. The same auditor authorized a workload-identical 2700s retry, which completed the canonical A/B/C marker.
+  Honest out-of-L2 raw/grouped throughput is **1442.5 GB/s / 1672.9 M-elem/s**; production point reads are
+  **268.934M/s, p50 117us** in-L2 and **244.560M/s, p50 139us** out-of-L2. Point throughput is
+  **-0.8%/-2.0%** versus the preceding card with +1us/unchanged p50, so no material regression is present. The
+  accepted log SHA-256 is `99608314fa3e90a2e9516efc58be6c71b1021232dc62d546ae7840eac71d55b8`.
 
 ## Resume here
 
-Resume the PLAN-owned **PRODUCT-001** SQLSTATE/type-codec, named-client, and mixed-recovery proofs before the
-legacy/P8 compatibility-and-deletion slice. The 2,002-line transaction-catalog core-test extraction remains
-PRODUCT-001-owned before the parent closes.
+Resume the PLAN-owned **PRODUCT-001 legacy/P8 compatibility-and-deletion slice**. Re-inventory every live
+psql/preflight/benchmark consumer, migrate or explicitly disposition it, then delete the superseded listener and
+independently callable P8 protocol adapters without adding a second execution or write owner. The 2,002-line
+transaction-catalog core-test extraction remains PRODUCT-001-owned before the parent closes.

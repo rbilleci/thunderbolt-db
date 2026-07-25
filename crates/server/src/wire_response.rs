@@ -134,6 +134,12 @@ pub(crate) fn encode_outcome_messages(
                                 pg_adapter::logical_type_oid(column.logical_type),
                                 pg_adapter::logical_type_size(column.logical_type),
                             )
+                            .with_type_modifier(
+                                pg_adapter::logical_type_typmod(
+                                    column.logical_type,
+                                    column.numeric_typmod,
+                                ),
+                            )
                         })
                         .collect();
                     writer.row_description(&backend_columns)?;

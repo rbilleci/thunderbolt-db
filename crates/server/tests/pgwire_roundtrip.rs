@@ -13,9 +13,11 @@ use gpu_db_execution::{CudaDriverRuntime, DeviceTarget};
 use gpu_db_facade::SharedEngine;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-/// STRATA golden gate: a real pgwire client reaches the dense GPU point route for coarse- and fine-sharded generations,
-/// returns fixture-derived row values, and carries NULL data without disabling an unreferenced
-/// projection. The route counter makes the wire-level equality non-vacuous.
+/// STRATA golden gate: a real pgwire client carries alternating NULL/non-NULL values for every
+/// exposed logical type, then reaches the dense GPU point route for coarse- and fine-sharded
+/// generations. The all-type wire assertion is deliberately separate from the route counter:
+/// that counter proves the specialized keyed resident `accounts` projection, not a claim that
+/// the current point kernel covers one wide heterogeneous projection.
 #[tokio::test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 async fn pgwire_gpu_point_route_is_non_vacuous_across_coarse_and_fine_shards() {
@@ -26,7 +28,16 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_coarse_and_fine_shards() {
     if !runtime.driver_available || runtime.device_count == 0 {
         return;
     }
-    async fn run_arm(shard_target: usize) -> (Vec<String>, Vec<Option<String>>, u64, usize) {
+    async fn run_arm(
+        shard_target: usize,
+    ) -> (
+        Vec<String>,
+        Vec<Option<String>>,
+        Vec<Vec<Option<String>>>,
+        u64,
+        u64,
+        usize,
+    ) {
         let engine = Engine::new_local();
         engine.set_shard_residency_enabled(true);
         engine.set_shard_size_target(shard_target);
@@ -68,6 +79,7 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_coarse_and_fine_shards() {
                 )
                 .unwrap();
         }
+        let keyed_device_authoritative_publications = engine.device_authoritative_commits();
         let direct_payload = engine
             .execute_relational_select_text("SELECT balance FROM accounts WHERE id = 100")
             .unwrap();
@@ -79,10 +91,35 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_coarse_and_fine_shards() {
         assert_eq!(direct_null.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(direct_null.fallback_reason, None);
 
+        // Every logical type crosses pgwire below with a non-NULL value in exactly one row and
+        // NULL in the other. The expected text is fixed fixture algebra, not a CPU-executor
+        // oracle. The resident point-route proof remains the keyed `accounts` projection above.
+        txn_id += 1;
+        engine
+            .execute_text(
+                txn_id,
+                "CREATE TABLE wire_all_types (\
+                    row_id INT PRIMARY KEY, i2 SMALLINT, i4 INT, i8 BIGINT, amount NUMERIC(12,4),\
+                    flag BOOL, note TEXT, day DATE, created_at TIMESTAMP, ident UUID\
+                 )",
+            )
+            .unwrap();
+        txn_id += 1;
+        engine
+            .execute_text(
+                txn_id,
+                "INSERT INTO wire_all_types VALUES \
+                    (1, -7, NULL, -9000000000, 12.3400, NULL, 'left', NULL, \
+                     '2000-01-01 00:00:01.234567', NULL),\
+                    (2, NULL, 42, NULL, NULL, true, NULL, '1999-12-31', NULL, \
+                     '550e8400-e29b-41d4-a716-446655440000')",
+            )
+            .unwrap();
+
         let shared = Arc::new(SharedEngine::from_engine(engine));
         let before = shared.gpu_native_activity_snapshot("accounts");
         if before.resident_shards == 0 {
-            return (Vec::new(), Vec::new(), 0, 0);
+            return (Vec::new(), Vec::new(), Vec::new(), 0, 0, 0);
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -123,10 +160,30 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_coarse_and_fine_shards() {
                 _ => None,
             })
             .collect();
+        let typed_messages = client
+            .simple_query(
+                "SELECT i2, i4, i8, amount, flag, note, day, created_at, ident \
+                 FROM wire_all_types ORDER BY row_id",
+            )
+            .await
+            .unwrap();
+        let typed_rows = typed_messages
+            .into_iter()
+            .filter_map(|message| match message {
+                SimpleQueryMessage::Row(row) => Some(
+                    (0..9)
+                        .map(|column| row.get(column).map(str::to_owned))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
         (
             payloads,
             nulls,
+            typed_rows,
             after.sharded_gpu_probe_batches - before.sharded_gpu_probe_batches,
+            keyed_device_authoritative_publications,
             before.resident_shards,
         )
     }
@@ -135,15 +192,51 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_coarse_and_fine_shards() {
     let fine = run_arm(32).await;
     assert_eq!(coarse.0, vec!["700"]);
     assert_eq!(coarse.1, vec![None]);
-    assert_eq!((fine.0.clone(), fine.1.clone()), (coarse.0, coarse.1));
-    assert!(coarse.3 > 0, "coarse-sharded arm has resident shards");
+    assert_eq!(
+        coarse.2,
+        vec![
+            vec![
+                Some("-7".to_string()),
+                None,
+                Some("-9000000000".to_string()),
+                Some("12.3400".to_string()),
+                None,
+                Some("left".to_string()),
+                None,
+                Some("2000-01-01 00:00:01.234567".to_string()),
+                None,
+            ],
+            vec![
+                None,
+                Some("42".to_string()),
+                None,
+                None,
+                Some("t".to_string()),
+                None,
+                Some("1999-12-31".to_string()),
+                None,
+                Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            ],
+        ],
+        "all-type pgwire rows preserve both typed values and per-column NULLs"
+    );
+    assert_eq!(
+        (fine.0.clone(), fine.1.clone(), fine.2.clone()),
+        (coarse.0, coarse.1, coarse.2),
+        "coarse and fine resident generations agree on the same closed-form wire fixture"
+    );
+    assert!(coarse.5 > 0, "coarse-sharded arm has resident shards");
     assert!(
-        fine.3 > coarse.3,
+        fine.5 > coarse.5,
         "fine-sharded arm has more shards than coarse arm"
     );
     assert!(
-        coarse.2 > 0 && fine.2 > 0,
+        coarse.3 > 0 && fine.3 > 0,
         "wire reads fired the dense GPU route"
+    );
+    assert!(
+        coarse.4 > 0 && fine.4 > 0,
+        "the keyed resident accounts fixture published device-authoritative state before pgwire reads"
     );
 }
 

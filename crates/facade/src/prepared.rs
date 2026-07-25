@@ -733,6 +733,7 @@ mod tests {
                 [ColumnMeta {
                     name: "value".to_string(),
                     logical_type: LogicalType::Text,
+                    numeric_typmod: None,
                 }]
                 .as_slice()
             )
@@ -846,6 +847,7 @@ mod tests {
                 [ColumnMeta {
                     name: "value".to_string(),
                     logical_type: LogicalType::Text,
+                    numeric_typmod: None,
                 }]
                 .as_slice()
             )
@@ -884,6 +886,26 @@ mod tests {
             ErrorCategory::UndefinedRelation
         );
         submit_text(&facade, &mut reader, "ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn cached_numeric_result_typmod_is_not_erased_during_revalidation() {
+        let expected = [ColumnMeta {
+            name: "amount".to_string(),
+            logical_type: LogicalType::Numeric,
+            numeric_typmod: Some((12, 2)),
+        }];
+        let actual = QueryOutcome::Rows {
+            columns: vec![ColumnMeta {
+                name: "amount".to_string(),
+                logical_type: LogicalType::Numeric,
+                numeric_typmod: Some((12, 3)),
+            }],
+            rows: vec![],
+        };
+        let error = validate_result_columns(actual, Some(&expected))
+            .expect_err("same OID with changed numeric scale must invalidate prepared metadata");
+        assert_eq!(error.category, ErrorCategory::Unsupported);
     }
 
     #[test]
@@ -926,6 +948,7 @@ mod tests {
                 columns: vec![ColumnMeta {
                     name: "balance".to_string(),
                     logical_type: LogicalType::Int8,
+                    numeric_typmod: None,
                 }],
                 rows: vec![vec![DbValue::Int8(91)]],
                 rows_affected: 1,

@@ -44,6 +44,14 @@ pub enum EngineError {
     ApplyFailed(String),
     #[error("unique constraint violation: {0}")]
     UniqueViolation(String),
+    #[error("not-null constraint violation: {0}")]
+    NotNullViolation(String),
+    #[error("foreign key constraint violation: {0}")]
+    ForeignKeyViolation(String),
+    #[error("check constraint violation: {0}")]
+    CheckViolation(String),
+    #[error("numeric value out of range: {0}")]
+    NumericValueOutOfRange(String),
     #[error("durability failure: {0}")]
     Durability(String),
     #[error("pending mutation queue overloaded: pending={pending} cap={cap}")]

@@ -502,6 +502,7 @@ fn pg_dump_session_controls_and_access_share_lock_are_wal_neutral() {
             columns: vec![ColumnMeta {
                 name: "transaction_isolation".to_string(),
                 logical_type: LogicalType::Text,
+                numeric_typmod: None,
             }],
             rows: vec![vec![DbValue::Text("repeatable read".to_string())]],
         }
@@ -587,6 +588,7 @@ fn show_transaction_isolation_reports_session_state_without_claiming_work() {
         columns: vec![ColumnMeta {
             name: "transaction_isolation".to_string(),
             logical_type: LogicalType::Text,
+            numeric_typmod: None,
         }],
         rows: vec![vec![DbValue::Text(value.to_string())]],
     };
@@ -742,10 +744,12 @@ fn parameterized_w1_update_preserves_types_and_returning_rows() {
                 ColumnMeta {
                     name: "balance_cents".to_string(),
                     logical_type: LogicalType::Int8,
+                    numeric_typmod: None,
                 },
                 ColumnMeta {
                     name: "version".to_string(),
                     logical_type: LogicalType::Int8,
+                    numeric_typmod: None,
                 },
             ],
             rows: vec![vec![DbValue::Int8(975), DbValue::Int8(1)]],

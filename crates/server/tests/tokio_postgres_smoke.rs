@@ -4,8 +4,75 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use chrono::{NaiveDate, NaiveDateTime};
 use futures_util::{pin_mut, stream, SinkExt, TryStreamExt};
+use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+use uuid::Uuid;
+
+/// The Rust client deliberately has no built-in arbitrary-precision NUMERIC type.  Keep that
+/// limitation at the client boundary by using one small binary-format wrapper over the canonical
+/// finite value used by this smoke; the server still sees a real NUMERIC Bind/Result payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgNumeric(Vec<u8>);
+
+impl PgNumeric {
+    fn fixed_12345_6700() -> Self {
+        Self(vec![
+            0, 3, 0, 1, 0, 0, 0, 4, // ndigits, weight, positive sign, display scale
+            0, 1, 0x09, 0x29, 0x1a, 0x2c,
+        ])
+    }
+
+    fn fixed_1_00() -> Self {
+        Self(vec![0, 1, 0, 0, 0, 0, 0, 2, 0, 1])
+    }
+}
+
+impl ToSql for PgNumeric {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        if *ty != Type::NUMERIC {
+            return Err(Box::new(tokio_postgres::types::WrongType::new::<Self>(
+                ty.clone(),
+            )));
+        }
+        out.extend_from_slice(&self.0);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+impl<'a> FromSql<'a> for PgNumeric {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if *ty != Type::NUMERIC || raw.len() < 8 {
+            return Err(Box::new(tokio_postgres::types::WrongType::new::<Self>(
+                ty.clone(),
+            )));
+        }
+        let ndigits = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
+        let expected_len = 8 + ndigits * 2;
+        if raw.len() != expected_len {
+            return Err("malformed PostgreSQL binary numeric payload".into());
+        }
+        Ok(Self(raw.to_vec()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
 
 struct ServerGuard {
     child: Child,
@@ -57,6 +124,31 @@ async fn connect(port: u16) -> Result<Client, tokio_postgres::Error> {
         }
     });
     Ok(client)
+}
+
+async fn require_failed_transaction_rollback(
+    client: &Client,
+    violation_sql: &str,
+    expected_sqlstate: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    client.batch_execute("BEGIN").await?;
+    let violation = client
+        .batch_execute(violation_sql)
+        .await
+        .expect_err("constraint violation must fail its explicit transaction");
+    assert_eq!(
+        violation.code().map(|code| code.code()),
+        Some(expected_sqlstate),
+        "violation must preserve its PostgreSQL SQLSTATE"
+    );
+    let blocked = client
+        .query_one("SELECT 1", &[])
+        .await
+        .expect_err("a constraint failure must abort the explicit transaction");
+    assert_eq!(blocked.code().map(|code| code.code()), Some("25P02"));
+    client.batch_execute("ROLLBACK").await?;
+    assert_eq!(client.query_one("SELECT 1", &[]).await?.get::<_, i32>(0), 1);
+    Ok(())
 }
 
 #[tokio::test]
@@ -215,6 +307,212 @@ async fn canonical_server_tokio_postgres_copy_and_recovery_smoke(
         .query_one("SELECT name FROM driver_people WHERE id = $1", &[&91_i32])
         .await?;
     assert_eq!(null_row.get::<_, Option<String>>(0), None);
+
+    // Every exposed logical type crosses an actual Parse/Bind/Execute exchange using this
+    // client's native value mappings. PgNumeric is the one test-local binary mapping because
+    // tokio-postgres deliberately does not ship an arbitrary-precision NUMERIC implementation.
+    client
+        .batch_execute(
+            "CREATE TABLE driver_all_types (\
+                row_id INT PRIMARY KEY, i2 SMALLINT, i4 INT, i8 BIGINT, amount NUMERIC(12,4),\
+                flag BOOL, note TEXT, day DATE, created_at TIMESTAMP, ident UUID\
+             );",
+        )
+        .await?;
+    let numeric = PgNumeric::fixed_12345_6700();
+    let day = NaiveDate::from_ymd_opt(1999, 12, 31).expect("fixed valid date");
+    let created_at = day
+        .and_hms_micro_opt(0, 0, 1, 234_567)
+        .expect("fixed valid timestamp");
+    let ident = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("fixed UUID");
+    let insert_all_types = client
+        .prepare("INSERT INTO driver_all_types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
+        .await?;
+    client
+        .execute(
+            &insert_all_types,
+            &[
+                &1_i32,
+                &-7_i16,
+                &42_i32,
+                &-9_i64,
+                &numeric,
+                &true,
+                &"Grüße",
+                &day,
+                &created_at,
+                &ident,
+            ],
+        )
+        .await?;
+    let absent_i2: Option<i16> = None;
+    let absent_i4: Option<i32> = None;
+    let absent_i8: Option<i64> = None;
+    let absent_numeric: Option<PgNumeric> = None;
+    let absent_bool: Option<bool> = None;
+    let absent_text: Option<String> = None;
+    let absent_day: Option<NaiveDate> = None;
+    let absent_timestamp: Option<NaiveDateTime> = None;
+    let absent_uuid: Option<Uuid> = None;
+    client
+        .execute(
+            &insert_all_types,
+            &[
+                &2_i32,
+                &absent_i2,
+                &absent_i4,
+                &absent_i8,
+                &absent_numeric,
+                &absent_bool,
+                &absent_text,
+                &absent_day,
+                &absent_timestamp,
+                &absent_uuid,
+            ],
+        )
+        .await?;
+    let all_types = client
+        .query_one(
+            "SELECT i2, i4, i8, amount, flag, note, day, created_at, ident \
+             FROM driver_all_types WHERE row_id = 1",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        (
+            all_types.get::<_, i16>(0),
+            all_types.get::<_, i32>(1),
+            all_types.get::<_, i64>(2),
+            all_types.get::<_, PgNumeric>(3),
+            all_types.get::<_, bool>(4),
+            all_types.get::<_, String>(5),
+            all_types.get::<_, NaiveDate>(6),
+            all_types.get::<_, NaiveDateTime>(7),
+            all_types.get::<_, Uuid>(8),
+        ),
+        (
+            -7,
+            42,
+            -9,
+            numeric,
+            true,
+            "Grüße".to_string(),
+            day,
+            created_at,
+            ident
+        )
+    );
+    let typed_nulls = client
+        .query_one(
+            "SELECT i2, i4, i8, amount, flag, note, day, created_at, ident \
+             FROM driver_all_types WHERE row_id = 2",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        (
+            typed_nulls.get::<_, Option<i16>>(0),
+            typed_nulls.get::<_, Option<i32>>(1),
+            typed_nulls.get::<_, Option<i64>>(2),
+            typed_nulls.get::<_, Option<PgNumeric>>(3),
+            typed_nulls.get::<_, Option<bool>>(4),
+            typed_nulls.get::<_, Option<String>>(5),
+            typed_nulls.get::<_, Option<NaiveDate>>(6),
+            typed_nulls.get::<_, Option<NaiveDateTime>>(7),
+            typed_nulls.get::<_, Option<Uuid>>(8),
+        ),
+        (None, None, None, None, None, None, None, None, None),
+        "every declared result type must retain wire NULL"
+    );
+
+    client
+        .batch_execute("CREATE TABLE driver_constraint_parent (id INT PRIMARY KEY)")
+        .await?;
+    client
+        .batch_execute(
+            "CREATE TABLE driver_constraint_child (\
+                 id INT PRIMARY KEY, parent_id INT, amount NUMERIC(4,2),\
+                 CONSTRAINT driver_constraint_positive CHECK (amount > 0.00)\
+             )",
+        )
+        .await?;
+    client
+        .batch_execute(
+            "ALTER TABLE ONLY driver_constraint_child ADD CONSTRAINT driver_constraint_parent_fk \
+             FOREIGN KEY (parent_id) REFERENCES driver_constraint_parent(id)",
+        )
+        .await?;
+    client
+        .batch_execute("INSERT INTO driver_constraint_parent VALUES (1)")
+        .await?;
+
+    // This is deliberately a real tokio-postgres prepared statement (its generated named
+    // statement uses Parse/Bind/Execute), outside an explicit transaction. A failed W1 must be
+    // effect-free, retain its typed constraint SQLSTATE, and leave this same client usable.
+    let prepared_not_null = client
+        .prepare("INSERT INTO driver_constraint_child VALUES ($1, $2, $3)")
+        .await?;
+    let child_count_before = client
+        .query_one("SELECT COUNT(*) FROM driver_constraint_child", &[])
+        .await?
+        .get::<_, i64>(0);
+    let absent_child_id: Option<i32> = None;
+    let not_null_error = client
+        .execute(
+            &prepared_not_null,
+            &[&absent_child_id, &1_i32, &PgNumeric::fixed_1_00()],
+        )
+        .await
+        .expect_err("prepared autocommit Bind/Execute must surface NOT NULL");
+    assert_eq!(
+        not_null_error.code().map(|code| code.code()),
+        Some("23502"),
+        "the prepared W1 failure must preserve the typed constraint SQLSTATE"
+    );
+    let child_count_after = client
+        .query_one("SELECT COUNT(*) FROM driver_constraint_child", &[])
+        .await?
+        .get::<_, i64>(0);
+    assert_eq!(
+        child_count_after, child_count_before,
+        "failed W1 must publish no row"
+    );
+    assert_eq!(
+        client.query_one("SELECT 1", &[]).await?.get::<_, i32>(0),
+        1,
+        "autocommit W1 failure must not poison this client connection"
+    );
+
+    for (sql, sqlstate) in [
+        (
+            "INSERT INTO driver_constraint_child VALUES (NULL, 1, 1.00)",
+            "23502",
+        ),
+        (
+            "INSERT INTO driver_constraint_child VALUES (2, 999, 1.00)",
+            "23503",
+        ),
+        (
+            "INSERT INTO driver_constraint_child VALUES (3, 1, -1.00)",
+            "23514",
+        ),
+        (
+            "INSERT INTO driver_constraint_child VALUES (4, 1, 999.99)",
+            "22003",
+        ),
+    ] {
+        require_failed_transaction_rollback(&client, sql, sqlstate).await?;
+    }
+    assert_eq!(
+        client
+            .execute(
+                "INSERT INTO driver_constraint_child VALUES ($1, $2, $3)",
+                &[&10_i32, &1_i32, &PgNumeric::fixed_1_00()],
+            )
+            .await?,
+        1,
+        "ROLLBACK must leave the connection reusable"
+    );
 
     let statement = client
         .prepare("SELECT id, name FROM driver_people WHERE id = $1")

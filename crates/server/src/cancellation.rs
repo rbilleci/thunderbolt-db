@@ -502,6 +502,7 @@ mod tests {
             columns: vec![ColumnMeta {
                 name: "value".to_string(),
                 logical_type: LogicalType::Int4,
+                numeric_typmod: None,
             }],
             rows: vec![vec![DbValue::Int4(7)]],
         });
@@ -884,6 +885,7 @@ mod tests {
                     columns: vec![ColumnMeta {
                         name: "value".to_string(),
                         logical_type: LogicalType::Int4,
+                        numeric_typmod: None,
                     }],
                     rows: vec![vec![DbValue::Int4(1)]],
                 }),
@@ -900,6 +902,7 @@ mod tests {
                     columns: vec![ColumnMeta {
                         name: "value".to_string(),
                         logical_type: LogicalType::Int4,
+                        numeric_typmod: None,
                     }],
                     rows: vec![vec![DbValue::Int4(1)]],
                     rows_affected: 1,
