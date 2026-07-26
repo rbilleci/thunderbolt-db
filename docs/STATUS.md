@@ -14,6 +14,69 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 legacy/P8 compatibility and deletion — accepted 2026-07-26
+
+- PRODUCT-001 is complete. The superseded protocol listener, host-relational module tree, both independently
+  callable P8 protocol adapters, their P8-only launchers, and the direct-Engine product-like benchmark endpoint are
+  deleted. The canonical preflights boot only `gpu-db-engine-server`; the accepted ownership guard proves one
+  product server, one public `SharedEngine::submit` facade boundary, and the sole commit/WAL/recovery/publication
+  authority.
+- The final fresh-endpoint PostgreSQL 16.14 checkpoint passes **352/352** frozen scenarios, including the repaired
+  exact `\df` route and scenarios 51/348/352. The report is
+  `target/product001-postaudit-golden-7d43c4e1-report.json`, SHA-256
+  `86d8ca63e86244d7d8e69611e70a07b2bf4f6726a946bf4780a95b7e623e98e1`. All eighteen pg_dump/restore
+  variants, pg_dumpall, tokio-postgres, SQLx, node-postgres, asyncpg, psycopg, pgx, JDBC, R2DBC,
+  TLS/SCRAM/mTLS, COPY, cancellation, prepared/portal, transaction, durable recovery, product-preflight,
+  security, and catalog gates pass on the accepted implementation.
+- The accepted physical GPU/residency aggregate records `executed_target=Gpu(0)`, zero protected-path
+  H2D/fallback, fail-closed sabotage, and **697 passed, 0 failed, 0 skipped**. The exact compatibility scorecard
+  records **1,866 passed, 0 failed, 0 ignored**. The complete workspace suite, warnings-denied Clippy, rustfmt,
+  diff hygiene, NULL differential, three 3-serial-plus-2-simultaneous HAZARD cohorts, aggregate preflight, and
+  ownership checks pass.
+- The accepted catalog and psql paths use GPU-resident relations, device joins/DISTINCT, and typed terminal device
+  verdicts. The three pre-card audits found and drove repairs for query-specific host decisions, ACL/role/format
+  handling, RETURNING authorization, role scope, prepared arithmetic, evidence markers, catalog joins and
+  `\gdesc` reupload, JOIN DISTINCT and function-list sabotage, fail-open `\df` recognition, and a reproducible
+  point-read code-placement regression. The final matcher admits only exact normalized PostgreSQL 16 programs and
+  rejects injected predicates, projections, joins, and limits.
+- Controlled clean builds isolated the point-read regression without changing semantics: base tree `3805edaa…`
+  measured p50 **117us**, the unaligned candidate `57a9cc9e…` measured **133us**, and the 64-byte-aligned hot
+  section `77c2ee78…` restored **117us / 270.019M lookups/s**. The official repaired-tree quick screen on
+  `7d43c4e1…` completed A/B at **1,439.4 GB/s** out-of-L2 roofline, **1,673.2 M-elem/s** grouped,
+  **1,468.8 GB/s** constant-mask output, and **269.642M lookups/s at p50 117us** for batch 65,536.
+- The source-size dispositions are complete without exceptions. Comment-excluded counts are
+  `engine_dml_concurrent.rs` **1,850**, `engine_commit.rs` **1,914**, and
+  `engine_mutation_admission.rs` **1,462**. The former 2,002-line transaction-catalog mixed owner is a
+  594-physical-line production root plus a 1,398-line `core_tests.rs` child.
+- The final pre-card auditor returned **ACCEPT** for HEAD
+  `573e5142a1272645cb3443e7515023809a8b2227`, staged tree
+  `1f721b3170587cc68a492af7c69fa866a6651b80`, cached-diff SHA-256
+  `7684ee88aad78cbcd0f6401bec6c492846d3724be5938d88df40b71a07ddf6ba`, 178 staged paths, and no
+  unstaged or untracked drift.
+- The first authorized canonical full card built the fixed 48M-row fixture in **2,372.6s** but reached the default
+  Section C timeout before measurement; it is incomplete non-acceptance evidence
+  (`target/product001-final-full-1f721b31.log`, SHA-256
+  `8ca378d960851c38fa7a1ca31bda51d79febe1b2f7675110541651ceeca1ee64`). The auditor authorized one
+  workload-identical retry changing only `SECTION_C_TIMEOUT` from 2400 to 2700 seconds.
+- That retry completed A/B/C and emitted
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`; its isolated target was
+  removed. The log is `target/product001-final-full-retry2700-1f721b31.log`, SHA-256
+  `e00606cff3d793cef537106e2fab6f9318f21bfa266c7a4d6ba2cba873330ab8`. Exact artifacts are raw
+  `a39c5a1a174530a8279132c3ab8e4c469357311683cc38d342fe25258b57c603` (1,131,808 bytes), point
+  `4b9cd11ff160fc20349639abdc8e8d0ee1613867a156110c3fd4eaa52665c27e` (10,068,296 bytes), and
+  AWS-LC `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61` (7,156,488 bytes).
+- The accepted card measured **1,431.7 GB/s** out-of-L2 roofline, **1,673.2 M-elem/s** grouped, and
+  **1,481.0 GB/s** out-of-L2 constant-mask output. Layer 2 measured **236.658M lookups/s, p50 117us,
+  p99 130us** in-L2 and **246.203M lookups/s, p50 139us** out-of-L2 after the fixture built in
+  **2,318.3s** with zero final-residency work. The immediately preceding accepted values were
+  **268.934M/p50 117us** and **244.560M/p50 139us**. The post-card auditor accepted the in-L2 wall-throughput
+  outlier as benchmark-side allocation variance outside latency timing: p50/p99 were unchanged and the identical
+  point artifact measured **269.642M** in the official quick screen and **266.243M** in the first full attempt.
+  Out-of-L2 throughput improved **0.7%**, and raw/grouped performance remained stable.
+- The same independent auditor verified completeness, provenance, workload identity, target cleanup, and baseline
+  comparison and returned final **ACCEPT** with no unresolved finding. PRODUCT-001 therefore owns no remaining
+  PLAN work; `COPY-001` is the active continuation.
+
 ## PRODUCT-001 SQLSTATE/type codecs, named clients, and mixed recovery — accepted 2026-07-24
 
 - The facade now has PostgreSQL text and binary Bind/result codecs for all nine exposed logical types: `int2`,

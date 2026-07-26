@@ -4,7 +4,7 @@ use super::{
     find_keyword_outside_quotes, find_matching_paren, next_clause_pos, normalize_identifier,
     normalize_relation_identifier, normalize_select_relation_identifier, parse_sql_value,
     split_csv, split_keyword_chain_outside_quotes, split_select_and_chain_outside_quotes,
-    strip_keyword_prefix_case_insensitive, ParseError, SqlValue,
+    strip_keyword_prefix_case_insensitive, ParseError, SqlType, SqlValue,
 };
 
 /// Internal marker for an in-place bare `*` inside an otherwise explicit projection list.
@@ -40,6 +40,20 @@ pub struct Select {
     pub order_by: Vec<SelectOrder>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+impl Select {
+    /// Returns the one-based parameter index encoded in an unbound prepared `LIMIT` clause.
+    ///
+    /// The ordinary execution AST deliberately retains `Option<usize>` so every GPU route sees a
+    /// fully bound window. A value in this reserved range exists only between prepared Parse and
+    /// Bind; ordinary command parsing rejects unbound parameters before it can enter execution.
+    pub fn prepared_limit_parameter_index(&self) -> Option<usize> {
+        let limit = self.limit?;
+        (limit > i32::MAX as usize)
+            .then(|| usize::MAX.checked_sub(limit)?.checked_add(1))
+            .flatten()
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -378,6 +392,16 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
+        SqlValue::Parameter { index, cast } if cast.is_none() || cast == Some(SqlType::Int4) => {
+            // SQL literals are bounded to int4, so this high range cannot collide with a parsed
+            // literal. PreparedCommand replaces it with the decoded int4 before the AST reaches
+            // any engine route.
+            usize::MAX
+                .checked_sub(index.saturating_sub(1))
+                .filter(|encoded| *encoded > i32::MAX as usize)
+                .ok_or(ParseError::InvalidParameterReference)
+        }
+        SqlValue::Parameter { .. } => Err(ParseError::InvalidRelationalSql),
         SqlValue::Null
         | SqlValue::Int8(_)
         | SqlValue::Int2(_)
@@ -386,8 +410,7 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_)
-        | SqlValue::Parameter { .. } => Err(ParseError::InvalidRelationalSql),
+        | SqlValue::Uuid(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
 

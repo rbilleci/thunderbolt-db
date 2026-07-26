@@ -10,6 +10,8 @@
 //! writing-then-reverting them. CI builds `--features probe-timing` to keep them from bit-rotting.
 //!
 //! ```ignore
+//! use gpu_db_execution::Probe;
+//!
 //! let p = Probe::start();
 //! // ... compare kernel ...
 //! p.lap("compare");   // prints the compare duration, resets the lap clock

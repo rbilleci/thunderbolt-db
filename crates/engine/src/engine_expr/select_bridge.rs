@@ -9,7 +9,10 @@ use crate::engine_expr_ir::ResidentExpr;
 use crate::relational_model::{RelationalSelectResult, RelationalTable, RowBlock};
 use crate::resident_route::BoundRelationalSelect;
 use crate::{Engine, ExecuteError};
-use gpu_db_sql::{GroupedAggKind, GroupedAggregate, Select, SelectProjection, SqlValue};
+use gpu_db_sql::{
+    GroupedAggKind, GroupedAggregate, Select, SelectFilter, SelectFilterOp, SelectOrder,
+    SelectProjection, SqlType, SqlValue,
+};
 use gpu_db_types::{EngineError, Index};
 use std::sync::Arc;
 
@@ -217,10 +220,79 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if let Some(result) = self.execute_resident_scalar_text_extreme_via_general(select)? {
+            return Ok(result);
+        }
         if select.distinct {
             self.execute_resident_distinct_via_general(select, None, None)
         } else {
             self.execute_resident_grouped_via_general(select, None, None)
         }
+    }
+
+    /// Scalar `MIN/MAX(text)` is the one aggregate shape that cannot use the numeric reduction
+    /// operator. Re-express its device work as a one-row text sort: retain the original GPU WHERE,
+    /// add a NULL-excluding text-prefix predicate (`LIKE '%'`), sort the surviving text values on
+    /// device, and materialize its first row. The host only restores aggregate metadata and the
+    /// SQL NULL empty-input result; it never compares or selects table values.
+    fn execute_resident_scalar_text_extreme_via_general(
+        &self,
+        select: &Select,
+    ) -> Result<Option<RelationalSelectResult>, ExecuteError> {
+        let (column, descending) = match &select.projection {
+            SelectProjection::Min { column } => (column, false),
+            SelectProjection::Max { column } => (column, true),
+            _ => return Ok(None),
+        };
+        // Preserve the existing general executor's behavior for wider scalar syntax. This bridge
+        // is deliberately the simple aggregate form whose device sort is semantically identical
+        // to MIN/MAX and whose result window is exactly one row.
+        if !select.order_by.is_empty()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+        {
+            return Ok(None);
+        }
+        let (table, bound, _) = self.bind_relational_select_for_execution(select)?;
+        let column_idx = crate::rel_exec_helpers::relational_column_index(&table, column)?;
+        if table.columns[column_idx].ty != SqlType::Text {
+            return Ok(None);
+        }
+
+        let mut device_select = select.clone();
+        device_select.projection = SelectProjection::Columns(vec![column.clone()]);
+        device_select.order_by = vec![SelectOrder {
+            column: column.clone(),
+            descending,
+        }];
+        device_select.limit = Some(1);
+        // Aggregate MIN/MAX ignore NULL inputs. The typed subset's literal-prefix filter is
+        // exactly `LIKE '%'` for an empty prefix, which the device predicate lowers as a
+        // NULL-rejecting all-text match; conjoin it with every WHERE disjunct.
+        let non_null = SelectFilter {
+            column: column.clone(),
+            op: SelectFilterOp::LikePrefix,
+            value: SqlValue::Text(String::new()),
+        };
+        if !device_select.filter_groups.is_empty() {
+            for group in &mut device_select.filter_groups {
+                group.push(non_null.clone());
+            }
+        } else if !device_select.filters.is_empty() {
+            device_select.filters.push(non_null);
+        } else if let Some(filter) = device_select.filter.take() {
+            device_select.filters = vec![filter, non_null];
+        } else {
+            device_select.filters = vec![non_null];
+        }
+
+        let mut result = self.execute_resident_grouped_via_general(&device_select, None, None)?;
+        if result.rows.is_empty() {
+            result.rows = vec![vec![SqlValue::Null]].into();
+        }
+        result.columns = Arc::new(bound.selected_columns);
+        Ok(Some(result))
     }
 }

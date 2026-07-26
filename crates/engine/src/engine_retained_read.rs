@@ -66,6 +66,16 @@ fn shard_key_column_validity_offset(
     )
 }
 
+// The permanent hot section below needs deterministic cache-line alignment: unrelated
+// one-CGU control/catalog growth must not shift this batch-critical entry. Linux x86_64
+// aligns the input fragment to 64 bytes; the canonical report card remains the guard.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+core::arch::global_asm!(
+    ".pushsection .text.hot.gpu_db_sharded_point_read,\"ax\",@progbits\n\
+     .p2align 6\n\
+     .popsection"
+);
+
 impl Engine {
     fn ensure_retained_submission_available(
         &self,

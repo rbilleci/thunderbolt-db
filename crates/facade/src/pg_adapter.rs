@@ -828,6 +828,8 @@ pub fn error_sqlstate(category: ErrorCategory) -> &'static str {
         ErrorCategory::Unsupported => "0A000",
         ErrorCategory::UndefinedRelation => "42P01",
         ErrorCategory::UndefinedColumn => "42703",
+        ErrorCategory::UndefinedObject => "42704",
+        ErrorCategory::PermissionDenied => "42501",
         ErrorCategory::DuplicateColumn => "42701",
         ErrorCategory::IndeterminateDatatype => "42P18",
         ErrorCategory::DatatypeMismatch => "42804",
@@ -1061,6 +1063,8 @@ mod tests {
     fn maps_neutral_error_categories_to_sqlstate() {
         assert_eq!(error_sqlstate(ErrorCategory::Syntax), "42601");
         assert_eq!(error_sqlstate(ErrorCategory::Unsupported), "0A000");
+        assert_eq!(error_sqlstate(ErrorCategory::UndefinedObject), "42704");
+        assert_eq!(error_sqlstate(ErrorCategory::PermissionDenied), "42501");
         assert_eq!(error_sqlstate(ErrorCategory::DuplicateColumn), "42701");
         assert_eq!(error_sqlstate(ErrorCategory::Cancelled), "57014");
         assert_eq!(error_sqlstate(ErrorCategory::UniqueViolation), "23505");

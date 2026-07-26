@@ -7,8 +7,7 @@ license.workspace = true
 # Engine-backed pgwire server (prototype→production plan, P0-M3). Serves the
 # relational subset through the protocol-neutral façade: pgwire wire framing from
 # `gpu_db_protocol`, execution via `gpu_db_facade` over the real `Engine`. This is
-# the unification target — a server that speaks the wire AND uses the engine —
-# distinct from the legacy in-memory `gpu-db-server` in the protocol crate.
+# the sole product listener — a server that speaks the wire AND uses the engine.
 
 [[bin]]
 name = "gpu-db-engine-server"
@@ -20,6 +19,7 @@ gpu_db_facade = { path = "../facade" }
 base64 = "0.22"
 hmac = "0.12"
 pbkdf2 = "0.12"
+pg_query = "6"
 rand = "0.8"
 rustls = "0.23"
 rustls-pemfile = "2"
@@ -48,11 +48,7 @@ bytes = "1"
 futures-util = "0.3"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "chrono", "uuid", "bigdecimal"] }
 bigdecimal = "0.4"
-# For the GPU-retained benchmark example only: it builds + warms an Engine to GPU residency,
-# then serves it through the façade. The library itself never depends on the engine directly.
+# GPU-native server tests and the retained-query mix example construct a real engine and inspect
+# device-route facts without introducing another listener or product submission boundary.
 gpu_db_engine = { path = "../engine" }
-# The engine+pgwire integration examples (`p8_engine_*`) live here — the server is
-# the layer that legitimately spans both the engine and the wire crate. They reach
-# into the engine's residency/metrics internals directly, so those are dev-deps too.
 gpu_db_execution = { path = "../execution" }
-gpu_db_metrics = { path = "../metrics" }

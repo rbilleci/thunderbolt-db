@@ -83,17 +83,20 @@ impl Engine {
                 type_oid: SqlType::Text.postgres_oid(),
                 type_size: SqlType::Text.type_size(),
             }],
-            Command::SelectLiteral(literal) => vec![RelationalColumn {
-                id: 0,
-                table_oid: 0,
-                attnum: 0,
-                name: literal.column_name.clone(),
-                ty: literal.ty,
-                domain: None,
-                default: None,
-                type_oid: literal.ty.postgres_oid(),
-                type_size: literal.ty.type_size(),
-            }],
+            Command::SelectLiteral(literal) => {
+                infer_value(&literal.value, literal.ty, &mut parameter_types)?;
+                vec![RelationalColumn {
+                    id: 0,
+                    table_oid: 0,
+                    attnum: 0,
+                    name: literal.column_name.clone(),
+                    ty: literal.ty,
+                    domain: None,
+                    default: None,
+                    type_oid: literal.ty.postgres_oid(),
+                    type_size: literal.ty.type_size(),
+                }]
+            }
             Command::SequenceNextVal(_) => vec![sequence_result_column("nextval")],
             Command::SequenceCurrVal(_) => vec![sequence_result_column("currval")],
             Command::SequenceSetVal(_) => vec![sequence_result_column("setval")],
@@ -229,11 +232,9 @@ fn prepared_select_table(
     }
     if catalog.relational_views.contains_key(name) {
         if !select_is_plain_view_scan(select) {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                format!(
-                    "prepared SELECT over public relation {name:?} requires a supported base-table route"
-                ),
-            )));
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "prepared SELECT over public relation {name:?} requires a supported base-table route"
+            ))));
         }
         return prepared_view_table(catalog, name, &mut BTreeSet::new());
     }
@@ -346,6 +347,9 @@ fn infer_select_parameters(
             infer_value(&filter.value, column.ty, parameter_types)?;
         }
     }
+    if let Some(index) = select.prepared_limit_parameter_index() {
+        infer_parameter(index, None, SqlType::Int4, parameter_types)?;
+    }
     Ok(())
 }
 
@@ -414,6 +418,15 @@ fn infer_value(
     let SqlValue::Parameter { index, cast } = value else {
         return Ok(());
     };
+    infer_parameter(*index, *cast, context, parameter_types)
+}
+
+fn infer_parameter(
+    index: usize,
+    cast: Option<SqlType>,
+    context: SqlType,
+    parameter_types: &mut [Option<SqlType>],
+) -> Result<(), ExecuteError> {
     let inferred = cast.unwrap_or(context);
     if cast.is_some() && !same_type_family(inferred, context) {
         return Err(ExecuteError::DatatypeMismatch(format!(
@@ -473,6 +486,33 @@ mod tests {
         assert_eq!(description.result_columns.len(), 1);
         assert_eq!(description.result_columns[0].name, "balance");
         assert_eq!(description.result_columns[0].ty, SqlType::Int8);
+    }
+
+    #[test]
+    fn description_infers_an_int4_parameterized_limit() {
+        let engine = Engine::new_local();
+        engine
+            .execute_text(1, "CREATE TABLE limited_accounts (id int4)")
+            .unwrap();
+        let prepared = PreparedCommand::parse(
+            "SELECT id FROM limited_accounts WHERE id >= $1 ORDER BY id LIMIT $2",
+        )
+        .unwrap();
+        let description = engine.describe_prepared_command(&prepared, &[]).unwrap();
+        assert_eq!(
+            description.parameter_types,
+            vec![SqlType::Int4, SqlType::Int4]
+        );
+    }
+
+    #[test]
+    fn description_infers_prepared_int4_scalar_addition() {
+        let engine = Engine::new_local();
+        let prepared = PreparedCommand::parse("SELECT $1 + 10 AS plus_ten").unwrap();
+        let description = engine.describe_prepared_command(&prepared, &[]).unwrap();
+        assert_eq!(description.parameter_types, vec![SqlType::Int4]);
+        assert_eq!(description.result_columns[0].name, "plus_ten");
+        assert_eq!(description.result_columns[0].ty, SqlType::Int4);
     }
 
     #[test]

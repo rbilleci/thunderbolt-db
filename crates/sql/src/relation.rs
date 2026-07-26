@@ -265,10 +265,7 @@ pub(super) fn parse_relational_command(
     if first.eq_ignore_ascii_case("INSERT") {
         return Some(parse_insert(input).map(Command::Insert));
     }
-    if first.eq_ignore_ascii_case("UPDATE")
-        && find_keyword_outside_quotes(input, "SET").is_some()
-        && find_keyword_outside_quotes(input, "WHERE").is_some()
-    {
+    if first.eq_ignore_ascii_case("UPDATE") {
         return Some(parse_update(input).map(Command::Update));
     }
     if first.eq_ignore_ascii_case("DELETE")
@@ -407,8 +404,14 @@ fn parse_add_foreign_key(input: &str) -> Result<AddForeignKey, ParseError> {
         .trim_start();
     let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
     let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
-    if close <= open || !rest[close + 1..].trim().is_empty() {
+    if close <= open {
         return Err(ParseError::InvalidRelationalSql);
+    }
+    if !rest[close + 1..].trim().is_empty() {
+        return Err(ParseError::Unsupported(
+            "foreign key options beyond single-column immediate constraints are not supported"
+                .to_string(),
+        ));
     }
     let referenced_table = normalize_relation_identifier(rest[..open].trim())?;
     let referenced_columns = split_csv(&rest[open + 1..close])?;
@@ -1307,10 +1310,6 @@ fn parse_truncate_table(input: &str) -> Result<TruncateTable, ParseError> {
     if let Some(before_restart) = strip_keyword_suffix_case_insensitive(rest, "RESTART IDENTITY") {
         rest = before_restart.trim_end();
         restart_identity = true;
-    } else if let Some(before_continue) =
-        strip_keyword_suffix_case_insensitive(rest, "CONTINUE IDENTITY")
-    {
-        rest = before_continue.trim_end();
     }
     if rest.is_empty()
         || find_keyword_outside_quotes(rest, "CASCADE").is_some()
@@ -1509,14 +1508,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_bounded_truncate_identity_modes() {
-        assert_eq!(
-            parse_truncate_table("TRUNCATE TABLE accounts CONTINUE IDENTITY").unwrap(),
-            TruncateTable {
-                name: "accounts".to_string(),
-                restart_identity: false,
-            }
-        );
+    fn parses_bounded_truncate_restart_identity_and_rejects_other_modes() {
         assert_eq!(
             parse_truncate_table("TRUNCATE ONLY accounts RESTART IDENTITY").unwrap(),
             TruncateTable {
@@ -1524,6 +1516,7 @@ mod tests {
                 restart_identity: true,
             }
         );
+        assert!(parse_truncate_table("TRUNCATE TABLE accounts CONTINUE IDENTITY").is_err());
         assert!(parse_truncate_table("TRUNCATE a, b CONTINUE IDENTITY").is_err());
         assert!(parse_truncate_table("TRUNCATE accounts CASCADE").is_err());
     }
@@ -1620,6 +1613,10 @@ mod tests {
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
+            parse_relational_command("UPDATE t SET a = 1", false),
+            Some(Err(ParseError::InvalidRelationalSql))
+        ));
+        assert!(matches!(
             parse_delete("DELETE FROM t WHERE id = 1 RETURNING"),
             Err(ParseError::InvalidRelationalSql)
         ));
@@ -1635,6 +1632,7 @@ mod tests {
                 column_name: "one".to_string(),
                 ty: SqlType::Int4,
                 value: SqlValue::Int4(1),
+                add_int4: None,
             })
         );
         assert_eq!(
@@ -1645,6 +1643,7 @@ mod tests {
                 column_name: "Display Name".to_string(),
                 ty: SqlType::Text,
                 value: SqlValue::Text("Ada".to_string()),
+                add_int4: None,
             })
         );
         assert!(matches!(
@@ -1665,6 +1664,7 @@ mod tests {
                 column_name: "set_config".to_string(),
                 ty: SqlType::Text,
                 value: SqlValue::Text(String::new()),
+                add_int4: None,
             })
         );
         assert!(parse_relational_command(
@@ -1681,6 +1681,7 @@ mod tests {
                 column_name: "pg_is_in_recovery".to_string(),
                 ty: SqlType::Bool,
                 value: SqlValue::Bool(false),
+                add_int4: None,
             })
         );
         assert_eq!(
@@ -1691,6 +1692,7 @@ mod tests {
                 column_name: "current_schemas".to_string(),
                 ty: SqlType::Text,
                 value: SqlValue::Text("{public}".to_string()),
+                add_int4: None,
             })
         );
     }

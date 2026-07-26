@@ -33,20 +33,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpu_db_engine::{
-    CopyMutationRequest, CopyTargetProof, Engine, ExecuteError, MutationRequest, RelationalColumn,
-    TransactionAdmissionResult, TransactionCopyTargetOrigin,
+    AuthorizationPrincipal, CopyMutationRequest, CopyTargetProof, Engine, ExecuteError,
+    MutationRequest, RelationalColumn, TransactionAdmissionResult, TransactionCopyTargetOrigin,
 };
 use gpu_db_sql::{
     parse_command, Command, CopyFromStdin, CopyToStdout, Decimal128, ParseError, ParsedCommand,
-    Select, SelectProjection, SqlType, SqlValue, TransactionCharacteristics, TransactionIsolation,
+    Select, SelectProjection, SetRoleScope, SqlType, SqlValue, TablePrivilege,
+    TransactionCharacteristics, TransactionIsolation,
 };
 
+mod command_tags;
 #[cfg(test)]
 mod mutation_admission_tests;
 pub mod pg_adapter;
 mod point_lookup_batcher;
 mod prepared;
 
+use command_tags::{command_tag, is_effect_free_session_function, reset_command_tag};
 pub use point_lookup_batcher::{PointLookupBatcher, PointLookupBatcherActivitySnapshot};
 pub use prepared::{BoundPreparedStatement, PreparedStatement};
 
@@ -190,6 +193,8 @@ pub enum ErrorCategory {
     Unsupported,
     UndefinedRelation,
     UndefinedColumn,
+    UndefinedObject,
+    PermissionDenied,
     DuplicateColumn,
     IndeterminateDatatype,
     DatatypeMismatch,
@@ -324,6 +329,14 @@ pub struct SharedSession {
     transaction_characteristics: Option<TransactionCharacteristics>,
     transaction_has_statement: bool,
     transaction_failed: bool,
+    /// Stable session role identity. The engine resolves the OID against each exact statement
+    /// snapshot; names never become authorization state and rename therefore preserves identity.
+    session_principal: AuthorizationPrincipal,
+    /// Session role at BEGIN. A transaction-scoped `SET SESSION ROLE` is effective immediately
+    /// but ROLLBACK restores this baseline; COMMIT retains the changed session role.
+    transaction_entry_session_principal: Option<AuthorizationPrincipal>,
+    /// `SET LOCAL ROLE` overrides the session role only until the current transaction ends.
+    transaction_local_principal: Option<AuthorizationPrincipal>,
     /// PostgreSQL session-local sequence state, keyed by catalog-stable sequence OID. It is
     /// intentionally neither transactional nor recovered from WAL.
     sequence_currvals: BTreeMap<u32, i64>,
@@ -353,6 +366,11 @@ impl SharedSession {
         (!self.transaction_failed)
             .then_some(self.active_txn_id)
             .flatten()
+    }
+
+    fn effective_principal(&self) -> AuthorizationPrincipal {
+        self.transaction_local_principal
+            .unwrap_or(self.session_principal)
     }
 }
 
@@ -410,6 +428,9 @@ impl SharedEngine {
             transaction_characteristics: None,
             transaction_has_statement: false,
             transaction_failed: false,
+            session_principal: AuthorizationPrincipal::BootstrapPostgres,
+            transaction_entry_session_principal: None,
+            transaction_local_principal: None,
             sequence_currvals: BTreeMap::new(),
         }
     }
@@ -490,6 +511,10 @@ impl SharedEngine {
             session.active_txn_id = None;
             session.transaction_characteristics = None;
             session.transaction_has_statement = false;
+            if let Some(entry) = session.transaction_entry_session_principal.take() {
+                session.session_principal = entry;
+            }
+            session.transaction_local_principal = None;
         }
         session.transaction_failed = false;
         session.sequence_currvals.clear();
@@ -650,6 +675,15 @@ fn submit_copy_from_start_with_hook(
                 }),
         }
         .map_err(map_execute_error)?;
+        shared
+            .engine
+            .authorize_relation_for_session(
+                session.active_txn_id,
+                session.effective_principal(),
+                &copy.table,
+                TablePrivilege::Insert,
+            )
+            .map_err(map_execute_error)?;
         on_target_resolved();
         let (column_names, columns) = match &copy.columns {
             None => (
@@ -742,7 +776,8 @@ fn submit_copy_from(
         .engine
         .submit_transaction(
             txn_id,
-            CopyMutationRequest::new(target.copy.clone(), rows, target.proof.clone()),
+            CopyMutationRequest::new(target.copy.clone(), rows, target.proof.clone())
+                .with_principal(session.effective_principal()),
         )
         .map_err(map_execute_error)
         .and_then(|admitted| match admitted {
@@ -898,7 +933,7 @@ fn submit_autocommit_parsed_with_catalog(
                 return Err(poisoned_engine_error());
             }
             let result = engine
-                .execute_relational_select(select)
+                .execute_relational_select_as_principal(select, session.effective_principal())
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
         }
@@ -926,7 +961,7 @@ fn submit_autocommit_parsed_with_catalog(
                 return Err(poisoned_engine_error());
             }
             let result = engine
-                .execute_relational_function(call)
+                .execute_relational_function_as_principal(call, session.effective_principal())
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
         }
@@ -953,7 +988,8 @@ fn submit_autocommit_parsed_with_catalog(
             if engine.is_commit_path_poisoned() {
                 return Err(poisoned_engine_error());
             }
-            let mut request = MutationRequest::new(parsed);
+            let mut request =
+                MutationRequest::new(parsed).with_principal(session.effective_principal());
             if let Some(version) = expected_catalog_version {
                 request = request.with_expected_catalog_version(version);
             }
@@ -999,6 +1035,13 @@ fn submit_text_inner(
     let parsed = match ParsedCommand::parse_allowing_catalog(sql) {
         Ok(parsed) => parsed,
         Err(ParseError::Empty) => return Ok(QueryOutcome::Empty),
+        // LIMIT/OFFSET negativity is already a precise typed-parser diagnosis.  It is not an
+        // indication that this is richer SQL for libpg_query to lower, and sending it there loses
+        // the PostgreSQL-compatible error in favor of the general lowerer's broader diagnostic.
+        Err(error @ (ParseError::NegativeLimit | ParseError::NegativeOffset)) => {
+            session.mark_transaction_failed();
+            return Err(map_parse_error(error));
+        }
         // The typed parser intentionally rejects joins, expressions, and other richer SELECT
         // syntax. The engine's libpg_query lowering is the one general GPU relational path for
         // those statements; an actual syntax error or non-SELECT still fails pre-effect there.
@@ -1028,8 +1071,14 @@ fn submit_general_select_text_inner(
     let result = match session.active_txn_id {
         Some(txn_id) => shared
             .engine
-            .execute_resident_expr_select_sql_in_transaction(txn_id, sql),
-        None => shared.engine.execute_resident_expr_select_sql(sql),
+            .execute_resident_expr_select_sql_in_transaction_as_principal(
+                txn_id,
+                sql,
+                session.effective_principal(),
+            ),
+        None => shared
+            .engine
+            .execute_resident_expr_select_sql_as_principal(sql, session.effective_principal()),
     }
     .map(map_relational_result)
     .map_err(map_execute_error);
@@ -1155,6 +1204,47 @@ fn submit_parsed_inner(
     expected_catalog_version: Option<u64>,
 ) -> Result<QueryOutcome, DbError> {
     match parsed.command() {
+        Command::SetRole { role, scope } => {
+            let reset_syntax = parsed
+                .source()
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("RESET");
+            // PostgreSQL accepts SET LOCAL outside a transaction as a successful no-op (a NOTICE
+            // is optional on this protocol surface).  Do not resolve the requested role or mutate
+            // session identity: there is no local scope to install.
+            if *scope == SetRoleScope::Local && session.active_txn_id.is_none() {
+                return Ok(QueryOutcome::Command {
+                    tag: CommandTag::Other(if reset_syntax { "RESET" } else { "SET" }.to_string()),
+                    rows_affected: None,
+                });
+            }
+            let principal = match role {
+                Some(role) => shared
+                    .engine
+                    .resolve_authorization_principal_at(session.active_txn_id, role)
+                    .map_err(map_execute_error)?,
+                None => AuthorizationPrincipal::BootstrapPostgres,
+            };
+            match scope {
+                SetRoleScope::Session => {
+                    // SESSION takes effect immediately even inside a transaction and supersedes
+                    // any prior LOCAL override for the remainder of that transaction.
+                    session.session_principal = principal;
+                    session.transaction_local_principal = None;
+                }
+                SetRoleScope::Local => {
+                    // `SET LOCAL ROLE DEFAULT|NONE` is an explicit bootstrap override, while
+                    // `RESET LOCAL ROLE` removes the override and exposes the session role.
+                    session.transaction_local_principal =
+                        if reset_syntax { None } else { Some(principal) };
+                }
+            }
+            Ok(QueryOutcome::Command {
+                tag: CommandTag::Other(if reset_syntax { "RESET" } else { "SET" }.to_string()),
+                rows_affected: None,
+            })
+        }
         Command::PreparedCatalog(program) => {
             if shared.engine.is_commit_path_poisoned() {
                 return Err(poisoned_engine_error());
@@ -1202,11 +1292,7 @@ fn submit_parsed_inner(
             })
         }
         Command::ResetAll => Ok(QueryOutcome::Command {
-            // The SQL parser deliberately normalizes the bounded session-cleanup family
-            // (RESET/DISCARD/DEALLOCATE/CLOSE/UNLISTEN) to one effect-free command. It belongs
-            // to the session control plane and must neither enter transaction catalog staging
-            // nor claim an autocommit transaction/WAL position.
-            tag: command_tag(parsed.command()),
+            tag: reset_command_tag(parsed.source()),
             rows_affected: None,
         }),
         Command::ShowTransactionIsolation => {
@@ -1252,6 +1338,8 @@ fn submit_parsed_inner(
                 session.transaction_characteristics = Some(accepted);
                 session.transaction_has_statement = false;
                 session.transaction_failed = false;
+                session.transaction_entry_session_principal = Some(session.session_principal);
+                session.transaction_local_principal = None;
             }
             Ok(QueryOutcome::Command {
                 tag: CommandTag::Begin,
@@ -1280,6 +1368,9 @@ fn submit_parsed_inner(
                     successor.and(session.transaction_characteristics);
                 session.transaction_has_statement = false;
                 session.transaction_failed = false;
+                session.transaction_local_principal = None;
+                session.transaction_entry_session_principal =
+                    successor.map(|_| session.session_principal);
             }
             Ok(QueryOutcome::Command {
                 tag: CommandTag::Commit,
@@ -1308,6 +1399,12 @@ fn submit_parsed_inner(
                     successor.and(session.transaction_characteristics);
                 session.transaction_has_statement = false;
                 session.transaction_failed = false;
+                if let Some(entry) = session.transaction_entry_session_principal.take() {
+                    session.session_principal = entry;
+                }
+                session.transaction_local_principal = None;
+                session.transaction_entry_session_principal =
+                    successor.map(|_| session.session_principal);
             }
             Ok(QueryOutcome::Command {
                 tag: CommandTag::Rollback,
@@ -1323,7 +1420,11 @@ fn submit_parsed_inner(
                 .expect("guarded by transaction-active match arm");
             let result = shared
                 .engine
-                .execute_relational_select_in_transaction(txn_id, select)
+                .execute_relational_select_in_transaction_as_principal(
+                    txn_id,
+                    select,
+                    session.effective_principal(),
+                )
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
         }
@@ -1365,7 +1466,11 @@ fn submit_parsed_inner(
                 .expect("guarded by transaction-active match arm");
             let result = shared
                 .engine
-                .execute_relational_function_in_transaction(txn_id, call)
+                .execute_relational_function_in_transaction_as_principal(
+                    txn_id,
+                    call,
+                    session.effective_principal(),
+                )
                 .map_err(map_execute_error)?;
             Ok(map_relational_result(result))
         }
@@ -1400,7 +1505,8 @@ fn submit_parsed_inner(
                 .active_txn_id
                 .expect("guarded by transaction-active match arm");
             let tag = command_tag(parsed.command());
-            let mut request = MutationRequest::new(parsed);
+            let mut request =
+                MutationRequest::new(parsed).with_principal(session.effective_principal());
             if let Some(version) = expected_catalog_version {
                 request = request.with_expected_catalog_version(version);
             }
@@ -1421,7 +1527,8 @@ fn submit_parsed_inner(
                 .expect("guarded by transaction-active match arm");
             let tag = command_tag(parsed.command());
             let sequence_column = sequence_value_column(parsed.command());
-            let mut request = MutationRequest::new(parsed);
+            let mut request =
+                MutationRequest::new(parsed).with_principal(session.effective_principal());
             if let Some(version) = expected_catalog_version {
                 request = request.with_expected_catalog_version(version);
             }
@@ -1476,7 +1583,10 @@ fn reset_empty_transaction_characteristics(
     }
     let result = shared
         .engine
-        .submit_transaction(current_txn_id, MutationRequest::new(parsed))
+        .submit_transaction(
+            current_txn_id,
+            MutationRequest::new(parsed).with_principal(session.effective_principal()),
+        )
         .map_err(map_execute_error)?;
     let TransactionAdmissionResult::Command = result else {
         return Err(invalid_mutation_result("SET TRANSACTION"));
@@ -1518,7 +1628,9 @@ fn submit_instrumented_dml(
         });
     }
     let txn_id = shared.take_txn_id()?;
-    let request = MutationRequest::new(parsed).with_prepared_hook(on_prepared);
+    let request = MutationRequest::new(parsed)
+        .with_principal(session.effective_principal())
+        .with_prepared_hook(on_prepared);
     match engine
         .submit_transaction(txn_id, request)
         .map_err(map_execute_error)?
@@ -1603,6 +1715,10 @@ fn submit_batched_text_inner(
     let parsed = match ParsedCommand::parse_allowing_catalog(sql) {
         Ok(parsed) => parsed,
         Err(ParseError::Empty) => return SubmissionDispatch::Immediate(Ok(QueryOutcome::Empty)),
+        Err(error @ (ParseError::NegativeLimit | ParseError::NegativeOffset)) => {
+            session.mark_transaction_failed();
+            return SubmissionDispatch::Immediate(Err(map_parse_error(error)));
+        }
         Err(_) if gpu_db_sql::is_select_statement(sql) => {
             return SubmissionDispatch::Immediate(submit_general_select_text_inner(
                 shared, session, sql,
@@ -1614,6 +1730,7 @@ fn submit_batched_text_inner(
         }
     };
     if session.in_transaction()
+        || !session.effective_principal().is_bootstrap()
         || matches!(
             parsed.command(),
             Command::Begin { .. } | Command::Commit { .. } | Command::Rollback { .. }
@@ -1764,7 +1881,18 @@ fn map_parse_error(err: ParseError) -> DbError {
     };
     DbError {
         category,
-        message: err.to_string(),
+        message: match err {
+            ParseError::InvalidRelationalSql => {
+                "query shape is not supported by the compatibility stub".to_string()
+            }
+            ParseError::Unsupported(message)
+                if message
+                    == "foreign key options beyond single-column immediate constraints are not supported" =>
+            {
+                message
+            }
+            other => other.to_string(),
+        },
     }
 }
 
@@ -1789,6 +1917,8 @@ fn map_execute_error(err: ExecuteError) -> DbError {
             }
             ExecuteError::UndefinedRelation(_) => ErrorCategory::UndefinedRelation,
             ExecuteError::UndefinedColumn(_) => ErrorCategory::UndefinedColumn,
+            ExecuteError::UndefinedRole(_) => ErrorCategory::UndefinedObject,
+            ExecuteError::PermissionDenied(_) => ErrorCategory::PermissionDenied,
             ExecuteError::IndeterminateParameterType(_) => ErrorCategory::IndeterminateDatatype,
             ExecuteError::DatatypeMismatch(_) => ErrorCategory::DatatypeMismatch,
             ExecuteError::InvalidRequest(_) => ErrorCategory::InvalidRequest,
@@ -1797,10 +1927,140 @@ fn map_execute_error(err: ExecuteError) -> DbError {
             _ => ErrorCategory::Engine,
         }
     };
-    DbError {
-        category,
-        message: err.to_string(),
+    let message = postgres_compatibility_error_message(&err);
+    DbError { category, message }
+}
+
+fn postgres_compatibility_error_message(err: &ExecuteError) -> String {
+    if err.is_unique_violation() {
+        return "duplicate key value violates unique index".to_string();
     }
+    if err.is_foreign_key_violation() {
+        return "insert or update violates foreign key constraint".to_string();
+    }
+    if err.is_check_violation() {
+        return "new row violates check constraint".to_string();
+    }
+
+    let raw = err.to_string();
+    let mut message = raw.as_str();
+    while let Some(stripped) = message.strip_prefix("apply failed: ") {
+        message = stripped;
+    }
+    let message = message
+        .strip_suffix(" in the bootstrap relational subset")
+        .unwrap_or(message);
+    if message.starts_with("GPU execution is required for SELECT on relation \"")
+        && message.ends_with(": no GPU route accepted the statement")
+    {
+        return "relation does not exist".to_string();
+    }
+    // The hand-rolled compatibility subset presents SUM/AVG as int4-only even though the general
+    // GPU executor also has wider numeric operators. Keep its public failure contract stable; a
+    // successful wider aggregate still runs through the general device path unchanged.
+    if message == "SUM supports int2 / int4 / int8 / numeric columns" {
+        return "SUM only supports int4 columns".to_string();
+    }
+    if message == "AVG supports int2 / int4 / int8 / numeric columns" {
+        return "AVG only supports int4 columns".to_string();
+    }
+
+    for object in [
+        "relation",
+        "view",
+        "materialized view",
+        "index",
+        "column",
+        "constraint",
+        "domain",
+        "sequence",
+        "role",
+        "database",
+        "tablespace",
+        "publication",
+        "subscription",
+        "function",
+    ] {
+        if quoted_object_message_has_suffix(message, object, "does not exist") {
+            return format!("{object} does not exist");
+        }
+        if quoted_object_message_has_suffix(message, object, "already exists") {
+            if object == "function" {
+                return "function already exists with same argument types".to_string();
+            }
+            return format!("{object} already exists");
+        }
+    }
+    if message == "the general GPU executor supports exactly one FROM relation (no joins yet)" {
+        return "query shape is not supported by the compatibility stub".to_string();
+    }
+    for object in ["schema", "extension"] {
+        if quoted_object_message_has_suffix(message, object, "does not exist") {
+            return format!("{object} does not exist");
+        }
+    }
+    for kind in ["table", "view", "materialized view", "sequence"] {
+        if quoted_object_message_has_suffix(message, "relation", &format!("is not a {kind}")) {
+            return format!("relation is not a {kind}");
+        }
+    }
+    if quoted_object_message_has_suffix(
+        message,
+        "role",
+        "cannot be dropped because dependent metadata exists",
+    ) {
+        return "role cannot be dropped because dependent metadata exists".to_string();
+    }
+    for object in ["table", "view", "subscription"] {
+        if quoted_object_message_has_suffix(message, object, "specified more than once") {
+            return format!("{object} specified more than once");
+        }
+    }
+    if quoted_object_message_has_suffix(message, "publication", "specified more than once") {
+        return "subscription publication specified more than once".to_string();
+    }
+    for action in ["drop", "rename"] {
+        for object in ["role", "database", "tablespace"] {
+            let prefix = format!("cannot {action} bootstrap {object} \"");
+            if message
+                .strip_prefix(&prefix)
+                .is_some_and(|name| !name.is_empty() && name.ends_with('"'))
+            {
+                return format!("cannot {action} bootstrap {object}");
+            }
+        }
+    }
+    for (prefix, suffix) in [
+        (
+            "cannot drop column",
+            "because an index or constraint depends on it",
+        ),
+        ("cannot rename relation", "because a view depends on it"),
+        ("cannot replace view", "because another view depends on it"),
+        ("cannot rename view", "because another view depends on it"),
+        ("cannot drop view", "because another view depends on it"),
+        (
+            "cannot drop table",
+            "because a foreign key constraint depends on it",
+        ),
+        ("cannot drop domain", "because other objects depend on it"),
+    ] {
+        if message.starts_with(&format!("{prefix} \""))
+            && message.ends_with(&format!("\" {suffix}"))
+        {
+            return format!("{prefix} {suffix}");
+        }
+    }
+    message.to_string()
+}
+
+fn quoted_object_message_has_suffix(message: &str, object: &str, suffix: &str) -> bool {
+    let prefix = format!("{object} \"");
+    let Some(rest) = message.strip_prefix(&prefix) else {
+        return false;
+    };
+    rest.rsplit_once("\" ")
+        .is_some_and(|(name, ending)| !name.is_empty() && ending == suffix)
 }
 
 fn map_logical_type(ty: SqlType) -> LogicalType {
@@ -1879,15 +2139,26 @@ fn sequence_currval_outcome(
     }
     let oid = shared
         .engine
-        .sequence_oid_for_session(session.active_txn_id, name)
-        .map_err(map_execute_error)?;
+        .authorize_sequence_for_session(
+            session.active_txn_id,
+            session.effective_principal(),
+            name,
+            TablePrivilege::Select,
+        )
+        .map_err(map_execute_error)
+        .and_then(|()| {
+            shared
+                .engine
+                .sequence_oid_for_session(session.active_txn_id, name)
+                .map_err(map_execute_error)
+        })?;
     let value = session
         .sequence_currvals
         .get(&oid)
         .copied()
         .ok_or_else(|| DbError {
             category: ErrorCategory::InvalidRequest,
-            message: format!("currval of sequence \"{name}\" is not yet defined in this session"),
+            message: "currval of sequence is not yet defined in this session".to_string(),
         })?;
     Ok(sequence_value_rows("currval", value))
 }
@@ -1967,22 +2238,6 @@ fn map_db_value(value: &DbValue) -> SqlValue {
         DbValue::Timestamp(value) => SqlValue::Timestamp(*value),
         DbValue::Uuid(value) => SqlValue::Uuid(*value),
     }
-}
-
-fn command_tag(command: &Command) -> CommandTag {
-    match command {
-        Command::CreateTable(_) => CommandTag::CreateTable,
-        Command::CreateIndex(_) => CommandTag::CreateIndex,
-        Command::Insert(_) => CommandTag::Insert,
-        Command::Update(_) => CommandTag::Update,
-        Command::Delete(_) => CommandTag::Delete,
-        Command::TruncateTable(_) => CommandTag::Truncate,
-        _ => CommandTag::Other("OK".to_string()),
-    }
-}
-
-fn is_effect_free_session_function(call: &gpu_db_sql::SelectFunction) -> bool {
-    call.name == "pg_advisory_unlock_all"
 }
 
 #[cfg(test)]

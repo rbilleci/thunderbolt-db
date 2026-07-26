@@ -787,6 +787,9 @@ impl Engine {
         predicates: &[Option<crate::engine_expr::ResidentExpr>],
         copin_s: Index,
     ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
+        if plan.distinct {
+            return None;
+        }
         if plan.relations.len() > 2 {
             return self.try_streaming_nway_join(plan, tables, predicates, copin_s);
         }

@@ -6,16 +6,25 @@
 use super::*;
 
 mod compatibility;
+mod pg16_relations;
 pub(crate) use compatibility::{
     catalog_constraint_oid, catalog_index_entries, catalog_index_oid, synthesize_pg_tablespace,
 };
 use compatibility::{
-    relation_acl_array, synthesize_pg_default_acl, synthesize_pg_description,
-    synthesize_pg_indexes, synthesize_pg_language, synthesize_pg_proc, synthesize_pg_roles,
-    synthesize_pg_views,
+    description_catalog_id, relation_acl_array, synthesize_pg_default_acl,
+    synthesize_pg_description, synthesize_pg_indexes, synthesize_pg_language, synthesize_pg_proc,
+    synthesize_pg_roles, synthesize_pg_views, PG_CLASS_CLASS_OID,
+};
+pub(crate) use pg16_relations::synthesize_information_schema_key_column_usage;
+use pg16_relations::{
+    synthesize_information_schema_schemata, synthesize_information_schema_table_constraints,
+    synthesize_information_schema_views, synthesize_pg_attrdef, synthesize_pg_extension,
+    synthesize_pg_index, synthesize_pg_publication, synthesize_pg_publication_rel,
+    synthesize_pg_subscription, synthesize_pg_tables,
 };
 
 pub(crate) const GPU_CATALOG_RELKIND_DISPLAY: &str = "__gpu_relkind_display";
+pub(crate) const GPU_CATALOG_RELPERSISTENCE_DISPLAY: &str = "__gpu_relpersistence_display";
 pub(crate) const GPU_CATALOG_OWNER_NAME: &str = "__gpu_owner_name";
 pub(crate) const GPU_CATALOG_FALSE: &str = "__gpu_false";
 pub(crate) const GPU_CATALOG_EMPTY_TEXT: &str = "__gpu_empty_text";
@@ -42,6 +51,8 @@ pub(crate) const GPU_CATALOG_POLICY_DISPLAY: &str = "__gpu_policy_display";
 pub(crate) const GPU_CATALOG_CURRENT_USER_MATCH: &str = "__gpu_current_user_match";
 pub(crate) const GPU_CATALOG_TABLESPACE_LOCATION: &str = "__gpu_tablespace_location";
 pub(crate) const GPU_CATALOG_TABLESPACE_SIZE: &str = "__gpu_tablespace_size";
+pub(crate) const GPU_CATALOG_RELATION_SIZE: &str = "__gpu_relation_size";
+pub(crate) const GPU_CATALOG_NULL_INT4: &str = "__gpu_null_int4";
 
 fn sql_pg_error(message: String) -> ExecuteError {
     ExecuteError::Engine(EngineError::ApplyFailed(message))
@@ -60,7 +71,7 @@ fn sql_pg_error(message: String) -> ExecuteError {
 //
 // Catalog columns whose PostgreSQL type the engine lacks (`oid`, `name`, `char`) are
 // mapped to the nearest engine type (oid -> int4, name/char -> text) — the VALUES are
-// faithful. NULL-bearing columns are omitted until the value model gains NULL (M3).
+// faithful. NULL-bearing fields use the engine's typed-column validity representation.
 // ============================================================================
 
 /// The OID PostgreSQL assigns the `public` schema — the one namespace every engine
@@ -74,6 +85,8 @@ pub(crate) const PG_INFORMATION_SCHEMA_NAMESPACE_OID: i32 = 13183;
 pub(crate) const PG_BOOTSTRAP_OWNER_OID: i32 = 10;
 /// The built-in heap table access method OID.
 pub(crate) const PG_HEAP_AM_OID: i32 = 2;
+/// The built-in btree index access method OID.
+pub(crate) const PG_BTREE_AM_OID: i32 = 403;
 
 /// Built-in relation names whose implicit `pg_catalog` lookup precedes the modeled public schema.
 /// This includes every relation synthesized by this GPU catalog slice plus the binding-only
@@ -89,6 +102,7 @@ pub(crate) const MODELED_PG_CATALOG_RELATION_NAMES: &[&str] = &[
     "pg_description",
     "pg_default_acl",
     "pg_inherits",
+    "pg_index",
     "pg_indexes",
     "pg_language",
     "pg_namespace",
@@ -101,6 +115,7 @@ pub(crate) const MODELED_PG_CATALOG_RELATION_NAMES: &[&str] = &[
     "pg_roles",
     "pg_settings",
     "pg_statistic_ext",
+    "pg_tables",
     "pg_tablespace",
     "pg_trigger",
     "pg_type",
@@ -206,29 +221,24 @@ fn schema_acl_array_value(catalog: &CatalogSnapshot) -> SqlValue {
     if catalog.relational_schema_acl.is_empty() {
         return SqlValue::Null;
     }
-    let mut entries = vec![
-        "postgres=UC/postgres".to_string(),
-        "=U/postgres".to_string(),
-    ];
-    entries.extend(
-        catalog
-            .relational_schema_acl
-            .iter()
-            .filter_map(|(grantee, privileges)| {
-                if privileges.is_empty() {
-                    return None;
-                }
-                let mut letters = String::new();
-                if privileges.contains(&SchemaPrivilege::Usage) {
-                    letters.push('U');
-                }
-                if privileges.contains(&SchemaPrivilege::Create) {
-                    letters.push('C');
-                }
-                let grantee = if grantee == "public" { "" } else { grantee };
-                Some(format!("{grantee}={letters}/postgres"))
-            }),
-    );
+    let entries = catalog
+        .relational_schema_acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let mut letters = String::new();
+            if privileges.contains(&SchemaPrivilege::Usage) {
+                letters.push('U');
+            }
+            if privileges.contains(&SchemaPrivilege::Create) {
+                letters.push('C');
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!("{grantee}={letters}/postgres"))
+        })
+        .collect::<Vec<_>>();
     SqlValue::Text(format!("{{{}}}", entries.join(",")))
 }
 
@@ -265,7 +275,13 @@ pub(crate) fn synthesize_pg_class(
     );
     let namespace = SqlValue::Int4(PG_PUBLIC_NAMESPACE_OID);
     let owner = SqlValue::Int4(PG_BOOTSTRAP_OWNER_OID);
-    let row = |oid: u32, name: &str, kind: &str, natts: usize, has_index: bool| {
+    let row = |oid: u32,
+               name: &str,
+               kind: &str,
+               natts: usize,
+               has_index: bool,
+               check_count: usize,
+               has_triggers: bool| {
         vec![
             SqlValue::Int4(oid as i32),
             SqlValue::Text(name.to_string()),
@@ -275,10 +291,14 @@ pub(crate) fn synthesize_pg_class(
             owner.clone(),
             SqlValue::Bool(has_index),
             SqlValue::Text("p".to_string()),
-            SqlValue::Int4(PG_HEAP_AM_OID),
-            SqlValue::Int4(0),
+            SqlValue::Int4(if kind == "i" {
+                PG_BTREE_AM_OID
+            } else {
+                PG_HEAP_AM_OID
+            }),
+            SqlValue::Int4(check_count as i32),
             SqlValue::Bool(false),
-            SqlValue::Bool(false),
+            SqlValue::Bool(has_triggers),
             SqlValue::Bool(false),
             SqlValue::Bool(false),
             SqlValue::Bool(false),
@@ -290,22 +310,38 @@ pub(crate) fn synthesize_pg_class(
     };
     let mut rows = Vec::new();
     for t in catalog.relational_catalog.values() {
+        let has_referencing_foreign_key = catalog.relational_catalog.values().any(|candidate| {
+            candidate
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.referenced_table == t.name)
+        });
         rows.push(row(
             t.oid,
             &t.name,
             "r",
             t.columns.len(),
             !t.indexes.is_empty(),
+            t.check_constraints.len(),
+            !t.foreign_keys.is_empty() || has_referencing_foreign_key,
         ));
     }
     for v in catalog.relational_views.values() {
-        rows.push(row(v.oid, &v.name, "v", 0, false));
+        rows.push(row(v.oid, &v.name, "v", 0, false, 0, false));
     }
     for mv in catalog.relational_materialized_views.values() {
-        rows.push(row(mv.oid, &mv.name, "m", mv.columns.len(), false));
+        rows.push(row(
+            mv.oid,
+            &mv.name,
+            "m",
+            mv.columns.len(),
+            false,
+            0,
+            false,
+        ));
     }
     for s in catalog.relational_sequences.values() {
-        rows.push(row(s.oid, &s.name, "S", 0, false));
+        rows.push(row(s.oid, &s.name, "S", 0, false, 0, false));
     }
     for index in catalog_index_entries(catalog) {
         rows.push(row(
@@ -314,12 +350,14 @@ pub(crate) fn synthesize_pg_class(
             "i",
             index.attnums.len(),
             false,
+            0,
+            false,
         ));
     }
     (table, rows)
 }
 
-/// `pg_catalog.pg_am` — the heap access method used by synthesized user relations.
+/// `pg_catalog.pg_am` — the heap and btree access methods used by synthesized relations.
 pub(crate) fn synthesize_pg_am() -> (RelationalTable, Vec<Vec<SqlValue>>) {
     let table = catalog_relation_table(
         "pg_catalog",
@@ -328,10 +366,16 @@ pub(crate) fn synthesize_pg_am() -> (RelationalTable, Vec<Vec<SqlValue>>) {
     );
     (
         table,
-        vec![vec![
-            SqlValue::Int4(PG_HEAP_AM_OID),
-            SqlValue::Text("heap".to_string()),
-        ]],
+        vec![
+            vec![
+                SqlValue::Int4(PG_HEAP_AM_OID),
+                SqlValue::Text("heap".to_string()),
+            ],
+            vec![
+                SqlValue::Int4(PG_BTREE_AM_OID),
+                SqlValue::Text("btree".to_string()),
+            ],
+        ],
     )
 }
 
@@ -349,6 +393,10 @@ pub(crate) fn synthesize_pg_constraint(
             ("contype", SqlType::Text),
             ("conparentid", SqlType::Int4),
             ("confrelid", SqlType::Int4),
+            ("conindid", SqlType::Int4),
+            ("condeferrable", SqlType::Bool),
+            ("condeferred", SqlType::Bool),
+            ("convalidated", SqlType::Bool),
         ],
     );
     let mut rows = Vec::new();
@@ -366,6 +414,10 @@ pub(crate) fn synthesize_pg_constraint(
                 SqlValue::Text(if index.primary_key { "p" } else { "u" }.to_string()),
                 SqlValue::Int4(0),
                 SqlValue::Int4(0),
+                SqlValue::Int4(index.oid as i32),
+                SqlValue::Bool(false),
+                SqlValue::Bool(false),
+                SqlValue::Bool(true),
             ]);
         }
         for constraint in &relation.check_constraints {
@@ -378,6 +430,10 @@ pub(crate) fn synthesize_pg_constraint(
                 SqlValue::Text("c".to_string()),
                 SqlValue::Int4(0),
                 SqlValue::Int4(0),
+                SqlValue::Int4(0),
+                SqlValue::Bool(false),
+                SqlValue::Bool(false),
+                SqlValue::Bool(true),
             ]);
         }
         for constraint in &relation.foreign_keys {
@@ -394,6 +450,10 @@ pub(crate) fn synthesize_pg_constraint(
                 SqlValue::Text("f".to_string()),
                 SqlValue::Int4(0),
                 SqlValue::Int4(referenced_oid),
+                SqlValue::Int4(0),
+                SqlValue::Bool(false),
+                SqlValue::Bool(false),
+                SqlValue::Bool(true),
             ]);
         }
     }
@@ -435,6 +495,9 @@ pub(crate) fn synthesize_pg_attribute(
             ("attcollation", SqlType::Int4),
             ("attidentity", SqlType::Text),
             ("attgenerated", SqlType::Text),
+            ("attstorage", SqlType::Text),
+            ("attcompression", SqlType::Text),
+            ("attstattarget", SqlType::Int4),
         ],
     );
     let attribute_row = |oid: u32, col: &RelationalColumn| {
@@ -451,6 +514,9 @@ pub(crate) fn synthesize_pg_attribute(
             SqlValue::Int4(0),
             SqlValue::Text(String::new()),
             SqlValue::Text(String::new()),
+            SqlValue::Text(if col.ty == SqlType::Text { "x" } else { "p" }.to_string()),
+            SqlValue::Text(String::new()),
+            SqlValue::Int4(-1),
         ]
     };
     let mut rows = Vec::new();
@@ -538,28 +604,109 @@ pub(crate) fn synthesize_information_schema_tables(
             ("table_schema", SqlType::Text),
             ("table_name", SqlType::Text),
             ("table_type", SqlType::Text),
+            ("self_referencing_column_name", SqlType::Text),
+            ("reference_generation", SqlType::Text),
+            ("user_defined_type_catalog", SqlType::Text),
+            ("user_defined_type_schema", SqlType::Text),
+            ("user_defined_type_name", SqlType::Text),
+            ("is_insertable_into", SqlType::Text),
+            ("is_typed", SqlType::Text),
+            ("commit_action", SqlType::Text),
         ],
     );
-    let row = |name: &str, table_type: &str| {
+    let row = |name: &str, table_type: &str, insertable: bool| {
         vec![
             SqlValue::Text("postgres".to_string()),
             SqlValue::Text("public".to_string()),
             SqlValue::Text(name.to_string()),
             SqlValue::Text(table_type.to_string()),
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Text(if insertable { "YES" } else { "NO" }.to_string()),
+            SqlValue::Text("NO".to_string()),
+            SqlValue::Null,
         ]
     };
     let mut rows = Vec::new();
     for t in catalog.relational_catalog.values() {
-        rows.push(row(&t.name, "BASE TABLE"));
+        rows.push(row(&t.name, "BASE TABLE", true));
     }
     for v in catalog.relational_views.values() {
-        rows.push(row(&v.name, "VIEW"));
+        rows.push(row(&v.name, "VIEW", false));
     }
     (table, rows)
 }
 
+fn information_schema_column_default(column: &RelationalColumn) -> SqlValue {
+    match &column.default {
+        None => SqlValue::Null,
+        Some(ColumnDefault::Literal(value)) => SqlValue::Text(
+            pg16_column_default_expression(value)
+                .expect("catalog column defaults cannot retain unbound parameters"),
+        ),
+        Some(ColumnDefault::SequenceNextVal { sequence, .. }) => SqlValue::Text(format!(
+            "nextval('{}'::regclass)",
+            sequence.replace('\'', "''")
+        )),
+    }
+}
+
+pub(crate) fn pg16_column_default_expression(value: &SqlValue) -> Result<String, EngineError> {
+    let rendered = render_sql_value_literal(value)?;
+    Ok(match value {
+        SqlValue::Int2(_) => format!("{rendered}::smallint"),
+        SqlValue::Text(_) => format!("{rendered}::text"),
+        SqlValue::Date(_) => format!("{rendered}::date"),
+        SqlValue::Timestamp(_) => format!("{rendered}::timestamp"),
+        SqlValue::Uuid(_) => format!("{rendered}::uuid"),
+        SqlValue::Null
+        | SqlValue::Int4(_)
+        | SqlValue::Int8(_)
+        | SqlValue::Numeric(_)
+        | SqlValue::Bool(_) => rendered,
+        SqlValue::Parameter { .. } => unreachable!("catalog defaults never retain parameters"),
+    })
+}
+
+fn information_schema_numeric_metadata(ty: SqlType) -> (SqlValue, SqlValue, SqlValue, SqlValue) {
+    let null = || SqlValue::Null;
+    match ty {
+        SqlType::Int2 => (
+            null(),
+            SqlValue::Int4(16),
+            SqlValue::Int4(2),
+            SqlValue::Int4(0),
+        ),
+        SqlType::Int4 => (
+            null(),
+            SqlValue::Int4(32),
+            SqlValue::Int4(2),
+            SqlValue::Int4(0),
+        ),
+        SqlType::Int8 => (
+            null(),
+            SqlValue::Int4(64),
+            SqlValue::Int4(2),
+            SqlValue::Int4(0),
+        ),
+        SqlType::Numeric { precision, scale } => (
+            null(),
+            SqlValue::Int4(i32::from(precision)),
+            SqlValue::Int4(10),
+            SqlValue::Int4(i32::from(scale)),
+        ),
+        SqlType::Bool | SqlType::Text | SqlType::Date | SqlType::Timestamp | SqlType::Uuid => {
+            (null(), null(), null(), null())
+        }
+    }
+}
+
 /// `information_schema.columns` — one row per user column. `data_type` uses the SQL-standard
-/// spelling; `is_nullable` is always `YES` until the value model gains NULL (M3).
+/// spelling; nullable/default/numeric metadata is encoded into typed transient columns before
+/// the relation enters the GPU bind/filter/project/order pipeline.
 pub(crate) fn synthesize_information_schema_columns(
     catalog: &CatalogSnapshot,
 ) -> (RelationalTable, Vec<Vec<SqlValue>>) {
@@ -572,8 +719,13 @@ pub(crate) fn synthesize_information_schema_columns(
             ("table_name", SqlType::Text),
             ("column_name", SqlType::Text),
             ("ordinal_position", SqlType::Int4),
+            ("column_default", SqlType::Text),
             ("data_type", SqlType::Text),
             ("is_nullable", SqlType::Text),
+            ("character_maximum_length", SqlType::Int4),
+            ("numeric_precision", SqlType::Int4),
+            ("numeric_precision_radix", SqlType::Int4),
+            ("numeric_scale", SqlType::Int4),
             ("udt_schema", SqlType::Text),
             ("udt_name", SqlType::Text),
         ],
@@ -581,6 +733,12 @@ pub(crate) fn synthesize_information_schema_columns(
     let mut rows = Vec::new();
     for t in catalog.relational_catalog.values() {
         for col in &t.columns {
+            let (
+                character_maximum_length,
+                numeric_precision,
+                numeric_precision_radix,
+                numeric_scale,
+            ) = information_schema_numeric_metadata(col.ty);
             let (data_type, udt_schema, udt_name) = match &col.domain {
                 Some(domain) => (domain.as_str(), "public", domain.as_str()),
                 None => (
@@ -595,8 +753,13 @@ pub(crate) fn synthesize_information_schema_columns(
                 SqlValue::Text(t.name.clone()),
                 SqlValue::Text(col.name.clone()),
                 SqlValue::Int4(i32::from(col.attnum)),
+                information_schema_column_default(col),
                 SqlValue::Text(data_type.to_string()),
                 SqlValue::Text("YES".to_string()),
+                character_maximum_length,
+                numeric_precision,
+                numeric_precision_radix,
+                numeric_scale,
                 SqlValue::Text(udt_schema.to_string()),
                 SqlValue::Text(udt_name.to_string()),
             ]);
@@ -632,6 +795,10 @@ pub(crate) fn synthesize_catalog_relation(
         return match relation {
             "tables" => Some(synthesize_information_schema_tables(catalog)),
             "columns" => Some(synthesize_information_schema_columns(catalog)),
+            "schemata" => Some(synthesize_information_schema_schemata(catalog)),
+            "table_constraints" => Some(synthesize_information_schema_table_constraints(catalog)),
+            "key_column_usage" => Some(synthesize_information_schema_key_column_usage(catalog)),
+            "views" => Some(synthesize_information_schema_views(catalog)),
             _ => None,
         };
     }
@@ -645,40 +812,19 @@ pub(crate) fn synthesize_catalog_relation(
         "pg_roles" => Some(synthesize_pg_roles(catalog)),
         "pg_tablespace" => Some(synthesize_pg_tablespace(catalog)),
         "pg_constraint" => Some(synthesize_pg_constraint(catalog)),
+        "pg_index" => Some(synthesize_pg_index(catalog)),
+        "pg_attrdef" => Some(synthesize_pg_attrdef(catalog)),
         "pg_description" => Some(synthesize_pg_description(catalog)),
+        "pg_subscription" => Some(synthesize_pg_subscription(catalog)),
+        "pg_extension" => Some(synthesize_pg_extension(catalog)),
         "pg_default_acl" => Some(synthesize_pg_default_acl(catalog)),
         "pg_indexes" => Some(synthesize_pg_indexes(catalog)),
+        "pg_tables" => Some(synthesize_pg_tables(catalog)),
         "pg_language" => Some(synthesize_pg_language()),
         "pg_proc" => Some(synthesize_pg_proc(catalog)),
         "pg_views" => Some(synthesize_pg_views(catalog)),
-        "pg_publication" if catalog.relational_publications.is_empty() => {
-            Some(synthesize_empty_catalog_table(
-                "pg_publication",
-                &[
-                    ("oid", SqlType::Int4),
-                    ("pubname", SqlType::Text),
-                    ("pubowner", SqlType::Int4),
-                    ("puballtables", SqlType::Bool),
-                    ("pubinsert", SqlType::Bool),
-                    ("pubupdate", SqlType::Bool),
-                    ("pubdelete", SqlType::Bool),
-                    ("pubtruncate", SqlType::Bool),
-                    ("pubviaroot", SqlType::Bool),
-                ],
-            ))
-        }
-        "pg_publication_rel" if catalog.relational_publications.is_empty() => {
-            Some(synthesize_empty_catalog_table(
-                "pg_publication_rel",
-                &[
-                    ("oid", SqlType::Int4),
-                    ("prpubid", SqlType::Int4),
-                    ("prrelid", SqlType::Int4),
-                    ("prattrs", SqlType::Text),
-                    ("prqual", SqlType::Text),
-                ],
-            ))
-        }
+        "pg_publication" => Some(synthesize_pg_publication(catalog)),
+        "pg_publication_rel" => Some(synthesize_pg_publication_rel(catalog)),
         "pg_publication_namespace" if catalog.relational_publications.is_empty() => {
             Some(synthesize_empty_catalog_table(
                 "pg_publication_namespace",
@@ -712,19 +858,6 @@ pub(crate) fn synthesize_catalog_relation(
                 ("polrelid", SqlType::Int4),
                 ("polwithcheck", SqlType::Text),
                 ("polcmd", SqlType::Text),
-            ],
-        )),
-        "pg_extension" => Some(synthesize_empty_catalog_table(
-            "pg_extension",
-            &[
-                ("tableoid", SqlType::Int4),
-                ("oid", SqlType::Int4),
-                ("extname", SqlType::Text),
-                ("extnamespace", SqlType::Int4),
-                ("extrelocatable", SqlType::Bool),
-                ("extversion", SqlType::Text),
-                ("extconfig", SqlType::Text),
-                ("extcondition", SqlType::Text),
             ],
         )),
         // PostgreSQL 17+ dump clients conditionally set
@@ -781,6 +914,7 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
     table: &mut RelationalTable,
     rows: &mut [Vec<SqlValue>],
     catalog: &CatalogSnapshot,
+    relation_device_sizes: &BTreeMap<String, u64>,
 ) -> Result<(), ExecuteError> {
     match table.name.as_str() {
         "pg_roles" => {
@@ -964,9 +1098,11 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
         }
         "pg_class" => {
             let oid = catalog_column_position(table, "oid")?;
+            let relname = catalog_column_position(table, "relname")?;
             let relkind = catalog_column_position(table, "relkind")?;
             let relowner = catalog_column_position(table, "relowner")?;
             let reloftype = catalog_column_position(table, "reloftype")?;
+            let relpersistence = catalog_column_position(table, "relpersistence")?;
             append_catalog_column(
                 table,
                 rows,
@@ -1006,6 +1142,27 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
                         _ => SqlValue::Null,
                     })
                     .collect(),
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_RELPERSISTENCE_DISPLAY,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(relpersistence) {
+                        Some(SqlValue::Text(value)) => match value.as_str() {
+                            "p" => Ok(SqlValue::Text("permanent".to_string())),
+                            "t" => Ok(SqlValue::Text("temporary".to_string())),
+                            "u" => Ok(SqlValue::Text("unlogged".to_string())),
+                            _ => Err(sql_pg_error(format!(
+                                "catalog presentation does not model relpersistence {value:?}"
+                            ))),
+                        },
+                        other => Err(sql_pg_error(format!(
+                            "catalog relpersistence row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             )?;
             let relation_acls = rows
                 .iter()
@@ -1072,6 +1229,58 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
                 GPU_CATALOG_EMPTY_TEXT,
                 SqlType::Text,
                 vec![SqlValue::Text(String::new()); rows.len()],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_RELATION_SIZE,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match (row.get(relname), row.get(relkind)) {
+                        (
+                            Some(SqlValue::Text(name)),
+                            Some(SqlValue::Text(kind)),
+                        ) => match kind.as_str() {
+                            "r" if relation_device_sizes.contains_key(name) => Ok(SqlValue::Text(
+                                format!("{} bytes", relation_device_sizes[name]),
+                            )),
+                            "r" | "m" | "S" => {
+                                Ok(SqlValue::Text("0 bytes".to_string()))
+                            }
+                            "v" | "i" => Ok(SqlValue::Null),
+                            _ => Err(sql_pg_error(format!(
+                                "catalog presentation does not model relation size for relkind {kind:?}"
+                            ))),
+                        },
+                        other => Err(sql_pg_error(format!(
+                            "catalog relation-size row is malformed: {other:?}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DESCRIPTION,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match row.get(oid) {
+                        Some(SqlValue::Int4(oid)) => catalog
+                            .relational_comments
+                            .iter()
+                            .find_map(|(target, description)| {
+                                description_catalog_id(catalog, target)
+                                    .filter(|(classoid, objoid, objsubid)| {
+                                        *classoid == PG_CLASS_CLASS_OID
+                                            && *objoid == *oid as u32
+                                            && *objsubid == 0
+                                    })
+                                    .map(|_| SqlValue::Text(description.clone()))
+                            })
+                            .unwrap_or(SqlValue::Null),
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
             )?;
             append_catalog_column(
                 table,
@@ -1145,6 +1354,37 @@ pub(crate) fn add_gpu_catalog_presentation_columns(
                         ))),
                     })
                     .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_NULL_INT4,
+                SqlType::Int4,
+                vec![SqlValue::Null; rows.len()],
+            )?;
+            append_catalog_column(
+                table,
+                rows,
+                GPU_CATALOG_DESCRIPTION,
+                SqlType::Text,
+                rows.iter()
+                    .map(|row| match (row.get(attrelid), row.get(attnum)) {
+                        (Some(SqlValue::Int4(relid)), Some(SqlValue::Int4(attnum))) => catalog
+                            .relational_comments
+                            .iter()
+                            .find_map(|(target, description)| {
+                                description_catalog_id(catalog, target)
+                                    .filter(|(classoid, objoid, objsubid)| {
+                                        *classoid == PG_CLASS_CLASS_OID
+                                            && *objoid == *relid as u32
+                                            && *objsubid == *attnum
+                                    })
+                                    .map(|_| SqlValue::Text(description.clone()))
+                            })
+                            .unwrap_or(SqlValue::Null),
+                        _ => SqlValue::Null,
+                    })
+                    .collect(),
             )?;
         }
         "pg_proc" => {
@@ -1466,7 +1706,7 @@ fn catalog_role_name(oid: i32, catalog: &CatalogSnapshot) -> Option<&str> {
         .map(|role| role.name.as_str())
 }
 
-fn catalog_type_name(oid: i32, catalog: &CatalogSnapshot) -> Option<&str> {
+pub(crate) fn catalog_type_name(oid: i32, catalog: &CatalogSnapshot) -> Option<&str> {
     let builtin = match oid as u32 {
         16 => Some("boolean"),
         20 => Some("bigint"),
@@ -1564,7 +1804,7 @@ fn catalog_attribute_default_expr(
     };
     match &column.default {
         None => Ok(SqlValue::Null),
-        Some(ColumnDefault::Literal(value)) => render_sql_value_literal(value)
+        Some(ColumnDefault::Literal(value)) => pg16_column_default_expression(value)
             .map(SqlValue::Text)
             .map_err(ExecuteError::Engine),
         Some(ColumnDefault::SequenceNextVal { sequence, .. }) => Ok(SqlValue::Text(format!(

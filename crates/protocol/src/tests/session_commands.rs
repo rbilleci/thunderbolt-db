@@ -88,48 +88,72 @@ fn parses_set_with_session_or_local_scope_aliases() {
 fn parses_postgres_style_set_session_reset_aliases() {
     assert_eq!(
         parse_command("SET ROLE NONE").unwrap(),
-        Command::SetRole { role: None }
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("SET ROLE DEFAULT").unwrap(),
-        Command::SetRole { role: None }
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("SET ROLE app_role").unwrap(),
         Command::SetRole {
-            role: Some("app_role".to_string())
+            role: Some("app_role".to_string()),
+            scope: SetRoleScope::Session,
         }
     );
     assert_eq!(
         parse_command("SET ROLE \"app role\"").unwrap(),
         Command::SetRole {
-            role: Some("app role".to_string())
+            role: Some("app role".to_string()),
+            scope: SetRoleScope::Session,
         }
     );
     assert_eq!(
         parse_command("SET ROLE \"\"\"quoted\"\" role\"").unwrap(),
         Command::SetRole {
-            role: Some("\"quoted\" role".to_string())
+            role: Some("\"quoted\" role".to_string()),
+            scope: SetRoleScope::Session,
         }
     );
     assert_eq!(
         parse_command("SET SESSION ROLE DEFAULT").unwrap(),
-        Command::SetRole { role: None }
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("SET SESSION ROLE \"app role\"").unwrap(),
         Command::SetRole {
-            role: Some("app role".to_string())
+            role: Some("app role".to_string()),
+            scope: SetRoleScope::Session,
         }
     );
     assert_eq!(
         parse_command("SET LOCAL ROLE NONE").unwrap(),
-        Command::SetRole { role: None }
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Local
+        }
+    );
+    assert_eq!(
+        parse_command("SET LOCAL ROLE DEFAULT").unwrap(),
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Local
+        }
     );
     assert_eq!(
         parse_command("SET LOCAL ROLE app_role").unwrap(),
         Command::SetRole {
-            role: Some("app_role".to_string())
+            role: Some("app_role".to_string()),
+            scope: SetRoleScope::Local,
         }
     );
     assert_eq!(
@@ -264,6 +288,15 @@ fn parses_flush() {
 
 #[test]
 fn parses_reset_all() {
+    let session_role_reset = Command::SetRole {
+        role: None,
+        scope: SetRoleScope::Session,
+    };
+    let local_role_reset = Command::SetRole {
+        role: None,
+        scope: SetRoleScope::Local,
+    };
+
     let cmd = parse_command("RESET ALL").unwrap();
     assert_eq!(cmd, Command::ResetAll);
 
@@ -271,37 +304,37 @@ fn parses_reset_all() {
     assert_eq!(cmd, Command::ResetAll);
 
     let cmd = parse_command("RESET ROLE").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET SESSION ROLE").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET LOCAL ROLE").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, local_role_reset);
 
     let cmd = parse_command("RESET AUTHORIZATION").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET AUTH").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET SESSION AUTHORIZATION").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET SESSION AUTHORIZATION DEFAULT").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET SESSION AUTHORIZATION TO DEFAULT").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET SESSION AUTH").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET SESSION AUTH DEFAULT").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("RESET SESSION AUTH TO DEFAULT").unwrap();
-    assert_eq!(cmd, Command::ResetAll);
+    assert_eq!(cmd, session_role_reset);
 
     let cmd = parse_command("DISCARD TEMP").unwrap();
     assert_eq!(cmd, Command::ResetAll);

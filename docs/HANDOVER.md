@@ -1,34 +1,35 @@
 # HANDOVER — Resume Baton
 
 This file is only the short resume pointer. [`PLAN.md`](PLAN.md) owns all open, deferred, blocked, and sequenced
-work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts; the
-[`PRODUCT-001 inventory`](design/product-001-serving-write-inventory.md) owns the factual source/consumer map.
+work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Current boundary
 
-- **PRODUCT-001** has an accepted SQLSTATE/type-codec, named-client, and mixed-recovery slice. Every facade type has
-  PostgreSQL text/binary codecs; NUMERIC carries typmod and PostgreSQL 16 finite grammar/wire semantics; typed
-  constraint/range errors map to `23502`/`23503`/`23514`/`22003` while `23505`, `25P02`, and `40001` remain exact.
-  All eight native driver suites cover non-NULL/NULL values, SQLSTATEs, rollback, and reuse on the canonical server.
-- Process recovery covers W1, General, explicit transaction, COPY, and sequence traffic across SIGKILL, two fresh
-  reopen cycles, and later append. The alternating-NULL all-type GPU fixture plus separate keyed point route pass
-  three serial and two simultaneous runs with zero CUDA 700/716/717. Facade, canonical server, pgwire, protocol,
-  engine, recovery, eight-driver, workspace, Clippy, rustfmt, diff, and source-size gates are green.
-- The first frozen audit rejected four NUMERIC edges; direct repairs and sabotage 07–10 close radix/underscore text,
-  binary leading-zero normalization, `i128::MIN`, and reserved dscale classification. Repaired-tree and post-card
-  audits returned **ACCEPT** on base `e7333dc4a339468ae0fc9727b8858ecbe3acfc9f`, code/test tree
-  `ab1d4bffeb429413f238df3d786fdaa04281c146`, and cached binary-diff SHA-256
-  `a454ea91826d951775ed5f6b8e072f537806e8a51ab9ab08574af6665f8aace8` across 30 paths without drift.
-- The default 2400s full card is preserved as incomplete timeout evidence after its fixed Section-C build consumed
-  2306.9s. The same auditor authorized a workload-identical 2700s retry, which completed the canonical A/B/C marker.
-  Honest out-of-L2 raw/grouped throughput is **1442.5 GB/s / 1672.9 M-elem/s**; production point reads are
-  **268.934M/s, p50 117us** in-L2 and **244.560M/s, p50 139us** out-of-L2. Point throughput is
-  **-0.8%/-2.0%** versus the preceding card with +1us/unchanged p50, so no material regression is present. The
-  accepted log SHA-256 is `99608314fa3e90a2e9516efc58be6c71b1021232dc62d546ae7840eac71d55b8`.
+- **PRODUCT-001 completed and received final independent acceptance on 2026-07-26.** The superseded listener,
+  host-relational module tree, callable P8 adapters, P8-only launchers, and direct-Engine benchmark endpoint are
+  deleted. Ownership guards prove one product server, one public `SharedEngine::submit` boundary, and the sole
+  commit/WAL/recovery/publication authority.
+- The final PostgreSQL 16.14 migration gate passes **352/352** scenarios; all dump/restore, eight application-driver,
+  TLS/SCRAM/mTLS, COPY, cancellation, prepared/portal, transaction, recovery, catalog, security, and product gates
+  pass. The physical aggregate passes **697/697** GPU tests with `executed_target=Gpu(0)`, protected-path
+  zero-fallback evidence, and fail-closed sabotage. The compatibility scorecard passes **1,866/1,866**.
+- The former transaction-catalog mixed owner is a 594-line production root plus a 1,398-line test leaf.
+  `engine_dml_concurrent.rs`, `engine_commit.rs`, and `engine_mutation_admission.rs` are below the
+  comment-excluded production threshold; no source-size exception remains.
+- Three pre-card audits drove the final host-authority, authorization, role-scope, catalog-join, sabotage,
+  fail-open matcher, and point-read code-placement repairs. The repaired official quick screen restored the
+  production batch-65,536 route to **269.642M lookups/s at p50 117us**.
+- The accepted candidate seal is HEAD `573e5142…`, staged tree `1f721b31…`, and cached-diff
+  `7684ee88…` across 178 paths without drift. After the default Section C timeout produced only incomplete
+  evidence, the auditor authorized one workload-identical retry with `SECTION_C_TIMEOUT=2700`. It completed
+  A/B/C with the canonical terminal record, removed its isolated target, and recorded **1,431.7 GB/s** out-of-L2
+  roofline, **1,673.2 M-elem/s** grouped, **236.658M/p50 117us** in-L2 point reads, and
+  **246.203M/p50 139us** out-of-L2 point reads after a **2,318.3s** fixture build. The post-card auditor accepted
+  provenance and performance with no unresolved finding.
 
 ## Resume here
 
-Resume the PLAN-owned **PRODUCT-001 legacy/P8 compatibility-and-deletion slice**. Re-inventory every live
-psql/preflight/benchmark consumer, migrate or explicitly disposition it, then delete the superseded listener and
-independently callable P8 protocol adapters without adding a second execution or write owner. The 2,002-line
-transaction-catalog core-test extraction remains PRODUCT-001-owned before the parent closes.
+Start **COPY-001**, now the sole active PLAN item. Preserve PRODUCT-001's accepted server, facade-admission,
+sequence/WAL, recovery, publication, and GPU-relational ownership while adding bounded, PostgreSQL-compatible
+GPU-native `COPY FROM STDIN`. Do not reopen PRODUCT-001 or use the retired P8/direct-engine paths as benchmark
+evidence.

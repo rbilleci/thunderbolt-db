@@ -31,12 +31,14 @@ fn compatibility_reads_stay_outside_mutation_admission() {
         (engine.visible_up_to(), engine.durable_wal_records().len())
     };
 
-    for sql in ["GET answer", "SELECT pg_advisory_unlock_all()"] {
-        assert!(matches!(
-            submit_text(&shared, &mut session, sql).unwrap(),
-            QueryOutcome::Command { .. }
-        ));
-    }
+    assert!(matches!(
+        submit_text(&shared, &mut session, "GET answer").unwrap(),
+        QueryOutcome::Command { .. }
+    ));
+    assert!(matches!(
+        submit_text(&shared, &mut session, "SELECT pg_advisory_unlock_all()").unwrap(),
+        QueryOutcome::Rows { rows, .. } if rows == vec![vec![DbValue::Null]]
+    ));
     assert_eq!(
         submit_text(&shared, &mut session, "SELECT currval('seq')")
             .unwrap_err()

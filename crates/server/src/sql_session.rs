@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use gpu_db_facade::{
-    BoundPreparedStatement, CommandTag, DbError, ErrorCategory, QueryOutcome,
+    BoundPreparedStatement, CommandTag, DbError, ErrorCategory, PreparedStatement, QueryOutcome,
     SessionTransactionStatus, SharedEngine, SharedSession, SubmissionRequest,
 };
 
@@ -19,7 +19,9 @@ use crate::async_submit::{
 use crate::cancellation::ActiveRequest;
 use crate::extended::{ExtendedError, ExtendedSession};
 use crate::sql_cursor::SqlCursorAction;
-use crate::sql_prepared::{bind_sql_execute, SqlPreparedAction};
+use crate::sql_prepared::{
+    bind_sql_execute, classify_sql_prepared_statement, sql_prepare_name, SqlPreparedAction,
+};
 use crate::wire_response::{cancellation_checked_outcome, cancellation_error};
 use crate::{shared_session_transaction_status, submit_text_cancellable};
 
@@ -52,11 +54,72 @@ fn command_outcome(tag: &str) -> QueryOutcome {
     }
 }
 
+fn deallocate_command_tag(target: &crate::sql_prepared::SqlDeallocateTarget) -> &'static str {
+    match target {
+        crate::sql_prepared::SqlDeallocateTarget::All => "DEALLOCATE ALL",
+        crate::sql_prepared::SqlDeallocateTarget::Named(_) => "DEALLOCATE",
+    }
+}
+
 fn extended_error_as_db(error: ExtendedError) -> DbError {
     DbError {
         category: ErrorCategory::InvalidRequest,
         message: error.message,
     }
+}
+
+pub(crate) fn cursor_error_is_connection_local(error: &DbError) -> bool {
+    matches!(
+        error.message.as_str(),
+        "cursor already exists" | "cursor does not exist"
+    )
+}
+
+pub(crate) fn outcome_error_poison_transaction(outcome: &Result<QueryOutcome, DbError>) -> bool {
+    outcome
+        .as_ref()
+        .is_err_and(|error| !cursor_error_is_connection_local(error))
+}
+
+fn validate_cursor_query(query: &str) -> Result<(), DbError> {
+    match PreparedStatement::parse(query) {
+        Ok(prepared) if prepared.parameter_count() > 0 => Err(DbError {
+            category: ErrorCategory::Unsupported,
+            message: "parameterized cursor declarations are not supported".to_string(),
+        }),
+        Err(error)
+            if matches!(
+                error.message.as_str(),
+                "LIMIT must not be negative" | "OFFSET must not be negative"
+            ) =>
+        {
+            Err(error)
+        }
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
+fn bind_cursor_sql_execute(
+    extended: &ExtendedSession,
+    query: &str,
+) -> Result<Option<BoundPreparedStatement>, DbError> {
+    let Some(action) = classify_sql_prepared_statement(query)? else {
+        return Ok(None);
+    };
+    let SqlPreparedAction::Execute { name, arguments } = action else {
+        return Err(DbError {
+            category: ErrorCategory::Unsupported,
+            message: "cursor declarations only support relational SELECT or SQL EXECUTE"
+                .to_string(),
+        });
+    };
+    let plan = extended
+        .sql_prepared_plan(&name)
+        .map_err(extended_error_as_db)?;
+    if let Some(error) = plan.deferred_execution_error {
+        return Err(error);
+    }
+    bind_sql_execute(&plan.prepared, &arguments).map(Some)
 }
 
 fn in_failed_transaction_error() -> DbError {
@@ -65,6 +128,24 @@ fn in_failed_transaction_error() -> DbError {
         message: "current transaction is aborted, commands ignored until end of transaction block"
             .to_string(),
     }
+}
+
+pub(super) fn classify_prepared_action(
+    extended: &ExtendedSession,
+    statement: &str,
+    transaction_status: SessionTransactionStatus,
+) -> Result<Option<SqlPreparedAction>, DbError> {
+    if transaction_status != SessionTransactionStatus::FailedTransaction {
+        if let Some(name) = sql_prepare_name(statement)? {
+            if extended.has_sql_prepared(&name) {
+                return Err(DbError {
+                    category: ErrorCategory::InvalidRequest,
+                    message: "prepared statement already exists".to_string(),
+                });
+            }
+        }
+    }
+    classify_sql_prepared_statement(statement)
 }
 
 pub(super) fn execute_prepared_action_blocking(
@@ -86,26 +167,36 @@ pub(super) fn execute_prepared_action_blocking(
             query,
             parameter_hints,
         } => {
-            let prepared =
-                ExtendedSession::analyze_sql_prepare(engine, session, &query, &parameter_hints)?;
+            let plan = ExtendedSession::analyze_sql_prepare_plan(
+                engine,
+                session,
+                &query,
+                &parameter_hints,
+            )?;
             if active.is_cancelled() {
                 return Err(cancellation_error());
             }
             extended
-                .install_sql_prepared(name, prepared)
+                .install_sql_prepared_plan(name, plan)
                 .map_err(extended_error_as_db)?;
             Ok(command_outcome("PREPARE"))
         }
         SqlPreparedAction::Execute { name, arguments } => {
-            let prepared = extended.sql_prepared(&name).map_err(extended_error_as_db)?;
-            let bound = bind_sql_execute(&prepared, &arguments)?;
+            let plan = extended
+                .sql_prepared_plan(&name)
+                .map_err(extended_error_as_db)?;
+            if let Some(error) = plan.deferred_execution_error {
+                return Err(error);
+            }
+            let bound = bind_sql_execute(&plan.prepared, &arguments)?;
             submit_prepared_cancellable(engine, session, &bound, active)
         }
         SqlPreparedAction::Deallocate(target) => {
+            let tag = deallocate_command_tag(&target);
             extended
                 .deallocate_sql_prepared(target)
                 .map_err(extended_error_as_db)?;
-            Ok(command_outcome("DEALLOCATE"))
+            Ok(command_outcome(tag))
         }
     }
 }
@@ -140,12 +231,12 @@ pub(super) async fn execute_prepared_action_async(
             )
             .await?;
             match prepared {
-                Ok(prepared) => {
+                Ok(plan) => {
                     if active.is_cancelled() {
                         return Ok(Err(cancellation_error()));
                     }
                     Ok(extended
-                        .install_sql_prepared(name, prepared)
+                        .install_sql_prepared_plan(name, plan)
                         .map(|()| command_outcome("PREPARE"))
                         .map_err(extended_error_as_db))
                 }
@@ -153,11 +244,14 @@ pub(super) async fn execute_prepared_action_async(
             }
         }
         SqlPreparedAction::Execute { name, arguments } => {
-            let prepared = match extended.sql_prepared(&name) {
-                Ok(prepared) => prepared,
+            let plan = match extended.sql_prepared_plan(&name) {
+                Ok(plan) => plan,
                 Err(error) => return Ok(Err(extended_error_as_db(error))),
             };
-            let bound = match bind_sql_execute(&prepared, &arguments) {
+            if let Some(error) = plan.deferred_execution_error {
+                return Ok(Err(error));
+            }
+            let bound = match bind_sql_execute(&plan.prepared, &arguments) {
                 Ok(bound) => bound,
                 Err(error) => return Ok(Err(error)),
             };
@@ -166,10 +260,13 @@ pub(super) async fn execute_prepared_action_async(
             )
             .await
         }
-        SqlPreparedAction::Deallocate(target) => Ok(extended
-            .deallocate_sql_prepared(target)
-            .map(|()| command_outcome("DEALLOCATE"))
-            .map_err(extended_error_as_db)),
+        SqlPreparedAction::Deallocate(target) => {
+            let tag = deallocate_command_tag(&target);
+            Ok(extended
+                .deallocate_sql_prepared(target)
+                .map(|()| command_outcome(tag))
+                .map_err(extended_error_as_db))
+        }
     }
 }
 
@@ -188,23 +285,28 @@ pub(super) fn execute_cursor_action_blocking(
     }
     match action {
         SqlCursorAction::Declare { name, query } => {
-            if session.transaction_status() == SessionTransactionStatus::Idle {
-                return Err(DbError {
-                    category: ErrorCategory::InvalidRequest,
-                    message: "DECLARE CURSOR can only be used in transaction blocks".to_string(),
-                });
-            }
-            let outcome = submit_text_cancellable(engine, session, &query, active)?;
+            extended
+                .ensure_sql_cursor_name_available(&name)
+                .map_err(extended_error_as_db)?;
+            validate_cursor_query(&query)?;
+            let transaction_bound = session.transaction_status() != SessionTransactionStatus::Idle;
+            let outcome = match bind_cursor_sql_execute(extended, &query)? {
+                Some(bound) => submit_prepared_cancellable(engine, session, &bound, active)?,
+                None => submit_text_cancellable(engine, session, &query, active)?,
+            };
             if active.is_cancelled() {
                 return Err(cancellation_error());
             }
             extended
-                .install_sql_cursor(name, outcome)
+                .install_sql_cursor(name, outcome, transaction_bound)
                 .map_err(extended_error_as_db)?;
             Ok(command_outcome("DECLARE CURSOR"))
         }
         SqlCursorAction::Fetch { name, count } => extended
             .fetch_sql_cursor(&name, count)
+            .map_err(extended_error_as_db),
+        SqlCursorAction::Move { name, count } => extended
+            .move_sql_cursor(&name, count)
             .map_err(extended_error_as_db),
         SqlCursorAction::Close(target) => {
             extended
@@ -231,16 +333,29 @@ pub(super) async fn execute_cursor_action_async(
     }
     match action {
         SqlCursorAction::Declare { name, query } => {
-            if shared_session_transaction_status(&session) == SessionTransactionStatus::Idle {
-                return Ok(Err(DbError {
-                    category: ErrorCategory::InvalidRequest,
-                    message: "DECLARE CURSOR can only be used in transaction blocks".to_string(),
-                }));
+            if let Err(error) = extended.ensure_sql_cursor_name_available(&name) {
+                return Ok(Err(extended_error_as_db(error)));
             }
-            let outcome = execute_shared_session_blocking_cancellable(
-                engine, session, executor, query, active,
-            )
-            .await?;
+            if let Err(error) = validate_cursor_query(&query) {
+                return Ok(Err(error));
+            }
+            let transaction_bound =
+                shared_session_transaction_status(&session) != SessionTransactionStatus::Idle;
+            let outcome = match bind_cursor_sql_execute(extended, &query) {
+                Err(error) => return Ok(Err(error)),
+                Ok(Some(bound)) => {
+                    execute_prepared_shared_session_blocking_cancellable(
+                        engine, session, executor, bound, active,
+                    )
+                    .await?
+                }
+                Ok(None) => {
+                    execute_shared_session_blocking_cancellable(
+                        engine, session, executor, query, active,
+                    )
+                    .await?
+                }
+            };
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => return Ok(Err(error)),
@@ -249,12 +364,15 @@ pub(super) async fn execute_cursor_action_async(
                 return Ok(Err(cancellation_error()));
             }
             Ok(extended
-                .install_sql_cursor(name, outcome)
+                .install_sql_cursor(name, outcome, transaction_bound)
                 .map(|()| command_outcome("DECLARE CURSOR"))
                 .map_err(extended_error_as_db))
         }
         SqlCursorAction::Fetch { name, count } => Ok(extended
             .fetch_sql_cursor(&name, count)
+            .map_err(extended_error_as_db)),
+        SqlCursorAction::Move { name, count } => Ok(extended
+            .move_sql_cursor(&name, count)
             .map_err(extended_error_as_db)),
         SqlCursorAction::Close(target) => Ok(extended
             .close_sql_cursor(target)
@@ -270,6 +388,87 @@ mod tests {
     use crate::sql_cursor::SqlCursorCloseTarget;
     use crate::sql_prepared::SqlDeallocateTarget;
     use gpu_db_facade::{ColumnMeta, DbValue, LogicalType};
+
+    #[test]
+    fn deallocate_all_uses_the_distinct_postgresql_command_tag() {
+        assert_eq!(
+            deallocate_command_tag(&SqlDeallocateTarget::All),
+            "DEALLOCATE ALL"
+        );
+        assert_eq!(
+            deallocate_command_tag(&SqlDeallocateTarget::Named("kept".to_string())),
+            "DEALLOCATE"
+        );
+    }
+
+    #[test]
+    fn only_connection_local_cursor_state_errors_preserve_a_transaction() {
+        for message in ["cursor already exists", "cursor does not exist"] {
+            let outcome = Err(DbError {
+                category: ErrorCategory::InvalidRequest,
+                message: message.to_string(),
+            });
+            assert!(!outcome_error_poison_transaction(&outcome));
+        }
+        let query_error = Err(DbError {
+            category: ErrorCategory::Syntax,
+            message: "LIMIT must not be negative".to_string(),
+        });
+        assert!(outcome_error_poison_transaction(&query_error));
+    }
+
+    #[test]
+    fn cursor_query_preflight_preserves_bounded_frozen_diagnostics() {
+        let parameterized =
+            validate_cursor_query("SELECT id FROM accounts WHERE id = $1").unwrap_err();
+        assert_eq!(parameterized.category, ErrorCategory::Unsupported);
+        assert_eq!(
+            parameterized.message,
+            "parameterized cursor declarations are not supported"
+        );
+
+        for (query, message) in [
+            (
+                "SELECT id FROM accounts LIMIT -1",
+                "LIMIT must not be negative",
+            ),
+            (
+                "SELECT id FROM accounts OFFSET -1",
+                "OFFSET must not be negative",
+            ),
+        ] {
+            let error = validate_cursor_query(query).unwrap_err();
+            assert_eq!(error.category, ErrorCategory::Syntax);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn duplicate_sql_prepare_name_precedes_unsupported_type_analysis() {
+        let mut extended = ExtendedSession::default();
+        extended
+            .install_sql_prepared(
+                "duplicate_name".to_string(),
+                gpu_db_facade::PreparedStatement::parse("SELECT 1").unwrap(),
+            )
+            .unwrap();
+        let error = classify_prepared_action(
+            &extended,
+            "PREPARE duplicate_name(jsonb) AS SELECT $1",
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::InvalidRequest);
+        assert_eq!(error.message, "prepared statement already exists");
+
+        let failed_error = classify_prepared_action(
+            &extended,
+            "PREPARE duplicate_name(jsonb) AS SELECT $1",
+            SessionTransactionStatus::FailedTransaction,
+        )
+        .unwrap_err();
+        assert_ne!(failed_error.message, "prepared statement already exists");
+    }
 
     fn install_local_objects(
         engine: &SharedEngine,
@@ -300,6 +499,7 @@ mod tests {
                     }],
                     rows: vec![vec![DbValue::Int4(1)]],
                 },
+                true,
             )
             .unwrap();
     }

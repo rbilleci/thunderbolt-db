@@ -30,8 +30,9 @@ pub use ast::{
     PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
     RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
     RenameTablespace, RenameView, SelectFunction, SelectLiteral, SequenceCurrVal, SequenceNextVal,
-    SequenceRestart, SequenceSetVal, TransactionAccessMode, TransactionCharacteristics,
-    TransactionIsolation, TruncateTable, UniqueConstraint, Update, UpdateAssignment,
+    SequenceRestart, SequenceSetVal, SetRoleScope, TransactionAccessMode,
+    TransactionCharacteristics, TransactionIsolation, TruncateTable, UniqueConstraint, Update,
+    UpdateAssignment,
 };
 pub use command::{
     is_select_statement, parse_command, parse_command_allowing_catalog, split_simple_query,
@@ -165,6 +166,7 @@ fn parse_select_pg_dump_builtin(input: &str) -> Result<Command, ParseError> {
             column_name: "pg_is_in_recovery".to_string(),
             ty: SqlType::Bool,
             value: SqlValue::Bool(false),
+            add_int4: None,
         }));
     }
     if rest.eq_ignore_ascii_case("pg_catalog.current_schemas(false)") {
@@ -172,6 +174,27 @@ fn parse_select_pg_dump_builtin(input: &str) -> Result<Command, ParseError> {
             column_name: "current_schemas".to_string(),
             ty: SqlType::Text,
             value: SqlValue::Text("{public}".to_string()),
+            add_int4: None,
+        }));
+    }
+    if rest.eq_ignore_ascii_case("current_schema()")
+        || rest.eq_ignore_ascii_case("pg_catalog.current_schema()")
+    {
+        return Ok(Command::SelectLiteral(SelectLiteral {
+            column_name: "current_schema".to_string(),
+            ty: SqlType::Text,
+            value: SqlValue::Text("public".to_string()),
+            add_int4: None,
+        }));
+    }
+    if rest.eq_ignore_ascii_case("pg_advisory_unlock_all()")
+        || rest.eq_ignore_ascii_case("pg_catalog.pg_advisory_unlock_all()")
+    {
+        return Ok(Command::SelectLiteral(SelectLiteral {
+            column_name: "pg_advisory_unlock_all".to_string(),
+            ty: SqlType::Text,
+            value: SqlValue::Null,
+            add_int4: None,
         }));
     }
     let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
@@ -202,6 +225,7 @@ fn parse_select_pg_dump_builtin(input: &str) -> Result<Command, ParseError> {
         column_name: "set_config".to_string(),
         ty: SqlType::Text,
         value,
+        add_int4: None,
     }))
 }
 
@@ -231,15 +255,46 @@ fn parse_select_literal(input: &str) -> Result<Command, ParseError> {
         }
         None => (rest, "?column?".to_string()),
     };
-    let (ty, value) = scalar::parse_typed_sql_literal(expression)?;
-    if matches!(value, SqlValue::Parameter { .. }) {
+    let (ty, value, add_int4) = match scalar::parse_typed_sql_literal(expression) {
+        Ok((ty, value)) => (ty, value, None),
+        Err(_) if find_char_outside_quotes(expression, '+').is_some() => {
+            parse_prepared_int4_add_projection(expression)?
+        }
+        Err(error) => return Err(error),
+    };
+    if matches!(value, SqlValue::Parameter { .. }) && add_int4.is_none() {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(Command::SelectLiteral(SelectLiteral {
         column_name,
         ty,
         value,
+        add_int4,
     }))
+}
+
+/// Parse the one scalar expression that can become a typed prepared GPU literal at Bind. Once a
+/// client supplies the parameter, PostgreSQL may constant-fold this bounded `int4` expression;
+/// the bound value then takes the existing transient GPU scalar result route. Keep this narrow so
+/// ordinary no-`FROM` expressions remain owned by the general SQL planner rather than a second
+/// scalar evaluator.
+fn parse_prepared_int4_add_projection(
+    expression: &str,
+) -> Result<(SqlType, SqlValue, Option<i32>), ParseError> {
+    let Some((parameter, addend)) = expression.split_once('+') else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let parameter = parse_sql_value(parameter.trim())?;
+    let SqlValue::Parameter { cast, .. } = parameter else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    if cast.is_some() && cast != Some(SqlType::Int4) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let SqlValue::Int4(addend) = parse_sql_value(addend.trim())? else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok((SqlType::Int4, parameter, Some(addend)))
 }
 
 fn parse_sequence_value_function(input: &str) -> Result<Command, ParseError> {

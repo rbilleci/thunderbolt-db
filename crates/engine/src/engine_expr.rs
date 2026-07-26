@@ -34,7 +34,9 @@ pub(crate) use shard_pruning::shard_point_lookup_int4_eq;
 
 mod grouped_values;
 pub(crate) use grouped_values::composite_group_has_duplicate;
-use grouped_values::{composite_group_count_reps, narrow_ordered_value};
+use grouped_values::{
+    composite_group_count_reps, narrow_ordered_value, normalized_grouped_sort_payload,
+};
 mod grouped_count_distinct;
 use grouped_count_distinct::count_distinct_groups;
 mod scalar_aggregate;
@@ -2319,7 +2321,10 @@ impl Engine {
             // that window from the materialized group rows. With no LIMIT the window is the full range, so
             // this is byte-identical to applying the same permutation to the materialized rows.
             if rows.len() > 1 || select.offset.is_some() || select.limit.is_some() {
-                let col_types: Vec<SqlType> = bound.selected_columns.iter().map(|c| c.ty).collect();
+                let result_col_types: Vec<SqlType> =
+                    bound.selected_columns.iter().map(|c| c.ty).collect();
+                let (sort_rows, sort_col_types) =
+                    normalized_grouped_sort_payload(&rows, &result_col_types)?;
                 // The GROUP-KEY result columns (emitted first by the merge): result columns 0..n_group_cols.
                 let n_group_cols = if is_composite_key {
                     2
@@ -2362,8 +2367,13 @@ impl Engine {
                         }
                         (order, nulls_first)
                     };
-                let perm =
-                    gpu_sort_permutation(&rows, &order, &nulls_first, &col_types, &device_memory)?;
+                let perm = gpu_sort_permutation(
+                    &sort_rows,
+                    &order,
+                    &nulls_first,
+                    &sort_col_types,
+                    &device_memory,
+                )?;
                 let start = select.offset.unwrap_or(0).min(perm.len());
                 let end = select
                     .limit

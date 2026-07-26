@@ -2,7 +2,7 @@
 
 use super::*;
 
-const PG_CLASS_CLASS_OID: i32 = 1259;
+pub(super) const PG_CLASS_CLASS_OID: i32 = 1259;
 const PG_CONSTRAINT_CLASS_OID: i32 = 2606;
 const PG_NAMESPACE_CLASS_OID: i32 = 2615;
 const PG_PROC_CLASS_OID: i32 = 1255;
@@ -31,20 +31,20 @@ pub(super) fn synthesize_pg_roles(
             ("rolbypassrls", SqlType::Bool),
         ],
     );
-    let role_row = |oid: i32, name: String, superuser: bool, login: bool| {
+    let role_row = |oid: i32, name: String, superuser: bool, login: bool, bootstrap: bool| {
         vec![
             SqlValue::Int4(oid),
             SqlValue::Text(name),
             SqlValue::Bool(superuser),
             SqlValue::Bool(true),
-            SqlValue::Bool(false),
-            SqlValue::Bool(false),
+            SqlValue::Bool(bootstrap),
+            SqlValue::Bool(bootstrap),
             SqlValue::Bool(login),
             SqlValue::Int4(-1),
             SqlValue::Null,
             SqlValue::Null,
-            SqlValue::Bool(false),
-            SqlValue::Bool(false),
+            SqlValue::Bool(bootstrap),
+            SqlValue::Bool(bootstrap),
         ]
     };
     let mut rows = vec![role_row(
@@ -52,12 +52,13 @@ pub(super) fn synthesize_pg_roles(
         "postgres".to_string(),
         true,
         true,
+        true,
     )];
     rows.extend(
         catalog
             .relational_roles
             .values()
-            .map(|role| role_row(role.oid as i32, role.name.clone(), false, role.login)),
+            .map(|role| role_row(role.oid as i32, role.name.clone(), false, role.login, false)),
     );
     (table, rows)
 }
@@ -99,7 +100,7 @@ pub(crate) fn synthesize_pg_tablespace(
 }
 
 fn tablespace_acl_array(acl: &BTreeMap<String, BTreeSet<TablespacePrivilege>>) -> SqlValue {
-    let mut entries = acl
+    let entries = acl
         .iter()
         .filter(|(_, privileges)| privileges.contains(&TablespacePrivilege::Create))
         .map(|(grantee, _)| {
@@ -107,12 +108,7 @@ fn tablespace_acl_array(acl: &BTreeMap<String, BTreeSet<TablespacePrivilege>>) -
             format!("{grantee}=C/postgres")
         })
         .collect::<Vec<_>>();
-    if entries.is_empty() {
-        SqlValue::Null
-    } else {
-        entries.insert(0, "postgres=C/postgres".to_string());
-        SqlValue::Text(format!("{{{}}}", entries.join(",")))
-    }
+    acl_entries_value(entries)
 }
 
 pub(crate) struct CatalogIndexEntry<'a> {
@@ -376,17 +372,18 @@ pub(super) fn relation_acl_array(
     acl: &BTreeMap<String, BTreeSet<TablePrivilege>>,
     relation_kind: &str,
 ) -> SqlValue {
+    // Interactive catalog presentation reflects the bounded privilege deltas represented by the
+    // engine's ACL model. The pg_dump catalog program has a separate baseline-aware projection
+    // because its relacl/acldefault comparison must reconstruct PostgreSQL owner defaults. The
+    // sequence smoke additionally observes the PostgreSQL owner baseline when a non-owner grant
+    // materializes a sequence ACL; an owner-only sequence grant remains the bounded stored entry.
     let mut entries = relation_acl_entries(acl);
-    if !entries.is_empty() {
-        entries.insert(
-            0,
-            if relation_kind == "S" {
-                "postgres=rwU/postgres"
-            } else {
-                "postgres=arwdDxt/postgres"
-            }
-            .to_string(),
-        );
+    if relation_kind == "S"
+        && !entries.is_empty()
+        && !acl.contains_key("postgres")
+        && acl.keys().any(|grantee| grantee != "public")
+    {
+        entries.insert(0, "postgres=rwU/postgres".to_string());
     }
     acl_entries_value(entries)
 }
@@ -441,7 +438,7 @@ pub(super) fn synthesize_pg_description(
     (table, rows)
 }
 
-fn description_catalog_id(
+pub(super) fn description_catalog_id(
     catalog: &CatalogSnapshot,
     target: &RelationalCommentTarget,
 ) -> Option<(i32, u32, i32)> {
@@ -500,10 +497,35 @@ fn description_catalog_id(
             catalog_constraint_oid(catalog, table, constraint)
                 .map(|oid| (PG_CONSTRAINT_CLASS_OID, oid, 0))
         }
+        RelationalCommentTarget::Extension { extension } if extension == "plpgsql" => {
+            Some((3079, 13_500, 0))
+        }
         RelationalCommentTarget::Database { .. }
         | RelationalCommentTarget::Role { .. }
         | RelationalCommentTarget::Tablespace { .. }
         | RelationalCommentTarget::Extension { .. }
         | RelationalCommentTarget::Schema { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_relation_acl_presents_only_stored_privilege_deltas() {
+        let acl = BTreeMap::from([(
+            "dump_reader".to_string(),
+            BTreeSet::from([TablePrivilege::Select, TablePrivilege::Update]),
+        )]);
+        assert_eq!(
+            relation_acl_array(&acl, "S"),
+            SqlValue::Text("{postgres=rwU/postgres,dump_reader=rw/postgres}".to_string())
+        );
+        assert_eq!(
+            relation_acl_array(&acl, "r"),
+            SqlValue::Text("{dump_reader=rw/postgres}".to_string())
+        );
+        assert_eq!(relation_acl_array(&BTreeMap::new(), "S"), SqlValue::Null);
     }
 }

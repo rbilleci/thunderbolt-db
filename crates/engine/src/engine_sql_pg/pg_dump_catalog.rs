@@ -118,6 +118,9 @@ impl Engine {
         if let Some(view_oid) = dependencies::pg16_dump_view_definition_oid(&canonical) {
             return self.execute_pg16_dump_view_definition(view_oid).map(Some);
         }
+        if dependencies::is_pg16_dump_extension_membership_program(&canonical) {
+            return self.execute_pg16_dump_extension_membership().map(Some);
+        }
         if let Some(sequence_oid) = sequences::pg16_dump_sequence_metadata_oid(&canonical) {
             return self
                 .execute_pg16_dump_sequence_metadata(sequence_oid)
@@ -307,7 +310,7 @@ impl Engine {
         self.execute_pg_dump_gpu_int4_equal_count(table, rows, "subdbid", database_oid as i32)
     }
 
-    fn execute_pg_dump_transient_relation(
+    pub(super) fn execute_pg_dump_transient_relation(
         &self,
         table: RelationalTable,
         rows: Vec<Vec<SqlValue>>,
@@ -652,20 +655,7 @@ fn pg16_dump_attrdef_metadata_relation(
 }
 
 fn pg16_dump_default_expression(value: &SqlValue) -> Result<String, ExecuteError> {
-    let rendered = render_sql_value_literal(value).map_err(ExecuteError::Engine)?;
-    Ok(match value {
-        SqlValue::Int2(_) => format!("{rendered}::smallint"),
-        SqlValue::Text(_) => format!("{rendered}::text"),
-        SqlValue::Date(_) => format!("{rendered}::date"),
-        SqlValue::Timestamp(_) => format!("{rendered}::timestamp"),
-        SqlValue::Uuid(_) => format!("{rendered}::uuid"),
-        SqlValue::Null
-        | SqlValue::Int4(_)
-        | SqlValue::Int8(_)
-        | SqlValue::Numeric(_)
-        | SqlValue::Bool(_) => rendered,
-        SqlValue::Parameter { .. } => unreachable!("catalog defaults never retain parameters"),
-    })
+    pg16_column_default_expression(value).map_err(ExecuteError::Engine)
 }
 
 fn pg16_dump_language_metadata_relation() -> (RelationalTable, Vec<Vec<SqlValue>>) {
@@ -721,6 +711,14 @@ fn pg16_dump_authoritatively_empty_relation(canonical: &str) -> Option<Relationa
     let relation = |name: &str, columns: &[(&str, SqlType)]| {
         catalog_relation_table("pg_catalog", name, columns)
     };
+    if canonical
+        == "select conrelid, confrelid from pg_constraint join pg_depend on (objid = confrelid) where contype = 'f' and refclassid = 'pg_extension'::regclass and classid = 'pg_class'::regclass"
+    {
+        return Some(relation(
+            "__pg16_dump_extension_foreign_keys",
+            &[("conrelid", SqlType::Int4), ("confrelid", SqlType::Int4)],
+        ));
+    }
     if canonical
         .strip_prefix(
             "select unnest(setconfig) from pg_db_role_setting where setdatabase = 0 and setrole = (select oid from pg_roles where rolname = '",
@@ -1614,6 +1612,15 @@ mod tests {
 
     #[test]
     fn pg16_empty_program_recognition_is_exact_and_literal_bounded() {
+        let extension_foreign_keys = "select conrelid, confrelid from pg_constraint join \
+            pg_depend on (objid = confrelid) where contype = 'f' and refclassid = \
+            'pg_extension'::regclass and classid = 'pg_class'::regclass";
+        assert!(pg16_dump_authoritatively_empty_relation(extension_foreign_keys).is_some());
+        assert!(pg16_dump_authoritatively_empty_relation(
+            &extension_foreign_keys.replace("contype = 'f'", "contype != 'f'")
+        )
+        .is_none());
+
         let transform = "select tableoid, oid, trftype, trflang, trffromsql::oid, \
             trftosql::oid from pg_transform order by 3,4";
         assert!(pg16_dump_authoritatively_empty_relation(transform).is_some());

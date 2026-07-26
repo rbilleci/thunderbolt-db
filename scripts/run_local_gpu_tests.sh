@@ -7,11 +7,14 @@ cd "$ROOT"
 # These crates carry the #[ignore]-gated end-to-end GPU tests
 # ("requires a local NVIDIA driver and GPU" / "requires local NVIDIA driver
 # and CUDA-capable hardware"). Every #[ignore] in them is GPU-gated, so we run
-# the whole ignored set: gpu_db_execution (15) + gpu_db_engine (39) = 54 tests,
-# including the resident parity gate
+# the whole ignored set, including the resident parity gate
 # (cuda_resident_i32_equal_any_project_submit_complete_matches_sync) and the
 # pinned host buffer pool isolation test
 # (gpu_pinned_host_buffer_pool_reuses_buffers_and_isolates_concurrent_leases).
+#
+# Run one libtest case at a time: these tests share one physical CUDA device
+# and deliberately exercise global memory pressure, lifecycle, and failure
+# controls whose simultaneous execution would interfere with one another.
 GPU_TEST_CRATES=(-p gpu_db_execution -p gpu_db_engine)
 
 # Harmless on a non-GPU box: skip cleanly and succeed so this can sit in shared
@@ -33,7 +36,7 @@ echo "local_gpu_tests_device_info=${device_info}"
 
 # Preserve the cargo exit code through tee so a failing GPU test fails this
 # script (pipefail is on via `set -euo pipefail`).
-cargo test "${GPU_TEST_CRATES[@]}" -- --ignored --color never 2>&1 | tee "$LOG"
+cargo test "${GPU_TEST_CRATES[@]}" -- --ignored --color never --test-threads=1 2>&1 | tee "$LOG"
 
 # Roll the per-binary `test result:` lines up into one summary so the preflight
 # can grep for stable counts.

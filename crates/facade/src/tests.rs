@@ -107,6 +107,146 @@ fn submit_session_text(
         .into_immediate()
 }
 
+#[test]
+fn set_role_scopes_restore_or_persist_at_transaction_boundaries() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    for statement in [
+        "CREATE ROLE set_role_session_a",
+        "CREATE ROLE set_role_session_b",
+        "CREATE ROLE set_role_local",
+    ] {
+        submit_session_text(&shared, &mut session, statement).unwrap();
+    }
+    let session_a = shared
+        .engine
+        .resolve_authorization_principal("set_role_session_a")
+        .unwrap();
+    let session_b = shared
+        .engine
+        .resolve_authorization_principal("set_role_session_b")
+        .unwrap();
+    let local = shared
+        .engine
+        .resolve_authorization_principal("set_role_local")
+        .unwrap();
+
+    // PostgreSQL accepts an out-of-transaction LOCAL setting but leaves the session unchanged.
+    submit_session_text(
+        &shared,
+        &mut session,
+        "SET LOCAL ROLE definitely_missing_role",
+    )
+    .unwrap();
+    assert_eq!(
+        session.effective_principal(),
+        AuthorizationPrincipal::BootstrapPostgres
+    );
+
+    submit_session_text(&shared, &mut session, "SET SESSION ROLE set_role_session_a").unwrap();
+    assert_eq!(session.effective_principal(), session_a);
+
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    submit_session_text(&shared, &mut session, "SET LOCAL ROLE set_role_local").unwrap();
+    assert_eq!(session.effective_principal(), local);
+    // SESSION clears LOCAL and takes effect immediately.
+    submit_session_text(&shared, &mut session, "SET SESSION ROLE set_role_session_b").unwrap();
+    assert_eq!(session.effective_principal(), session_b);
+    assert!(session.transaction_local_principal.is_none());
+    submit_session_text(&shared, &mut session, "COMMIT").unwrap();
+    assert_eq!(session.effective_principal(), session_b);
+
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    submit_session_text(&shared, &mut session, "SET LOCAL ROLE set_role_local").unwrap();
+    assert_eq!(session.effective_principal(), local);
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+    assert_eq!(session.effective_principal(), session_b);
+
+    // Failed COMMIT acts as rollback: the transaction-scoped SESSION change and LOCAL override
+    // are both discarded, restoring the entry session identity.
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    submit_session_text(&shared, &mut session, "SET SESSION ROLE set_role_session_a").unwrap();
+    submit_session_text(&shared, &mut session, "SET LOCAL ROLE set_role_local").unwrap();
+    assert_eq!(session.effective_principal(), local);
+    submit_session_text(&shared, &mut session, "SELEC broken").unwrap_err();
+    assert!(matches!(
+        submit_session_text(&shared, &mut session, "COMMIT").unwrap(),
+        QueryOutcome::Command {
+            tag: CommandTag::Rollback,
+            ..
+        }
+    ));
+    assert_eq!(session.effective_principal(), session_b);
+
+    submit_session_text(&shared, &mut session, "BEGIN").unwrap();
+    submit_session_text(&shared, &mut session, "SET LOCAL ROLE set_role_local").unwrap();
+    submit_session_text(&shared, &mut session, "COMMIT AND CHAIN").unwrap();
+    assert!(session.in_transaction());
+    assert_eq!(session.effective_principal(), session_b);
+    submit_session_text(&shared, &mut session, "SET LOCAL ROLE set_role_local").unwrap();
+    submit_session_text(&shared, &mut session, "ROLLBACK AND CHAIN").unwrap();
+    assert!(session.in_transaction());
+    assert_eq!(session.effective_principal(), session_b);
+    submit_session_text(&shared, &mut session, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn currval_requires_sequence_select_after_update_authorized_nextval() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    for statement in [
+        "CREATE ROLE currval_acl_actor",
+        "CREATE SEQUENCE currval_acl_sequence",
+        "GRANT USAGE ON SCHEMA public TO currval_acl_actor",
+        "GRANT UPDATE ON SEQUENCE currval_acl_sequence TO currval_acl_actor",
+        "SET ROLE currval_acl_actor",
+    ] {
+        submit_session_text(&shared, &mut session, statement).unwrap();
+    }
+    assert_eq!(
+        single_int8(
+            submit_session_text(
+                &shared,
+                &mut session,
+                "SELECT nextval('currval_acl_sequence')"
+            )
+            .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        submit_session_text(
+            &shared,
+            &mut session,
+            "SELECT currval('currval_acl_sequence')"
+        )
+        .unwrap_err()
+        .category,
+        ErrorCategory::PermissionDenied,
+        "currval must use the sequence SELECT ACL request, not a relation-shaped miss"
+    );
+
+    submit_session_text(&shared, &mut session, "RESET ROLE").unwrap();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "GRANT SELECT ON SEQUENCE currval_acl_sequence TO currval_acl_actor",
+    )
+    .unwrap();
+    submit_session_text(&shared, &mut session, "SET ROLE currval_acl_actor").unwrap();
+    assert_eq!(
+        single_int8(
+            submit_session_text(
+                &shared,
+                &mut session,
+                "SELECT currval('currval_acl_sequence')"
+            )
+            .unwrap()
+        ),
+        1
+    );
+}
+
 fn single_int8(outcome: QueryOutcome) -> i64 {
     let QueryOutcome::Rows { columns, rows } = outcome else {
         panic!("expected one sequence result row");
@@ -411,7 +551,7 @@ fn session_cleanup_and_compatibility_reads_do_not_enter_mutation_admission() {
     let next_after_begin = shared.next_txn_id.load(Ordering::Relaxed);
     assert!(matches!(
         submit_session_text(&shared, &mut session, "SELECT pg_advisory_unlock_all()").unwrap(),
-        QueryOutcome::Command { .. }
+        QueryOutcome::Rows { rows, .. } if rows == vec![vec![DbValue::Null]]
     ));
     for cleanup in ["CLOSE ALL", "UNLISTEN *", "RESET ALL"] {
         assert!(matches!(
@@ -1009,7 +1149,7 @@ fn command_tags_are_neutral_until_adapter_formats_them() {
     );
     assert_eq!(pg_adapter::command_complete_tag(&outcome), "CREATE TABLE");
 
-    let parsed_truncate = parse_command("TRUNCATE TABLE t CONTINUE IDENTITY").unwrap();
+    let parsed_truncate = parse_command("TRUNCATE TABLE t RESTART IDENTITY").unwrap();
     let truncate = command_tag(&parsed_truncate);
     assert_eq!(truncate, CommandTag::Truncate);
     assert_eq!(
@@ -1019,6 +1159,68 @@ fn command_tags_are_neutral_until_adapter_formats_them() {
         }),
         "TRUNCATE TABLE"
     );
+
+    for (sql, expected) in [
+        ("DROP INDEX t_idx", "DROP INDEX"),
+        ("ALTER TABLE t ADD COLUMN b INT", "ALTER TABLE"),
+        ("COMMENT ON TABLE t IS 'table comment'", "COMMENT"),
+        ("DROP TABLE t", "DROP TABLE"),
+        ("CREATE VIEW t_v AS SELECT a FROM t", "CREATE VIEW"),
+    ] {
+        let parsed = parse_command(sql).unwrap();
+        let outcome = QueryOutcome::Command {
+            tag: command_tag(&parsed),
+            rows_affected: None,
+        };
+        assert_eq!(pg_adapter::command_complete_tag(&outcome), expected);
+    }
+}
+
+#[test]
+fn postgres_compatibility_diagnostics_remove_internal_engine_context() {
+    for (input, expected) in [
+        (
+            "apply failed: relation \"missing_people\" does not exist",
+            "relation does not exist",
+        ),
+        (
+            "apply failed: apply failed: column \"missing\" does not exist",
+            "column does not exist",
+        ),
+        (
+            "apply failed: relation \"people\" is not a view",
+            "relation is not a view",
+        ),
+        (
+            "apply failed: cannot drop column \"id\" because an index or constraint depends on it",
+            "cannot drop column because an index or constraint depends on it",
+        ),
+        (
+            "apply failed: INSERT must provide every column without a default in the bootstrap relational subset",
+            "INSERT must provide every column without a default",
+        ),
+    ] {
+        let error = ExecuteError::Unsupported(input.to_string());
+        assert_eq!(postgres_compatibility_error_message(&error), expected);
+    }
+}
+
+#[test]
+fn relational_parse_failures_use_the_stable_client_diagnostic() {
+    let error = map_parse_error(ParseError::InvalidRelationalSql);
+    assert_eq!(
+        error.message,
+        "query shape is not supported by the compatibility stub"
+    );
+}
+
+#[test]
+fn typed_negative_offset_is_not_relowered_as_general_select_sql() {
+    let shared = SharedEngine::new();
+    let error = submit_ephemeral_text(&shared, "SELECT id FROM missing ORDER BY id OFFSET -1")
+        .expect_err("negative OFFSET is a typed parser error");
+    assert_eq!(error.category, ErrorCategory::Syntax);
+    assert_eq!(error.message, "OFFSET must not be negative");
 }
 
 #[test]
@@ -1181,7 +1383,8 @@ fn active_transaction_stages_create_table_until_rollback() {
     let hidden = facade
         .execute(observer, "SELECT id FROM must_not_autocommit")
         .unwrap_err();
-    assert!(hidden.message.contains("must_not_autocommit"));
+    assert_eq!(hidden.category, ErrorCategory::Engine);
+    assert_eq!(hidden.message, "relation does not exist");
 
     facade.execute(session, "ROLLBACK").unwrap();
     facade
@@ -1203,7 +1406,8 @@ fn shared_active_transaction_publishes_create_table_only_at_commit() {
     assert!(session.in_transaction());
 
     let hidden = submit_ephemeral_text(&shared, "SELECT id FROM must_not_autocommit").unwrap_err();
-    assert!(hidden.message.contains("must_not_autocommit"));
+    assert_eq!(hidden.category, ErrorCategory::Engine);
+    assert_eq!(hidden.message, "relation does not exist");
 
     submit_session_text(&shared, &mut session, "COMMIT").unwrap();
     let QueryOutcome::Rows { rows, .. } =
@@ -1736,7 +1940,8 @@ fn prepared_public_catalog_lookalike_fails_closed_and_survives_drop_aba() {
     let missing = shared
         .prepare_statement(&session, sql, &[])
         .expect_err("missing explicit public relation must fail during Parse/Describe");
-    assert!(missing.message.contains("public.pg_type"), "{missing:?}");
+    assert_eq!(missing.category, ErrorCategory::UndefinedRelation);
+    assert_eq!(missing.message, "relation does not exist");
 
     submit_session_text(&shared, &mut session, "CREATE TABLE pg_type (oid INT)").unwrap();
     let prepared = shared.prepare_statement(&session, sql, &[]).unwrap();
@@ -1746,7 +1951,8 @@ fn prepared_public_catalog_lookalike_fails_closed_and_survives_drop_aba() {
         .submit(&mut session, SubmissionRequest::Prepared(&bound))
         .into_immediate()
         .expect_err("drop must not rebind public.pg_type to pg_catalog.pg_type");
-    assert!(dropped.message.contains("public.pg_type"), "{dropped:?}");
+    assert_eq!(dropped.category, ErrorCategory::UndefinedRelation);
+    assert_eq!(dropped.message, "relation does not exist");
 }
 
 #[test]

@@ -66,6 +66,9 @@ pub(crate) struct JoinPlan {
     pub relations: Vec<JoinRelationRef>,
     pub steps: Vec<JoinStep>,
     pub projection: Vec<JoinProjItem>,
+    /// Plain `SELECT DISTINCT` over the complete projected row. The non-streaming executor
+    /// materializes the projection, sorts all keys, and compacts adjacent equals on the GPU.
+    pub distinct: bool,
     /// Output aliases parallel to SELECT-list `projection` items. Stars always carry `None`; a column
     /// alias is preserved through device materialization and may be referenced by ORDER BY.
     pub projection_aliases: Vec<Option<String>>,

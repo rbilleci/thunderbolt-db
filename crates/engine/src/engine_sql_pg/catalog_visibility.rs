@@ -15,6 +15,17 @@ pub(super) fn map_catalog_predicate_function(
         ));
     }
     let name = super::catalog_presentation::catalog_function_name(function)?;
+    if name == "current_database" {
+        if function.args.is_empty() {
+            // The endpoint currently exposes one fixed database identity. Lower that immutable
+            // session/catalog fact to a typed literal; the surrounding comparison still compiles
+            // and executes as a device text predicate.
+            return Ok(ResidentExpr::TextLiteral("postgres".to_string()));
+        }
+        return Err(sql_pg_error(
+            "function current_database requires no arguments".to_string(),
+        ));
+    }
     let expected_relation = match name.as_str() {
         "pg_table_is_visible" => Some("pg_class"),
         "pg_type_is_visible" => Some("pg_type"),

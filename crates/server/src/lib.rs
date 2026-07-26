@@ -89,7 +89,7 @@ mod sql_cursor;
 use sql_cursor::classify_sql_cursor_statement;
 mod sql_session;
 use sql_session::{
-    execute_cursor_action_async as execute_sql_cursor_action_async,
+    classify_prepared_action, execute_cursor_action_async as execute_sql_cursor_action_async,
     execute_cursor_action_blocking as execute_sql_cursor_action_blocking,
     execute_prepared_action_async as execute_sql_prepared_action_async,
     execute_prepared_action_blocking as execute_sql_prepared_action_blocking,
@@ -535,13 +535,15 @@ fn execute_simple_query_blocking(
                 execute_sql_cursor_action_blocking(engine, session, extended, action, active)
             }
             Err(error) => Err(error),
-            Ok(None) => match classify_sql_prepared_statement(statement) {
-                Ok(Some(action)) => {
-                    execute_sql_prepared_action_blocking(engine, session, extended, action, active)
+            Ok(None) => {
+                match classify_prepared_action(extended, statement, session.transaction_status()) {
+                    Ok(Some(action)) => execute_sql_prepared_action_blocking(
+                        engine, session, extended, action, active,
+                    ),
+                    Ok(None) => submit_text_cancellable(engine, session, statement, active),
+                    Err(error) => Err(error),
                 }
-                Ok(None) => submit_text_cancellable(engine, session, statement, active),
-                Err(error) => Err(error),
-            },
+            }
         };
         response.extend_from_slice(&encode_cancellable_outcome_messages(active, &mut outcome)?);
         let failed = outcome.is_err();
@@ -584,7 +586,7 @@ fn complete_simple_query_action_blocking(
     outcome: &Result<QueryOutcome, DbError>,
     response: &mut Vec<u8>,
 ) -> io::Result<()> {
-    if outcome.is_err() {
+    if sql_session::outcome_error_poison_transaction(outcome) {
         session.mark_transaction_failed();
     }
     let action = extended.simple_query_completion_action(outcome);
@@ -1899,7 +1901,11 @@ async fn execute_simple_query_async(
                 )
                 .await?
             }
-            Ok(None) => match classify_sql_prepared_statement(statement) {
+            Ok(None) => match classify_prepared_action(
+                extended,
+                statement,
+                shared_session_transaction_status(&session),
+            ) {
                 Err(error) => Err(error),
                 Ok(Some(action)) => {
                     execute_sql_prepared_action_async(

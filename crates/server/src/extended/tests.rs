@@ -1,7 +1,7 @@
 use super::*;
 use gpu_db_facade::{
-    BoundPreparedStatement, DbError, DbValue, QueryOutcome, SharedEngine, SharedSession,
-    SubmissionRequest,
+    BoundPreparedStatement, DbError, DbValue, ErrorCategory, PreparedStatement, QueryOutcome,
+    SharedEngine, SharedSession, SubmissionRequest,
 };
 
 fn submit_text(
@@ -22,6 +22,270 @@ fn submit_prepared(
     engine
         .submit(session, SubmissionRequest::Prepared(bound))
         .into_immediate()
+}
+
+#[test]
+fn session_cursor_and_parse_shape_errors_keep_the_frozen_psql_diagnostics() {
+    let mut extended = ExtendedSession::default();
+    for error in [
+        extended.fetch_sql_cursor("missing", Some(1)).unwrap_err(),
+        extended
+            .close_sql_cursor(crate::sql_cursor::SqlCursorCloseTarget::Named(
+                "missing".to_string(),
+            ))
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code, "34000");
+        assert_eq!(error.message, "cursor does not exist");
+    }
+
+    let error = extended_prepared_parse_error(DbError {
+        category: ErrorCategory::Syntax,
+        message: "invalid SQL parameter reference".to_string(),
+    });
+    assert_eq!(error.code, "42P02");
+    assert_eq!(error.message, "there is no parameter $0");
+}
+
+#[test]
+fn materialized_cursor_lifecycle_distinguishes_idle_and_transaction_ownership() {
+    let outcome = || QueryOutcome::Rows {
+        columns: vec![ColumnMeta {
+            name: "value".to_string(),
+            logical_type: LogicalType::Int4,
+            numeric_typmod: None,
+        }],
+        rows: vec![
+            vec![DbValue::Int4(1)],
+            vec![DbValue::Int4(2)],
+            vec![DbValue::Int4(3)],
+        ],
+    };
+    let mut extended = ExtendedSession::default();
+    extended
+        .install_sql_cursor("idle_cursor".to_string(), outcome(), false)
+        .unwrap();
+    extended
+        .install_sql_cursor("transaction_cursor".to_string(), outcome(), true)
+        .unwrap();
+
+    let QueryOutcome::Command { tag, .. } =
+        extended.move_sql_cursor("idle_cursor", Some(2)).unwrap()
+    else {
+        panic!("MOVE must return a command outcome");
+    };
+    assert_eq!(tag, CommandTag::Other("MOVE 2".to_string()));
+    assert_eq!(
+        extended.fetch_sql_cursor("idle_cursor", None).unwrap(),
+        QueryOutcome::Returning {
+            tag: CommandTag::Other("FETCH".to_string()),
+            columns: vec![ColumnMeta {
+                name: "value".to_string(),
+                logical_type: LogicalType::Int4,
+                numeric_typmod: None,
+            }],
+            rows: vec![vec![DbValue::Int4(3)]],
+            rows_affected: 1,
+        }
+    );
+
+    extended.finish_transaction_boundary(false);
+    assert!(extended.fetch_sql_cursor("idle_cursor", Some(0)).is_ok());
+    let error = extended
+        .fetch_sql_cursor("transaction_cursor", Some(0))
+        .unwrap_err();
+    assert_eq!(error.code, "34000");
+    assert_eq!(error.message, "cursor does not exist");
+
+    let duplicate = extended
+        .ensure_sql_cursor_name_available("idle_cursor")
+        .unwrap_err();
+    assert_eq!(duplicate.code, "42P03");
+    assert_eq!(duplicate.message, "cursor already exists");
+}
+
+#[test]
+fn extended_cursor_wrapper_describes_no_data_and_survives_its_implicit_cycle() {
+    let engine = SharedEngine::new();
+    let mut session = engine.open_session();
+    let mut extended = ExtendedSession::default();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE cursor_wrapper_accounts (id int4)",
+    )
+    .unwrap();
+    let target = ExtendedSession::analyze_sql_prepare(
+        &engine,
+        &session,
+        "SELECT id FROM cursor_wrapper_accounts WHERE id = $1",
+        &[Some(LogicalType::Int4)],
+    )
+    .unwrap();
+    extended
+        .install_sql_prepared("cursor_target".to_string(), target)
+        .unwrap();
+
+    extended.complete_transaction_action(TransactionAction::BeginImplicit, true);
+    let request = extended
+        .prepare_request(
+            String::new(),
+            "DECLARE implicit_cursor CURSOR FOR EXECUTE cursor_target($1)".to_string(),
+            &[23],
+            SessionTransactionStatus::InTransaction,
+        )
+        .unwrap();
+    assert!(
+        !request
+            .cursor_declaration
+            .as_ref()
+            .unwrap()
+            .transaction_bound
+    );
+    let analysis = ExtendedSession::analyze_prepare(&engine, &mut session, &request);
+    extended.complete_parse(request, analysis).unwrap();
+    assert_eq!(
+        message_tags(
+            &extended
+                .describe(
+                    DescribeTarget::Statement,
+                    "",
+                    SessionTransactionStatus::InTransaction,
+                )
+                .unwrap()
+        ),
+        vec![b't', b'n']
+    );
+    extended
+        .bind(String::new(), "", &[], &[Some(b"2".to_vec())], &[])
+        .unwrap();
+    assert!(matches!(
+        extended.execution_request("").unwrap(),
+        Some(ExecutionRequest::Query(_))
+    ));
+    extended
+        .set_execution_outcome(
+            "",
+            Ok(QueryOutcome::Rows {
+                columns: vec![ColumnMeta {
+                    name: "id".to_string(),
+                    logical_type: LogicalType::Int4,
+                    numeric_typmod: None,
+                }],
+                rows: vec![vec![DbValue::Int4(2)]],
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        message_tags(&extended.encode_execute("", 0).unwrap()),
+        vec![b'C']
+    );
+
+    extended.complete_transaction_action(TransactionAction::CommitImplicit, true);
+    extended.finish_transaction_boundary(false);
+    assert!(matches!(
+        extended
+            .fetch_sql_cursor("implicit_cursor", Some(1))
+            .unwrap(),
+        QueryOutcome::Returning { rows, .. } if rows == vec![vec![DbValue::Int4(2)]]
+    ));
+
+    let explicit = extended
+        .prepare_request(
+            "explicit".to_string(),
+            "DECLARE explicit_cursor CURSOR FOR EXECUTE cursor_target($1)".to_string(),
+            &[23],
+            SessionTransactionStatus::InTransaction,
+        )
+        .unwrap();
+    assert!(
+        explicit
+            .cursor_declaration
+            .as_ref()
+            .unwrap()
+            .transaction_bound
+    );
+}
+
+#[test]
+fn extended_parameterized_select_cursor_keeps_the_frozen_fetch_count_boundary() {
+    let mut extended = ExtendedSession::default();
+    let error = extended
+        .prepare_request(
+            String::new(),
+            "DECLARE _psql_cursor CURSOR FOR SELECT id FROM accounts WHERE id = $1".to_string(),
+            &[23],
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "0A000");
+    assert_eq!(
+        error.message,
+        "parameterized cursor declarations are not supported"
+    );
+}
+
+#[test]
+fn bind_arity_error_keeps_the_frozen_psql_diagnostic() {
+    let statement = Statement {
+        prepared: PreparedStatement::parse("SELECT 1").unwrap(),
+        sql_execute_bind_arguments: None,
+        deferred_execution_error: None,
+        cursor_declaration: None,
+        copy: None,
+        copy_target: None,
+        parameter_oids: vec![23, 25],
+        columns: Vec::new(),
+    };
+    let error = validate_bind_shape(&statement, &[], &[Some(b"1".to_vec())]).unwrap_err();
+    assert_eq!(error.code, "08P01");
+    assert_eq!(error.message, "bind message has wrong number of parameters");
+}
+
+#[test]
+fn extended_sql_execute_arity_keeps_the_frozen_prepared_diagnostic() {
+    let engine = SharedEngine::new();
+    let mut session = engine.open_session();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE arity_accounts (id int4)",
+    )
+    .unwrap();
+    let target = ExtendedSession::analyze_sql_prepare(
+        &engine,
+        &session,
+        "SELECT id FROM arity_accounts WHERE id = $1",
+        &[Some(LogicalType::Int4)],
+    )
+    .unwrap();
+    let error = sql_execute_bind_arguments(&target, &[], &[]).unwrap_err();
+    assert_eq!(error.code, "08P01");
+    assert_eq!(
+        error.message,
+        "bound parameter count does not match prepared statement"
+    );
+}
+
+#[test]
+fn extended_relational_parse_errors_keep_the_bounded_protocol_diagnostic() {
+    for parsed in [
+        PreparedStatement::parse(
+            "SELECT id FROM accounts JOIN teams ON id = account_id WHERE id = $1",
+        )
+        .unwrap_err(),
+        DbError {
+            category: ErrorCategory::Syntax,
+            message: "query shape is not supported by the compatibility stub".to_string(),
+        },
+    ] {
+        let error = extended_prepared_parse_error(parsed);
+        assert_eq!(error.code, "0A000");
+        assert_eq!(
+            error.message,
+            "extended query protocol only supports relational SELECT"
+        );
+    }
 }
 
 #[test]
@@ -87,6 +351,227 @@ fn parse_bind_and_describe_are_effect_free_and_catalog_typed() {
     assert_eq!(statement_description[0], b't');
     assert!(statement_description.contains(&b'T'));
     assert!(extended.execution_request("portal").unwrap().is_some());
+}
+
+#[test]
+fn extended_sql_execute_binds_outer_parameters_to_the_session_prepared_target() {
+    let engine = SharedEngine::new();
+    let mut session = engine.open_session();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE execute_bind_accounts (id int4 PRIMARY KEY, name text)",
+    )
+    .unwrap();
+    submit_text(
+        &engine,
+        &mut session,
+        "INSERT INTO execute_bind_accounts VALUES (1, 'Ada'), (2, 'Grace')",
+    )
+    .unwrap();
+    let target = engine
+        .prepare_statement(
+            &session,
+            "SELECT id FROM execute_bind_accounts WHERE id = $1 AND id = $2 AND name = $3 ORDER BY id",
+            &[
+                Some(LogicalType::Int4),
+                Some(LogicalType::Int4),
+                Some(LogicalType::Text),
+            ],
+        )
+        .unwrap();
+    let mut extended = ExtendedSession::default();
+    extended
+        .install_sql_prepared("lookup".to_string(), target)
+        .unwrap();
+
+    let request = extended
+        .prepare_request(
+            "outer_lookup".to_string(),
+            "EXECUTE lookup($1, $1, $2)".to_string(),
+            &[],
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap();
+    let analysis = ExtendedSession::analyze_prepare(&engine, &mut session, &request);
+    extended.complete_parse(request, analysis).unwrap();
+    assert_eq!(
+        extended.statements["outer_lookup"].parameter_oids,
+        vec![23, 25]
+    );
+    extended
+        .describe_revalidated(
+            &engine,
+            &session,
+            DescribeTarget::Statement,
+            "outer_lookup",
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap();
+    extended
+        .bind(
+            "lookup_portal".to_string(),
+            "outer_lookup",
+            &[],
+            &[Some(b"1".to_vec()), Some(b"Ada".to_vec())],
+            &[],
+        )
+        .unwrap();
+    let request = extended
+        .execution_request("lookup_portal")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        submit_prepared(&engine, &mut session, request.query_bound()).unwrap(),
+        QueryOutcome::Rows { rows, .. } if rows == vec![vec![DbValue::Int4(1)]]
+    ));
+}
+
+#[test]
+fn extended_sql_execute_describes_then_rejects_a_deferred_negative_limit() {
+    let engine = SharedEngine::new();
+    let mut session = engine.open_session();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE deferred_limit_accounts (id int4)",
+    )
+    .unwrap();
+    let plan = ExtendedSession::analyze_sql_prepare_plan(
+        &engine,
+        &session,
+        "SELECT id FROM deferred_limit_accounts ORDER BY id LIMIT -1",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        plan.deferred_execution_error.as_ref().unwrap().message,
+        "LIMIT must not be negative"
+    );
+    let mut extended = ExtendedSession::default();
+    extended
+        .install_sql_prepared_plan("negative_limit".to_string(), plan)
+        .unwrap();
+    let request = extended
+        .prepare_request(
+            "negative_execute".to_string(),
+            "EXECUTE negative_limit".to_string(),
+            &[],
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap();
+    let analysis = ExtendedSession::analyze_prepare(&engine, &mut session, &request);
+    extended.complete_parse(request, analysis).unwrap();
+    assert_eq!(
+        message_tags(
+            &extended
+                .describe(
+                    DescribeTarget::Statement,
+                    "negative_execute",
+                    SessionTransactionStatus::Idle,
+                )
+                .unwrap()
+        ),
+        vec![b't', b'T']
+    );
+    extended
+        .bind(
+            "negative_portal".to_string(),
+            "negative_execute",
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+    let error = extended.execution_request("negative_portal").unwrap_err();
+    assert_eq!(error.message, "LIMIT must not be negative");
+}
+
+#[test]
+fn extended_sql_execute_binds_typed_literals_before_outer_parameters() {
+    let engine = SharedEngine::new();
+    let mut session = engine.open_session();
+    submit_text(
+        &engine,
+        &mut session,
+        "CREATE TABLE execute_literal_accounts (id int4 PRIMARY KEY, name text)",
+    )
+    .unwrap();
+    submit_text(
+        &engine,
+        &mut session,
+        "INSERT INTO execute_literal_accounts VALUES (1, 'Ada'), (2, 'Linus')",
+    )
+    .unwrap();
+    let target = engine
+        .prepare_statement(
+            &session,
+            "SELECT id FROM execute_literal_accounts WHERE id = $1 AND name = $2",
+            &[Some(LogicalType::Int4), Some(LogicalType::Text)],
+        )
+        .unwrap();
+    let mut extended = ExtendedSession::default();
+    extended
+        .install_sql_prepared("literal_lookup".to_string(), target)
+        .unwrap();
+
+    let request = extended
+        .prepare_request(
+            "outer_literal_lookup".to_string(),
+            "EXECUTE literal_lookup(($1)::int4, 'Ada')".to_string(),
+            &[],
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap();
+    let analysis = ExtendedSession::analyze_prepare(&engine, &mut session, &request);
+    extended.complete_parse(request, analysis).unwrap();
+    assert_eq!(
+        extended.statements["outer_literal_lookup"].parameter_oids,
+        vec![23]
+    );
+    extended
+        .bind(
+            "literal_lookup_portal".to_string(),
+            "outer_literal_lookup",
+            &[],
+            &[Some(b"1".to_vec())],
+            &[],
+        )
+        .unwrap();
+    let request = extended
+        .execution_request("literal_lookup_portal")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        submit_prepared(&engine, &mut session, request.query_bound()).unwrap(),
+        QueryOutcome::Rows { rows, .. } if rows == vec![vec![DbValue::Int4(1)]]
+    ));
+    let error = extended
+        .prepare_request(
+            "invalid_literal_lookup".to_string(),
+            "EXECUTE literal_lookup('not-an-int', 'Ada')".to_string(),
+            &[],
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "22P02");
+    assert_eq!(
+        error.message,
+        "invalid input syntax for parameter type oid 23: \"not-an-int\""
+    );
+    let error = extended
+        .prepare_request(
+            "conflicting_literal_lookup".to_string(),
+            "EXECUTE literal_lookup($1, $1)".to_string(),
+            &[],
+            SessionTransactionStatus::Idle,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "42P08");
+    assert_eq!(
+        error.message,
+        "inconsistent parameter types for SQL EXECUTE placeholder"
+    );
 }
 
 #[test]
@@ -1352,6 +1837,20 @@ fn bind_codec_errors_use_postgresql_semantic_sqlstates() {
             expected
         );
     }
+    let error = extended
+        .bind(
+            "bad_int4_message".to_string(),
+            "int4_arg",
+            &[0],
+            &[Some(b"not-an-int".to_vec())],
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "22P02");
+    assert_eq!(
+        error.message,
+        "invalid input syntax for parameter type oid 23: \"not-an-int\""
+    );
     for (portal, value) in [
         ("numeric_hex", b"0x2a".as_slice()),
         ("numeric_decimal_underscores", b"1_500.25_00".as_slice()),

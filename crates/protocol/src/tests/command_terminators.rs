@@ -38,43 +38,82 @@ fn accepts_optional_statement_terminator() {
         }
     );
     assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
-    assert_eq!(parse_command("RESET ROLE;\n").unwrap(), Command::ResetAll);
+    assert_eq!(
+        parse_command("RESET ROLE;\n").unwrap(),
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
+    );
     assert_eq!(
         parse_command("RESET SESSION ROLE;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("RESET LOCAL ROLE;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Local
+        }
     );
     assert_eq!(
         parse_command("RESET AUTHORIZATION;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
-    assert_eq!(parse_command("RESET AUTH;\n").unwrap(), Command::ResetAll);
+    assert_eq!(
+        parse_command("RESET AUTH;\n").unwrap(),
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
+    );
     assert_eq!(
         parse_command("RESET SESSION AUTHORIZATION;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("RESET SESSION AUTHORIZATION DEFAULT;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("RESET SESSION AUTHORIZATION TO DEFAULT;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("RESET SESSION AUTH;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("RESET SESSION AUTH DEFAULT;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("RESET SESSION AUTH TO DEFAULT;\n").unwrap(),
-        Command::ResetAll
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);
     assert_eq!(parse_command("CLOSE ALL;\n").unwrap(), Command::ResetAll);
@@ -94,7 +133,10 @@ fn accepts_optional_statement_terminator() {
     );
     assert_eq!(
         parse_command("SET ROLE NONE;\n").unwrap(),
-        Command::SetRole { role: None }
+        Command::SetRole {
+            role: None,
+            scope: SetRoleScope::Session
+        }
     );
     assert_eq!(
         parse_command("SET SESSION AUTHORIZATION DEFAULT;\n").unwrap(),

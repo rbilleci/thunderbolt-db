@@ -17,8 +17,8 @@ COMMENT
  name   | text    |           |          |         | extended |             |              | person name
  bucket | integer |           |          | 7       | plain    |             |              |
 Indexes:
-    "rename_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
     "rename_table_people_pkey" PRIMARY KEY, btree (id)
+    "rename_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
 Access method: heap
 
 ALTER TABLE
@@ -36,8 +36,8 @@ psql:324_protocol_psql_rename_tables.sql:10: error: Did not find any relation na
  name   | text    |           |          |         | extended |             |              | person name
  bucket | integer |           |          | 7       | plain    |             |              |
 Indexes:
-    "rename_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
     "rename_table_people_pkey" PRIMARY KEY, btree (id)
+    "rename_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
 Access method: heap
 
  table_schema |      table_name      | table_type
@@ -90,9 +90,8 @@ Access method: heap
                         Object descriptions
  Schema |           Name           |      Object      | Description
 --------+--------------------------+------------------+-------------
- public | renamed_table_people     | table            | old table
  public | rename_table_people_pkey | table constraint | primary id
-(2 rows)
+(1 row)
 
                                                          List of relations
  Schema |             Name             | Type  |  Owner   |        Table         | Persistence | Access method | Size | Description

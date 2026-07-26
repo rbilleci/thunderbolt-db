@@ -1,0 +1,99 @@
+{
+  "buckets": {
+    "durability.invariants": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 309,
+      "total": 309
+    },
+    "execution.gpu_routing_and_batching": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 212,
+      "total": 212
+    },
+    "protocol.client_flows": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 136,
+      "total": 136
+    },
+    "protocol.error_paths": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 96,
+      "total": 96
+    },
+    "protocol.extended_query": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 401,
+      "total": 401
+    },
+    "replication.operational_cluster": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 8,
+      "total": 8
+    },
+    "replication.role_and_log": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 271,
+      "total": 271
+    },
+    "sql.catalog_schema_types": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 388,
+      "total": 388
+    },
+    "sql.gpu_bridge": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 1,
+      "total": 1
+    },
+    "sql.parser_features": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 66,
+      "total": 66
+    },
+    "sql.relational_foundation": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 510,
+      "total": 510
+    },
+    "sql.transaction_flows": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 294,
+      "total": 294
+    },
+    "storage.indexing": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 57,
+      "total": 57
+    },
+    "uncategorized": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 308,
+      "total": 308
+    }
+  },
+  "top_failing_categories": [],
+  "totals": {
+    "failed": 0,
+    "ignored": 0,
+    "passed": 1866,
+    "total": 1866
+  },
+  "trend_hook": {
+    "baseline_available": false,
+    "note": "No baseline configured yet. Add docs/compatibility/scorecard.baseline.json to enable diffs."
+  }
+}

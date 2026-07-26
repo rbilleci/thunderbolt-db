@@ -18,6 +18,8 @@ fn catalog_visibility_and_explicit_text_oid_comparisons_fail_closed_during_bindi
          WHERE pg_catalog.pg_type_is_visible(typnamespace)",
         "SELECT proname FROM pg_catalog.pg_proc \
          WHERE pg_catalog.pg_function_is_visible('not-an-oid')",
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_catalog = current_database('postgres')",
         "SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = '2200'::text",
         "SELECT relname FROM pg_catalog.pg_class WHERE '2200'::text = relnamespace",
     ] {
@@ -72,6 +74,16 @@ fn gpu_catalog_visibility_accepts_only_corresponding_oid_membership_shapes() {
         visible.rows,
         vec![vec![SqlValue::Text("visibility_gpu_probe".to_string())]]
     );
+
+    let current_database = engine
+        .execute_resident_expr_select_sql(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_catalog = current_database() \
+               AND table_name = 'visibility_gpu_probe'",
+        )
+        .unwrap();
+    assert_eq!(current_database.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(current_database.rows, visible.rows);
 
     let unknown_literal = engine
         .execute_resident_expr_select_sql(

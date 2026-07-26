@@ -59,7 +59,10 @@ if run_preflight "$stale_fixture" --apply >"$TMP_DIR/stale.out" 2>"$TMP_DIR/stal
   echo "expected stale sidecar maintenance preflight to fail" >&2
   exit 1
 fi
-grep -q 'does not match sidecar' "$TMP_DIR/stale.err"
+if ! grep -q 'SHA-256 checksum mismatch' "$TMP_DIR/stale.err"; then
+  cat "$TMP_DIR/stale.err" >&2
+  exit 1
+fi
 sha256sum "$stale_fixture/archive/MANIFEST" "$stale_fixture/TIMELINE_REGISTRY" \
   >"$TMP_DIR/stale-after.sha256"
 diff -u "$TMP_DIR/stale-before.sha256" "$TMP_DIR/stale-after.sha256"
@@ -81,7 +84,10 @@ if cargo run -q -p gpu_db_engine --example wal_archive_maintenance_preflight -- 
   echo "expected unsafe recent-base maintenance preflight to fail" >&2
   exit 1
 fi
-grep -q 'newer than PITR retention cutoff' "$TMP_DIR/recent.err"
+if ! grep -q 'newer than PITR retention cutoff' "$TMP_DIR/recent.err"; then
+  cat "$TMP_DIR/recent.err" >&2
+  exit 1
+fi
 sha256sum "$recent_fixture/archive/MANIFEST" "$recent_fixture/TIMELINE_REGISTRY" \
   >"$TMP_DIR/recent-after.sha256"
 diff -u "$TMP_DIR/recent-before.sha256" "$TMP_DIR/recent-after.sha256"

@@ -12,10 +12,6 @@ impl Engine {
             .gpu_id
             .unwrap_or_else(|| self.planner.default_gpu_id());
         let policy_sets_budget = policy.budget_bytes.is_some();
-        if let Some(budget_bytes) = policy.budget_bytes {
-            self.set_relational_residency_budget_bytes(gpu_id, budget_bytes);
-        }
-        let budget_bytes = self.relational_residency_budget_bytes(gpu_id);
         let requested_tables = if policy.tables.is_empty() {
             self.ddl_catalog_mut()
                 .relational_catalog
@@ -31,6 +27,55 @@ impl Engine {
         if let Some(max_table_count) = policy.max_table_count {
             selected_tables.truncate(max_table_count);
         }
+        if let Some(requested_budget) = policy.budget_bytes {
+            let incompatible = selected_tables
+                .iter()
+                .filter_map(|table| {
+                    let resident_bytes =
+                        self.relational_resident_table_bytes_for_gpu(table, gpu_id);
+                    (self.table_device_authoritative(table) && resident_bytes > requested_budget)
+                        .then(|| (table.clone(), resident_bytes))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if !incompatible.is_empty() {
+                let budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+                let entries = selected_tables
+                    .into_iter()
+                    .map(|table| {
+                        if let Some(resident_bytes) = incompatible.get(&table).copied() {
+                            RelationalResidencyWarmupEntry {
+                                table: table.clone(),
+                                action: RelationalResidencyWarmupAction::Error,
+                                reason: format!(
+                                    "requested GPU {gpu_id} residency budget {requested_budget} bytes cannot replace device-authoritative relation \"{table}\" requiring {resident_bytes} retained bytes"
+                                ),
+                                resident_bytes,
+                                evicted_tables: Vec::new(),
+                                route_decision: None,
+                            }
+                        } else {
+                            RelationalResidencyWarmupEntry {
+                                table,
+                                action: RelationalResidencyWarmupAction::Skipped,
+                                reason: "requested residency budget was rejected before application"
+                                    .to_string(),
+                                resident_bytes: 0,
+                                evicted_tables: Vec::new(),
+                                route_decision: None,
+                            }
+                        }
+                    })
+                    .collect();
+                return RelationalResidencyWarmupReport {
+                    gpu_id,
+                    budget_bytes,
+                    requested_tables,
+                    entries,
+                };
+            }
+            self.set_relational_residency_budget_bytes(gpu_id, requested_budget);
+        }
+        let budget_bytes = self.relational_residency_budget_bytes(gpu_id);
 
         let memory_pressure_active = self
             .router

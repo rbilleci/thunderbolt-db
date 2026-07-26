@@ -1136,6 +1136,28 @@ pub(crate) fn bind_relational_select(
         (SelectProjection::All | SelectProjection::Columns(_), None) => {}
     }
 
+    // Bind HAVING before selecting a physical route. Otherwise a semantically-invalid typed SELECT
+    // can be declined by an enumerated route, attempted by the broader Expr bridge, and finally be
+    // reported as a residency miss instead of the SQL error that belongs to the statement. The
+    // predicate itself still runs on the GPU; this only resolves its result-column names against
+    // the already-bound SELECT schema.
+    if !select.having_groups.is_empty() {
+        let group_column = select.group_by.as_deref().ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "HAVING requires GROUP BY".to_string(),
+            ))
+        })?;
+        for filter in select.having_groups.iter().flatten() {
+            if !filter.column.eq_ignore_ascii_case(group_column)
+                && !select_is_aggregate_result_column(select, &filter.column)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "HAVING must reference grouped column or aggregate result".to_string(),
+                )));
+            }
+        }
+    }
+
     Ok(BoundRelationalSelect {
         selected_columns,
         selected_indexes,
@@ -1225,7 +1247,18 @@ pub(crate) fn bind_update_assignments(
                 table.columns[idx].ty,
                 &assignment.column,
             )
-            .map_err(ExecuteError::Engine)?;
+            .map_err(|error| {
+                if error
+                    .to_string()
+                    .starts_with("apply failed: invalid value for column")
+                {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "column type mismatch".to_string(),
+                    ))
+                } else {
+                    ExecuteError::Engine(error)
+                }
+            })?;
             let value = match &assignment.source_column {
                 None => BoundUpdateValue::Literal(value),
                 Some(source) if source == &assignment.column => {

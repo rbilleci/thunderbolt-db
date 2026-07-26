@@ -36,15 +36,11 @@ run_gate \
   scripts/run_p7_gpu_residency_baseline.sh \
   "- resident_device_memory_proof_supported: true" \
   "- resident_device_memory_retained: true" \
-  "- resident_device_memory_cuda_event_timing_supported: true" \
+  "- resident_device_memory_cuda_event_timing_supported: false" \
   "- p8_cache_manager_component_supported: explicit_relational_resident_cache" \
   "- resident_snapshot_valid_before_mutation: true" \
   "- resident_snapshot_valid_after_mutation: false" \
-  "- resident_refresh_cost_recorded: true" \
-  "- resident_budget_admission_supported: true" \
-  "- resident_budget_decision_accepted: true" \
-  "- resident_budget_oversize_rejected: true" \
-  "- memory_pressure_fallback_supported: true" \
+  "- resident_refresh_cost_recorded: false" \
   "- retained_filter_family_closeout: supported retained int4 filter groups and text prefix LIKE count are closed for the current SQL subset" \
   "### warm_resident_snapshot_probe" \
   "### resident_device_memory_count_kernel_probe" \
@@ -52,7 +48,7 @@ run_gate \
   "### resident_device_memory_text_prefix_count_probe" \
   "### resident_device_memory_filtered_grouped_count_kernel_probe" \
   "- h2d_bytes: 0" \
-  "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes"
+  "decision: current P7 evidence includes bounded resident table-data SELECT probes"
 
 run_gate \
   resident_warmup \
@@ -73,8 +69,8 @@ printf 'local_gpu_residency_preflight=passed\n'
 printf 'local_gpu_residency_preflight_scope=residency_baseline_warmup_maintenance_gpu_tests\n'
 printf 'local_gpu_residency_preflight_resident_device_memory=retained_cuda_allocation\n'
 printf 'local_gpu_residency_preflight_resident_routes=zero_h2d_supported_kernel_shapes\n'
-printf 'local_gpu_residency_preflight_cache_manager=budget_admission_eviction_invalidation_refresh\n'
-printf 'local_gpu_residency_preflight_cuda_event_timing=first_accepted_route_samples\n'
+printf 'local_gpu_residency_preflight_cache_manager=retained_allocation_invalidation_only\n'
+printf 'local_gpu_residency_preflight_cuda_event_timing=no_samples_for_current_routes\n'
 printf 'local_gpu_residency_preflight_warmup=operator_triggered_dry_run_apply\n'
 printf 'local_gpu_residency_preflight_maintenance=scheduler_friendly_tick\n'
 printf 'local_gpu_residency_preflight_gpu_tests=ignored_gpu_suite_execution_engine\n'

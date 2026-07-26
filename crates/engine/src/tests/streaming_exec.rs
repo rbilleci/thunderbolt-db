@@ -1202,9 +1202,10 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     assert!(e.table_chunk_authoritative("cp").is_some());
     assert!(e.table_chunk_authoritative("cc").is_some());
 
-    // Facade transaction identities are not MVCC indices. Rebuild from WAL, re-enter both cold
-    // classes, then use deliberately low/reused facade ids: the parent must still resolve at the
-    // recovered committed boundary and reject before adding a durable record.
+    // Facade transaction identities are not MVCC indices, but canonical durable identities cannot
+    // be reused for a different request. Rebuild from WAL, re-enter both cold classes, then use a
+    // fresh facade id: the parent must still resolve at the recovered committed boundary and reject
+    // before adding a durable record.
     let durable = e.durable_wal_records();
     let mut recovered = Engine::recover_from_durable_wal(&durable).unwrap();
     recovered.set_relational_residency_budget_bytes(0, 8192);
@@ -1233,7 +1234,7 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     assert!(recovered.table_chunk_authoritative("cc").is_some());
     let recovered_wal_before = recovered.durable_wal_records().len();
     let recovered_error = recovered
-        .execute_text(1, "DELETE FROM cp WHERE id = 100005")
+        .execute_text(20_001, "DELETE FROM cp WHERE id = 100005")
         .expect_err("decoupled facade id must not hide the current provider");
     assert!(
         format!("{recovered_error:?}").contains("foreign key constraint"),
@@ -1252,13 +1253,18 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     let recovered = std::sync::Arc::new(recovered);
     let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
     let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-    recovered.set_commit_prelock_hook(
-        std::sync::Arc::clone(&reached),
-        std::sync::Arc::clone(&resume),
-    );
     let deleting = std::sync::Arc::clone(&recovered);
+    let delete_reached = std::sync::Arc::clone(&reached);
+    let delete_resume = std::sync::Arc::clone(&resume);
     let delete = std::thread::spawn(move || {
-        deleting.execute_text(10_004, "DELETE FROM cp WHERE id = 100006")
+        deleting.execute_dml_concurrent_instrumented(
+            10_004,
+            "DELETE FROM cp WHERE id = 100006",
+            move || {
+                delete_reached.wait();
+                delete_resume.wait();
+            },
+        )
     });
     reached.wait();
     let race_wal_before = recovered.durable_wal_records().len();

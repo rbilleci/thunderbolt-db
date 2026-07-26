@@ -71,6 +71,8 @@ pub enum Command {
     ResetAll,
     SetRole {
         role: Option<String>,
+        #[serde(default)]
+        scope: SetRoleScope,
     },
     SetKv {
         key: String,
@@ -174,6 +176,15 @@ pub enum Command {
     /// is performance-sensitive, and ordinary `setval` has deliberately different rollback
     /// semantics.
     SequenceRestart(SequenceRestart),
+}
+
+/// PostgreSQL role-setting lifetime.  `SESSION` is also the bare/default `SET ROLE` scope;
+/// `LOCAL` is transaction-local and therefore must remain explicit in the executable AST.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetRoleScope {
+    #[default]
+    Session,
+    Local,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -420,11 +431,15 @@ pub struct SelectFunction {
 ///
 /// The parser resolves the literal's PostgreSQL type up front, so execution can materialize one
 /// typed transient relation on the GPU without carrying SQL text or wire metadata into the engine.
+/// A prepared `int4` parameter plus a bounded `int4` constant is folded at Bind, once all
+/// parameters are typed, into that same transient GPU scalar relation.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SelectLiteral {
     pub column_name: String,
     pub ty: SqlType,
     pub value: SqlValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_int4: Option<i32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

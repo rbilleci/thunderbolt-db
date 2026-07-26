@@ -989,7 +989,7 @@ fn shadowed_restart_identity_remains_an_ordered_sequence_barrier() {
         )
         .unwrap();
     engine
-        .execute_text(5_051, "TRUNCATE restart_barrier_owner CONTINUE IDENTITY")
+        .execute_text(5_051, "TRUNCATE restart_barrier_owner")
         .unwrap();
     engine
         .execute_text(

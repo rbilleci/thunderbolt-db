@@ -9,8 +9,8 @@ COMMENT
  id     | integer |           |          |
  name   | text    |           |          |
 Indexes:
-    "dc_people_name_key" UNIQUE CONSTRAINT, btree (name)
     "dc_people_pkey" PRIMARY KEY, btree (id)
+    "dc_people_name_key" UNIQUE CONSTRAINT, btree (name)
 
                     Object descriptions
  Schema |      Name      |      Object      | Description
@@ -18,11 +18,10 @@ Indexes:
  public | dc_people_pkey | table constraint | row identity
 (1 row)
 
-                    Object descriptions
- Schema |      Name      |      Object      | Description
---------+----------------+------------------+--------------
- public | dc_people_pkey | table constraint | row identity
-(1 row)
+         Object descriptions
+ Schema | Name | Object | Description
+--------+------+--------+-------------
+(0 rows)
 
 ALTER TABLE
 ALTER TABLE

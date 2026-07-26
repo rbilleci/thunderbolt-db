@@ -1245,6 +1245,37 @@ fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
 }
 
 #[test]
+fn device_authoritative_warmup_rejects_an_impossible_budget_without_applying_it() {
+    let mut engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(1, "CREATE TABLE authoritative_budget (id INT, label TEXT)")
+        .unwrap();
+    engine
+        .execute_text(2, "INSERT INTO authoritative_budget VALUES (1, 'resident')")
+        .unwrap();
+    assert!(engine.table_device_authoritative("authoritative_budget"));
+    assert_eq!(engine.relational_residency_budget_bytes(0), None);
+
+    let report = engine.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+        tables: vec!["authoritative_budget".to_string()],
+        budget_bytes: Some(1),
+        refresh_invalidated: true,
+        ..RelationalResidencyWarmupPolicy::default()
+    });
+
+    assert_eq!(report.budget_bytes, None);
+    assert_eq!(
+        report.entries[0].action,
+        RelationalResidencyWarmupAction::Error
+    );
+    assert!(report.entries[0]
+        .reason
+        .contains("cannot replace device-authoritative relation"));
+    assert_eq!(engine.relational_residency_budget_bytes(0), None);
+    assert!(engine.table_device_authoritative("authoritative_budget"));
+}
+
+#[test]
 fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
     let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")

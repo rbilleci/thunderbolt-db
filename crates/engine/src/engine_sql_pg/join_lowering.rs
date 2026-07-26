@@ -365,6 +365,7 @@ pub(super) fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteErro
         relations,
         steps,
         projection,
+        distinct: !stmt.distinct_clause.is_empty(),
         projection_aliases,
         order_by,
         order_by_nulls_first,
@@ -388,6 +389,7 @@ pub(super) fn build_join_plan_with_projection(
         relations,
         steps,
         projection,
+        distinct: !stmt.distinct_clause.is_empty(),
         projection_aliases,
         order_by,
         order_by_nulls_first,
@@ -425,14 +427,19 @@ fn build_join_structure(
     Ok((relations, steps))
 }
 
-/// Reject the clauses not on the join path yet (GROUP BY / HAVING / DISTINCT / window / WITH). WHERE is
-/// supported (split per-relation in the entry); ORDER BY / LIMIT / OFFSET are parsed by
+/// Reject the clauses not on the join path yet (GROUP BY / HAVING / DISTINCT ON / window / WITH).
+/// Plain DISTINCT is a GPU sort plus adjacent-equality compaction over the materialized projection.
+/// WHERE is supported (split per-relation in the entry); ORDER BY / LIMIT / OFFSET are parsed by
 /// `parse_join_order_by_limit` and applied to the result (a GPU sort then a slice). Shared by both joins.
 pub(super) fn reject_unsupported_join_clauses(stmt: &SelectStmt) -> Result<(), ExecuteError> {
     let unsupported = [
         (!stmt.group_clause.is_empty(), "GROUP BY"),
         (stmt.having_clause.is_some(), "HAVING"),
-        (!stmt.distinct_clause.is_empty(), "DISTINCT"),
+        (
+            !stmt.distinct_clause.is_empty()
+                && !(stmt.distinct_clause.len() == 1 && stmt.distinct_clause[0].node.is_none()),
+            "DISTINCT ON",
+        ),
         (!stmt.window_clause.is_empty(), "window functions"),
         (stmt.with_clause.is_some(), "WITH / CTEs"),
     ];

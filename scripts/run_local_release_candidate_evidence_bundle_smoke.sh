@@ -23,18 +23,17 @@ cat >"$FAKE_PREFLIGHT" <<'FAKE'
 set -euo pipefail
 printf 'local_release_candidate_preflight=passed\n'
 printf 'local_release_candidate_preflight_scope=validation_postgresql_product_gpu_residency_plus_connection_security\n'
-printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_psql_golden_scorecard_freshness\n'
+printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_single_product_server_psql_golden_scorecard_freshness\n'
 printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_pg_dumpall_globals_privileges_local_resilience\n'
 printf 'local_release_candidate_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls\n'
-printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
-printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_event_timing_warmup_maintenance\n'
+printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance_gpu_tests\n'
+printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_no_cuda_event_samples_warmup_maintenance_gpu_tests\n'
+printf 'local_gpu_residency_preflight_cache_manager=retained_allocation_invalidation_only\n'
+printf 'local_gpu_residency_preflight_cuda_event_timing=no_samples_for_current_routes\n'
 printf 'local_release_candidate_preflight_connection_security=local_dev_trust_auth_no_tls_plus_production_tls_scram_profile_v1\n'
 printf 'local_release_candidate_preflight_production_scram_verifier=verifier_file_plaintext_conflict_rejection\n'
-printf 'local_release_candidate_preflight_p8_ch_benchmark=checked_harness_self_check_and_baseline_report\n'
-printf 'local_release_candidate_preflight_p8_ch_benchmark_report=docs/testing/reports/2026-05-30-p8-ch-benchmark-residency-baseline-v1.md\n'
 printf 'local_release_candidate_preflight_replication_mtls=local_generated_ca_append_entries_smoke\n'
 printf 'local_release_candidate_preflight_gap_replication_mtls=production_certificate_lifecycle_and_trust_distribution_missing\n'
-printf 'local_release_candidate_preflight_gap_p8_ch_benchmark_6gib_tier=needs_streaming_generator_long_run_window_and_cleanup_budget\n'
 printf 'local_release_candidate_preflight_gap_certificate_lifecycle_automation=missing\n'
 printf 'local_release_candidate_preflight_gap_enterprise_identity=missing\n'
 printf 'local_release_candidate_preflight_gap_kms_hsm_secret_manager=missing\n'
@@ -96,11 +95,11 @@ require_line "$MANIFEST" "evidence_stamp=$STAMP"
 require_line "$MANIFEST" "git_dirty=1"
 require_line "$MANIFEST" "preflight_command=$FAKE_PREFLIGHT"
 require_line "$PREFLIGHT_LOG" "local_release_candidate_preflight=passed"
+require_line "$PREFLIGHT_LOG" "local_gpu_residency_preflight_cache_manager=retained_allocation_invalidation_only"
+require_line "$PREFLIGHT_LOG" "local_gpu_residency_preflight_cuda_event_timing=no_samples_for_current_routes"
 require_line "$GAPS" "local_release_candidate_preflight_gap_broad_cuda_event_timing=missing"
-require_line "$GAPS" "local_release_candidate_preflight_gap_p8_ch_benchmark_6gib_tier=needs_streaming_generator_long_run_window_and_cleanup_budget"
-
-if [[ "$(wc -l <"$GAPS" | tr -d ' ')" -ne 22 ]]; then
-  printf 'release evidence bundle smoke expected 22 remaining-gap lines\n' >&2
+if [[ "$(wc -l <"$GAPS" | tr -d ' ')" -ne 21 ]]; then
+  printf 'release evidence bundle smoke expected 21 remaining-gap lines\n' >&2
   exit 1
 fi
 

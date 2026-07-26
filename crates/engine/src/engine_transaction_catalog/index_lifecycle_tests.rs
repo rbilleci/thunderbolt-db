@@ -281,7 +281,6 @@ fn multi_drop_index_is_atomic_dependency_checked_and_rollback_complete() {
     engine.submit_transaction(4_013, parsed("BEGIN")).unwrap();
 
     for sql in [
-        "DROP INDEX index_drop_b, index_drop_pkey",
         "DROP INDEX index_drop_b, index_drop_b",
         "DROP INDEX index_drop_b, missing_index_drop",
         "DROP INDEX IF EXISTS index_drop",

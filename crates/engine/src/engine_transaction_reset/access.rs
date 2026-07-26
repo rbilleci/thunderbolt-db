@@ -4,10 +4,11 @@ use super::*;
 
 impl Engine {
     /// Retain every stable relation identity a parsed live mutation can observe or change. Row
-    /// mutations take their dependency closure; catalog mutations conservatively retain every
-    /// published relation because a rename/drop/constraint/default/ACL operation can change the
-    /// identity or schema proof of a concurrently staged table reset. DDL is not an OLTP hot path,
-    /// and this deliberately simple boundary avoids a command-by-command dependency oracle.
+    /// mutations take their dependency closure. Index and table-constraint lifecycle commands
+    /// have an exact owning-table proof and retain only that dependency closure, so independent
+    /// `pg_restore --jobs` workers do not conflict with an unrelated table-data reset. Other
+    /// catalog mutations conservatively retain every published relation because they can change
+    /// the identity or schema proof of a concurrently staged table reset.
     pub(crate) fn acquire_autocommit_command_table_access(
         &self,
         command: &Command,
@@ -80,14 +81,19 @@ impl Engine {
                 access_share_relations,
                 ..
             } if !access_share_relations.is_empty() => Some(access_share_relations.clone()),
-            command if Self::command_changes_catalog(command) => Some(
-                self.read_state
-                    .latest_catalog()
-                    .relational_catalog
-                    .keys()
-                    .cloned()
-                    .collect(),
-            ),
+            command if Self::command_changes_catalog(command) => {
+                match self.exact_catalog_command_table_access(command)? {
+                    Some(tables) => Some(tables),
+                    None => Some(
+                        self.read_state
+                            .latest_catalog()
+                            .relational_catalog
+                            .keys()
+                            .cloned()
+                            .collect(),
+                    ),
+                }
+            }
             // Live TRUNCATE must acquire its exclusive dependency closure through the typed reset
             // owner. Acquiring a second shared owner here would reject that owner's own upgrade.
             Command::TruncateTable(_)
@@ -132,5 +138,50 @@ impl Engine {
             lease.acquire_shared(sequence_oids)?;
         }
         Ok(lease)
+    }
+
+    fn exact_catalog_command_table_access(
+        &self,
+        command: &Command,
+    ) -> Result<Option<Vec<String>>, ExecuteError> {
+        let tables = match command {
+            Command::CreateIndex(create) => vec![create.table.clone()],
+            Command::RenameIndex(rename) => {
+                let catalog = self.catalog_snapshot();
+                catalog
+                    .relational_catalog
+                    .values()
+                    .filter(|table| {
+                        table
+                            .indexes
+                            .iter()
+                            .any(|index| index.name == rename.old_name)
+                    })
+                    .map(|table| table.name.clone())
+                    .collect()
+            }
+            Command::DropIndex(drop) => {
+                let catalog = self.catalog_snapshot();
+                catalog
+                    .relational_catalog
+                    .values()
+                    .filter(|table| {
+                        table
+                            .indexes
+                            .iter()
+                            .any(|index| drop.names.contains(&index.name))
+                    })
+                    .map(|table| table.name.clone())
+                    .collect()
+            }
+            Command::AddPrimaryKey(add) => vec![add.table.clone()],
+            Command::AddUniqueConstraint(add) => vec![add.table.clone()],
+            Command::AddCheckConstraint(add) => vec![add.table.clone()],
+            Command::AddForeignKey(add) => {
+                vec![add.table.clone(), add.referenced_table.clone()]
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(tables))
     }
 }

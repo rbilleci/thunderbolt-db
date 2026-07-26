@@ -202,7 +202,7 @@ pub(crate) fn append_copy_data(state: &mut CopyInState, bytes: &[u8]) -> Result<
                 message: "COPY data follows the end-of-data marker".to_string(),
             });
         }
-        if state.copy.options.format == CopyFormat::Text && line == r"\." {
+        if line == r"\." {
             state.seen_terminator = true;
             continue;
         }
@@ -1081,7 +1081,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn copy_accepts_archive_separator_lines_after_the_text_terminator_only() {
+    fn copy_accepts_archive_separator_lines_after_the_client_terminator() {
         let engine = SharedEngine::new();
         let mut session = engine.open_session();
         engine
@@ -1100,6 +1100,30 @@ mod tests {
         assert_eq!(state.pending_rows.len(), 1);
         let error = append_copy_data(&mut state, b"2\tGrace\n").unwrap_err();
         assert_eq!(error.code, "22P04");
+    }
+
+    #[test]
+    fn csv_copy_accepts_psql16_client_terminator_but_preserves_quoted_data() {
+        let engine = SharedEngine::new();
+        let mut session = engine.open_session();
+        engine
+            .submit(
+                &mut session,
+                SubmissionRequest::Text("CREATE TABLE csv_marker (id int4, name text)"),
+            )
+            .into_immediate()
+            .unwrap();
+        let copy = parse_copy_from_stdin("COPY csv_marker FROM STDIN WITH CSV").unwrap();
+        let mut state = begin_copy_from(&engine, &mut session, copy, false)
+            .unwrap()
+            .0;
+
+        append_copy_data(&mut state, b"1,\"\\.\"\n\\.\n").unwrap();
+        assert_eq!(
+            state.pending_rows,
+            vec![vec![DbValue::Int4(1), DbValue::Text(r"\.".to_string())]]
+        );
+        assert!(state.seen_terminator);
     }
 
     #[tokio::test]

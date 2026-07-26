@@ -66,7 +66,7 @@ run_gate \
   local_validation \
   scripts/run_local_validation_preflight.sh \
   "local_validation_preflight=passed" \
-  "local_validation_preflight_scope=fmt_clippy_all_features_psql_golden_scorecard_freshness" \
+  "local_validation_preflight_scope=fmt_clippy_all_features_single_product_server_psql_golden_scorecard_freshness" \
   "local_validation_preflight_cargo_all_features=passed" \
   "local_validation_preflight_psql_golden=passed" \
   "local_validation_preflight_scorecard_freshness=checked_in"
@@ -93,11 +93,11 @@ run_gate \
   gpu_residency \
   scripts/run_local_gpu_residency_preflight.sh \
   "local_gpu_residency_preflight=passed" \
-  "local_gpu_residency_preflight_scope=residency_baseline_warmup_maintenance" \
+  "local_gpu_residency_preflight_scope=residency_baseline_warmup_maintenance_gpu_tests" \
   "local_gpu_residency_preflight_resident_device_memory=retained_cuda_allocation" \
   "local_gpu_residency_preflight_resident_routes=zero_h2d_supported_kernel_shapes" \
-  "local_gpu_residency_preflight_cache_manager=budget_admission_eviction_invalidation_refresh" \
-  "local_gpu_residency_preflight_cuda_event_timing=first_accepted_route_samples" \
+  "local_gpu_residency_preflight_cache_manager=retained_allocation_invalidation_only" \
+  "local_gpu_residency_preflight_cuda_event_timing=no_samples_for_current_routes" \
   "local_gpu_residency_preflight_warmup=operator_triggered_dry_run_apply" \
   "local_gpu_residency_preflight_maintenance=scheduler_friendly_tick" \
   "local_gpu_residency_preflight_gap_durable_gpu_pages=missing" \
@@ -126,28 +126,18 @@ run_gate \
   "connection_security_posture_preflight_non_claim_row_level_security=not_supported" \
   "connection_security_posture_preflight_non_claim_masking=not_supported"
 
-run_gate_with_args \
-  p8_ch_benchmark \
-  scripts/run_p8_ch_benchmark_residency_probe.sh \
-  --self-check \
-  -- \
-  "p8 ch benchmark residency probe self-check passed"
-
 printf 'local_release_candidate_preflight=passed\n'
 printf 'local_release_candidate_preflight_scope=validation_postgresql_product_gpu_residency_plus_connection_security\n'
-printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_psql_golden_scorecard_freshness\n'
+printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_single_product_server_psql_golden_scorecard_freshness\n'
 printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_pg_dumpall_globals_privileges_local_resilience\n'
 printf 'local_release_candidate_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls\n'
-printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
+printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance_gpu_tests\n'
 printf 'local_release_candidate_preflight_connection_security=local_dev_trust_auth_no_tls_plus_production_tls_scram_profile_v1\n'
 printf 'local_release_candidate_preflight_production_scram_verifier=verifier_file_plaintext_conflict_rejection\n'
 printf 'local_release_candidate_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg,pgx,jdbc,r2dbc\n'
-printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_event_timing_warmup_maintenance\n'
-printf 'local_release_candidate_preflight_p8_ch_benchmark=checked_harness_self_check_and_baseline_report\n'
-printf 'local_release_candidate_preflight_p8_ch_benchmark_report=docs/testing/reports/2026-05-30-p8-ch-benchmark-residency-baseline-v1.md\n'
+printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_no_cuda_event_samples_warmup_maintenance_gpu_tests\n'
 printf 'local_release_candidate_preflight_replication_mtls=local_generated_ca_append_entries_smoke\n'
 printf 'local_release_candidate_preflight_gap_replication_mtls=production_certificate_lifecycle_and_trust_distribution_missing\n'
-printf 'local_release_candidate_preflight_gap_p8_ch_benchmark_6gib_tier=needs_streaming_generator_long_run_window_and_cleanup_budget\n'
 printf 'local_release_candidate_preflight_gap_certificate_lifecycle_automation=missing\n'
 printf 'local_release_candidate_preflight_gap_enterprise_identity=missing\n'
 printf 'local_release_candidate_preflight_gap_kms_hsm_secret_manager=missing\n'

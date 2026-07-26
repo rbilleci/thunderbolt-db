@@ -72,7 +72,7 @@ run_gate \
   pg_dumpall_globals \
   tests/compat/pg-dumpall/run.sh \
   "pg_dumpall_globals_restore=passed" \
-  "pg_dumpall_globals_scope=roles_tablespaces_comments_tablespace_acls_no_role_passwords" \
+  "pg_dumpall_globals_scope=roles_login_attribute_tablespaces_comments_tablespace_acls_no_role_passwords" \
   "pg_dumpall_globals_gap_bootstrap_role_restore=filtered_existing_bootstrap_role" \
   "pg_dumpall_globals_gap_database_acl_restore=not_emitted_by_globals_only"
 

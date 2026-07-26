@@ -7,6 +7,11 @@ pub(super) fn is_pg16_dump_dependency_program(canonical: &str) -> bool {
         == "select classid, objid, refclassid, refobjid, deptype from pg_depend where deptype != 'p' and deptype != 'e' union all select 'pg_opfamily'::regclass as classid, amopfamily as objid, refclassid, refobjid, deptype from pg_depend d, pg_amop o where deptype not in ('p', 'e', 'i') and classid = 'pg_amop'::regclass and objid = o.oid and not (refclassid = 'pg_opfamily'::regclass and amopfamily = refobjid) union all select 'pg_opfamily'::regclass as classid, amprocfamily as objid, refclassid, refobjid, deptype from pg_depend d, pg_amproc p where deptype not in ('p', 'e', 'i') and classid = 'pg_amproc'::regclass and objid = p.oid and not (refclassid = 'pg_opfamily'::regclass and amprocfamily = refobjid) order by 1,2"
 }
 
+pub(super) fn is_pg16_dump_extension_membership_program(canonical: &str) -> bool {
+    canonical
+        == "select classid, objid, refobjid from pg_depend where refclassid = 'pg_extension'::regclass and deptype = 'e' order by 3"
+}
+
 pub(super) fn pg16_dump_view_definition_oid(canonical: &str) -> Option<u32> {
     let oid = canonical.strip_prefix("select pg_catalog.pg_get_viewdef('")?;
     let oid = oid.strip_suffix("'::pg_catalog.oid) as viewdef")?;
@@ -14,6 +19,33 @@ pub(super) fn pg16_dump_view_definition_oid(canonical: &str) -> Option<u32> {
 }
 
 impl Engine {
+    pub(super) fn execute_pg16_dump_extension_membership(
+        &self,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let boundary = self.read_snapshot_boundary();
+        let table = catalog_relation_table(
+            "pg_catalog",
+            "__pg16_dump_extension_membership",
+            &[
+                ("classid", SqlType::Int4),
+                ("objid", SqlType::Int4),
+                ("refobjid", SqlType::Int4),
+            ],
+        );
+        self.execute_pg_dump_gpu_select(
+            table,
+            Vec::new(),
+            SelectProjection::Columns(vec![
+                "classid".to_string(),
+                "objid".to_string(),
+                "refobjid".to_string(),
+            ]),
+            None,
+            &["refobjid"],
+            boundary,
+        )
+    }
+
     pub(super) fn execute_pg16_dump_view_definition(
         &self,
         view_oid: u32,
@@ -151,4 +183,19 @@ fn pg16_dump_dependency_relations(
             .map(|relation| row(relation.oid, &relation.name)),
     );
     (table, rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pg16_extension_membership_probe_is_exact() {
+        assert!(is_pg16_dump_extension_membership_program(
+            "select classid, objid, refobjid from pg_depend where refclassid = 'pg_extension'::regclass and deptype = 'e' order by 3"
+        ));
+        assert!(!is_pg16_dump_extension_membership_program(
+            "select classid, objid from pg_depend where refclassid = 'pg_extension'::regclass"
+        ));
+    }
 }

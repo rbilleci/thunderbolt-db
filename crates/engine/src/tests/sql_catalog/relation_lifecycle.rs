@@ -785,7 +785,7 @@ fn relational_catalog_drops_index_and_replays_from_wal() {
     multi
         .execute_text(
             8,
-            "DROP INDEX public.people_name_idx, public.people_city_idx",
+            "DROP INDEX public.people_pkey, public.people_name_idx, public.people_city_idx",
         )
         .unwrap();
     let table_indexes = multi
@@ -793,19 +793,7 @@ fn relational_catalog_drops_index_and_replays_from_wal() {
         .unwrap()
         .indexes
         .clone();
-    assert_eq!(
-        table_indexes,
-        vec![RelationalIndex {
-            oid: FIRST_TABLE_INDEX_OID,
-            name: "people_pkey".to_string(),
-            table: "people".to_string(),
-            column: "id".to_string(),
-            key_columns: vec!["id".to_string()],
-            unique: true,
-            primary_key: true,
-            unique_constraint: false,
-        }]
-    );
+    assert_eq!(table_indexes, Vec::<RelationalIndex>::new());
     assert_eq!(multi.relational_index_comment("people_name_idx"), None);
     assert_eq!(multi.relational_index_comment("people_city_idx"), None);
     let Command::Select(select) =
@@ -934,40 +922,34 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
             "COMMENT ON CONSTRAINT keyed_people_pkey ON keyed_people IS 'primary identity'",
         )
         .unwrap();
-    let original = constrained
-        .relational_catalog_table("keyed_people")
-        .unwrap()
-        .indexes[0]
-        .clone();
-    constrained
+    let before = constrained.catalog_snapshot();
+    let wal_before = constrained.durable_wal_records().len();
+    let error = constrained
         .execute_text(
             4,
             "ALTER INDEX keyed_people_pkey RENAME TO keyed_people_id_idx",
         )
-        .unwrap();
-    let renamed = constrained
-        .relational_catalog_table("keyed_people")
-        .unwrap()
-        .indexes[0]
-        .clone();
-    assert_eq!(renamed.oid, original.oid);
-    assert_eq!(renamed.name, "keyed_people_id_idx");
-    assert!(renamed.primary_key);
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot rename constraint-backed index with ALTER INDEX"),
+        "{error}"
+    );
+    assert_eq!(constrained.durable_wal_records().len(), wal_before);
+    assert!(constrained
+        .catalog_snapshot()
+        .same_contents(before.as_ref()));
     assert_eq!(
         constrained
-            .relational_index_comment("keyed_people_id_idx")
+            .relational_index_comment("keyed_people_pkey")
             .as_deref(),
         Some("primary lookup")
     );
     assert_eq!(
         constrained
-            .relational_constraint_comment("keyed_people", "keyed_people_id_idx")
+            .relational_constraint_comment("keyed_people", "keyed_people_pkey")
             .as_deref(),
         Some("primary identity")
-    );
-    assert_eq!(
-        constrained.relational_constraint_comment("keyed_people", "keyed_people_pkey"),
-        None
     );
     let recovered = Engine::recover_from_durable_wal(&constrained.durable_wal_records()).unwrap();
     assert!(recovered

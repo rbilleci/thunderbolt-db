@@ -4,6 +4,11 @@ use std::collections::HashMap;
 use std::io;
 
 use crate::copy::{classify_copy_statement, CopyClassification, CopyStatement};
+use crate::sql_cursor::{classify_sql_cursor_statement, SqlCursorAction};
+use crate::sql_prepared::{
+    classify_extended_sql_execute, decode_sql_execute_literal, deferred_sql_prepare_analysis_query,
+    fill_unused_parameter_holes, ExtendedSqlExecuteArgument, SqlPreparedPlan,
+};
 use gpu_db_facade::{
     pg_adapter, BoundPreparedStatement, ColumnMeta, CommandTag, CopyTarget, DbError, DbValue,
     ErrorCategory, LogicalType, PreparedStatement, QueryOutcome, SessionTransactionStatus,
@@ -15,6 +20,9 @@ use gpu_db_protocol::{parse_frontend_message, CopyToStdout, DescribeTarget, Fron
 #[derive(Debug, Clone)]
 struct Statement {
     prepared: PreparedStatement,
+    sql_execute_bind_arguments: Option<Vec<SqlExecuteBindArgument>>,
+    deferred_execution_error: Option<DbError>,
+    cursor_declaration: Option<ExtendedCursorDeclaration>,
     copy: Option<CopyStatement>,
     copy_target: Option<CopyTarget>,
     parameter_oids: Vec<u32>,
@@ -26,6 +34,8 @@ struct Portal {
     statement_name: String,
     transaction_exit: bool,
     bound: BoundPreparedStatement,
+    deferred_execution_error: Option<DbError>,
+    cursor_declaration: Option<ExtendedCursorDeclaration>,
     copy: Option<CopyStatement>,
     copy_target: Option<CopyTarget>,
     columns: Vec<ColumnMeta>,
@@ -33,6 +43,12 @@ struct Portal {
     outcome: Option<Result<QueryOutcome, DbError>>,
     row_offset: usize,
     command_completed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExtendedCursorDeclaration {
+    name: String,
+    transaction_bound: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +76,10 @@ pub(crate) struct PrepareRequest {
     pub statement_name: String,
     pub parsed: PreparedStatement,
     pub(crate) copy: Option<CopyStatement>,
+    pub(crate) sql_execute_bind_arguments: Option<Vec<SqlExecuteBindArgument>>,
+    pub(crate) outer_parameter_types: Option<Vec<LogicalType>>,
+    pub(crate) deferred_execution_error: Option<DbError>,
+    pub(crate) cursor_declaration: Option<ExtendedCursorDeclaration>,
     #[cfg(test)]
     pub query: String,
     pub parameter_type_hints: Vec<Option<LogicalType>>,
@@ -67,7 +87,14 @@ pub(crate) struct PrepareRequest {
 
 pub(crate) struct PrepareAnalysis {
     prepared: PreparedStatement,
+    parameter_types: Vec<LogicalType>,
     copy_target: Option<CopyTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SqlExecuteBindArgument {
+    OuterParameter(usize),
+    Literal(DbValue),
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +222,7 @@ impl From<gpu_db_protocol::FrontendMessageError> for ExtendedError {
 #[derive(Debug, Default)]
 pub(crate) struct ExtendedSession {
     statements: HashMap<String, Statement>,
-    sql_statements: HashMap<String, PreparedStatement>,
+    sql_statements: HashMap<String, SqlPreparedPlan>,
     sql_cursors: HashMap<String, SqlCursor>,
     portals: HashMap<String, Portal>,
     skip_until_sync: bool,
@@ -207,20 +234,24 @@ struct SqlCursor {
     columns: Vec<ColumnMeta>,
     rows: Vec<Vec<DbValue>>,
     position: usize,
+    transaction_bound: bool,
 }
 
 impl ExtendedSession {
+    pub(crate) fn ensure_sql_cursor_name_available(&self, name: &str) -> Result<(), ExtendedError> {
+        if self.sql_cursors.contains_key(name) {
+            return Err(ExtendedError::new("42P03", "cursor already exists"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn install_sql_cursor(
         &mut self,
         name: String,
         outcome: QueryOutcome,
+        transaction_bound: bool,
     ) -> Result<(), ExtendedError> {
-        if self.sql_cursors.contains_key(&name) {
-            return Err(ExtendedError::new(
-                "42P03",
-                format!("cursor \"{name}\" already exists"),
-            ));
-        }
+        self.ensure_sql_cursor_name_available(&name)?;
         let QueryOutcome::Rows { columns, rows } = outcome else {
             return Err(ExtendedError::new(
                 "0A000",
@@ -233,6 +264,7 @@ impl ExtendedSession {
                 columns,
                 rows,
                 position: 0,
+                transaction_bound,
             },
         );
         Ok(())
@@ -243,9 +275,10 @@ impl ExtendedSession {
         name: &str,
         count: Option<usize>,
     ) -> Result<QueryOutcome, ExtendedError> {
-        let cursor = self.sql_cursors.get_mut(name).ok_or_else(|| {
-            ExtendedError::new("34000", format!("cursor \"{name}\" does not exist"))
-        })?;
+        let cursor = self
+            .sql_cursors
+            .get_mut(name)
+            .ok_or_else(|| ExtendedError::new("34000", "cursor does not exist"))?;
         let start = cursor.position;
         let end = count
             .map(|count| start.saturating_add(count).min(cursor.rows.len()))
@@ -259,6 +292,26 @@ impl ExtendedSession {
         })
     }
 
+    pub(crate) fn move_sql_cursor(
+        &mut self,
+        name: &str,
+        count: Option<usize>,
+    ) -> Result<QueryOutcome, ExtendedError> {
+        let cursor = self
+            .sql_cursors
+            .get_mut(name)
+            .ok_or_else(|| ExtendedError::new("34000", "cursor does not exist"))?;
+        let start = cursor.position;
+        let end = count
+            .map(|count| start.saturating_add(count).min(cursor.rows.len()))
+            .unwrap_or(cursor.rows.len());
+        cursor.position = end;
+        Ok(QueryOutcome::Command {
+            tag: CommandTag::Other(format!("MOVE {}", end - start)),
+            rows_affected: None,
+        })
+    }
+
     pub(crate) fn close_sql_cursor(
         &mut self,
         target: crate::sql_cursor::SqlCursorCloseTarget,
@@ -267,10 +320,7 @@ impl ExtendedSession {
             crate::sql_cursor::SqlCursorCloseTarget::All => self.sql_cursors.clear(),
             crate::sql_cursor::SqlCursorCloseTarget::Named(name) => {
                 if self.sql_cursors.remove(&name).is_none() {
-                    return Err(ExtendedError::new(
-                        "34000",
-                        format!("cursor \"{name}\" does not exist"),
-                    ));
+                    return Err(ExtendedError::new("34000", "cursor does not exist"));
                 }
             }
         }
@@ -286,22 +336,58 @@ impl ExtendedSession {
         engine.prepare_statement(session, query, parameter_hints)
     }
 
+    pub(crate) fn analyze_sql_prepare_plan(
+        engine: &SharedEngine,
+        session: &SharedSession,
+        query: &str,
+        parameter_hints: &[Option<LogicalType>],
+    ) -> Result<SqlPreparedPlan, DbError> {
+        match Self::analyze_sql_prepare(engine, session, query, parameter_hints) {
+            Ok(prepared) => Ok(SqlPreparedPlan::ready(prepared)),
+            Err(error) => {
+                let Some(analysis_query) = deferred_sql_prepare_analysis_query(query, &error)
+                else {
+                    return Err(error);
+                };
+                let prepared =
+                    Self::analyze_sql_prepare(engine, session, &analysis_query, parameter_hints)?;
+                Ok(SqlPreparedPlan {
+                    prepared,
+                    deferred_execution_error: Some(error),
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_sql_prepared(
         &mut self,
         name: String,
         prepared: PreparedStatement,
     ) -> Result<(), ExtendedError> {
+        self.install_sql_prepared_plan(name, SqlPreparedPlan::ready(prepared))
+    }
+
+    pub(crate) fn install_sql_prepared_plan(
+        &mut self,
+        name: String,
+        plan: SqlPreparedPlan,
+    ) -> Result<(), ExtendedError> {
         if self.sql_statements.contains_key(&name) {
             return Err(ExtendedError::new(
                 "42P05",
-                format!("prepared statement \"{name}\" already exists"),
+                "prepared statement already exists",
             ));
         }
-        self.sql_statements.insert(name, prepared);
+        self.sql_statements.insert(name, plan);
         Ok(())
     }
 
-    pub(crate) fn sql_prepared(&self, name: &str) -> Result<PreparedStatement, ExtendedError> {
+    pub(crate) fn has_sql_prepared(&self, name: &str) -> bool {
+        self.sql_statements.contains_key(name)
+    }
+
+    pub(crate) fn sql_prepared_plan(&self, name: &str) -> Result<SqlPreparedPlan, ExtendedError> {
         self.sql_statements.get(name).cloned().ok_or_else(|| {
             ExtendedError::new(
                 "26000",
@@ -562,7 +648,8 @@ impl ExtendedSession {
     pub(crate) fn finish_transaction_boundary(&mut self, transaction_open: bool) {
         if !transaction_open {
             self.portals.clear();
-            self.sql_cursors.clear();
+            self.sql_cursors
+                .retain(|_, cursor| !cursor.transaction_bound);
         }
     }
 
@@ -585,12 +672,21 @@ impl ExtendedSession {
             parameter_type_oids,
             SessionTransactionStatus::Idle,
         )?;
-        let prepared = prepare(&request.query, &request.parameter_type_hints).map(|prepared| {
-            PrepareAnalysis {
-                prepared,
-                copy_target: None,
-            }
-        });
+        let prepared =
+            prepare(&request.query, &request.parameter_type_hints).and_then(|prepared| {
+                let parameter_types = prepared
+                    .parameter_types()
+                    .ok_or_else(|| DbError {
+                        category: ErrorCategory::Internal,
+                        message: "test Parse analysis lost its parameter types".to_string(),
+                    })?
+                    .to_vec();
+                Ok(PrepareAnalysis {
+                    prepared,
+                    parameter_types,
+                    copy_target: None,
+                })
+            });
         self.complete_parse(request, prepared)
     }
 
@@ -622,18 +718,31 @@ impl ExtendedSession {
                 "COPY Parse message has too many parameter type OIDs",
             ));
         }
+        let mut cursor_declaration = None;
         let analysis_sql = match &copy {
             Some(CopyStatement::From(_)) => String::new(),
             Some(CopyStatement::To(copy)) => copy_to_validation_sql(copy),
-            None => query.clone(),
+            None => match classify_sql_cursor_statement(&query)? {
+                Some(SqlCursorAction::Declare {
+                    name,
+                    query: cursor_query,
+                }) => {
+                    let transaction_bound = !self.implicit_transaction
+                        && transaction_status != SessionTransactionStatus::Idle;
+                    cursor_declaration = Some(ExtendedCursorDeclaration {
+                        name,
+                        transaction_bound,
+                    });
+                    cursor_query
+                }
+                Some(
+                    SqlCursorAction::Fetch { .. }
+                    | SqlCursorAction::Move { .. }
+                    | SqlCursorAction::Close(_),
+                )
+                | None => query.clone(),
+            },
         };
-        let parsed = PreparedStatement::parse(&analysis_sql).map_err(ExtendedError::from)?;
-        if transaction_status == SessionTransactionStatus::FailedTransaction
-            && (copy.is_some() || !parsed.is_empty())
-            && !parsed.is_transaction_exit()
-        {
-            return Err(ExtendedError::in_failed_transaction());
-        }
         let parameter_type_hints = parameter_type_oids
             .iter()
             .map(|oid| {
@@ -646,10 +755,48 @@ impl ExtendedSession {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let parameter_type_hints = fill_unused_parameter_holes(&analysis_sql, parameter_type_hints);
+        let extended_sql_execute = classify_extended_sql_execute(&analysis_sql)?;
+        let (parsed, sql_execute_bind_arguments, outer_parameter_types, deferred_execution_error) =
+            if let Some(extended_sql_execute) = extended_sql_execute {
+                let plan = self.sql_prepared_plan(&extended_sql_execute.name)?;
+                let (sql_execute_bind_arguments, outer_parameter_types) =
+                    sql_execute_bind_arguments(
+                        &plan.prepared,
+                        &extended_sql_execute.arguments,
+                        &parameter_type_hints,
+                    )?;
+                (
+                    plan.prepared,
+                    Some(sql_execute_bind_arguments),
+                    Some(outer_parameter_types),
+                    plan.deferred_execution_error,
+                )
+            } else {
+                let parsed = PreparedStatement::parse(&analysis_sql)
+                    .map_err(extended_prepared_parse_error)?;
+                if cursor_declaration.is_some() && parsed.parameter_count() > 0 {
+                    return Err(ExtendedError::new(
+                        "0A000",
+                        "parameterized cursor declarations are not supported",
+                    ));
+                }
+                (parsed, None, None, None)
+            };
+        if transaction_status == SessionTransactionStatus::FailedTransaction
+            && (copy.is_some() || !parsed.is_empty())
+            && !parsed.is_transaction_exit()
+        {
+            return Err(ExtendedError::in_failed_transaction());
+        }
         Ok(PrepareRequest {
             statement_name,
             parsed,
             copy,
+            sql_execute_bind_arguments,
+            outer_parameter_types,
+            deferred_execution_error,
+            cursor_declaration,
             #[cfg(test)]
             query,
             parameter_type_hints,
@@ -664,11 +811,31 @@ impl ExtendedSession {
         session: &mut SharedSession,
         request: &PrepareRequest,
     ) -> Result<PrepareAnalysis, DbError> {
-        let prepared = engine.describe_prepared_statement(
-            session,
-            request.parsed.clone(),
-            &request.parameter_type_hints,
-        )?;
+        let prepared = if request.sql_execute_bind_arguments.is_some() {
+            engine
+                .revalidate_prepared_description(session, &request.parsed)
+                .map_err(extended_relational_error)?;
+            request.parsed.clone()
+        } else {
+            engine
+                .describe_prepared_statement(
+                    session,
+                    request.parsed.clone(),
+                    &request.parameter_type_hints,
+                )
+                .map_err(extended_relational_error)?
+        };
+        let parameter_types = if let Some(outer_parameter_types) = &request.outer_parameter_types {
+            outer_parameter_types.clone()
+        } else {
+            prepared
+                .parameter_types()
+                .ok_or_else(|| DbError {
+                    category: ErrorCategory::Internal,
+                    message: "prepared Parse analysis lost its parameter types".to_string(),
+                })?
+                .to_vec()
+        };
         let copy_target = match &request.copy {
             Some(CopyStatement::From(copy)) => {
                 let outcome = engine
@@ -687,6 +854,7 @@ impl ExtendedSession {
         };
         Ok(PrepareAnalysis {
             prepared,
+            parameter_types,
             copy_target,
         })
     }
@@ -700,17 +868,19 @@ impl ExtendedSession {
             statement_name,
             parsed: _,
             copy,
+            sql_execute_bind_arguments,
+            outer_parameter_types: _,
+            deferred_execution_error,
+            cursor_declaration,
             #[cfg(test)]
                 query: _,
             parameter_type_hints: _,
         } = request;
         let PrepareAnalysis {
             prepared,
+            parameter_types,
             copy_target,
         } = analysis.map_err(ExtendedError::from)?;
-        let parameter_types = prepared
-            .parameter_types()
-            .ok_or_else(|| ExtendedError::new("XX000", "prepared statement was not described"))?;
         let parameter_oids = parameter_types
             .iter()
             .copied()
@@ -720,7 +890,7 @@ impl ExtendedSession {
             .result_columns()
             .ok_or_else(|| ExtendedError::new("XX000", "prepared statement was not described"))?
             .to_vec();
-        let columns = if copy.is_some() {
+        let columns = if copy.is_some() || cursor_declaration.is_some() {
             Vec::new()
         } else {
             described_columns
@@ -743,6 +913,9 @@ impl ExtendedSession {
             statement_name,
             Statement {
                 prepared,
+                sql_execute_bind_arguments,
+                deferred_execution_error,
+                cursor_declaration,
                 copy,
                 copy_target,
                 parameter_oids,
@@ -811,6 +984,8 @@ impl ExtendedSession {
             result_format_codes,
         } = request;
         let transaction_exit = statement.prepared.is_transaction_exit();
+        let deferred_execution_error = statement.deferred_execution_error.clone();
+        let cursor_declaration = statement.cursor_declaration.clone();
         let copy = statement.copy.clone();
         let copy_target = statement.copy_target.clone();
         let params = parameters
@@ -823,7 +998,9 @@ impl ExtendedSession {
                     format,
                     value.as_deref(),
                 )
-                .map_err(|error| codec_error(error, "parameter"))
+                .map_err(|error| {
+                    parameter_codec_error(error, statement.parameter_oids[index], value.as_deref())
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Result formats are applied after CreatePortal and parameter decoding. Their arity must
@@ -832,9 +1009,26 @@ impl ExtendedSession {
             validate_format_count("result", result_format_codes.len(), statement.columns.len())?;
         }
         validate_result_formats(&statement.columns, &result_format_codes)?;
+        let bound_parameters = match &statement.sql_execute_bind_arguments {
+            Some(arguments) => arguments
+                .iter()
+                .map(|argument| match argument {
+                    SqlExecuteBindArgument::OuterParameter(index) => {
+                        params.get(index.saturating_sub(1)).cloned().ok_or_else(|| {
+                            ExtendedError::new(
+                                "XX000",
+                                "extended SQL EXECUTE lost a validated outer parameter",
+                            )
+                        })
+                    }
+                    SqlExecuteBindArgument::Literal(value) => Ok(value.clone()),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => params,
+        };
         let bound = statement
             .prepared
-            .bind_values(&params)
+            .bind_values(&bound_parameters)
             .map_err(ExtendedError::from)?;
         Ok(BindCompletion {
             portal_name,
@@ -842,6 +1036,8 @@ impl ExtendedSession {
                 statement_name,
                 transaction_exit,
                 bound,
+                deferred_execution_error,
+                cursor_declaration,
                 copy,
                 copy_target,
                 columns: statement.columns,
@@ -1065,6 +1261,12 @@ impl ExtendedSession {
         if portal.command_completed {
             return Ok(None);
         }
+        if let Some(cursor) = &portal.cursor_declaration {
+            self.ensure_sql_cursor_name_available(&cursor.name)?;
+        }
+        if let Some(error) = &portal.deferred_execution_error {
+            return Err(error.clone().into());
+        }
         Ok(match &portal.copy {
             Some(copy) => Some(ExecutionRequest::Copy {
                 statement: copy.clone(),
@@ -1120,6 +1322,24 @@ impl ExtendedSession {
         portal_name: &str,
         outcome: Result<QueryOutcome, DbError>,
     ) -> Result<(), ExtendedError> {
+        let cursor_declaration = self
+            .portals
+            .get(portal_name)
+            .ok_or_else(|| {
+                ExtendedError::new("34000", format!("portal \"{portal_name}\" does not exist"))
+            })?
+            .cursor_declaration
+            .clone();
+        let outcome = match (cursor_declaration, outcome) {
+            (Some(cursor), Ok(outcome)) => {
+                self.install_sql_cursor(cursor.name, outcome, cursor.transaction_bound)?;
+                Ok(QueryOutcome::Command {
+                    tag: CommandTag::Other("DECLARE CURSOR".to_string()),
+                    rows_affected: None,
+                })
+            }
+            (_, outcome) => outcome,
+        };
         if matches!(
             &outcome,
             Ok(QueryOutcome::Command {
@@ -1266,14 +1486,127 @@ fn validate_bind_shape(
     if parameters.len() != statement.parameter_oids.len() {
         return Err(ExtendedError::new(
             "08P01",
-            format!(
-                "Bind supplies {} parameters, but prepared statement requires {}",
-                parameters.len(),
-                statement.parameter_oids.len()
-            ),
+            "bind message has wrong number of parameters",
         ));
     }
     validate_format_count("parameter", parameter_formats.len(), parameters.len())
+}
+
+fn sql_execute_bind_arguments(
+    target: &PreparedStatement,
+    arguments: &[ExtendedSqlExecuteArgument],
+    supplied: &[Option<LogicalType>],
+) -> Result<(Vec<SqlExecuteBindArgument>, Vec<LogicalType>), ExtendedError> {
+    let target_parameter_types = target
+        .parameter_types()
+        .ok_or_else(|| ExtendedError::new("XX000", "SQL prepared statement was not described"))?;
+    if target_parameter_types.len() != arguments.len() {
+        return Err(ExtendedError::new(
+            "08P01",
+            "bound parameter count does not match prepared statement",
+        ));
+    }
+    let parameter_count = arguments
+        .iter()
+        .filter_map(|argument| match argument {
+            ExtendedSqlExecuteArgument::OuterParameter { index, .. } => Some(*index),
+            ExtendedSqlExecuteArgument::Literal(_) => None,
+        })
+        .max()
+        .unwrap_or_default()
+        .max(supplied.len());
+    let mut outer_parameter_types = vec![None; parameter_count];
+    for (slot, hint) in outer_parameter_types
+        .iter_mut()
+        .zip(supplied.iter().copied())
+    {
+        *slot = hint;
+    }
+    let mut bind_arguments = Vec::with_capacity(arguments.len());
+    for (target_type, argument) in target_parameter_types.iter().copied().zip(arguments) {
+        match argument {
+            ExtendedSqlExecuteArgument::OuterParameter {
+                index: outer_index,
+                explicit_type,
+            } => {
+                if explicit_type.is_some_and(|explicit_type| explicit_type != target_type) {
+                    return Err(ExtendedError::new(
+                        "0A000",
+                        format!(
+                            "SQL EXECUTE argument cast {explicit_type:?} does not match prepared \
+                             parameter type {target_type:?}"
+                        ),
+                    ));
+                }
+                let Some(slot) = outer_parameter_types.get_mut(outer_index.saturating_sub(1))
+                else {
+                    return Err(ExtendedError::new(
+                        "XX000",
+                        "extended SQL EXECUTE lost a validated outer parameter",
+                    ));
+                };
+                match *slot {
+                    Some(existing) if existing != target_type => {
+                        return Err(ExtendedError::new(
+                            "42P08",
+                            "inconsistent parameter types for SQL EXECUTE placeholder",
+                        ));
+                    }
+                    _ => *slot = Some(target_type),
+                }
+                bind_arguments.push(SqlExecuteBindArgument::OuterParameter(*outer_index));
+            }
+            ExtendedSqlExecuteArgument::Literal(value) => {
+                let literal = decode_sql_execute_literal(target_type, value)
+                    .map_err(sql_execute_literal_error)?;
+                bind_arguments.push(SqlExecuteBindArgument::Literal(literal));
+            }
+        }
+    }
+    let outer_parameter_types = outer_parameter_types
+        .into_iter()
+        .enumerate()
+        .map(|(index, logical_type)| {
+            logical_type.ok_or_else(|| {
+                ExtendedError::new(
+                    "42P18",
+                    format!("could not determine data type of parameter ${}", index + 1),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((bind_arguments, outer_parameter_types))
+}
+
+fn sql_execute_literal_error(error: DbError) -> ExtendedError {
+    if error.category == ErrorCategory::InvalidRequest {
+        return ExtendedError::new("22P02", error.message);
+    }
+    ExtendedError::from(error)
+}
+
+fn extended_prepared_parse_error(error: DbError) -> ExtendedError {
+    let error = extended_relational_error(error);
+    if error.message == "invalid SQL parameter reference" {
+        return ExtendedError::new("42P02", "there is no parameter $0");
+    }
+    ExtendedError::from(error)
+}
+
+/// Parse and catalog-description failures share one extended-query compatibility boundary.  The
+/// simple-query route keeps the facade's generic diagnostic; an extended relational SELECT must
+/// retain the frozen protocol diagnostic before a statement or portal can be installed.
+fn extended_relational_error(error: DbError) -> DbError {
+    if error.message.starts_with("invalid relational SQL syntax;")
+        || error.message == "query shape is not supported by the compatibility stub"
+    {
+        DbError {
+            category: ErrorCategory::Unsupported,
+            message: "extended query protocol only supports relational SELECT".to_string(),
+        }
+    } else {
+        error
+    }
 }
 
 fn validate_result_formats(columns: &[ColumnMeta], formats: &[i16]) -> Result<(), ExtendedError> {
@@ -1306,6 +1639,24 @@ fn codec_error(error: pg_adapter::PgValueCodecError, kind: &str) -> ExtendedErro
         _ => "0A000",
     };
     ExtendedError::new(code, format!("invalid {kind}: {error}"))
+}
+
+fn parameter_codec_error(
+    error: pg_adapter::PgValueCodecError,
+    oid: u32,
+    value: Option<&[u8]>,
+) -> ExtendedError {
+    if matches!(
+        &error,
+        pg_adapter::PgValueCodecError::InvalidValue { format: 0, .. }
+    ) {
+        let value = value.map_or_else(String::new, |raw| String::from_utf8_lossy(raw).into_owned());
+        return ExtendedError::new(
+            "22P02",
+            format!("invalid input syntax for parameter type oid {oid}: {value:?}"),
+        );
+    }
+    codec_error(error, "parameter")
 }
 
 fn backend_columns(columns: &[ColumnMeta]) -> Vec<BackendColumn> {

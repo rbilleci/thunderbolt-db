@@ -241,39 +241,6 @@ impl Engine {
                 .map_err(map_err)?;
         }
 
-        if !resolved_order.is_empty() {
-            let order = resolved_order
-                .iter()
-                .map(|&(relation, column, descending, nulls_first)| {
-                    Ok(CudaJoinOrderKey {
-                        relation: relation as u32,
-                        key: key_descriptor(relation, column)?,
-                        descending,
-                        nulls_first: nulls_first.unwrap_or(descending),
-                        lexicographic_16: tables[relation].columns[column].ty == SqlType::Uuid,
-                    })
-                })
-                .collect::<Result<Vec<_>, ExecuteError>>()?;
-            coordinates = context
-                .sort_join_coordinates(&coordinates, &order)
-                .map_err(map_err)?;
-        }
-        if plan.offset.is_some() || plan.limit.is_some() {
-            let offset = u32::try_from(plan.offset.unwrap_or(0)).map_err(|_| {
-                ExecuteError::Engine(EngineError::ApplyFailed(
-                    "join OFFSET exceeds the device coordinate range".to_string(),
-                ))
-            })?;
-            let limit = plan.limit.map(u32::try_from).transpose().map_err(|_| {
-                ExecuteError::Engine(EngineError::ApplyFailed(
-                    "join LIMIT exceeds the device coordinate range".to_string(),
-                ))
-            })?;
-            coordinates = context
-                .window_join_coordinates(&coordinates, offset, limit)
-                .map_err(map_err)?;
-        }
-
         let output_aliases = self.join_projection_output_aliases(plan, tables)?;
         let mut columns = Vec::with_capacity(projection.len());
         for (index, &(relation, column)) in projection.iter().enumerate() {
@@ -354,6 +321,178 @@ impl Engine {
                 }
             });
         }
+
+        if plan.distinct {
+            if resolved_order
+                .iter()
+                .any(|&(relation, column, _, _)| !projection.contains(&(relation, column)))
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+                        .to_string(),
+                )));
+            }
+            let materialized = context
+                .materialize_join_coordinates(&coordinates, &specs)
+                .map_err(map_err)?;
+            let materialized_context = materialized.memory();
+            let identity = materialized_context
+                .identity_join_coordinates(materialized.row_count(), None)
+                .map_err(map_err)?;
+            let distinct_order = columns
+                .iter()
+                .enumerate()
+                .map(|(column, metadata)| {
+                    Ok(CudaJoinOrderKey {
+                        relation: 0,
+                        key: materialized.payload_key(column).ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "materialized DISTINCT key is absent".to_string(),
+                            ))
+                        })?,
+                        descending: false,
+                        nulls_first: false,
+                        lexicographic_16: metadata.ty == SqlType::Uuid,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecuteError>>()?;
+            let sorted = materialized_context
+                .sort_join_coordinates(&identity, &distinct_order)
+                .map_err(map_err)?;
+            let distinct_keys = distinct_order
+                .iter()
+                .map(|order| order.key)
+                .collect::<Vec<_>>();
+            let mut distinct = materialized_context
+                .distinct_sorted_join_coordinates(&sorted, &distinct_keys)
+                .map_err(map_err)?;
+
+            if !resolved_order.is_empty() {
+                let order = resolved_order
+                    .iter()
+                    .map(|&(relation, column, descending, nulls_first)| {
+                        let output_column = projection
+                            .iter()
+                            .position(|projected| *projected == (relation, column))
+                            .expect("DISTINCT ORDER BY projection was validated");
+                        Ok(CudaJoinOrderKey {
+                            relation: 0,
+                            key: materialized.payload_key(output_column).ok_or_else(|| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "materialized DISTINCT order key is absent".to_string(),
+                                ))
+                            })?,
+                            descending,
+                            nulls_first: nulls_first.unwrap_or(descending),
+                            lexicographic_16: columns[output_column].ty == SqlType::Uuid,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
+                distinct = materialized_context
+                    .sort_join_coordinates(&distinct, &order)
+                    .map_err(map_err)?;
+            }
+            if plan.offset.is_some() || plan.limit.is_some() {
+                let offset = u32::try_from(plan.offset.unwrap_or(0)).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "join OFFSET exceeds the device coordinate range".to_string(),
+                    ))
+                })?;
+                let limit = plan.limit.map(u32::try_from).transpose().map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "join LIMIT exceeds the device coordinate range".to_string(),
+                    ))
+                })?;
+                distinct = materialized_context
+                    .window_join_coordinates(&distinct, offset, limit)
+                    .map_err(map_err)?;
+            }
+            let final_specs = materialized
+                .columns()
+                .iter()
+                .map(|layout| match layout.kind {
+                    gpu_db_execution::CudaMaterializedColumnKind::Fixed { width } => {
+                        gpu_db_execution::CudaMaterializeJoinColumn::Fixed {
+                            relation: 0,
+                            payload: materialized_context,
+                            byte_offset: layout.value_byte_offset,
+                            validity_bitmap_offset: Some(layout.validity_bitmap_offset),
+                            width,
+                        }
+                    }
+                    gpu_db_execution::CudaMaterializedColumnKind::Text => {
+                        gpu_db_execution::CudaMaterializeJoinColumn::Text {
+                            relation: 0,
+                            payload: materialized_context,
+                            offsets_byte_offset: layout.value_byte_offset,
+                            bytes_byte_offset: layout
+                                .text_bytes_byte_offset
+                                .expect("text materialization retains its byte layout"),
+                            bytes_len: layout.text_bytes_len,
+                            validity_bitmap_offset: Some(layout.validity_bitmap_offset),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            let final_materialized = materialized_context
+                .materialize_join_coordinates(&distinct, &final_specs)
+                .map_err(map_err)?;
+            if let Some(out) = materialized_out {
+                *out = Some(final_materialized);
+                return Ok(RelationalSelectResult {
+                    columns: Arc::new(columns),
+                    rows: Vec::<Vec<SqlValue>>::new().into(),
+                    planned_target: DeviceTarget::Gpu(gpu_id),
+                    executed_target: DeviceTarget::Gpu(gpu_id),
+                    fallback_reason: None,
+                    access_path: Arc::new(RelationalAccessPath::FullTableScan),
+                });
+            }
+            let frame = final_materialized.read_result_frame().map_err(map_err)?;
+            let result_rows = self.decode_materialized_result_frame(&frame, &columns)?;
+            return Ok(RelationalSelectResult {
+                columns: Arc::new(columns),
+                rows: result_rows.into(),
+                planned_target: DeviceTarget::Gpu(gpu_id),
+                executed_target: DeviceTarget::Gpu(gpu_id),
+                fallback_reason: None,
+                access_path: Arc::new(RelationalAccessPath::FullTableScan),
+            });
+        }
+
+        if !resolved_order.is_empty() {
+            let order = resolved_order
+                .iter()
+                .map(|&(relation, column, descending, nulls_first)| {
+                    Ok(CudaJoinOrderKey {
+                        relation: relation as u32,
+                        key: key_descriptor(relation, column)?,
+                        descending,
+                        nulls_first: nulls_first.unwrap_or(descending),
+                        lexicographic_16: tables[relation].columns[column].ty == SqlType::Uuid,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecuteError>>()?;
+            coordinates = context
+                .sort_join_coordinates(&coordinates, &order)
+                .map_err(map_err)?;
+        }
+        if plan.offset.is_some() || plan.limit.is_some() {
+            let offset = u32::try_from(plan.offset.unwrap_or(0)).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "join OFFSET exceeds the device coordinate range".to_string(),
+                ))
+            })?;
+            let limit = plan.limit.map(u32::try_from).transpose().map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "join LIMIT exceeds the device coordinate range".to_string(),
+                ))
+            })?;
+            coordinates = context
+                .window_join_coordinates(&coordinates, offset, limit)
+                .map_err(map_err)?;
+        }
+
         let materialized = context
             .materialize_join_coordinates(&coordinates, &specs)
             .map_err(map_err)?;

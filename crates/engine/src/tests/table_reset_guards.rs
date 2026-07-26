@@ -256,6 +256,44 @@ fn table_affecting_ddl_claimants_conflict_before_effect() {
 }
 
 #[test]
+fn exact_index_and_constraint_claimants_ignore_unrelated_table_reset() {
+    let engine = Engine::with_batching(8, Duration::from_secs(60));
+    engine
+        .execute_text(1, "CREATE TABLE ddl_exact_target (id INT)")
+        .unwrap();
+    engine
+        .execute_text(2, "CREATE TABLE ddl_exact_reset_peer (id INT)")
+        .unwrap();
+    let target_oid = table_oid(&engine, "ddl_exact_target");
+    let peer_oid = table_oid(&engine, "ddl_exact_reset_peer");
+    let reset = engine.table_access.lease();
+    reset.acquire_exclusive([peer_oid]).unwrap();
+
+    engine
+        .execute_text(
+            3,
+            "CREATE INDEX ddl_exact_target_idx ON ddl_exact_target (id)",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            4,
+            "ALTER TABLE ddl_exact_target ADD CONSTRAINT ddl_exact_target_pkey PRIMARY KEY (id)",
+        )
+        .unwrap();
+
+    let target_reset = engine.table_access.lease();
+    target_reset.acquire_exclusive([target_oid]).unwrap();
+    let error = engine
+        .execute_text(
+            5,
+            "CREATE INDEX ddl_exact_target_idx_2 ON ddl_exact_target (id)",
+        )
+        .unwrap_err();
+    assert!(matches!(error, ExecuteError::Serialization(_)), "{error}");
+}
+
+#[test]
 fn terminal_serialized_and_ddl_retries_resolve_before_fresh_table_access() {
     let engine = Engine::new_local_test_engine();
     engine

@@ -2,8 +2,8 @@
 
 use super::{
     normalize_identifier, normalize_relation_identifier, parse_relational_command, split_csv,
-    strip_keyword_prefix_case_insensitive, Command, ParseError, TransactionAccessMode,
-    TransactionCharacteristics, TransactionIsolation,
+    strip_keyword_prefix_case_insensitive, Command, ParseError, SetRoleScope,
+    TransactionAccessMode, TransactionCharacteristics, TransactionIsolation,
 };
 use crate::parameter::{
     dollar_quote_delimiter, is_escape_string_prefix, is_identifier_continuation_byte,
@@ -289,27 +289,40 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
 
     if first.eq_ignore_ascii_case("RESET") {
         return Some(match rest {
+            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
             [target]
-                if target.eq_ignore_ascii_case("ALL")
-                    || target.eq_ignore_ascii_case("ROLE")
+                if target.eq_ignore_ascii_case("ROLE")
                     || target.eq_ignore_ascii_case("AUTHORIZATION")
                     || target.eq_ignore_ascii_case("AUTH") =>
             {
-                Ok(Command::ResetAll)
+                Ok(Command::SetRole {
+                    role: None,
+                    scope: SetRoleScope::Session,
+                })
             }
             [scope, role]
                 if (scope.eq_ignore_ascii_case("SESSION")
                     || scope.eq_ignore_ascii_case("LOCAL"))
                     && role.eq_ignore_ascii_case("ROLE") =>
             {
-                Ok(Command::ResetAll)
+                Ok(Command::SetRole {
+                    role: None,
+                    scope: if scope.eq_ignore_ascii_case("LOCAL") {
+                        SetRoleScope::Local
+                    } else {
+                        SetRoleScope::Session
+                    },
+                })
             }
             [session, authorization]
                 if session.eq_ignore_ascii_case("SESSION")
                     && (authorization.eq_ignore_ascii_case("AUTHORIZATION")
                         || authorization.eq_ignore_ascii_case("AUTH")) =>
             {
-                Ok(Command::ResetAll)
+                Ok(Command::SetRole {
+                    role: None,
+                    scope: SetRoleScope::Session,
+                })
             }
             [session, authorization, default]
                 if session.eq_ignore_ascii_case("SESSION")
@@ -317,7 +330,10 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
                         || authorization.eq_ignore_ascii_case("AUTH"))
                     && default.eq_ignore_ascii_case("DEFAULT") =>
             {
-                Ok(Command::ResetAll)
+                Ok(Command::SetRole {
+                    role: None,
+                    scope: SetRoleScope::Session,
+                })
             }
             [session, authorization, to, default]
                 if session.eq_ignore_ascii_case("SESSION")
@@ -326,7 +342,10 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
                     && to.eq_ignore_ascii_case("TO")
                     && default.eq_ignore_ascii_case("DEFAULT") =>
             {
-                Ok(Command::ResetAll)
+                Ok(Command::SetRole {
+                    role: None,
+                    scope: SetRoleScope::Session,
+                })
             }
             _ => Err(ParseError::InvalidReset),
         });
@@ -684,7 +703,7 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         let after_local = after_local.trim_start();
         if let Some(after_role) = strip_keyword_prefix_case_insensitive(after_local, "ROLE") {
             let tail = after_role.trim_start();
-            return Some(parse_set_role_command(tail));
+            return Some(parse_set_role_command(tail, SetRoleScope::Local));
         }
 
         if let Some(after_transaction) =
@@ -706,13 +725,13 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         let after_session = after_session.trim_start();
         if let Some(after_role) = strip_keyword_prefix_case_insensitive(after_session, "ROLE") {
             let tail = after_role.trim_start();
-            return Some(parse_set_role_command(tail));
+            return Some(parse_set_role_command(tail, SetRoleScope::Session));
         }
     }
 
     if let Some(after_role) = strip_keyword_prefix_case_insensitive(rest, "ROLE") {
         let tail = after_role.trim_start();
-        return Some(parse_set_role_command(tail));
+        return Some(parse_set_role_command(tail, SetRoleScope::Session));
     }
 
     if let Some(after_transaction) = strip_keyword_prefix_case_insensitive(rest, "TRANSACTION") {
@@ -789,14 +808,15 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
     None
 }
 
-fn parse_set_role_command(tail: &str) -> Result<Command, ParseError> {
+fn parse_set_role_command(tail: &str, scope: SetRoleScope) -> Result<Command, ParseError> {
     if tail.eq_ignore_ascii_case("NONE") || tail.eq_ignore_ascii_case("DEFAULT") {
-        return Ok(Command::SetRole { role: None });
+        return Ok(Command::SetRole { role: None, scope });
     }
     if let Some((role, trailing)) = parse_reset_identifier(tail) {
         if trailing.trim().is_empty() {
             return Ok(Command::SetRole {
                 role: Some(normalize_identifier(role)?),
+                scope,
             });
         }
     }
@@ -1144,6 +1164,17 @@ fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Comma
     {
         return Ok(Command::ShowTransactionIsolation);
     }
+    if show_tokens.len() == 2
+        && show_tokens[0].eq_ignore_ascii_case("SHOW")
+        && show_tokens[1].eq_ignore_ascii_case("client_encoding")
+    {
+        return Ok(Command::SelectLiteral(crate::SelectLiteral {
+            column_name: "client_encoding".to_string(),
+            ty: crate::SqlType::Text,
+            value: crate::SqlValue::Text("UTF8".to_string()),
+            add_int4: None,
+        }));
+    }
     if let Some(relational) = parse_relational_command(s, allow_catalog_schemas) {
         return relational;
     }
@@ -1451,6 +1482,7 @@ mod transaction_characteristic_tests {
                 column_name,
                 ty: crate::SqlType::Int4,
                 value: crate::SqlValue::Int4(1),
+                ..
             }) if column_name == "one"
         ));
         assert!(matches!(
@@ -1459,6 +1491,7 @@ mod transaction_characteristic_tests {
                 column_name,
                 ty: crate::SqlType::Int4,
                 value: crate::SqlValue::Int4(1),
+                ..
             }) if column_name == "one"
         ));
         assert!(matches!(

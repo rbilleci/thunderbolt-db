@@ -93,6 +93,8 @@ mod resident_route;
 pub(crate) use resident_route::*;
 mod engine_catalog;
 pub use engine_catalog::{CopyTargetProof, TransactionCopyTargetOrigin};
+mod engine_authorization;
+pub use engine_authorization::AuthorizationPrincipal;
 mod engine_commit;
 mod engine_commit_coordinator;
 mod engine_commit_residency;
@@ -286,6 +288,10 @@ pub enum ExecuteError {
     UndefinedRelation(String),
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
+    #[error("role \"{0}\" does not exist")]
+    UndefinedRole(String),
+    #[error("{0}")]
+    PermissionDenied(String),
     #[error("could not determine data type of parameter ${0}")]
     IndeterminateParameterType(usize),
     #[error("datatype mismatch: {0}")]

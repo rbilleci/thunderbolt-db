@@ -73,7 +73,7 @@ impl DurableFixture {
             .as_nanos();
         let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "gpu-db-server-process-recovery-{}-{nonce}-{id}",
+            "gpu-db-engine-process-recovery-{}-{nonce}-{id}",
             std::process::id()
         ));
         fs::create_dir(&directory)?;

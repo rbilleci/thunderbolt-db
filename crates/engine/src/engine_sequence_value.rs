@@ -159,6 +159,7 @@ impl Engine {
         &self,
         parent_txn_id: TxnId,
         command: &Command,
+        principal: AuthorizationPrincipal,
     ) -> Result<SequenceValueOutcome, ExecuteError> {
         let (source_name, operation, set_value) = match command {
             Command::SequenceNextVal(nextval) => (
@@ -195,6 +196,7 @@ impl Engine {
                 ));
             }
             let catalog = snapshot.transaction_catalog();
+            self.authorize_command_at(&catalog, principal, command)?;
             let target =
                 self.sequence_value_target(source_name, &catalog, Some(snapshot.as_ref()))?;
             if self.transaction_sequence_value_is_private(&snapshot, target.sequence_oid) {
@@ -294,6 +296,7 @@ impl Engine {
                 return Ok(outcome);
             }
             let catalog = self.catalog_snapshot();
+            self.authorize_command_at(&catalog, principal, command)?;
             let target = self.sequence_value_target(source_name, &catalog, None)?;
             let lease = self.table_access.lease();
             lease.acquire_shared([target.sequence_oid])?;

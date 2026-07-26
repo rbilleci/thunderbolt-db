@@ -20,9 +20,9 @@ COMMENT
  id     | integer |           |          |         | plain    |             |              |
  name   | text    |           |          |         | extended |             |              | display name
 Indexes:
+    "drop_table_people_pkey" PRIMARY KEY, btree (id)
     "drop_table_people_name_idx" btree (name)
     "drop_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
-    "drop_table_people_pkey" PRIMARY KEY, btree (id)
 Access method: heap
 
 DROP TABLE

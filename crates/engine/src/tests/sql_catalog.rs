@@ -271,7 +271,7 @@ fn engine_answers_pg_attribute_pg_type_and_information_schema() {
     let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
-        "CREATE TABLE people (id INT, name TEXT, bal NUMERIC(10,2))",
+        "CREATE TABLE people (id INT DEFAULT 7, name TEXT DEFAULT 'unknown', bal NUMERIC(10,2))",
     )
     .unwrap();
     let run = |e: &Engine, sql: &str| {
@@ -355,6 +355,57 @@ fn engine_answers_pg_attribute_pg_type_and_information_schema() {
         .unwrap()
         .rows,
         vec![vec![SqlValue::Text("BASE TABLE".to_string())]]
+    );
+    assert_eq!(
+        run(
+            &e,
+            "SELECT self_referencing_column_name, reference_generation, \
+             user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, \
+             is_insertable_into, is_typed, commit_action \
+             FROM information_schema.tables WHERE table_name = 'people'"
+        ),
+        vec![vec![
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Null,
+            SqlValue::Text("YES".to_string()),
+            SqlValue::Text("NO".to_string()),
+            SqlValue::Null,
+        ]]
+    );
+    assert_eq!(
+        run(
+            &e,
+            "SELECT column_default, character_maximum_length, numeric_precision, \
+             numeric_precision_radix, numeric_scale \
+             FROM information_schema.columns WHERE table_name = 'people' \
+             ORDER BY ordinal_position"
+        ),
+        vec![
+            vec![
+                SqlValue::Text("7".to_string()),
+                SqlValue::Null,
+                SqlValue::Int4(32),
+                SqlValue::Int4(2),
+                SqlValue::Int4(0),
+            ],
+            vec![
+                SqlValue::Text("'unknown'::text".to_string()),
+                SqlValue::Null,
+                SqlValue::Null,
+                SqlValue::Null,
+                SqlValue::Null,
+            ],
+            vec![
+                SqlValue::Null,
+                SqlValue::Null,
+                SqlValue::Int4(10),
+                SqlValue::Int4(10),
+                SqlValue::Int4(2),
+            ],
+        ]
     );
 }
 
@@ -440,6 +491,16 @@ fn gpu_catalog_exact_psql_table_list_and_description_are_non_vacuous() {
     .unwrap();
     e.execute_text(2, "CREATE TABLE public.pg_class (id INT)")
         .unwrap();
+    e.execute_text(
+        3,
+        "COMMENT ON TABLE exact_psql_catalog_people IS 'catalog people'",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "COMMENT ON COLUMN exact_psql_catalog_people.name IS 'display name'",
+    )
+    .unwrap();
 
     let table_list = e.execute_resident_expr_select_sql(
         r#"SELECT n.nspname as "Schema",
@@ -468,6 +529,30 @@ ORDER BY 1,2"#,
         ]],
         "the exact psql table-list join must return its nonempty device result"
     );
+    let verbose_sql = r#"SELECT n.nspname, c.relname,
+  CASE c.relpersistence WHEN 'p' THEN 'permanent' WHEN 't' THEN 'temporary' WHEN 'u' THEN 'unlogged' END,
+  am.amname,
+  pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)),
+  pg_catalog.obj_description(c.oid, 'pg_class')
+FROM pg_catalog.pg_class c
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+WHERE c.relname = 'exact_psql_catalog_people'"#;
+    let verbose = e
+        .execute_resident_expr_select_sql(verbose_sql)
+        .expect("exact psql verbose table-list GPU query");
+    assert_eq!(verbose.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        verbose.rows,
+        vec![vec![
+            SqlValue::Text("public".to_string()),
+            SqlValue::Text("exact_psql_catalog_people".to_string()),
+            SqlValue::Text("permanent".to_string()),
+            SqlValue::Text("heap".to_string()),
+            SqlValue::Text("0 bytes".to_string()),
+            SqlValue::Text("catalog people".to_string()),
+        ]]
+    );
 
     let oid = e
         .relational_catalog_table("exact_psql_catalog_people")
@@ -483,7 +568,11 @@ ORDER BY 1,2"#,
   (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t
    WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS attcollation,
   a.attidentity,
-  a.attgenerated
+  a.attgenerated,
+  a.attstorage,
+  a.attcompression,
+  CASE WHEN a.attstattarget = -1 THEN NULL ELSE a.attstattarget END,
+  pg_catalog.col_description(a.attrelid, a.attnum)
 FROM pg_catalog.pg_attribute a
 WHERE a.attrelid = '{oid}' AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum"#
@@ -503,6 +592,10 @@ ORDER BY a.attnum"#
                 SqlValue::Null,
                 SqlValue::Text(String::new()),
                 SqlValue::Text(String::new()),
+                SqlValue::Text("p".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::Null,
+                SqlValue::Null,
             ],
             vec![
                 SqlValue::Text("name".to_string()),
@@ -512,9 +605,27 @@ ORDER BY a.attnum"#
                 SqlValue::Null,
                 SqlValue::Text(String::new()),
                 SqlValue::Text(String::new()),
+                SqlValue::Text("x".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::Null,
+                SqlValue::Text("display name".to_string()),
             ],
         ],
         "format_type and guarded nullable display values must preserve the GPU-filtered row order"
+    );
+
+    e.execute_text(
+        5,
+        "INSERT INTO exact_psql_catalog_people (id, name) VALUES (1, 'device')",
+    )
+    .unwrap();
+    let verbose = e
+        .execute_resident_expr_select_sql(verbose_sql)
+        .expect("nonempty relation size must use the published device payload");
+    assert_eq!(
+        verbose.rows[0][4],
+        SqlValue::Text("34 bytes".to_string()),
+        "the display size is the exact immutable resident payload plus its device MVCC stamps"
     );
 }
 
@@ -2391,13 +2502,7 @@ fn relational_catalog_records_comments_and_replays_from_wal() {
     assert_eq!(e.relational_column_comment("people", 2), None);
     e.execute_text(21, "DROP INDEX people_name_idx").unwrap();
     assert_eq!(e.relational_index_comment("people_name_idx"), None);
-    assert!(e
-        .execute_text(22, "DROP INDEX people_pkey")
-        .unwrap_err()
-        .to_string()
-        .contains("cannot drop constraint-backed index"));
-    e.execute_text(23, "ALTER TABLE people DROP CONSTRAINT people_pkey")
-        .unwrap();
+    e.execute_text(22, "DROP INDEX people_pkey").unwrap();
     assert_eq!(
         e.relational_constraint_comment("people", "people_pkey"),
         None
@@ -2409,11 +2514,20 @@ fn relational_catalog_records_comments_and_replays_from_wal() {
     missing
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
+    let wal_before_missing_comment = missing.durable_wal_records().len();
     assert!(missing
         .execute_text(2, "COMMENT ON COLUMN public.people.missing IS 'bad'")
         .unwrap_err()
         .to_string()
         .contains("column \"missing\" does not exist"));
+    assert_eq!(
+        missing.durable_wal_records().len(),
+        wal_before_missing_comment,
+        "missing COMMENT target must fail before WAL"
+    );
+    missing
+        .execute_text(3, "COMMENT ON TABLE public.people IS 'still usable'")
+        .expect("missing COMMENT target must not wedge later writes");
 
     let missing_index = Engine::new_local_test_engine();
     missing_index
@@ -2525,6 +2639,28 @@ fn relational_catalog_select_binding_uses_catalog_descriptors() {
         .unwrap_err()
         .to_string()
         .contains("SELECT DISTINCT ORDER BY must reference a selected column"));
+
+    for (sql, expected) in [
+        (
+            "SELECT name, COUNT(*) FROM people GROUP BY name HAVING id = 1",
+            "HAVING must reference grouped column or aggregate result",
+        ),
+        (
+            "SELECT COUNT(*) FROM people HAVING count > 1",
+            "HAVING requires GROUP BY",
+        ),
+    ] {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        assert!(
+            bind_relational_select(&table, &select)
+                .unwrap_err()
+                .to_string()
+                .contains(expected),
+            "{sql}"
+        );
+    }
 }
 
 #[test]

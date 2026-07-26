@@ -74,6 +74,7 @@ fn production_literal_projection_is_materialized_by_the_gpu() {
             column_name: "one".to_string(),
             ty: SqlType::Int4,
             value: SqlValue::Int4(1),
+            add_int4: None,
         })
         .unwrap();
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));

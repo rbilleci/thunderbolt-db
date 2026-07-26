@@ -9,8 +9,8 @@ COMMENT
  id     | integer |           |          |         | plain    |             |              |
  name   | text    |           |          |         | extended |             |              |
 Indexes:
-    "rename_constraint_people_name_key" UNIQUE CONSTRAINT, btree (name)
     "rename_constraint_people_pkey" PRIMARY KEY, btree (id)
+    "rename_constraint_people_name_key" UNIQUE CONSTRAINT, btree (name)
 Access method: heap
 
 ALTER TABLE
@@ -63,8 +63,8 @@ ALTER TABLE
  id     | integer |           |          |         | plain    |             |              |
  name   | text    |           |          |         | extended |             |              |
 Indexes:
-    "rename_constraint_people_display_name_key" UNIQUE CONSTRAINT, btree (name)
     "rename_constraint_people_id_pkey" PRIMARY KEY, btree (id)
+    "rename_constraint_people_display_name_key" UNIQUE CONSTRAINT, btree (name)
 Access method: heap
 
 psql:322_protocol_psql_rename_constraints.sql:37: ERROR:  duplicate key value violates unique index

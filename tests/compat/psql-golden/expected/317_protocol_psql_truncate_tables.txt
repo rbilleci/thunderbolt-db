@@ -14,9 +14,9 @@ COMMENT
  id     | integer |           |          |         | plain    |             |              |
  name   | text    |           |          |         | extended |             |              | display name
 Indexes:
+    "truncate_people_pkey" PRIMARY KEY, btree (id)
     "truncate_people_name_idx" btree (name)
     "truncate_people_name_key" UNIQUE CONSTRAINT, btree (name)
-    "truncate_people_pkey" PRIMARY KEY, btree (id)
 Access method: heap
 
 TRUNCATE TABLE
@@ -30,17 +30,16 @@ TRUNCATE TABLE
  id     | integer |           |          |         | plain    |             |              |
  name   | text    |           |          |         | extended |             |              | display name
 Indexes:
+    "truncate_people_pkey" PRIMARY KEY, btree (id)
     "truncate_people_name_idx" btree (name)
     "truncate_people_name_key" UNIQUE CONSTRAINT, btree (name)
-    "truncate_people_pkey" PRIMARY KEY, btree (id)
 Access method: heap
 
-                       Object descriptions
- Schema |         Name         |      Object      | Description
---------+----------------------+------------------+--------------
- public | truncate_people      | table            | people table
- public | truncate_people_pkey | table constraint | identity
-(2 rows)
+               Object descriptions
+ Schema |      Name       | Object | Description
+--------+-----------------+--------+--------------
+ public | truncate_people | table  | people table
+(1 row)
 
 INSERT 0 1
  id | name

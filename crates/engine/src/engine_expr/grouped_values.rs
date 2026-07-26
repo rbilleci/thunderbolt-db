@@ -29,6 +29,50 @@ pub(super) fn narrow_ordered_value(ty: SqlType, lo: i64, hi: i64, scale: u8) -> 
     }
 }
 
+/// Build the temporary typed payload consumed by the GPU sort for grouped result rows.
+///
+/// PostgreSQL AVG can produce a different numeric display scale for every group, while a device
+/// relation column must have one scale. Rescale a copy to the maximum observed scale in each
+/// numeric result column so the GPU comparator sees equal numeric values at equal magnitudes. The
+/// caller applies the resulting device permutation to its untouched rows, preserving their original
+/// per-value PG representation for the wire result.
+pub(super) fn normalized_grouped_sort_payload(
+    rows: &[Vec<SqlValue>],
+    result_types: &[SqlType],
+) -> Result<(Vec<Vec<SqlValue>>, Vec<SqlType>), ExecuteError> {
+    let mut sort_rows = rows.to_vec();
+    let mut sort_types = result_types.to_vec();
+    for (column, ty) in sort_types.iter_mut().enumerate() {
+        if !matches!(ty, SqlType::Numeric { .. }) {
+            continue;
+        }
+        let Some(scale) = sort_rows
+            .iter()
+            .filter_map(|row| match row[column] {
+                SqlValue::Numeric(value) => Some(value.scale),
+                _ => None,
+            })
+            .max()
+        else {
+            continue;
+        };
+        for row in &mut sort_rows {
+            if let SqlValue::Numeric(value) = row[column] {
+                row[column] = SqlValue::Numeric(value.rescale(scale).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "grouped numeric result overflowed normalizing sort scale".to_string(),
+                    ))
+                })?);
+            }
+        }
+        *ty = SqlType::Numeric {
+            precision: 38,
+            scale,
+        };
+    }
+    Ok((sort_rows, sort_types))
+}
+
 /// COUNT(DISTINCT v) on the non-plain-integer/composite group-key route: the building block of the
 /// GROUP-BY-(g,v) reduction.
 /// Runs a general composite GROUP BY COUNT(*) over `members` (any mix of fixed-width + text columns --
@@ -224,4 +268,47 @@ fn composite_group_reduce(
         groups.iter().map(|g| g.key_i128 as u64 as u32).collect(),
         false,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_sort_payload_normalizes_heterogeneous_avg_scales() {
+        let rows = vec![
+            vec![
+                SqlValue::Text("Ada".to_string()),
+                SqlValue::Numeric(Decimal128::new(100_000_000_000_000_000_000, 20)),
+            ],
+            vec![
+                SqlValue::Text("Grace".to_string()),
+                SqlValue::Numeric(Decimal128::new(35_000_000_000_000_000, 16)),
+            ],
+        ];
+        let (sort_rows, sort_types) = normalized_grouped_sort_payload(
+            &rows,
+            &[
+                SqlType::Text,
+                SqlType::Numeric {
+                    precision: 38,
+                    scale: 16,
+                },
+            ],
+        )
+        .expect("AVG result scales widen exactly for the GPU sort payload");
+
+        assert_eq!(sort_rows[0][1], rows[0][1]);
+        assert_eq!(
+            sort_rows[1][1],
+            SqlValue::Numeric(Decimal128::new(350_000_000_000_000_000_000, 20))
+        );
+        assert_eq!(
+            sort_types[1],
+            SqlType::Numeric {
+                precision: 38,
+                scale: 20,
+            }
+        );
+    }
 }

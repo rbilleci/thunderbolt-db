@@ -37,6 +37,7 @@ impl PreparedCommand {
                 && !matches!(
                     &command,
                     Command::Select(_)
+                        | Command::SelectLiteral(_)
                         | Command::Insert(_)
                         | Command::Update(_)
                         | Command::Delete(_)
@@ -104,6 +105,7 @@ impl PreparedCommand {
             *value = coerce_explicit_cast(supplied, *cast)?;
             Ok(())
         })?;
+        bind_select_limit_parameter(&mut command, parameters)?;
         debug_assert_eq!(command_parameter_count(&command), 0);
 
         // Transitional durability identity only. The executable command above is the directly
@@ -180,7 +182,36 @@ pub(crate) fn command_parameter_count(command: &Command) -> usize {
             highest = highest.max(*index);
         }
     });
+    if let Command::Select(select) = command {
+        highest = highest.max(select.prepared_limit_parameter_index().unwrap_or_default());
+    }
     highest
+}
+
+fn bind_select_limit_parameter(
+    command: &mut Command,
+    parameters: &[SqlValue],
+) -> Result<(), ParseError> {
+    let Command::Select(select) = command else {
+        return Ok(());
+    };
+    let Some(index) = select.prepared_limit_parameter_index() else {
+        return Ok(());
+    };
+    let value =
+        parameters
+            .get(index.saturating_sub(1))
+            .ok_or(ParseError::InvalidParameterCount {
+                expected: index,
+                actual: parameters.len(),
+            })?;
+    select.limit = match value {
+        SqlValue::Null => None,
+        SqlValue::Int4(value) if *value >= 0 => Some(*value as usize),
+        SqlValue::Int4(_) => return Err(ParseError::NegativeLimit),
+        _ => return Err(ParseError::InvalidRelationalSql),
+    };
+    Ok(())
 }
 
 fn visit_command_values(command: &Command, visit: &mut impl FnMut(&SqlValue)) {
@@ -198,6 +229,7 @@ fn visit_command_values(command: &Command, visit: &mut impl FnMut(&SqlValue)) {
                 }
             }
         }
+        Command::SelectLiteral(literal) => visit(&literal.value),
         Command::Insert(insert) => {
             for row in &insert.rows {
                 for value in row {
@@ -286,6 +318,7 @@ fn visit_command_values_mut(
                 }
             }
         }
+        Command::SelectLiteral(literal) => visit(&mut literal.value)?,
         Command::Insert(insert) => {
             for row in &mut insert.rows {
                 for value in row {
@@ -407,6 +440,62 @@ mod tests {
         assert_eq!(select.filters[0].value, SqlValue::Int4(7));
         assert_eq!(select.filters[1].value, SqlValue::Int8(90));
         assert_eq!(select.filters[2].value, SqlValue::Int4(7));
+    }
+
+    #[test]
+    fn bind_resolves_parameterized_limit_before_execution() {
+        let prepared = PreparedCommand::parse(
+            "SELECT id FROM accounts WHERE id >= $1 ORDER BY id LIMIT $002::pg_catalog.int4",
+        )
+        .unwrap();
+        assert_eq!(prepared.parameter_count(), 2);
+        let bound = prepared
+            .bind(&[SqlValue::Int4(7), SqlValue::Int4(3)])
+            .unwrap();
+        let Command::Select(select) = bound.command() else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.limit, Some(3));
+        assert!(matches!(
+            prepared.bind(&[SqlValue::Int4(7), SqlValue::Int4(-1)]),
+            Err(ParseError::NegativeLimit)
+        ));
+    }
+
+    #[test]
+    fn bind_preserves_prepared_int4_scalar_addition_for_gpu_literal_execution() {
+        let prepared = PreparedCommand::parse("SELECT $1 + 10 AS plus_ten").unwrap();
+        assert_eq!(prepared.parameter_count(), 1);
+        let Command::SelectLiteral(literal) = prepared.command() else {
+            panic!("expected bounded scalar projection");
+        };
+        assert_eq!(literal.ty, SqlType::Int4);
+        assert_eq!(literal.add_int4, Some(10));
+
+        let bound = prepared.bind(&[SqlValue::Int4(5)]).unwrap();
+        let Command::SelectLiteral(literal) = bound.command() else {
+            panic!("expected bound scalar projection");
+        };
+        assert_eq!(literal.value, SqlValue::Int4(5));
+        assert_eq!(literal.add_int4, Some(10));
+    }
+
+    #[test]
+    fn prepared_int4_addition_binds_edge_operands_without_host_range_folding() {
+        for (sql, value, addend) in [
+            ("SELECT $1 + 0 AS unchanged", SqlValue::Int4(i32::MAX), 0),
+            ("SELECT $1 + -1 AS minus_one", SqlValue::Int4(i32::MIN), -1),
+            ("SELECT $1 + 1 AS plus_one", SqlValue::Int4(i32::MAX), 1),
+            ("SELECT $1 + 1 AS plus_one", SqlValue::Null, 1),
+        ] {
+            let prepared = PreparedCommand::parse(sql).unwrap();
+            let bound = prepared.bind(std::slice::from_ref(&value)).unwrap();
+            let Command::SelectLiteral(literal) = bound.command() else {
+                panic!("expected bound scalar arithmetic literal");
+            };
+            assert_eq!(literal.value, value);
+            assert_eq!(literal.add_int4, Some(addend));
+        }
     }
 
     #[test]

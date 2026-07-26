@@ -175,7 +175,7 @@ fn gpu_pg16_dump_and_dumpall_catalog_routes_are_nonvacuous_and_wal_neutral() {
     );
     assert_eq!(
         tablespaces.rows[0][4],
-        SqlValue::Text("{postgres=C/postgres,dump_reader=C/postgres}".to_string())
+        SqlValue::Text("{dump_reader=C/postgres}".to_string())
     );
     assert_eq!(
         tablespaces.rows[0][7],

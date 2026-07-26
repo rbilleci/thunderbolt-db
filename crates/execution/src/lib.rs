@@ -161,6 +161,7 @@ mod join_contract;
 pub use join_contract::{
     CudaJoinCoordinatesU32, CudaJoinOrderKey, CudaJoinPayloadKey, CudaJoinSortKey,
 };
+mod join_distinct;
 mod join_filter;
 mod join_fixed;
 mod join_materialize;
@@ -188,6 +189,16 @@ mod resident_sidecar;
 pub use resident_sidecar::{CudaSidecarSource, CudaTextOffsetSource};
 mod unique_coordinate;
 use unique_coordinate::launch_cuda_unique_coordinate_threshold;
+mod device_catalog_verdict;
+pub use device_catalog_verdict::{
+    DeviceAclGrant, DeviceAclObject, DeviceAclRequest, DeviceAclRole, DeviceAclSchemaGrant,
+    DeviceAclVerdict, DeviceFormatTypeCandidate, DeviceFormatTypeRow, DeviceFormatTypeValue,
+    DeviceFormatTypeVerdict, DeviceFunctionListCell, DeviceFunctionListDescription,
+    DeviceFunctionListFunction, DeviceFunctionListGrant, DeviceFunctionListRequest,
+    DeviceFunctionListRow, DeviceFunctionListTextCandidate, DeviceFunctionListVerdict,
+    DeviceRoleNameRequest, DeviceRoleNameVerdict, FUNCTION_LIST_COLUMN_COUNT,
+    MAX_FUNCTION_LIST_TEXT,
+};
 mod point_read_submit;
 use point_read_submit::{
     submit_cuda_resident_i32_equal_any_project, submit_cuda_resident_i32_index_probe,

@@ -480,6 +480,7 @@ fn function_arity_is_valid(name: &str, len: usize) -> bool {
         "generate_series" | "pg_get_expr" => (2..=3).contains(&len),
         "pg_get_indexdef" => (1..=3).contains(&len),
         "obj_description" | "pg_get_constraintdef" | "pg_get_triggerdef" => (1..=2).contains(&len),
+        "pg_size_pretty" | "pg_table_size" => len == 1,
         "set_config" => len == 3,
         "pg_function_is_visible"
         | "pg_get_partkeydef"
@@ -638,6 +639,17 @@ fn validate_function(
                 require(2, SqlType::Bool)?;
             }
         }
+        "pg_size_pretty" => {
+            let ty = arg_type(0).ok_or_else(|| {
+                sql_pg_error("pg_size_pretty argument has no catalog type".to_string())
+            })?;
+            if !catalog_integer_type(ty) {
+                return Err(sql_pg_error(
+                    "pg_size_pretty argument must be an integer".to_string(),
+                ));
+            }
+        }
+        "pg_table_size" => require_oid(0)?,
         "string_agg" => {
             require(0, SqlType::Text)?;
             require(1, SqlType::Text)?;
@@ -1344,7 +1356,7 @@ fn expression_metadata(
             let name = catalog_function_name(function).ok()?;
             let ty = match name.as_str() {
                 "array_upper" | "generate_series" | "pg_partition_ancestors" => SqlType::Int4,
-                "count" => SqlType::Int8,
+                "count" | "pg_table_size" => SqlType::Int8,
                 "pg_function_is_visible"
                 | "pg_relation_is_publishable"
                 | "pg_table_is_visible"

@@ -35,7 +35,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -102,6 +102,19 @@ const DDL_DML_TEST_DEADLINE_SECS: u64 = 120;
 
 // ----- helpers -------------------------------------------------------------------------------
 
+/// libtest runs independent `#[test]` cases in parallel by default, but this suite's cases all
+/// exercise the one physical GPU.  Serialize only those outer cases: every acquired case still
+/// runs its own `THREADS` fan-out, barriers, and `REPS` exactly as before.  Waiting for another
+/// case's GPU ownership happens before [`with_deadline`] starts its watchdog, so unrelated
+/// libtest scheduling pressure cannot masquerade as an in-case deadlock.
+fn concurrency_case_gpu_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Run `body` on a worker thread under a wall-clock deadline. If it does not finish within `secs`,
 /// `panic!` (failing the test) instead of letting the harness park forever. A concurrency test that
 /// can hang silently is itself a defect: every `#[test]` below wraps its body in this so ANY missed
@@ -111,6 +124,10 @@ const DDL_DML_TEST_DEADLINE_SECS: u64 = 120;
 /// thread); the process exits right after the panic propagates, reaping it. The body must be
 /// `Send + 'static` so it can move to the worker (the tests build all their state inside `body`).
 fn with_deadline(secs: u64, name: &'static str, body: impl FnOnce() + Send + 'static) {
+    // Acquire before creating the worker/channel and before `recv_timeout`: the per-case
+    // watchdog measures only this case's concurrent interleavings, never time queued behind an
+    // unrelated libtest case using the same physical GPU.
+    let _case_gpu_guard = concurrency_case_gpu_guard();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let worker = thread::Builder::new()
         .name(name.to_string())

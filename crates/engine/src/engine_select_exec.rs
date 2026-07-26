@@ -66,6 +66,14 @@ impl Engine {
         self.execute_resident_expr_select_sql_scoped(sql, || {})
     }
 
+    pub fn execute_resident_expr_select_sql_as_principal(
+        &self,
+        sql: &str,
+        principal: AuthorizationPrincipal,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_resident_expr_select_sql_scoped_authorized(sql, principal, || {})
+    }
+
     #[cfg(test)]
     pub(crate) fn execute_resident_expr_select_sql_instrumented(
         &self,
@@ -79,12 +87,23 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_select_as_principal(
+            select,
+            AuthorizationPrincipal::BootstrapPostgres,
+        )
+    }
+
+    pub fn execute_relational_select_as_principal(
+        &self,
+        select: &Select,
+        principal: AuthorizationPrincipal,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         if self.is_commit_path_poisoned() {
             return Err(ExecuteError::Engine(EngineError::Durability(
                 "commit path is wedged; restart recovery required".to_string(),
             )));
         }
-        self.execute_relational_select_instrumented(select, || {})
+        self.execute_relational_select_instrumented_authorized(select, principal, || {})
     }
 
     /// Execute a SELECT against the generation bundle retained by explicit `txn_id`. The scoped
@@ -96,7 +115,21 @@ impl Engine {
         txn_id: TxnId,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        self.execute_relational_select_in_transaction_with_hook(txn_id, select, || {})
+        self.execute_relational_select_in_transaction_with_hook(
+            txn_id,
+            select,
+            AuthorizationPrincipal::BootstrapPostgres,
+            || {},
+        )
+    }
+
+    pub fn execute_relational_select_in_transaction_as_principal(
+        &self,
+        txn_id: TxnId,
+        select: &Select,
+        principal: AuthorizationPrincipal,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_select_in_transaction_with_hook(txn_id, select, principal, || {})
     }
 
     /// Execute a libpg_query-lowered SELECT against the generation retained by `txn_id`.
@@ -109,6 +142,19 @@ impl Engine {
         &self,
         txn_id: TxnId,
         sql: &str,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_resident_expr_select_sql_in_transaction_as_principal(
+            txn_id,
+            sql,
+            AuthorizationPrincipal::BootstrapPostgres,
+        )
+    }
+
+    pub fn execute_resident_expr_select_sql_in_transaction_as_principal(
+        &self,
+        txn_id: TxnId,
+        sql: &str,
+        principal: AuthorizationPrincipal,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
@@ -124,7 +170,7 @@ impl Engine {
         let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
         self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
         let _scope = self.enter_transaction_read(snapshot);
-        self.execute_resident_expr_select_sql(sql)
+        self.execute_resident_expr_select_sql_as_principal(sql, principal)
     }
 
     #[cfg(test)]
@@ -134,13 +180,19 @@ impl Engine {
         select: &Select,
         on_statement_locked: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        self.execute_relational_select_in_transaction_with_hook(txn_id, select, on_statement_locked)
+        self.execute_relational_select_in_transaction_with_hook(
+            txn_id,
+            select,
+            AuthorizationPrincipal::BootstrapPostgres,
+            on_statement_locked,
+        )
     }
 
     fn execute_relational_select_in_transaction_with_hook(
         &self,
         txn_id: TxnId,
         select: &Select,
+        principal: AuthorizationPrincipal,
         on_statement_locked: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
@@ -155,10 +207,11 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
         let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
-        self.execute_relational_select_in_transaction_statement_locked(
+        self.execute_relational_select_in_transaction_statement_locked_authorized(
             txn_id,
             &snapshot,
             select,
+            principal,
             on_statement_locked,
         )
     }
@@ -170,13 +223,30 @@ impl Engine {
         select: &Select,
         on_statement_locked: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_select_in_transaction_statement_locked_authorized(
+            txn_id,
+            snapshot,
+            select,
+            AuthorizationPrincipal::BootstrapPostgres,
+            on_statement_locked,
+        )
+    }
+
+    fn execute_relational_select_in_transaction_statement_locked_authorized(
+        &self,
+        txn_id: TxnId,
+        snapshot: &Arc<TransactionSnapshot>,
+        select: &Select,
+        principal: AuthorizationPrincipal,
+        on_statement_locked: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         self.ensure_transaction_snapshot_current(txn_id, snapshot)?;
         on_statement_locked();
         self.acquire_transaction_table_access(snapshot, [select.table.clone()])?;
         let _scope = self.enter_transaction_read(Arc::clone(snapshot));
-        self.execute_relational_select(select)
+        self.execute_relational_select_as_principal(select, principal)
     }
 
     /// Parse and execute a relational SELECT from text, accepting native
@@ -291,6 +361,19 @@ impl Engine {
         select: &Select,
         on_pinned: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_select_instrumented_authorized(
+            select,
+            AuthorizationPrincipal::BootstrapPostgres,
+            on_pinned,
+        )
+    }
+
+    fn execute_relational_select_instrumented_authorized(
+        &self,
+        select: &Select,
+        principal: AuthorizationPrincipal,
+        on_pinned: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         // Autocommit reads retain one immutable catalog+device generation for the full statement,
@@ -349,6 +432,7 @@ impl Engine {
         // runs, so `catalog_as_of(s)` never falls back to a too-new generation.
         let s = self.read_snapshot_boundary();
         let catalog = self.read_catalog_as_of(s);
+        self.authorize_select_at(&catalog, principal, select)?;
         if self
             .current_transaction_read_snapshot()
             .is_some_and(|snapshot| snapshot.table_has_typed_empty_root(&select.table))
@@ -439,6 +523,11 @@ impl Engine {
                 }
             }
         }
+        // Validate the typed SELECT against the same catalog generation before a resident-route
+        // decline can hand it to the broad Expr bridge. This preserves statement-local diagnostics
+        // (GROUP BY/HAVING, aggregate value types, DISTINCT ordering) and never reads tuple-store
+        // rows: route selection and device execution still own all relational work.
+        let _ = self.bind_relational_select_at(select, s)?;
         let resident_route = self.plan_relational_resident_route(select);
         if resident_route.accepted {
             // The resident route does not use the inter-bind-and-pin window the hook targets; fire the
@@ -724,15 +813,39 @@ impl Engine {
         &self,
         call: &SelectFunction,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_function_as_principal(
+            call,
+            AuthorizationPrincipal::BootstrapPostgres,
+        )
+    }
+
+    pub fn execute_relational_function_as_principal(
+        &self,
+        call: &SelectFunction,
+        principal: AuthorizationPrincipal,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
-        self.execute_relational_function_scoped(call)
+        self.execute_relational_function_scoped(call, principal)
     }
 
     pub fn execute_relational_function_in_transaction(
         &self,
         txn_id: TxnId,
         call: &SelectFunction,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_function_in_transaction_as_principal(
+            txn_id,
+            call,
+            AuthorizationPrincipal::BootstrapPostgres,
+        )
+    }
+
+    pub fn execute_relational_function_in_transaction_as_principal(
+        &self,
+        txn_id: TxnId,
+        call: &SelectFunction,
+        principal: AuthorizationPrincipal,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
@@ -748,16 +861,18 @@ impl Engine {
         let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
         self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
         let _scope = self.enter_transaction_read(snapshot);
-        self.execute_relational_function_scoped(call)
+        self.execute_relational_function_scoped(call, principal)
     }
 
     fn execute_relational_function_scoped(
         &self,
         call: &SelectFunction,
+        principal: AuthorizationPrincipal,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Lock-free read path: pin one catalog generation for lookup and scalar execution.
         let boundary = self.read_snapshot_boundary();
         let catalog = self.read_catalog_as_of(boundary);
+        self.authorize_function_at(&catalog, principal, &call.name)?;
         let Some(function) = catalog.relational_functions.get(&call.name) else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "function \"{}\" does not exist",
@@ -789,6 +904,11 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        if let Some(addend) = literal.add_int4 {
+            if let SqlValue::Int4(value) = &literal.value {
+                return self.execute_checked_int4_literal_addition_via_gpu(literal, *value, addend);
+            }
+        }
         self.execute_typed_scalar_via_gpu(
             literal.column_name.clone(),
             literal.ty,
@@ -799,6 +919,67 @@ impl Engine {
             0,
             self.committed_seq(),
         )
+    }
+
+    /// Keep prepared `$n + int4` as a checked device VM program.  The host stages only the bound
+    /// operand; it never computes and uploads a completed scalar result.  The one-row D2H below
+    /// is the terminal result readback, and the VM's overflow flag remains the authoritative
+    /// PostgreSQL range-error source.
+    fn execute_checked_int4_literal_addition_via_gpu(
+        &self,
+        literal: &SelectLiteral,
+        value: i32,
+        addend: i32,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let table = typed_scalar_table(
+            literal.column_name.clone(),
+            SqlType::Int4,
+            "pg_catalog".to_string(),
+            "__gpu_scalar_literal".to_string(),
+            0,
+            0,
+        );
+        let (snapshot, memory) =
+            self.build_transient_relation_residency(&table, &[vec![SqlValue::Int4(value)]])?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, 0)?;
+        let values = memory
+            .arith_value_column_at_selected_indices(
+                &[
+                    gpu_db_execution::ExprStep::LoadColumn { byte_offset },
+                    gpu_db_execution::ExprStep::ScalarBinary {
+                        op: 0,
+                        scalar: addend,
+                        scalar_on_left: false,
+                    },
+                ],
+                1,
+                &[0],
+                ResidentElemType::I32,
+            )
+            .map_err(|error| match error {
+                gpu_db_execution::CudaRuntimeProbeError::IntegerOutOfRange => ExecuteError::Engine(
+                    EngineError::NumericValueOutOfRange("integer out of range".to_string()),
+                ),
+                other => ExecuteError::Engine(EngineError::ApplyFailed(other.to_string())),
+            })?;
+        let [value] = values.as_slice() else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "device scalar arithmetic returned an unexpected cardinality".to_string(),
+            )));
+        };
+        let value = i32::try_from(*value).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "device checked int4 arithmetic returned an out-of-range value".to_string(),
+            ))
+        })?;
+        Ok(RelationalSelectResult {
+            columns: Arc::new(table.columns),
+            rows: vec![vec![SqlValue::Int4(value)]].into(),
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -813,27 +994,8 @@ impl Engine {
         attnum: i16,
         boundary: Index,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let column = RelationalColumn {
-            id: 0,
-            table_oid: relation_oid,
-            attnum,
-            name: column_name,
-            ty,
-            domain: None,
-            default: None,
-            type_oid: ty.postgres_oid(),
-            type_size: ty.type_size(),
-        };
-        let table = RelationalTable {
-            schema,
-            name: relation_name,
-            oid: relation_oid,
-            columns: vec![column],
-            indexes: Vec::new(),
-            check_constraints: Vec::new(),
-            foreign_keys: Vec::new(),
-            acl: BTreeMap::new(),
-        };
+        let table =
+            typed_scalar_table(column_name, ty, schema, relation_name, relation_oid, attnum);
         let select = Select {
             table: table.name.clone(),
             public_only: false,
@@ -850,7 +1012,40 @@ impl Engine {
         };
         self.execute_transient_rows_via_general(&select, table, vec![vec![value]], boundary)
     }
+}
 
+fn typed_scalar_table(
+    column_name: String,
+    ty: SqlType,
+    schema: String,
+    relation_name: String,
+    relation_oid: u32,
+    attnum: i16,
+) -> RelationalTable {
+    let column = RelationalColumn {
+        id: 0,
+        table_oid: relation_oid,
+        attnum,
+        name: column_name,
+        ty,
+        domain: None,
+        default: None,
+        type_oid: ty.postgres_oid(),
+        type_size: ty.type_size(),
+    };
+    RelationalTable {
+        schema,
+        name: relation_name,
+        oid: relation_oid,
+        columns: vec![column],
+        indexes: Vec::new(),
+        check_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+        acl: BTreeMap::new(),
+    }
+}
+
+impl Engine {
     pub fn execute_relational_select_with_cuda_driver_probe(
         &self,
         select: &Select,

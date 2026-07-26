@@ -1220,7 +1220,7 @@ fn transaction_fk_commit_waits_across_classic_wave_tail_handoff() {
     let result = commit.join().unwrap();
     assert!(
         matches!(&result, Err(ExecuteError::Serialization(message))
-            if message.contains("device foreign-key conflict")),
+            if message.contains("foreign-key dependency relation \"parents\" changed")),
         "the settled parent delete must reject the child commit: {result:?}"
     );
     e.execute_text(90, "ROLLBACK").unwrap();

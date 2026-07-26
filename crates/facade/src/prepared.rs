@@ -572,6 +572,23 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn prepared_int4_overflow_is_bound_then_reported_at_execute_as_22003() {
+        let facade = SharedEngine::new();
+        let mut session = facade.open_session();
+        let prepared = facade
+            .prepare_statement(&session, "SELECT $1 + 1 AS plus_one", &[])
+            .unwrap();
+        let bound = prepared
+            .bind_values(&[super::super::DbValue::Int4(i32::MAX)])
+            .expect("overflow is not a bind-time host fold");
+        let error = submit_prepared(&facade, &mut session, &bound)
+            .expect_err("device checked arithmetic must reject the bound value");
+        assert_eq!(error.category, ErrorCategory::NumericValueOutOfRange);
+        assert_eq!(crate::pg_adapter::error_sqlstate(error.category), "22003");
+    }
+
+    #[test]
     fn r2dbc_catalog_autodetection_is_described_at_the_public_facade_boundary() {
         let facade = SharedEngine::new();
         let session = facade.open_session();

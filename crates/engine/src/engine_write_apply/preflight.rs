@@ -54,6 +54,160 @@ impl Engine {
         self.preflight_constraints_against_current_device_generation(cmd, txn_id)
     }
 
+    /// Validate every supported COMMENT target before WAL admission. Keep this target/error match
+    /// in lock-step with `apply_comment_on`; apply must not discover a missing target after the
+    /// durable boundary.
+    fn preflight_comment_target(
+        &self,
+        cat: &CatalogSnapshot,
+        target: &CommentTarget,
+    ) -> Result<(), EngineError> {
+        match target {
+            CommentTarget::Database { database } if !self.database_exists(database) => Err(
+                EngineError::ApplyFailed(format!("database \"{database}\" does not exist")),
+            ),
+            CommentTarget::Role { role } if !self.role_exists(role) => Err(
+                EngineError::ApplyFailed(format!("role \"{role}\" does not exist")),
+            ),
+            CommentTarget::Schema { schema } if schema != PUBLIC_SCHEMA_NAME => Err(
+                EngineError::ApplyFailed(format!("schema \"{schema}\" does not exist")),
+            ),
+            CommentTarget::Tablespace { tablespace } if !self.tablespace_exists(tablespace) => Err(
+                EngineError::ApplyFailed(format!("tablespace \"{tablespace}\" does not exist")),
+            ),
+            CommentTarget::Table { table } if !cat.relational_catalog.contains_key(table) => Err(
+                EngineError::ApplyFailed(format!("relation \"{table}\" does not exist")),
+            ),
+            CommentTarget::Column { table, column } => {
+                let table_ref = cat.relational_catalog.get(table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{table}\" does not exist"))
+                })?;
+                if table_ref
+                    .columns
+                    .iter()
+                    .all(|candidate| &candidate.name != column)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{column}\" does not exist"
+                    )));
+                }
+                Ok(())
+            }
+            CommentTarget::Index { index }
+                if !cat.relational_catalog.values().any(|table| {
+                    table
+                        .indexes
+                        .iter()
+                        .any(|candidate| &candidate.name == index)
+                }) =>
+            {
+                Err(EngineError::ApplyFailed(format!(
+                    "index \"{index}\" does not exist"
+                )))
+            }
+            CommentTarget::View { view } if !cat.relational_views.contains_key(view) => {
+                if cat.relational_catalog.contains_key(view)
+                    || cat.relational_materialized_views.contains_key(view)
+                    || cat.relational_sequences.contains_key(view)
+                {
+                    Err(EngineError::ApplyFailed(format!(
+                        "relation \"{view}\" is not a view"
+                    )))
+                } else {
+                    Err(EngineError::ApplyFailed(format!(
+                        "view \"{view}\" does not exist"
+                    )))
+                }
+            }
+            CommentTarget::MaterializedView { materialized_view }
+                if !cat
+                    .relational_materialized_views
+                    .contains_key(materialized_view) =>
+            {
+                if cat.relational_catalog.contains_key(materialized_view)
+                    || cat.relational_views.contains_key(materialized_view)
+                    || cat.relational_sequences.contains_key(materialized_view)
+                {
+                    Err(EngineError::ApplyFailed(format!(
+                        "relation \"{materialized_view}\" is not a materialized view"
+                    )))
+                } else {
+                    Err(EngineError::ApplyFailed(format!(
+                        "materialized view \"{materialized_view}\" does not exist"
+                    )))
+                }
+            }
+            CommentTarget::Function { function }
+                if !cat.relational_functions.contains_key(function) =>
+            {
+                Err(EngineError::ApplyFailed(format!(
+                    "function \"{function}\" does not exist"
+                )))
+            }
+            CommentTarget::Extension { extension } if extension != "plpgsql" => Err(
+                EngineError::ApplyFailed(format!("extension \"{extension}\" does not exist")),
+            ),
+            CommentTarget::Sequence { sequence }
+                if !cat.relational_sequences.contains_key(sequence) =>
+            {
+                if cat.relational_catalog.contains_key(sequence)
+                    || cat.relational_views.contains_key(sequence)
+                    || cat.relational_materialized_views.contains_key(sequence)
+                {
+                    Err(EngineError::ApplyFailed(format!(
+                        "relation \"{sequence}\" is not a sequence"
+                    )))
+                } else {
+                    Err(EngineError::ApplyFailed(format!(
+                        "sequence \"{sequence}\" does not exist"
+                    )))
+                }
+            }
+            CommentTarget::Domain { domain } if !cat.relational_domains.contains_key(domain) => {
+                Err(EngineError::ApplyFailed(format!(
+                    "domain \"{domain}\" does not exist"
+                )))
+            }
+            CommentTarget::Publication { publication }
+                if !cat.relational_publications.contains_key(publication) =>
+            {
+                Err(EngineError::ApplyFailed(format!(
+                    "publication \"{publication}\" does not exist"
+                )))
+            }
+            CommentTarget::Subscription { subscription }
+                if !cat.relational_subscriptions.contains_key(subscription) =>
+            {
+                Err(EngineError::ApplyFailed(format!(
+                    "subscription \"{subscription}\" does not exist"
+                )))
+            }
+            CommentTarget::Constraint { table, constraint } => {
+                let table_ref = cat.relational_catalog.get(table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{table}\" does not exist"))
+                })?;
+                let exists = table_ref.indexes.iter().any(|candidate| {
+                    &candidate.name == constraint
+                        && (candidate.primary_key || candidate.unique_constraint)
+                }) || table_ref
+                    .check_constraints
+                    .iter()
+                    .any(|candidate| &candidate.name == constraint)
+                    || table_ref
+                        .foreign_keys
+                        .iter()
+                        .any(|candidate| &candidate.name == constraint);
+                if !exists {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "constraint \"{constraint}\" does not exist"
+                    )));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Run the state-sensitive constraint pass against an already-established device generation.
     ///
     /// This seam exists for callers that already own `commit_mutex`: calling
@@ -778,7 +932,7 @@ impl Engine {
                         rename.new_name
                     )));
                 }
-                let Some((owner, index)) = cat.relational_catalog.values().find_map(|table| {
+                let Some((_owner, index)) = cat.relational_catalog.values().find_map(|table| {
                     table
                         .indexes
                         .iter()
@@ -790,20 +944,10 @@ impl Engine {
                         rename.old_name
                     )));
                 };
-                if (index.primary_key || index.unique_constraint)
-                    && (owner
-                        .check_constraints
-                        .iter()
-                        .any(|constraint| constraint.name == rename.new_name)
-                        || owner
-                            .foreign_keys
-                            .iter()
-                            .any(|constraint| constraint.name == rename.new_name))
-                {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "relation \"{}\" already exists",
-                        rename.new_name
-                    )));
+                if index.primary_key || index.unique_constraint {
+                    return Err(EngineError::ApplyFailed(
+                        "cannot rename constraint-backed index with ALTER INDEX".to_string(),
+                    ));
                 }
             }
             Command::CreateView(create) => {
@@ -954,14 +1098,7 @@ impl Engine {
             }
             Command::CreateFunction(_) | Command::DropFunction(_) => {}
             Command::CommentOn(comment) => {
-                if let CommentTarget::Function { function } = &comment.target {
-                    if !cat.relational_functions.contains_key(function) {
-                        return Err(EngineError::ApplyFailed(format!(
-                            "function \"{}\" does not exist",
-                            function
-                        )));
-                    }
-                }
+                self.preflight_comment_target(cat.as_ref(), &comment.target)?
             }
             Command::CreateSequence(create) => {
                 self.preflight_create_sequence(create)?;

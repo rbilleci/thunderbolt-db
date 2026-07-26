@@ -384,11 +384,17 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
         // current flagged BIGINT index at COMMIT. The private duplicate stages successfully, but the
         // intervening committed row wins and COMMIT reports the device unique conflict.
         const EXPLICIT_TXN: u64 = 9_000_000;
+        const INTERVENING_TXN: u64 = EXPLICIT_TXN + 1;
         engine.execute_text(EXPLICIT_TXN, "BEGIN").unwrap();
-        sql!("INSERT INTO wide_i8 VALUES (777777777777, 80, NULL)").unwrap();
+        engine
+            .execute_text(
+                EXPLICIT_TXN,
+                "INSERT INTO wide_i8 VALUES (777777777777, 80, NULL)",
+            )
+            .unwrap();
         engine
             .execute_dml_concurrent(
-                EXPLICIT_TXN,
+                INTERVENING_TXN,
                 "INSERT INTO wide_i8 VALUES (777777777777, 81, NULL)",
             )
             .unwrap();

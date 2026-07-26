@@ -5,6 +5,13 @@
 
 use super::*;
 
+mod pg16;
+pub(super) use pg16::catalog_relation_device_sizes;
+use pg16::{
+    catalog_attstattarget_case_is_exact, catalog_join_relation_size_source,
+    catalog_reloptions_array_source_is_exact, catalog_relpersistence_case_is_exact,
+};
+
 #[derive(Clone)]
 pub(super) struct CatalogJoinPresentation {
     output_name: String,
@@ -137,16 +144,46 @@ pub(super) fn catalog_join_projection_plan(
                 };
                 let mut source = parse_join_col_ref(source)?;
                 let typmod = parse_join_col_ref(typmod)?;
-                if source.column != "typbasetype"
-                    || typmod.column != "typtypmod"
-                    || source.qualifier != typmod.qualifier
-                {
+                let modeled_pair = matches!(
+                    (source.column.as_str(), typmod.column.as_str()),
+                    ("typbasetype", "typtypmod") | ("atttypid", "atttypmod")
+                );
+                if !modeled_pair || source.qualifier != typmod.qualifier {
                     return Err(sql_pg_error(
-                        "domain format_type presentation requires typbasetype and typtypmod"
+                        "format_type presentation requires a modeled OID and typmod pair"
                             .to_string(),
                     ));
                 }
                 source.column = GPU_CATALOG_FORMATTED_TYPE.to_string();
+                source
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "pg_get_expr" => {
+                let [expression, relation, rest @ ..] = function.args.as_slice() else {
+                    return Err(sql_pg_error(
+                        "pg_get_expr requires an expression and relation OID".to_string(),
+                    ));
+                };
+                if rest.len() > 1
+                    || rest
+                        .first()
+                        .is_some_and(|pretty| !catalog_bool_constant_is_exact(pretty, true))
+                {
+                    return Err(sql_pg_error(
+                        "pg_get_expr accepts only an optional true pretty-print argument"
+                            .to_string(),
+                    ));
+                }
+                let source = parse_join_col_ref(expression)?;
+                let relation = parse_join_col_ref(relation)?;
+                if source.column != "adbin"
+                    || relation.column != "adrelid"
+                    || source.qualifier != relation.qualifier
+                {
+                    return Err(sql_pg_error(
+                        "pg_get_expr catalog presentation requires pg_attrdef adbin/adrelid"
+                            .to_string(),
+                    ));
+                }
                 source
             }
             NodeEnum::SubLink(sublink) => {
@@ -165,6 +202,9 @@ pub(super) fn catalog_join_projection_plan(
                         "catalog array_to_string has no modeled presentation column".to_string(),
                     )
                 })?
+            }
+            NodeEnum::FuncCall(function) if catalog_function_name(function)? == "pg_size_pretty" => {
+                catalog_join_relation_size_source(function)?
             }
             NodeEnum::AConst(constant) => {
                 let value = catalog_scalar_constant(constant)?;
@@ -198,7 +238,12 @@ pub(super) fn catalog_join_projection_plan(
                 ))
             }
         };
-        let default_name = source.column.clone();
+        let default_name = match node_enum(value)? {
+            NodeEnum::FuncCall(function) => catalog_function_name(function)?,
+            NodeEnum::CaseExpr(_) => "case".to_string(),
+            NodeEnum::AConst(_) | NodeEnum::SubLink(_) => "?column?".to_string(),
+            _ => source.column.clone(),
+        };
         let output_name = if target.name.is_empty() {
             default_name
         } else {
@@ -316,6 +361,14 @@ fn catalog_case_projection_source(
                 && catalog_relation_acl_kind_case_is_exact(&arms) =>
         {
             source.column = GPU_CATALOG_RELKIND_ACL_DISPLAY.to_string();
+            Ok(source)
+        }
+        "relpersistence"
+            if !reject_unmatched
+                && otherwise.is_none()
+                && catalog_relpersistence_case_is_exact(&arms) =>
+        {
+            source.column = GPU_CATALOG_RELPERSISTENCE_DISPLAY.to_string();
             Ok(source)
         }
         "reloftype"
@@ -608,6 +661,15 @@ pub(super) fn catalog_single_projection_plan(
                 )
             }
             NodeEnum::FuncCall(function)
+                if catalog_function_name(function)? == "col_description" =>
+            {
+                pg16::catalog_single_col_description_source(
+                    function,
+                    &table,
+                    &qualifier,
+                )?
+            }
+            NodeEnum::FuncCall(function)
                 if catalog_function_name(function)? == "pg_get_userbyid" =>
             {
                 let [source] = function.args.as_slice() else {
@@ -805,6 +867,14 @@ pub(super) fn catalog_single_projection_plan(
                 (
                     GPU_CATALOG_CURRENT_USER_MATCH.to_string(),
                     "?column?".to_string(),
+                )
+            }
+            NodeEnum::CaseExpr(case)
+                if catalog_attstattarget_case_is_exact(case, &qualifier) =>
+            {
+                (
+                    GPU_CATALOG_NULL_INT4.to_string(),
+                    "case".to_string(),
                 )
             }
             _ => {
@@ -1188,6 +1258,12 @@ fn catalog_join_array_to_string_source(
         }
         return None;
     }
+    if separator.sval == ", " && catalog_reloptions_array_source_is_exact(source) {
+        return Some(JoinColRef {
+            qualifier: Some("c".to_string()),
+            column: GPU_CATALOG_EMPTY_TEXT.to_string(),
+        });
+    }
     let Ok(NodeEnum::SubLink(sublink)) = node_enum(source) else {
         return None;
     };
@@ -1250,7 +1326,9 @@ fn catalog_obj_description_source(
             "obj_description catalog class must be text".to_string(),
         ));
     };
-    if source.column != "oid" || !matches!(class.sval.as_str(), "pg_namespace" | "pg_proc") {
+    if source.column != "oid"
+        || !matches!(class.sval.as_str(), "pg_class" | "pg_namespace" | "pg_proc")
+    {
         return Err(sql_pg_error(
             "obj_description requires a modeled catalog OID".to_string(),
         ));
@@ -1612,7 +1690,7 @@ pub(super) fn select_tree_uses_synthesized_catalog(
     })
 }
 
-fn collect_select_tree_relations(stmt: &SelectStmt, relations: &mut Vec<String>) {
+pub(super) fn collect_select_tree_relations(stmt: &SelectStmt, relations: &mut Vec<String>) {
     for from in &stmt.from_clause {
         collect_from_relations(from, relations);
     }
@@ -1671,5 +1749,132 @@ mod tests {
         let plan = catalog_single_projection_plan(&stmt).unwrap();
         assert_eq!(plan.select.table, "pg_catalog.pg_attribute");
         assert_eq!(plan.qualifier, "pg_attribute");
+    }
+
+    #[test]
+    fn pg16_verbose_relation_presentation_accepts_only_the_frozen_gpu_columns() {
+        let stmt = parse_single_select(
+            "SELECT c.relname, \
+             CASE c.relpersistence \
+               WHEN 'p' THEN 'permanent' \
+               WHEN 't' THEN 'temporary' \
+               WHEN 'u' THEN 'unlogged' \
+             END AS persistence, \
+             pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) AS size \
+             FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+        )
+        .unwrap();
+        let plan = catalog_join_projection_plan(&stmt).unwrap();
+        assert!(matches!(
+            &plan.projection[1],
+            JoinProjItem::Column(column)
+                if column.column == GPU_CATALOG_RELPERSISTENCE_DISPLAY
+        ));
+        assert!(matches!(
+            &plan.projection[2],
+            JoinProjItem::Column(column) if column.column == GPU_CATALOG_RELATION_SIZE
+        ));
+
+        for sql in [
+            "SELECT CASE c.relpersistence \
+               WHEN 'p' THEN 'persistent' \
+               WHEN 't' THEN 'temporary' \
+               WHEN 'u' THEN 'unlogged' \
+             END \
+             FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+            "SELECT pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(n.oid)) \
+             FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+        ] {
+            let stmt = parse_single_select(sql).unwrap();
+            assert!(
+                catalog_join_projection_plan(&stmt).is_err(),
+                "altered PostgreSQL presentation must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn pg16_describe_reloptions_accepts_only_the_frozen_gpu_empty_display() {
+        let sql = "SELECT pg_catalog.array_to_string(\
+            c.reloptions || ARRAY(\
+              SELECT 'toast.' || x FROM pg_catalog.unnest(tc.reloptions) x\
+            ), ', ') \
+            FROM pg_catalog.pg_class c \
+            LEFT JOIN pg_catalog.pg_class tc ON c.reltoastrelid = tc.oid";
+        let stmt = parse_single_select(sql).unwrap();
+        let plan = catalog_join_projection_plan(&stmt).unwrap();
+        assert!(matches!(
+            &plan.projection[0],
+            JoinProjItem::Column(column) if column.column == GPU_CATALOG_EMPTY_TEXT
+        ));
+
+        let altered = parse_single_select(&sql.replace("'toast.'", "'toastx.'")).unwrap();
+        assert!(
+            catalog_join_projection_plan(&altered).is_err(),
+            "altered reloptions presentation must fail closed"
+        );
+    }
+
+    #[test]
+    fn pg16_verbose_attribute_presentation_accepts_only_the_frozen_gpu_columns() {
+        let stmt = parse_single_select(
+            "SELECT a.attname, a.attstorage, a.attcompression, \
+             CASE WHEN a.attstattarget = -1 THEN NULL ELSE a.attstattarget END \
+               AS attstattarget, \
+             pg_catalog.col_description(a.attrelid, a.attnum) \
+             FROM pg_catalog.pg_attribute a",
+        )
+        .unwrap();
+        let plan = catalog_single_projection_plan(&stmt).unwrap();
+        let SelectProjection::Columns(columns) = &plan.select.projection else {
+            panic!("attribute presentation must project modeled columns");
+        };
+        assert_eq!(columns[1], "attstorage");
+        assert_eq!(columns[2], "attcompression");
+        assert_eq!(columns[3], GPU_CATALOG_NULL_INT4);
+        assert_eq!(columns[4], GPU_CATALOG_DESCRIPTION);
+
+        for sql in [
+            "SELECT CASE WHEN a.attstattarget = 0 THEN NULL \
+               ELSE a.attstattarget END \
+             FROM pg_catalog.pg_attribute a",
+            "SELECT pg_catalog.col_description(a.attrelid, a.atttypid) \
+             FROM pg_catalog.pg_attribute a",
+        ] {
+            let stmt = parse_single_select(sql).unwrap();
+            assert!(
+                catalog_single_projection_plan(&stmt).is_err(),
+                "altered PostgreSQL attribute presentation must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn relation_obj_description_requires_the_matching_catalog_class() {
+        let stmt = parse_single_select(
+            "SELECT pg_catalog.obj_description(c.oid, 'pg_class') \
+             FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+        )
+        .unwrap();
+        let plan = catalog_join_projection_plan(&stmt).unwrap();
+        assert!(matches!(
+            &plan.projection[0],
+            JoinProjItem::Column(column) if column.column == GPU_CATALOG_DESCRIPTION
+        ));
+
+        let altered = parse_single_select(
+            "SELECT pg_catalog.obj_description(c.oid, 'pg_type') \
+             FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+        )
+        .unwrap();
+        assert!(
+            catalog_join_projection_plan(&altered).is_err(),
+            "a mismatched description class must fail closed"
+        );
     }
 }

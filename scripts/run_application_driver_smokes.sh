@@ -50,7 +50,7 @@ require_python314() {
 
 require_canonical_driver_source() {
   local driver="$1"
-  if rg -q 'gpu_db_protocol|gpu-db-server' "tests/compat/$driver"; then
+  if rg -q 'gpu_db_protocol|gpu-db-[s]erver' "tests/compat/$driver"; then
     echo "canonical application driver still names the legacy server: $driver" >&2
     exit 1
   fi

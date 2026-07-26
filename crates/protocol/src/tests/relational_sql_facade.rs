@@ -214,7 +214,8 @@ default: None,
         parse_command(
             "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE"
         ),
-        Err(ParseError::InvalidRelationalSql)
+        Err(ParseError::Unsupported(message))
+            if message.contains("foreign key options beyond single-column immediate constraints")
     ));
     assert_eq!(
         parse_command(
@@ -851,13 +852,10 @@ default: Some(ColumnDefault::SequenceNextVal {
             restart_identity: true,
         })
     );
-    assert_eq!(
-        parse_command("TRUNCATE TABLE people CONTINUE IDENTITY").unwrap(),
-        Command::TruncateTable(TruncateTable {
-            name: "people".to_string(),
-            restart_identity: false,
-        })
-    );
+    assert!(matches!(
+        parse_command("TRUNCATE TABLE people CONTINUE IDENTITY"),
+        Err(ParseError::InvalidRelationalSql)
+    ));
     assert!(matches!(
         parse_command("TRUNCATE TABLE people CASCADE"),
         Err(ParseError::InvalidRelationalSql)
@@ -1646,7 +1644,7 @@ default: Some(ColumnDefault::SequenceNextVal {
     );
     assert!(matches!(
         parse_command("UPDATE public.people SET name = 'Updated'"),
-        Err(ParseError::Unsupported(_))
+        Err(ParseError::InvalidRelationalSql)
     ));
     assert!(matches!(
         parse_command("UPDATE public.people SET name = 'Updated' WHERE"),

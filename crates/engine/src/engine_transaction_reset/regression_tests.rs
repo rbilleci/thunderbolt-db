@@ -25,7 +25,7 @@ fn typed_transaction_resets_preserve_order_identity_consumption_and_recovery() {
         .submit_transaction(102, parsed("INSERT INTO reset_order VALUES (2)"))
         .unwrap();
     engine
-        .submit_transaction(102, parsed("TRUNCATE TABLE reset_order CONTINUE IDENTITY"))
+        .submit_transaction(102, parsed("TRUNCATE TABLE reset_order"))
         .unwrap();
     let private_empty = match parse_command("SELECT id FROM reset_order").unwrap() {
         Command::Select(select) => engine
@@ -112,7 +112,7 @@ fn typed_transaction_resets_preserve_order_identity_consumption_and_recovery() {
         .submit_transaction(104, parsed("INSERT INTO reset_order VALUES (4)"))
         .unwrap();
     engine
-        .submit_transaction(104, parsed("TRUNCATE reset_order CONTINUE IDENTITY"))
+        .submit_transaction(104, parsed("TRUNCATE reset_order"))
         .unwrap();
     engine
         .submit_transaction(104, parsed("INSERT INTO reset_order VALUES (5)"))
@@ -756,7 +756,7 @@ fn every_live_autocommit_truncate_surface_emits_typed_reset_wal() {
         .unwrap()
         .1;
     engine
-        .submit_transaction(203, parsed("TRUNCATE autocommit_reset CONTINUE IDENTITY"))
+        .submit_transaction(203, parsed("TRUNCATE autocommit_reset"))
         .unwrap();
     assert!(engine.transaction_snapshot_handle(203).is_none());
     assert_eq!(engine.durable_wal_records().len(), before_submit + 1);

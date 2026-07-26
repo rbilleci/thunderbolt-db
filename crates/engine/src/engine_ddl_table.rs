@@ -1225,22 +1225,6 @@ impl Engine {
             }
         }
         let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
-        if enforce_constraint_dependency {
-            if let Some(index) = cat
-                .relational_catalog
-                .values()
-                .flat_map(|table| table.indexes.iter())
-                .find(|index| {
-                    drop_names.contains(&index.name)
-                        && (index.primary_key || index.unique_constraint)
-                })
-            {
-                return Err(EngineError::ApplyFailed(format!(
-                    "cannot drop constraint-backed index \"{}\" with DROP INDEX",
-                    index.name
-                )));
-            }
-        }
         let dropped_constraint_targets = cat
             .relational_catalog
             .values()
@@ -1319,20 +1303,6 @@ impl Engine {
             )));
         }
         Self::validate_current_drop_index_targets(drop, |name| cat.pg_class_relation_kind(name))?;
-        let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
-        if let Some(index) = cat
-            .relational_catalog
-            .values()
-            .flat_map(|table| table.indexes.iter())
-            .find(|index| {
-                drop_names.contains(&index.name) && (index.primary_key || index.unique_constraint)
-            })
-        {
-            return Err(EngineError::ApplyFailed(format!(
-                "cannot drop constraint-backed index \"{}\" with DROP INDEX",
-                index.name
-            )));
-        }
         Ok(())
     }
 
@@ -1391,29 +1361,16 @@ impl Engine {
                 rename.new_name
             )));
         }
-        let constraint_backed_owner = cat.relational_catalog.values().find(|table| {
-            table.indexes.iter().any(|index| {
-                index.name == rename.old_name && (index.primary_key || index.unique_constraint)
+        if current_semantics
+            && cat.relational_catalog.values().any(|table| {
+                table.indexes.iter().any(|index| {
+                    index.name == rename.old_name && (index.primary_key || index.unique_constraint)
+                })
             })
-        });
-        // Index relation names occupy the schema-wide relation namespace (checked above and by
-        // command preflight), while CHECK/FK constraint names are local to their owner relation.
-        // Renaming a PK/UNIQUE backing index therefore conflicts only with constraints on that
-        // index's table; an unrelated table may legitimately use the same constraint name.
-        if constraint_backed_owner.is_some_and(|owner| {
-            owner
-                .check_constraints
-                .iter()
-                .any(|constraint| constraint.name == rename.new_name)
-                || owner
-                    .foreign_keys
-                    .iter()
-                    .any(|constraint| constraint.name == rename.new_name)
-        }) {
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" already exists",
-                rename.new_name
-            )));
+        {
+            return Err(EngineError::ApplyFailed(
+                "cannot rename constraint-backed index with ALTER INDEX".to_string(),
+            ));
         }
 
         for table in cat.relational_catalog.values_mut() {
@@ -1692,6 +1649,8 @@ impl Engine {
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         self.preflight_drop_table(&drop)?;
+        let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
+        Self::validate_drop_table_foreign_key_dependencies(&cat.relational_catalog, &drop_names)?;
 
         for name in &drop.names {
             // RETIREMENT A4e (audit SF4): a dropped table must LEAVE the elided set — a later
@@ -1800,7 +1759,7 @@ impl Engine {
         let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
-            if !seen.insert(name) {
+            if !seen.insert(name.clone()) {
                 return Err(EngineError::ApplyFailed(format!(
                     "table \"{}\" specified more than once",
                     name
@@ -1824,6 +1783,25 @@ impl Engine {
                     name
                 )));
             }
+        }
+        Self::validate_drop_table_foreign_key_dependencies(&cat.relational_catalog, &seen)?;
+        Ok(())
+    }
+
+    fn validate_drop_table_foreign_key_dependencies(
+        tables: &BTreeMap<String, RelationalTable>,
+        drop_names: &BTreeSet<String>,
+    ) -> Result<(), EngineError> {
+        if tables.iter().any(|(child_name, child)| {
+            !drop_names.contains(child_name)
+                && child
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| drop_names.contains(&foreign_key.referenced_table))
+        }) {
+            return Err(EngineError::ApplyFailed(
+                "cannot drop table because a foreign key constraint depends on it".to_string(),
+            ));
         }
         Ok(())
     }

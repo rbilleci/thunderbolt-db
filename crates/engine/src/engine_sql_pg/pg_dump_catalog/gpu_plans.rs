@@ -5,6 +5,19 @@
 //! through these helpers so every returned scalar is gathered from device memory.
 
 use super::*;
+#[cfg(test)]
+use std::sync::Mutex;
+
+#[cfg(test)]
+struct GpuPgDumpDistinctJoinSabotage {
+    engine_identity: usize,
+    scope: &'static str,
+    canonical_request: String,
+}
+
+#[cfg(test)]
+static GPU_PG_DUMP_DISTINCT_JOIN_SABOTAGE: Mutex<Option<GpuPgDumpDistinctJoinSabotage>> =
+    Mutex::new(None);
 
 pub(super) fn catalog_column_index(
     table: &RelationalTable,
@@ -115,7 +128,7 @@ pub(super) fn pg_dump_select(
 }
 
 impl Engine {
-    pub(super) fn execute_pg_dump_gpu_select(
+    pub(crate) fn execute_pg_dump_gpu_select(
         &self,
         table: RelationalTable,
         rows: Vec<Vec<SqlValue>>,
@@ -184,7 +197,7 @@ impl Engine {
         })
     }
 
-    pub(super) fn execute_pg_dump_gpu_join(
+    pub(crate) fn execute_pg_dump_gpu_join(
         &self,
         plan: &JoinPlan,
         tables: Vec<RelationalTable>,
@@ -202,6 +215,50 @@ impl Engine {
             None,
             false,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sabotage_next_pg_dump_gpu_distinct_join(
+        &self,
+        scope: &'static str,
+        sql: &str,
+    ) -> Result<(), ExecuteError> {
+        let canonical_request = canonicalize_sql_for_exact_match(sql)?;
+        *GPU_PG_DUMP_DISTINCT_JOIN_SABOTAGE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(GpuPgDumpDistinctJoinSabotage {
+                engine_identity: self as *const Self as usize,
+                scope,
+                canonical_request,
+            });
+        Ok(())
+    }
+
+    /// Consume an exact engine/request-scoped terminal DISTINCT fault.  Route code calls this
+    /// only after its GPU JOIN DISTINCT completes, so a sabotaged result cannot be replaced with
+    /// a host-materialized fallback or consumed by a concurrent unrelated catalog request.
+    #[cfg(test)]
+    pub(crate) fn fail_if_pg_dump_gpu_distinct_join_sabotaged(
+        &self,
+        scope: &str,
+        canonical_request: &str,
+    ) -> Result<(), ExecuteError> {
+        let mut sabotage = GPU_PG_DUMP_DISTINCT_JOIN_SABOTAGE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = sabotage.as_ref().is_some_and(|request| {
+            request.engine_identity == self as *const Self as usize
+                && request.scope == scope
+                && request.canonical_request == canonical_request
+        });
+        if matches {
+            *sabotage = None;
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "injected terminal GPU JOIN DISTINCT failure".to_string(),
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -260,6 +317,7 @@ pub(super) fn join_plan(
             .iter()
             .map(|(alias, column, _)| projected_column(alias, column))
             .collect(),
+        distinct: false,
         projection_aliases: projection
             .into_iter()
             .map(|(_, _, output)| Some(output.to_string()))

@@ -9,6 +9,7 @@ const PG_PROC_CLASS_OID: i32 = 1255;
 const PG_PUBLICATION_CLASS_OID: i32 = 6104;
 const PG_SUBSCRIPTION_CLASS_OID: i32 = 6100;
 const PG_TYPE_CLASS_OID: i32 = 1247;
+const PG_EXTENSION_CLASS_OID: i32 = 3079;
 
 pub(super) fn is_pg16_dump_description_program(canonical: &str) -> bool {
     canonical
@@ -119,6 +120,9 @@ fn description_catalog_id(
         RelationalCommentTarget::Constraint { table, constraint } => {
             catalog_constraint_oid(catalog, table, constraint)
                 .map(|oid| (PG_CONSTRAINT_CLASS_OID, oid, 0))
+        }
+        RelationalCommentTarget::Extension { extension } if extension == "plpgsql" => {
+            Some((PG_EXTENSION_CLASS_OID, 13_500, 0))
         }
         RelationalCommentTarget::Database { .. }
         | RelationalCommentTarget::Role { .. }

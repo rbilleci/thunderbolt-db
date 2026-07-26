@@ -78,11 +78,26 @@ enum GpuRankTarget {
 mod catalog_empty;
 mod catalog_presentation;
 pub(crate) mod pg_dump_catalog;
+mod psql_bootstrap_metadata;
+mod psql_databases;
+mod psql_describe;
+mod psql_empty_metadata;
+mod psql_functions;
+mod psql_information_schema;
+mod psql_metadata_lists;
+mod psql_object_descriptions;
+mod psql_publications;
+mod psql_relation_detail;
+mod psql_roles;
+mod psql_routes;
+mod psql_sequence_catalog;
+mod psql_shared_comments;
+mod psql_subscriptions;
 
 use catalog_presentation::{
-    apply_catalog_projection_metadata, catalog_join_projection_plan,
-    catalog_single_projection_plan, scalar_aggregate_alias_presentation,
-    select_tree_uses_synthesized_catalog,
+    apply_catalog_projection_metadata, catalog_join_projection_plan, catalog_relation_device_sizes,
+    catalog_single_projection_plan, collect_select_tree_relations,
+    scalar_aggregate_alias_presentation, select_tree_uses_synthesized_catalog,
 };
 
 /// A resident user relation carries no host rows; a synthesized catalog relation carries the
@@ -127,6 +142,19 @@ impl Engine {
         sql: &str,
         after_snapshot: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_resident_expr_select_sql_scoped_authorized(
+            sql,
+            AuthorizationPrincipal::BootstrapPostgres,
+            after_snapshot,
+        )
+    }
+
+    pub(crate) fn execute_resident_expr_select_sql_scoped_authorized(
+        &self,
+        sql: &str,
+        principal: AuthorizationPrincipal,
+        after_snapshot: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         let stmt = parse_single_select(sql)?;
@@ -134,7 +162,16 @@ impl Engine {
         let _statement_scope =
             statement_snapshot.map(|snapshot| self.enter_transaction_read(snapshot));
         after_snapshot();
-        if let Some(result) = self.execute_pg_dump_catalog_route_if_applicable(sql)? {
+        let authorization_boundary = self.read_snapshot_boundary();
+        let authorization_catalog = self.read_catalog_as_of(authorization_boundary);
+        let mut authorization_relations = Vec::new();
+        collect_select_tree_relations(&stmt, &mut authorization_relations);
+        self.authorize_relation_names_at(
+            &authorization_catalog,
+            principal,
+            &authorization_relations,
+        )?;
+        if let Some(result) = self.execute_psql_catalog_route_if_applicable(sql, &stmt)? {
             return Ok(result);
         }
         if select_has_inline_window(&stmt)? {
@@ -151,6 +188,7 @@ impl Engine {
             // being reinterpreted by compatibility metadata rules.
             let s = self.read_snapshot_boundary();
             let catalog = self.read_catalog_as_of(s);
+            let relation_device_sizes = catalog_relation_device_sizes(self);
             let (plan, presentation) = match build_join_plan(&stmt) {
                 Ok(plan) => (plan, None),
                 Err(error) => {
@@ -181,7 +219,12 @@ impl Engine {
                 let (mut table, mut rows) = bind_join_relation(relation, &catalog)?;
                 if presentation.is_some() {
                     if let Some(rows) = rows.as_mut() {
-                        add_gpu_catalog_presentation_columns(&mut table, rows, &catalog)?;
+                        add_gpu_catalog_presentation_columns(
+                            &mut table,
+                            rows,
+                            &catalog,
+                            &relation_device_sizes,
+                        )?;
                     }
                 }
                 Ok((table, rows))
@@ -272,6 +315,7 @@ impl Engine {
                 relations,
                 steps,
                 projection,
+                distinct: !stmt.distinct_clause.is_empty(),
                 projection_aliases,
                 order_by,
                 order_by_nulls_first,
@@ -292,6 +336,7 @@ impl Engine {
         // the relation. It can never reinterpret an unsupported user-table SELECT.
         let copin_s = self.read_snapshot_boundary();
         let catalog = self.read_catalog_as_of(copin_s);
+        let relation_device_sizes = catalog_relation_device_sizes(self);
         let (select, qualifier, presentation, presentation_requires_columns) =
             match build_select_from_select_stmt(&stmt) {
                 Ok((select, qualifier)) => {
@@ -328,7 +373,12 @@ impl Engine {
             {
                 let exposed_width = table.columns.len();
                 if presentation_requires_columns {
-                    add_gpu_catalog_presentation_columns(&mut table, &mut rows, &catalog)?;
+                    add_gpu_catalog_presentation_columns(
+                        &mut table,
+                        &mut rows,
+                        &catalog,
+                        &relation_device_sizes,
+                    )?;
                 }
                 let range = match stmt.from_clause.as_slice() {
                     [from] => match node_enum(from)? {

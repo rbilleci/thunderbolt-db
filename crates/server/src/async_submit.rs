@@ -156,7 +156,7 @@ pub(crate) async fn analyze_sql_prepare_cancellable(
     query: String,
     parameter_hints: Vec<Option<gpu_db_facade::LogicalType>>,
     active: &ActiveRequest,
-) -> Result<Result<gpu_db_facade::PreparedStatement, DbError>, String> {
+) -> Result<Result<crate::sql_prepared::SqlPreparedPlan, DbError>, String> {
     let Some(_permit) = active
         .acquire_permit(executor)
         .await
@@ -175,7 +175,7 @@ pub(crate) async fn analyze_sql_prepare_cancellable(
         if cancellation.is_cancelled() {
             return Err(cancellation_error());
         }
-        ExtendedSession::analyze_sql_prepare(&engine, &session, &query, &parameter_hints)
+        ExtendedSession::analyze_sql_prepare_plan(&engine, &session, &query, &parameter_hints)
     })
     .await
     .map_err(|error| error.to_string())?;
@@ -267,7 +267,7 @@ pub(crate) async fn complete_simple_query_action(
     outcome: &Result<QueryOutcome, DbError>,
     response: &mut Vec<u8>,
 ) -> Result<(), String> {
-    if outcome.is_err() {
+    if crate::sql_session::outcome_error_poison_transaction(outcome) {
         session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -591,6 +591,10 @@ mod tests {
             statement_name: "queued".to_string(),
             parsed: PreparedStatement::parse("SELECT 1 AS value").unwrap(),
             copy: None,
+            sql_execute_bind_arguments: None,
+            outer_parameter_types: None,
+            deferred_execution_error: None,
+            cursor_declaration: None,
             query: "SELECT 1 AS value".to_string(),
             parameter_type_hints: Vec::new(),
         };
