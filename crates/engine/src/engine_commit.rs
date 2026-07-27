@@ -230,7 +230,7 @@ impl Engine {
                 }
             };
             let record = match Self::canonical_wal_record_with_commit_outcome(
-                &commit,
+                &mut commit,
                 txn_id,
                 token.index,
                 0,
@@ -245,7 +245,7 @@ impl Engine {
                     return Err(err);
                 }
             };
-            commit.wal.append(record);
+            commit.wal.append_canonical(record);
             if let Err(err) = commit.wal.flush_all() {
                 commit.repl.rollback_unapplied_from(token.index);
                 commit.wal.truncate(wal_len_before);
@@ -441,9 +441,14 @@ impl Engine {
                     Ok(token) => {
                         first_index.get_or_insert(token.index);
                         last_index = token.index;
-                        match Self::canonical_wal_record(&commit, *txn_id, token.index, 0, payload)
-                        {
-                            Ok(record) => commit.wal.append(record),
+                        match Self::canonical_wal_record(
+                            &mut commit,
+                            *txn_id,
+                            token.index,
+                            0,
+                            payload,
+                        ) {
+                            Ok(record) => commit.wal.append_canonical(record),
                             Err(error) => {
                                 commit.repl.rollback_unapplied_from(
                                     first_index.expect("the current proposal established it"),
@@ -1237,15 +1242,15 @@ impl Engine {
                     return Err(err);
                 }
             };
-            let record = match Self::canonical_wal_record(&commit, txn_id, token.index, 0, &payload)
-            {
-                Ok(record) => record,
-                Err(err) => {
-                    commit.repl.rollback_unapplied_from(token.index);
-                    return Err(err);
-                }
-            };
-            commit.wal.append(record);
+            let record =
+                match Self::canonical_wal_record(&mut commit, txn_id, token.index, 0, &payload) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        commit.repl.rollback_unapplied_from(token.index);
+                        return Err(err);
+                    }
+                };
+            commit.wal.append_canonical(record);
             if let Err(err) = commit.wal.flush_all() {
                 commit.repl.rollback_unapplied_from(token.index);
                 commit.wal.truncate(wal_len_before);
@@ -1757,7 +1762,7 @@ impl Engine {
                 if old_rows.is_empty() {
                     // 0-row update: a durable no-op that still burned the claimed `new_row_id`.
                     // Advance the allocator by 1 to keep replay in lock-step with the live pump.
-                    self.read_state.mvcc.advance_row_id(1);
+                    self.read_state.mvcc.advance_row_id(1)?;
                     return Ok(None);
                 }
                 if old_rows.len() != 1 || entity_ids.len() != 1 {

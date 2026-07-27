@@ -69,6 +69,16 @@ pub(crate) fn coerce_insert_value(
             .map(SqlValue::Int2)
             .map_err(|_| EngineError::NumericValueOutOfRange("smallint out of range".to_string()));
     }
+    // SQL literal inference promotes an integer that exceeds int4 to `Int8`. Preserve the
+    // existing no-narrowing type rule for in-range `Int8`, but distinguish an actual int4 range
+    // overflow from a generic type mismatch so every relational INSERT path reaches 22003.
+    if let (SqlValue::Int8(v), SqlType::Int4) = (&value, ty) {
+        if i32::try_from(*v).is_err() {
+            return Err(EngineError::NumericValueOutOfRange(
+                "integer out of range".to_string(),
+            ));
+        }
+    }
 
     // A string literal assigned to a date/timestamp column is parsed as that type (PG coerces an
     // unknown-type literal to the column type). An already-typed value passes through the check below.

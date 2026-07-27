@@ -43,6 +43,7 @@ pub use copy::{
     CopyToStdout,
 };
 mod decimal;
+mod lexical;
 mod parameter;
 mod parsed;
 mod prepared;
@@ -51,6 +52,7 @@ mod scalar;
 mod select;
 
 pub use decimal::{Decimal128, NumericOverflow};
+pub use lexical::sql_may_start_with_any_keyword;
 pub use parameter::{canonicalize_sql_for_exact_match, lower_sql_parameters};
 pub use parsed::ParsedCommand;
 pub use prepared::PreparedCommand;

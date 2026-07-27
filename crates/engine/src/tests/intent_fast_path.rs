@@ -187,6 +187,7 @@ fn covered_insert_route_requires_covered_shape() {
     assert!(err.to_string().contains("does not exist"), "{err}");
 
     // Binary WAL records disabled.
+    engine.set_binary_wal_records_enabled(false);
     let err = engine.prepare_covered_insert_route("t").unwrap_err();
     assert!(err.to_string().contains("binary WAL records"), "{err}");
 

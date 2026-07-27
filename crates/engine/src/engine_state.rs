@@ -842,6 +842,13 @@ pub(crate) struct ResidencyReadState {
     /// S-F/R-1: open-shard rollovers declined before allocation because the new payload plus
     /// version/identity regions would exceed the GPU residency budget.
     pub(crate) rollover_budget_declines: std::sync::atomic::AtomicU64,
+    /// Build-only INSERT qualification evidence. Every `with_shards_mut*` publication counts the
+    /// descriptors structurally cloned from the current immutable map plus the descriptors whose
+    /// route token is retokened in the next map. This is intentionally owned here rather than by
+    /// one mutation caller: in-place appends, rollover, admission, and maintenance all publish
+    /// through these helpers.
+    #[cfg(feature = "probe-timing")]
+    pub(crate) insert_probe_descriptor_clone_retoken_visits: std::sync::atomic::AtomicU64,
     /// E2.5c 2M+ push (b): merged applies served by the FUSED device pass.
     pub(crate) fused_apply_hits: std::sync::atomic::AtomicU64,
     /// S-d3: count of shards actually GATHERED (recompacted) by the sharded read after zone-map pruning.
@@ -1026,6 +1033,12 @@ pub(crate) struct ResidencyReadState {
     // memory-pressure.
     pub(crate) snapshots: ArcSwap<BTreeMap<String, RelationalResidencyEntry>>,
     pub(crate) shards: ArcSwap<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    /// Always-present mutation boundary for every residency publisher, sidecar lifecycle change,
+    /// and device-index rebuild. It is independent of optional intent lanes, so local/DDL engines
+    /// cannot accidentally plan a pre-WAL append without the exclusion that protects its sealed
+    /// descriptor and allocation geometry. Lock order is commit -> residency mutation -> budget.
+    /// Readers remain lock-free.
+    pub(crate) mutation_gate: Mutex<()>,
     /// W0: serializes the load→clone→store publishers of `snapshots`/`shards` (see
     /// [`ResidencyReadState::with_snapshots_mut`]). Readers never touch it.
     pub(crate) descriptor_publish_lock: Mutex<()>,
@@ -1459,6 +1472,11 @@ impl ResidencyReadState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.shards.load_full();
+        #[cfg(feature = "probe-timing")]
+        let descriptor_clones = current
+            .values()
+            .map(|shards| shards.len() as u64)
+            .sum::<u64>();
         let mut next = (*current).clone();
         let result = mutate(&mut next);
         // Derive the exact changed-table set while publication is serialized, so no caller can forget
@@ -1473,14 +1491,26 @@ impl ResidencyReadState {
             .filter(|table| current.get(*table) != next.get(*table))
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+        #[cfg(feature = "probe-timing")]
+        let mut descriptor_retoken_visits = 0_u64;
         for table in &changed_tables {
             if let Some(shards) = next.get_mut(table) {
                 let generation = Arc::new(());
+                #[cfg(feature = "probe-timing")]
+                {
+                    descriptor_retoken_visits =
+                        descriptor_retoken_visits.saturating_add(shards.len() as u64);
+                }
                 for shard in shards {
                     shard.point_route_generation = Arc::clone(&generation);
                 }
             }
         }
+        #[cfg(feature = "probe-timing")]
+        self.insert_probe_descriptor_clone_retoken_visits.fetch_add(
+            descriptor_clones.saturating_add(descriptor_retoken_visits),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.shards.store(Arc::new(next));
         // Store-before-purge is deliberate. New readers immediately see a new table token; old readers
         // fail their under-lock global-token recheck. Retaining descriptor_publish_lock through this purge
@@ -1502,14 +1532,30 @@ impl ResidencyReadState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.shards.load_full();
+        #[cfg(feature = "probe-timing")]
+        let descriptor_clones = current
+            .values()
+            .map(|shards| shards.len() as u64)
+            .sum::<u64>();
         let mut next = (*current).clone();
         let result = mutate(&mut next);
+        #[cfg(feature = "probe-timing")]
+        let mut descriptor_retoken_visits = 0_u64;
         if let Some(shards) = next.get_mut(table) {
             let generation = Arc::new(());
+            #[cfg(feature = "probe-timing")]
+            {
+                descriptor_retoken_visits = shards.len() as u64;
+            }
             for shard in shards {
                 shard.point_route_generation = Arc::clone(&generation);
             }
         }
+        #[cfg(feature = "probe-timing")]
+        self.insert_probe_descriptor_clone_retoken_visits.fetch_add(
+            descriptor_clones.saturating_add(descriptor_retoken_visits),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.shards.store(Arc::new(next));
         self.purge_sharded_point_routes_for_tables(std::iter::once(table));
         result

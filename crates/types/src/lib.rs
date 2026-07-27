@@ -42,6 +42,15 @@ pub enum EngineError {
     ProposalFailed(String),
     #[error("apply failed: {0}")]
     ApplyFailed(String),
+    /// A relational bind resolved a target column name that is absent from the table schema.
+    /// Kept typed through the engine boundary so neutral protocol adapters can emit 42703
+    /// without inspecting a diagnostic string.
+    #[error("column \"{0}\" does not exist")]
+    UndefinedColumn(String),
+    /// A relational target list named the same column more than once. This is a pre-effect
+    /// binding failure (42701), not an internal apply error.
+    #[error("column \"{0}\" specified more than once")]
+    DuplicateColumn(String),
     #[error("unique constraint violation: {0}")]
     UniqueViolation(String),
     #[error("not-null constraint violation: {0}")]

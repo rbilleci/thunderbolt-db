@@ -80,14 +80,16 @@ impl Engine {
             (0..table.columns.len()).collect::<Vec<_>>()
         } else {
             let mut indexes = Vec::with_capacity(insert.columns.len());
+            let mut seen = BTreeSet::new();
             for column in &insert.columns {
+                if !seen.insert(column) {
+                    return Err(EngineError::DuplicateColumn(column.clone()));
+                }
                 let idx = table
                     .columns
                     .iter()
                     .position(|candidate| candidate.name == *column)
-                    .ok_or_else(|| {
-                        EngineError::ApplyFailed(format!("column \"{}\" does not exist", column))
-                    })?;
+                    .ok_or_else(|| EngineError::UndefinedColumn(column.clone()))?;
                 indexes.push(idx);
             }
             indexes
@@ -212,10 +214,23 @@ impl Engine {
         // `relational_next_row_id` — `apply_delta` advances it by `rows_consumed`). These row keys
         // are exactly what the old `apply_insert` assigned because, under the still-serialized
         // commit, the snapshot is taken immediately before apply.
-        let rows_consumed = new_rows.len() as u64;
+        let rows_consumed = u64::try_from(new_rows.len()).map_err(|_| {
+            EngineError::ApplyFailed(
+                "INSERT row count exceeds relational row-id capacity".to_string(),
+            )
+        })?;
+        snapshot
+            .next_row_id
+            .checked_add(rows_consumed)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed("relational row-id allocator overflow".to_string())
+            })?;
         let mut inserted_rows = Vec::with_capacity(new_rows.len());
         for (offset, values) in new_rows.into_iter().enumerate() {
-            let row_id = snapshot.next_row_id + offset as u64;
+            let row_id = snapshot
+                .next_row_id
+                .checked_add(u64::try_from(offset).expect("usize always fits u64"))
+                .expect("prevalidated INSERT row-id range");
             let row_key = relational_row_key(&insert.table, row_id);
             inserted_rows.push((row_key, values));
         }

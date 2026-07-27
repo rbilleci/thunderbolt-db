@@ -750,7 +750,7 @@ impl Engine {
             }
         };
         let record = match Self::canonical_wal_record_with_isolation_and_request_digest(
-            &commit,
+            &mut commit,
             txn_id,
             token.index,
             0,
@@ -765,7 +765,7 @@ impl Engine {
                 return Err(ExecuteError::Engine(err));
             }
         };
-        commit.wal.append(record);
+        commit.wal.append_canonical(record);
         if let Err(err) = commit.wal.flush_all() {
             commit.repl.rollback_unapplied_from(token.index);
             commit.wal.truncate(wal_len_before);
@@ -1090,7 +1090,7 @@ impl Engine {
                         None => {
                             return Err(ExecuteError::Serialization(format!(
                                 "device write-conflict row verification failed for relation \"{table_name}\""
-                            )))
+                            )));
                         }
                     }
                 }
@@ -1188,12 +1188,12 @@ impl Engine {
                     return Err(ExecuteError::Serialization(format!(
                         "device unique conflict: write history changed in relation \"{table_name}\" after snapshot {}",
                         conflict_boundary
-                    )))
+                    )));
                 }
                 None => {
                     return Err(ExecuteError::Serialization(format!(
                         "device unique-history verdict unavailable for relation \"{table_name}\""
-                    )))
+                    )));
                 }
             }
         }
@@ -1273,12 +1273,12 @@ impl Engine {
                     Some(Err(_)) => {
                         return Err(ExecuteError::Serialization(format!(
                             "device unique conflict on entity {row_id} in relation \"{table_name}\""
-                        )))
+                        )));
                     }
                     None => {
                         return Err(ExecuteError::Serialization(format!(
-                        "device unique-conflict verdict unavailable for relation \"{table_name}\""
-                    )))
+                            "device unique-conflict verdict unavailable for relation \"{table_name}\""
+                        )));
                     }
                 }
                 continue;
@@ -1353,12 +1353,12 @@ impl Engine {
                     Some(true) => {
                         return Err(ExecuteError::Serialization(format!(
                             "device unique conflict on entity {row_id} in relation \"{table_name}\""
-                        )))
+                        )));
                     }
                     None => {
                         return Err(ExecuteError::Serialization(format!(
-                        "device unique-conflict verdict unavailable for relation \"{table_name}\""
-                    )))
+                            "device unique-conflict verdict unavailable for relation \"{table_name}\""
+                        )));
                     }
                 }
             }

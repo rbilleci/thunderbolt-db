@@ -41,8 +41,12 @@ use gpu_db_sql::{
     Select, SelectProjection, SetRoleScope, SqlType, SqlValue, TablePrivilege,
     TransactionCharacteristics, TransactionIsolation,
 };
+#[cfg(feature = "probe-timing")]
+pub use insert_probe::{InsertProbeConfig, InsertProbeSnapshot};
 
 mod command_tags;
+/// Feature-gated INSERT qualification accessors and the one canonical submission wrapper.
+mod insert_probe;
 #[cfg(test)]
 mod mutation_admission_tests;
 pub mod pg_adapter;
@@ -448,11 +452,11 @@ impl SharedEngine {
         }
         match request {
             SubmissionRequest::Text(sql) => {
-                SubmissionDispatch::Immediate(submit_text_inner(self, session, sql))
+                SubmissionDispatch::Immediate(insert_probe::submit_text_inner(self, session, sql))
             }
-            SubmissionRequest::Prepared(bound) => {
-                SubmissionDispatch::Immediate(prepared::submit_prepared_inner(self, session, bound))
-            }
+            SubmissionRequest::Prepared(bound) => SubmissionDispatch::Immediate(
+                insert_probe::submit_prepared_inner(self, session, bound),
+            ),
             SubmissionRequest::BatchedText { sql, batcher } => {
                 submit_batched_text_inner(self, session, batcher, sql)
             }
@@ -1021,39 +1025,6 @@ fn submit_autocommit_parsed_with_catalog(
             }
         }
     }
-}
-
-/// Execute through the concurrent shared engine while preserving one transaction owner per client
-/// session. Transaction control drives the engine's keyed snapshot lifecycle; SELECT executes on
-/// that retained generation, while DML stages into a transaction-private GPU generation and COMMIT
-/// publishes the resolved mutations atomically.
-fn submit_text_inner(
-    shared: &SharedEngine,
-    session: &mut SharedSession,
-    sql: &str,
-) -> Result<QueryOutcome, DbError> {
-    let parsed = match ParsedCommand::parse_allowing_catalog(sql) {
-        Ok(parsed) => parsed,
-        Err(ParseError::Empty) => return Ok(QueryOutcome::Empty),
-        // LIMIT/OFFSET negativity is already a precise typed-parser diagnosis.  It is not an
-        // indication that this is richer SQL for libpg_query to lower, and sending it there loses
-        // the PostgreSQL-compatible error in favor of the general lowerer's broader diagnostic.
-        Err(error @ (ParseError::NegativeLimit | ParseError::NegativeOffset)) => {
-            session.mark_transaction_failed();
-            return Err(map_parse_error(error));
-        }
-        // The typed parser intentionally rejects joins, expressions, and other richer SELECT
-        // syntax. The engine's libpg_query lowering is the one general GPU relational path for
-        // those statements; an actual syntax error or non-SELECT still fails pre-effect there.
-        Err(_) if gpu_db_sql::is_select_statement(sql) => {
-            return submit_general_select_text_inner(shared, session, sql);
-        }
-        Err(error) => {
-            session.mark_transaction_failed();
-            return Err(map_parse_error(error));
-        }
-    };
-    submit_parsed(shared, session, parsed)
 }
 
 fn submit_general_select_text_inner(
@@ -1909,6 +1880,10 @@ fn map_execute_error(err: ExecuteError) -> DbError {
         ErrorCategory::CheckViolation
     } else if err.is_numeric_value_out_of_range() {
         ErrorCategory::NumericValueOutOfRange
+    } else if err.is_duplicate_column() {
+        ErrorCategory::DuplicateColumn
+    } else if err.is_undefined_column() {
+        ErrorCategory::UndefinedColumn
     } else {
         match &err {
             ExecuteError::Parse(_) => ErrorCategory::Syntax,

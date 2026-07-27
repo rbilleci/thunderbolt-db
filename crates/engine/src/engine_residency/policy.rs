@@ -169,12 +169,10 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// RETIREMENT A4e: enable/disable the HOST-INSTALL ELISION (default OFF — the A/B lever; the
-    /// flip is gated on the SLO measurement + the ADR-013 stamps/publication gates + audits).
-    /// W5a kill switch: covered inserts log binary WAL records (see `wal_binary`). NOTE for the
-    /// flip checklist (audit 21eddaa7, MEDIUM): once BINWAL records exist in a segment, binaries
-    /// OLDER than 21eddaa7 silently DROP them at replay (their from_utf8 skip arm) — the WAL is
-    /// non-downgradeable past this commit once enabled.
+    /// Resolved binary WAL is product-default. OFF is retained only as an explicit
+    /// compatibility/parity kill switch; it makes eligible routes retain legacy text operations.
+    /// Once a segment contains binary records, it remains non-downgradeable for readers that do
+    /// not implement their replay format.
     pub fn set_binary_wal_records_enabled(&self, on: bool) {
         self.binary_wal_records_enabled
             .store(on, std::sync::atomic::Ordering::Release);

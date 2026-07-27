@@ -148,11 +148,11 @@ impl Engine {
         // device preparation. The shared helper also re-resolves after a raced lease failure: an
         // identical request can become terminal between the first lookup and an intervening reset
         // taking exclusivity.
-        let request_digest = gpu_db_wal::canonical_request_digest(text.as_bytes());
+        let request = CanonicalRequest::from_text(self, text);
         let _table_access = match self.acquire_autocommit_table_access_after_retry(
             table_name,
             txn_id,
-            request_digest,
+            request.digest(),
         )? {
             StableRetryOr::Terminal(affected_rows) => {
                 if command_has_returning(&cmd) {
@@ -176,10 +176,11 @@ impl Engine {
         let _snapshot_guard = transaction_snapshot
             .is_none()
             .then(|| self.register_active_snapshot(read_snapshot));
-        let prepared_catalog_seq = transaction_snapshot.as_ref().map_or_else(
-            || self.catalog_snapshot().commit_seq,
-            |snapshot| snapshot.catalog.commit_seq,
+        let pinned_catalog = transaction_snapshot.as_ref().map_or_else(
+            || self.catalog_snapshot(),
+            |snapshot| Arc::clone(&snapshot.catalog),
         );
+        let prepared_catalog_seq = pinned_catalog.commit_seq;
         let snapshot = transaction_snapshot.as_ref().map_or_else(
             || self.dml_read_snapshot(read_snapshot),
             |generation| DmlReadSnapshot {
@@ -187,41 +188,109 @@ impl Engine {
                 next_row_id: generation.next_row_id,
             },
         );
-        let prepared = {
-            const GENERATION_RETRIES: usize = 64;
-            let mut attempts = 0;
-            loop {
-                let result = if let Some(generation) = transaction_snapshot.as_ref() {
-                    let _scope = self.enter_transaction_read(Arc::clone(generation));
-                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
-                } else {
-                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
-                };
-                match result {
-                    Ok(prepared) => break prepared,
-                    Err(error)
-                        if attempts < GENERATION_RETRIES
-                            && is_device_prepare_verdict_unavailable(&error) =>
-                    {
-                        attempts += 1;
-                        self.ensure_dml_device_generation(&cmd)?;
-                        std::thread::yield_now();
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+        #[cfg(feature = "probe-timing")]
+        let probe_insert = matches!(&cmd, Command::Insert(_));
+        #[cfg(feature = "probe-timing")]
+        let probe_prepare_started = probe_insert.then(Instant::now);
+        let direct_fixed = if self.binary_wal_records_enabled() {
+            crate::prepared_insert_batch::try_prepare_direct_fixed_insert_batch(
+                &cmd,
+                &pinned_catalog,
+                prepared_catalog_seq,
+                expected_catalog_version,
+            )?
+        } else {
+            None
         };
+        let (write_set, offlock_prepared) = if let Some(batch) = direct_fixed {
+            let prepared = OfflockPreparedDml::fixed_insert(batch, &request, read_snapshot)
+                .map_err(ExecuteError::Engine)?;
+            let write_set = prepared.write_set().clone();
+            debug_assert_eq!(prepared.read_snapshot(), read_snapshot);
+            #[cfg(feature = "probe-timing")]
+            self.record_insert_probe_direct_fixed_insert_carrier();
+            (write_set, Some(prepared))
+        } else {
+            let prepared = {
+                const GENERATION_RETRIES: usize = 64;
+                let mut attempts = 0;
+                loop {
+                    let result = if let Some(generation) = transaction_snapshot.as_ref() {
+                        let _scope = self.enter_transaction_read(Arc::clone(generation));
+                        self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
+                    } else {
+                        self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
+                    };
+                    match result {
+                        Ok(prepared) => break prepared,
+                        Err(error)
+                            if attempts < GENERATION_RETRIES
+                                && is_device_prepare_verdict_unavailable(&error) =>
+                        {
+                            attempts += 1;
+                            self.ensure_dml_device_generation(&cmd)?;
+                            std::thread::yield_now();
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            #[cfg(feature = "probe-timing")]
+            if matches!(&cmd, Command::Insert(_)) {
+                self.record_insert_probe_legacy_insert_delta_build(prepared.rows_consumed);
+            }
+            let prepared = OfflockPreparedDml::legacy(prepared, read_snapshot);
+            let write_set = prepared.write_set().clone();
+            debug_assert_eq!(prepared.read_snapshot(), read_snapshot);
+            (write_set, Some(prepared))
+        };
+        #[cfg(feature = "probe-timing")]
+        if let Some(started) = probe_prepare_started {
+            self.record_insert_probe_offlock_prepare_nanos(started.elapsed().as_nanos() as u64);
+            self.record_insert_probe_peak_statement(
+                text.len() as u64,
+                insert_device_statement_bytes_estimate(&cmd),
+            );
+        }
         on_prepared();
-        let write_set = prepared.write_set.clone();
         self.commit_dml_concurrent(
             txn_id,
             cmd,
-            text,
+            request,
             write_set,
             read_snapshot,
             prepared_catalog_seq,
             expected_catalog_version,
-            Some(prepared),
+            offlock_prepared,
         )
     }
+}
+
+/// Conservative logical payload estimate for the device append staging seam. This is deliberately
+/// labelled an estimate: its owner is the typed request before table-specific residency layout is
+/// selected, while the exact H2D/apply wall time is measured at the common wave flush seam.
+#[cfg(feature = "probe-timing")]
+fn insert_device_statement_bytes_estimate(command: &Command) -> u64 {
+    let Command::Insert(insert) = command else {
+        return 0;
+    };
+    insert
+        .rows
+        .iter()
+        .map(|row| {
+            let values = row.iter().fold(0_u64, |bytes, value| {
+                bytes.saturating_add(match value {
+                    SqlValue::Null | SqlValue::Parameter { .. } => 0,
+                    SqlValue::Bool(_) => 1,
+                    SqlValue::Int2(_) => 2,
+                    SqlValue::Int4(_) | SqlValue::Date(_) => 4,
+                    SqlValue::Int8(_) | SqlValue::Timestamp(_) => 8,
+                    SqlValue::Numeric(_) | SqlValue::Uuid(_) => 16,
+                    SqlValue::Text(text) => text.len() as u64,
+                })
+            });
+            // The append seam retains row identity and MVCC birth metadata alongside values.
+            values.saturating_add(16)
+        })
+        .sum()
 }

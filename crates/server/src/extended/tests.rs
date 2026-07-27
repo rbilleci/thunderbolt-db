@@ -48,6 +48,62 @@ fn session_cursor_and_parse_shape_errors_keep_the_frozen_psql_diagnostics() {
 }
 
 #[test]
+fn extended_parse_keyword_extensions_stay_on_the_existing_syntax_before_effect_path() {
+    let mut extended = ExtendedSession::default();
+    let error = extended
+        .parse(
+            "copy_prefix_must_not_install".to_string(),
+            "COPYfoo accounts FROM STDIN",
+            &[],
+            |_, _| -> Result<PreparedStatement, DbError> {
+                panic!("keyword-extension Parse must fail before catalog analysis")
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "42601");
+    assert!(!extended
+        .statements
+        .contains_key("copy_prefix_must_not_install"));
+}
+
+#[test]
+fn extended_parse_proves_ordinary_syntax_before_unsupported_parameter_oids() {
+    for query in [
+        "SELECT 'unterminated",
+        "SELECT $unterminated$",
+        "/* unterminated",
+    ] {
+        let mut extended = ExtendedSession::default();
+        let error = extended
+            .parse(
+                "syntax_before_oid".to_string(),
+                query,
+                &[u32::MAX],
+                |_, _| -> Result<PreparedStatement, DbError> {
+                    panic!("malformed Parse must fail before catalog analysis")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "42601", "{query:?}");
+    }
+
+    for query in ["VACUUM", "EXECUTE missing_prepared()"] {
+        let mut extended = ExtendedSession::default();
+        let error = extended
+            .parse(
+                "oid_before_semantic_shape".to_string(),
+                query,
+                &[u32::MAX],
+                |_, _| -> Result<PreparedStatement, DbError> {
+                    panic!("unsupported OID must fail before catalog analysis")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "0A000", "{query:?}");
+    }
+}
+
+#[test]
 fn materialized_cursor_lifecycle_distinguishes_idle_and_transaction_ownership() {
     let outcome = || QueryOutcome::Rows {
         columns: vec![ColumnMeta {

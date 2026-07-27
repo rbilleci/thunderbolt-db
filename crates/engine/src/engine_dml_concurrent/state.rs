@@ -1,10 +1,50 @@
 //! Commit-wave and lane item ownership shared by the concurrent DML subpaths.
 
 use super::{
-    AtomicOrdering, AtomicU64, Command, Engine, ExecuteError, Index, Mutex, RelationalSelectResult,
-    SqlValue, WriteSet,
+    AtomicOrdering, AtomicU64, CatalogSnapshot, Command, Engine, EngineError, ExecuteError, Index,
+    Mutex, RelationalSelectResult, SqlValue, WriteSet,
 };
 use std::sync::Arc;
+
+/// One immutable request allocation and the canonical identity derived from its exact bytes.
+///
+/// Admission creates this before it takes a table-access lease.  The bytes cannot be replaced or
+/// mutably borrowed after construction, so queued retry, WAL, and status users can carry the
+/// same digest without independently hashing the same logical request.  There is deliberately no
+/// from-parts constructor: an identity always originates from this exact `Arc` allocation.
+pub(crate) struct CanonicalRequest {
+    payload: Arc<[u8]>,
+    digest: gpu_db_wal::CanonicalDigest,
+}
+
+impl CanonicalRequest {
+    /// Seal one request identity before table access. With `probe-timing` this is also the sole
+    /// accounting seam for bytes passed to canonical digest derivation; the feature-off hot path
+    /// remains the allocation and digest it already required.
+    pub(crate) fn from_text(engine: &Engine, text: &str) -> Self {
+        let payload: Arc<[u8]> = Arc::from(text.as_bytes());
+        let digest = gpu_db_wal::canonical_request_digest(payload.as_ref());
+        #[cfg(feature = "probe-timing")]
+        engine.record_insert_probe_raw_request_digest_derivation(
+            u64::try_from(payload.len()).expect("request payload length exceeds u64"),
+        );
+        #[cfg(not(feature = "probe-timing"))]
+        let _ = engine;
+        Self { payload, digest }
+    }
+
+    pub(crate) fn digest(&self) -> gpu_db_wal::CanonicalDigest {
+        self.digest
+    }
+
+    pub(super) fn payload_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.payload)
+    }
+
+    fn same_origin(&self, payload: &Arc<[u8]>) -> bool {
+        Arc::ptr_eq(&self.payload, payload)
+    }
+}
 
 #[cfg(test)]
 type WaveTailTestHook = (
@@ -25,12 +65,378 @@ pub(super) fn wave_tail_failure_publish_hook() -> &'static Mutex<Option<WaveTail
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
+/// One authoritative off-lock preparation carried into a commit wave.
+///
+/// The fixed-width variant owns only its direct columnar proof and request binding. It never
+/// materializes a `WriteDelta` or predicted row keys; legacy remains the sole carrier of that
+/// host mutation authority.
+pub(super) struct OfflockPreparedDml(OfflockPreparedDmlKind);
+
+// The hot legacy wave keeps its established by-value `WriteDelta`; boxing it solely to equalize
+// variants would add an allocation to every legacy commit. The fixed batch is already isolated in
+// its own box and remains move-only (not Arc-shared).
+#[allow(clippy::large_enum_variant)]
+enum OfflockPreparedDmlKind {
+    Legacy {
+        delta: crate::write_path::WriteDelta,
+        read_snapshot: Index,
+    },
+    /// A legacy item must not inflate to the fixed batch's columnar size. The box is only enum
+    /// layout isolation: the inner carrier owns the batch by value (never through `Arc`).
+    FixedInsert(Box<OfflockFixedInsert>),
+}
+
+struct OfflockFixedInsert {
+    batch: crate::prepared_insert_batch::PreparedInsertBatch,
+    template: crate::wal_binary::PreparedBinaryInsertTemplate,
+    /// A cloned allocation witness keeps the fixed carrier bound to the precise sealed request
+    /// that entered admission.  Digest equality alone is not enough at preflight.
+    request_payload: Arc<[u8]>,
+    request_digest: gpu_db_wal::CanonicalDigest,
+    read_snapshot: Index,
+    write_set: WriteSet,
+}
+
+/// The only pre-WAL hand-off that may consume a sealed fixed INSERT carrier. It carries no
+/// legacy mutation state: any pre-WAL typed mismatch discards it and invokes the established
+/// full preparation once from the parsed command held by the wave item.
+pub(super) struct FixedInsertPreflight {
+    source: crate::prepared_insert_batch::PreparedI32AppendSource,
+    template: crate::wal_binary::PreparedBinaryInsertTemplate,
+    request_digest: gpu_db_wal::CanonicalDigest,
+    row_count: u32,
+}
+
+impl FixedInsertPreflight {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        crate::prepared_insert_batch::PreparedI32AppendSource,
+        crate::wal_binary::PreparedBinaryInsertTemplate,
+        gpu_db_wal::CanonicalDigest,
+        u32,
+    ) {
+        (
+            self.source,
+            self.template,
+            self.request_digest,
+            self.row_count,
+        )
+    }
+}
+
+impl OfflockPreparedDml {
+    pub(super) fn legacy(delta: crate::write_path::WriteDelta, read_snapshot: Index) -> Self {
+        Self(OfflockPreparedDmlKind::Legacy {
+            delta,
+            read_snapshot,
+        })
+    }
+
+    /// Pair a fixed batch with the precise sealed request that entered admission. The carrier
+    /// retains an allocation witness, so no caller can attach a batch to an unrelated payload or
+    /// separately supplied digest.
+    pub(super) fn fixed_insert(
+        batch: crate::prepared_insert_batch::PreparedInsertBatch,
+        request: &CanonicalRequest,
+        read_snapshot: Index,
+    ) -> Result<Self, EngineError> {
+        let template = batch.binary_insert_template()?;
+        let write_set = WriteSet {
+            tables: std::collections::BTreeSet::from([batch
+                .binary_insert_template_table_name()
+                .to_string()]),
+            rows: Vec::new(),
+            unique_slots: Vec::new(),
+            unique_slots_i32: Vec::new(),
+        };
+        Ok(Self(OfflockPreparedDmlKind::FixedInsert(Box::new(
+            OfflockFixedInsert {
+                batch,
+                template,
+                request_payload: request.payload_arc(),
+                request_digest: request.digest(),
+                read_snapshot,
+                write_set,
+            },
+        ))))
+    }
+
+    pub(super) fn legacy_delta(&self) -> Option<&crate::write_path::WriteDelta> {
+        match &self.0 {
+            OfflockPreparedDmlKind::Legacy { delta, .. } => Some(delta),
+            OfflockPreparedDmlKind::FixedInsert(_) => None,
+        }
+    }
+
+    /// The wave's conflict footprint is always owned by the same off-lock carrier that supplied
+    /// it. The item retains a clone for the canonical owner, never an independently derived set.
+    pub(super) fn write_set(&self) -> &WriteSet {
+        match &self.0 {
+            OfflockPreparedDmlKind::Legacy { delta, .. } => &delta.write_set,
+            OfflockPreparedDmlKind::FixedInsert(fixed) => &fixed.write_set,
+        }
+    }
+
+    /// Snapshot identity travels with either carrier variant; a wave-item mismatch is a
+    /// programming error at admission, while a fixed preflight still rechecks it defensively.
+    pub(super) fn read_snapshot(&self) -> Index {
+        match &self.0 {
+            OfflockPreparedDmlKind::Legacy { read_snapshot, .. } => *read_snapshot,
+            OfflockPreparedDmlKind::FixedInsert(fixed) => fixed.read_snapshot,
+        }
+    }
+
+    /// Privately extract a typed candidate only after proving that all pieces still describe the
+    /// same live statement. The `Err` value lets the caller distinguish a direct-carrier binding
+    /// mismatch from a normal legacy item, then discard the typed carrier before full prepare.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn into_fixed_insert_preflight(
+        self,
+        request: &CanonicalRequest,
+        expected_write_set: &WriteSet,
+        catalog: &CatalogSnapshot,
+        prepared_catalog_seq: Index,
+        read_snapshot: Index,
+        reuse_eligible: bool,
+    ) -> Result<FixedInsertPreflight, Self> {
+        let Self(kind) = self;
+        let OfflockPreparedDmlKind::FixedInsert(fixed) = kind else {
+            return Err(Self(kind));
+        };
+        let exact_request =
+            fixed.request_digest == request.digest() && request.same_origin(&fixed.request_payload);
+        let batch_matches = fixed.batch.matches_direct_fixed_insert(
+            expected_write_set,
+            catalog,
+            prepared_catalog_seq,
+        );
+        let template_matches =
+            fixed.template.count() == fixed.batch.binary_insert_template_row_count();
+        if !exact_request
+            || fixed.read_snapshot != read_snapshot
+            || !reuse_eligible
+            || fixed.write_set != *expected_write_set
+            || !batch_matches
+            || !template_matches
+        {
+            return Err(Self(OfflockPreparedDmlKind::FixedInsert(fixed)));
+        }
+        let OfflockFixedInsert {
+            batch,
+            template,
+            request_digest,
+            ..
+        } = *fixed;
+        let row_count = batch.binary_insert_template_row_count();
+        Ok(FixedInsertPreflight {
+            source: batch.into_i32_append_source(),
+            template,
+            request_digest,
+            row_count,
+        })
+    }
+
+    pub(super) fn is_fixed_insert(&self) -> bool {
+        matches!(self.0, OfflockPreparedDmlKind::FixedInsert(_))
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn matches_request(&self, request: &CanonicalRequest) -> bool {
+        match &self.0 {
+            OfflockPreparedDmlKind::Legacy { .. } => true,
+            OfflockPreparedDmlKind::FixedInsert(fixed) => {
+                fixed.request_digest == request.digest()
+                    && request.same_origin(&fixed.request_payload)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod offlock_prepared_tests {
+    use super::*;
+
+    #[test]
+    fn direct_fixed_batch_is_paired_to_the_same_request_and_snapshot() {
+        let engine = Engine::new_local();
+        engine
+            .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
+            .unwrap();
+        let insert = crate::Insert {
+            table: "accounts".to_string(),
+            columns: Vec::new(),
+            rows: vec![vec![SqlValue::Int4(7), SqlValue::Int4(70)]],
+            returning: Vec::new(),
+        };
+        let catalog = engine.catalog_snapshot();
+        let batch = crate::prepared_insert_batch::try_prepare_direct_fixed_insert_batch(
+            &Command::Insert(insert),
+            &catalog,
+            catalog.commit_seq,
+            None,
+        )
+        .unwrap()
+        .expect("the exact NULL-free int4 shape is a direct fixed candidate");
+        let request = CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
+        let prepared =
+            OfflockPreparedDml::fixed_insert(batch, &request, engine.committed_seq()).unwrap();
+        assert!(prepared.matches_request(&request));
+        let other_request =
+            CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (8, 80)");
+        assert!(!prepared.matches_request(&other_request));
+        assert!(prepared.legacy_delta().is_none());
+        assert_eq!(prepared.read_snapshot(), engine.committed_seq());
+        let OfflockPreparedDmlKind::FixedInsert(fixed) = &prepared.0 else {
+            unreachable!("fixed constructor must retain the batch and template atomically");
+        };
+        assert_eq!(
+            fixed.batch.binary_insert_template_row_count(),
+            fixed.template.count()
+        );
+        let write_set = WriteSet {
+            tables: std::collections::BTreeSet::from(["accounts".to_string()]),
+            rows: Vec::new(),
+            unique_slots: Vec::new(),
+            unique_slots_i32: Vec::new(),
+        };
+        assert_eq!(prepared.write_set(), &write_set);
+        assert!(prepared
+            .into_fixed_insert_preflight(
+                &request,
+                &write_set,
+                &catalog,
+                catalog.commit_seq,
+                engine.committed_seq() + 1,
+                true,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn direct_fixed_preflight_rejects_same_bytes_from_a_different_sealed_request() {
+        let engine = Engine::new_local();
+        engine
+            .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
+            .unwrap();
+        let insert = crate::Insert {
+            table: "accounts".to_string(),
+            columns: Vec::new(),
+            rows: vec![vec![SqlValue::Int4(7), SqlValue::Int4(70)]],
+            returning: Vec::new(),
+        };
+        let catalog = engine.catalog_snapshot();
+        let batch = crate::prepared_insert_batch::try_prepare_direct_fixed_insert_batch(
+            &Command::Insert(insert),
+            &catalog,
+            catalog.commit_seq,
+            None,
+        )
+        .unwrap()
+        .expect("the exact NULL-free int4 shape is a direct fixed candidate");
+        let request = CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
+        let prepared =
+            OfflockPreparedDml::fixed_insert(batch, &request, engine.committed_seq()).unwrap();
+        let same_bytes_different_request =
+            CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
+
+        assert_eq!(request.digest(), same_bytes_different_request.digest());
+        assert!(!prepared.matches_request(&same_bytes_different_request));
+        let write_set = WriteSet {
+            tables: std::collections::BTreeSet::from(["accounts".to_string()]),
+            rows: Vec::new(),
+            unique_slots: Vec::new(),
+            unique_slots_i32: Vec::new(),
+        };
+        assert!(prepared
+            .into_fixed_insert_preflight(
+                &same_bytes_different_request,
+                &write_set,
+                &catalog,
+                catalog.commit_seq,
+                engine.committed_seq(),
+                true,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn canonical_request_hashes_once_at_admission_and_waves_reuse_the_sealed_identity() {
+        let state = include_str!("state.rs")
+            .split("\n#[cfg(test)]\nmod offlock_prepared_tests")
+            .next()
+            .expect("production state precedes its tests");
+        assert_eq!(state.matches("canonical_request_digest(").count(), 1);
+        assert!(state.contains("Arc::ptr_eq(&self.payload, payload)"));
+        assert!(!state.contains("from_parts"));
+
+        let request = include_str!("request.rs");
+        assert!(request.contains("CanonicalRequest::from_text(self, text)"));
+        assert!(!request.contains("canonical_request_digest("));
+
+        let wave = include_str!("wave.rs");
+        assert!(!wave.contains("canonical_request_digest(&item."));
+        assert!(!wave.contains("canonical_request_digest(&batch"));
+
+        let intent = include_str!("../engine_dml_intent.rs");
+        assert!(intent.contains("CanonicalRequest::from_text(self, &logical_request)"));
+        assert!(!intent.contains("canonical_request_digest(logical_request.as_bytes())"));
+    }
+
+    #[test]
+    fn covered_wave_item_keeps_the_pre_lease_request_allocation_and_digest() {
+        let engine = Engine::new_local();
+        let text = "INSERT INTO accounts VALUES (7, 70)";
+        let request = CanonicalRequest::from_text(&engine, text);
+        let digest = request.digest();
+        let witness = request.payload_arc();
+        let item = engine.make_covered_insert_wave_item(
+            2,
+            crate::parse_command(text).unwrap(),
+            request,
+            WriteSet::default(),
+            engine.committed_seq(),
+            engine.catalog_snapshot().commit_seq,
+            None,
+            None,
+        );
+
+        assert_eq!(item.request.digest(), digest);
+        assert!(item.request.same_origin(&witness));
+        assert_eq!(item.request.payload_arc().as_ref(), text.as_bytes());
+    }
+
+    #[cfg(feature = "probe-timing")]
+    #[test]
+    fn request_identity_probe_counts_only_the_sealed_dml_payload_bytes() {
+        let engine = Engine::new_local();
+        let before_create = engine.insert_probe_snapshot();
+        engine
+            .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
+            .unwrap();
+        let after_create = engine.insert_probe_snapshot();
+        let create_delta = after_create.delta_since(before_create);
+        assert_eq!(create_delta.raw_request_digest_derivations, 0);
+        assert_eq!(create_delta.raw_request_digest_derivation_bytes, 0);
+
+        let sql = "INSERT INTO accounts VALUES (7, 70)";
+        engine.execute_dml_concurrent(2, sql).unwrap();
+        let delta = engine.insert_probe_snapshot().delta_since(after_create);
+        assert_eq!(delta.raw_request_digest_derivations, 1);
+        assert_eq!(
+            delta.raw_request_digest_derivation_bytes,
+            u64::try_from(sql.len()).unwrap()
+        );
+    }
+}
+
 /// One enqueued concurrent commit: everything the sequencer needs to conflict-check, re-resolve,
 /// append, apply, and publish it — plus the shared slot its owner blocks on.
 pub(crate) struct CommitWaveItem {
     pub(super) txn_id: u64,
     pub(super) cmd: Command,
-    pub(super) payload: Arc<[u8]>,
+    /// The single sealed request identity carried from admission through the canonical owner.
+    pub(super) request: CanonicalRequest,
     pub(super) write_set: WriteSet,
     pub(super) read_snapshot: Index,
     /// The catalog generation the OFF-LOCK prepare validated against.
@@ -45,14 +451,15 @@ pub(crate) struct CommitWaveItem {
     /// a mismatch must fail before WAL/apply rather than re-resolve under a changed row type.
     pub(super) expected_catalog_version:
         Option<crate::engine_mutation_admission::CatalogVersionExpectation>,
-    /// DELTA-REUSE (B): the OFF-LOCK-prepared insert delta, carried forward for reuse-eligible
-    /// items (elided, FK-free, no nextval). The under-lock re-resolve then only RE-KEYS it at the
-    /// wave's `next_row_id` (`rekey_offlock_insert_delta`) instead of re-running the full
-    /// coerce+validate+write-set rebuild — the coerced values / write-set are input-deterministic,
-    /// so they are identical to a fresh re-prepare while the catalog generation still matches
-    /// (`prepared_catalog_seq`; a DDL bump forces the Full path, dropping the reuse). `None` = the
-    /// item takes the normal `prepare_dml` re-resolve.
-    pub(super) offlock_delta: Option<crate::write_path::WriteDelta>,
+    /// DELTA-REUSE (B): the off-lock delta, optionally paired with a sealed fixed-width batch
+    /// when INSERT-001 eligibility is exact. Typed preflight consumes that pair only after all
+    /// ordinary wave guards; every other shape follows the unchanged `prepare_dml` path.
+    pub(super) offlock_prepared: Option<OfflockPreparedDml>,
+    /// Build-only handoff from the sealed typed apply to the common durable/publication tail.
+    /// Counting at the tail makes qualification compare successful statements to typed commits
+    /// without treating a later durability failure as a completed typed commit.
+    #[cfg(feature = "probe-timing")]
+    pub(super) fixed_insert_typed: bool,
     /// E2.2(b) — the PRE-ENCODED W5a binary WAL record, built OFF the sequencer at intent-build
     /// time as a pure function of `(route, params)` with a PLACEHOLDER row id, plus the fixed byte
     /// offset of that row id. Present only for single-row covered-INSERT intents. The sequencer
@@ -109,6 +516,18 @@ impl CommitWaveDone {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+    }
+
+    pub(crate) fn set_outcome(&self, result: Result<u64, ExecuteError>) {
+        let mut outcome = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.done.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        *outcome = Some(result);
+        self.done.store(true, AtomicOrdering::Release);
     }
 }
 
@@ -216,16 +635,7 @@ pub(crate) fn new_pending_outcome() -> CommitWaveOutcome {
 
 impl CommitWaveItem {
     pub(crate) fn set_outcome(&self, result: Result<u64, ExecuteError>) {
-        let mut outcome = self
-            .outcome
-            .result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.outcome.done.load(AtomicOrdering::Acquire) {
-            return;
-        }
-        *outcome = Some(result);
-        self.outcome.done.store(true, AtomicOrdering::Release);
+        self.outcome.set_outcome(result);
     }
 }
 

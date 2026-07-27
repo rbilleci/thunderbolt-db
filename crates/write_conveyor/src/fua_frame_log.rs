@@ -33,6 +33,13 @@ const FRAME_LOG_VERSION: u32 = 1;
 const FRAME_ALIGN: usize = 4096;
 pub(crate) const FRAME_LOG_HEADER_BYTES: usize = 4096;
 const FRAME_HEADER_BYTES: usize = 64;
+/// Fixed actual-depth buckets sampled immediately before each frame publication:
+/// `1`, `2`, `3..=4`, `5..=8`, `9..=16`, `17..=32`, and `33+`.
+///
+/// This is deliberately a small aggregate, rather than a per-frame trace. It makes a physical
+/// QD=1 run distinguishable from QD=16 without adding allocation, locking, or a timestamp vector
+/// to the appender hot path.
+pub const FUA_IN_FLIGHT_DEPTH_BUCKETS: usize = 7;
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, Default)]
@@ -79,6 +86,12 @@ fn padded_frame_bytes(payload_bytes: usize) -> usize {
     (FRAME_HEADER_BYTES + payload_bytes).div_ceil(FRAME_ALIGN) * FRAME_ALIGN
 }
 
+/// Physical bytes occupied by one frame carrying `payload_bytes`, including its header and
+/// alignment padding. WAL aggregates use this as the no-fragmentation baseline.
+pub fn fua_frame_padded_bytes(payload_bytes: usize) -> usize {
+    padded_frame_bytes(payload_bytes)
+}
+
 /// Configuration for a FUA frame log segment.
 #[derive(Clone, Debug)]
 pub struct FuaFrameLogConfig {
@@ -118,7 +131,126 @@ pub struct FrameHandle {
     pub last_seq: u64,
 }
 
+/// CRC-covered physical metadata for a fragmented logical group. All-zero reserved header fields
+/// mean a legacy single-frame payload; they remain wire-compatible and are never reinterpreted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameGroupMetadata {
+    pub total_payload_bytes: u64,
+    pub fragment_index: u32,
+    pub fragment_count: u32,
+    pub group_crc32c: u32,
+}
+
+/// Placement of one atomically published physical group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameBatchHandle {
+    pub first_frame_id: u64,
+    pub terminal_frame_id: u64,
+    pub last_seq: u64,
+}
+
+fn frame_group_metadata(header: &FrameHeader) -> Option<FrameGroupMetadata> {
+    let all_zero = header.reserved0 == 0
+        && header.reserved1 == 0
+        && header.reserved2 == 0
+        && header.reserved3 == 0;
+    (!all_zero).then_some(FrameGroupMetadata {
+        total_payload_bytes: header.reserved0,
+        fragment_index: header.reserved1,
+        fragment_count: header.reserved2,
+        group_crc32c: header.reserved3,
+    })
+}
+
+/// Monotonic aggregate attribution for one live FUA frame-log segment.
+///
+/// Every duration is a saturated sum of successful frames in nanoseconds. The boundaries are
+/// `published_frames` release -> successful fence claim -> successful `O_DIRECT|O_DSYNC` write
+/// return -> contiguous durable-cut publication. The depth histogram is sampled once for every
+/// published frame using the buckets documented by [`FUA_IN_FLIGHT_DEPTH_BUCKETS`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FuaFrameLogTelemetry {
+    pub published_frames: u64,
+    pub fenced_frames: u64,
+    pub fence_failures: u64,
+    pub payload_bytes: u64,
+    pub padded_bytes: u64,
+    pub stage_copy_nanos: u64,
+    pub stage_copy_frames: u64,
+    pub publish_to_claim_nanos: u64,
+    pub publish_to_claim_frames: u64,
+    pub claim_to_write_done_nanos: u64,
+    pub claim_to_write_done_frames: u64,
+    pub write_done_to_contiguous_cut_nanos: u64,
+    pub write_done_to_contiguous_cut_frames: u64,
+    pub contiguous_cut_events: u64,
+    pub contiguous_cut_advanced_frames: u64,
+    pub contiguous_cut_advance_max_frames: u64,
+    pub in_flight_depth_max: u64,
+    pub in_flight_depth_histogram: [u64; FUA_IN_FLIGHT_DEPTH_BUCKETS],
+}
+
+impl FuaFrameLogTelemetry {
+    /// Saturating aggregate addition used by WAL segment-chain snapshots.
+    pub fn saturating_add_assign(&mut self, other: Self) {
+        self.published_frames = self.published_frames.saturating_add(other.published_frames);
+        self.fenced_frames = self.fenced_frames.saturating_add(other.fenced_frames);
+        self.fence_failures = self.fence_failures.saturating_add(other.fence_failures);
+        self.payload_bytes = self.payload_bytes.saturating_add(other.payload_bytes);
+        self.padded_bytes = self.padded_bytes.saturating_add(other.padded_bytes);
+        self.stage_copy_nanos = self.stage_copy_nanos.saturating_add(other.stage_copy_nanos);
+        self.stage_copy_frames = self
+            .stage_copy_frames
+            .saturating_add(other.stage_copy_frames);
+        self.publish_to_claim_nanos = self
+            .publish_to_claim_nanos
+            .saturating_add(other.publish_to_claim_nanos);
+        self.publish_to_claim_frames = self
+            .publish_to_claim_frames
+            .saturating_add(other.publish_to_claim_frames);
+        self.claim_to_write_done_nanos = self
+            .claim_to_write_done_nanos
+            .saturating_add(other.claim_to_write_done_nanos);
+        self.claim_to_write_done_frames = self
+            .claim_to_write_done_frames
+            .saturating_add(other.claim_to_write_done_frames);
+        self.write_done_to_contiguous_cut_nanos = self
+            .write_done_to_contiguous_cut_nanos
+            .saturating_add(other.write_done_to_contiguous_cut_nanos);
+        self.write_done_to_contiguous_cut_frames = self
+            .write_done_to_contiguous_cut_frames
+            .saturating_add(other.write_done_to_contiguous_cut_frames);
+        self.contiguous_cut_events = self
+            .contiguous_cut_events
+            .saturating_add(other.contiguous_cut_events);
+        self.contiguous_cut_advanced_frames = self
+            .contiguous_cut_advanced_frames
+            .saturating_add(other.contiguous_cut_advanced_frames);
+        self.contiguous_cut_advance_max_frames = self
+            .contiguous_cut_advance_max_frames
+            .max(other.contiguous_cut_advance_max_frames);
+        self.in_flight_depth_max = self.in_flight_depth_max.max(other.in_flight_depth_max);
+        for (total, value) in self
+            .in_flight_depth_histogram
+            .iter_mut()
+            .zip(other.in_flight_depth_histogram)
+        {
+            *total = total.saturating_add(value);
+        }
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
 struct FrameSlot {
+    /// Generation guard for bounded-ring telemetry readers. A delayed reader verifies this exact
+    /// id before and after loading timestamps so a reused slot yields `None`, never another
+    /// frame's direct-write service time.
+    frame_id: AtomicU64,
     /// Data-region offset of the frame (not including the file header).
     offset: AtomicU64,
     /// Padded on-disk length of the frame.
@@ -165,6 +297,32 @@ pub struct FuaFrameLog {
     stat_fenced_frames: AtomicU64,
     /// Publish instants ring (nanos from `stat_base`), indexed like `slots`.
     publish_ns: Vec<AtomicU64>,
+    /// Fence-claim instants, retained in the same bounded ring for benchmark-local service
+    /// percentiles. Production telemetry consumes only the aggregate claim->write sum.
+    claim_ns: Vec<AtomicU64>,
+    /// Successful direct-write completion instants, indexed like `slots`. A slot is not reused
+    /// until its previous frame is inside the durable prefix, so an advancing cut can safely
+    /// charge every newly-covered frame's write->cut lag exactly once.
+    write_done_ns: Vec<AtomicU64>,
+    /// Timestamp of the most recently published contiguous durable cut. WAL waiters use this to
+    /// attribute cut->observation without allocating one timestamp per waiter.
+    durable_cut_ns: AtomicU64,
+    stat_payload_bytes: AtomicU64,
+    stat_padded_bytes: AtomicU64,
+    stat_stage_copy_ns: AtomicU64,
+    stat_stage_copy_frames: AtomicU64,
+    stat_fence_failures: AtomicU64,
+    stat_publish_to_claim_ns: AtomicU64,
+    stat_publish_to_claim_frames: AtomicU64,
+    stat_claim_to_write_done_ns: AtomicU64,
+    stat_claim_to_write_done_frames: AtomicU64,
+    stat_write_done_to_cut_ns: AtomicU64,
+    stat_write_done_to_cut_frames: AtomicU64,
+    stat_cut_events: AtomicU64,
+    stat_cut_advanced_frames: AtomicU64,
+    stat_cut_advance_max_frames: AtomicU64,
+    stat_in_flight_depth_max: AtomicU64,
+    stat_in_flight_depth_histogram: [AtomicU64; FUA_IN_FLIGHT_DEPTH_BUCKETS],
     stat_base: std::time::Instant,
 }
 
@@ -225,6 +383,7 @@ impl FuaFrameLog {
             capacity,
             slots: (0..FRAME_SLOTS)
                 .map(|_| FrameSlot {
+                    frame_id: AtomicU64::new(u64::MAX),
                     offset: AtomicU64::new(0),
                     padded_len: AtomicU64::new(0),
                     end_seq: AtomicU64::new(0),
@@ -237,6 +396,25 @@ impl FuaFrameLog {
             stat_fence_ns: AtomicU64::new(0),
             stat_fenced_frames: AtomicU64::new(0),
             publish_ns: (0..FRAME_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            claim_ns: (0..FRAME_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            write_done_ns: (0..FRAME_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            durable_cut_ns: AtomicU64::new(0),
+            stat_payload_bytes: AtomicU64::new(0),
+            stat_padded_bytes: AtomicU64::new(0),
+            stat_stage_copy_ns: AtomicU64::new(0),
+            stat_stage_copy_frames: AtomicU64::new(0),
+            stat_fence_failures: AtomicU64::new(0),
+            stat_publish_to_claim_ns: AtomicU64::new(0),
+            stat_publish_to_claim_frames: AtomicU64::new(0),
+            stat_claim_to_write_done_ns: AtomicU64::new(0),
+            stat_claim_to_write_done_frames: AtomicU64::new(0),
+            stat_write_done_to_cut_ns: AtomicU64::new(0),
+            stat_write_done_to_cut_frames: AtomicU64::new(0),
+            stat_cut_events: AtomicU64::new(0),
+            stat_cut_advanced_frames: AtomicU64::new(0),
+            stat_cut_advance_max_frames: AtomicU64::new(0),
+            stat_in_flight_depth_max: AtomicU64::new(0),
+            stat_in_flight_depth_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
             stat_base: std::time::Instant::now(),
             appender_taken: AtomicBool::new(false),
             fence_cursor: PaddedAtomicU64::zero(),
@@ -311,12 +489,22 @@ impl FuaFrameLog {
             // are taken only when work exists, so any parked lane can serve
             // any frame and a single `notify_one` per publish suffices (no
             // pre-assigned frame = no missed-wake hang, no thundering herd).
-            let frame = loop {
+            let (frame, claim_ns) = loop {
                 let claimed = self.fence_cursor.load_acquire();
                 let published = self.published_frames.load_acquire();
                 if published > claimed {
                     if self.fence_cursor.compare_exchange(claimed, claimed + 1) {
-                        break claimed;
+                        let claim_ns = self.stat_now_nanos();
+                        self.claim_ns[(claimed as usize) % FRAME_SLOTS]
+                            .store(claim_ns, Ordering::Relaxed);
+                        let published_ns = self.publish_ns[(claimed as usize) % FRAME_SLOTS]
+                            .load(Ordering::Relaxed);
+                        saturating_add(
+                            &self.stat_publish_to_claim_ns,
+                            claim_ns.saturating_sub(published_ns),
+                        );
+                        saturating_add(&self.stat_publish_to_claim_frames, 1);
+                        break (claimed, claim_ns);
                     }
                     continue; // lost the claim race; re-check immediately
                 }
@@ -354,7 +542,8 @@ impl FuaFrameLog {
                     }
                 }
             };
-            if let Err(error) = self.fence_frame(frame) {
+            if let Err(error) = self.fence_frame(frame, claim_ns) {
+                saturating_add(&self.stat_fence_failures, 1);
                 self.fence_failed.store(true, Ordering::Release);
                 // Wake everyone so sibling lanes observe the failure/finish
                 // promptly instead of parking forever.
@@ -365,9 +554,10 @@ impl FuaFrameLog {
         }
     }
 
-    /// Wake fence lanes after state they wait on changed (a publish or
-    /// finish). One frame needs one lane; `finish`/failure wake all.
-    fn wake_fence_lanes(&self, all: bool) {
+    /// Wake fence lanes after state they wait on changed. A batch exposes several independent
+    /// fenceable frames at one release point, so wake up to that many parked lanes; `all` is for
+    /// finish/failure draining.
+    fn wake_fence_lanes(&self, frames: usize, all: bool) {
         // The mutex bounds the race with a parking lane (it re-checks under
         // the lock before waiting); an EMPTY critical section is enough.
         let parked = self.park.lock().unwrap_or_else(|p| p.into_inner());
@@ -375,12 +565,14 @@ impl FuaFrameLog {
             if all {
                 self.park_wake.notify_all();
             } else {
-                self.park_wake.notify_one();
+                for _ in 0..frames.min(*parked) {
+                    self.park_wake.notify_one();
+                }
             }
         }
     }
 
-    fn fence_frame(&self, frame_id: u64) -> std::io::Result<()> {
+    fn fence_frame(&self, frame_id: u64, claim_ns: u64) -> std::io::Result<()> {
         let slot = &self.slots[(frame_id as usize) % FRAME_SLOTS];
         let offset = slot.offset.load(Ordering::Acquire) as usize;
         let padded_len = slot.padded_len.load(Ordering::Acquire) as usize;
@@ -391,12 +583,18 @@ impl FuaFrameLog {
                 (FRAME_LOG_HEADER_BYTES + offset) as u64,
             )?;
         }
+        let write_done_ns = self.stat_now_nanos();
+        self.write_done_ns[(frame_id as usize) % FRAME_SLOTS]
+            .store(write_done_ns, Ordering::Relaxed);
+        saturating_add(
+            &self.stat_claim_to_write_done_ns,
+            write_done_ns.saturating_sub(claim_ns),
+        );
+        saturating_add(&self.stat_claim_to_write_done_frames, 1);
         slot.fenced.store(true, Ordering::Release);
         let published = self.publish_ns[(frame_id as usize) % FRAME_SLOTS].load(Ordering::Relaxed);
-        let now = self.stat_base.elapsed().as_nanos() as u64;
-        self.stat_fence_ns
-            .fetch_add(now.saturating_sub(published), Ordering::Relaxed);
-        self.stat_fenced_frames.fetch_add(1, Ordering::Relaxed);
+        saturating_add(&self.stat_fence_ns, write_done_ns.saturating_sub(published));
+        saturating_add(&self.stat_fenced_frames, 1);
         self.fences_completed.fetch_add(1);
         let mut frontier = self
             .durable_frontier
@@ -411,12 +609,36 @@ impl FuaFrameLog {
             advanced += 1;
         }
         if advanced != *frontier {
+            let previous = *frontier;
+            let cut_ns = self.stat_now_nanos();
+            for cut_frame in previous..advanced {
+                let write_done_ns =
+                    self.write_done_ns[(cut_frame as usize) % FRAME_SLOTS].load(Ordering::Relaxed);
+                saturating_add(
+                    &self.stat_write_done_to_cut_ns,
+                    cut_ns.saturating_sub(write_done_ns),
+                );
+            }
+            let advanced_frames = advanced.saturating_sub(previous);
+            saturating_add(&self.stat_write_done_to_cut_frames, advanced_frames);
+            saturating_add(&self.stat_cut_events, 1);
+            saturating_add(&self.stat_cut_advanced_frames, advanced_frames);
+            self.stat_cut_advance_max_frames
+                .fetch_max(advanced_frames, Ordering::Relaxed);
             *frontier = advanced;
+            // Publish the timestamp before the cut itself; an acquire load of durable_seq then
+            // observes the cut time without a waiter-side event allocation.
+            self.durable_cut_ns
+                .store(cut_ns.saturating_add(1), Ordering::Relaxed);
             self.durable_frames.store_release(advanced);
             let end_seq = self.slots[((advanced - 1) as usize) % FRAME_SLOTS]
                 .end_seq
                 .load(Ordering::Relaxed);
-            self.durable_seq.store_release(end_seq);
+            // Continuation fragments carry `seq_count=0` and therefore their group start as
+            // `end_seq`; never let a durable cut regress (or acknowledge past) the preceding
+            // terminal group's logical boundary. Only the terminal fragment advances it.
+            let prior_end = self.durable_seq.load_relaxed();
+            self.durable_seq.store_release(prior_end.max(end_seq));
         }
         Ok(())
     }
@@ -445,6 +667,64 @@ impl FuaFrameLog {
         )
     }
 
+    /// Snapshot the permanent aggregate FUA attribution for this segment. Relaxed loads are
+    /// intentional: this is observability, not a recovery or acknowledgement authority.
+    pub fn telemetry(&self) -> FuaFrameLogTelemetry {
+        FuaFrameLogTelemetry {
+            published_frames: self.published_frames.load_acquire(),
+            fenced_frames: self.stat_fenced_frames.load(Ordering::Relaxed),
+            fence_failures: self.stat_fence_failures.load(Ordering::Relaxed),
+            payload_bytes: self.stat_payload_bytes.load(Ordering::Relaxed),
+            padded_bytes: self.stat_padded_bytes.load(Ordering::Relaxed),
+            stage_copy_nanos: self.stat_stage_copy_ns.load(Ordering::Relaxed),
+            stage_copy_frames: self.stat_stage_copy_frames.load(Ordering::Relaxed),
+            publish_to_claim_nanos: self.stat_publish_to_claim_ns.load(Ordering::Relaxed),
+            publish_to_claim_frames: self.stat_publish_to_claim_frames.load(Ordering::Relaxed),
+            claim_to_write_done_nanos: self.stat_claim_to_write_done_ns.load(Ordering::Relaxed),
+            claim_to_write_done_frames: self
+                .stat_claim_to_write_done_frames
+                .load(Ordering::Relaxed),
+            write_done_to_contiguous_cut_nanos: self
+                .stat_write_done_to_cut_ns
+                .load(Ordering::Relaxed),
+            write_done_to_contiguous_cut_frames: self
+                .stat_write_done_to_cut_frames
+                .load(Ordering::Relaxed),
+            contiguous_cut_events: self.stat_cut_events.load(Ordering::Relaxed),
+            contiguous_cut_advanced_frames: self.stat_cut_advanced_frames.load(Ordering::Relaxed),
+            contiguous_cut_advance_max_frames: self
+                .stat_cut_advance_max_frames
+                .load(Ordering::Relaxed),
+            in_flight_depth_max: self.stat_in_flight_depth_max.load(Ordering::Relaxed),
+            in_flight_depth_histogram: std::array::from_fn(|index| {
+                self.stat_in_flight_depth_histogram[index].load(Ordering::Relaxed)
+            }),
+        }
+    }
+
+    /// Return the elapsed time from the last durable-cut publication to this waiter observation.
+    /// `None` means this segment has not yet published any durable cut.
+    pub fn durable_cut_to_observe_nanos(&self) -> Option<u64> {
+        let cut_ns = self.durable_cut_ns.load(Ordering::Relaxed);
+        (cut_ns != 0).then(|| self.stat_now_nanos().saturating_sub(cut_ns - 1))
+    }
+
+    /// Successful direct-write service time for one recently completed frame. This bounded-ring
+    /// inspection generation-checks the slot before and after timestamp loads; a delayed reader
+    /// that races reuse gets `None` rather than a stale service sample.
+    pub fn frame_direct_write_service_nanos(&self, frame_id: u64) -> Option<u64> {
+        let index = (frame_id as usize) % FRAME_SLOTS;
+        let slot = &self.slots[index];
+        if slot.frame_id.load(Ordering::Acquire) != frame_id || !slot.fenced.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let claim_ns = self.claim_ns[index].load(Ordering::Relaxed);
+        let write_done_ns = self.write_done_ns[index].load(Ordering::Relaxed);
+        (slot.frame_id.load(Ordering::Acquire) == frame_id)
+            .then(|| write_done_ns.saturating_sub(claim_ns))
+    }
+
     pub fn published_frames(&self) -> u64 {
         self.published_frames.load_acquire()
     }
@@ -457,6 +737,30 @@ impl FuaFrameLog {
             .load_relaxed()
             .saturating_sub(self.fences_completed.load_acquire());
         (lanes as u64).saturating_sub(in_flight) as usize
+    }
+
+    fn stat_now_nanos(&self) -> u64 {
+        self.stat_base
+            .elapsed()
+            .as_nanos()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn record_in_flight_depth(&self, depth: u64) {
+        let depth = depth.max(1);
+        self.stat_in_flight_depth_max
+            .fetch_max(depth, Ordering::Relaxed);
+        let bucket = match depth {
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=32 => 5,
+            _ => 6,
+        };
+        saturating_add(&self.stat_in_flight_depth_histogram[bucket], 1);
     }
 }
 
@@ -483,75 +787,188 @@ impl FuaFrameLogAppender {
         first_seq: u64,
         seq_count: u32,
     ) -> std::io::Result<FrameHandle> {
-        let log = &*self.log;
-        if payload.is_empty() || payload.len() > u32::MAX as usize {
-            return Err(invalid_data("FUA frame payload must be 1..=u32::MAX bytes"));
+        let batch = self.publish_internal(&[payload], first_seq, seq_count, None)?;
+        Ok(FrameHandle {
+            frame_id: batch.terminal_frame_id,
+            last_seq: batch.last_seq,
+        })
+    }
+
+    /// Atomically stage and expose a fragmented physical representation of one logical group.
+    /// No fragment becomes visible to fence lanes unless all chunks, slots, and the complete
+    /// padded extent preflight successfully. Every fragment has the same `first_seq`; only the
+    /// terminal fragment carries `seq_count`, so no durable cut can acknowledge a partial group.
+    pub fn publish_batch(
+        &mut self,
+        chunks: &[&[u8]],
+        first_seq: u64,
+        seq_count: u32,
+    ) -> std::io::Result<FrameBatchHandle> {
+        if chunks.len() < 2 {
+            return Err(invalid_data(
+                "FUA fragmented batch must contain at least two nonempty chunks",
+            ));
         }
-        let padded = padded_frame_bytes(payload.len());
-        if self.next_offset + padded > log.capacity {
+        let total_payload_bytes = chunks.iter().try_fold(0_u64, |total, chunk| {
+            total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| invalid_data("FUA fragmented batch payload length overflow"))
+        })?;
+        let group_crc32c = chunks
+            .iter()
+            .fold(0_u32, |crc, chunk| crc32c::crc32c_append(crc, chunk));
+        self.publish_internal(
+            chunks,
+            first_seq,
+            seq_count,
+            Some(FrameGroupMetadata {
+                total_payload_bytes,
+                fragment_index: 0,
+                fragment_count: u32::try_from(chunks.len())
+                    .map_err(|_| invalid_data("FUA fragmented batch has too many chunks"))?,
+                group_crc32c,
+            }),
+        )
+    }
+
+    /// Preflight a physical group without writing staging memory or publishing a frame. This is
+    /// intentionally the same complete-extent/ring check used by [`Self::publish_batch`].
+    pub fn can_publish_batch(&self, chunks: &[&[u8]]) -> std::io::Result<()> {
+        self.preflight(chunks).map(|_| ())
+    }
+
+    fn preflight(&self, chunks: &[&[u8]]) -> std::io::Result<(usize, usize)> {
+        if chunks.is_empty() {
+            return Err(invalid_data("FUA batch must contain at least one chunk"));
+        }
+        let mut total_padded = 0usize;
+        let mut total_payload = 0usize;
+        for chunk in chunks {
+            if chunk.is_empty() || chunk.len() > u32::MAX as usize {
+                return Err(invalid_data("FUA frame payload must be 1..=u32::MAX bytes"));
+            }
+            total_padded = total_padded
+                .checked_add(padded_frame_bytes(chunk.len()))
+                .ok_or_else(|| invalid_data("FUA batch padded length overflow"))?;
+            total_payload = total_payload
+                .checked_add(chunk.len())
+                .ok_or_else(|| invalid_data("FUA batch payload length overflow"))?;
+        }
+        if self
+            .next_offset
+            .checked_add(total_padded)
+            .is_none_or(|end| end > self.log.capacity)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
-                "FUA frame log segment is full; roll to the next segment",
+                "FUA frame log segment is full; roll before publishing the complete batch",
             ));
         }
-        let frame_id = self.next_frame;
-        if frame_id >= log.durable_frames.load_acquire() + FRAME_SLOTS as u64 {
+        let terminal = self
+            .next_frame
+            .checked_add(chunks.len() as u64)
+            .ok_or_else(|| invalid_data("FUA frame id overflow"))?;
+        if terminal > self.log.durable_frames.load_acquire() + FRAME_SLOTS as u64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "FUA frame log slot ring exhausted; pace on free_fence_slots",
+                "FUA frame log slot ring lacks capacity for the complete batch",
             ));
         }
-        let mut header = FrameHeader {
-            magic: FRAME_MAGIC,
-            frame_id,
-            first_seq,
-            reserved0: 0,
-            epoch: log.epoch,
-            payload_bytes: payload.len() as u32,
-            seq_count,
-            payload_crc: crc32c::crc32c(payload),
-            header_crc: 0,
-            reserved1: 0,
-            reserved2: 0,
-            reserved3: 0,
-        };
-        header.header_crc = header_crc(&header);
-        unsafe {
-            let base = log.staging.ptr().add(self.next_offset);
-            std::ptr::copy_nonoverlapping(bytes_of(&header).as_ptr(), base, FRAME_HEADER_BYTES);
-            std::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                base.add(FRAME_HEADER_BYTES),
-                payload.len(),
-            );
-            let used = FRAME_HEADER_BYTES + payload.len();
-            if padded > used {
-                std::ptr::write_bytes(base.add(used), 0, padded - used);
-            }
+        Ok((total_payload, total_padded))
+    }
+
+    fn publish_internal(
+        &mut self,
+        chunks: &[&[u8]],
+        first_seq: u64,
+        seq_count: u32,
+        group: Option<FrameGroupMetadata>,
+    ) -> std::io::Result<FrameBatchHandle> {
+        if seq_count == 0 {
+            return Err(invalid_data("FUA frame group seq_count must be non-zero"));
         }
-        let slot = &log.slots[(frame_id as usize) % FRAME_SLOTS];
-        log.publish_ns[(frame_id as usize) % FRAME_SLOTS]
-            .store(log.stat_base.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        slot.fenced.store(false, Ordering::Relaxed);
-        slot.offset
-            .store(self.next_offset as u64, Ordering::Relaxed);
-        slot.padded_len.store(padded as u64, Ordering::Relaxed);
-        slot.end_seq
-            .store(first_seq + seq_count as u64, Ordering::Relaxed);
-        self.next_offset += padded;
-        self.next_frame = frame_id + 1;
+        let last_seq = first_seq
+            .checked_add(u64::from(seq_count))
+            .ok_or_else(|| invalid_data("FUA frame group sequence range overflow"))?;
+        let (total_payload, total_padded) = self.preflight(chunks)?;
+        let log = &*self.log;
+        let stage_copy_started = log.stat_now_nanos();
+        let first_frame_id = self.next_frame;
+        let mut offset = self.next_offset;
+        for (index, payload) in chunks.iter().enumerate() {
+            let frame_id = first_frame_id + index as u64;
+            let padded = padded_frame_bytes(payload.len());
+            let terminal = index + 1 == chunks.len();
+            let mut header = FrameHeader {
+                magic: FRAME_MAGIC,
+                frame_id,
+                first_seq,
+                reserved0: group.map_or(0, |metadata| metadata.total_payload_bytes),
+                epoch: log.epoch,
+                payload_bytes: payload.len() as u32,
+                seq_count: u32::from(terminal).saturating_mul(seq_count),
+                payload_crc: crc32c::crc32c(payload),
+                header_crc: 0,
+                reserved1: group.map_or(0, |_| index as u32),
+                reserved2: group.map_or(0, |metadata| metadata.fragment_count),
+                reserved3: group.map_or(0, |metadata| metadata.group_crc32c),
+            };
+            header.header_crc = header_crc(&header);
+            unsafe {
+                let base = log.staging.ptr().add(offset);
+                std::ptr::copy_nonoverlapping(bytes_of(&header).as_ptr(), base, FRAME_HEADER_BYTES);
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    base.add(FRAME_HEADER_BYTES),
+                    payload.len(),
+                );
+                let used = FRAME_HEADER_BYTES + payload.len();
+                if padded > used {
+                    std::ptr::write_bytes(base.add(used), 0, padded - used);
+                }
+            }
+            let slot = &log.slots[(frame_id as usize) % FRAME_SLOTS];
+            let publish_ns = log.stat_now_nanos();
+            log.publish_ns[(frame_id as usize) % FRAME_SLOTS].store(publish_ns, Ordering::Relaxed);
+            slot.fenced.store(false, Ordering::Relaxed);
+            slot.frame_id.store(frame_id, Ordering::Release);
+            slot.offset.store(offset as u64, Ordering::Relaxed);
+            slot.padded_len.store(padded as u64, Ordering::Relaxed);
+            slot.end_seq.store(
+                if terminal { last_seq } else { first_seq },
+                Ordering::Relaxed,
+            );
+            offset += padded;
+        }
+        self.next_offset = offset;
+        self.next_frame = first_frame_id + chunks.len() as u64;
+        let completed = log.fences_completed.load_acquire();
+        for frame_id in first_frame_id..self.next_frame {
+            log.record_in_flight_depth(frame_id.saturating_add(1).saturating_sub(completed));
+        }
+        saturating_add(&log.stat_payload_bytes, total_payload as u64);
+        saturating_add(&log.stat_padded_bytes, total_padded as u64);
+        saturating_add(
+            &log.stat_stage_copy_ns,
+            log.stat_now_nanos().saturating_sub(stage_copy_started),
+        );
+        saturating_add(&log.stat_stage_copy_frames, chunks.len() as u64);
+        // This is the sole visibility/claim publication for the complete group. All slots and
+        // staging bytes above happen-before this release store, so a fence lane cannot claim a
+        // prefix of the group.
         log.published_frames.store_release(self.next_frame);
-        log.wake_fence_lanes(false);
-        Ok(FrameHandle {
-            frame_id,
-            last_seq: first_seq + seq_count as u64,
+        log.wake_fence_lanes(chunks.len(), false);
+        Ok(FrameBatchHandle {
+            first_frame_id,
+            terminal_frame_id: self.next_frame - 1,
+            last_seq,
         })
     }
 
     /// Declare publishing finished so fence lanes can drain and exit.
     pub fn finish(self) {
         self.log.publishing_finished.store(true, Ordering::Release);
-        self.log.wake_fence_lanes(true);
+        self.log.wake_fence_lanes(0, true);
     }
 }
 
@@ -581,6 +998,10 @@ pub struct RecoveredFrame {
     pub first_seq: u64,
     pub seq_count: u32,
     pub payload: Vec<u8>,
+    /// `Some` only for a complete, scan-validated fragmented group. The generic scanner retains
+    /// physical frame visibility, but incomplete or malformed metadata groups contribute no
+    /// frames to its result.
+    pub group: Option<FrameGroupMetadata>,
 }
 
 /// Scan recovery: walk the frame chain from the data region start, stopping
@@ -604,6 +1025,15 @@ pub fn recover_frame_log_by_scan(
     let expected_epoch = file_header.segment_id as u32;
     let capacity = file_header.capacity_bytes;
     let mut frames = Vec::new();
+    struct PendingGroup {
+        metadata: FrameGroupMetadata,
+        first_seq: u64,
+        next_index: u32,
+        payload_bytes: u64,
+        group_crc32c: u32,
+        frames: Vec<RecoveredFrame>,
+    }
+    let mut pending: Option<PendingGroup> = None;
     let mut offset = 0_u64;
     let mut expected_frame = 0_u64;
     while offset + FRAME_HEADER_BYTES as u64 <= capacity {
@@ -629,12 +1059,81 @@ pub fn recover_frame_log_by_scan(
         if crc32c::crc32c(&payload) != header.payload_crc {
             break;
         }
-        frames.push(RecoveredFrame {
+        let recovered = RecoveredFrame {
             frame_id: header.frame_id,
             first_seq: header.first_seq,
             seq_count: header.seq_count,
             payload,
-        });
+            group: frame_group_metadata(&header),
+        };
+        match recovered.group {
+            None => {
+                // A legacy frame cannot complete or follow an incomplete fragmented group; the
+                // entire partial group is outside the recoverable prefix. A zero-count legacy
+                // frame is never valid: only metadata-marked continuations use `seq_count=0`,
+                // so accepting it would let a crafted old-format payload bypass that law.
+                if pending.is_some() || recovered.seq_count == 0 {
+                    break;
+                }
+                frames.push(recovered);
+            }
+            Some(metadata) => {
+                if metadata.total_payload_bytes == 0
+                    || metadata.fragment_count < 2
+                    || metadata.fragment_index >= metadata.fragment_count
+                {
+                    break;
+                }
+                let terminal = metadata.fragment_index + 1 == metadata.fragment_count;
+                if (terminal && recovered.seq_count == 0) || (!terminal && recovered.seq_count != 0)
+                {
+                    break;
+                }
+                if let Some(group) = pending.as_mut() {
+                    if metadata.total_payload_bytes != group.metadata.total_payload_bytes
+                        || metadata.fragment_count != group.metadata.fragment_count
+                        || metadata.group_crc32c != group.metadata.group_crc32c
+                        || metadata.fragment_index != group.next_index
+                        || recovered.first_seq != group.first_seq
+                    {
+                        break;
+                    }
+                    group.next_index = group.next_index.saturating_add(1);
+                    let Some(payload_bytes) = group
+                        .payload_bytes
+                        .checked_add(recovered.payload.len() as u64)
+                    else {
+                        break;
+                    };
+                    group.payload_bytes = payload_bytes;
+                    group.group_crc32c =
+                        crc32c::crc32c_append(group.group_crc32c, &recovered.payload);
+                    group.frames.push(recovered);
+                } else {
+                    if metadata.fragment_index != 0 || recovered.seq_count != 0 {
+                        break;
+                    }
+                    pending = Some(PendingGroup {
+                        metadata,
+                        first_seq: recovered.first_seq,
+                        next_index: 1,
+                        payload_bytes: recovered.payload.len() as u64,
+                        group_crc32c: crc32c::crc32c(&recovered.payload),
+                        frames: vec![recovered],
+                    });
+                }
+                if terminal {
+                    let complete = pending.take().expect("terminal metadata group is pending");
+                    if complete.next_index != complete.metadata.fragment_count
+                        || complete.payload_bytes != complete.metadata.total_payload_bytes
+                        || complete.group_crc32c != complete.metadata.group_crc32c
+                    {
+                        break;
+                    }
+                    frames.extend(complete.frames);
+                }
+            }
+        }
         offset += padded;
         expected_frame += 1;
     }
@@ -768,6 +1267,34 @@ mod tests {
         assert_eq!(fences, sizes.len() as u64);
         assert_eq!(log.durable_frames(), sizes.len() as u64);
         assert_eq!(log.durable_seq(), seq);
+        let telemetry = log.telemetry();
+        assert_eq!(telemetry.published_frames, sizes.len() as u64);
+        assert_eq!(telemetry.fenced_frames, sizes.len() as u64);
+        assert_eq!(telemetry.fence_failures, 0);
+        assert_eq!(telemetry.stage_copy_frames, sizes.len() as u64);
+        assert_eq!(telemetry.publish_to_claim_frames, sizes.len() as u64);
+        assert_eq!(telemetry.claim_to_write_done_frames, sizes.len() as u64);
+        assert_eq!(
+            telemetry.write_done_to_contiguous_cut_frames,
+            sizes.len() as u64
+        );
+        assert_eq!(telemetry.contiguous_cut_advanced_frames, sizes.len() as u64);
+        assert_eq!(
+            telemetry.in_flight_depth_histogram.iter().sum::<u64>(),
+            sizes.len() as u64
+        );
+        assert!(telemetry.in_flight_depth_max >= 1);
+        assert_eq!(
+            telemetry.payload_bytes,
+            sizes.iter().map(|size| *size as u64).sum::<u64>()
+        );
+        assert_eq!(
+            telemetry.padded_bytes,
+            sizes
+                .iter()
+                .map(|size| fua_frame_padded_bytes(*size) as u64)
+                .sum::<u64>()
+        );
         drop(log);
         let frames = recover_frame_log_by_scan(&path).expect("scan");
         assert_eq!(frames.len(), sizes.len());
@@ -792,12 +1319,12 @@ mod tests {
                     .expect("publish");
             }
             // fence only 0..3 (out of order to exercise the cut)
-            log.fence_frame(1).expect("fence");
+            log.fence_frame(1, log.stat_now_nanos()).expect("fence");
             assert_eq!(log.durable_frames(), 0);
-            log.fence_frame(0).expect("fence");
+            log.fence_frame(0, log.stat_now_nanos()).expect("fence");
             assert_eq!(log.durable_frames(), 2);
             assert_eq!(log.durable_seq(), 20);
-            log.fence_frame(2).expect("fence");
+            log.fence_frame(2, log.stat_now_nanos()).expect("fence");
             assert_eq!(log.durable_frames(), 3);
             drop(appender);
         }
@@ -879,6 +1406,93 @@ mod tests {
             std::io::ErrorKind::StorageFull
         );
         drop(appender);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_publish_is_atomic_and_terminal_owns_the_cut() {
+        let path = test_path("batch-atomic-terminal");
+        let log = unsafe { FuaFrameLog::create(config(&path, 11)).expect("create") };
+        let mut appender = log.appender();
+        let chunks = [payload(700, 1), payload(900, 2), payload(800, 3)];
+        let references: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
+        let batch = appender
+            .publish_batch(&references, 0, 5)
+            .expect("batch publish");
+        assert_eq!(log.published_frames(), 3);
+        // A terminal write that lands first cannot advance a cut across unfenced continuations.
+        log.fence_frame(batch.terminal_frame_id, log.stat_now_nanos())
+            .expect("terminal fence");
+        assert_eq!(log.durable_frames(), 0);
+        assert_eq!(log.durable_seq(), 0);
+        log.fence_frame(batch.first_frame_id, log.stat_now_nanos())
+            .expect("first fence");
+        assert_eq!(log.durable_frames(), 1);
+        assert_eq!(log.durable_seq(), 0);
+        log.fence_frame(batch.first_frame_id + 1, log.stat_now_nanos())
+            .expect("middle fence");
+        assert_eq!(log.durable_frames(), 3);
+        assert_eq!(log.durable_seq(), 5);
+        drop(appender);
+        drop(log);
+        let recovered = recover_frame_log_by_scan(&path).expect("scan");
+        assert_eq!(recovered.len(), 3, "complete group retains physical frames");
+        assert!(recovered.iter().all(|frame| frame.group.is_some()));
+        assert_eq!(recovered[0].seq_count, 0);
+        assert_eq!(recovered[1].seq_count, 0);
+        assert_eq!(recovered[2].seq_count, 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn incomplete_batch_recovery_keeps_only_prior_legacy_prefix() {
+        let path = test_path("batch-torn-continuation");
+        {
+            let log = unsafe { FuaFrameLog::create(config(&path, 12)).expect("create") };
+            let mut appender = log.appender();
+            appender
+                .publish_frame(&payload(128, 9), 0, 1)
+                .expect("legacy prefix");
+            log.fence_frame(0, log.stat_now_nanos())
+                .expect("prefix fence");
+            let chunks = [payload(700, 1), payload(700, 2), payload(700, 3)];
+            let references: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
+            let batch = appender
+                .publish_batch(&references, 1, 3)
+                .expect("batch publish");
+            // Persist only the first continuation then simulate a torn/unfenced tail.
+            log.fence_frame(batch.first_frame_id, log.stat_now_nanos())
+                .expect("continuation fence");
+            drop(appender);
+        }
+        let recovered = recover_frame_log_by_scan(&path).expect("scan");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].seq_count, 1);
+        assert!(recovered[0].group.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_preflight_storage_full_leaves_no_visible_prefix() {
+        let path = test_path("batch-preflight-full");
+        let mut small = config(&path, 13);
+        small.capacity_bytes = 2 * FRAME_ALIGN;
+        let log = unsafe { FuaFrameLog::create(small).expect("create") };
+        let mut appender = log.appender();
+        let chunks = [payload(100, 1), payload(100, 2), payload(100, 3)];
+        let references: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            appender
+                .publish_batch(&references, 0, 1)
+                .expect_err("batch cannot fit")
+                .kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        assert_eq!(log.published_frames(), 0);
+        appender
+            .publish_frame(&payload(100, 7), 0, 1)
+            .expect("cursor remains usable after preflight failure");
+        assert_eq!(log.published_frames(), 1);
         let _ = std::fs::remove_file(&path);
     }
 }

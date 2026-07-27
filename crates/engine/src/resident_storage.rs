@@ -277,14 +277,27 @@ impl ShardResidentDeviceMemoryMap {
         gpu_id: u16,
         include: impl Fn(&str) -> bool,
     ) -> u64 {
-        self.cells
-            .load()
+        self.retained_bytes_and_entries_matching(gpu_id, include).0
+    }
+
+    /// Same accounting traversal as [`Self::retained_bytes_matching`], plus the exact number of
+    /// map entries inspected before table/GPU filtering. Budget diagnostics use this to distinguish
+    /// metadata traversal from allocation bytes without changing the ownership calculation.
+    pub(crate) fn retained_bytes_and_entries_matching(
+        &self,
+        gpu_id: u16,
+        include: impl Fn(&str) -> bool,
+    ) -> (u64, u64) {
+        let cells = self.cells.load();
+        let entries = cells.len() as u64;
+        let bytes = cells
             .iter()
             .filter(|((table, _), _)| include(table))
             .filter_map(|(_, cell)| cell.load().get().clone())
             .filter(|memory| memory.metadata().gpu_id == gpu_id)
             .map(|memory| memory.metadata().allocated_bytes)
-            .sum()
+            .sum();
+        (bytes, entries)
     }
 
     /// Replace a table's shards: publish each new shard as a new generation
@@ -496,9 +509,57 @@ impl MvccData {
         self.next_row_id.load(AtomicOrdering::Relaxed)
     }
 
-    /// Advance the relational row-id allocator by `n` (serialized writer, on apply).
-    pub(crate) fn advance_row_id(&self, n: u64) {
-        self.next_row_id.fetch_add(n, AtomicOrdering::Relaxed);
+    /// Advance the relational row-id allocator by `n` without silently wrapping. Callers that
+    /// reach this after canonical WAL/device apply must fail-stop on an error; pre-WAL callers
+    /// return the error to the statement instead.
+    pub(crate) fn advance_row_id(&self, n: u64) -> Result<(), EngineError> {
+        let current = self.next_row_id.load(AtomicOrdering::Acquire);
+        let next = current.checked_add(n).ok_or_else(|| {
+            EngineError::ApplyFailed("relational row-id allocator overflow".to_string())
+        })?;
+        self.next_row_id
+            .compare_exchange(
+                current,
+                next,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|actual| {
+                EngineError::ApplyFailed(format!(
+                    "relational row-id allocator drift: expected {current}, found {actual}"
+                ))
+            })
+    }
+
+    /// Consume the exact range that already bound one canonical fixed-INSERT record.  This is not
+    /// an allocator claim: the caller derived the proposal under the commit mutex, applied the
+    /// device plan with those same identities, and now proves that no other writer advanced the
+    /// cursor before moving it to the proposal's exclusive high-water.
+    pub(crate) fn consume_proposed_row_id_range(
+        &self,
+        proposed: crate::wal_binary::ProposedRowIdRange,
+    ) -> Result<(), EngineError> {
+        let expected = proposed.first();
+        let high_water = proposed.allocator_high_water();
+        if high_water <= expected {
+            return Err(EngineError::ApplyFailed(
+                "fixed INSERT proposed row-id range has invalid high-water".to_string(),
+            ));
+        }
+        self.next_row_id
+            .compare_exchange(
+                expected,
+                high_water,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|actual| {
+                EngineError::ApplyFailed(format!(
+                    "fixed INSERT allocator drift: expected row-id start {expected}, found {actual}"
+                ))
+            })
     }
 
     /// Advance the relational row-id allocator to at least `high_water`. Explicit transactions
@@ -761,7 +822,7 @@ thread_local! {
     pub(crate) static MVCC_READ_SKIPS_LEADER_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// U1 WAL-FIRST: set (RAII-scoped) while this thread is the LANE APPLY LEADER — it already
-    /// holds `device_apply_lock`, so a PK-index rebuild triggered by the apply-time delete
+    /// holds the residency mutation gate, so a PK-index rebuild triggered by the apply-time delete
     /// visible-locate (`ensure_shard_pk_device_index`) must SKIP re-taking that lock or it
     /// self-deadlocks. The leader's exclusivity already gives the rebuild the exclusion the
     /// guard provides. False for every off-lock prober.

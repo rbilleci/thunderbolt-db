@@ -629,6 +629,174 @@ pub(crate) fn parse_relational_row_id(key: &str, prefix: &str) -> Option<u64> {
     key.strip_prefix(prefix)?.parse::<u64>().ok()
 }
 
+/// Checked capacity-aware fixed-width append layout shared by row-major and typed-column inputs.
+/// `column_offsets` is catalog ordered; BOOL has no byte chunk because its bitmap is maintained by
+/// its dedicated device operation. Keeping this geometry in one place prevents a typed append from
+/// drifting from the layout read helpers and the row-major encoder already publish.
+pub(crate) struct FixedWidthAppendGeometry {
+    end: usize,
+    column_offsets: Vec<Option<u64>>,
+}
+
+impl FixedWidthAppendGeometry {
+    pub(crate) fn end(&self) -> usize {
+        self.end
+    }
+
+    pub(crate) fn column_offset(&self, column: usize) -> Option<u64> {
+        self.column_offsets.get(column).copied().flatten()
+    }
+}
+
+fn append_geometry_error(message: impl Into<String>) -> ExecuteError {
+    ExecuteError::Engine(EngineError::ApplyFailed(message.into()))
+}
+
+/// Return the sole checked section geometry for an open fixed-width shard. Every multiplication
+/// and offset conversion is checked before an encoder allocates bytes or submits an HtoD write.
+pub(crate) fn checked_fixed_width_append_geometry(
+    column_types: &[SqlType],
+    capacity: usize,
+    row_start: usize,
+    appended: usize,
+) -> Result<FixedWidthAppendGeometry, ExecuteError> {
+    let end = row_start
+        .checked_add(appended)
+        .ok_or_else(|| append_geometry_error("open-shard append row index overflowed"))?;
+    if end > capacity {
+        return Err(append_geometry_error(format!(
+            "open-shard append of {appended} rows at {row_start} exceeds capacity {capacity}"
+        )));
+    }
+    if capacity > (1_usize << 31) {
+        return Err(append_geometry_error(format!(
+            "open-shard append capacity {capacity} is implausibly large"
+        )));
+    }
+    if !column_types.iter().all(|ty| {
+        matches!(
+            ty,
+            SqlType::Int4
+                | SqlType::Date
+                | SqlType::Int2
+                | SqlType::Int8
+                | SqlType::Timestamp
+                | SqlType::Numeric { .. }
+                | SqlType::Uuid
+                | SqlType::Bool
+        )
+    }) {
+        return Err(append_geometry_error(
+            "open-shard append supports fixed-width (i32/i64/b128) + bool-bitmap sections only",
+        ));
+    }
+
+    let count =
+        |predicate: fn(&SqlType) -> bool| column_types.iter().filter(|ty| predicate(ty)).count();
+    let is_i32 = |ty: &SqlType| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2);
+    let is_i64 = |ty: &SqlType| matches!(ty, SqlType::Int8 | SqlType::Timestamp);
+    let is_b128 = |ty: &SqlType| matches!(ty, SqlType::Numeric { .. } | SqlType::Uuid);
+    let section_bytes = |columns: usize, width: usize| {
+        columns
+            .checked_mul(capacity)
+            .and_then(|bytes| bytes.checked_mul(width))
+            .ok_or_else(|| append_geometry_error("open-shard append section geometry overflowed"))
+    };
+    let header = std::mem::size_of::<u64>();
+    let i32_base = header;
+    let i64_base = i32_base
+        .checked_add(section_bytes(count(is_i32), std::mem::size_of::<i32>())?)
+        .ok_or_else(|| append_geometry_error("open-shard append section geometry overflowed"))?;
+    let b128_base = i64_base
+        .checked_add(section_bytes(count(is_i64), std::mem::size_of::<i64>())?)
+        .ok_or_else(|| append_geometry_error("open-shard append section geometry overflowed"))?;
+    let _total = b128_base
+        .checked_add(section_bytes(count(is_b128), 16)?)
+        .ok_or_else(|| append_geometry_error("open-shard append section geometry overflowed"))?;
+
+    let mut i32_ordinal = 0usize;
+    let mut i64_ordinal = 0usize;
+    let mut b128_ordinal = 0usize;
+    let mut column_offsets = Vec::with_capacity(column_types.len());
+    for ty in column_types {
+        let offset = match ty {
+            SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
+                let offset = i32_base
+                    .checked_add(
+                        i32_ordinal
+                            .checked_mul(capacity)
+                            .and_then(|bytes| bytes.checked_mul(std::mem::size_of::<i32>()))
+                            .and_then(|bytes| {
+                                row_start
+                                    .checked_mul(std::mem::size_of::<i32>())
+                                    .and_then(|start| bytes.checked_add(start))
+                            })
+                            .ok_or_else(|| {
+                                append_geometry_error("open-shard i32 offset overflowed")
+                            })?,
+                    )
+                    .ok_or_else(|| append_geometry_error("open-shard i32 offset overflowed"))?;
+                i32_ordinal += 1;
+                Some(
+                    u64::try_from(offset)
+                        .map_err(|_| append_geometry_error("open-shard i32 offset overflowed"))?,
+                )
+            }
+            SqlType::Int8 | SqlType::Timestamp => {
+                let offset = i64_base
+                    .checked_add(
+                        i64_ordinal
+                            .checked_mul(capacity)
+                            .and_then(|bytes| bytes.checked_mul(std::mem::size_of::<i64>()))
+                            .and_then(|bytes| {
+                                row_start
+                                    .checked_mul(std::mem::size_of::<i64>())
+                                    .and_then(|start| bytes.checked_add(start))
+                            })
+                            .ok_or_else(|| {
+                                append_geometry_error("open-shard i64 offset overflowed")
+                            })?,
+                    )
+                    .ok_or_else(|| append_geometry_error("open-shard i64 offset overflowed"))?;
+                i64_ordinal += 1;
+                Some(
+                    u64::try_from(offset)
+                        .map_err(|_| append_geometry_error("open-shard i64 offset overflowed"))?,
+                )
+            }
+            SqlType::Numeric { .. } | SqlType::Uuid => {
+                let offset = b128_base
+                    .checked_add(
+                        b128_ordinal
+                            .checked_mul(capacity)
+                            .and_then(|bytes| bytes.checked_mul(16))
+                            .and_then(|bytes| {
+                                row_start
+                                    .checked_mul(16)
+                                    .and_then(|start| bytes.checked_add(start))
+                            })
+                            .ok_or_else(|| {
+                                append_geometry_error("open-shard b128 offset overflowed")
+                            })?,
+                    )
+                    .ok_or_else(|| append_geometry_error("open-shard b128 offset overflowed"))?;
+                b128_ordinal += 1;
+                Some(
+                    u64::try_from(offset)
+                        .map_err(|_| append_geometry_error("open-shard b128 offset overflowed"))?,
+                )
+            }
+            SqlType::Bool => None,
+            _ => unreachable!("the fixed-width guard above rejects non-fixed-width columns"),
+        };
+        column_offsets.push(offset);
+    }
+    Ok(FixedWidthAppendGeometry {
+        end,
+        column_offsets,
+    })
+}
+
 /// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
 /// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
 /// slots. Each chunk lands EXACTLY where the capacity-aware read offsets expect it (column `c` at
@@ -648,44 +816,8 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
     new_rows: &[Vec<SqlValue>],
 ) -> Result<Vec<CudaOwnedDeviceMemoryChunk>, ExecuteError> {
     let appended = new_rows.len();
-    let end = row_start.checked_add(appended).ok_or_else(|| {
-        ExecuteError::Engine(EngineError::ApplyFailed(
-            "open-shard append row index overflowed".to_string(),
-        ))
-    })?;
-    if end > capacity {
-        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-            "open-shard append of {appended} rows at {row_start} exceeds capacity {capacity}"
-        ))));
-    }
-    // Mirror the builder's defensive capacity bound so the unchecked offset multiplies below cannot
-    // overflow usize (the read helpers + append_owned_chunks are likewise checked/guarded).
-    if capacity > (1_usize << 31) {
-        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-            "open-shard append capacity {capacity} is implausibly large"
-        ))));
-    }
-    if !column_types.iter().all(|ty| {
-        matches!(
-            ty,
-            SqlType::Int4
-                | SqlType::Date
-                | SqlType::Int2
-                | SqlType::Int8
-                | SqlType::Timestamp
-                // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) 16-byte section.
-                | SqlType::Numeric { .. }
-                | SqlType::Uuid
-                // TYPE-COVERAGE #14 (bool): the 1-bit/row bitmap — emits NO chunk here (the caller's
-                // device atomicOr set-range op writes its bits); the encoder just skips the column.
-                | SqlType::Bool
-        )
-    }) {
-        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "open-shard append supports fixed-width (i32/i64/b128) + bool-bitmap sections only"
-                .to_string(),
-        )));
-    }
+    let geometry =
+        checked_fixed_width_append_geometry(column_types, capacity, row_start, appended)?;
     // Row-arity guard: a malformed (short/long) row must return the fallback Err, never panic on the
     // unchecked `row[col_idx]` indexing below.
     if new_rows.iter().any(|row| row.len() != column_types.len()) {
@@ -693,35 +825,15 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
             "open-shard append row has the wrong column count".to_string(),
         )));
     }
-    let header_bytes = std::mem::size_of::<u64>();
-    // TYPE-COVERAGE track 2 slice 2 stage (ii): MIXED fixed-width sections. Catalog order no
-    // longer equals section ordinal - each column maps to (section, within-section ordinal):
-    // i32 sections first (header + c32*capacity*4), then i64 sections
-    // (header + num_i32*capacity*4 + c64*capacity*8) - the shared offset-helper formula.
-    let num_i32_cols = column_types
-        .iter()
-        .filter(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
-        .count();
-    let i64_section_base = header_bytes + num_i32_cols * capacity * std::mem::size_of::<i32>();
-    // TYPE-COVERAGE #14 (numeric): the b128 section follows the i64 sections — base = i64_base +
-    // num_i64*capacity*8; each b128 column strides capacity*16 (matches the payload builder).
-    let num_i64_cols = column_types
-        .iter()
-        .filter(|ty| matches!(ty, SqlType::Int8 | SqlType::Timestamp))
-        .count();
-    let numeric_section_base =
-        i64_section_base + num_i64_cols * capacity * std::mem::size_of::<i64>();
     // Column chunks FIRST, header LAST (the partial-failure contract: never advertise un-written rows).
     let mut chunks = Vec::with_capacity(column_types.len() + 1);
-    let mut i32_ordinal = 0_usize;
-    let mut i64_ordinal = 0_usize;
-    let mut numeric_ordinal = 0_usize;
     for (col_idx, ty) in column_types.iter().enumerate() {
         match ty {
             SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
                 let width = std::mem::size_of::<i32>();
-                let section_start = header_bytes + i32_ordinal * capacity * width;
-                let byte_offset = (section_start + row_start * width) as u64;
+                let byte_offset = geometry
+                    .column_offset(col_idx)
+                    .expect("fixed-width i32 offset");
                 let mut bytes = Vec::with_capacity(appended * width);
                 for row in new_rows {
                     let value: i32 = match row[col_idx] {
@@ -738,12 +850,12 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                     bytes.extend_from_slice(&value.to_le_bytes());
                 }
                 chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
-                i32_ordinal += 1;
             }
             SqlType::Int8 | SqlType::Timestamp => {
                 let width = std::mem::size_of::<i64>();
-                let section_start = i64_section_base + i64_ordinal * capacity * width;
-                let byte_offset = (section_start + row_start * width) as u64;
+                let byte_offset = geometry
+                    .column_offset(col_idx)
+                    .expect("fixed-width i64 offset");
                 let mut bytes = Vec::with_capacity(appended * width);
                 for row in new_rows {
                     let value: i64 = match row[col_idx] {
@@ -758,15 +870,15 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                     bytes.extend_from_slice(&value.to_le_bytes());
                 }
                 chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
-                i64_ordinal += 1;
             }
             SqlType::Numeric { .. } | SqlType::Uuid => {
                 // TYPE-COVERAGE #14 (numeric): the b128 (16-byte) section — numeric = i128 mantissa
                 // LE, uuid = raw 16 bytes, NULL = 16 zero bytes (validity bitmap marks the row).
                 // Byte-identical to the payload builder's numeric/uuid section encoding.
                 let width = 16_usize;
-                let section_start = numeric_section_base + numeric_ordinal * capacity * width;
-                let byte_offset = (section_start + row_start * width) as u64;
+                let byte_offset = geometry
+                    .column_offset(col_idx)
+                    .expect("fixed-width b128 offset");
                 let mut bytes = Vec::with_capacity(appended * width);
                 for row in new_rows {
                     match &row[col_idx] {
@@ -784,7 +896,6 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                     }
                 }
                 chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
-                numeric_ordinal += 1;
             }
             // TYPE-COVERAGE #14 (bool): the bitmap is NOT a capacity-strided fixed-width chunk — its
             // bits are set by the caller's device atomicOr op (`set_bool_bitmap_range`) into the
@@ -795,7 +906,49 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
     }
     chunks.push(CudaOwnedDeviceMemoryChunk {
         byte_offset: 0,
-        bytes: (end as u64).to_le_bytes().to_vec(),
+        bytes: (geometry.end() as u64).to_le_bytes().to_vec(),
+    });
+    Ok(chunks)
+}
+
+/// Direct column-major form of the fixed-width-i32 encoder. It shares the exact checked geometry
+/// above with the legacy row-major path and intentionally never materializes `Vec<Vec<SqlValue>>`.
+/// The count header remains the final chunk.
+#[allow(dead_code)] // inert typed INSERT seam; no production wave caller before cutover
+pub(crate) fn compute_open_shard_i32_column_append_chunks(
+    capacity: usize,
+    row_start: usize,
+    columns: &[&[i32]],
+) -> Result<Vec<CudaOwnedDeviceMemoryChunk>, ExecuteError> {
+    let Some(first) = columns.first() else {
+        return Err(append_geometry_error("typed i32 append has no columns"));
+    };
+    let appended = first.len();
+    if appended == 0 || columns.iter().any(|column| column.len() != appended) {
+        return Err(append_geometry_error(
+            "typed i32 append lost its parallel column geometry",
+        ));
+    }
+    let types = vec![SqlType::Int4; columns.len()];
+    let geometry = checked_fixed_width_append_geometry(&types, capacity, row_start, appended)?;
+    let mut chunks = Vec::with_capacity(columns.len() + 1);
+    for (ordinal, values) in columns.iter().enumerate() {
+        let byte_len = values
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| append_geometry_error("typed i32 append byte length overflowed"))?;
+        let mut bytes = Vec::with_capacity(byte_len);
+        for value in *values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        chunks.push(CudaOwnedDeviceMemoryChunk {
+            byte_offset: geometry.column_offset(ordinal).expect("i32 column offset"),
+            bytes,
+        });
+    }
+    chunks.push(CudaOwnedDeviceMemoryChunk {
+        byte_offset: 0,
+        bytes: (geometry.end() as u64).to_le_bytes().to_vec(),
     });
     Ok(chunks)
 }

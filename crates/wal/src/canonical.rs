@@ -385,9 +385,75 @@ pub struct CanonicalEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedCanonicalEnvelope {
     /// Fragment frames followed by exactly one terminal outcome-marker frame.
-    pub frames: Vec<Vec<u8>>,
-    pub ordered_fragment_root: CanonicalDigest,
-    pub final_digest: CanonicalDigest,
+    frames: Vec<Vec<u8>>,
+    ordered_fragment_root: CanonicalDigest,
+    final_digest: CanonicalDigest,
+    // Kept private so only `encode_canonical_envelope` can bind the prepared record's immutable
+    // outer bytes and catalog tail to the same validated pre-apply header.
+    header: CanonicalPreApplyHeader,
+}
+
+/// The catalog boundary carried by the last canonical logical record.
+///
+/// This is intentionally small and copyable: `WalBuffer` owns the cache, while the engine owns
+/// genesis derivation when no canonical record has yet been appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalCatalogTail {
+    pub identity: CanonicalIdentity,
+    pub catalog_after_epoch: u64,
+    pub catalog_after_digest: CanonicalDigest,
+}
+
+/// An immutable canonical WAL record prepared from one successfully encoded envelope.
+///
+/// Fields are private on purpose. The only construction path is
+/// [`EncodedCanonicalEnvelope::into_prepared_record`], which seals the exact record bytes and
+/// catalog-after tail from the same validated header. Live owners hand this value directly to
+/// [`crate::WalBuffer::append_canonical`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct PreparedCanonicalWalRecord {
+    record: crate::WalRecord,
+    tail: CanonicalCatalogTail,
+}
+
+impl PreparedCanonicalWalRecord {
+    /// Borrow the sealed outer record for recovery/archive evidence. Normal live append owners
+    /// consume this value through [`crate::WalBuffer::append_canonical`] instead.
+    pub fn as_wal_record(&self) -> &crate::WalRecord {
+        &self.record
+    }
+
+    /// Consume the sealed wrapper when a caller is deliberately materializing an offline/archive
+    /// record rather than appending it to a live [`crate::WalBuffer`].
+    pub fn into_wal_record(self) -> crate::WalRecord {
+        self.record
+    }
+
+    pub(crate) fn into_parts(self) -> (crate::WalRecord, CanonicalCatalogTail) {
+        (self.record, self.tail)
+    }
+}
+
+impl EncodedCanonicalEnvelope {
+    /// Seal the immutable outer record and the catalog tail produced by this exact envelope.
+    pub fn into_prepared_record(
+        self,
+        txn_id: gpu_db_types::TxnId,
+    ) -> Result<PreparedCanonicalWalRecord, EngineError> {
+        let tail = CanonicalCatalogTail {
+            identity: self.header.identity,
+            catalog_after_epoch: self.header.catalog_after_epoch,
+            catalog_after_digest: self.header.catalog_after_digest,
+        };
+        let payload = pack_canonical_record_payload(&self)?;
+        Ok(PreparedCanonicalWalRecord {
+            record: crate::WalRecord {
+                txn_id,
+                payload: payload.into(),
+            },
+            tail,
+        })
+    }
 }
 
 /// Exact manifest-accounted logical intent/outcome bytes.
@@ -576,6 +642,7 @@ pub fn encode_canonical_envelope(
         frames,
         ordered_fragment_root: root,
         final_digest,
+        header: header.clone(),
     })
 }
 

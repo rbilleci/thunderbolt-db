@@ -81,6 +81,24 @@ impl Engine {
     /// their own Arc until their transaction deregisters. Deleted_by cannot be dropped in place
     /// (that would resurrect dead slots) and remains owned by thresholded dense VACUUM.
     pub(crate) fn gc_transaction_created_by_regions(&self) -> usize {
+        // A pre-WAL fixed INSERT plan may bind an existing created_by Arc across canonical
+        // WAL/status buffering and device apply before physical group durability. Every normal
+        // publisher takes this same gate, so GC must join it rather than rely on each caller to
+        // retain the commit mutex. The lane leader already owns the gate; all other callers acquire
+        // it here before touching either descriptor or write-side sidecar ownership.
+        let apply_leader =
+            crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(std::cell::Cell::get);
+        let _device_apply = if apply_leader {
+            None
+        } else {
+            Some(
+                self.read_state
+                    .residency
+                    .mutation_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        };
         let safe_boundary = self
             .active_snapshots_oldest()
             .unwrap_or_else(|| self.committed_seq());

@@ -748,9 +748,19 @@ fn blocking_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     client
         .write_all(&tagged(
             b'Q',
+            &query_payload("COPYfoo blocking_single_copy_prefix"),
+        ))
+        .unwrap();
+    let single_copy_prefix = read_messages(&mut client, 2);
+    assert_error_sqlstate(&single_copy_prefix, b"C42601\0");
+    assert_eq!(single_copy_prefix[1].1, vec![b'I']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
             &query_payload(
                 "CREATE TABLE blocking_copy_preflight_must_not_publish (id int4); \
-                 SELECT FROM; \
+                 COPYfoo blocking_copy_preflight_must_not_publish FROM STDIN; \
                  COPY blocking_copy_preflight_must_not_publish FROM STDIN",
             ),
         ))
@@ -1138,9 +1148,20 @@ async fn async_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     client
         .write_all(&tagged(
             b'Q',
+            &query_payload("COPYfoo async_single_copy_prefix"),
+        ))
+        .await
+        .unwrap();
+    let single_copy_prefix = read_messages_async(&mut client, 2).await;
+    assert_error_sqlstate(&single_copy_prefix, b"C42601\0");
+    assert_eq!(single_copy_prefix[1].1, vec![b'I']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
             &query_payload(
                 "CREATE TABLE async_copy_preflight_must_not_publish (id int4); \
-                 SELECT FROM; \
+                 COPYfoo async_copy_preflight_must_not_publish FROM STDIN; \
                  COPY async_copy_preflight_must_not_publish FROM STDIN",
             ),
         ))

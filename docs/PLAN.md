@@ -22,15 +22,40 @@ Maintain one active priority path; do not start another feature slice while its 
 BENCH-001 preflight made three existing tasks explicit prerequisite owners. READ-002's canonical compound-key
 milestone and PRODUCT-002's canonical SQL/type milestone passed on 2026-07-19; their broader post-benchmark breadth
 does not delay the architecture evidence gate. PRODUCT-001 completed its independent implementation and full-card
-acceptance on 2026-07-26; `STATUS.md` owns that accepted evidence. The active sequence now starts at COPY-001:
+acceptance on 2026-07-26; `STATUS.md` owns that accepted evidence. PERF-002 then restored and permanently guarded the
+canonical in-L2 point-read throughput on 2026-07-26. INSERT-001 was accepted on 2026-07-27; the active sequence now
+starts at CARD-001:
 
-1. **COPY-001 — PostgreSQL-compatible GPU-native bulk COPY.** Build on PRODUCT-001's accepted sole server,
-   facade admission boundary, WAL claimant, and publication owner. This is necessary both for product ingestion and
-   for development velocity: the canonical report card still constructs its 48M-row out-of-L2 fixture through about
-   48,000 SQL-text INSERT/autocommit operations, and the current accepted evidence records **2,138.3s insert + 0.0s
-   final residency**. INSERT chunks of 250/1,000/10,000 did not materially change per-row cost, so another larger SQL
-   string or an outer transaction is not the target. Keep PostgreSQL `COPY ... FROM STDIN` and `psql \copy` as the
-   public surface; do not add a benchmark-only direct-write authority.
+1. **CARD-001 — whole report-card phase attribution and development-cycle wall time — NOW.** INSERT-001's accepted
+   phase records are the before-baseline and cannot be counted again as a CARD-001 gain. Add a
+   machine-readable, configuration-bound phase ledger for successful, failed, timed-out, and drifted invocations.
+   Cover GPU-lock wait/acquisition; candidate/staged-tree validation and export; isolated-target creation; dependency,
+   native-library, example, and link builds; artifact hashing; Section A initialization, fixtures, warmup, and
+   measurement; mandatory cool-downs; Section B SQL-source generation, fixture load, final residency, route
+   preparation/non-vacuity, warmup, measurement, and throughput-floor validation; the corresponding Section C
+   phases; final candidate-drift/completion checks; target cleanup; and total command wall time. Report build versus
+   execution separately, plus CPU wall, GPU-busy, I/O, explicit wait/idle, peak disk/host/device bytes, and the
+   INSERT-001 engine subphases without double-counting nested intervals.
+
+   Coarse runner lifecycle timing is permanent benchmark output; deep engine timing remains behind the build-only
+   `probe-timing` feature and is aggregated so instrumentation cannot become the workload. Require unique phase
+   records, monotonic nonnegative durations, explicit parent/child or overlap ownership, and reconciliation of
+   exclusive phases plus named residual to total wall within the greater of 1% or one second. Freeze an
+   instrumentation-only comparable baseline before optimizing, rank every material phase, and remove only
+   demonstrated harness waste. Cached/prebuilt targets or fixtures are not acceptance evidence, and this task may
+   not weaken the fresh target, staged-tree export, exact artifact identities, both layers/cache regimes, fixed
+   row/batch/sample counts, GPU lock, cool-downs, completion markers, candidate-drift checks, or PERF-002 floor.
+   Acceptance completes post-build A+B+C in **<=10 minutes** including mandatory cool-downs and completes the entire
+   canonical fresh-target invocation from preflight through cleanup in **<=20 minutes**. Focused sabotage must prove
+   phase evidence fails closed when missing, duplicated, malformed, inconsistent, or incomplete; the final harness
+   receives independent audit and one canonical full-card seal.
+
+2. **COPY-001 — PostgreSQL-compatible GPU-native bulk COPY — BLOCKED on CARD-001.** Start only after CARD-001 is
+   accepted; INSERT-001 was accepted on 2026-07-27.
+   Build on PRODUCT-001's sole server/facade/admission/WAL/publication authority and the accepted shared typed
+   device-batch primitive; COPY is a product ingestion surface, not a bypass for slow ordinary INSERT or an owner of
+   whole-card observability. Keep PostgreSQL `COPY ... FROM STDIN` and `psql \copy` as the public surface; do not add
+   a benchmark-only direct-write authority.
 
    Parse the COPY command once and stream bounded, backpressured `CopyData` into typed columnar staging chunks. Retain
    PostgreSQL 16 text/CSV behavior and add standard binary COPY for the supported type vocabulary, including column
@@ -52,21 +77,19 @@ acceptance on 2026-07-26; `STATUS.md` owns that accepted evidence. The active se
    fixed metadata, independent of total rows), non-vacuous GPU batch apply, no host relational authority, and no
    regression in COPY TO or ordinary INSERT/transaction semantics.
 
-   The development-cycle gate uses the unchanged report-card `accounts(id int4, balance int4)` data and cache/read
-   workload. On the canonical RTX PRO 6000 host under the report card's existing local/in-memory, no-fsync durability
-   profile, load and publish the 48M-row Section C fixture through the canonical COPY path in **<=180s and >=270,000
-   rows/s** (at least 10x faster than the frozen 2,138.3s setup baseline). After the script's recorded isolated clean
-   build, complete both layers and cache regimes in **<=10 minutes**, including fixed cool-down gaps, and complete the
-   entire canonical fresh-target invocation in **<=20 minutes** with build and execution time reported separately.
-   Record parse/decode, staging, H2D, GPU validation/encode/apply/index, WAL/durability, publication, peak host/device
-   bytes, and end-to-end COPY throughput through permanent `probe-timing` instrumentation. After small-fixture
+   The COPY-specific performance gate uses the unchanged report-card `accounts(id int4, balance int4)` data and
+   cache/read workload. On the canonical RTX PRO 6000 host under the report card's local/in-memory no-fsync profile,
+   load and publish the 48M-row Section C fixture through canonical COPY in **<=180s and >=270,000 rows/s**. Record
+   COPY parse/decode, staging, H2D, GPU validation/encode/apply/index, WAL/durability, publication, peak host/device
+   bytes, and end-to-end throughput through permanent `probe-timing` instrumentation. After small-fixture
    INSERT-versus-COPY semantic and physical-layout invariants pass, switch only Layer 2 fixture construction to this
-   path; keep row counts, cache regimes, measured read route, samples, result contracts, and fixed baseline unchanged.
-2. **BENCH-001 — runner and campaign.** Use COPY-001 for the deterministic 34M-row seed, then build the fixed
+   path; preserve CARD-001's phase ledger and 10/20-minute budgets, PERF-002's floor, row counts, cache regimes,
+   measured read route, samples, result contracts, and fixed baseline.
+3. **BENCH-001 — runner and campaign.** Use COPY-001 for the deterministic 34M-row seed, then build the fixed
    open-loop sustained and `B01`–`B10` driver, tuned PostgreSQL profile, quiet-window qualification, and versioned
    artifacts; execute the immutable comparison. Publish the exact host, GPU/driver/runtime, durability, and PostgreSQL
    configuration. Never substitute the older P8 `order_line` microbenchmarks or add a benchmark-only write authority.
-3. **DUR-001 — checkpoint/PITR policy.** Start only after preserving the accepted pre-DUR BENCH result, then rerun
+4. **DUR-001 — checkpoint/PITR policy.** Start only after preserving the accepted pre-DUR BENCH result, then rerun
    the affected cohorts to measure checkpoint-policy overhead.
 
 **ROUTE-001** and **SCALE-001** remain blocked on BENCH-001 evidence; their broader route and connection-scale work
@@ -81,9 +104,11 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline had **30 files outside
 its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
 or tools over 3,000 lines. Every baseline outlier plus one subsequently crossed test threshold has a completed
-audited disposition. The standalone **STRUCT-001** queue is **zero files**; under the comment-excluded count in
-`CODE_SIZE.md`, `engine_expr.rs` no longer requires an exception. PRODUCT-001 completed the four reopened engine
-dispositions: `engine_dml_concurrent.rs`, `engine_commit.rs`, and `engine_mutation_admission.rs` are below the
+audited disposition. The standalone **STRUCT-001** queue is **zero actionable files**; under the
+comment-excluded count in `CODE_SIZE.md`, `engine_expr.rs` no longer requires an exception, while the SQL crate
+root has the one accepted bounded-facade exception recorded by the standard. PRODUCT-001 completed the four
+reopened engine dispositions: `engine_dml_concurrent.rs`, `engine_commit.rs`, and
+`engine_mutation_admission.rs` are below the
 2,000-line comment-excluded threshold, while `engine_transaction_catalog.rs` is a 594-line physical root with its
 core tests in a bounded child. They are not a hidden STRUCT queue and require no exceptions.
 
@@ -132,7 +157,7 @@ module map; work may run independently across crates but GPU validation remains 
 |---:|---|---|
 | 1,783 | `crates/engine/src/engine_streaming_exec.rs` | **DISPOSITION COMPLETE — bounded streaming facade/control-plane owner below the 2,000-line production analysis threshold.** STRUCT-001HW–IH isolated every separable join, SELECT-fold, scalar, cold-lifecycle, DML/class, and chunk-key owner into bounded private leaves. IH moved exact key-index/Bloom/candidate/structural-uniqueness behavior into the rustfmt-clean 1,164-line `streaming_chunk_keys.rs`, preserving six public telemetry and five crate APIs, adding exactly seven sibling bridges, and keeping nine helpers private. All 80 focused GPU executions, both 505/487 modes, the complete 992 suite, all static/source/cleanup gates, and an independent 16-control audit passed. The root now cohesively owns shared cold/key/staging contracts and telemetry, durable checkpoint codec/orchestration, sanctioned final readback/reverse decode, and the scheduler helper; no exception is required. Multi-GPU remains separately deferred. |
 | 1,872 | `crates/wal/src/lib.rs` | **DISPOSITION COMPLETE — bounded mixed root below the 2,000-line production threshold; no exception.** STRUCT-001II–IN isolated coherent test, buffer/group-flush, timeline/registry/prune, object-backup, and checkpoint owners; IL hardened timeline delimiters. IN moved exact checkpoint/control/lane ownership into the 371-line `checkpoint.rs` behind three type/nine function re-exports with no bridge. Both 85-test modes, 40 engine recovery tests, five GPU cold-checkpoint controls, static gates, fresh inventory, and independent audit passed. The root cohesively retains shared record/archive/recovery/commit contracts; strict/tolerant segment+tail persistence; archive manifest/recovery/retention; and shared path/validation/codec helpers used by multiple leaves. Further splitting now causes bridge/helper churn. Re-audit at 2,000 lines, a second new family, bridge/cycle/public-boundary pressure, or descendant threshold crossing. All WAL descendants are within mandatory envelopes. |
-| 1,810 | `crates/sql/src/lib.rs` | **DISPOSITION COMPLETE — bounded SQL facade below the 2,000-line production threshold; no exception.** STRUCT-001IO–IV isolated COPY, fixed-point decimal, ACL, SELECT, scalar, command/control, AST, and relation/schema/table/index/DML parsing into bounded private leaves. IV moved the exact six-range relation owner into the rustfmt-clean 1,414-line `relation.rs`; normalized reconstruction differs only by separator blanks and the sole authorized `pub(super)` dispatcher bridge. The root privately aliases that entry for the existing command child; all 36 subordinate functions remain private. Both SQL/protocol/server/engine/facade test modes, all static/source/rustdoc/cleanup gates, fresh inventory, and independent audit pass. Runtime behavior is unchanged, so HAZARD/report-card/GPU-kernel gates were inapplicable. Every SQL production descendant is below 2,000 lines and every new leaf is below 1,500. |
+| 2,025 counted | `crates/sql/src/lib.rs` | **DISPOSITION COMPLETE — accepted bounded-facade exception registered in `CODE_SIZE.md`.** The root remains the stable SQL crate facade re-exported wholesale by protocol and directly consumed across engine/facade/planner/server; it owns the shared `ParseError`, catalog/control DDL dispatch, and identifier/quote/clause utilities for the remaining coupled parser family. STRUCT-001IO–IV already isolated COPY, decimal, ACL, SELECT, scalar, command/control, AST, and relation/schema/table/index/DML owners. INSERT-001 placed its allocation-free compatibility-prefix scanner in the bounded 162-line `lexical.rs` leaf and added only the root declaration/re-export. The exact current count is 2,052 physical less 27 comment-only lines; the exception reopens on any net growth, new root SQL family, public-boundary change, or 2,100 counted lines. |
 
 **Wave 3 — production review outliers (2,001–5,000 lines).** Analyze after Waves 1–2 establish the relevant
 facades, unless one is a safe leaf extraction that directly reduces an earlier wave.
@@ -188,7 +213,8 @@ the final acceptance source.
 |---|---|---:|---|---|---|
 | **READ-002** | BLOCKED | P2 | The BENCH prerequisite milestone passed on 2026-07-19: the typed engine API prepares one exact-generation, O(1) GPU directory for compound `(tenant_id int4, account_id int8)` equality, exact-rechecks collisions and MVCC on-device, gathers the required fixed-width projections, proves nonzero GPU/index/cache hits, and retains zero cold accesses with GPU-scan parity. Broader bigint/text/UUID/numeric and composite point-lookup breadth remains under READ-002 after BENCH-001. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical compound milestone is complete | `docs/design/non-int4-index-design-inputs.md`; 2026-07-19 STATUS evidence |
 | **PRODUCT-002** | BLOCKED | P2 | The BENCH canonical SQL/type milestone passed on 2026-07-19: the immutable schema and W1 statements parse unchanged; typed placeholders and required pgwire codecs are available; every named primary/secondary index publishes and mutates in resident GPU generations; checked expression UPDATE and DML `RETURNING` execute without host relational fallback. After BENCH evidence, complete persistent GPU system catalogs, large NUMERIC, and unrelated protocol/type breadth. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical SQL/type milestone is complete | ARCHITECTURE §3; `docs/design/oltp-benchmark-workload-v1.md`; 2026-07-19 STATUS evidence |
-| **COPY-001** | NOW | P0 | Deliver PostgreSQL-compatible, bounded, GPU-native bulk `COPY FROM STDIN` behind the sole PRODUCT-001 admission/WAL/publication authority. Parse once; stream text/CSV/binary `CopyData` into typed columnar chunks; preserve PostgreSQL 16 NULL, column/default/sequence, constraint, transaction, cancellation, SQLSTATE, and command-count behavior; generate canonical typed WAL without SQL rendering/reparse; perform device-batch encode/validation/append/sidecar/index work; keep chunks private so autocommit COPY publishes once and explicit COPY publishes only with its enclosing transaction; and prove RPO-0 fresh-context recovery with no host relational authority or O(total rows) staging. Real `psql \copy`, simple/extended clients, autocommit/explicit transactions, failure/retry/reopen parity, bounded-memory accounting, non-vacuous GPU evidence, HAZARD, and independent audit are mandatory. Replace only report-card Layer 2 fixture construction after INSERT-versus-COPY semantic/layout equivalence: under its existing local/in-memory no-fsync profile, the unchanged 48M-row Section C fixture must load and publish in <=180s and >=270,000 rows/s on the canonical RTX PRO 6000 (>=10x versus 2,138.3s); post-build execution must finish in <=10 minutes and the complete canonical isolated clean-build invocation in <=20 minutes, with phases reported separately. | PRODUCT-001 accepted 2026-07-26; preserve its sole server, facade, sequence/WAL, recovery, and publication ownership | CHARTER host-control-plane COPY staging; ARCHITECTURE §§1, 6–8; ADR-014/015; 2026-07-22 HANDOVER report-card baseline |
+| **CARD-001** | NOW | P0 | Use INSERT-001's accepted phase records as the before-baseline, then add a machine-readable whole-card phase ledger covering lock/preflight, candidate export and isolated target setup, dependency/native/example/link builds, artifact identity, A/B/C initialization, fixtures, warm-up, measurement, cool-downs, throughput gates, drift/completion checks, cleanup, resource peaks, and total wall time on success, failure, and timeout. Reconcile exclusive phases plus a named residual to total within the greater of 1% or 1s, reuse aggregated `probe-timing` for engine subphases, freeze an instrumentation-only baseline, and remove only measured harness waste. Acceptance preserves every canonical workload and provenance control, completes post-build A+B+C in at most 10 minutes and the fresh-target invocation in at most 20 minutes, fails closed on malformed phase evidence, and passes independent audit plus one canonical full seal; INSERT-001's measured gain cannot be counted again as a CARD-001 improvement. | INSERT-001 accepted 2026-07-27; use its accepted phase records | AGENTS development gate; `scripts/benchmark_report_card.sh`; PERF-002 accepted harness evidence |
+| **COPY-001** | BLOCKED | P0 | After CARD-001, deliver PostgreSQL-compatible, bounded, GPU-native bulk `COPY FROM STDIN` behind the sole PRODUCT-001 admission/WAL/publication authority, reusing the accepted typed/device-batch append owner rather than creating a second write authority. Parse once; stream text/CSV/binary `CopyData` into typed columnar chunks; preserve PostgreSQL 16 NULL, column/default/sequence, constraint, transaction, cancellation, SQLSTATE, and command-count behavior; generate canonical typed WAL without SQL rendering/reparse; perform device-batch encode/validation/append/sidecar/index work; keep chunks private so autocommit COPY publishes once and explicit COPY publishes only with its enclosing transaction; and prove RPO-0 fresh-context recovery with no host relational authority or O(total rows) staging. Real `psql \copy`, simple/extended clients, autocommit/explicit transactions, failure/retry/reopen parity, bounded-memory accounting, non-vacuous GPU evidence, HAZARD, and independent audit are mandatory. Replace only report-card Layer 2 fixture construction after INSERT-versus-COPY semantic/layout equivalence; preserve INSERT-001 ordinary-INSERT performance, CARD-001 phase evidence and 10/20-minute budgets, and PERF-002's point-read floor. COPY is a product ingestion feature, not the repair for unexplained INSERT or report-card overhead. | Accept CARD-001; INSERT-001 accepted 2026-07-27; preserve PRODUCT-001/PERF-002 ownership and floors | CHARTER host-control-plane COPY staging; ARCHITECTURE §§1, 6–8; ADR-014/015; accepted INSERT-001/CARD-001 evidence |
 | **BENCH-001** | BLOCKED | P0 | The mutation-boundary repair plus READ-002 and PRODUCT-002 canonical milestones are complete. After COPY-001 passes, use the canonical bulk COPY path for the deterministic 34M-row seed, then build the remaining benchmark-owned pieces: fixed 3.3M+66M arrival generator, `B01`–`B10` driver, versioned result artifact, and reproducible tuned PostgreSQL durability/checkpoint profile. Run the complete same-host comparison in a qualified quiet window and report per-class p50/p99/p99.9/p99.99, committed TPS, logical operations/s, producer slip, queueing, WAL, saturation, and drain. The accepted artifact publishes the exact host, CPU/governor, GPU/driver/runtime, durability, and PostgreSQL configuration. Exclude warm-up, preserve the fixed schedule/mix, never add a benchmark-only write authority, and never substitute the older P8 `order_line` suite. Preserve the accepted pre-DUR result for the DUR-001 overhead comparison. | Complete COPY-001 and its bulk-seed gates; PRODUCT-001 serving, recovery, compatibility, deletion, and source ownership were accepted 2026-07-26; then PostgreSQL profile and qualified quiet window | ADR-008; `docs/design/oltp-benchmark-workload-v1.md`; ARCHITECTURE §§6, 10; 2026-07-19 STATUS preflight |
 | **DUR-001** | BLOCKED | P1 | After the accepted pre-DUR BENCH-001 result is preserved, add automatic intent-lane checkpoint policy and timestamped lane records sufficient for archive/PITR. Keep explicit operator checkpointing and refusal behavior until both are crash-gated, then rerun affected BENCH cohorts to report checkpoint-policy overhead against that exact baseline. | Accepted pre-DUR BENCH-001 artifact | Archived durable-path handover and write-conveyor record |
 | **RETIRE-002** | BLOCKED | P1 | Replace chunk reverse-gather, deauthorization, and scan-build repair with device-native DDL/recovery/import repair; then delete those host relational repair operators. Acked commits remain recoverable after every injected repair failure. | Device-native DDL validation and recovery repair | ADR-006; STRATA repair boundary |

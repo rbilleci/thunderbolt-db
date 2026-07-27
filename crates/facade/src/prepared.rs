@@ -42,6 +42,13 @@ impl BoundPreparedStatement {
         self.parsed.is_none()
     }
 
+    #[cfg(feature = "probe-timing")]
+    pub(super) fn is_insert(&self) -> bool {
+        self.parsed
+            .as_ref()
+            .is_some_and(|parsed| matches!(parsed.command(), Command::Insert(_)))
+    }
+
     fn is_transaction_exit(&self) -> bool {
         self.parsed.as_ref().is_some_and(|parsed| {
             matches!(

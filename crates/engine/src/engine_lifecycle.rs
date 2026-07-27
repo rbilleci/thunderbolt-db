@@ -338,6 +338,8 @@ impl Engine {
 
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
+            #[cfg(feature = "probe-timing")]
+            insert_probe: Default::default(),
             commit: Mutex::new(CommitState {
                 canonical_identity: Self::fresh_canonical_identity(),
                 canonical_lineage_bound: false,
@@ -359,6 +361,8 @@ impl Engine {
             commit_path_wedged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_transaction_post_durable_apply: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_fixed_insert_post_wal_apply: AtomicBool::new(false),
             #[cfg(test)]
             transaction_post_durable_hook: Mutex::new(None),
             active_snapshots: std::sync::Arc::new(Mutex::new(ActiveSnapshots::default())),
@@ -438,7 +442,10 @@ impl Engine {
             // rehydrating decline -> a dead slot re-tombstoned, the live version leaked) is
             // FIXED by re-pinning the view at every post-rehydration fallback — pinned by the
             // SV6 concurrent hammer, which now runs elided BY DEFAULT.
-            binary_wal_records_enabled: std::sync::atomic::AtomicBool::new(false),
+            // INSERT-001: resolved binary WAL is product-default for every construction path
+            // through `with_planner_config` (local, durable, and recovery/reopen). The setter is
+            // retained solely as an explicit compatibility/parity kill switch.
+            binary_wal_records_enabled: std::sync::atomic::AtomicBool::new(true),
             // THE CONSTRAINED-ELISION FLIP (user-authorized 2026-07-03): unique/PK'd
             auto_vacuum_enabled: std::sync::atomic::AtomicBool::new(true),
             // THE i64-SECTION FLIP (user-authorized 2026-07-03): Int8/Timestamp columns ride
@@ -638,6 +645,7 @@ impl Engine {
         engine
             .install_fresh_durable_identity(&segment_path)
             .expect("failed to install durable database identity");
+        let durable_identity = engine.commit_state().canonical_identity;
         #[cfg(unix)]
         let lane_base_path = segment_path.clone();
         let wal = match WalDurability::from_env() {
@@ -645,11 +653,17 @@ impl Engine {
             WalDurability::FuaFencePool {
                 lanes,
                 segment_bytes,
-            } => WalBuffer::with_fua_durable_segment(segment_path, lanes, segment_bytes)
-                .expect("failed to create FUA durable WAL segment (GPU_DB_WAL_DURABILITY=fua)"),
+            } => WalBuffer::with_fua_durable_segment_bound_to_identity(
+                segment_path,
+                lanes,
+                segment_bytes,
+                durable_identity,
+            )
+            .expect("failed to create FUA durable WAL segment (GPU_DB_WAL_DURABILITY=fua)"),
             // Non-unix has no FUA backend; from_env can still name it, so fall back to serial.
             #[allow(unreachable_patterns)]
-            _ => WalBuffer::with_durable_segment(segment_path),
+            _ => WalBuffer::with_durable_segment_bound_to_identity(segment_path, durable_identity)
+                .expect("failed to create serial durable WAL segment"),
         };
         engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
         engine.commit_state_mut().wal = wal;
@@ -800,15 +814,17 @@ impl Engine {
                 let records = gpu_db_wal::recover_fua_wal_records(segment_path)?;
                 let mut engine = Self::with_planner_config(planner_cfg);
                 engine.bind_durable_identity_for_recovery(segment_path, &records)?;
+                let durable_identity = engine.commit_state().canonical_identity;
                 engine.begin_recovery_replay();
                 // Replay the durable prefix WITHOUT a durable backing (no segment I/O), then install
                 // a reopened FUA backend that appends above the recovered history in a fresh segment.
                 engine.replay_durable_records(&records)?;
-                let wal = WalBuffer::with_recovered_fua_durable_segment(
+                let wal = WalBuffer::with_recovered_fua_durable_segment_bound_to_identity(
                     segment_path,
                     records,
                     lanes,
                     segment_bytes,
+                    durable_identity,
                 )?;
                 engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
                 engine.commit_state_mut().wal = wal;
@@ -823,6 +839,7 @@ impl Engine {
         let recovery = recover_wal_segment(segment_path)?;
         let mut engine = Self::with_planner_config(planner_cfg);
         engine.bind_durable_identity_for_recovery(segment_path, &recovery.records)?;
+        let durable_identity = engine.commit_state().canonical_identity;
         engine.begin_recovery_replay();
         // Replay the durable prefix WITHOUT a durable backing so the replay does no segment I/O;
         // then install the recovered segment so post-recovery commits keep appending to the same
@@ -830,7 +847,12 @@ impl Engine {
         engine.replay_durable_records(&recovery.records)?;
         let records = recovery.records.clone();
         engine.commit_state_mut().wal =
-            WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
+            WalBuffer::with_recovered_durable_segment_bound_to_identity(
+                segment_path,
+                records,
+                &recovery,
+                durable_identity,
+            )?;
         #[cfg(unix)]
         engine.attach_fresh_intent_lanes(segment_path, false)?;
         engine.finish_recovery_replay()?;
@@ -915,6 +937,10 @@ impl Engine {
             .unwrap_or_else(|| serial_records.clone());
         identity_records.extend_from_slice(&lane_records);
         engine.bind_durable_identity_for_recovery(segment_path, &identity_records)?;
+        // The retained serial continuation can sit outside a lanes checkpoint's replay source.
+        // Its checked recovered-WAL constructor independently verifies every supplied canonical
+        // record against this anchor before it seeds the incremental identity cursor below.
+        let durable_identity = engine.commit_state().canonical_identity;
         engine.install_reconciled_transaction_statuses(segment_path)?;
         let initial_index = engine.commit_state().repl.peek_next_index();
         let serial_count = if let Some(checkpoint) = &lanes_checkpoint {
@@ -1001,14 +1027,20 @@ impl Engine {
                     WalDurability::DEFAULT_FUA_SEGMENT_BYTES,
                 ),
             };
-            WalBuffer::with_recovered_fua_durable_segment(
+            WalBuffer::with_recovered_fua_durable_segment_bound_to_identity(
                 segment_path,
                 serial_records,
                 lanes,
                 segment_bytes,
+                durable_identity,
             )?
         } else if let Some(recovery) = &serial_recovery {
-            WalBuffer::with_recovered_durable_segment(segment_path, serial_records, recovery)?
+            WalBuffer::with_recovered_durable_segment_bound_to_identity(
+                segment_path,
+                serial_records,
+                recovery,
+                durable_identity,
+            )?
         } else {
             // No serial log on disk (a lanes database whose serial WAL never flushed): create a
             // fresh durable buffer per env, exactly like the durable constructor.
@@ -1016,9 +1048,17 @@ impl Engine {
                 WalDurability::FuaFencePool {
                     lanes,
                     segment_bytes,
-                } => WalBuffer::with_fua_durable_segment(segment_path, lanes, segment_bytes)?,
+                } => WalBuffer::with_fua_durable_segment_bound_to_identity(
+                    segment_path,
+                    lanes,
+                    segment_bytes,
+                    durable_identity,
+                )?,
                 #[allow(unreachable_patterns)]
-                _ => WalBuffer::with_durable_segment(segment_path),
+                _ => WalBuffer::with_durable_segment_bound_to_identity(
+                    segment_path,
+                    durable_identity,
+                )?,
             }
         };
         engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
@@ -1100,13 +1140,19 @@ impl Engine {
         let mut identity_records = checkpoint_records.clone();
         identity_records.extend_from_slice(&recovery.records);
         engine.bind_durable_identity_for_recovery(segment_path, &identity_records)?;
+        let durable_identity = engine.commit_state().canonical_identity;
         engine.begin_recovery_replay();
         let checkpoint_count = checkpoint_records.len();
         let mut records = checkpoint_records;
         records.extend_from_slice(&recovery.records);
         engine.replay_durable_records(&records)?;
         engine.commit_state_mut().wal =
-            WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
+            WalBuffer::with_recovered_durable_segment_bound_to_identity(
+                segment_path,
+                records,
+                &recovery,
+                durable_identity,
+            )?;
         if overlap > 0 {
             // Repair: complete the crashed rotation's truncation so the live segment converges
             // to the suffix-only layout (the overlap-skip above makes the pre-repair state
@@ -1232,6 +1278,14 @@ impl Engine {
     }
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
+        self.relational_resident_bytes_and_entries_for_gpu(gpu_id).0
+    }
+
+    /// Exact GPU-residency accounting plus the number of resident-accounting map entries it
+    /// actually walked. The entry count is diagnostic only; the byte total remains the sole
+    /// admission authority. Keeping both in one traversal prevents a probe from reporting a
+    /// synthetic capacity-search count as if it were retained-allocation accounting work.
+    pub(crate) fn relational_resident_bytes_and_entries_for_gpu(&self, gpu_id: u16) -> (u64, u64) {
         // Lifetime registry first: explicit snapshot capture uses registry -> descriptor/cache.
         // Holding it across the current-map scan makes replacement/purge and capture/accounting
         // linearizable even though publishers themselves never need this read-side registry lock.
@@ -1241,6 +1295,7 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut current_allocation_identities = BTreeSet::new();
         let snapshots = self.read_state.residency.snapshots.load();
+        let mut accounting_entries = (snapshots.len() as u64).saturating_mul(2);
         current_allocation_identities.extend(snapshots.values().filter_map(|entry| {
             entry
                 .device_memory
@@ -1265,14 +1320,18 @@ impl Engine {
         ]
         .into_iter()
         .map(|sidecars| {
-            sidecars.retained_bytes_matching(gpu_id, |table| {
+            let (bytes, entries) = sidecars.retained_bytes_and_entries_matching(gpu_id, |table| {
                 snapshots
                     .get(table)
                     .is_some_and(|entry| entry.descriptor.gpu_id == gpu_id)
-            })
+            });
+            accounting_entries = accounting_entries.saturating_add(entries);
+            bytes
         })
         .sum::<u64>();
         let shards = self.read_state.residency.shards.load();
+        let shard_entries = shards.values().map(Vec::len).sum::<usize>() as u64;
+        accounting_entries = accounting_entries.saturating_add(shard_entries.saturating_mul(2));
         current_allocation_identities.extend(shards.values().flatten().flat_map(|shard| {
             [
                 shard.device_memory.as_ref(),
@@ -1309,6 +1368,7 @@ impl Engine {
                 .wave_index
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            accounting_entries = accounting_entries.saturating_add(cache.len() as u64);
             for memory in cache
                 .values()
                 .filter_map(|index| index.index_memory.as_ref())
@@ -1328,6 +1388,7 @@ impl Engine {
                 .shard_pk_device_index
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            accounting_entries = accounting_entries.saturating_add(cache.len() as u64);
             for memory in cache
                 .values()
                 .filter_map(|index| index.device_index.as_ref())
@@ -1347,6 +1408,7 @@ impl Engine {
                 .chunk_key_index
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            accounting_entries = accounting_entries.saturating_add(cache.len() as u64);
             for index in cache.values() {
                 device_index_allocations.insert(
                     (index.device.metadata().gpu_id, index.device.device_ptr()),
@@ -1363,6 +1425,7 @@ impl Engine {
                 .chunk_key_bloom
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            accounting_entries = accounting_entries.saturating_add(cache.len() as u64);
             for bloom in cache.values() {
                 device_index_allocations.insert(
                     (bloom.device.metadata().gpu_id, bloom.device.device_ptr()),
@@ -1377,6 +1440,7 @@ impl Engine {
             .filter(|((device, _), _)| *device == gpu_id)
             .map(|(_, bytes)| bytes)
             .sum::<u64>();
+        accounting_entries = accounting_entries.saturating_add(retained_gpu.len() as u64);
         let retained_orphan_bytes = retained_gpu
             .iter()
             .filter(|((device, ptr), _)| {
@@ -1385,16 +1449,16 @@ impl Engine {
             .map(|(_, (bytes, _owners))| *bytes)
             .sum::<u64>();
         drop(retained_gpu);
-        let route_descriptors = self
-            .read_state
-            .residency
-            .sharded_point_routes
-            .load()
+        let sharded_point_routes = self.read_state.residency.sharded_point_routes.load();
+        accounting_entries = accounting_entries.saturating_add(sharded_point_routes.len() as u64);
+        let route_descriptors = sharded_point_routes
             .values()
             .filter(|route| route.gpu_id == gpu_id)
             .map(|route| route.plan.descriptor_allocated_bytes())
             .sum::<u64>();
-        let live_compound_routes = self.live_compound_point_route_bytes_for_gpu(gpu_id);
+        let (live_compound_routes, compound_route_entries) =
+            self.live_compound_point_route_bytes_and_entries_for_gpu(gpu_id);
+        accounting_entries = accounting_entries.saturating_add(compound_route_entries);
         let private_bytes = self
             .transaction_private_gpu_bytes
             .lock()
@@ -1402,7 +1466,7 @@ impl Engine {
             .get(&gpu_id)
             .copied()
             .unwrap_or(0);
-        snapshot_bytes
+        let bytes = snapshot_bytes
             .saturating_add(snapshot_sidecar_bytes)
             .saturating_add(shard_bytes)
             .saturating_add(device_index_bytes)
@@ -1410,7 +1474,8 @@ impl Engine {
             .saturating_add(route_descriptors)
             .saturating_add(live_compound_routes)
             .saturating_add(private_bytes)
-            .saturating_sub(Self::active_transaction_commit_gpu_credit(gpu_id))
+            .saturating_sub(Self::active_transaction_commit_gpu_credit(gpu_id));
+        (bytes, accounting_entries)
     }
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {

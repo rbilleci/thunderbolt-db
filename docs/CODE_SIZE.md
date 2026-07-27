@@ -87,9 +87,15 @@ Add accepted exceptions to the table below. An exception records a current archi
 any proposed remediation belongs in `PLAN.md`. Re-review an exception when the file grows by 20%, gains a new
 responsibility, changes its public boundary, or reaches the stated trigger.
 
-There are currently no accepted exceptions. Under the comment-excluded count, `crates/engine/src/engine_expr.rs`
-has 1,926 counted lines (2,403 physical lines less 477 comment-only lines), so its former exception is no longer
-needed. Its completed historical disposition remains in `PLAN.md` and `STATUS.md`.
+There is currently one accepted exception:
+
+| File | Policy count | Architecture fact and re-review trigger |
+|---|---:|---|
+| `crates/sql/src/lib.rs` | 2,025 production lines (2,052 physical less 27 comment-only) | Stable SQL crate facade re-exported wholesale by `gpu_db_protocol` and consumed directly by engine, facade, planner, and server code. It retains the shared `ParseError`, catalog/control DDL dispatch, and identifier/quote/clause utilities that bind the remaining root parser family; 123 Rust files reference `gpu_db_sql`. INSERT-001 added only the private `lexical.rs` leaf declaration and its stable re-export, while the allocation-free implementation remains in that bounded 162-line leaf. Splitting the root during the classifier behavior slice would violate the behavior/structure separation rule for a 25-line breach. Re-review on any further net production growth, a new root-owned SQL family, a public-boundary change, or a count of 2,100 lines, whichever comes first. |
+
+Under the comment-excluded count, `crates/engine/src/engine_expr.rs` has 1,926 counted lines (2,403 physical lines
+less 477 comment-only lines), so its former exception is no longer needed. Its completed historical disposition
+remains in `PLAN.md` and `STATUS.md`.
 
 ## Candidate inventory command
 

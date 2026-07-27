@@ -332,11 +332,12 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         self.check_intent_params(route, params)?;
         let logical_request = route.synthesize_text(params);
-        let request_digest = gpu_db_wal::canonical_request_digest(logical_request.as_bytes());
+        let request =
+            crate::engine_dml_concurrent::CanonicalRequest::from_text(self, &logical_request);
         let table_access = match self.acquire_autocommit_table_access_after_retry(
             &route.table,
             txn_id,
-            request_digest,
+            request.digest(),
         )? {
             StableRetryOr::Terminal(_) => return Ok(()),
             StableRetryOr::Fresh(access) => access,
@@ -351,6 +352,7 @@ impl Engine {
             route,
             params,
             &logical_request,
+            request,
             read_snapshot,
         ) {
             IntentBuild::Item(mut item) => {
@@ -449,11 +451,12 @@ impl Engine {
     ) -> Result<IntentTicket, ExecuteError> {
         self.check_intent_params(route, params)?;
         let logical_request = route.synthesize_text(params);
-        let request_digest = gpu_db_wal::canonical_request_digest(logical_request.as_bytes());
+        let request =
+            crate::engine_dml_concurrent::CanonicalRequest::from_text(self, &logical_request);
         let table_access = match self.acquire_autocommit_table_access_after_retry(
             &route.table,
             txn_id,
-            request_digest,
+            request.digest(),
         )? {
             StableRetryOr::Terminal(affected_rows) => {
                 return Ok(IntentTicket {
@@ -472,7 +475,7 @@ impl Engine {
             let snapshot_hold =
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
             if let Some(mut intent) =
-                self.build_lane_intent(txn_id, route, params, request_digest, read_snapshot)
+                self.build_lane_intent(txn_id, route, params, request.digest(), read_snapshot)
             {
                 intent.table_access = Some(table_access);
                 let retry = match self.claim_lane_intent(&mut intent) {
@@ -525,6 +528,7 @@ impl Engine {
             route,
             params,
             &logical_request,
+            request,
             read_snapshot,
         ) {
             IntentBuild::Item(mut item) => {
@@ -1084,6 +1088,7 @@ impl Engine {
         route: &CoveredInsertRoute,
         params: &[i32],
         logical_request: &str,
+        request: crate::engine_dml_concurrent::CanonicalRequest,
         read_snapshot: Index,
     ) -> IntentBuild {
         // Re-derive eligibility against the LIVE catalog generation. The gate must match what the
@@ -1160,7 +1165,7 @@ impl Engine {
         IntentBuild::Item(self.make_covered_insert_wave_item(
             txn_id,
             cmd,
-            logical_request,
+            request,
             write_set,
             read_snapshot,
             prepared_catalog_seq,

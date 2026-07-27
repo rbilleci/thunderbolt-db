@@ -486,7 +486,7 @@ impl Engine {
         // excludes applies during the rebuild, and the live count re-converges the
         // extension chain (entry.row_count == the next apply's base) instead of
         // looping through rebuild-per-wave. Cache HITS above stay lock-free.
-        // U1 WAL-FIRST: the apply LEADER already holds `device_apply_lock` (the delete
+        // U1 WAL-FIRST: the apply LEADER already holds the residency mutation gate (the delete
         // visible-locate rebuilds under it), so re-taking it here would self-deadlock — skip the
         // guard when the leader thread-local is set; the leader's exclusivity already gives the
         // rebuild what the guard provides.
@@ -494,12 +494,13 @@ impl Engine {
         let _lane_rebuild_guard = if apply_leader || apply_already_locked {
             None
         } else {
-            self.intent_lanes.as_ref().map(|lanes| {
-                lanes
-                    .device_apply_lock
+            Some(
+                self.read_state
+                    .residency
+                    .mutation_gate
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            })
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
         };
         let (
             build_memory,
@@ -568,9 +569,8 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_key_column_validity_offset(&live, table, p))
                 .collect::<Option<Vec<Option<u64>>>>());
-            // CAPACITY-SIZED INDEX: size the hash table once for the shard's
-            // full capacity (clamped to the builder's 2^30 slot limit via the
-            // sizing_rows argument), so capacity-exhaustion rebuilds are
+            // CAPACITY-HORIZON INDEX: reserve one allocation for the shard's
+            // full physical capacity, so capacity-exhaustion rebuilds are
             // impossible for the shard's lifetime — only ptr changes
             // (re-admission) rebuild, and the floor above makes those rare.
             let capacity_rows = live.capacity as u64;
@@ -657,39 +657,45 @@ impl Engine {
         // is mutation/publication plumbing and may already name a replacement generation; reloading it here could
         // pair a captured payload with unrelated DELETE state.
         let deleted_by = build_deleted_by;
-        // GROWTH HEADROOM (E2.5b-2): size the rebuilt table for 2x the current
-        // rows, not 1x. The builder's natural rule next_pow2(rows*2) can land
-        // capacity EXACTLY at the current row count (whenever rows*2 is a power
-        // of two), so the very next append re-drops the entry and the probe
-        // rebuilds again — measured as 222 O(rows) rebuilds in one 8s lane run
-        // (~seconds of DtoH+build+HtoD). Sizing for 2x makes the drop->rebuild
-        // cadence geometric: log2(final/initial) rebuilds per shard lifetime.
-        // The table only ever holds `keys` (real rows); the extra slots are
-        // empty probe space (sparser = faster linear probing).
-        let sizing_rows = if self.intent_lanes.is_some() {
-            // lanes: size for the shard's capacity once (see live rebuild note)
-            row_count_u64
-                .saturating_mul(2)
-                .max(build_capacity_rows.saturating_mul(2))
-                .min(1_u64 << 29)
-        } else {
-            row_count_u64
-                .saturating_mul(2)
-                .max(build_capacity_rows.saturating_mul(2))
-                .min(1_u64 << 29)
-        };
-        let table_size = some_or_decline!(sizing_rows
-            .checked_mul(2)
-            .and_then(u64::checked_next_power_of_two));
-        if table_size > (1_u64 << 30) {
-            return Ok(None);
-        }
+        // One GPU directory is retained for the whole physical append horizon. Its 2x horizon
+        // keeps the table at <=50% load through the final append without the former 4x-capacity
+        // expansion that needlessly displaced point-read state from cache. The independent
+        // named-index budget estimate calls this same helper, so admission accounting and the
+        // actual allocation cannot drift.
+        let table_size =
+            some_or_decline!(crate::engine_residency::resident_shard_index_table_size(
+                row_count_u64,
+                build_capacity_rows,
+            ));
         let table_mask = (table_size - 1) as u32;
         let hash_shift = 32 - table_size.trailing_zeros();
+        let posting_rows = build_capacity_rows.max(row_count_u64);
         let index_bytes = some_or_decline!(gpu_db_execution::resident_index_allocated_bytes(
             table_mask,
-            build_capacity_rows.max(row_count_u64),
+            posting_rows,
         ));
+        // Permanent build-only probes: cache hits return before this point, and all calls vanish
+        // without `probe-timing`. The index-build submission has no CUDA-event timing surface;
+        // do not report `last_kernel_event_elapsed_us`, which may belong to an earlier point read.
+        #[cfg(feature = "probe-timing")]
+        let (index_build_probe, directory_bytes, posting_bytes) = (
+            gpu_db_execution::Probe::start(),
+            some_or_decline!(gpu_db_execution::resident_index_hash_bytes(table_mask)),
+            some_or_decline!(posting_rows.checked_mul(std::mem::size_of::<u32>() as u64)),
+        );
+        #[cfg(feature = "probe-timing")]
+        {
+            gpu_db_execution::Probe::value("point_index_nonempty_shard", 1, "bool");
+            gpu_db_execution::Probe::value("point_index_live_rows", row_count_u64, "rows");
+            gpu_db_execution::Probe::value(
+                "point_index_capacity_rows",
+                build_capacity_rows,
+                "rows",
+            );
+            gpu_db_execution::Probe::value("point_index_directory_bytes", directory_bytes, "B");
+            gpu_db_execution::Probe::value("point_index_posting_bytes", posting_bytes, "B");
+            gpu_db_execution::Probe::value("point_index_geometry_capacity_horizon", 1, "bool");
+        }
         // Only the retained zeroed table affects the residency cap, so serialize allocation, build,
         // and publication. `cuMemsetD8` initializes it without an O(table) host zero vector/H2D.
         let _budget_allocation = (!budget_already_locked).then(|| {
@@ -724,6 +730,8 @@ impl Engine {
                 || deleted_by.is_some()
                 || key_id & crate::engine_residency::COMPOUND_KEY_ID_FLAG != 0,
         )?;
+        #[cfg(feature = "probe-timing")]
+        index_build_probe.mark("point_index_build_wall");
         let device_index = (!index_status.declined).then(|| Arc::new(mem));
         let result = device_index.clone().map(|di| {
             (

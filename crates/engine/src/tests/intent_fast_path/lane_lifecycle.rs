@@ -956,7 +956,7 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
     let classic = engine.make_covered_insert_wave_item(
         txn_ids.fetch_add(1, Ordering::Relaxed),
         gpu_db_sql::parse_command(classic_text).unwrap(),
-        classic_text,
+        crate::engine_dml_concurrent::CanonicalRequest::from_text(&engine, classic_text),
         crate::write_path::WriteSet::default(),
         engine.committed_seq(),
         engine.catalog_snapshot().commit_seq,

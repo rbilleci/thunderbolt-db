@@ -1,5 +1,6 @@
 //! Resident append, rollover, sparse-version stamping, and fused-apply ownership.
 
+use super::append_source::ResidentAppendSource;
 use super::*;
 
 impl Engine {
@@ -32,12 +33,13 @@ impl Engine {
         let _apply = if apply_leader {
             None
         } else {
-            self.intent_lanes.as_ref().map(|lanes| {
-                lanes
-                    .device_apply_lock
+            Some(
+                self.read_state
+                    .residency
+                    .mutation_gate
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            })
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
         };
         if new_rows.is_empty() {
             return false;
@@ -59,7 +61,12 @@ impl Engine {
             .get(table)
             .is_some_and(|shards| !shards.is_empty())
         {
-            return self.try_append_to_resident_open_shard(table, new_rows, created_by, row_ids);
+            return self.try_append_to_resident_open_shard(
+                table,
+                ResidentAppendSource::Rows(new_rows),
+                created_by,
+                row_ids,
+            );
         }
         // SINGLE-BUFFER path only: a NULL in an appended row would need a validity bitmap, but the single
         // buffer this path appends into is bitmap-free by construction (the `purely_int4` eligibility below
@@ -276,14 +283,50 @@ impl Engine {
             .map(|column| column.ty)
             .collect::<Vec<_>>();
         let has_text = types.iter().any(|ty| matches!(ty, SqlType::Text));
-        let new_capacity = if has_text || batch_has_null {
-            k
-        } else if self.relational_residency_budget_bytes(gpu_id).is_some() {
-            k.saturating_mul(2).next_power_of_two()
-        } else {
-            self.shard_size_target()
-                .max(k.saturating_mul(2).next_power_of_two())
-        };
+        let named_indexes_required =
+            final_named_indexes_required || self.relational_named_index_publication_required(table);
+        if !has_text && !batch_has_null {
+            let desired_capacity =
+                super::rollover::ResidentRolloverPlan::fixed_width_desired_capacity(
+                    k,
+                    Some(self.shard_size_target()),
+                )
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "transaction fixed-width rollover capacity overflowed".to_string(),
+                    ))
+                })?;
+            // This is the pre-WAL half of the same sealed planner used by the global rollover
+            // publisher. The reservation itself is charged under `budget_allocation_lock` by
+            // `TransactionGpuReservation::reserve`; the later apply deliberately replans under
+            // that lock rather than smuggling a stale device/shape token through the canonical
+            // WAL envelope. Any generation/GPU/layout drift therefore fails closed at apply.
+            let current_bytes = self.relational_resident_bytes_for_gpu(gpu_id);
+            let remaining_budget = self
+                .relational_residency_budget_bytes(gpu_id)
+                .map(|budget| budget.saturating_sub(current_bytes));
+            let plan = super::rollover::ResidentRolloverPlan::fixed_width_null_free(
+                table,
+                &types,
+                k,
+                desired_capacity,
+                true,
+                named_indexes_required,
+                remaining_budget,
+            )?
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" cannot fit a dense fixed-width rollover before WAL",
+                    table.name
+                )))
+            })?;
+            return Ok((gpu_id, plan.total_allocation_bytes()));
+        }
+
+        // Text and NULL-carrying generations stay dense. Their variable-length/validity sections
+        // have no capacity-strided append contract, so budget pressure must not invent `2*k`
+        // headroom for this fallback.
+        let new_capacity = k;
         let (payload, ..) =
             build_relational_device_payload_with_capacity(&names, &types, new_rows, new_capacity)
                 .map_err(|error| {
@@ -292,9 +335,7 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let named_index_bytes = if final_named_indexes_required
-            || self.relational_named_index_publication_required(table)
-        {
+        let named_index_bytes = if named_indexes_required {
             estimated_named_index_bytes_for_shard(table, k, new_capacity).ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has unsupported mandatory index allocation geometry",
@@ -326,17 +367,17 @@ impl Engine {
     /// open shard on overflow is S-d2c), or the device append fails. Shard tables read via device
     /// recompaction and have no single-buffer `wave_index` to drop. The device PK-index cache is
     /// `(ptr,row_count)`-validated, so an in-place append makes the next probe rebuild or extend it.
-    fn try_append_to_resident_open_shard(
+    pub(super) fn try_append_to_resident_open_shard(
         &self,
         table: &str,
-        new_rows: &[Vec<SqlValue>],
+        mut source: ResidentAppendSource<'_, '_>,
         created_by: AppendCreatedBy<'_>,
         row_ids: Option<&[u64]>,
     ) -> bool {
         // D3: materialize one birth stamp per appended row (validated len) — the in-place branch
         // stamps them into the open shard's created_by region and the rollover branch bakes them
         // into the new shard's region; both bump the descriptor's max_created_by high-water.
-        let Some(stamps) = created_by.stamps_for(new_rows.len()) else {
+        let Some(stamps) = created_by.stamps_for(source.row_count()) else {
             return false;
         };
         let stamps_max = stamps.iter().copied().max().unwrap_or(0);
@@ -346,13 +387,11 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .clone();
-        let k = new_rows.len();
+        let k = source.row_count();
         // ADR-006 (NULL coverage): does this appended BATCH carry any NULL? A null-bearing batch cannot
         // append in place (the in-place chunk encoder has no validity-bitmap channel); it rolls a DENSE
         // shard whose bitmaps the payload builder constructs — exactly like a text column.
-        let batch_has_null = new_rows
-            .iter()
-            .any(|row| row.iter().any(|v| matches!(v, SqlValue::Null)));
+        let batch_has_null = source.has_null();
         // Read the OPEN (last) shard's state once.
         let (
             shard_id,
@@ -367,7 +406,6 @@ impl Engine {
             shard_null_layouts,
             gpu_id,
             schema,
-            max_shard_id,
         ) = {
             let shards = self.read_state.residency.shards.load();
             let Some(table_shards) = shards.get(table) else {
@@ -376,7 +414,11 @@ impl Engine {
             let Some(open) = table_shards.last() else {
                 return false;
             };
-            if !open.int4_appendable || !open.is_valid(pressured_gpus.contains(&open.gpu_id)) {
+            let pressured = pressured_gpus.contains(&open.gpu_id);
+            if !open.int4_appendable
+                || !open.is_valid(pressured)
+                || !source.matches_open_descriptor(open, pressured)
+            {
                 return false;
             }
             (
@@ -392,21 +434,19 @@ impl Engine {
                 open.resident_device_null_columns.clone(),
                 open.gpu_id,
                 open.schema.clone(),
-                table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
             )
         };
         // TYPE-COVERAGE track 2 slice 2 stage (ii): CATALOG-ordered names/types drive the
         // section-aware chunk encoder + the rollover payload (mixed i32/i64 sections —
         // catalog order != section ordinal). Defensive arity guard: the shard's section
         // lists must cover the catalog exactly, else decline to the re-admit oracle.
-        let Some(catalog_table) = self
-            .catalog_snapshot()
-            .relational_catalog
-            .get(table)
-            .cloned()
-        else {
+        let catalog = self.catalog_snapshot();
+        let Some(catalog_table) = catalog.relational_catalog.get(table).cloned() else {
             return false;
         };
+        if !source.matches_current_catalog(&catalog_table, catalog.commit_seq) {
+            return false;
+        }
         let column_names: Vec<String> = catalog_table
             .columns
             .iter()
@@ -438,6 +478,7 @@ impl Engine {
         let num_i64_cols = shard_int8_names.len();
         let num_numeric_cols = shard_numeric_names.len();
         let num_bool_cols = shard_bool_layouts.len();
+        let preheld_budget_reservation = source.holds_budget_reservation();
 
         // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path). Text / null-bearing
         // shards never qualify (dense: row_count == capacity), and a null-carrying batch is excluded so it
@@ -457,12 +498,7 @@ impl Engine {
             };
             // The append position within THIS shard's buffer is its LOCAL row_count (rows [0, row_count)
             // are live; the new rows go at [row_count, row_count+k)), NOT the shard's global `row_start`.
-            let chunks = match compute_open_shard_int4_append_chunks(
-                &column_types,
-                capacity,
-                row_count,
-                new_rows,
-            ) {
+            let chunks = match source.append_chunks(&column_types, capacity, row_count) {
                 Ok(chunks) => chunks,
                 Err(_) => return false,
             };
@@ -470,14 +506,9 @@ impl Engine {
             // extension, and the device index maintenance below). NULL-free by the appendable
             // guard, so `sql_value_as_int4` yields exactly the bytes the chunks encode for the
             // i32 columns.
-            let column_values: Vec<Vec<i32>> = (0..column_count)
-                .map(|c| {
-                    new_rows
-                        .iter()
-                        .map(|row| sql_value_as_int4(&row[c]))
-                        .collect()
-                })
-                .collect();
+            let Some(column_values) = source.i32_columns(column_count) else {
+                return false;
+            };
             // E2.5c 2M+ push (b): the FUSED merged-apply device pass — column scatter +
             // created_by/row-id stamps + PK index insert in ONE staging HtoD + ONE launch
             // (replacing the ~8 driver calls of the unfused chain below). Int4-only shards
@@ -498,17 +529,19 @@ impl Engine {
                     .take(column_count)
                     .map(|chunk| chunk.byte_offset)
                     .collect();
+                let column_value_slices = column_values.slices();
                 let outcome = self.try_fused_apply_in_place(
                     table,
                     shard_id,
                     &shard_device_memory,
                     &chunk_offsets,
-                    &column_values,
+                    &column_value_slices,
                     row_count,
                     capacity,
                     gpu_id,
                     &stamps,
                     row_ids,
+                    preheld_budget_reservation,
                 );
                 if let Some(started) = append_started {
                     crate::engine_dml_concurrent::WAVE_DEVICE_STATS[1].fetch_add(
@@ -553,10 +586,13 @@ impl Engine {
                 // stamps: the slots are still invisible headroom, so a torn (bits written, count not
                 // bumped) state is unreadable, and a failure -> false -> re-admit (rebuild is truthful).
                 for layout in &shard_bool_layouts {
+                    let Some(rows) = source.rows() else {
+                        return false;
+                    };
                     let Some(col_idx) = column_names.iter().position(|n| n == &layout.name) else {
                         return false; // shard/catalog bool label mismatch -> decline to the oracle
                     };
-                    let values: Vec<u8> = new_rows
+                    let values: Vec<u8> = rows
                         .iter()
                         .map(|row| match row[col_idx] {
                             SqlValue::Bool(true) => 1u8,
@@ -579,7 +615,13 @@ impl Engine {
                 // SV5 P2 double-read window this gate closes. A stamp failure -> false -> the caller re-admits
                 // (the re-admit purge releases any partial region; rebuild-all-live is always correct).
                 if !self.stamp_created_by_resident_shard_slots(
-                    table, shard_id, row_count, capacity, gpu_id, &stamps,
+                    table,
+                    shard_id,
+                    row_count,
+                    capacity,
+                    gpu_id,
+                    &stamps,
+                    preheld_budget_reservation,
                 ) {
                     return false;
                 }
@@ -599,35 +641,35 @@ impl Engine {
             // S-d3: extend the open shard's zone map (min/max per int4 column) to cover the appended
             // rows. The stats vector is INT4-ORDINAL-aligned, so iterate only the i32-section catalog
             // columns, in order (stage ii: i64 columns carry no zone map — they simply never prune).
-            let new_min_max: Vec<(i32, i32)> = (0..column_count)
-                .filter(|&c| {
-                    matches!(
-                        column_types[c],
-                        SqlType::Int4 | SqlType::Date | SqlType::Int2
-                    )
-                })
-                .map(|c| {
-                    new_rows.iter().fold((i32::MAX, i32::MIN), |(lo, hi), row| {
-                        let v = sql_value_as_int4(&row[c]);
-                        (lo.min(v), hi.max(v))
-                    })
-                })
-                .collect();
+            let Some(new_min_max) = source.int4_min_max(&column_types) else {
+                return false;
+            };
             // M1 (ledger #24): incrementally maintain the DEVICE PK index too (the index_insert
             // kernel), so the wave-batched device locate never triggers the O(rows) rebuild.
             // Only fires when a device index is cached; no-op otherwise.
             if !fused {
                 let idx_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                     .then(std::time::Instant::now);
-                if !self.extend_shard_pk_device_index_on_append(
-                    table,
-                    shard_id,
-                    shard_device_memory.device_ptr(),
-                    row_count,
-                    &column_values,
-                    new_rows,
-                ) {
-                    return false;
+                if let (Some(rows), Some(column_values)) = (source.rows(), column_values.rows()) {
+                    if !self.extend_shard_pk_device_index_on_append(
+                        table,
+                        shard_id,
+                        shard_device_memory.device_ptr(),
+                        row_count,
+                        column_values,
+                        rows,
+                    ) {
+                        return false;
+                    }
+                } else {
+                    // A sealed fixed-i32 source is admitted only for a no-index catalog shape.
+                    // Retire any impossible stale index basis before descriptor publication.
+                    if !catalog_table.indexes.is_empty() {
+                        return false;
+                    }
+                    self.read_state
+                        .residency
+                        .purge_shard_pk_index_for_table(table);
                 }
                 if let Some(started) = idx_started {
                     crate::engine_dml_concurrent::WAVE_DEVICE_STATS[2].fetch_add(
@@ -640,23 +682,31 @@ impl Engine {
                 // secondaries still require their fingerprint candidates before row-count publication.
                 let idx_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                     .then(std::time::Instant::now);
-                if !self.extend_shard_fingerprint_device_indexes_on_append(
-                    table,
-                    shard_id,
-                    shard_device_memory.device_ptr(),
-                    row_count,
-                    new_rows,
-                ) {
+                if let Some(rows) = source.rows() {
+                    if !self.extend_shard_fingerprint_device_indexes_on_append(
+                        table,
+                        shard_id,
+                        shard_device_memory.device_ptr(),
+                        row_count,
+                        rows,
+                    ) {
+                        return false;
+                    }
+                    if !self.named_indexes_cover_after_fused_append(
+                        table,
+                        shard_id,
+                        shard_device_memory.device_ptr(),
+                        row_count,
+                        row_count + k,
+                    ) {
+                        return false;
+                    }
+                } else if !catalog_table.indexes.is_empty() {
                     return false;
-                }
-                if !self.named_indexes_cover_after_fused_append(
-                    table,
-                    shard_id,
-                    shard_device_memory.device_ptr(),
-                    row_count,
-                    row_count + k,
-                ) {
-                    return false;
+                } else {
+                    self.read_state
+                        .residency
+                        .purge_shard_pk_index_for_table(table);
                 }
                 if let Some(started) = idx_started {
                     crate::engine_dml_concurrent::WAVE_DEVICE_STATS[2].fetch_add(
@@ -694,151 +744,325 @@ impl Engine {
             return true;
         }
 
-        // S-d2c ROLLOVER: the open shard is full -> SEAL it (leave it in place, immutable) and build + install
-        // a NEW open shard holding the k rows (capacity = the target, so it grows to the target before the
-        // next rollover). O(rows appended), NOT the O(table) re-admit -> this is what removes the 536M cap.
-        // TYPE-COVERAGE #14 (text): a text column has NO capacity-strided headroom (the builder rejects
-        // capacity > row_count for text), so a text-bearing rollover shard is DENSE (capacity == k) — it
-        // never appends in place; the NEXT commit rolls another dense shard. Fixed-width/bool rollovers
-        // keep the growth headroom.
+        // S-d2c ROLLOVER: the open shard is full -> seal it in place and build a new private
+        // generation. Fixed-width, NULL-free batches use the fit-aware plan below; text/NULL keep
+        // the established dense builder because their layouts cannot append into headroom.
         let has_text = column_types.iter().any(|ty| matches!(ty, SqlType::Text));
-        // ADR-006 (NULL coverage): a null-carrying batch rolls a DENSE shard (capacity == k, like text) so
-        // the validity bitmaps are exact for the live rows and the shard never appends in place afterward
-        // (which would need in-place bitmap maintenance). A fixed-width null-FREE batch keeps growth headroom.
-        let new_capacity = if has_text || batch_has_null {
-            k
-        } else if self.relational_residency_budget_bytes(gpu_id).is_some() {
-            k.saturating_mul(2).next_power_of_two()
-        } else {
-            self.shard_size_target()
-                .max(k.saturating_mul(2).next_power_of_two())
-        };
-        let (device_payload, text_layouts, bool_layouts, int4_stats, null_layouts) =
-            match build_relational_device_payload_with_capacity(
-                &column_names,
-                &column_types,
-                new_rows,
-                new_capacity,
-            ) {
-                // Keep the columnar payload + the int4 zone-map stats (min/max over the k rows) for pruning
-                // (S-d3). TYPE-COVERAGE #14: the bool bitmap AND text (offsets+blob) layouts (offsets into
-                // THIS payload) carry. ADR-006 (NULL coverage): the VALIDITY BITMAP layouts (`null_cols`,
-                // offsets into THIS payload) now ALSO carry, so a null-carrying rollover STAYS ELIDED with
-                // correct NULL-ness (was discarded, forcing a de-elide via re-admit). Null-free batch -> empty.
-                Ok((payload, text_cols, bool_cols, stats, _b128, null_cols)) => {
-                    (payload, text_cols, bool_cols, stats, null_cols)
-                }
-                Err(_) => return false,
-            };
-        // R-1 / S-F: rollover is an admission event too. Account the new payload plus its
-        // mandatory created_by region and optional row-identity region before allocating any of
-        // them. If it would cross the configured/default GPU budget, decline atomically; the
-        // caller invalidates this table and the normal admission path may evict an older table or
-        // leave this relation to the bounded streaming executor. The commit remains durable.
         let named_indexes_required =
             self.relational_named_index_publication_required(&catalog_table);
-        let named_index_bytes = if named_indexes_required {
-            let Some(bytes) =
-                estimated_named_index_bytes_for_shard(&catalog_table, k, new_capacity)
-            else {
-                return false;
-            };
-            bytes
-        } else {
-            0
+        // The allocation lock makes the exact retained/pinned-generation scan and capacity choice
+        // one transaction. It is intentionally held through the private construction: otherwise a
+        // concurrent allocation could turn a correctly planned generation into an over-budget one
+        // between the scan and CUDA allocation.
+        let _budget_allocation = match &source {
+            ResidentAppendSource::Rows(_) => Some(
+                self.read_state
+                    .residency
+                    .budget_allocation_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
+            ResidentAppendSource::FixedI32Plan(plan) => {
+                // The move-only pre-WAL plan retains this mutex through WAL. Re-locking would
+                // deadlock; accepting a plan without it would reopen the budget race it seals.
+                if !plan.holds_budget_reservation() {
+                    return false;
+                }
+                None
+            }
         };
-        let rollover_bytes = (device_payload.len() as u64)
-            .saturating_add((new_capacity as u64).saturating_mul(8))
-            .saturating_add(if row_ids.is_some() {
-                (new_capacity as u64).saturating_mul(8)
-            } else {
-                0
-            })
-            .saturating_add(named_index_bytes);
-        let _budget_allocation = self
+        // The plan is intentionally not carried through WAL. Re-observe the exact open-tail
+        // identity while the allocation transaction is held, and decline rather than applying a
+        // capacity chosen for a different generation/GPU/layout after a concurrent publication.
+        // The caller's invalidation/re-admission fallback is the only recovery path for drift.
+        let open_still_matches = self
             .read_state
             .residency
-            .budget_allocation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self
-            .relational_residency_budget_bytes(gpu_id)
-            .is_some_and(|budget| {
-                self.relational_resident_bytes_for_gpu(gpu_id)
-                    .saturating_add(rollover_bytes)
-                    > budget
-            })
-        {
-            self.read_state
-                .residency
-                .rollover_budget_declines
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .shards
+            .load()
+            .get(table)
+            .and_then(|table_shards| table_shards.last())
+            .is_some_and(|open| {
+                open.shard_id == shard_id
+                    && open.capacity == capacity
+                    && open.row_count == row_count
+                    && open.row_start == row_start
+                    && open.gpu_id == gpu_id
+                    && open.schema == schema
+                    && open.resident_device_int4_columns == shard_int4_names
+                    && open.resident_device_int8_columns == shard_int8_names
+                    && open.resident_device_numeric_columns == shard_numeric_names
+                    && open.resident_device_bool_columns == shard_bool_layouts
+                    && open.resident_device_text_columns == shard_text_layouts
+                    && open.resident_device_null_columns == shard_null_layouts
+            });
+        if !open_still_matches {
             return false;
         }
-        // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
-        // `deleted_by` is on-demand (allocated in `shard_deleted_by_memory` on the shard's first delete).
-        let Some(new_device_memory) = self
-            .relational_residency_device_memory(gpu_id, &device_payload)
-            .map(Arc::new)
-        else {
-            return false;
-        };
-        let new_shard_id = max_shard_id.saturating_add(1);
-        let pressured = pressured_gpus.contains(&gpu_id);
-        // D4 (ADR-013 pre2): build the regions BEFORE the descriptor literal so their Arcs ride the
-        // published descriptor — the map inserts below keep the same Arcs for write-side bookkeeping.
-        // SV6: a version-stamped (UPDATE-appended) rollover's created_by region must be observable
-        // with the shard itself; carrying it IN the descriptor makes that atomic by construction.
-        // D3: every rolled shard's first `k` slots carry their birth stamps; the headroom keeps the
-        // born-visible fill (0) and later appends stamp into it. The region costs 8B/slot on the
-        // OPEN shard lineage only (bulk-admitted shards stay region-free, hwm 0); reclaiming sealed
-        // shards' regions once hwm falls below every active reader is VACUUM's job (ledger #5).
-        let rolled_created_by_region = {
-            let mut created_payload =
-                vec![CREATED_BY_VISIBLE_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
-            for (slot, stamp) in stamps.iter().enumerate() {
-                created_payload[slot * 8..slot * 8 + 8].copy_from_slice(&stamp.to_le_bytes());
+        let (current_resident_bytes, budget_scan_entries) =
+            self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
+        let remaining_budget = self
+            .relational_residency_budget_bytes(gpu_id)
+            .map(|budget| budget.saturating_sub(current_resident_bytes));
+        let (
+            new_capacity,
+            new_device_memory,
+            rolled_created_by_region,
+            rolled_row_id_region,
+            int4_stats,
+            bool_layouts,
+            text_layouts,
+            null_layouts,
+            rollover_allocated_bytes,
+            rollover_probe,
+        ) = if !has_text && !batch_has_null {
+            let plan = match &source {
+                ResidentAppendSource::Rows(_) => {
+                    let desired_capacity =
+                        match super::rollover::ResidentRolloverPlan::fixed_width_desired_capacity(
+                            k,
+                            Some(self.shard_size_target()),
+                        ) {
+                            Some(desired) => desired,
+                            None => return false,
+                        };
+                    match super::rollover::ResidentRolloverPlan::fixed_width_null_free(
+                        &catalog_table,
+                        &column_types,
+                        k,
+                        desired_capacity,
+                        row_ids.is_some(),
+                        named_indexes_required,
+                        remaining_budget,
+                    ) {
+                        Ok(Some(plan)) => plan,
+                        Ok(None) | Err(_) => {
+                            self.read_state
+                                .residency
+                                .rollover_budget_declines
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return false;
+                        }
+                    }
+                }
+                ResidentAppendSource::FixedI32Plan(prepared) => {
+                    let Some(plan) = prepared.rollover_plan() else {
+                        return false;
+                    };
+                    // The pre-WAL plan selected this exact capacity under the allocation lock.
+                    // Recheck the retained-generation budget before the first CUDA allocation:
+                    // a post-WAL miss is fatal to the caller, never a reason to republish through
+                    // a fallback route.
+                    if plan.capacity() < k
+                        || row_ids.is_some() != prepared.row_ids_required()
+                        || remaining_budget
+                            .is_some_and(|remaining| plan.total_allocation_bytes() > remaining)
+                    {
+                        self.read_state
+                            .residency
+                            .rollover_budget_declines
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return false;
+                    }
+                    plan.clone()
+                }
+            };
+            let pending_result = match &mut source {
+                ResidentAppendSource::Rows(rows) => super::rollover::PendingResidentShard::build(
+                    self,
+                    gpu_id,
+                    &catalog_table,
+                    &column_types,
+                    rows,
+                    &stamps,
+                    row_ids,
+                    &plan,
+                ),
+                ResidentAppendSource::FixedI32Plan(prepared) => {
+                    let int4_stats = catalog_table
+                        .columns
+                        .iter()
+                        .zip(prepared.int4_min_max())
+                        .map(|(column, &(min, max))| ResidentDeviceInt4ColumnStats {
+                            name: column.name.clone(),
+                            min,
+                            max,
+                        })
+                        .collect();
+                    let Some(chunks) = prepared.chunks_for_rollover(plan.capacity()) else {
+                        return false;
+                    };
+                    super::rollover::PendingResidentShard::build_i32_chunks(
+                        self,
+                        gpu_id,
+                        &catalog_table,
+                        k,
+                        chunks,
+                        &stamps,
+                        row_ids,
+                        &plan,
+                        int4_stats,
+                    )
+                }
+            };
+            let pending = match pending_result {
+                Ok(pending) => pending,
+                Err(_) => return false,
+            };
+            debug_assert_eq!(
+                pending
+                    .device_memory
+                    .metadata()
+                    .allocated_bytes
+                    .saturating_add(pending.created_by_region.metadata().allocated_bytes)
+                    .saturating_add(
+                        pending
+                            .row_id_region
+                            .as_ref()
+                            .map_or(0, |region| region.metadata().allocated_bytes),
+                    ),
+                plan.allocation_bytes_before_indexes(),
+                "fixed-width rollover allocation must match its sealed plan"
+            );
+            (
+                plan.capacity(),
+                pending.device_memory,
+                Some(pending.created_by_region),
+                pending.row_id_region,
+                pending.int4_stats,
+                pending.bool_layouts,
+                Vec::new(),
+                Vec::new(),
+                plan.allocation_bytes_before_indexes(),
+                Some((
+                    plan.capacity_scan_entries(),
+                    budget_scan_entries,
+                    pending.sidecar_fill_bytes,
+                    pending.live_h2d_bytes,
+                    pending.persistent_allocation_count,
+                )),
+            )
+        } else {
+            // Dense text/NULL fallback: unchanged layout and HtoD construction. A NULL-bearing
+            // shard owns exact validity bitmaps for its k live rows; a text shard owns exact offsets
+            // and bytes. Neither has capacity-strided append headroom.
+            let Some(rows) = source.rows() else {
+                return false;
+            };
+            let new_capacity = k;
+            let (device_payload, text_layouts, bool_layouts, int4_stats, null_layouts) =
+                match build_relational_device_payload_with_capacity(
+                    &column_names,
+                    &column_types,
+                    rows,
+                    new_capacity,
+                ) {
+                    Ok((payload, text_cols, bool_cols, stats, _b128, null_cols)) => {
+                        (payload, text_cols, bool_cols, stats, null_cols)
+                    }
+                    Err(_) => return false,
+                };
+            let named_index_bytes = if named_indexes_required {
+                let Some(bytes) =
+                    estimated_named_index_bytes_for_shard(&catalog_table, k, new_capacity)
+                else {
+                    return false;
+                };
+                bytes
+            } else {
+                0
+            };
+            let rollover_bytes = (device_payload.len() as u64)
+                .saturating_add((new_capacity as u64).saturating_mul(8))
+                .saturating_add(if row_ids.is_some() {
+                    (new_capacity as u64).saturating_mul(8)
+                } else {
+                    0
+                })
+                .saturating_add(named_index_bytes);
+            let dense_live_h2d_bytes = (device_payload.len() as u64)
+                .saturating_add((new_capacity as u64).saturating_mul(8))
+                .saturating_add(if row_ids.is_some() {
+                    (new_capacity as u64).saturating_mul(8)
+                } else {
+                    0
+                });
+            if remaining_budget.is_some_and(|remaining| rollover_bytes > remaining) {
+                self.read_state
+                    .residency
+                    .rollover_budget_declines
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
             }
-            let Some(created_region) =
-                self.relational_residency_device_memory(gpu_id, &created_payload)
+            let Some(new_device_memory) = self
+                .relational_residency_device_memory(gpu_id, &device_payload)
+                .map(Arc::new)
             else {
                 return false;
             };
-            Some(Arc::new(created_region))
-        };
-        let rolled_row_id_region = if let Some(ids) = &row_ids {
-            let mut payload =
-                vec![ROW_ID_UNSTAMPED_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
-            for (slot, row_id) in ids.iter().enumerate() {
-                payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
+            let rolled_created_by_region = {
+                let mut created_payload =
+                    vec![CREATED_BY_VISIBLE_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
+                for (slot, stamp) in stamps.iter().enumerate() {
+                    created_payload[slot * 8..slot * 8 + 8].copy_from_slice(&stamp.to_le_bytes());
+                }
+                let Some(created_region) =
+                    self.relational_residency_device_memory(gpu_id, &created_payload)
+                else {
+                    return false;
+                };
+                Some(Arc::new(created_region))
+            };
+            let rolled_row_id_region = if let Some(ids) = row_ids {
+                let mut payload =
+                    vec![ROW_ID_UNSTAMPED_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
+                for (slot, row_id) in ids.iter().enumerate() {
+                    payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
+                }
+                self.relational_residency_device_memory(gpu_id, &payload)
+                    .map(Arc::new)
+            } else {
+                None
+            };
+            if row_ids.is_some() && rolled_row_id_region.is_none() {
+                return false;
             }
-            self.relational_residency_device_memory(gpu_id, &payload)
-                .map(Arc::new)
-        } else {
-            None
-        };
-        if row_ids.is_some() && rolled_row_id_region.is_none() {
-            return false;
-        }
-        let rollover_allocated_bytes = new_device_memory
-            .metadata()
-            .allocated_bytes
-            .saturating_add(
-                rolled_created_by_region
-                    .as_ref()
-                    .map_or(0, |region| region.metadata().allocated_bytes),
+            let allocated_bytes = new_device_memory
+                .metadata()
+                .allocated_bytes
+                .saturating_add(
+                    rolled_created_by_region
+                        .as_ref()
+                        .map_or(0, |region| region.metadata().allocated_bytes),
+                )
+                .saturating_add(
+                    rolled_row_id_region
+                        .as_ref()
+                        .map_or(0, |region| region.metadata().allocated_bytes),
+                );
+            (
+                new_capacity,
+                new_device_memory,
+                rolled_created_by_region,
+                rolled_row_id_region,
+                int4_stats,
+                bool_layouts,
+                text_layouts,
+                null_layouts,
+                allocated_bytes,
+                Some((
+                    0,
+                    budget_scan_entries,
+                    0,
+                    dense_live_h2d_bytes,
+                    2 + u64::from(row_ids.is_some()),
+                )),
             )
-            .saturating_add(
-                rolled_row_id_region
-                    .as_ref()
-                    .map_or(0, |region| region.metadata().allocated_bytes),
-            );
+        };
         if self
             .relational_residency_budget_bytes(gpu_id)
             .is_some_and(|budget| {
-                self.relational_resident_bytes_for_gpu(gpu_id)
-                    .saturating_add(rollover_allocated_bytes)
-                    > budget
+                current_resident_bytes.saturating_add(rollover_allocated_bytes) > budget
             })
         {
             self.read_state
@@ -847,6 +1071,15 @@ impl Engine {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
+        // The last shard is the only open shard. Deriving from it preserves ordered `(row_start,
+        // shard_id)` identity without an O(number-of-shards) max scan.
+        let Some(new_shard_id) = shard_id.checked_add(1) else {
+            return false;
+        };
+        let pressured = pressured_gpus.contains(&gpu_id);
+        // D4: every resource above was constructed before this descriptor. The private pending
+        // owner writes the fixed-width payload and sidecars before the final header; the dense
+        // fallback retains the same no-public-owner-before-descriptor property.
         let new_shard = RelationalResidentShard {
             shard_id: new_shard_id,
             row_start: row_start.saturating_add(row_count),
@@ -903,8 +1136,18 @@ impl Engine {
             row_id_region: rolled_row_id_region.clone(),
             max_created_by: stamps_max,
         };
+        // The descriptor is the first public owner: it already carries every payload/sidecar Arc.
+        // Do not publish the legacy write-side mirrors while a pending generation is still being
+        // built, because a failed private build must be released solely by its local owner.
+        self.read_state
+            .residency
+            .with_shards_mut_for_table(table, |shards| {
+                if let Some(table_shards) = shards.get_mut(table) {
+                    table_shards.push(new_shard);
+                }
+            });
         // Write-side bookkeeping mirrors of the SAME Arcs (alloc/stamp/purge choreography unchanged);
-        // readers take them from the published descriptor above.
+        // readers take resources from the one-load published descriptor above.
         if let Some(created_region) = rolled_created_by_region {
             self.read_state
                 .residency
@@ -917,20 +1160,11 @@ impl Engine {
                 .shard_row_id_memory
                 .insert_shard(table, new_shard_id, region);
         }
-        // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard
-        // in the shards list always finds its device memory (the recompaction loads the list then the memory).
         self.read_state.residency.shard_device_memory.insert_shard(
             table,
             new_shard_id,
             new_device_memory,
         );
-        self.read_state
-            .residency
-            .with_shards_mut_for_table(table, |shards| {
-                if let Some(table_shards) = shards.get_mut(table) {
-                    table_shards.push(new_shard);
-                }
-            });
         // PRODUCT-002: a rollover is a new resident generation, so every declared index must cover
         // the new shard before the commit can publish visibility. Existing shards are cache hits;
         // only this k-row shard builds. The surrounding admission budget guard remains the single
@@ -958,6 +1192,8 @@ impl Engine {
             } else {
                 table_shards.as_slice()
             };
+            #[cfg(feature = "probe-timing")]
+            let publish_shard_visits = publish_shards.len() as u64;
             if self
                 .publish_relational_resident_indexes_for_generation(
                     &catalog_table,
@@ -978,7 +1214,39 @@ impl Engine {
                     .flag_table_descriptors_invalidated(table, boundary, boundary);
                 return false;
             }
+            #[cfg(feature = "probe-timing")]
+            self.record_insert_probe_named_index_shard_visits(publish_shard_visits);
         }
+        #[cfg(feature = "probe-timing")]
+        if let Some((
+            capacity_fit_evaluations,
+            budget_scans,
+            sidecar_fills,
+            live_h2d,
+            persistent_allocations,
+        )) = rollover_probe
+        {
+            let current_shards = self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(table)
+                .map_or(0, |table_shards| table_shards.len() as u64);
+            self.record_insert_probe_rollover_geometry(
+                crate::engine_insert_probe::InsertProbeRolloverGeometry {
+                    capacity_rows: new_capacity as u64,
+                    current_shards,
+                    persistent_allocations,
+                    capacity_fit_evaluations,
+                    budget_scans,
+                    sidecar_fills,
+                    live_h2d,
+                },
+            );
+        }
+        #[cfg(not(feature = "probe-timing"))]
+        let _ = rollover_probe;
         self.read_state
             .residency
             .open_shard_append_hits
@@ -1162,6 +1430,7 @@ impl Engine {
         shard_id: u32,
         capacity: usize,
         gpu_id: u16,
+        budget_reservation_held: bool,
     ) -> Option<Arc<CudaResidentDeviceMemory>> {
         if let Some(region) = self
             .read_state
@@ -1171,12 +1440,13 @@ impl Engine {
         {
             return Some(region);
         }
-        let _budget_allocation = self
-            .read_state
-            .residency
-            .budget_allocation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _budget_allocation = (!budget_reservation_held).then(|| {
+            self.read_state
+                .residency
+                .budget_allocation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         if let Some(region) = self
             .read_state
             .residency
@@ -1235,18 +1505,19 @@ impl Engine {
     /// - `Some(false)` -> device failure mid-pass; bytes live only in invisible headroom, the
     ///   caller must NOT publish and must invalidate + re-admit (the unfused contract).
     #[allow(clippy::too_many_arguments)]
-    fn try_fused_apply_in_place(
+    pub(super) fn try_fused_apply_in_place(
         &self,
         table: &str,
         shard_id: u32,
         shard_device_memory: &Arc<CudaResidentDeviceMemory>,
         chunk_offsets: &[u64],
-        column_values: &[Vec<i32>],
+        column_values: &[&[i32]],
         row_count: usize,
         capacity: usize,
         gpu_id: u16,
         stamps: &[Index],
         row_ids: Option<&[u64]>,
+        budget_reservation_held: bool,
     ) -> Option<bool> {
         let k = stamps.len();
         if k == 0
@@ -1258,8 +1529,13 @@ impl Engine {
         }
         let base_row_u32 = u32::try_from(row_count).ok()?;
         // created_by region (get-or-allocate — same semantics as the unfused stamp path).
-        let created_by_region =
-            self.get_or_alloc_created_by_region(table, shard_id, capacity, gpu_id)?;
+        let created_by_region = self.get_or_alloc_created_by_region(
+            table,
+            shard_id,
+            capacity,
+            gpu_id,
+            budget_reservation_held,
+        )?;
         // Row-id region: get-or-skip, exactly like `stamp_row_id_resident_shard_slots` (a
         // region-less lineage stamps nothing).
         let row_ids_arg = row_ids.and_then(|ids| {
@@ -1371,7 +1647,11 @@ impl Engine {
             }
         }
         // Flatten col-major values + owned per-column destinations.
-        let values: Vec<i32> = column_values.iter().flatten().copied().collect();
+        let values: Vec<i32> = column_values
+            .iter()
+            .flat_map(|column| column.iter())
+            .copied()
+            .collect();
         let columns: Vec<gpu_db_execution::CudaWriteDestination> = chunk_offsets
             .iter()
             .map(|&byte_offset| gpu_db_execution::CudaWriteDestination {
@@ -1470,7 +1750,7 @@ impl Engine {
         }
     }
 
-    fn stamp_row_id_resident_shard_slots(
+    pub(super) fn stamp_row_id_resident_shard_slots(
         &self,
         table: &str,
         shard_id: u32,
@@ -1521,6 +1801,7 @@ impl Engine {
         gpu_id: u16,
         // D3: one birth stamp per appended slot (the wave-batched flush spans commit seqs).
         stamps: &[Index],
+        budget_reservation_held: bool,
     ) -> bool {
         let k = stamps.len();
         if k == 0 {
@@ -1531,8 +1812,13 @@ impl Engine {
         if first_slot.saturating_add(k) > capacity {
             return false;
         }
-        let Some(region) = self.get_or_alloc_created_by_region(table, shard_id, capacity, gpu_id)
-        else {
+        let Some(region) = self.get_or_alloc_created_by_region(
+            table,
+            shard_id,
+            capacity,
+            gpu_id,
+            budget_reservation_held,
+        ) else {
             return false;
         };
         let mut bytes = Vec::with_capacity(std::mem::size_of_val(stamps));

@@ -9,6 +9,8 @@ use super::*;
 use crate::engine_mutation_admission::validate_transaction_characteristics;
 use crate::engine_transaction_reset::StableRetryOr;
 
+mod canonical;
+mod fixed_insert;
 mod lane;
 mod lane_apply;
 mod request;
@@ -16,11 +18,12 @@ mod state;
 mod wave;
 
 pub(crate) use state::{
-    new_pending_outcome, CommitWaveItem, CommitWaveOutcome, CommitWaveState, LaneIntent, LaneOpKind,
+    new_pending_outcome, CanonicalRequest, CommitWaveItem, CommitWaveOutcome, CommitWaveState,
+    LaneIntent, LaneOpKind,
 };
 #[cfg(test)]
 use state::{wave_tail_failure_publish_hook, wave_tail_handoff_hook};
-use state::{CommitWaveDone, CommitWaveQueue, CommitWaveTail};
+use state::{CommitWaveDone, CommitWaveQueue, CommitWaveTail, OfflockPreparedDml};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmlExecutionResult {
@@ -703,7 +706,7 @@ impl Engine {
     fn rekey_offlock_insert_delta(
         delta: &crate::write_path::WriteDelta,
         snapshot: DmlReadSnapshot,
-    ) -> crate::write_path::WriteDelta {
+    ) -> Result<crate::write_path::WriteDelta, ExecuteError> {
         let crate::write_path::PreparedMutation::Insert {
             table,
             inserted_rows,
@@ -716,13 +719,23 @@ impl Engine {
             .iter()
             .enumerate()
             .map(|(offset, (_stale_key, values))| {
-                (
-                    relational_row_key(table, snapshot.next_row_id + offset as u64),
+                let offset = u64::try_from(offset).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "re-keyed INSERT row-id offset exceeds u64".to_string(),
+                    ))
+                })?;
+                let row_id = snapshot.next_row_id.checked_add(offset).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "re-keyed INSERT row-id range overflows before WAL".to_string(),
+                    ))
+                })?;
+                Ok::<(String, Vec<SqlValue>), ExecuteError>((
+                    relational_row_key(table, row_id),
                     values.clone(),
-                )
+                ))
             })
-            .collect();
-        crate::write_path::WriteDelta {
+            .collect::<Result<_, _>>()?;
+        Ok(crate::write_path::WriteDelta {
             write_set: delta.write_set.clone(),
             read_snapshot: snapshot.commit_seq,
             catalog_dependencies: delta.catalog_dependencies.clone(),
@@ -733,7 +746,7 @@ impl Engine {
                 inserted_rows: rekeyed,
                 seq_advances: seq_advances.clone(),
             },
-        }
+        })
     }
 
     /// Enqueue one prepared concurrent DML commit into the deterministic commit WAVE and block
@@ -754,26 +767,32 @@ impl Engine {
     /// one publish PER WAVE instead of per commit, and the apply loop runs back-to-back on one
     /// core (the sequencer) instead of bouncing the MVCC structures across every writer's cache.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_dml_concurrent(
+    fn commit_dml_concurrent(
         &self,
         txn_id: u64,
         cmd: Command,
-        text: &str,
+        request: CanonicalRequest,
         write_set: WriteSet,
         read_snapshot: Index,
         prepared_catalog_seq: Index,
         expected_catalog_version: Option<
             crate::engine_mutation_admission::CatalogVersionExpectation,
         >,
-        offlock_delta: Option<crate::write_path::WriteDelta>,
+        offlock_prepared: Option<OfflockPreparedDml>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        #[cfg(any(test, debug_assertions))]
+        debug_assert!(offlock_prepared
+            .as_ref()
+            .is_none_or(|prepared| prepared.matches_request(&request)));
         let item = CommitWaveItem {
             txn_id,
             cmd,
-            payload: std::sync::Arc::from(text.as_bytes()),
+            request,
             prepared_catalog_seq,
             expected_catalog_version,
-            offlock_delta,
+            offlock_prepared,
+            #[cfg(feature = "probe-timing")]
+            fixed_insert_typed: false,
             binary_wal_template: None,
             table_access: None,
             write_set,
@@ -805,7 +824,7 @@ impl Engine {
         &self,
         txn_id: u64,
         cmd: Command,
-        text: &str,
+        request: CanonicalRequest,
         write_set: WriteSet,
         read_snapshot: Index,
         prepared_catalog_seq: Index,
@@ -815,10 +834,13 @@ impl Engine {
         CommitWaveItem {
             txn_id,
             cmd,
-            payload: std::sync::Arc::from(text.as_bytes()),
+            request,
             prepared_catalog_seq,
             expected_catalog_version: None,
-            offlock_delta,
+            offlock_prepared: offlock_delta
+                .map(|delta| OfflockPreparedDml::legacy(delta, read_snapshot)),
+            #[cfg(feature = "probe-timing")]
+            fixed_insert_typed: false,
             binary_wal_template,
             table_access: None,
             write_set,
@@ -1218,6 +1240,13 @@ impl Engine {
     /// waiter or the sequencer); requires no locks beyond what `wait_group_durable` takes
     /// internally, and never the commit_mutex the sequencer may be holding for the next wave.
     fn finish_wave_tail(&self, mut tail: CommitWaveTail) {
+        #[cfg(feature = "probe-timing")]
+        let probe_has_insert = tail
+            .batch
+            .iter()
+            .any(|item| matches!(&item.cmd, Command::Insert(_)));
+        #[cfg(not(feature = "probe-timing"))]
+        let probe_has_insert = false;
         // AUDIT d6d10f8e D (documented decision): on an fsync FAILURE the flusher arm panics on
         // the CLAIMING thread — which may be a client whose OWN statement is already durably
         // acked (it claimed a DIFFERENT wave's tail). That client observes a panic for a
@@ -1292,7 +1321,14 @@ impl Engine {
             engine: self,
             clean: false,
         };
-        if let Err(err) = self.wait_group_durable(tail.last_position) {
+        #[cfg(feature = "probe-timing")]
+        let probe_durability_started = probe_has_insert.then(Instant::now);
+        let durability_result = self.wait_group_durable(tail.last_position, probe_has_insert);
+        #[cfg(feature = "probe-timing")]
+        if let Some(started) = probe_durability_started {
+            self.record_insert_probe_durability_wait_nanos(started.elapsed().as_nanos() as u64);
+        }
+        if let Err(err) = durability_result {
             // The wave's deltas are applied-but-unpublishable; the flush protocol has recorded
             // its sticky failure (and the flusher wedge-panicked if we were the flusher — in
             // that case this line is unreachable and the completion guard runs on unwind). Fail
@@ -1307,6 +1343,8 @@ impl Engine {
             drop(tail); // armed: fail outcomes; a wedged service publishes no later visibility
             return;
         }
+        #[cfg(feature = "probe-timing")]
+        let probe_publication_started = probe_has_insert.then(Instant::now);
         let last_committed_seq = tail.committed.last().map(|(_, seq, _)| *seq);
         if let Err(error) =
             self.publish_ready_indices(tail.committed.iter().map(|(_, commit_seq, _)| *commit_seq))
@@ -1334,7 +1372,20 @@ impl Engine {
         }
         for (position, _seq, rows) in &tail.committed {
             self.metrics.inc_commit();
+            #[cfg(feature = "probe-timing")]
+            if matches!(&tail.batch[*position].cmd, Command::Insert(_)) {
+                self.record_insert_probe_success(*rows);
+                if tail.batch[*position].fixed_insert_typed {
+                    self.record_insert_probe_fixed_insert_typed_commit();
+                }
+            }
             tail.batch[*position].set_outcome(Ok(*rows));
+        }
+        #[cfg(feature = "probe-timing")]
+        if let Some(started) = probe_publication_started {
+            self.record_insert_probe_publication_status_ack_nanos(
+                started.elapsed().as_nanos() as u64
+            );
         }
         tail.armed = false;
         completion.clean = true;
@@ -1405,12 +1456,16 @@ impl Engine {
         }
     }
 
-    fn wait_group_durable(&self, wal_position: usize) -> Result<(), EngineError> {
+    fn wait_group_durable(
+        &self,
+        wal_position: usize,
+        probe_insert: bool,
+    ) -> Result<(), EngineError> {
         // E1 step 2 — FUA fence-pool backend: no single-flusher election. Every committer whose
         // record isn't yet covered runs its own `begin_group_flush` + `job.commit()` concurrently;
         // the WAL's ticket gate keeps frames ordered and the fence pool pipelines durability.
         if self.group_flush.concurrent_durability {
-            return self.wait_group_durable_concurrent(wal_position);
+            return self.wait_group_durable_concurrent(wal_position, probe_insert);
         }
         loop {
             if self
@@ -1458,15 +1513,34 @@ impl Engine {
             // then run the write + fsync with NO lock held — this is what lets other committers
             // validate/append/apply (and queue into the NEXT group) while this group's disk IO is
             // in flight. Completion takes only the WAL core's own lock, never the commit_mutex.
+            #[cfg(feature = "probe-timing")]
+            let probe_begin_started = probe_insert.then(Instant::now);
             let begun = {
                 let mut commit = self.commit_state();
                 commit.wal.begin_group_flush()
             };
+            #[cfg(feature = "probe-timing")]
+            if let Some(started) = probe_begin_started {
+                self.record_insert_probe_durability_begin_group_flush_nanos(
+                    started.elapsed().as_nanos() as u64,
+                );
+            }
             let flush_result = match begun {
                 Ok(gpu_db_wal::WalGroupFlushBegin::Clean { flushed_records }) => {
                     Ok(flushed_records)
                 }
-                Ok(gpu_db_wal::WalGroupFlushBegin::Job(job)) => job.commit(),
+                Ok(gpu_db_wal::WalGroupFlushBegin::Job(job)) => {
+                    #[cfg(feature = "probe-timing")]
+                    let probe_job_started = probe_insert.then(Instant::now);
+                    let result = job.commit();
+                    #[cfg(feature = "probe-timing")]
+                    if let Some(started) = probe_job_started {
+                        self.record_insert_probe_durability_job_wait_nanos(
+                            started.elapsed().as_nanos() as u64,
+                        );
+                    }
+                    result
+                }
                 Err(err) => Err(err),
             };
             let mut coord = self
@@ -1511,7 +1585,11 @@ impl Engine {
     /// shared `durable_records` mirror (spin-then-yield, no per-commit wakeup) until the owning
     /// thread's fence completes and advances it. Visibility still gates on the durable frontier
     /// exactly as the serial path; a fence/publish/roll failure wedges fail-closed identically.
-    fn wait_group_durable_concurrent(&self, wal_position: usize) -> Result<(), EngineError> {
+    fn wait_group_durable_concurrent(
+        &self,
+        wal_position: usize,
+        _probe_insert: bool,
+    ) -> Result<(), EngineError> {
         loop {
             if self
                 .group_flush
@@ -1534,6 +1612,8 @@ impl Engine {
             // (ours included) into ONE larger frame. This recreates serial-election batching but
             // with up to `lanes` groups pipelined instead of one. `fua_free_fence_slots` is `None`
             // on the serial backend (never reached here) → treat as "a lane is free".
+            #[cfg(feature = "probe-timing")]
+            let probe_begin_started = _probe_insert.then(Instant::now);
             let begun = {
                 let mut commit = self.commit_state();
                 if commit.wal.fua_free_fence_slots().unwrap_or(1) == 0 {
@@ -1542,6 +1622,12 @@ impl Engine {
                     Some(commit.wal.begin_group_flush())
                 }
             };
+            #[cfg(feature = "probe-timing")]
+            if let Some(started) = probe_begin_started {
+                self.record_insert_probe_durability_begin_group_flush_nanos(
+                    started.elapsed().as_nanos() as u64,
+                );
+            }
             match begun {
                 None => {
                     // Pacing back-off: another begin will cover us once a lane frees. Poll the
@@ -1562,16 +1648,27 @@ impl Engine {
                         return Ok(());
                     }
                 }
-                Some(Ok(gpu_db_wal::WalGroupFlushBegin::Job(job))) => match job.commit() {
-                    Ok(flushed_records) => {
-                        self.group_flush
-                            .durable_records
-                            .fetch_max(flushed_records, AtomicOrdering::AcqRel);
-                        // Loop: our own record was appended before this frame was published, so the
-                        // frontier now covers it.
+                Some(Ok(gpu_db_wal::WalGroupFlushBegin::Job(job))) => {
+                    #[cfg(feature = "probe-timing")]
+                    let probe_job_started = _probe_insert.then(Instant::now);
+                    let result = job.commit();
+                    #[cfg(feature = "probe-timing")]
+                    if let Some(started) = probe_job_started {
+                        self.record_insert_probe_durability_job_wait_nanos(
+                            started.elapsed().as_nanos() as u64,
+                        );
                     }
-                    Err(err) => return Err(self.wedge_group_flush(err)),
-                },
+                    match result {
+                        Ok(flushed_records) => {
+                            self.group_flush
+                                .durable_records
+                                .fetch_max(flushed_records, AtomicOrdering::AcqRel);
+                            // Loop: our own record was appended before this frame was published, so the
+                            // frontier now covers it.
+                        }
+                        Err(err) => return Err(self.wedge_group_flush(err)),
+                    }
+                }
                 Some(Err(err)) => return Err(self.wedge_group_flush(err)),
             }
         }

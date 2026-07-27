@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+probe-timing = ["gpu_db_facade/probe-timing"]
+
 # Engine-backed pgwire server (prototype→production plan, P0-M3). Serves the
 # relational subset through the protocol-neutral façade: pgwire wire framing from
 # `gpu_db_protocol`, execution via `gpu_db_facade` over the real `Engine`. This is

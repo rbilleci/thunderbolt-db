@@ -7,9 +7,27 @@
 
 use super::*;
 
+/// One resident index directory has two slots for every row that can appear in the current shard
+/// generation. This keeps linear probing at or below 50% load for the full open-shard lifetime,
+/// while its posting-link suffix still reserves exactly one link per physical row.
+///
+/// The CUDA directory ABI uses a 30-bit slot count and 31-bit physical row ids. Returning `None`
+/// makes an optional route decline before allocation when either bound cannot be represented.
+pub(crate) fn resident_shard_index_table_size(
+    live_rows: u64,
+    physical_capacity: u64,
+) -> Option<u64> {
+    if live_rows == 0 {
+        return None;
+    }
+    let horizon = live_rows.max(physical_capacity);
+    let table_size = horizon.checked_mul(2)?.checked_next_power_of_two()?;
+    (table_size <= (1_u64 << 30)).then_some(table_size)
+}
+
 /// Exact retained bytes for every distinct named-index key id on one shard. The sizing mirrors
-/// `ensure_shard_pk_device_index`: capacity-sized directory headroom plus one posting link per row
-/// of shard capacity. Shared key ids are charged once because publication reuses their allocation.
+/// `ensure_shard_pk_device_index`: a directory at the full physical append horizon plus one posting
+/// link per physical row. Shared key ids are charged once because publication reuses their allocation.
 pub(crate) fn estimated_named_index_key_bytes_for_shard(
     row_count: usize,
     capacity: usize,
@@ -17,14 +35,7 @@ pub(crate) fn estimated_named_index_key_bytes_for_shard(
     if row_count == 0 {
         return Some(0);
     }
-    let sizing_rows = (row_count as u64)
-        .saturating_mul(2)
-        .max((capacity as u64).saturating_mul(2))
-        .min(1_u64 << 29);
-    let table_size = sizing_rows.checked_mul(2)?.checked_next_power_of_two()?;
-    if table_size > (1_u64 << 30) {
-        return None;
-    }
+    let table_size = resident_shard_index_table_size(row_count as u64, capacity as u64)?;
     gpu_db_execution::resident_index_allocated_bytes(
         (table_size - 1) as u32,
         capacity.max(row_count) as u64,
@@ -52,6 +63,10 @@ pub(crate) fn estimated_named_index_bytes_for_shard(
 
 /// Snapshot construction, admission, and publication ownership.
 mod admission;
+/// Logical input forms for the one mutation-owned resident append publisher.
+mod append_source;
+/// Sealed INSERT-001 typed-column adaptation for the serial-wave cutover.
+mod fixed_insert;
 /// Vacuum, serialized rehydration, and device-gather ownership.
 mod maintenance;
 /// Resident append, rollover, sparse-version stamping, and fused-apply ownership.
@@ -60,21 +75,28 @@ mod mutation;
 mod payload;
 /// Residency feature policy, elision eligibility, and telemetry ownership.
 mod policy;
+/// Fit-aware fixed-width rollover planning and private device construction ownership.
+mod rollover;
 /// Residency warmup, route planning, and status ownership.
 mod routes;
 /// Commit auto-admission, transient relations, and benchmark installation ownership.
 mod transient;
 
+#[allow(unused_imports)] // some sealed apply errors are asserted only by focused tests
+pub(crate) use fixed_insert::{
+    PreparedI32AppendApplyError, PreparedI32AppendPrepareError, PreparedI32AppendRowIds,
+    PreparedI32OpenShardAppendPlan,
+};
 pub(crate) use payload::{
     build_relational_device_payload, build_relational_device_payload_with_capacity,
     compound_index_row_fingerprint, compound_key_fingerprint, compound_key_type_supported,
-    compound_unique_slot_id, compute_open_shard_int4_append_chunks, i32_section_needle,
-    index_all_key_columns_foldable, index_is_compound, index_key_column_positions,
-    index_probe_key_id, index_uses_fingerprint, key_column_width_words, parse_relational_row_id,
-    probe_key_id_positions, sql_value_as_int4, sql_value_from_i32_section,
-    sql_value_from_i64_section, sql_value_key_words, AppendCreatedBy, UnifiedResidentSnapshotParts,
-    COMPOUND_KEY_ID_FLAG, CREATED_BY_VISIBLE_FILL_BYTE, DELETED_BY_LIVE_FILL_BYTE,
-    ROW_ID_UNSTAMPED_FILL_BYTE,
+    compound_unique_slot_id, compute_open_shard_i32_column_append_chunks,
+    compute_open_shard_int4_append_chunks, i32_section_needle, index_all_key_columns_foldable,
+    index_is_compound, index_key_column_positions, index_probe_key_id, index_uses_fingerprint,
+    key_column_width_words, parse_relational_row_id, probe_key_id_positions, sql_value_as_int4,
+    sql_value_from_i32_section, sql_value_from_i64_section, sql_value_key_words, AppendCreatedBy,
+    UnifiedResidentSnapshotParts, COMPOUND_KEY_ID_FLAG, CREATED_BY_VISIBLE_FILL_BYTE,
+    DELETED_BY_LIVE_FILL_BYTE, ROW_ID_UNSTAMPED_FILL_BYTE,
 };
 
 #[cfg(test)]
@@ -415,15 +437,29 @@ impl Engine {
     }
 
     pub(crate) fn live_compound_point_route_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
-        self.read_state
+        self.live_compound_point_route_bytes_and_entries_for_gpu(gpu_id)
+            .0
+    }
+
+    /// Compound-route accounting with the exact map entries inspected. The byte total remains
+    /// unchanged; the entry count feeds build-only rollover diagnostics.
+    pub(crate) fn live_compound_point_route_bytes_and_entries_for_gpu(
+        &self,
+        gpu_id: u16,
+    ) -> (u64, u64) {
+        let routes = self
+            .read_state
             .residency
             .live_compound_point_route_bytes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entries = routes.len() as u64;
+        let bytes = routes
             .iter()
             .filter(|((charged_gpu, _), _)| *charged_gpu == gpu_id)
             .map(|(_, bytes)| *bytes)
-            .sum()
+            .sum();
+        (bytes, entries)
     }
 
     pub(crate) fn live_compound_point_route_bytes_for_table(

@@ -251,6 +251,603 @@ fn durable_flush_preserves_history_across_flushes() {
 fn remove_segment_files(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(wal_tail_offset_path(path));
+    let _ = fs::remove_file(durable_identity_path(path));
+}
+
+fn identity_test_value(tag: u8) -> CanonicalIdentity {
+    CanonicalIdentity {
+        database_id: [tag; 16],
+        cluster_id: [tag.wrapping_add(1); 16],
+        timeline_id: [tag.wrapping_add(2); 16],
+        format_epoch: u64::from(tag),
+    }
+}
+
+fn canonical_identity_test_record(txn_id: TxnId, identity: CanonicalIdentity) -> WalRecord {
+    let operation = CanonicalFragment {
+        kind: CanonicalFragmentKind::RowMutation,
+        body: txn_id.to_le_bytes().to_vec(),
+    };
+    let request_digest = canonical_request_digest(&operation.body);
+    let encoded = encode_canonical_envelope(
+        CanonicalPhysicalRange {
+            log_epoch: 1,
+            lane_id: 0,
+            segment_id: 1,
+            first_frame_ordinal: txn_id,
+        },
+        &CanonicalPreApplyHeader {
+            identity,
+            leader_epoch: 1,
+            commit_seq: txn_id,
+            stable_transaction_id: txn_id,
+            request_digest,
+            isolation: CanonicalIsolation::ReadCommitted,
+            flags: 0,
+            catalog_before_epoch: 0,
+            catalog_after_epoch: 0,
+            catalog_before_digest: [1; 32],
+            catalog_after_digest: [1; 32],
+            operation_count: 1,
+            table_block_count: 1,
+            allocator_high_water: txn_id,
+        },
+        &[operation],
+        &CanonicalOutcome {
+            kind: CanonicalOutcomeKind::CommitSuccess,
+            affected_rows: 1,
+            sqlstate: None,
+            constraint_id: 0,
+            target_digest: request_digest,
+            returning_digest: [0; 32],
+        },
+    )
+    .expect("canonical identity test envelope");
+    WalRecord {
+        txn_id,
+        payload: pack_canonical_record_payload(&encoded)
+            .expect("canonical identity test payload")
+            .into(),
+    }
+}
+
+fn prepared_canonical_catalog_test_record(
+    txn_id: TxnId,
+    identity: CanonicalIdentity,
+    catalog_before_epoch: u64,
+    catalog_after_epoch: u64,
+    catalog_before_digest: CanonicalDigest,
+    catalog_after_digest: CanonicalDigest,
+    kind: CanonicalFragmentKind,
+) -> PreparedCanonicalWalRecord {
+    let operation = CanonicalFragment {
+        kind,
+        body: txn_id.to_le_bytes().to_vec(),
+    };
+    let request_digest = canonical_request_digest(&operation.body);
+    encode_canonical_envelope(
+        CanonicalPhysicalRange {
+            log_epoch: 1,
+            lane_id: 0,
+            segment_id: txn_id,
+            first_frame_ordinal: txn_id,
+        },
+        &CanonicalPreApplyHeader {
+            identity,
+            leader_epoch: 1,
+            commit_seq: txn_id,
+            stable_transaction_id: txn_id,
+            request_digest,
+            isolation: CanonicalIsolation::ReadCommitted,
+            flags: u32::from(kind as u16),
+            catalog_before_epoch,
+            catalog_after_epoch,
+            catalog_before_digest,
+            catalog_after_digest,
+            operation_count: 1,
+            table_block_count: 1,
+            allocator_high_water: txn_id,
+        },
+        &[operation],
+        &CanonicalOutcome {
+            kind: CanonicalOutcomeKind::CommitSuccess,
+            affected_rows: 1,
+            sqlstate: None,
+            constraint_id: 0,
+            target_digest: request_digest,
+            returning_digest: [0; 32],
+        },
+    )
+    .expect("canonical catalog test envelope")
+    .into_prepared_record(txn_id)
+    .expect("canonical catalog test record")
+}
+
+#[test]
+fn canonical_append_cache_avoids_tail_decodes_and_preserves_header_chain_bytes() {
+    let identity = identity_test_value(37);
+    let catalog_digest = [9; 32];
+    let mut wal = WalBuffer::new();
+    for txn_id in 1..=16 {
+        let prepared = prepared_canonical_catalog_test_record(
+            txn_id,
+            identity,
+            0,
+            0,
+            catalog_digest,
+            catalog_digest,
+            CanonicalFragmentKind::RowMutation,
+        );
+        let expected = prepared.as_wal_record().clone();
+        wal.append_canonical(prepared);
+        assert_eq!(wal.last_record(), Some(&expected));
+        let tail = wal.canonical_catalog_tail().unwrap().unwrap();
+        assert_eq!(tail.identity, identity);
+        assert_eq!(tail.catalog_after_epoch, 0);
+        assert_eq!(tail.catalog_after_digest, catalog_digest);
+        let envelope = decode_canonical_record_payload(&expected.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.header.catalog_before_epoch, 0);
+        assert_eq!(envelope.header.catalog_before_digest, catalog_digest);
+        assert_eq!(
+            envelope.header.catalog_after_epoch,
+            tail.catalog_after_epoch
+        );
+        assert_eq!(
+            envelope.header.catalog_after_digest,
+            tail.catalog_after_digest
+        );
+    }
+    assert_eq!(
+        wal.canonical_catalog_tail_decodes_for_test(),
+        0,
+        "sealed append must not re-decode the prior logical tail"
+    );
+}
+
+#[test]
+fn canonical_append_cache_chains_row_catalog_row_boundaries() {
+    let identity = identity_test_value(41);
+    let genesis = [3; 32];
+    let catalog_after = [4; 32];
+    let mut wal = WalBuffer::new();
+    wal.append_canonical(prepared_canonical_catalog_test_record(
+        1,
+        identity,
+        0,
+        0,
+        genesis,
+        genesis,
+        CanonicalFragmentKind::RowMutation,
+    ));
+    let row_tail = wal.canonical_catalog_tail().unwrap().unwrap();
+    wal.append_canonical(prepared_canonical_catalog_test_record(
+        2,
+        identity,
+        row_tail.catalog_after_epoch,
+        1,
+        row_tail.catalog_after_digest,
+        catalog_after,
+        CanonicalFragmentKind::CatalogMutation,
+    ));
+    let catalog_tail = wal.canonical_catalog_tail().unwrap().unwrap();
+    wal.append_canonical(prepared_canonical_catalog_test_record(
+        3,
+        identity,
+        catalog_tail.catalog_after_epoch,
+        catalog_tail.catalog_after_epoch,
+        catalog_tail.catalog_after_digest,
+        catalog_tail.catalog_after_digest,
+        CanonicalFragmentKind::RowMutation,
+    ));
+
+    wal.flush_all().unwrap();
+    let headers = wal
+        .flushed_records()
+        .iter()
+        .map(|record| {
+            decode_canonical_record_payload(&record.payload)
+                .unwrap()
+                .unwrap()
+                .header
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(headers.len(), 3);
+    assert_eq!(
+        headers[1].catalog_before_epoch,
+        headers[0].catalog_after_epoch
+    );
+    assert_eq!(
+        headers[1].catalog_before_digest,
+        headers[0].catalog_after_digest
+    );
+    assert_eq!(
+        headers[2].catalog_before_epoch,
+        headers[1].catalog_after_epoch
+    );
+    assert_eq!(
+        headers[2].catalog_before_digest,
+        headers[1].catalog_after_digest
+    );
+    let final_header = &headers[2];
+    assert_eq!(final_header.catalog_before_epoch, 1);
+    assert_eq!(final_header.catalog_before_digest, catalog_after);
+    assert_eq!(final_header.catalog_after_epoch, 1);
+    assert_eq!(final_header.catalog_after_digest, catalog_after);
+    assert_eq!(wal.canonical_catalog_tail_decodes_for_test(), 0);
+}
+
+#[test]
+fn canonical_tail_retries_from_surviving_or_empty_rollback_boundary() {
+    let identity = identity_test_value(45);
+    let first_digest = [6; 32];
+    let second_digest = [7; 32];
+    let mut wal = WalBuffer::new();
+    wal.append_canonical(prepared_canonical_catalog_test_record(
+        1,
+        identity,
+        0,
+        0,
+        first_digest,
+        first_digest,
+        CanonicalFragmentKind::RowMutation,
+    ));
+    wal.append_canonical(prepared_canonical_catalog_test_record(
+        2,
+        identity,
+        0,
+        1,
+        first_digest,
+        second_digest,
+        CanonicalFragmentKind::CatalogMutation,
+    ));
+    wal.truncate(1);
+    let surviving = wal.canonical_catalog_tail().unwrap().unwrap();
+    assert_eq!(surviving.catalog_after_epoch, 0);
+    assert_eq!(surviving.catalog_after_digest, first_digest);
+    wal.append_canonical(prepared_canonical_catalog_test_record(
+        3,
+        identity,
+        surviving.catalog_after_epoch,
+        surviving.catalog_after_epoch,
+        surviving.catalog_after_digest,
+        surviving.catalog_after_digest,
+        CanonicalFragmentKind::RowMutation,
+    ));
+    wal.truncate(0);
+    assert_eq!(wal.canonical_catalog_tail().unwrap(), None);
+    assert_eq!(
+        wal.canonical_catalog_tail_decodes_for_test(),
+        1,
+        "surviving rollback tail decodes once; known-empty rollback does not"
+    );
+}
+
+#[test]
+fn generic_malformed_canonical_tail_fails_closed_and_legacy_prefix_is_neutral() {
+    let identity = identity_test_value(49);
+    let mut malformed = prepared_canonical_catalog_test_record(
+        1,
+        identity,
+        0,
+        0,
+        [8; 32],
+        [8; 32],
+        CanonicalFragmentKind::RowMutation,
+    )
+    .into_wal_record();
+    malformed.payload = malformed.payload[..16].to_vec().into();
+    let mut wal = WalBuffer::new();
+    wal.append(malformed);
+    assert!(wal.canonical_catalog_tail().is_err());
+
+    let mut legacy_first = WalBuffer::new();
+    legacy_first.append(WalRecord {
+        txn_id: 1,
+        payload: b"legacy prefix".to_vec().into(),
+    });
+    assert_eq!(legacy_first.canonical_catalog_tail().unwrap(), None);
+    legacy_first.append_canonical(prepared_canonical_catalog_test_record(
+        2,
+        identity,
+        0,
+        0,
+        [8; 32],
+        [8; 32],
+        CanonicalFragmentKind::RowMutation,
+    ));
+    assert_eq!(
+        legacy_first
+            .canonical_catalog_tail()
+            .unwrap()
+            .unwrap()
+            .identity,
+        identity
+    );
+}
+
+#[test]
+fn recovered_constructor_lazily_recovers_canonical_catalog_tail() {
+    let path = test_wal_path("canonical-tail-reopen");
+    let identity = identity_test_value(53);
+    {
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        wal.append_canonical(prepared_canonical_catalog_test_record(
+            1,
+            identity,
+            0,
+            0,
+            [10; 32],
+            [10; 32],
+            CanonicalFragmentKind::RowMutation,
+        ));
+        wal.flush_all().unwrap();
+    }
+    let recovery = recover_wal_segment(&path).unwrap();
+    let mut reopened =
+        WalBuffer::with_recovered_durable_segment(&path, recovery.records.clone(), &recovery)
+            .unwrap();
+    assert_eq!(reopened.canonical_catalog_tail_decodes_for_test(), 0);
+    let tail = reopened.canonical_catalog_tail().unwrap().unwrap();
+    assert_eq!(tail.identity, identity);
+    assert_eq!(tail.catalog_after_digest, [10; 32]);
+    assert_eq!(reopened.canonical_catalog_tail_decodes_for_test(), 1);
+    drop(reopened);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn serial_identity_anchor_loss_after_binding_rejects_before_physical_wal_handoff() {
+    let path = test_wal_path("identity-incremental-serial");
+    let identity = identity_test_value(1);
+    let mut wal = WalBuffer::with_durable_segment(&path);
+
+    wal.append(WalRecord {
+        txn_id: 1,
+        payload: b"legacy WAL payload".to_vec().into(),
+    });
+    wal.flush_all()
+        .expect("unbound legacy history remains flushable");
+    assert_eq!(read_durable_identity(&path).unwrap(), None);
+    assert_eq!(wal.flushed_count(), 1);
+
+    wal.append(canonical_identity_test_record(2, identity));
+    wal.flush_all().expect("initial canonical bind");
+    assert_eq!(read_durable_identity(&path).unwrap(), Some(identity));
+    assert_eq!(wal.flushed_count(), 2);
+    assert_eq!(wal.durable_identity_decoded_records_for_test(), 2);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 2);
+
+    fs::remove_file(durable_identity_path(&path)).expect("remove identity anchor");
+    wal.append(canonical_identity_test_record(3, identity));
+    let error = wal
+        .flush_all()
+        .expect_err("bound anchor loss must reject before serial WAL IO");
+    assert!(error.to_string().contains("anchor is missing"));
+
+    assert_eq!(read_durable_identity(&path).unwrap(), None);
+    assert_eq!(wal.flushed_count(), 2, "anchor loss cannot advance durable");
+    assert_eq!(read_wal_segment(&path).unwrap().len(), 2);
+    assert_eq!(wal.durable_identity_decoded_records_for_test(), 3);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 2);
+
+    write_durable_identity(&path, identity).expect("restore identity anchor");
+    wal.flush_all()
+        .expect("restored anchor retries the same unverified tail");
+    assert_eq!(wal.flushed_count(), 3);
+    assert_eq!(read_wal_segment(&path).unwrap().len(), 3);
+    assert_eq!(wal.durable_identity_decoded_records_for_test(), 4);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 3);
+    drop(wal);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn serial_identity_anchor_failure_preserves_durable_cut_and_retries_unverified_tail() {
+    let path = test_wal_path("identity-foreign-serial");
+    let identity = identity_test_value(4);
+    let foreign = identity_test_value(7);
+    let mut wal = WalBuffer::with_durable_segment(&path);
+    wal.append(canonical_identity_test_record(1, identity));
+    wal.flush_all().expect("first flush");
+
+    write_durable_identity(&path, foreign).expect("install foreign anchor");
+    wal.append(canonical_identity_test_record(2, identity));
+    let error = match wal.begin_group_flush() {
+        Ok(_) => panic!("foreign identity anchor must reject before serial group IO"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("another database/timeline"));
+    assert_eq!(
+        wal.flushed_count(),
+        1,
+        "identity failure cannot advance durable"
+    );
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 1);
+    assert_eq!(read_wal_segment(&path).unwrap().len(), 1);
+
+    write_durable_identity(&path, identity).expect("restore expected anchor");
+    match wal.begin_group_flush().expect("retry after anchor restore") {
+        WalGroupFlushBegin::Job(job) => assert_eq!(job.commit().unwrap(), 2),
+        WalGroupFlushBegin::Clean { .. } => panic!("unverified record must still need a flush"),
+    }
+    assert_eq!(wal.flushed_count(), 2);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 2);
+    assert_eq!(
+        wal.durable_identity_decoded_records_for_test(),
+        3,
+        "the failed sidecar check leaves its record outside the verification cursor"
+    );
+    drop(wal);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn identity_binding_rejects_mixed_lineage_before_serial_group_io() {
+    let path = test_wal_path("identity-mixed-serial");
+    let identity = identity_test_value(10);
+    let foreign = identity_test_value(13);
+    let mut wal = WalBuffer::with_durable_segment(&path);
+    wal.append(canonical_identity_test_record(1, identity));
+    wal.flush_all().expect("first flush");
+
+    wal.append(canonical_identity_test_record(2, foreign));
+    let error = match wal.begin_group_flush() {
+        Ok(_) => panic!("mixed canonical lineages must reject before serial group IO"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("multiple durable identities"));
+    assert_eq!(wal.flushed_count(), 1);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 1);
+    assert_eq!(read_wal_segment(&path).unwrap().len(), 1);
+    assert_eq!(read_durable_identity(&path).unwrap(), Some(identity));
+    drop(wal);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn identity_binding_allows_legacy_prefix_then_canonical_lineage() {
+    let path = test_wal_path("identity-legacy-then-canonical");
+    let identity = identity_test_value(16);
+    let mut wal = WalBuffer::with_durable_segment(&path);
+    wal.append(WalRecord {
+        txn_id: 1,
+        payload: b"legacy WAL payload".to_vec().into(),
+    });
+    wal.flush_all().expect("legacy flush");
+    assert_eq!(read_durable_identity(&path).unwrap(), None);
+
+    wal.append(canonical_identity_test_record(2, identity));
+    wal.flush_all().expect("canonical flush");
+    assert_eq!(read_durable_identity(&path).unwrap(), Some(identity));
+    assert_eq!(wal.durable_identity_decoded_records_for_test(), 2);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 2);
+    drop(wal);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn identity_binding_truncation_clamps_cursor_but_never_forgets_lineage() {
+    let path = test_wal_path("identity-truncate-lineage");
+    let identity = identity_test_value(19);
+    let foreign = identity_test_value(22);
+    let mut wal = WalBuffer::with_durable_segment(&path);
+    wal.append(canonical_identity_test_record(1, identity));
+    wal.flush_all().expect("first flush");
+    wal.truncate(0);
+    assert_eq!(wal.flushed_count(), 0);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 0);
+
+    wal.append(canonical_identity_test_record(2, foreign));
+    assert!(
+        wal.begin_group_flush().is_err(),
+        "truncation must not let a different canonical lineage replace the original one"
+    );
+    assert_eq!(wal.flushed_count(), 0);
+    assert_eq!(read_durable_identity(&path).unwrap(), Some(identity));
+    drop(wal);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn recovered_bound_serial_buffer_scans_only_new_tail_and_continues() {
+    let path = test_wal_path("identity-recovered-bound-serial");
+    let identity = identity_test_value(25);
+    {
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        wal.append(canonical_identity_test_record(1, identity));
+        wal.append(canonical_identity_test_record(2, identity));
+        wal.flush_all().expect("first-life flush");
+    }
+    let recovery = recover_wal_segment(&path).expect("recover first life");
+    let mut wal = WalBuffer::with_recovered_durable_segment_bound_to_identity(
+        &path,
+        recovery.records.clone(),
+        &recovery,
+        identity,
+    )
+    .expect("bound recovery constructor");
+    assert_eq!(wal.durable_identity_decoded_records_for_test(), 0);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 2);
+    wal.append(canonical_identity_test_record(3, identity));
+    wal.flush_all().expect("post-recovery flush");
+    assert_eq!(wal.durable_identity_decoded_records_for_test(), 1);
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 3);
+    drop(wal);
+    assert_eq!(recover_wal_segment(&path).unwrap().records.len(), 3);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn raw_recovered_serial_canonical_history_requires_anchor_before_segment_reopen() {
+    let path = test_wal_path("identity-recovered-raw-serial");
+    let identity = identity_test_value(27);
+    {
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        wal.append(canonical_identity_test_record(1, identity));
+        wal.flush_all().expect("initial canonical flush");
+    }
+    let recovery = recover_wal_segment(&path).expect("recover canonical history");
+    let segment_before = fs::read(&path).expect("snapshot live segment");
+    fs::remove_file(durable_identity_path(&path)).expect("remove identity anchor");
+
+    let error = WalBuffer::with_recovered_durable_segment(&path, recovery.records.clone(), &recovery)
+        .expect_err("raw canonical recovery must require its existing anchor before segment mutation");
+    assert!(error.to_string().contains("anchor is missing"));
+    assert_eq!(fs::read(&path).unwrap(), segment_before);
+    assert_eq!(read_durable_identity(&path).unwrap(), None);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn raw_recovered_serial_rejects_suffix_mismatch_before_identity_or_segment_mutation() {
+    let path = test_wal_path("identity-recovered-suffix-mismatch");
+    let identity = identity_test_value(28);
+    {
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        wal.append(canonical_identity_test_record(1, identity));
+        wal.flush_all().expect("initial canonical flush");
+    }
+    let recovery = recover_wal_segment(&path).expect("recover canonical history");
+    let segment_before = fs::read(&path).expect("snapshot live segment");
+    fs::remove_file(durable_identity_path(&path)).expect("remove identity anchor");
+
+    let error = WalBuffer::with_recovered_durable_segment(
+        &path,
+        vec![canonical_identity_test_record(2, identity)],
+        &recovery,
+    )
+    .expect_err("release recovery must reject a mismatched suffix before touching durable state");
+    assert!(
+        error
+            .to_string()
+            .contains("exact recovered segment suffix")
+    );
+    assert_eq!(fs::read(&path).unwrap(), segment_before);
+    assert_eq!(read_durable_identity(&path).unwrap(), None);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn recovered_bound_constructor_rejects_sidecar_history_substitution() {
+    let path = test_wal_path("identity-recovered-substitution");
+    let anchor_identity = identity_test_value(28);
+    let record_identity = identity_test_value(31);
+    write_durable_identity(&path, anchor_identity).expect("write anchor");
+    let error = WalBuffer::with_recovered_durable_segment_bound_to_identity(
+        &path,
+        vec![canonical_identity_test_record(1, record_identity)],
+        &WalSegmentRecovery::empty(),
+        anchor_identity,
+    )
+    .expect_err("sidecar A plus recovered canonical record B must reject");
+    assert!(error.to_string().contains("do not match"));
+    assert!(
+        !path.exists(),
+        "rejected construction must not create a WAL segment"
+    );
+    remove_segment_files(&path);
 }
 
 #[test]
@@ -606,6 +1203,58 @@ fn truncate_durable_segment_prefix_bounds_live_file_and_keeps_appending() {
 }
 
 #[test]
+fn bound_identity_anchor_loss_rejects_empty_live_segment_rotation_without_rewrite() {
+    let path = test_wal_path("identity-rotation-anchor-loss");
+    let identity = identity_test_value(29);
+    let mut wal = WalBuffer::with_durable_segment(&path);
+    wal.append(canonical_identity_test_record(1, identity));
+    wal.flush_all().expect("initial canonical flush");
+    let segment_before = fs::read(&path).expect("snapshot live segment");
+
+    fs::remove_file(durable_identity_path(&path)).expect("remove identity anchor");
+    let error = wal
+        .truncate_durable_segment_prefix(1)
+        .expect_err("bound empty-suffix rotation must require its anchor before rewrite");
+    assert!(error.to_string().contains("anchor is missing"));
+    assert_eq!(wal.flushed_count(), 1);
+    assert_eq!(wal.durable_segment_base_records(), 0);
+    assert_eq!(fs::read(&path).unwrap(), segment_before);
+    assert_eq!(read_durable_identity(&path).unwrap(), None);
+    drop(wal);
+    remove_segment_files(&path);
+}
+
+#[test]
+fn bound_identity_anchor_loss_rejects_nonempty_live_segment_rotation_without_rewrite() {
+    let path = test_wal_path("identity-rotation-retained-anchor-loss");
+    let identity = identity_test_value(30);
+    let mut wal = WalBuffer::with_durable_segment(&path);
+    wal.append(canonical_identity_test_record(1, identity));
+    wal.flush_all().expect("first canonical flush");
+    wal.append(canonical_identity_test_record(2, identity));
+    wal.flush_all().expect("second canonical flush");
+    let segment_before = fs::read(&path).expect("snapshot live segment");
+
+    fs::remove_file(durable_identity_path(&path)).expect("remove identity anchor");
+    let error = wal
+        .truncate_durable_segment_prefix(1)
+        .expect_err("bound retained canonical rotation must require its anchor before rewrite");
+    assert!(error.to_string().contains("anchor is missing"));
+    assert_eq!(wal.flushed_count(), 2);
+    assert_eq!(wal.durable_segment_base_records(), 0);
+    assert_eq!(fs::read(&path).unwrap(), segment_before);
+    assert_eq!(read_durable_identity(&path).unwrap(), None);
+
+    write_durable_identity(&path, identity).expect("restore identity anchor");
+    wal.truncate_durable_segment_prefix(1)
+        .expect("restored anchor permits the retained-suffix rewrite");
+    assert_eq!(wal.durable_segment_base_records(), 1);
+    assert_eq!(read_wal_segment(&path).unwrap().len(), 1);
+    drop(wal);
+    remove_segment_files(&path);
+}
+
+#[test]
 fn durable_group_commit_stats_count_one_group_per_fsync() {
     let path = test_wal_path("durable-groups");
     let mut wal = WalBuffer::with_durable_segment(&path);
@@ -831,7 +1480,11 @@ fn v2_control_and_lanes_checkpoint_sidecars_fail_closed_on_tamper_or_truncation(
     )
     .unwrap();
     assert!(read_lanes_checkpoint(&base).unwrap().is_some());
-    fs::write(&sidecar, original.replace("serial_records=1", "serial_records=2")).unwrap();
+    fs::write(
+        &sidecar,
+        original.replace("serial_records=1", "serial_records=2"),
+    )
+    .unwrap();
     assert!(read_lanes_checkpoint(&base).is_err());
 
     let _ = fs::remove_file(control_path);

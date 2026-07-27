@@ -5,7 +5,7 @@
 //! the already-materialized result. This module owns syntax only, never relational execution.
 
 use gpu_db_facade::{DbError, ErrorCategory};
-use gpu_db_protocol::canonicalize_sql_for_exact_match;
+use gpu_db_protocol::{canonicalize_sql_for_exact_match, sql_may_start_with_any_keyword};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SqlCursorAction {
@@ -24,6 +24,9 @@ pub(crate) enum SqlCursorCloseTarget {
 pub(crate) fn classify_sql_cursor_statement(
     statement: &str,
 ) -> Result<Option<SqlCursorAction>, DbError> {
+    if !compat_classifier_gate(statement, &["DECLARE", "FETCH", "MOVE", "CLOSE"]) {
+        return Ok(None);
+    }
     let canonical = canonicalize_sql_for_exact_match(statement)
         .map_err(|error| syntax_error(error.to_string()))?;
     let statement = canonical.trim().trim_end_matches(';').trim();
@@ -40,6 +43,13 @@ pub(crate) fn classify_sql_cursor_statement(
         return parse_close(rest).map(|target| Some(SqlCursorAction::Close(target)));
     }
     Ok(None)
+}
+
+fn compat_classifier_gate(statement: &str, candidates: &[&str]) -> bool {
+    let admitted = sql_may_start_with_any_keyword(statement, candidates);
+    #[cfg(feature = "probe-timing")]
+    crate::insert_probe::record_compat_classifier_gate(statement.len() as u64, admitted);
+    admitted
 }
 
 fn parse_declare(rest: &str) -> Result<SqlCursorAction, DbError> {
@@ -377,5 +387,22 @@ mod tests {
                 "Mixed Cursor".to_string()
             )))
         );
+    }
+
+    #[test]
+    fn lexical_gate_preserves_every_cursor_action_after_leading_comments_and_case_fold() {
+        for statement in [
+            "/* gate */ dEcLaRe c CURSOR FOR SELECT 1",
+            "/* gate */ fEtCh c",
+            "/* gate */ mOvE ALL c",
+            "/* gate */ cLoSe c",
+            "DECLARE\u{2003}\u{202f}unicode_space CURSOR FOR SELECT 1",
+        ] {
+            assert!(classify_sql_cursor_statement(statement).unwrap().is_some());
+        }
+        assert_eq!(classify_sql_cursor_statement("DECLAREfoo c").unwrap(), None);
+        let non_ascii =
+            classify_sql_cursor_statement("DECLAREé c CURSOR FOR SELECT 1").unwrap_err();
+        assert_eq!(non_ascii.message, "invalid cursor name");
     }
 }

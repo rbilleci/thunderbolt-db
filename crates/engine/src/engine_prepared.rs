@@ -361,11 +361,17 @@ fn infer_insert_parameters(
     let columns = if insert.columns.is_empty() {
         table.columns.iter().collect::<Vec<_>>()
     } else {
-        insert
-            .columns
-            .iter()
-            .map(|name| prepared_column(table, name))
-            .collect::<Result<Vec<_>, _>>()?
+        let mut seen = BTreeSet::new();
+        let mut columns = Vec::with_capacity(insert.columns.len());
+        for name in &insert.columns {
+            if !seen.insert(name) {
+                return Err(ExecuteError::Engine(EngineError::DuplicateColumn(
+                    name.clone(),
+                )));
+            }
+            columns.push(prepared_column(table, name)?);
+        }
+        columns
     };
     for row in &insert.rows {
         if row.len() != columns.len() {

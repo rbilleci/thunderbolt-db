@@ -108,6 +108,8 @@ use wire_response::{
     encode_io_error, encode_optional_error_and_ready, encode_outcome, encode_outcome_messages,
     encode_ready, encode_startup_handshake, encode_startup_statuses_and_ready,
 };
+#[cfg(feature = "probe-timing")]
+mod insert_probe;
 
 /// Serve connections **concurrently** on `listener`: one engine shared across a
 /// thread-per-connection worker pool (`Arc<SharedEngine>`), each statement dispatched
@@ -244,9 +246,15 @@ fn handle_ready_connection(
     cancellation: &ConnectionCancellation,
     timeout_control: Option<&TcpStream>,
 ) -> Result<(), String> {
+    #[cfg(feature = "probe-timing")]
+    let probe_session_guard = insert_probe::ProbeSessionGuard::enter();
+    #[cfg(feature = "probe-timing")]
+    let probe_before = engine.insert_probe_snapshot();
     let mut session = engine.open_session();
     let result = run_shared_query_loop(stream, engine, &mut session, cancellation, timeout_control);
     let _ = engine.submit(&mut session, SubmissionRequest::CloseSession);
+    #[cfg(feature = "probe-timing")]
+    insert_probe::emit_session_delta(engine, probe_before, &probe_session_guard);
     result
 }
 
@@ -818,6 +826,14 @@ fn run_shared_query_loop(
             }
             extended.complete_transaction_action(transaction_action, true);
         }
+        #[cfg(feature = "probe-timing")]
+        let probe_simple_query = match &message {
+            gpu_db_protocol::FrontendMessage::SimpleQuery(sql) => Some((
+                insert_probe::raw_simple_query_before(engine),
+                sql.len() as u64,
+            )),
+            _ => None,
+        };
         let response = match extended.dispatch(message, session.transaction_status()) {
             ExtendedDispatch::SimpleQuery(sql) => execute_simple_query_blocking(
                 engine,
@@ -943,6 +959,12 @@ fn run_shared_query_loop(
             }
             ExtendedDispatch::Response(result) => result.map_err(encode_extended_error),
         };
+        #[cfg(feature = "probe-timing")]
+        if response.is_ok() {
+            if let Some((before, raw_sql_bytes)) = probe_simple_query {
+                insert_probe::record_raw_simple_query_after(engine, before, raw_sql_bytes);
+            }
+        }
         match response {
             Ok(buf) => stream.write_all(&buf).map_err(|err| err.to_string())?,
             Err(buf) => {
@@ -1087,6 +1109,10 @@ async fn handle_connection_async(
     let Some(cancellation) = complete_startup_async(&mut stream, cancellations).await? else {
         return Ok(());
     };
+    #[cfg(feature = "probe-timing")]
+    let probe_session_guard = insert_probe::ProbeSessionGuard::enter();
+    #[cfg(feature = "probe-timing")]
+    let probe_before = engine.insert_probe_snapshot();
     let session = Arc::new(std::sync::Mutex::new(engine.open_session()));
     let result = run_async_query_loop(
         &mut stream,
@@ -1101,6 +1127,8 @@ async fn handle_connection_async(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = engine.submit(&mut session, SubmissionRequest::CloseSession);
+    #[cfg(feature = "probe-timing")]
+    insert_probe::emit_session_delta(engine, probe_before, &probe_session_guard);
     result
 }
 
@@ -1371,6 +1399,14 @@ async fn run_async_query_loop(
             }
             extended.complete_transaction_action(transaction_action, true);
         }
+        #[cfg(feature = "probe-timing")]
+        let probe_simple_query = match &message {
+            gpu_db_protocol::FrontendMessage::SimpleQuery(sql) => Some((
+                insert_probe::raw_simple_query_before(engine),
+                sql.len() as u64,
+            )),
+            _ => None,
+        };
         let response = match extended.dispatch(message, shared_session_transaction_status(session))
         {
             ExtendedDispatch::SimpleQuery(sql) => execute_simple_query_async(
@@ -1597,6 +1633,12 @@ async fn run_async_query_loop(
             }
             ExtendedDispatch::Response(result) => result.map_err(encode_extended_error),
         };
+        #[cfg(feature = "probe-timing")]
+        if response.is_ok() {
+            if let Some((before, raw_sql_bytes)) = probe_simple_query {
+                insert_probe::record_raw_simple_query_after(engine, before, raw_sql_bytes);
+            }
+        }
         match response {
             Ok(buf) => {
                 if !buf.is_empty() {

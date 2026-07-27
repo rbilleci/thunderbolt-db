@@ -118,11 +118,52 @@ pub fn read_durable_identity(base: &Path) -> Result<Option<CanonicalIdentity>, E
     Ok(Some(identity))
 }
 
+/// Re-read the durable identity anchor and require that it names `identity`. This is deliberately
+/// small enough to run at every durable flush: the anchor is the substitution/tamper check for a
+/// buffer that has already incrementally verified its in-memory WAL prefix.
+pub(crate) fn require_durable_identity(
+    base: &Path,
+    identity: CanonicalIdentity,
+) -> Result<(), EngineError> {
+    match read_durable_identity(base)? {
+        Some(existing) if existing == identity => Ok(()),
+        Some(_) => Err(EngineError::Durability(format!(
+            "durable identity anchor beside {} belongs to another database/timeline",
+            base.display()
+        ))),
+        None => Err(EngineError::Durability(format!(
+            "canonical WAL exists beside {} but its durable identity anchor is missing",
+            base.display()
+        ))),
+    }
+}
+
+/// Re-read and verify the durable identity anchor, installing it only when this is the first
+/// canonical record written beside `base`. Existing anchors are never replaced.
+pub(crate) fn check_or_install_durable_identity(
+    base: &Path,
+    identity: CanonicalIdentity,
+) -> Result<(), EngineError> {
+    match read_durable_identity(base)? {
+        Some(existing) if existing == identity => {
+            // A prior install may have renamed the sidecar before its parent-directory fsync
+            // failed. Retrying the initial bind must finish that durability step before exposing
+            // the matching anchor as proof.
+            sync_wal_parent_dir(&durable_identity_path(base))
+        }
+        Some(_) => Err(EngineError::Durability(format!(
+            "durable identity anchor beside {} belongs to another database/timeline",
+            base.display()
+        ))),
+        None => write_durable_identity(base, identity),
+    }
+}
+
 /// Bind a durable artifact path to the one canonical lineage present in `records`. Writers call
 /// this before making a copied/streamed WAL authority durable, so a segment can never exist as a
 /// canonical recovery source without its checksummed identity anchor. Legacy-only record sets do
-/// not create an anchor. An existing foreign anchor is corruption/substitution and is never
-/// replaced.
+/// not create an anchor. Under the caller's exclusive path ownership, an existing foreign anchor
+/// is corruption/substitution and is never replaced.
 pub fn bind_or_install_durable_identity(
     base: &Path,
     records: &[crate::WalRecord],
@@ -145,14 +186,7 @@ pub fn bind_or_install_durable_identity(
     let Some(identity) = identity else {
         return Ok(());
     };
-    match read_durable_identity(base)? {
-        Some(existing) if existing == identity => Ok(()),
-        Some(_) => Err(EngineError::Durability(format!(
-            "durable identity anchor beside {} belongs to another database/timeline",
-            base.display()
-        ))),
-        None => write_durable_identity(base, identity),
-    }
+    check_or_install_durable_identity(base, identity)
 }
 
 fn encode_id(id: [u8; 16]) -> String {
@@ -204,5 +238,25 @@ mod tests {
         fs::write(&path, body.replace("format_epoch=4", "format_epoch=5")).unwrap();
         assert!(read_durable_identity(&base).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn matching_identity_install_retry_rechecks_parent_durability() {
+        let base = std::env::temp_dir().join(format!(
+            "gpu-db-identity-retry-{}-{:?}.wal",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let identity = CanonicalIdentity {
+            database_id: [5; 16],
+            cluster_id: [6; 16],
+            timeline_id: [7; 16],
+            format_epoch: 8,
+        };
+        write_durable_identity(&base, identity).unwrap();
+        check_or_install_durable_identity(&base, identity)
+            .expect("matching initial-bind retry re-syncs the anchor parent");
+        assert_eq!(read_durable_identity(&base).unwrap(), Some(identity));
+        let _ = fs::remove_file(durable_identity_path(&base));
     }
 }

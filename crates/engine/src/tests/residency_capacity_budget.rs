@@ -57,17 +57,48 @@ fn named_index_budget_estimate_charges_distinct_device_keys_once() {
     let table = engine.relational_catalog_table("estimate_idx").unwrap();
     let row_count = 3usize;
     let capacity = 8usize;
-    let table_size = 32u64;
-    let per_distinct_key = gpu_db_execution::resident_index_allocated_bytes(
-        (table_size - 1) as u32,
-        capacity as u64,
-    )
-    .unwrap();
+    let table_size = 16u64;
+    let per_distinct_key =
+        gpu_db_execution::resident_index_allocated_bytes((table_size - 1) as u32, capacity as u64)
+            .unwrap();
     assert_eq!(
         estimated_named_index_bytes_for_shard(&table, row_count, capacity),
         Some(per_distinct_key * 2),
         "the PK and duplicate id index share one raw key allocation; the compound index owns one fingerprint allocation"
     );
+    assert_eq!(
+        estimated_named_index_key_bytes_for_shard(row_count, capacity),
+        Some(per_distinct_key),
+        "named-index admission must charge the exact directory and posting allocation"
+    );
+}
+
+#[test]
+fn resident_shard_index_geometry_is_checked_and_keeps_capacity_lifetime_load_bounded() {
+    assert_eq!(resident_shard_index_table_size(0, 0), None);
+    assert_eq!(resident_shard_index_table_size(0, 64), None);
+    assert_eq!(resident_shard_index_table_size(1, 1), Some(2));
+    assert_eq!(resident_shard_index_table_size(8, 8), Some(16));
+    assert_eq!(resident_shard_index_table_size(3, 8), Some(16));
+    assert_eq!(
+        resident_shard_index_table_size(4_000_000, 4_000_000),
+        Some(8_388_608)
+    );
+    assert_eq!(
+        resident_shard_index_table_size(1_u64 << 29, 1_u64 << 29),
+        Some(1_u64 << 30)
+    );
+    assert_eq!(resident_shard_index_table_size((1_u64 << 29) + 1, 1), None);
+    assert_eq!(resident_shard_index_table_size(u64::MAX, 1), None);
+
+    for (live_rows, capacity) in [(1, 1), (3, 8), (8, 8), (511, 512)] {
+        let table_size = resident_shard_index_table_size(live_rows, capacity).unwrap();
+        assert!(table_size.is_power_of_two());
+        assert!(
+            live_rows.max(capacity) <= table_size / 2,
+            "the allocation must remain <=50% loaded through its physical append horizon"
+        );
+    }
 }
 
 /// S-F/R-1: the per-shard device hash index obeys the same hard cap as base payloads.

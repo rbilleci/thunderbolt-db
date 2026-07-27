@@ -63,10 +63,6 @@ pub(crate) struct IntentLaneState {
     /// submitters). Items route by PK hash, so same-PK contention stays in-lane.
     pub(crate) queues:
         Vec<Mutex<std::collections::VecDeque<crate::engine_dml_concurrent::LaneIntent>>>,
-    /// Device open-shard appends are not yet safe under concurrent lane pumps
-    /// (shared per-table device offsets): v1 serializes the apply stage.
-    /// ~20-30us per wave, so contention stays low at wave granularity.
-    pub(crate) device_apply_lock: Mutex<()>,
     /// Round-robin pump cursor: each `drive_commit_wave` call in lanes mode
     /// advances one lane's pipeline.
     pub(crate) pump_cursor: AtomicU64,
@@ -237,7 +233,6 @@ impl IntentLaneState {
             stat_resize_ns: AtomicU64::new(0),
             outstanding: std::sync::Arc::new(AtomicU64::new(0)),
             queues: (0..lane_count).map(|_| Default::default()).collect(),
-            device_apply_lock: Mutex::new(()),
             pump_cursor: AtomicU64::new(0),
             pump_guards: (0..lane_count).map(|_| Default::default()).collect(),
             pending_since: (0..lane_count).map(|_| Default::default()).collect(),

@@ -8,7 +8,7 @@ use gpu_db_facade::{
     pg_adapter, BoundPreparedStatement, DbError, DbValue, ErrorCategory, LogicalType,
     PreparedStatement,
 };
-use gpu_db_protocol::canonicalize_sql_for_exact_match;
+use gpu_db_protocol::{canonicalize_sql_for_exact_match, sql_may_start_with_any_keyword};
 use pg_query::protobuf::{a_const, AConst, Integer, Node, ScanToken, Token, TypeName};
 use pg_query::NodeEnum;
 
@@ -113,6 +113,9 @@ pub(crate) fn fill_unused_parameter_holes(
 pub(crate) fn classify_sql_prepared_statement(
     statement: &str,
 ) -> Result<Option<SqlPreparedAction>, DbError> {
+    if !compat_classifier_gate(statement, &["PREPARE", "EXECUTE", "DEALLOCATE"]) {
+        return Ok(None);
+    }
     let source = statement;
     let canonical = canonicalize_sql_for_exact_match(statement)
         .map_err(|error| syntax_error(error.to_string()))?;
@@ -132,6 +135,9 @@ pub(crate) fn classify_sql_prepared_statement(
 }
 
 pub(crate) fn sql_prepare_name(statement: &str) -> Result<Option<String>, DbError> {
+    if !compat_classifier_gate(statement, &["PREPARE"]) {
+        return Ok(None);
+    }
     let canonical = canonicalize_sql_for_exact_match(statement)
         .map_err(|error| syntax_error(error.to_string()))?;
     let Some(rest) = strip_keyword(canonical.trim(), "PREPARE") else {
@@ -143,6 +149,9 @@ pub(crate) fn sql_prepare_name(statement: &str) -> Result<Option<String>, DbErro
 pub(crate) fn classify_extended_sql_execute(
     statement: &str,
 ) -> Result<Option<ExtendedSqlExecute>, DbError> {
+    if !compat_classifier_gate(statement, &["EXECUTE"]) {
+        return Ok(None);
+    }
     let source = statement;
     let canonical = canonicalize_sql_for_exact_match(statement)
         .map_err(|error| syntax_error(error.to_string()))?;
@@ -150,6 +159,13 @@ pub(crate) fn classify_extended_sql_execute(
         return Ok(None);
     };
     parse_postgres_execute(source).map(Some)
+}
+
+fn compat_classifier_gate(statement: &str, candidates: &[&str]) -> bool {
+    let admitted = sql_may_start_with_any_keyword(statement, candidates);
+    #[cfg(feature = "probe-timing")]
+    crate::insert_probe::record_compat_classifier_gate(statement.len() as u64, admitted);
+    admitted
 }
 
 fn parse_postgres_execute(statement: &str) -> Result<ExtendedSqlExecute, DbError> {
@@ -873,6 +889,30 @@ mod tests {
             Some("Existing Name".to_string())
         );
         assert_eq!(sql_prepare_name("SELECT 1").unwrap(), None);
+    }
+
+    #[test]
+    fn lexical_gate_preserves_every_prepared_action_after_leading_comments_and_case_fold() {
+        for statement in [
+            "/* gate */ pRePaRe p AS SELECT 1",
+            "/* gate */ eXeCuTe p()",
+            "/* gate */ dEaLlOcAtE p",
+            "PREPARE\u{00a0}\u{2003}unicode_space AS SELECT 1",
+        ] {
+            assert!(classify_sql_prepared_statement(statement)
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(
+            classify_sql_prepared_statement("PREPAREfoo p").unwrap(),
+            None
+        );
+        assert_eq!(sql_prepare_name("PREPAREfoo p").unwrap(), None);
+        assert_eq!(
+            sql_prepare_name("PREPARE\u{00a0}\u{2003}unicode_space AS SELECT 1").unwrap(),
+            Some("unicode_space".to_string())
+        );
+        assert_eq!(classify_extended_sql_execute("EXECUTEfoo p()"), Ok(None));
     }
 
     #[test]

@@ -1,16 +1,19 @@
 //! ADR-014 canonical WAL integration and recovery-lineage validation.
 
+use super::engine_canonical_operation::{
+    SealedCanonicalOperation, ENGINE_OPERATION_CODEC_RESOLVED_BINARY,
+    ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2, ENGINE_OPERATION_MAGIC,
+};
 use super::*;
 
-const ENGINE_OPERATION_MAGIC: &[u8; 8] = b"GPUDBOP1";
+mod canonical_envelope;
+
 const TRANSACTION_STATUS_MAGIC: &[u8; 12] = b"GPUDBSTATUS1";
 const ENGINE_OPERATION_CODEC_LEGACY_SQL: u8 = 1;
-const ENGINE_OPERATION_CODEC_RESOLVED_BINARY: u8 = 2;
 /// Historical canonical typed commands contain bare canonical JSON and replay with pre-PRODUCT-001
 /// catalog semantics.
 const ENGINE_OPERATION_CODEC_TYPED_COMMAND_V1: u8 = 3;
 /// Additive discriminator for commands emitted after stable index OIDs/dependency policy landed.
-const ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2: u8 = 4;
 const ENGINE_TYPED_COMMAND_TAG: u8 = 0xfe;
 const ENGINE_TYPED_COMMAND_VERSION_LEGACY: u8 = 1;
 const ENGINE_TYPED_COMMAND_VERSION_CURRENT: u8 = 2;
@@ -46,23 +49,17 @@ impl Engine {
 
     pub(crate) fn canonical_catalog_boundary(
         identity: gpu_db_wal::CanonicalIdentity,
-        prior: Option<&WalRecord>,
+        prior: Option<gpu_db_wal::CanonicalCatalogTail>,
     ) -> Result<(u64, gpu_db_wal::CanonicalDigest), EngineError> {
         let Some(prior) = prior else {
             return Ok((0, Self::canonical_genesis_catalog_digest(identity)));
         };
-        let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&prior.payload)? else {
-            return Ok((0, Self::canonical_genesis_catalog_digest(identity)));
-        };
-        if envelope.header.identity != identity {
+        if prior.identity != identity {
             return Err(EngineError::Durability(
                 "canonical catalog boundary crosses database lineage".to_string(),
             ));
         }
-        Ok((
-            envelope.header.catalog_after_epoch,
-            envelope.header.catalog_after_digest,
-        ))
+        Ok((prior.catalog_after_epoch, prior.catalog_after_digest))
     }
 
     pub(crate) fn fresh_canonical_identity() -> gpu_db_wal::CanonicalIdentity {
@@ -119,7 +116,7 @@ impl Engine {
                 Some(_) => {
                     return Err(EngineError::Durability(
                         "canonical WAL lineage changes within the recovery source".to_string(),
-                    ))
+                    ));
                 }
             }
         }
@@ -389,38 +386,6 @@ impl Engine {
         }
     }
 
-    fn encode_engine_operation(payload: &[u8]) -> Result<Vec<u8>, EngineError> {
-        let (codec, canonical_payload) = if payload.first() == Some(&WAL_BINARY_TAG) {
-            // Decode before persistence so a tagged-but-malformed binary record never reaches a
-            // canonical fragment and becomes an unknown committed operation at restart.
-            decode_binary_record(payload)?;
-            (ENGINE_OPERATION_CODEC_RESOLVED_BINARY, payload.to_vec())
-        } else {
-            let command = Self::decode_engine_command(payload)?.ok_or_else(|| {
-                EngineError::Durability(
-                    "canonical WAL command payload cannot be decoded".to_string(),
-                )
-            })?;
-            let bytes = serde_json::to_vec(&command).map_err(|error| {
-                EngineError::Durability(format!(
-                    "canonical WAL typed command encode failed: {error}"
-                ))
-            })?;
-            (ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2, bytes)
-        };
-        let len = u64::try_from(canonical_payload.len()).map_err(|_| {
-            EngineError::Durability("canonical WAL operation length overflow".to_string())
-        })?;
-        let mut body =
-            Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + canonical_payload.len());
-        body.extend_from_slice(ENGINE_OPERATION_MAGIC);
-        body.push(codec);
-        body.extend_from_slice(&[0; 3]);
-        body.extend_from_slice(&len.to_le_bytes());
-        body.extend_from_slice(&canonical_payload);
-        Ok(body)
-    }
-
     /// Decode the replay payload for a typed command. Live callers still hand the engine SQL text;
     /// canonical recovery hands it the versioned AST payload below. The latter contains no SQL
     /// source and therefore cannot invoke the SQL parser during replay.
@@ -487,7 +452,7 @@ impl Engine {
 
     #[cfg(test)]
     pub(crate) fn canonical_legacy_wal_record_for_test(
-        commit: &CommitState,
+        commit: &mut CommitState,
         txn_id: TxnId,
         commit_seq: Index,
         lane_id: u32,
@@ -515,11 +480,12 @@ impl Engine {
         })?;
         let current = Self::canonical_wal_record(commit, txn_id, commit_seq, lane_id, payload)?;
         let envelope =
-            gpu_db_wal::decode_canonical_record_payload(&current.payload)?.ok_or_else(|| {
-                EngineError::Durability(
-                    "historical canonical test record did not produce an envelope".to_string(),
-                )
-            })?;
+            gpu_db_wal::decode_canonical_record_payload(&current.as_wal_record().payload)?
+                .ok_or_else(|| {
+                    EngineError::Durability(
+                        "historical canonical test record did not produce an envelope".to_string(),
+                    )
+                })?;
 
         let mut operation = Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + canonical.len());
         operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
@@ -544,10 +510,7 @@ impl Engine {
             &fragments,
             &outcome,
         )?;
-        Ok(WalRecord {
-            txn_id,
-            payload: Arc::from(gpu_db_wal::pack_canonical_record_payload(&encoded)?),
-        })
+        Ok(encoded.into_prepared_record(txn_id)?.into_wal_record())
     }
 
     fn encode_transaction_claim_status(
@@ -676,12 +639,12 @@ impl Engine {
     }
 
     pub(crate) fn canonical_wal_record(
-        commit: &CommitState,
+        commit: &mut CommitState,
         txn_id: TxnId,
         commit_seq: Index,
         lane_id: u32,
         payload: &Arc<[u8]>,
-    ) -> Result<WalRecord, EngineError> {
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
         Self::canonical_wal_record_with_commit_request_digest(
             commit,
             txn_id,
@@ -692,38 +655,21 @@ impl Engine {
         )
     }
 
-    pub(crate) fn canonical_wal_record_with_isolation(
-        commit: &CommitState,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        isolation: gpu_db_wal::CanonicalIsolation,
-    ) -> Result<WalRecord, EngineError> {
-        Self::canonical_wal_record_with_isolation_and_request_digest(
-            commit,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            isolation,
-            gpu_db_wal::canonical_request_digest(payload),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn canonical_wal_record_with_isolation_and_request_digest(
-        commit: &CommitState,
+        commit: &mut CommitState,
         txn_id: TxnId,
         commit_seq: Index,
         lane_id: u32,
         payload: &Arc<[u8]>,
         isolation: gpu_db_wal::CanonicalIsolation,
         request_digest: gpu_db_wal::CanonicalDigest,
-    ) -> Result<WalRecord, EngineError> {
-        let (catalog_epoch, catalog_digest) =
-            Self::canonical_catalog_boundary(commit.canonical_identity, commit.wal.last_record())?;
-        Self::canonical_wal_record_with_boundary_and_outcome_isolation(
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
+        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+            commit.canonical_identity,
+            commit.wal.canonical_catalog_tail()?,
+        )?;
+        Self::canonical_wal_record_with_boundary_and_optional_outcome_isolation(
             commit.canonical_identity,
             catalog_epoch,
             catalog_digest,
@@ -733,7 +679,7 @@ impl Engine {
             payload,
             request_digest,
             gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
-            Self::canonical_affected_rows(payload)?,
+            None,
             isolation,
         )
     }
@@ -818,15 +764,17 @@ impl Engine {
     }
 
     pub(crate) fn canonical_wal_record_with_commit_request_digest(
-        commit: &CommitState,
+        commit: &mut CommitState,
         txn_id: TxnId,
         commit_seq: Index,
         lane_id: u32,
         payload: &Arc<[u8]>,
         request_digest: gpu_db_wal::CanonicalDigest,
-    ) -> Result<WalRecord, EngineError> {
-        let (catalog_epoch, catalog_digest) =
-            Self::canonical_catalog_boundary(commit.canonical_identity, commit.wal.last_record())?;
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
+        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+            commit.canonical_identity,
+            commit.wal.canonical_catalog_tail()?,
+        )?;
         Self::canonical_wal_record_with_boundary_and_request_digest(
             commit.canonical_identity,
             catalog_epoch,
@@ -849,9 +797,8 @@ impl Engine {
         lane_id: u32,
         payload: &Arc<[u8]>,
         request_digest: gpu_db_wal::CanonicalDigest,
-    ) -> Result<WalRecord, EngineError> {
-        let affected_rows = Self::canonical_affected_rows(payload)?;
-        Self::canonical_wal_record_with_boundary_and_outcome(
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
+        Self::canonical_wal_record_with_boundary_and_optional_outcome_isolation(
             identity,
             catalog_epoch,
             catalog_digest,
@@ -861,7 +808,8 @@ impl Engine {
             payload,
             request_digest,
             gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
-            affected_rows,
+            None,
+            gpu_db_wal::CanonicalIsolation::ReadCommitted,
         )
     }
 
@@ -924,7 +872,7 @@ impl Engine {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn canonical_wal_record_with_commit_outcome(
-        commit: &CommitState,
+        commit: &mut CommitState,
         txn_id: TxnId,
         commit_seq: Index,
         lane_id: u32,
@@ -932,9 +880,11 @@ impl Engine {
         request_digest: gpu_db_wal::CanonicalDigest,
         outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
         affected_rows: u64,
-    ) -> Result<WalRecord, EngineError> {
-        let (catalog_epoch, catalog_digest) =
-            Self::canonical_catalog_boundary(commit.canonical_identity, commit.wal.last_record())?;
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
+        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+            commit.canonical_identity,
+            commit.wal.canonical_catalog_tail()?,
+        )?;
         Self::canonical_wal_record_with_boundary_and_outcome(
             commit.canonical_identity,
             catalog_epoch,
@@ -961,7 +911,7 @@ impl Engine {
         request_digest: gpu_db_wal::CanonicalDigest,
         outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
         affected_rows: u64,
-    ) -> Result<WalRecord, EngineError> {
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
         Self::canonical_wal_record_with_boundary_and_outcome_isolation(
             identity,
             catalog_epoch,
@@ -990,77 +940,55 @@ impl Engine {
         outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
         affected_rows: u64,
         isolation: gpu_db_wal::CanonicalIsolation,
-    ) -> Result<WalRecord, EngineError> {
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
+        Self::canonical_wal_record_with_boundary_and_optional_outcome_isolation(
+            identity,
+            catalog_epoch,
+            catalog_digest,
+            txn_id,
+            commit_seq,
+            lane_id,
+            payload,
+            request_digest,
+            outcome_kind,
+            Some(affected_rows),
+            isolation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn canonical_wal_record_with_boundary_and_optional_outcome_isolation(
+        identity: gpu_db_wal::CanonicalIdentity,
+        catalog_epoch: u64,
+        catalog_digest: gpu_db_wal::CanonicalDigest,
+        txn_id: TxnId,
+        commit_seq: Index,
+        lane_id: u32,
+        payload: &Arc<[u8]>,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
+        outcome_rows: Option<u64>,
+        isolation: gpu_db_wal::CanonicalIsolation,
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
         if outcome_kind == gpu_db_wal::CanonicalOutcomeKind::AbortError {
             return Err(EngineError::Durability(
                 "committed engine WAL cannot be encoded with an abort outcome".to_string(),
             ));
         }
-        validate_sequence_envelope_transaction_id(payload, txn_id)?;
-        let operation_body = Self::encode_engine_operation(payload)?;
-        let allocator_high_water = Self::canonical_allocator_high_water(payload)?;
-        let operation_digest = gpu_db_wal::canonical_request_digest(&operation_body);
-        let operation_kind = Self::canonical_fragment_kind(payload)?;
-        let operation_fragment = gpu_db_wal::CanonicalFragment {
-            kind: operation_kind,
-            body: operation_body,
-        };
-        let status_fragment = gpu_db_wal::CanonicalFragment {
-            kind: gpu_db_wal::CanonicalFragmentKind::TransactionClaimStatus,
-            body: Self::encode_transaction_claim_status(identity, txn_id, request_digest),
-        };
-        let catalog_after_epoch =
-            if operation_kind == gpu_db_wal::CanonicalFragmentKind::CatalogMutation {
-                catalog_epoch.checked_add(1).ok_or_else(|| {
-                    EngineError::Durability("canonical catalog epoch overflow".to_string())
-                })?
-            } else {
-                catalog_epoch
-            };
-        let catalog_after_digest = Self::canonical_catalog_transition(
-            catalog_digest,
-            operation_kind,
-            &operation_fragment.body,
-        );
-        let header = gpu_db_wal::CanonicalPreApplyHeader {
+        let operation = SealedCanonicalOperation::from_live_payload(payload, txn_id)?;
+        Self::canonical_wal_record_from_sealed_operation(
             identity,
-            leader_epoch: 1,
-            commit_seq,
-            stable_transaction_id: txn_id,
-            request_digest,
-            isolation,
-            flags: u32::from(operation_kind as u16),
-            catalog_before_epoch: catalog_epoch,
-            catalog_after_epoch,
-            catalog_before_digest: catalog_digest,
-            catalog_after_digest,
-            operation_count: 2,
-            table_block_count: Self::canonical_table_block_count(payload, operation_kind)?,
-            allocator_high_water,
-        };
-        let outcome = gpu_db_wal::CanonicalOutcome {
-            kind: outcome_kind,
-            affected_rows,
-            sqlstate: None,
-            constraint_id: 0,
-            target_digest: operation_digest,
-            returning_digest: [0; 32],
-        };
-        let encoded = gpu_db_wal::encode_canonical_envelope(
-            gpu_db_wal::CanonicalPhysicalRange {
-                log_epoch: 1,
-                lane_id,
-                segment_id: commit_seq,
-                first_frame_ordinal: 0,
-            },
-            &header,
-            &[operation_fragment, status_fragment],
-            &outcome,
-        )?;
-        Ok(WalRecord {
+            catalog_epoch,
+            catalog_digest,
             txn_id,
-            payload: Arc::from(gpu_db_wal::pack_canonical_record_payload(&encoded)?),
-        })
+            commit_seq,
+            lane_id,
+            operation,
+            request_digest,
+            outcome_kind,
+            outcome_rows,
+            isolation,
+        )
     }
 
     /// Validate every canonical authority before replaying any mutation. Legacy records are
@@ -1070,20 +998,15 @@ impl Engine {
         records: &[WalRecord],
     ) -> Result<Vec<WalRecord>, EngineError> {
         let mut lineage = None;
-        let commit = self.commit_state();
+        let mut commit = self.commit_state();
         let mut expected_commit_seq = commit.repl.peek_next_index();
-        let mut expected_catalog = match commit.wal.last_record() {
-            Some(record) => {
-                gpu_db_wal::decode_canonical_record_payload(&record.payload)?.map(|envelope| {
-                    (
-                        envelope.header.identity,
-                        envelope.header.catalog_after_epoch,
-                        envelope.header.catalog_after_digest,
-                    )
-                })
-            }
-            None => None,
-        };
+        let mut expected_catalog = commit.wal.canonical_catalog_tail()?.map(|tail| {
+            (
+                tail.identity,
+                tail.catalog_after_epoch,
+                tail.catalog_after_digest,
+            )
+        });
         // A prior replay chunk installs every canonical terminal claim before the next chunk is
         // admitted. This makes the one-way migration barrier span checkpoint/serial/lane chunks,
         // without treating a lineage-only identity anchor as evidence that canonical WAL exists.
@@ -1423,7 +1346,7 @@ impl Engine {
                     return Err(EngineError::Durability(format!(
                         "reconciled transaction {} conflicts with terminal WAL status",
                         status.txn_id
-                    )))
+                    )));
                 }
                 Some(_) => {}
                 None => {
@@ -1538,11 +1461,11 @@ mod tests {
             gpu_db_wal::canonical_request_digest(&payload),
         )
         .unwrap();
-        let envelope = gpu_db_wal::decode_canonical_record_payload(&record.payload)
+        let envelope = gpu_db_wal::decode_canonical_record_payload(&record.as_wal_record().payload)
             .unwrap()
             .unwrap();
         assert_eq!(envelope.header.table_block_count, 0);
-        let recovered = Engine::recover_from_durable_wal(&[record]).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&[record.into_wal_record()]).unwrap();
         assert!(recovered
             .catalog_snapshot()
             .relational_catalog
@@ -1606,12 +1529,16 @@ mod tests {
             gpu_db_wal::canonical_request_digest(&legacy_payload),
         )
         .unwrap();
-        let legacy_envelope = gpu_db_wal::decode_canonical_record_payload(&legacy_record.payload)
-            .unwrap()
-            .unwrap();
+        let legacy_envelope =
+            gpu_db_wal::decode_canonical_record_payload(&legacy_record.as_wal_record().payload)
+                .unwrap()
+                .unwrap();
         assert_eq!(legacy_envelope.header.table_block_count, 1);
-        let recovered =
-            Engine::recover_from_durable_wal(&[prefix_records[0].clone(), legacy_record]).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&[
+            prefix_records[0].clone(),
+            legacy_record.into_wal_record(),
+        ])
+        .unwrap();
         assert!(recovered
             .catalog_snapshot()
             .relational_catalog
@@ -1747,7 +1674,7 @@ mod tests {
         );
 
         let insert: Arc<[u8]> = Arc::from(&b"INSERT INTO typed_outcome VALUES (1)"[..]);
-        let false_noop = Engine::canonical_wal_record_with_boundary_and_outcome(
+        let valid_insert = Engine::canonical_wal_record_with_boundary_and_outcome(
             ddl_envelope.header.identity,
             ddl_envelope.header.catalog_after_epoch,
             ddl_envelope.header.catalog_after_digest,
@@ -1756,11 +1683,32 @@ mod tests {
             0,
             &insert,
             gpu_db_wal::canonical_request_digest(&insert),
-            gpu_db_wal::CanonicalOutcomeKind::CommitNoOp,
-            0,
+            gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
+            1,
         )
         .unwrap();
-        let error = match Engine::recover_from_durable_wal(&[records[0].clone(), false_noop]) {
+        let valid_envelope =
+            gpu_db_wal::decode_canonical_record_payload(&valid_insert.as_wal_record().payload)
+                .unwrap()
+                .unwrap();
+        let false_noop = gpu_db_wal::CanonicalOutcome {
+            kind: gpu_db_wal::CanonicalOutcomeKind::CommitNoOp,
+            affected_rows: 0,
+            ..valid_envelope.outcome
+        };
+        let false_noop = gpu_db_wal::encode_canonical_envelope(
+            valid_envelope.physical,
+            &valid_envelope.header,
+            &valid_envelope.fragments,
+            &false_noop,
+        )
+        .unwrap()
+        .into_prepared_record(7052)
+        .unwrap();
+        let error = match Engine::recover_from_durable_wal(&[
+            records[0].clone(),
+            false_noop.into_wal_record(),
+        ]) {
             Ok(_) => panic!("false affected-row marker was accepted"),
             Err(error) => error,
         };
@@ -1866,7 +1814,7 @@ mod tests {
             gpu_db_wal::canonical_request_digest(&payload),
         )
         .unwrap();
-        let envelope = gpu_db_wal::decode_canonical_record_payload(&record.payload)
+        let envelope = gpu_db_wal::decode_canonical_record_payload(&record.as_wal_record().payload)
             .unwrap()
             .unwrap();
         assert_eq!(envelope.header.allocator_high_water, u64::MAX);

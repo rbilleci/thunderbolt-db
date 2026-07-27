@@ -105,9 +105,15 @@ mod engine_ddl_pubsub_role;
 mod engine_ddl_table;
 mod engine_dml_concurrent;
 pub use engine_dml_concurrent::DmlExecutionResult;
+#[cfg(feature = "probe-timing")]
+mod engine_insert_probe;
+#[cfg(feature = "probe-timing")]
+pub use engine_insert_probe::{InsertProbeConfig, InsertProbeSnapshot};
+mod engine_canonical_operation;
 mod engine_dml_intent;
 mod engine_durability;
 mod engine_intent_lanes;
+mod prepared_insert_batch;
 pub use engine_dml_intent::{
     CoveredDeleteRoute, CoveredInsertRoute, CoveredUpdateRoute, IntentTicket, SynchronousCommit,
 };
@@ -329,6 +335,15 @@ impl ExecuteError {
     pub fn is_numeric_value_out_of_range(&self) -> bool {
         matches!(self, Self::Engine(EngineError::NumericValueOutOfRange(_)))
     }
+
+    pub fn is_undefined_column(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::UndefinedColumn(_)))
+            || matches!(self, Self::UndefinedColumn(_))
+    }
+
+    pub fn is_duplicate_column(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::DuplicateColumn(_)))
+    }
 }
 
 impl ExecuteError {
@@ -441,6 +456,10 @@ struct GroupFlushCoord {
 }
 
 pub struct Engine {
+    /// Build-only aggregate INSERT qualification counters. The feature is absent from ordinary
+    /// builds, so the production hot path has neither atomics nor clock reads for this evidence.
+    #[cfg(feature = "probe-timing")]
+    insert_probe: engine_insert_probe::InsertProbeCounters,
     /// The commit-critical mutable substate — the replicator (commit-`Index` oracle), the WAL, the
     /// per-txn commit timestamps, and the recent-commits conflict ledger — bundled behind ONE mutex
     /// that IS the **commit_mutex** (write-half MVCC, Stage 4). The concurrent DML commit path locks
@@ -477,6 +496,10 @@ pub struct Engine {
     /// per instance prevents parallel engines from stealing one another's one-shot failure.
     #[cfg(test)]
     fail_next_transaction_post_durable_apply: AtomicBool,
+    /// One-shot fixed INSERT cutover fault after canonical status/ledger and before device apply.
+    /// It proves the serial-wave guard wedges rather than attempting a legacy re-application.
+    #[cfg(test)]
+    fail_next_fixed_insert_post_wal_apply: AtomicBool,
     /// One-shot deterministic seam after WAL durability and private-generation retirement but
     /// before canonical apply, used to prove publication credit cannot be stolen by another
     /// allocator in that exact window.

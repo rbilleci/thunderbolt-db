@@ -23,6 +23,7 @@
 use super::*;
 
 mod index_identity_codec;
+mod insert_template;
 mod operation_identity;
 mod record_decode;
 mod row_codec;
@@ -37,6 +38,8 @@ pub(crate) use index_identity_codec::{
     BinaryTransactionIndexLifecycleOperationIdentity,
     BinaryTransactionIndexLifecycleTargetIdentity,
 };
+pub(crate) use insert_template::ProposedRowIdRange;
+pub(crate) use insert_template::{BoundBinaryInsert, PreparedBinaryInsertTemplate};
 pub(crate) use operation_identity::BinaryTransactionOperationIdentity;
 pub(crate) use record_decode::decode_binary_record;
 pub(crate) use row_codec::*;

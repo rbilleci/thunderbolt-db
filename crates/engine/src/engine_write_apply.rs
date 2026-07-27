@@ -56,7 +56,7 @@ impl Engine {
                 );
                 self.read_state
                     .mvcc
-                    .advance_row_id(inserted_rows.len() as u64);
+                    .advance_row_id(inserted_rows.len() as u64)?;
                 if self.table_chunk_authoritative(&table).is_some() {
                     self.read_state
                         .residency

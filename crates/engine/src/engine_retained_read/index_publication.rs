@@ -161,12 +161,13 @@ impl Engine {
         let _apply = if apply_leader {
             None
         } else {
-            self.intent_lanes.as_ref().map(|lanes| {
-                lanes
-                    .device_apply_lock
+            Some(
+                self.read_state
+                    .residency
+                    .mutation_gate
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            })
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
         };
         self.publish_relational_resident_indexes_for_generation(
             &table,

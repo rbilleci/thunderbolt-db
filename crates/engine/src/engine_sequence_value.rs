@@ -493,18 +493,18 @@ impl Engine {
         let mut provided = BTreeSet::new();
         for column in &insert.columns {
             if !provided.insert(column.as_str()) {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "column \"{column}\" specified more than once"
-                ))));
+                return Err(ExecuteError::Engine(EngineError::DuplicateColumn(
+                    column.clone(),
+                )));
             }
             if !table
                 .columns
                 .iter()
                 .any(|candidate| candidate.name == *column)
             {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "column \"{column}\" does not exist"
-                ))));
+                return Err(ExecuteError::Engine(EngineError::UndefinedColumn(
+                    column.clone(),
+                )));
             }
         }
         if insert
@@ -1055,7 +1055,7 @@ impl Engine {
             .propose(Arc::clone(&payload))
             .map_err(ExecuteError::Engine)?;
         let wal_record = match Self::canonical_wal_record(
-            &commit,
+            &mut commit,
             transition_txn_id,
             token.index,
             0,
@@ -1067,7 +1067,7 @@ impl Engine {
                 return Err(ExecuteError::Engine(error));
             }
         };
-        commit.wal.append(wal_record);
+        commit.wal.append_canonical(wal_record);
         if let Err(error) = commit.wal.flush_all() {
             commit.repl.rollback_unapplied_from(token.index);
             commit.wal.truncate(wal_len_before);

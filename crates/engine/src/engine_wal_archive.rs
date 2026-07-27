@@ -335,17 +335,17 @@ impl Engine {
                             &record.payload,
                             gpu_db_wal::canonical_request_digest(&record.payload),
                         )?;
-                    let envelope =
-                        gpu_db_wal::decode_canonical_record_payload(&converted_record.payload)?
-                            .ok_or_else(|| {
-                                EngineError::Durability(
-                                    "archive legacy conversion did not produce canonical WAL"
-                                        .to_string(),
-                                )
-                            })?;
+                    let envelope = gpu_db_wal::decode_canonical_record_payload(
+                        &converted_record.as_wal_record().payload,
+                    )?
+                    .ok_or_else(|| {
+                        EngineError::Durability(
+                            "archive legacy conversion did not produce canonical WAL".to_string(),
+                        )
+                    })?;
                     catalog_epoch = envelope.header.catalog_after_epoch;
                     catalog_digest = envelope.header.catalog_after_digest;
-                    canonical.push(converted_record);
+                    canonical.push(converted_record.into_wal_record());
                     converted = true;
                 }
                 commit_seq = commit_seq.checked_add(1).ok_or_else(|| {

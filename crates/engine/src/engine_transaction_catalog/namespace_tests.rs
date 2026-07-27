@@ -507,9 +507,9 @@ fn post_boundary_legacy_neutral_sequence_record_uses_current_namespace_in_split_
         &legacy_payload
     ));
     let suffix = {
-        let commit = source.commit_state();
+        let mut commit = source.commit_state();
         Engine::canonical_legacy_wal_record_for_test(
-            &commit,
+            &mut commit,
             9_722,
             source.committed_seq() + 1,
             0,
@@ -606,9 +606,9 @@ fn post_boundary_legacy_sequence_rename_and_drop_keep_historical_default_binding
             &legacy_payload
         ));
         let suffix = {
-            let commit = source.commit_state();
+            let mut commit = source.commit_state();
             Engine::canonical_legacy_wal_record_for_test(
-                &commit,
+                &mut commit,
                 txn_base + 3,
                 source.committed_seq() + 1,
                 0,
@@ -1124,9 +1124,10 @@ fn post_boundary_byte_stable_opcode_12_rejects_a_legacy_ambiguous_dependency() {
     let mut complete = boundary_records;
     let payload = Arc::from(payload);
     let suffix = {
-        let commit = source.commit_state();
-        Engine::canonical_wal_record(&commit, 9_613, source.committed_seq() + 1, 0, &payload)
+        let mut commit = source.commit_state();
+        Engine::canonical_wal_record(&mut commit, 9_613, source.committed_seq() + 1, 0, &payload)
             .unwrap()
+            .into_wal_record()
     };
     complete.push(suffix);
 

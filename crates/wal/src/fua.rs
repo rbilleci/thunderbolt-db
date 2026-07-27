@@ -33,17 +33,48 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use gpu_db_types::EngineError;
 use gpu_db_write_conveyor::{
-    recover_frame_log_by_scan, FuaFrameLog, FuaFrameLogAppender, FuaFrameLogConfig,
-    FuaFrameLogFencePool,
+    fua_frame_padded_bytes, recover_frame_log_by_scan, FuaControllerDecision,
+    FuaControllerEligibility, FuaControllerPhase, FuaFrameLog, FuaFrameLogAppender,
+    FuaFrameLogConfig, FuaFrameLogFencePool, FuaFrameLogTelemetry, FuaPhysicalController,
+    FUA_CONTROLLER_QD16_FRAGMENTS,
 };
 
-use crate::{decode_wal_record_run, WalGroupCommitStats, WalRecord};
+use crate::{decode_wal_record_run, FuaDurabilityTelemetry, WalGroupCommitStats, WalRecord};
 
 /// Busy-spins before falling back to `yield_now` in the durable-cut wait. Pure spin at low
 /// contention keeps the p50 ack near one fence latency; the yield fallback avoids burning a core
 /// when the pool is genuinely backed up. NO futex/condvar per-commit wakeups — measured law: futex
 /// wakes are unpayable at high ack rates.
 const SPIN_BEFORE_YIELD: u32 = 256;
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+fn split_physical_chunks(payload: &[u8], fragments: usize) -> Option<Vec<&[u8]>> {
+    if fragments < 2 || payload.len() < fragments {
+        return None;
+    }
+    let base = payload.len() / fragments;
+    let remainder = payload.len() % fragments;
+    let mut offset = 0usize;
+    let mut chunks = Vec::with_capacity(fragments);
+    for index in 0..fragments {
+        let bytes = base + usize::from(index < remainder);
+        debug_assert!(bytes > 0);
+        chunks.push(&payload[offset..offset + bytes]);
+        offset += bytes;
+    }
+    Some(chunks)
+}
+
+fn padded_chunks_bytes(chunks: &[&[u8]]) -> Option<usize> {
+    chunks.iter().try_fold(0usize, |total, chunk| {
+        total.checked_add(fua_frame_padded_bytes(chunk.len()))
+    })
+}
 
 /// The currently-open FUA segment: its frame log, the single appender, and its fence pool. On a
 /// roll this whole record is replaced; `appender`/`pool` are `Option` so `Drop` (and the roll) can
@@ -53,6 +84,61 @@ struct ActiveSegment {
     appender: Option<FuaFrameLogAppender>,
     pool: Option<FuaFrameLogFencePool>,
     segment_id: u64,
+    /// Segment-chain aggregation. The existing active lock serializes a roll with snapshots, so
+    /// retired segments are counted exactly once without retaining their staging buffers or adding
+    /// an observability lock.
+    retired_telemetry: FuaFrameLogTelemetry,
+}
+
+/// A successfully visible physical representation of one logical WAL group. The terminal frame
+/// is the only frame whose `seq_count` advances the WAL cut, and is therefore also the correct
+/// direct-service sample after the group becomes durable.
+struct PublishedGroup {
+    log: Arc<FuaFrameLog>,
+    terminal_frame_id: u64,
+    controller_sample: Option<ControllerSampleSettlement>,
+}
+
+/// Owns a published QD1 token until it is observed.  A post-publication error must not strand a
+/// pending Sparse/Verify gate or leave a Fast result unaccounted: dropping this guard settles the
+/// token as abandoned and conservatively returns the shared controller to sustained QD16.
+struct ControllerSampleSettlement {
+    controller: Arc<Mutex<FuaPhysicalController>>,
+    token: Option<gpu_db_write_conveyor::FuaControllerSampleToken>,
+}
+
+impl ControllerSampleSettlement {
+    fn observe(&mut self, direct_nanos: u64) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        self.controller
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observe_qd1_sample(token, direct_nanos);
+    }
+
+    fn unavailable(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        self.controller
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_qd1_sample_unavailable(token);
+    }
+}
+
+impl Drop for ControllerSampleSettlement {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        self.controller
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .abandon_qd1_sample(token);
+    }
 }
 
 /// The pre-staged NEXT segment (Chronicle's pre-toucher). A background thread prewrites the
@@ -113,6 +199,18 @@ pub(crate) struct FuaWalBackend {
     recycle_pool: Arc<Mutex<Vec<PathBuf>>>,
     /// Segments actually recycled into service (non-vacuity telemetry).
     stat_recycled: AtomicU64,
+    /// Group-level attribution not owned by an individual frame-log segment.
+    stat_logical_groups: AtomicU64,
+    stat_logical_payload_bytes: AtomicU64,
+    stat_single_frame_padded_baseline_bytes: AtomicU64,
+    stat_publish_turn_wait_ns: AtomicU64,
+    stat_publish_turn_wait_groups: AtomicU64,
+    stat_waiter_cut_to_observe_ns: AtomicU64,
+    stat_waiter_cut_to_observe_count: AtomicU64,
+    /// One physical cadence controller for this FUA backend/device, never per session/query.
+    /// Its lock is outside the appender and durable-cut authorities; decisions are committed only
+    /// after the frame-log's atomic batch publication succeeds.
+    controller: Arc<Mutex<FuaPhysicalController>>,
 }
 
 impl std::fmt::Debug for FuaWalBackend {
@@ -176,6 +274,7 @@ impl FuaWalBackend {
                 appender: Some(appender),
                 pool: Some(pool),
                 segment_id,
+                retired_telemetry: FuaFrameLogTelemetry::default(),
             }),
             published: AtomicUsize::new(0),
             next_ticket: AtomicU64::new(0),
@@ -188,6 +287,14 @@ impl FuaWalBackend {
             prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
             recycle_pool: Arc::new(Mutex::new(Vec::new())),
             stat_recycled: AtomicU64::new(0),
+            stat_logical_groups: AtomicU64::new(0),
+            stat_logical_payload_bytes: AtomicU64::new(0),
+            stat_single_frame_padded_baseline_bytes: AtomicU64::new(0),
+            stat_publish_turn_wait_ns: AtomicU64::new(0),
+            stat_publish_turn_wait_groups: AtomicU64::new(0),
+            stat_waiter_cut_to_observe_ns: AtomicU64::new(0),
+            stat_waiter_cut_to_observe_count: AtomicU64::new(0),
+            controller: Arc::new(Mutex::new(FuaPhysicalController::default())),
         };
         backend.kick_prestage();
         Ok(backend)
@@ -244,6 +351,7 @@ impl FuaWalBackend {
                 appender: Some(appender),
                 pool: Some(pool),
                 segment_id,
+                retired_telemetry: FuaFrameLogTelemetry::default(),
             }),
             published: AtomicUsize::new(recovered_records),
             next_ticket: AtomicU64::new(0),
@@ -256,6 +364,14 @@ impl FuaWalBackend {
             prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
             recycle_pool: Arc::new(Mutex::new(Vec::new())),
             stat_recycled: AtomicU64::new(0),
+            stat_logical_groups: AtomicU64::new(0),
+            stat_logical_payload_bytes: AtomicU64::new(0),
+            stat_single_frame_padded_baseline_bytes: AtomicU64::new(0),
+            stat_publish_turn_wait_ns: AtomicU64::new(0),
+            stat_publish_turn_wait_groups: AtomicU64::new(0),
+            stat_waiter_cut_to_observe_ns: AtomicU64::new(0),
+            stat_waiter_cut_to_observe_count: AtomicU64::new(0),
+            controller: Arc::new(Mutex::new(FuaPhysicalController::default())),
         };
         backend.kick_prestage();
         Ok(backend)
@@ -299,10 +415,115 @@ impl FuaWalBackend {
             .max(self.rolled_baseline.load(Ordering::Acquire)) as usize
     }
 
-    /// Aggregate publish->fence-done latency of the ACTIVE segment: (ns, frames).
+    /// Aggregate publish->fence-done latency of the complete live segment chain: (ns, frames).
     pub(crate) fn fence_latency_stats(&self) -> (u64, u64) {
-        let active = self.lock_active();
-        active.log.fence_latency_stats()
+        let telemetry = self.telemetry();
+        (
+            telemetry
+                .publish_to_claim_nanos
+                .saturating_add(telemetry.claim_to_write_done_nanos),
+            telemetry.fenced_frames,
+        )
+    }
+
+    /// Return physical frame and waiter attribution across active and rolled FUA segments.
+    /// Locking `active` also makes the snapshot roll-safe: a segment is either still active or
+    /// already folded into `retired_telemetry`, never both.
+    pub(crate) fn telemetry(&self) -> FuaDurabilityTelemetry {
+        let frame = {
+            let active = self.lock_active();
+            let mut frame = active.retired_telemetry;
+            frame.saturating_add_assign(active.log.telemetry());
+            frame
+        };
+        let controller_guard = self.controller.lock().unwrap_or_else(|p| p.into_inner());
+        let controller = controller_guard.telemetry();
+        // The controller has no authority until the synchronous canonical group route publishes
+        // through it.  In particular, legacy lane appends use the same physical writer but must
+        // not leak a dormant controller's default phase/counters into their telemetry.
+        let controller_active = controller.published_actions != 0;
+        FuaDurabilityTelemetry {
+            configured_fence_lanes: self.lanes as u64,
+            logical_groups: self.stat_logical_groups.load(Ordering::Relaxed),
+            logical_payload_bytes: self.stat_logical_payload_bytes.load(Ordering::Relaxed),
+            single_frame_padded_baseline_bytes: self
+                .stat_single_frame_padded_baseline_bytes
+                .load(Ordering::Relaxed),
+            publish_turn_wait_nanos: self.stat_publish_turn_wait_ns.load(Ordering::Relaxed),
+            publish_turn_wait_groups: self.stat_publish_turn_wait_groups.load(Ordering::Relaxed),
+            published_frames: frame.published_frames,
+            fenced_frames: frame.fenced_frames,
+            fence_failures: frame.fence_failures,
+            payload_bytes: frame.payload_bytes,
+            padded_bytes: frame.padded_bytes,
+            stage_copy_nanos: frame.stage_copy_nanos,
+            stage_copy_frames: frame.stage_copy_frames,
+            publish_to_claim_nanos: frame.publish_to_claim_nanos,
+            publish_to_claim_frames: frame.publish_to_claim_frames,
+            claim_to_write_done_nanos: frame.claim_to_write_done_nanos,
+            claim_to_write_done_frames: frame.claim_to_write_done_frames,
+            write_done_to_contiguous_cut_nanos: frame.write_done_to_contiguous_cut_nanos,
+            write_done_to_contiguous_cut_frames: frame.write_done_to_contiguous_cut_frames,
+            contiguous_cut_events: frame.contiguous_cut_events,
+            contiguous_cut_advanced_frames: frame.contiguous_cut_advanced_frames,
+            contiguous_cut_advance_max_frames: frame.contiguous_cut_advance_max_frames,
+            waiter_cut_to_observe_nanos: self.stat_waiter_cut_to_observe_ns.load(Ordering::Relaxed),
+            waiter_cut_to_observe_count: self
+                .stat_waiter_cut_to_observe_count
+                .load(Ordering::Relaxed),
+            in_flight_depth_max: frame.in_flight_depth_max,
+            in_flight_depth_histogram: frame.in_flight_depth_histogram,
+            controller_sustained_actions: controller.sustained_qd16_actions,
+            controller_pending_probe_cover_actions: controller.pending_probe_cover_actions,
+            controller_qd1_samples: controller.qd1_probe_actions,
+            controller_qd1_sparse_actions: controller.qd1_sparse_actions,
+            controller_qd1_verify_actions: controller.qd1_verify_actions,
+            controller_qd1_fast_actions: controller.qd1_fast_actions,
+            controller_unfragmented_actions: controller.unfragmented_actions,
+            controller_pool_too_narrow: controller.pool_too_narrow,
+            controller_empty_chunk: controller.empty_chunk,
+            controller_insufficient_free_slots: controller.insufficient_free_slots,
+            controller_natural_depth: controller.natural_depth,
+            controller_segment_boundary: controller.segment_boundary,
+            controller_amplification_cap: controller.amplification_cap,
+            controller_fast_samples: controller.fast_probes,
+            controller_nonfast_samples: controller.gray_or_slow_probes,
+            controller_transitions_to_verify: controller.transitions_to_verify,
+            controller_transitions_to_fast: controller.transitions_to_fast,
+            controller_transitions_to_sustained: controller.transitions_to_sustained,
+            controller_stale_qd1_samples: controller.stale_qd1_samples,
+            controller_unavailable_qd1_samples: controller.unavailable_qd1_samples,
+            controller_abandoned_qd1_samples: controller.abandoned_qd1_samples,
+            controller_protocol_faults: controller.protocol_faults,
+            controller_protocol_fallback_actions: controller.protocol_fallback_actions,
+            controller_phase: if controller_active {
+                match controller.phase {
+                    FuaControllerPhase::SustainedSlow => 1,
+                    FuaControllerPhase::Verify => 2,
+                    FuaControllerPhase::Fast => 3,
+                }
+            } else {
+                0
+            },
+            controller_verify_fast_streak: controller.verify_fast_streak as u64,
+            controller_sustained_remaining: if controller_active {
+                controller.sustained_qd16_remaining as u64
+            } else {
+                0
+            },
+            controller_generation: controller.generation,
+            controller_pending_qd1_samples: controller.pending_qd1_samples,
+            controller_fast_in_flight: controller.fast_in_flight,
+            controller_fast_in_flight_max: controller.fast_in_flight_max,
+            controller_generation_exhausted: controller.generation_exhausted,
+            controller_ordinal_exhausted: controller.ordinal_exhausted,
+            controller_action_reconciliation: u64::from(
+                controller_active && controller_guard.action_reconciliation_ok(),
+            ),
+            controller_sample_reconciliation: u64::from(
+                controller_active && controller_guard.sample_reconciliation_ok(),
+            ),
+        }
     }
 
     /// Segments recycled into service by the pre-stager (non-vacuity telemetry).
@@ -418,24 +639,22 @@ impl FuaWalBackend {
         self.active.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Publish one group's frame into the active segment (staging memcpy only — the fence pool does
-    /// the IO), rolling to a fresh segment on `StorageFull`. Returns the specific frame log the
-    /// frame landed in so the caller can poll THAT log's durable cut across concurrent rolls.
-    ///
-    /// Fence-pool PACING (the measured anti-convoy law): publish only while a fence slot is free
-    /// (`free_fence_slots > 0`), accumulating otherwise, so backlog spreads across the pool instead
-    /// of shipping tiny frames that collapse the pool to serial-fence latency.
+    /// Atomically publish one ordered logical group into the canonical FUA log. The shared
+    /// controller may choose a bounded physical subframe batch, but records, ticket order,
+    /// segment ownership, WAL cursor, and acknowledgement remain this backend's sole authority.
     fn publish(
         &self,
         ticket: u64,
         payload: &[u8],
         first_seq: u64,
         seq_count: u32,
-    ) -> Result<Arc<FuaFrameLog>, EngineError> {
+        controller_enabled: bool,
+    ) -> Result<PublishedGroup, EngineError> {
         // Wait our turn: publish frames in ticket (== `first_seq`) order. This is the ONLY ordering
         // point and it only gates a staging memcpy; the fence pool then pipelines the durability of
         // every published frame concurrently. A prior ticket that wedged the backend without
         // advancing the cursor is surfaced as poison so later tickets abort rather than hang.
+        let publish_turn_started = std::time::Instant::now();
         let mut spins = 0u32;
         while self.publish_cursor.load(Ordering::Acquire) != ticket {
             if let Some(reason) = self.poison_reason() {
@@ -448,6 +667,15 @@ impl FuaWalBackend {
                 std::thread::yield_now();
             }
         }
+        saturating_add(
+            &self.stat_publish_turn_wait_ns,
+            publish_turn_started
+                .elapsed()
+                .as_nanos()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        saturating_add(&self.stat_publish_turn_wait_groups, 1);
         let mut active = self.lock_active();
         loop {
             while active.log.free_fence_slots(self.lanes) == 0 {
@@ -457,20 +685,117 @@ impl FuaWalBackend {
                 }
                 std::thread::yield_now();
             }
-            let result = active
-                .appender
-                .as_mut()
-                .expect("FUA appender present")
-                .publish_frame(payload, first_seq, seq_count);
+            let free_slots = active.log.free_fence_slots(self.lanes);
+            let natural_depth = self.lanes.saturating_sub(free_slots);
+            let fragment_count = FUA_CONTROLLER_QD16_FRAGMENTS
+                .saturating_sub(natural_depth.min(FUA_CONTROLLER_QD16_FRAGMENTS));
+            let chunks = split_physical_chunks(payload, fragment_count);
+            let fragmented_padded_bytes = chunks
+                .as_deref()
+                .and_then(padded_chunks_bytes)
+                .unwrap_or(usize::MAX);
+            let single_frame_padded_bytes = fua_frame_padded_bytes(payload.len());
+            let batch_fit = chunks.as_deref().map(|chunks| {
+                active
+                    .appender
+                    .as_ref()
+                    .expect("FUA appender present")
+                    .can_publish_batch(chunks)
+            });
+            let one_segment = matches!(batch_fit, Some(Ok(())));
+            let eligibility = FuaControllerEligibility {
+                pool_lanes: self.lanes,
+                natural_depth,
+                free_slots,
+                fragment_count,
+                chunks_nonempty: chunks.is_some(),
+                one_segment,
+                single_frame_padded_bytes,
+                fragmented_padded_bytes,
+            };
+            // If the controller wants a fragmented group and this live segment has only a suffix
+            // left, drain/roll BEFORE touching any batch cursor. A fresh segment may admit the
+            // complete group; a segment whose geometry is too small remains an ineligible
+            // unfragmented group without an infinite roll loop.
+            let wants_fragmented = controller_enabled
+                && self
+                    .controller
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .select(FuaControllerEligibility {
+                        one_segment: true,
+                        ..eligibility
+                    })
+                    .fragments()
+                    >= 2;
+            if wants_fragmented
+                && !one_segment
+                && fragmented_padded_bytes <= self.segment_bytes
+                && matches!(batch_fit, Some(Err(ref err)) if err.kind() == std::io::ErrorKind::StorageFull)
+            {
+                self.roll(&mut active)?;
+                continue;
+            }
+            // The final choice, atomic frame-group visibility publication, and token issue are
+            // one controller critical section.  A fence completion can therefore never advance
+            // generation between selection and token creation.
+            let mut controller = controller_enabled
+                .then(|| self.controller.lock().unwrap_or_else(|p| p.into_inner()));
+            let decision = controller.as_deref().map_or(
+                FuaControllerDecision::Unfragmented(
+                    gpu_db_write_conveyor::FuaControllerReason::NaturalDepth,
+                ),
+                |controller| controller.select(eligibility),
+            );
+            let result = match decision {
+                FuaControllerDecision::SustainedEpoch { .. }
+                | FuaControllerDecision::PendingProbeCover { .. } => active
+                    .appender
+                    .as_mut()
+                    .expect("FUA appender present")
+                    .publish_batch(
+                        chunks.as_deref().expect("eligible fragmented chunks"),
+                        first_seq,
+                        seq_count,
+                    )
+                    .map(|handle| handle.terminal_frame_id),
+                FuaControllerDecision::Qd1Sample { .. }
+                | FuaControllerDecision::Unfragmented(_) => active
+                    .appender
+                    .as_mut()
+                    .expect("FUA appender present")
+                    .publish_frame(payload, first_seq, seq_count)
+                    .map(|handle| handle.frame_id),
+            };
             match result {
-                Ok(_) => {
+                Ok(terminal_frame_id) => {
                     let log = Arc::clone(&active.log);
+                    let controller_sample = controller
+                        .as_deref_mut()
+                        .and_then(|controller| controller.record_published(decision))
+                        .map(|token| ControllerSampleSettlement {
+                            controller: Arc::clone(&self.controller),
+                            token: Some(token),
+                        });
+                    saturating_add(&self.stat_logical_groups, 1);
+                    saturating_add(&self.stat_logical_payload_bytes, payload.len() as u64);
+                    saturating_add(
+                        &self.stat_single_frame_padded_baseline_bytes,
+                        fua_frame_padded_bytes(payload.len()) as u64,
+                    );
                     // Release the turn so the next ticket can publish. Store while holding the
                     // active lock so the memcpy is fully visible before the successor publishes.
                     self.publish_cursor.store(ticket + 1, Ordering::Release);
-                    return Ok(log);
+                    return Ok(PublishedGroup {
+                        log,
+                        terminal_frame_id,
+                        controller_sample,
+                    });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::StorageFull => {
+                    // This may only be the unfragmented fallback (fragmented batches were
+                    // preflighted above). Nothing was visible, so a roll preserves all-or-nothing
+                    // group ownership and lets the same ticket retry on one fresh segment.
                     self.roll(&mut active)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -673,6 +998,9 @@ impl FuaWalBackend {
         self.kick_prestage();
         let new_pool = new_log.spawn_fence_pool(self.lanes);
         let new_appender = new_log.appender();
+        active
+            .retired_telemetry
+            .saturating_add_assign(active.log.telemetry());
         active.log = new_log;
         active.appender = Some(new_appender);
         active.pool = Some(new_pool);
@@ -693,13 +1021,24 @@ impl FuaWalBackend {
         if let Some(reason) = self.poison_reason() {
             return Err(self.poison_error(&reason));
         }
-        let log = self.publish(ticket, payload, first_seq, seq_count)?;
+        let mut published = self.publish(ticket, payload, first_seq, seq_count, true)?;
         let mut spins = 0u32;
         loop {
-            if log.durable_seq() >= target as u64 {
+            if published.log.durable_seq() >= target as u64 {
+                self.record_waiter_cut_observation(&published.log);
+                if let Some(sample) = published.controller_sample.as_mut() {
+                    if let Some(direct_nanos) = published
+                        .log
+                        .frame_direct_write_service_nanos(published.terminal_frame_id)
+                    {
+                        sample.observe(direct_nanos);
+                    } else {
+                        sample.unavailable();
+                    }
+                }
                 break;
             }
-            if log.fence_failed() {
+            if published.log.fence_failed() {
                 self.set_poison("FUA fence lane failed");
                 return Err(self.poison_error("FUA fence lane failed"));
             }
@@ -728,8 +1067,11 @@ impl FuaWalBackend {
     /// seqs the frame covers); the durable cut (`durable_records`) reports the largest global end
     /// of this lane's contiguous-durable frame prefix. This is the per-lane primitive behind
     /// [`crate::FuaWalLaneSet`] — unlike [`Self::commit_group`] it does not block on the cut, so a
-    /// caller drives N lanes independently and polls the cross-lane merged cut. Single-writer per
-    /// lane is assumed (tickets serialize the staging memcpy; the fence pool then pipelines).
+    /// caller drives N lanes independently and polls the cross-lane merged cut. This legacy/test
+    /// lane primitive deliberately preserves the canonical appender, roll, fence-pool, and
+    /// recovery representation while remaining controller-disabled: it has no synchronous QD1
+    /// direct-service observation owner. Single-writer per lane is assumed (tickets serialize the
+    /// staging memcpy; the fence pool then pipelines).
     pub(crate) fn append_frame(
         &self,
         payload: &[u8],
@@ -740,7 +1082,7 @@ impl FuaWalBackend {
             return Err(self.poison_error(&reason));
         }
         let ticket = self.next_ticket();
-        self.publish(ticket, payload, first_seq, seq_count)?;
+        self.publish(ticket, payload, first_seq, seq_count, false)?;
         let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         stats.flush_groups += 1;
         stats.durable_records += seq_count as u64;
@@ -756,17 +1098,22 @@ impl FuaWalBackend {
             if let Some(reason) = self.poison_reason() {
                 return Err(self.poison_error(&reason));
             }
-            let (durable, failed) = {
+            let (durable, failed, cut_to_observe) = {
                 let active = self.lock_active();
+                let active_durable = active.log.durable_seq();
                 (
-                    active
-                        .log
-                        .durable_seq()
-                        .max(self.rolled_baseline.load(Ordering::Acquire)),
+                    active_durable.max(self.rolled_baseline.load(Ordering::Acquire)),
                     active.log.fence_failed(),
+                    (active_durable >= target as u64)
+                        .then(|| active.log.durable_cut_to_observe_nanos())
+                        .flatten(),
                 )
             };
             if durable >= target as u64 {
+                if let Some(nanos) = cut_to_observe {
+                    saturating_add(&self.stat_waiter_cut_to_observe_ns, nanos);
+                    saturating_add(&self.stat_waiter_cut_to_observe_count, 1);
+                }
                 return Ok(());
             }
             if failed {
@@ -779,6 +1126,13 @@ impl FuaWalBackend {
             } else {
                 std::thread::yield_now();
             }
+        }
+    }
+
+    fn record_waiter_cut_observation(&self, log: &FuaFrameLog) {
+        if let Some(nanos) = log.durable_cut_to_observe_nanos() {
+            saturating_add(&self.stat_waiter_cut_to_observe_ns, nanos);
+            saturating_add(&self.stat_waiter_cut_to_observe_count, 1);
         }
     }
 }
@@ -1005,69 +1359,118 @@ fn remove_stale_segments(base: &Path) {
     }
 }
 
-/// Recover the totally-ordered `WalRecord` history from a FUA-durable database at `base_path`.
-///
-/// Reads every `<base>.fua.<segment_id>` segment in ascending id order, scan-recovers each to its
-/// contiguous valid frame prefix ([`recover_frame_log_by_scan`]), verifies each frame's global
-/// `first_seq` chains contiguously (a gap ends the durable prefix — a torn tail), and decodes each
-/// frame payload (the serial-encoded record run) back into `WalRecord`s. The result is
-/// byte/semantic-identical to what the serial reader would recover from the same logical records.
-pub fn recover_fua_wal_records(base_path: impl AsRef<Path>) -> Result<Vec<WalRecord>, EngineError> {
-    let base = base_path.as_ref();
-    let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Ok(Vec::new());
-    };
-    let Some(stem) = base.file_name().and_then(|n| n.to_str()) else {
-        return Ok(Vec::new());
-    };
-    let mut segments: Vec<(u64, PathBuf)> = Vec::new();
-    match std::fs::read_dir(parent) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Some(id) = parse_segment_id(name, stem) {
-                        segments.push((id, entry.path()));
+/// One complete logical WAL run recovered from the physical frames of one segment.  This is the
+/// sole physical-fragment coalescer: single-log and lane-set recovery both decode these runs.
+pub(crate) struct RecoveredFuaWalRun {
+    pub first_seq: u64,
+    pub seq_count: u32,
+    pub terminal_frame_id: u64,
+    pub payload: Vec<u8>,
+}
+
+pub(crate) fn recover_fua_wal_runs(path: &Path) -> Result<Vec<RecoveredFuaWalRun>, EngineError> {
+    let frames = recover_frame_log_by_scan(path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to scan-recover FUA WAL segment {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut runs = Vec::new();
+    let mut pending: Option<(gpu_db_write_conveyor::FrameGroupMetadata, u64, Vec<u8>)> = None;
+    for frame in frames {
+        match frame.group {
+            None => {
+                if pending.is_some() {
+                    return Err(EngineError::Durability(format!(
+                        "FUA WAL segment {} interleaves a legacy frame into a fragmented group",
+                        path.display()
+                    )));
+                }
+                runs.push(RecoveredFuaWalRun {
+                    first_seq: frame.first_seq,
+                    seq_count: frame.seq_count,
+                    terminal_frame_id: frame.frame_id,
+                    payload: frame.payload,
+                });
+            }
+            Some(metadata) if metadata.fragment_index == 0 => {
+                if pending.is_some() {
+                    return Err(EngineError::Durability(format!(
+                        "FUA WAL segment {} starts a fragmented group before the prior group ends",
+                        path.display()
+                    )));
+                }
+                pending = Some((metadata, frame.first_seq, frame.payload));
+            }
+            Some(metadata) => {
+                let Some((expected, first_seq, payload)) = pending.as_mut() else {
+                    return Err(EngineError::Durability(format!(
+                        "FUA WAL segment {} frame {} has a fragmented continuation without a prefix",
+                        path.display(), frame.frame_id
+                    )));
+                };
+                if metadata.total_payload_bytes != expected.total_payload_bytes
+                    || metadata.fragment_count != expected.fragment_count
+                    || metadata.group_crc32c != expected.group_crc32c
+                    || metadata.fragment_index == 0
+                    || frame.first_seq != *first_seq
+                {
+                    return Err(EngineError::Durability(format!(
+                        "FUA WAL segment {} frame {} has inconsistent fragmented metadata",
+                        path.display(),
+                        frame.frame_id
+                    )));
+                }
+                payload.extend_from_slice(&frame.payload);
+                if metadata.fragment_index + 1 == metadata.fragment_count {
+                    let (expected, first_seq, payload) = pending.take().expect("group is pending");
+                    if payload.len() as u64 != expected.total_payload_bytes {
+                        return Err(EngineError::Durability(format!(
+                            "FUA WAL segment {} fragmented group ending at frame {} fails length validation",
+                            path.display(), frame.frame_id
+                        )));
                     }
+                    runs.push(RecoveredFuaWalRun {
+                        first_seq,
+                        seq_count: frame.seq_count,
+                        terminal_frame_id: frame.frame_id,
+                        payload,
+                    });
                 }
             }
         }
-        // No directory / no segments = a fresh (never-flushed) database.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(EngineError::Durability(format!(
-                "failed to enumerate FUA WAL segments in {}: {err}",
-                parent.display()
-            )));
-        }
     }
-    segments.sort_by_key(|(id, _)| *id);
+    if pending.is_some() {
+        return Err(EngineError::Durability(format!(
+            "FUA WAL segment {} exposes an incomplete fragmented group after scan validation",
+            path.display()
+        )));
+    }
+    Ok(runs)
+}
 
+/// Recover the totally-ordered `WalRecord` history from a FUA-durable database at `base_path`.
+pub fn recover_fua_wal_records(base_path: impl AsRef<Path>) -> Result<Vec<WalRecord>, EngineError> {
     let mut records = Vec::new();
     let mut expected_first = 0u64;
-    for (_id, path) in segments {
-        let frames = recover_frame_log_by_scan(&path).map_err(|err| {
-            EngineError::Durability(format!(
-                "failed to scan-recover FUA WAL segment {}: {err}",
-                path.display()
-            ))
-        })?;
-        for frame in frames {
-            if frame.first_seq != expected_first {
-                // A gap in the totally-ordered log: the durable prefix ends here (an earlier
-                // segment's tail was torn, or a segment is missing). Stop at the contiguous cut.
+    for path in fua_segment_paths_sorted(base_path.as_ref())? {
+        for run in recover_fua_wal_runs(&path)? {
+            if run.first_seq != expected_first {
                 return Ok(records);
             }
-            let decoded = decode_wal_record_run(&frame.payload)?;
-            if decoded.len() as u64 != frame.seq_count as u64 {
+            let decoded = decode_wal_record_run(&run.payload)?;
+            if decoded.len() as u64 != u64::from(run.seq_count) {
                 return Err(EngineError::Durability(format!(
-                    "FUA WAL segment {} frame {} declares {} records but its payload decodes to {}",
-                    path.display(),
-                    frame.frame_id,
-                    frame.seq_count,
-                    decoded.len()
+                    "FUA WAL segment {} terminal frame {} declares {} records but its run decodes to {}",
+                    path.display(), run.terminal_frame_id, run.seq_count, decoded.len()
                 )));
             }
-            expected_first += frame.seq_count as u64;
+            expected_first = run
+                .first_seq
+                .checked_add(u64::from(run.seq_count))
+                .ok_or_else(|| {
+                    EngineError::Durability("FUA WAL recovery sequence range overflow".to_string())
+                })?;
             records.extend(decoded);
         }
     }

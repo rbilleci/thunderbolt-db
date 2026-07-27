@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+probe-timing = ["gpu_db_engine/probe-timing"]
+
 # Protocol-neutral façade over the engine (prototype→production plan, P0-M1).
 # Depends on the engine (execution) and on the lower `gpu_db_sql` crate for the
 # SQL value/command vocabulary it converts away from. It has no wire dependency:

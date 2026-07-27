@@ -16,8 +16,8 @@ use gpu_db_facade::{
 use gpu_db_protocol::backend::{BackendError, BackendWriter};
 use gpu_db_protocol::{
     is_copy_statement, parse_copy_from_stdin, parse_copy_row, parse_copy_to_stdout_table,
-    parse_frontend_message, CopyColumn, CopyFormat, CopyFromStdin, CopyOptions, CopyParseError,
-    CopyToStdout, FrontendMessage, SqlType, SqlValue,
+    parse_frontend_message, sql_may_start_with_any_keyword, CopyColumn, CopyFormat, CopyFromStdin,
+    CopyOptions, CopyParseError, CopyToStdout, FrontendMessage, SqlType, SqlValue,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -45,6 +45,9 @@ pub(crate) enum CopyClassification {
 }
 
 pub(crate) fn classify_copy_statement(sql: &str) -> CopyClassification {
+    if !compat_classifier_gate(sql, &["COPY"]) {
+        return CopyClassification::NotCopy;
+    }
     if let Some(copy) = parse_copy_from_stdin(sql) {
         CopyClassification::Supported(CopyStatement::From(copy))
     } else if let Some(copy) = parse_copy_to_stdout_table(sql) {
@@ -54,6 +57,13 @@ pub(crate) fn classify_copy_statement(sql: &str) -> CopyClassification {
     } else {
         CopyClassification::NotCopy
     }
+}
+
+fn compat_classifier_gate(sql: &str, candidates: &[&str]) -> bool {
+    let admitted = sql_may_start_with_any_keyword(sql, candidates);
+    #[cfg(feature = "probe-timing")]
+    crate::insert_probe::record_compat_classifier_gate(sql.len() as u64, admitted);
+    admitted
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1079,6 +1089,31 @@ mod tests {
     use super::*;
     use crate::cancellation::CancellationRegistry;
     use std::sync::Mutex;
+
+    #[test]
+    fn lexical_gate_preserves_supported_copy_forms_and_rejects_keyword_extensions() {
+        for statement in [
+            "-- leading COPY\ncopy accounts FROM STDIN",
+            "/* outer /* inner */ */ CoPy accounts TO STDOUT WITH CSV",
+            "COPY\u{2003}\u{202f}accounts FROM STDIN",
+        ] {
+            assert!(matches!(
+                classify_copy_statement(statement),
+                CopyClassification::Supported(_)
+            ));
+        }
+        for statement in [
+            "COPYfoo accounts",
+            "COPY_ accounts",
+            "COPY$1 accounts",
+            "COPYé accounts",
+        ] {
+            assert_eq!(
+                classify_copy_statement(statement),
+                CopyClassification::NotCopy
+            );
+        }
+    }
 
     #[test]
     fn copy_accepts_archive_separator_lines_after_the_client_terminator() {

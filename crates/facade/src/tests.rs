@@ -1122,6 +1122,61 @@ fn count_aggregate_round_trips_as_a_neutral_integer() {
 }
 
 #[test]
+fn general_insert_binding_failures_preserve_postgres_sqlstates_and_pre_effect_atomicity() {
+    let shared = SharedEngine::new();
+    submit_ephemeral_text(
+        &shared,
+        "CREATE TABLE insert_error_parity (id int4, balance int4)",
+    )
+    .expect("create table");
+    submit_ephemeral_text(
+        &shared,
+        "INSERT INTO insert_error_parity (id, balance) VALUES (1, 10)",
+    )
+    .expect("seed row");
+
+    for (sql, expected_sqlstate) in [
+        (
+            "INSERT INTO insert_error_parity (id, balance) \
+             VALUES (2, 20), (3, 2147483648)",
+            "22003",
+        ),
+        (
+            "INSERT INTO insert_error_parity (id, id) VALUES (2, 20)",
+            "42701",
+        ),
+        (
+            "INSERT INTO insert_error_parity (missing, balance) VALUES (2, 20)",
+            "42703",
+        ),
+    ] {
+        let error = submit_ephemeral_text(&shared, sql).expect_err("INSERT must fail before WAL");
+        assert_eq!(
+            pg_adapter::error_sqlstate(error.category),
+            expected_sqlstate,
+            "{sql}: {error:?}"
+        );
+    }
+
+    let outcome = submit_ephemeral_text(&shared, "SELECT COUNT(*) FROM insert_error_parity")
+        .expect("failed INSERTs leave the table readable");
+    let QueryOutcome::Rows { rows, .. } = outcome else {
+        panic!("COUNT must return rows after failed INSERTs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 1);
+    let count = match rows[0][0] {
+        DbValue::Int4(value) => i64::from(value),
+        DbValue::Int8(value) => value,
+        ref other => panic!("COUNT must be an integer, got {other:?}"),
+    };
+    assert_eq!(
+        count, 1,
+        "multi-row range failure and target binding failures are atomic"
+    );
+}
+
+#[test]
 fn select_from_unknown_table_returns_neutral_error() {
     let mut facade = MultiSessionHarness::new();
     let session = facade.open_session();

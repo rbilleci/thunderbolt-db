@@ -448,15 +448,28 @@ impl Engine {
             on_prepared,
         } = request.into_parts();
         let (command, source) = parsed.into_parts();
+        #[cfg(feature = "probe-timing")]
+        let probe_insert = matches!(&command, Command::Insert(_));
+        #[cfg(feature = "probe-timing")]
+        let probe_admission_started = probe_insert.then(Instant::now);
         let authorization_catalog = match self.transaction_snapshot_handle(txn_id) {
             Some(snapshot) => snapshot.transaction_catalog(),
             None => self.catalog_snapshot(),
         };
-        self.authorize_command_at(&authorization_catalog, principal, &command)?;
-        if !principal.is_bootstrap() && expected_catalog_version.is_none() {
-            expected_catalog_version = Some(authorization_catalog.commit_seq);
+        let admission = (|| {
+            self.authorize_command_at(&authorization_catalog, principal, &command)?;
+            if !principal.is_bootstrap() && expected_catalog_version.is_none() {
+                expected_catalog_version = Some(authorization_catalog.commit_seq);
+            }
+            self.validate_sequence_autocommit_statement_parent(txn_id, &command)
+        })();
+        #[cfg(feature = "probe-timing")]
+        if let Some(started) = probe_admission_started {
+            self.record_insert_probe_authorization_catalog_admission_nanos(
+                started.elapsed().as_nanos() as u64,
+            );
         }
-        self.validate_sequence_autocommit_statement_parent(txn_id, &command)?;
+        admission?;
         match command {
             Command::Select(_)
             | Command::SelectFunction(_)
@@ -1043,18 +1056,50 @@ impl Engine {
                     ));
                 }
             };
-            let canonical = Self::canonical_wal_record_with_isolation(
-                &commit, txn_id, 1, 0, &payload, isolation,
+            // This is only a synthetic manifest-accounting record. Keep its pre-existing direct
+            // predecessor decode separate from the live append-owner tail cache: it publishes no
+            // record and must not be mistaken for the canonical commit-path optimization.
+            let prior = commit
+                .wal
+                .last_record()
+                .map(|record| {
+                    gpu_db_wal::decode_canonical_record_payload(&record.payload).map(|envelope| {
+                        envelope.map(|envelope| gpu_db_wal::CanonicalCatalogTail {
+                            identity: envelope.header.identity,
+                            catalog_after_epoch: envelope.header.catalog_after_epoch,
+                            catalog_after_digest: envelope.header.catalog_after_digest,
+                        })
+                    })
+                })
+                .transpose()
+                .map_err(ExecuteError::Engine)?
+                .flatten();
+            let (catalog_epoch, catalog_digest) =
+                Self::canonical_catalog_boundary(commit.canonical_identity, prior)
+                    .map_err(ExecuteError::Engine)?;
+            let canonical = Self::canonical_wal_record_with_boundary_and_outcome_isolation(
+                commit.canonical_identity,
+                catalog_epoch,
+                catalog_digest,
+                txn_id,
+                1,
+                0,
+                &payload,
+                gpu_db_wal::canonical_request_digest(&payload),
+                gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
+                Self::canonical_affected_rows(&payload).map_err(ExecuteError::Engine)?,
+                isolation,
             )
             .map_err(ExecuteError::Engine)?;
-            let envelope = gpu_db_wal::decode_canonical_record_payload(&canonical.payload)
-                .map_err(ExecuteError::Engine)?
-                .ok_or_else(|| {
-                    ExecuteError::Engine(EngineError::Durability(
-                        "predeclared WAL preflight did not produce a canonical envelope"
-                            .to_string(),
-                    ))
-                })?;
+            let envelope =
+                gpu_db_wal::decode_canonical_record_payload(&canonical.as_wal_record().payload)
+                    .map_err(ExecuteError::Engine)?
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::Durability(
+                            "predeclared WAL preflight did not produce a canonical envelope"
+                                .to_string(),
+                        ))
+                    })?;
             gpu_db_wal::canonical_logical_intent_outcome_bytes(
                 &envelope.fragments,
                 &envelope.outcome,

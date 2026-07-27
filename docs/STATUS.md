@@ -14,6 +14,107 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
+
+- The exact report-card workload now reaches one canonical typed INSERT owner through the accepted
+  `SharedEngine::submit` facade, mutation admission, global identity allocator, WAL/durability, serialized device
+  apply, and publication boundary. Eligible fixed-width multi-row statements carry one sealed request identity and
+  catalog-ordered typed columns through that authority; they do not build a legacy `WriteDelta`, predicted row-key
+  vector, SQL reconstruction, or a second publisher. The existing mutation owner remains the only publisher.
+  Eligibility is structural—exact all-`int4` catalog order, supported defaults/constraints/index/FK state, and no
+  `RETURNING`—rather than table, batch, or benchmark-name specific. Every other shape retains the one compatibility
+  route, while W1 indexed/singleton work retains the accepted intent/classic path.
+- The default WAL representation is the additive typed binary INSERT envelope. It binds the canonical request,
+  table/dependency identity, final row/transaction identities, typed column payload, exact outcome, and replay
+  closure. Admission hashes the request once; the canonical prepared carrier, allocator, encoder, status buffer, and
+  replay reuse that sealed identity. Preparation reserves mutation/device budget and the full append/rollover plan
+  before WAL/status buffering. Device apply precedes physical group durability; a failed apply wedges the commit
+  authority with durable count unchanged, before publication/ack or legacy apply.
+- The permanent `probe-timing` qualification path records source construction, raw/canonical bytes and digest work,
+  parse/bind, authorization/catalog admission, off-lock coercion/default/constraint preparation, validation,
+  typed-WAL encode/append/durability, H2D/device apply, rollover/sidecars/index work, publication/ack, waves,
+  allocations, memory, and residual overlap. The external client freezes a deterministic hashed statement stream,
+  drives the same simple-query bytes and 1,000-row autocommit boundaries against both servers, validates exact
+  table digests, and fails closed on missing, duplicate, inconsistent, or concurrent probe evidence.
+- The accepted frozen seal is HEAD `fa477aa86052bbef914c5ad2ef2dbc60ae284d93`, staged tree
+  `ed0febc2e8eabc10852baa765e7b7dcaf9c61f48`, cached-diff SHA-256
+  `189ad3c728357c7704aac2b3c660ca7b60aae5c6b263e415e4f1f8666191f1f8`, and **88 staged paths** with no drift.
+- All 12 alternating qualification trials passed. The exact 48M all-profile artifact
+  `target/insert001-exact-seal-qualification-v3-48m-all-20260727` records development GPU
+  **853,624.942 rows/s in 56,230ms** versus observed PostgreSQL **772,271.039** and frozen floor **778,301.447**;
+  durable GPU **459,141.726 rows/s in 104,542ms** versus observed PostgreSQL **468,644.691** and frozen floor
+  **235,965.297**. Route, probe, FUA, and point-index geometry reconciliations passed.
+- The exact PostgreSQL differential artifact
+  `target/insert001-postgresql-differential-exact-seal-v1-20260727` exercised **17 cases** against GPU-server SHA-256
+  `d5d70691e0834b70126e1481807630a193a2d3cdb9e1ce1c0b11a26ad628e452`: final reads are byte-equal and SQLSTATE
+  results match, including typed/reordered/NULL INSERT, `RETURNING`, rollback, overflow, duplicate/unknown column,
+  UNIQUE, and NOT NULL cases.
+- Exact W1 evidence is **560** classic TPS at p50 **1.86ms** and **566** intent TPS at p50 **1.83ms**, versus base
+  **160** TPS at p50 **6.19/6.27ms**; recovery parity is **2/2**. The exact HAZARD artifact
+  `target/insert001-exact-seal-hazard-v3-20260727` ran **49 filter groups / 91 executed** with zero ignored, failed,
+  or CUDA-signature cases, including durable reopen/retry. Exact FUA safety, partial-depth, and controller artifacts
+  are separately non-vacuous and reconciled.
+- Durable WAL identity binding is write-once only for fresh canonical authority. Bound anchors are require-only across
+  live flush, recovery, and prefix truncation; raw canonical recovery validates its exact suffix and existing anchor
+  before any serial/FUA mutation. The public fresh/checkpoint/archive writers retain initial-install authority under
+  the documented exclusive-path-owner contract.
+- The exact quick screen is `target/insert001-report-card-quick-exact-seal-v2-20260727/runner.log`: production
+  batch-65,536 reached **272,202,222 lookups/s, p50 113us**; raw out-of-L2 roofline was **1,433.8 GB/s** and grouped
+  execution **1,673.2 M-elem/s**. It is a quick screen only, not acceptance evidence.
+- The final canonical full card is `target/insert001-canonical-full-ed0febc2-20260727/runner.log`, SHA-256
+  `54fdb682900d8280124d0d6f183d4b76e4ba1c326014c5bcbaa7072787521d74` (**27,289 bytes**), with terminal
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`. Exact raw/point/AWS-LC artifacts
+  are `a39c5a1a174530a8279132c3ab8e4c469357311683cc38d342fe25258b57c603`,
+  `8ea9c0ea1268911e9d01491cf969a072c56946f8b32889695ca483ea09e79031`, and
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61`. Section A out-of-L2 roofline/grouped/
+  constant-mask measured **1,428.7 GB/s / 1,672.5 M-elem/s / 1,459.1 GB/s**. Section B measured
+  **272,880,443 lookups/s, p50/p99/p99.9/max 113/123/130/135us**; Section C measured
+  **235,370,206 lookups/s, p50/p99/p99.9/max 126/148/172/172us** after a **438.4s** build.
+- Against PERF-002, build time improved from **2,303.5s** by **5.25x**; Section B/raw/grouped/constant-mask changed
+  **+2.17% / +0.12% / -0.02% / -0.86%**. Section C whole-run throughput changed **-5.85%**, while p50 improved
+  **139→126us**, p99.9/max improved **177→172us**, and every smaller batch improved **+3.4% to +13.8%**. The
+  post-card auditor accepted this as benchmark needle-construction whole-loop variance; no Section C floor exists.
+- Exact static evidence is **120** WAL tests, **721** engine tests, and feature-off/on facade **95/95** each, plus
+  strict checks, FUA safety/partial-depth/controller coverage, source-size gates, and reconciled non-vacuous HAZARD.
+  Pre-card and post-card auditors returned final **ACCEPT** with no finding. The exact full card remains applicable
+  to this documentation-only closeout; INSERT-001 owns no remaining PLAN work.
+
+## PERF-002 in-L2 point-read floor — accepted 2026-07-26
+
+- Disposable benchmark state was reduced from about **143 GB to 4.9 GB** before measurement. Regenerable debug,
+  release, test-WAL scratch, controlled-build, and superseded quick-card targets were permanently removed; the three
+  historical accepted full-card targets and compact diagnostic evidence were preserved. The report-card runner now
+  recreates its source-relative `target/tmp` for both quick and exported-full clean builds.
+- No engine or CUDA change was required. Controlled repetitions of the byte-identical accepted point binary measured
+  **265.547M–273.222M lookups/s** on the canonical 1M-row, one-caller, production-compact batch-65,536 route. The
+  repaired exact-candidate clean quick measured **270.893M lookups/s at p50 116us**, confirming that the earlier
+  **236.658M** full-card value was whole-run variance rather than a latency or GPU-route regression.
+- The standard quick and full report cards now fail closed unless that exact in-L2 route reports canonical whole-run
+  wall throughput of at least **260,000,000 lookups/s**. The parser requires exactly one target batch header, one
+  production line, one throughput token, and one canonical base-10 value; it rejects missing, malformed, duplicated,
+  post-summary decoy, zero-prefixed, overlength, and below-floor evidence. Built-in sabotage covers those cases, and
+  a failed floor makes the card incomplete before Section C.
+- The accepted harness/card seal is HEAD `fa477aa86052bbef914c5ad2ef2dbc60ae284d93`, staged tree
+  `94927b1d2fbed8f2489351d04b18f85691c27d2e`, and cached-diff SHA-256
+  `5389a54674a2b6e184b76c4cf57acd060eed41cbdfe4701e7fe2dd50faf2232b`. The exact raw, point, and AWS-LC
+  artifacts remain `a39c5a1a174530a8279132c3ab8e4c469357311683cc38d342fe25258b57c603` (1,131,808 bytes),
+  `4b9cd11ff160fc20349639abdc8e8d0ee1613867a156110c3fd4eaa52665c27e` (10,068,296 bytes), and
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61` (7,156,488 bytes).
+- The sole authorized canonical card completed A/B/C and emitted
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`. In-L2 batch-65,536 passed the
+  floor at **267.086M lookups/s, p50 117us, p99 132us, p99.9 146us**. Out-of-L2 measured
+  **250.007M lookups/s, p50 139us, p99 146us** after a **2,303.5s insert + 0.0s residency** fixture build.
+  Raw out-of-L2 roofline was **1,427.0 GB/s**, grouped execution **1,672.9 M-elem/s**, and constant-mask output
+  **1,471.8 GB/s**. Versus the preceding normal card, in-L2 throughput is **-0.69%** with unchanged p50; versus
+  the immediately accepted outlier it is **+12.9%**. Out-of-L2 point throughput improved **1.54%**, while raw,
+  grouped, and constant-mask controls remained within **0.7%**.
+- The isolated target was removed. The preserved original Codex tool transcript is
+  `target/perf002-canonical-full-codex-transcript.jsonl`, SHA-256
+  `283654688504ed5ef95bba382daa72e90bfe31100f7549b40a0b3529a512539f`. The first independent audit rejected
+  three fail-open parser cases; the repaired pre-card audit and the transcript-backed post-card audit both returned
+  **ACCEPT** with no unresolved finding. Because no engine semantics changed, the accepted NULL differential,
+  HAZARD, recovery, and GPU-ownership evidence remains applicable.
+
 ## PRODUCT-001 legacy/P8 compatibility and deletion — accepted 2026-07-26
 
 - PRODUCT-001 is complete. The superseded protocol listener, host-relational module tree, both independently
@@ -75,7 +176,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Out-of-L2 throughput improved **0.7%**, and raw/grouped performance remained stable.
 - The same independent auditor verified completeness, provenance, workload identity, target cleanup, and baseline
   comparison and returned final **ACCEPT** with no unresolved finding. PRODUCT-001 therefore owns no remaining
-  PLAN work; `COPY-001` is the active continuation.
+  PLAN work.
 
 ## PRODUCT-001 SQLSTATE/type codecs, named clients, and mixed recovery — accepted 2026-07-24
 

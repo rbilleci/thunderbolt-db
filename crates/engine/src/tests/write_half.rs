@@ -1095,7 +1095,7 @@ fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_driver
     let item = e.make_covered_insert_wave_item(
         2,
         parse_command(text).unwrap(),
-        text,
+        crate::engine_dml_concurrent::CanonicalRequest::from_text(&e, text),
         WriteSet::default(),
         e.committed_seq(),
         e.catalog_snapshot().commit_seq,

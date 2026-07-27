@@ -1,6 +1,10 @@
 //! WAL buffering, group flush, and durable segment ownership.
+//!
+//! Callers must exclusively own a durable WAL base/path for each buffer or artifact lifetime;
+//! under that precondition, initial identity install and later require-only handoffs fail closed.
 
 use super::*;
+use crate::identity::{check_or_install_durable_identity, require_durable_identity};
 
 /// The durable backing for a [`WalBuffer`]: an **append-only** segment writer whose mutable
 /// state sits behind its OWN small lock, separate from whatever outer lock guards the buffer
@@ -384,9 +388,227 @@ impl SerialFlushJob {
     }
 }
 
+/// Per-buffer proof that the in-memory WAL history has one immutable canonical lineage.
+///
+/// The public artifact writers deliberately validate their complete supplied slice. A live
+/// append-only buffer instead verifies only its newly appended suffix, installing the small
+/// durable sidecar only when it first binds and requiring it on every later durability handoff.
+#[derive(Debug, Default)]
+struct DurableIdentityBinding {
+    identity: Option<CanonicalIdentity>,
+    verified_records: usize,
+    #[cfg(test)]
+    decoded_records_for_test: usize,
+}
+
+impl DurableIdentityBinding {
+    fn bound(identity: CanonicalIdentity, verified_records: usize) -> Self {
+        Self {
+            identity: Some(identity),
+            verified_records,
+            #[cfg(test)]
+            decoded_records_for_test: 0,
+        }
+    }
+
+    fn canonical_identity_in_records(
+        records: &[WalRecord],
+    ) -> Result<Option<CanonicalIdentity>, EngineError> {
+        let mut identity = None;
+        for record in records {
+            let Some(envelope) = decode_canonical_record_payload(&record.payload)? else {
+                continue;
+            };
+            match identity {
+                None => identity = Some(envelope.header.identity),
+                Some(expected) if expected == envelope.header.identity => {}
+                Some(_) => {
+                    return Err(EngineError::Durability(
+                        "canonical WAL records span multiple durable identities".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(identity)
+    }
+
+    /// Raw recovery derives its canonical lineage before it touches any serial segment or FUA
+    /// backend state. Canonical history is already durable, so its sidecar must already exist;
+    /// only all-legacy recovery stays unbound and may install on its first later canonical write.
+    fn for_recovered_history(base: &Path, records: &[WalRecord]) -> Result<Self, EngineError> {
+        let Some(identity) = Self::canonical_identity_in_records(records)? else {
+            return Ok(Self {
+                verified_records: records.len(),
+                ..Self::default()
+            });
+        };
+        require_durable_identity(base, identity)?;
+        Ok(Self::bound(identity, records.len()))
+    }
+
+    /// An explicit recovered constructor may skip the live hot-path scan only after it proves
+    /// every canonical record in the supplied recovery history agrees with its checked anchor.
+    /// Legacy records are intentionally neutral: they neither establish nor alter lineage.
+    fn validate_recovered_records(
+        records: &[WalRecord],
+        identity: CanonicalIdentity,
+    ) -> Result<(), EngineError> {
+        match Self::canonical_identity_in_records(records)? {
+            Some(found) if found != identity => Err(EngineError::Durability(
+                "recovered canonical WAL records do not match the durable identity anchor"
+                    .to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Decode only the unverified tail, then install the tiny identity sidecar on the initial
+    /// bind or require the installed sidecar thereafter. The binding cursor advances only after
+    /// that operation succeeds, so a failed anchor check cannot hide an unverified record.
+    fn verify_through(
+        &mut self,
+        base: &Path,
+        records: &[WalRecord],
+        target: usize,
+    ) -> Result<(), EngineError> {
+        debug_assert!(target <= records.len());
+        debug_assert!(self.verified_records <= target);
+        let was_bound = self.identity.is_some();
+        let mut identity = self.identity;
+        for record in &records[self.verified_records..target] {
+            #[cfg(test)]
+            {
+                self.decoded_records_for_test += 1;
+            }
+            let Some(envelope) = decode_canonical_record_payload(&record.payload)? else {
+                continue;
+            };
+            match identity {
+                None => identity = Some(envelope.header.identity),
+                Some(expected) if expected == envelope.header.identity => {}
+                Some(_) => {
+                    return Err(EngineError::Durability(
+                        "canonical WAL records span multiple durable identities".to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(identity) = identity {
+            if was_bound {
+                require_durable_identity(base, identity)?;
+            } else {
+                check_or_install_durable_identity(base, identity)?;
+            }
+        }
+        self.identity = identity;
+        self.verified_records = target;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalCatalogTailCache {
+    /// The cache describes exactly `record_count` logical records. `None` is the known
+    /// legacy/empty boundary; its genesis digest remains an engine concern because it depends on
+    /// the current engine identity.
+    Known {
+        record_count: usize,
+        tail: Option<CanonicalCatalogTail>,
+    },
+    /// A generic append/reinstatement/recovery install changed the logical history without a
+    /// sealed canonical tail. Decode the actual last record on the next boundary request.
+    Dirty,
+}
+
+impl Default for CanonicalCatalogTailCache {
+    fn default() -> Self {
+        Self::Known {
+            record_count: 0,
+            tail: None,
+        }
+    }
+}
+
+/// Aggregate physical FUA attribution surfaced to the engine probe.
+///
+/// A zero snapshot means that this `WalBuffer` is not using the FUA backend. The counters are
+/// observability only; the durable/published frontiers remain the acknowledgement authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FuaDurabilityTelemetry {
+    pub configured_fence_lanes: u64,
+    pub logical_groups: u64,
+    pub logical_payload_bytes: u64,
+    pub single_frame_padded_baseline_bytes: u64,
+    pub publish_turn_wait_nanos: u64,
+    pub publish_turn_wait_groups: u64,
+    pub published_frames: u64,
+    pub fenced_frames: u64,
+    pub fence_failures: u64,
+    pub payload_bytes: u64,
+    pub padded_bytes: u64,
+    pub stage_copy_nanos: u64,
+    pub stage_copy_frames: u64,
+    pub publish_to_claim_nanos: u64,
+    pub publish_to_claim_frames: u64,
+    pub claim_to_write_done_nanos: u64,
+    pub claim_to_write_done_frames: u64,
+    pub write_done_to_contiguous_cut_nanos: u64,
+    pub write_done_to_contiguous_cut_frames: u64,
+    pub contiguous_cut_events: u64,
+    pub contiguous_cut_advanced_frames: u64,
+    pub contiguous_cut_advance_max_frames: u64,
+    pub waiter_cut_to_observe_nanos: u64,
+    pub waiter_cut_to_observe_count: u64,
+    pub in_flight_depth_max: u64,
+    pub in_flight_depth_histogram: [u64; 7],
+    /// Persistent physical controller evidence. All fields remain zero until the controller-owned
+    /// canonical FUA group route publishes an action (and for a non-FUA backend).
+    pub controller_sustained_actions: u64,
+    pub controller_pending_probe_cover_actions: u64,
+    pub controller_qd1_samples: u64,
+    pub controller_qd1_sparse_actions: u64,
+    pub controller_qd1_verify_actions: u64,
+    pub controller_qd1_fast_actions: u64,
+    pub controller_unfragmented_actions: u64,
+    pub controller_pool_too_narrow: u64,
+    pub controller_empty_chunk: u64,
+    pub controller_insufficient_free_slots: u64,
+    pub controller_natural_depth: u64,
+    pub controller_segment_boundary: u64,
+    pub controller_amplification_cap: u64,
+    pub controller_fast_samples: u64,
+    pub controller_nonfast_samples: u64,
+    pub controller_transitions_to_verify: u64,
+    pub controller_transitions_to_fast: u64,
+    pub controller_transitions_to_sustained: u64,
+    pub controller_stale_qd1_samples: u64,
+    pub controller_unavailable_qd1_samples: u64,
+    pub controller_abandoned_qd1_samples: u64,
+    pub controller_protocol_faults: u64,
+    pub controller_protocol_fallback_actions: u64,
+    pub controller_phase: u64,
+    pub controller_verify_fast_streak: u64,
+    pub controller_sustained_remaining: u64,
+    pub controller_generation: u64,
+    pub controller_pending_qd1_samples: u64,
+    pub controller_fast_in_flight: u64,
+    pub controller_fast_in_flight_max: u64,
+    pub controller_generation_exhausted: u64,
+    pub controller_ordinal_exhausted: u64,
+    pub controller_action_reconciliation: u64,
+    pub controller_sample_reconciliation: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct WalBuffer {
     records: Vec<WalRecord>,
+    /// Logical canonical catalog boundary, including records not yet flushed to durable media.
+    /// It is independent of physical segment-prefix truncation because that operation preserves
+    /// the complete logical record vector.
+    canonical_catalog_tail: CanonicalCatalogTailCache,
+    /// The live-buffer equivalent of the public full-slice identity bind. It remains private so
+    /// only constructors that proved the sidecar may seed a recovered/fresh history.
+    durable_identity_binding: DurableIdentityBinding,
     /// Durable watermark for the IN-MEMORY mode only (`durable: None`). The durable mode's
     /// watermark lives in [`WalDurableState::flushed_records`] so a group flush can advance it
     /// under the core's own lock, without the buffer's outer lock (the engine commit_mutex).
@@ -400,6 +622,8 @@ pub struct WalBuffer {
     /// `#[cfg(unix)]` because the underlying `FuaFrameLog` is a unix `O_DIRECT|O_DSYNC` construct.
     #[cfg(unix)]
     fua: Option<Arc<fua::FuaWalBackend>>,
+    #[cfg(test)]
+    canonical_catalog_tail_decodes_for_test: usize,
 }
 
 /// Which durability backend a durable [`WalBuffer`] uses. Default is the existing single-slot
@@ -474,6 +698,20 @@ impl WalBuffer {
         }
     }
 
+    /// Construct a fresh serial durable buffer after the caller has durably installed exactly
+    /// `identity` beside `segment_path`. The constructor rechecks that proof rather than exposing
+    /// a mutable identity setter; every flush checks it again before durable I/O.
+    pub fn with_durable_segment_bound_to_identity(
+        segment_path: impl Into<PathBuf>,
+        identity: CanonicalIdentity,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.into();
+        require_durable_identity(&segment_path, identity)?;
+        let mut buffer = Self::with_durable_segment(segment_path);
+        buffer.durable_identity_binding = DurableIdentityBinding::bound(identity, 0);
+        Ok(buffer)
+    }
+
     /// A WAL buffer backed by the FUA fence-pool durability backend (E1 step 1) — a FRESH durable
     /// database. `flush_all` / `begin_group_flush` publish each group's encoded record run as ONE
     /// frame into a pipelined fence pool; the contiguous durable cut is the record watermark, so
@@ -501,6 +739,23 @@ impl WalBuffer {
         })
     }
 
+    /// Construct a fresh FUA durable buffer after the caller has durably installed exactly
+    /// `identity` beside `segment_path`. This is the checked constructor used by the engine's
+    /// fresh durable path; it cannot be used to smuggle an unchecked mutable lineage into a WAL.
+    #[cfg(unix)]
+    pub fn with_fua_durable_segment_bound_to_identity(
+        segment_path: impl Into<PathBuf>,
+        lanes: usize,
+        segment_bytes: usize,
+        identity: CanonicalIdentity,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.into();
+        require_durable_identity(&segment_path, identity)?;
+        let mut buffer = Self::with_fua_durable_segment(segment_path, lanes, segment_bytes)?;
+        buffer.durable_identity_binding = DurableIdentityBinding::bound(identity, 0);
+        Ok(buffer)
+    }
+
     /// A WAL buffer installed over a segment just read back by [`recover_wal_segment`], seeded
     /// with the full recovered record history and positioned to keep APPENDING to the same file.
     ///
@@ -515,6 +770,36 @@ impl WalBuffer {
         recovery: &WalSegmentRecovery,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.into();
+        Self::validate_recovered_segment_history(&records, recovery)?;
+        let durable_identity_binding =
+            DurableIdentityBinding::for_recovered_history(&segment_path, &records)?;
+        Self::with_recovered_durable_segment_with_binding(
+            segment_path,
+            records,
+            recovery,
+            durable_identity_binding,
+        )
+    }
+
+    fn validate_recovered_segment_history(
+        records: &[WalRecord],
+        recovery: &WalSegmentRecovery,
+    ) -> Result<(), EngineError> {
+        if records.len() < recovery.records.len() || !records.ends_with(&recovery.records) {
+            return Err(EngineError::Durability(
+                "recovered logical WAL history must end with the exact recovered segment suffix"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn with_recovered_durable_segment_with_binding(
+        segment_path: PathBuf,
+        records: Vec<WalRecord>,
+        recovery: &WalSegmentRecovery,
+        durable_identity_binding: DurableIdentityBinding,
+    ) -> Result<Self, EngineError> {
         debug_assert!(records.len() >= recovery.records.len());
         debug_assert!(records.ends_with(&recovery.records));
         let segment_base_records = records.len() - recovery.records.len();
@@ -557,12 +842,38 @@ impl WalBuffer {
         }
         Ok(Self {
             records,
+            canonical_catalog_tail: CanonicalCatalogTailCache::Dirty,
+            durable_identity_binding,
             flushed_memory: 0,
             fail_next_flush: false,
             durable: Some(Arc::new(core)),
             #[cfg(unix)]
             fua: None,
+            #[cfg(test)]
+            canonical_catalog_tail_decodes_for_test: 0,
         })
+    }
+
+    /// Reopen a serial durable buffer after recovery already proved the complete history and its
+    /// checked sidecar anchor. New flushes decode only appended records, but still re-read the
+    /// anchor before every durable handoff.
+    pub fn with_recovered_durable_segment_bound_to_identity(
+        segment_path: impl Into<PathBuf>,
+        records: Vec<WalRecord>,
+        recovery: &WalSegmentRecovery,
+        identity: CanonicalIdentity,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.into();
+        Self::validate_recovered_segment_history(&records, recovery)?;
+        require_durable_identity(&segment_path, identity)?;
+        DurableIdentityBinding::validate_recovered_records(&records, identity)?;
+        let verified_records = records.len();
+        Self::with_recovered_durable_segment_with_binding(
+            segment_path,
+            records,
+            recovery,
+            DurableIdentityBinding::bound(identity, verified_records),
+        )
     }
 
     /// REOPEN a FUA-durable database (E1 step 3) whose retained `<segment_path>.fua.*` segments were
@@ -579,16 +890,61 @@ impl WalBuffer {
         lanes: usize,
         segment_bytes: usize,
     ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.into();
+        let durable_identity_binding =
+            DurableIdentityBinding::for_recovered_history(&segment_path, &records)?;
+        Self::with_recovered_fua_durable_segment_with_binding(
+            segment_path,
+            records,
+            lanes,
+            segment_bytes,
+            durable_identity_binding,
+        )
+    }
+
+    #[cfg(unix)]
+    fn with_recovered_fua_durable_segment_with_binding(
+        segment_path: PathBuf,
+        records: Vec<WalRecord>,
+        lanes: usize,
+        segment_bytes: usize,
+        durable_identity_binding: DurableIdentityBinding,
+    ) -> Result<Self, EngineError> {
         let recovered = records.len();
-        let backend =
-            fua::FuaWalBackend::reopen(segment_path.into(), lanes, segment_bytes, recovered)?;
+        let backend = fua::FuaWalBackend::reopen(segment_path, lanes, segment_bytes, recovered)?;
         Ok(Self {
             records,
+            canonical_catalog_tail: CanonicalCatalogTailCache::Dirty,
+            durable_identity_binding,
             flushed_memory: 0,
             fail_next_flush: false,
             durable: None,
             fua: Some(Arc::new(backend)),
+            #[cfg(test)]
+            canonical_catalog_tail_decodes_for_test: 0,
         })
+    }
+
+    /// FUA counterpart of [`Self::with_recovered_durable_segment_bound_to_identity`].
+    #[cfg(unix)]
+    pub fn with_recovered_fua_durable_segment_bound_to_identity(
+        segment_path: impl Into<PathBuf>,
+        records: Vec<WalRecord>,
+        lanes: usize,
+        segment_bytes: usize,
+        identity: CanonicalIdentity,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.into();
+        require_durable_identity(&segment_path, identity)?;
+        DurableIdentityBinding::validate_recovered_records(&records, identity)?;
+        let verified_records = records.len();
+        Self::with_recovered_fua_durable_segment_with_binding(
+            segment_path,
+            records,
+            lanes,
+            segment_bytes,
+            DurableIdentityBinding::bound(identity, verified_records),
+        )
     }
 
     /// FUA-backend PACING signal (E1 step 3): free fence lanes in the active segment's pool, or
@@ -640,8 +996,31 @@ impl WalBuffer {
         false
     }
 
+    /// Permanent physical FUA aggregates for the build-only engine probe. In-memory and serial
+    /// WAL paths intentionally report all zeros.
+    pub fn fua_durability_telemetry(&self) -> FuaDurabilityTelemetry {
+        #[cfg(unix)]
+        if let Some(fua) = self.fua.as_ref() {
+            return fua.telemetry();
+        }
+        FuaDurabilityTelemetry::default()
+    }
+
     pub fn append(&mut self, rec: WalRecord) {
         self.records.push(rec);
+        self.canonical_catalog_tail = CanonicalCatalogTailCache::Dirty;
+    }
+
+    /// Append one sealed canonical envelope and advance the logical catalog boundary in the same
+    /// mutation. The cache includes unflushed records because the next canonical proposal must
+    /// chain from the logical append order, not only the durable prefix.
+    pub fn append_canonical(&mut self, prepared: PreparedCanonicalWalRecord) {
+        let (record, tail) = prepared.into_parts();
+        self.records.push(record);
+        self.canonical_catalog_tail = CanonicalCatalogTailCache::Known {
+            record_count: self.records.len(),
+            tail: Some(tail),
+        };
     }
 
     /// Seed the buffer with records already known to be durable (e.g. recovered from a segment),
@@ -660,6 +1039,7 @@ impl WalBuffer {
         );
         self.flushed_memory = records.len();
         self.records = records;
+        self.canonical_catalog_tail = CanonicalCatalogTailCache::Dirty;
     }
 
     pub fn len(&self) -> usize {
@@ -672,6 +1052,51 @@ impl WalBuffer {
         self.records.last()
     }
 
+    /// Return the last canonical record's catalog-after boundary, lazily decoding only when a
+    /// generic logical-history mutation made the cache dirty. A legacy final record returns
+    /// `None`; a canonical-magic payload must decode completely or the request fails closed.
+    pub fn canonical_catalog_tail(&mut self) -> Result<Option<CanonicalCatalogTail>, EngineError> {
+        if let CanonicalCatalogTailCache::Known { record_count, tail } = self.canonical_catalog_tail
+        {
+            if record_count == self.records.len() {
+                return Ok(tail);
+            }
+        }
+
+        if self.records.is_empty() {
+            self.canonical_catalog_tail = CanonicalCatalogTailCache::Known {
+                record_count: 0,
+                tail: None,
+            };
+            return Ok(None);
+        }
+
+        self.canonical_catalog_tail = CanonicalCatalogTailCache::Dirty;
+        #[cfg(test)]
+        {
+            self.canonical_catalog_tail_decodes_for_test = self
+                .canonical_catalog_tail_decodes_for_test
+                .saturating_add(1);
+        }
+        let tail = decode_canonical_record_payload(
+            &self
+                .records
+                .last()
+                .expect("non-empty WAL tail was checked above")
+                .payload,
+        )?
+        .map(|envelope| CanonicalCatalogTail {
+            identity: envelope.header.identity,
+            catalog_after_epoch: envelope.header.catalog_after_epoch,
+            catalog_after_digest: envelope.header.catalog_after_digest,
+        });
+        self.canonical_catalog_tail = CanonicalCatalogTailCache::Known {
+            record_count: self.records.len(),
+            tail,
+        };
+        Ok(tail)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -680,6 +1105,10 @@ impl WalBuffer {
         if len >= self.records.len() {
             return;
         }
+        // A rollback can discard already-verified records, but not the immutable lineage they
+        // established. Clamping makes any surviving/new tail decode again before it can flush.
+        self.durable_identity_binding.verified_records =
+            self.durable_identity_binding.verified_records.min(len);
         // Commit-path rollback only ever truncates the just-appended UNFLUSHED tail (the callers
         // capture `wal.len()` before appending, and any group flush that could cover the region
         // being cut would have had to `begin` inside this holder's outer critical section — it
@@ -697,6 +1126,14 @@ impl WalBuffer {
                 fua.set_poison("WAL truncate below the published FUA frame watermark");
             }
             self.records.truncate(len);
+            self.canonical_catalog_tail = if self.records.is_empty() {
+                CanonicalCatalogTailCache::Known {
+                    record_count: 0,
+                    tail: None,
+                }
+            } else {
+                CanonicalCatalogTailCache::Dirty
+            };
             return;
         }
         match self.durable.as_ref() {
@@ -742,6 +1179,14 @@ impl WalBuffer {
                 self.records.truncate(len);
             }
         }
+        self.canonical_catalog_tail = if self.records.is_empty() {
+            CanonicalCatalogTailCache::Known {
+                record_count: 0,
+                tail: None,
+            }
+        } else {
+            CanonicalCatalogTailCache::Dirty
+        };
     }
 
     /// Make every appended record durable.
@@ -760,9 +1205,6 @@ impl WalBuffer {
     /// leaves the on-disk tail state unknowable poisons the backing (fail-closed until restart
     /// recovery truncates the torn tail at [`recover_wal_segment`] time).
     pub fn flush_all(&mut self) -> Result<(), EngineError> {
-        if let Some(path) = self.durable_segment_path() {
-            bind_or_install_durable_identity(path, &self.records)?;
-        }
         // FUA backend: the inline serial-path flush is just a group flush that also WAITS for the
         // durable cut. Delegating keeps one publish/wait path (and one `fail_next_flush`
         // consumption, handled by `begin_group_flush`).
@@ -781,6 +1223,13 @@ impl WalBuffer {
                 fua.wait_durable(target)?;
             }
             return Ok(());
+        }
+        if let Some(path) = self.durable_segment_path().map(Path::to_path_buf) {
+            self.durable_identity_binding.verify_through(
+                &path,
+                &self.records,
+                self.records.len(),
+            )?;
         }
         if self.fail_next_flush {
             self.fail_next_flush = false;
@@ -873,8 +1322,12 @@ impl WalBuffer {
     /// stay totally ordered) and the returned job's fence-pool wait runs concurrently with any
     /// other FUA job — multiple groups may be durable in flight at once.
     pub fn begin_group_flush(&mut self) -> Result<WalGroupFlushBegin, EngineError> {
-        if let Some(path) = self.durable_segment_path() {
-            bind_or_install_durable_identity(path, &self.records)?;
+        if let Some(path) = self.durable_segment_path().map(Path::to_path_buf) {
+            self.durable_identity_binding.verify_through(
+                &path,
+                &self.records,
+                self.records.len(),
+            )?;
         }
         if self.fail_next_flush {
             self.fail_next_flush = false;
@@ -1029,6 +1482,12 @@ impl WalBuffer {
                 state.segment_base_records
             )));
         }
+        let bound_identity = self.durable_identity_binding.identity;
+        if let Some(identity) = bound_identity {
+            // A live rotation never establishes lineage: even an empty retained suffix must
+            // retain its already-bound anchor before the rewrite can touch the segment.
+            require_durable_identity(&core.segment_path, identity)?;
+        }
         // Close the old handle first: the rename below unlinks the inode it points at.
         // W1b audit fix 3: any failure past this point leaves `file = None`, and the next
         // flush's ensure_created would CLOBBER the live segment with fresh-database semantics —
@@ -1036,7 +1495,15 @@ impl WalBuffer {
         // recovery (which reads the on-disk files, not this handle).
         state.file = None;
         let retained = &self.records[base..flushed];
-        if let Err(err) = write_wal_segment(&core.segment_path, retained) {
+        let rewrite = match bound_identity {
+            Some(identity) => crate::rewrite_wal_segment_requiring_durable_identity(
+                &core.segment_path,
+                retained,
+                identity,
+            ),
+            None => write_wal_segment(&core.segment_path, retained),
+        };
+        if let Err(err) = rewrite {
             state.poisoned = Some(format!("prefix-truncation rewrite failed ({err})"));
             return Err(err);
         }
@@ -1126,5 +1593,25 @@ impl WalBuffer {
 
     pub fn fail_next_flush(&mut self) {
         self.fail_next_flush = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_identity_decoded_records_for_test(&self) -> usize {
+        self.durable_identity_binding.decoded_records_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_identity_verified_records_for_test(&self) -> usize {
+        self.durable_identity_binding.verified_records
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_catalog_tail_decodes_for_test(&self) -> usize {
+        self.canonical_catalog_tail_decodes_for_test
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn fua_published_records_for_test(&self) -> Option<usize> {
+        self.fua.as_ref().map(|fua| fua.published_records())
     }
 }

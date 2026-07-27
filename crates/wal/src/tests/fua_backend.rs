@@ -62,6 +62,107 @@ fn fua_roundtrip_recovers_identically_to_serial_path() {
     let _ = std::fs::remove_dir_all(base.parent().unwrap());
 }
 
+/// Controller decisions are owned by synchronous canonical group commit.  The small pool makes
+/// the first decision visibly unfragmented, proving this route is controller-enabled without
+/// turning the legacy lane primitive into a second asynchronous feedback system.
+#[cfg(unix)]
+#[test]
+fn fua_canonical_group_commit_owns_controller_decision() {
+    let base = fua_test_base("controller-owner");
+    let mut wal = WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("fua create");
+    wal.append(rec(1, b"controller-owned-group"));
+    wal.flush_all().expect("fua flush");
+
+    let telemetry = wal.fua_durability_telemetry();
+    assert_eq!(telemetry.logical_groups, 1);
+    assert_eq!(telemetry.controller_unfragmented_actions, 1);
+    assert_eq!(telemetry.controller_pool_too_narrow, 1);
+    assert_eq!(telemetry.controller_sustained_actions, 0);
+    assert_eq!(telemetry.controller_qd1_samples, 0);
+    assert_eq!(telemetry.controller_pending_qd1_samples, 0);
+    assert_eq!(telemetry.controller_action_reconciliation, 1);
+    assert_eq!(telemetry.controller_sample_reconciliation, 1);
+
+    drop(wal);
+    let _ = std::fs::remove_dir_all(base.parent().unwrap());
+}
+
+/// The FUA path uses the same incremental lineage proof, but its protected boundary is frame
+/// publication rather than serial `io_in_flight`: a substituted or missing sidecar must reject
+/// before either `set_published` or the durable cut can move.
+#[cfg(unix)]
+#[test]
+fn fua_identity_binding_rejects_substitution_and_anchor_loss_before_publish() {
+    let base = fua_test_base("identity-incremental");
+    let identity = identity_test_value(34);
+    let foreign = identity_test_value(37);
+    let mut wal =
+        WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("fua durable create");
+    wal.append(canonical_identity_test_record(1, identity));
+    wal.flush_all().expect("first FUA flush");
+    assert_eq!(wal.durable_identity_decoded_records_for_test(), 1);
+    assert_eq!(wal.fua_published_records_for_test(), Some(1));
+
+    write_durable_identity(&base, foreign).expect("install foreign anchor");
+    wal.append(canonical_identity_test_record(2, identity));
+    let error = match wal.begin_group_flush() {
+        Ok(_) => panic!("foreign anchor must reject before FUA ticket/publication"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("another database/timeline"));
+    assert_eq!(
+        wal.flushed_count(),
+        1,
+        "identity failure cannot advance durable"
+    );
+    assert_eq!(
+        wal.fua_published_records_for_test(),
+        Some(1),
+        "identity failure cannot advance the FUA published cursor"
+    );
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 1);
+
+    write_durable_identity(&base, identity).expect("restore expected anchor");
+    wal.flush_all().expect("retry after anchor restore");
+    assert_eq!(wal.flushed_count(), 2);
+    assert_eq!(wal.fua_published_records_for_test(), Some(2));
+    assert_eq!(
+        wal.durable_identity_decoded_records_for_test(),
+        3,
+        "the failed sidecar check leaves the second record unverified"
+    );
+
+    for txn_id in 3..=5 {
+        wal.append(canonical_identity_test_record(txn_id, identity));
+        wal.flush_all().expect("subsequent FUA flush");
+        assert_eq!(
+            wal.durable_identity_decoded_records_for_test(),
+            txn_id as usize + 1,
+            "each FUA flush after recovery scans only its new record"
+        );
+    }
+    assert_eq!(wal.flushed_count(), 5);
+    assert_eq!(wal.fua_published_records_for_test(), Some(5));
+
+    std::fs::remove_file(durable_identity_path(&base)).expect("remove identity anchor");
+    wal.append(canonical_identity_test_record(6, identity));
+    let error = match wal.begin_group_flush() {
+        Ok(_) => panic!("missing anchor must reject before FUA ticket/publication"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("anchor is missing"));
+    assert_eq!(wal.flushed_count(), 5, "anchor loss cannot advance durable");
+    assert_eq!(
+        wal.fua_published_records_for_test(),
+        Some(5),
+        "anchor loss cannot hand another frame to FUA"
+    );
+    assert_eq!(wal.durable_identity_verified_records_for_test(), 5);
+    assert_eq!(recover_fua_wal_records(&base).unwrap().len(), 5);
+    drop(wal);
+    let _ = std::fs::remove_dir_all(base.parent().unwrap());
+}
+
 /// (b) The durable watermark advances ONLY over the contiguous durable cut and is monotonic,
 /// even with MULTIPLE flush jobs in flight completing out of order across the fence pool.
 #[cfg(unix)]
@@ -179,6 +280,30 @@ fn fua_segment_roll_recovers_across_segments() {
             wal.flush_all().expect("flush");
             assert_eq!(wal.flushed_count(), txn as usize);
         }
+        let telemetry = wal.fua_durability_telemetry();
+        assert_eq!(telemetry.configured_fence_lanes, 8);
+        assert_eq!(telemetry.logical_groups, total as u64);
+        assert_eq!(telemetry.published_frames, total as u64);
+        assert_eq!(telemetry.fenced_frames, total as u64);
+        assert_eq!(telemetry.fence_failures, 0);
+        assert_eq!(telemetry.stage_copy_frames, total as u64);
+        assert_eq!(telemetry.publish_to_claim_frames, total as u64);
+        assert_eq!(telemetry.claim_to_write_done_frames, total as u64);
+        assert_eq!(telemetry.write_done_to_contiguous_cut_frames, total as u64);
+        assert_eq!(telemetry.contiguous_cut_advanced_frames, total as u64);
+        assert_eq!(
+            telemetry.in_flight_depth_histogram.iter().sum::<u64>(),
+            total as u64
+        );
+        assert_eq!(
+            telemetry.logical_payload_bytes, telemetry.payload_bytes,
+            "no fragmentation means logical and physical payload bytes match"
+        );
+        assert_eq!(
+            telemetry.single_frame_padded_baseline_bytes, telemetry.padded_bytes,
+            "no fragmentation means one-frame baseline and actual padding match"
+        );
+        assert!(telemetry.waiter_cut_to_observe_count >= total as u64);
     }
     // More than one segment file must exist (a roll happened).
     let dir = base.parent().unwrap();
@@ -282,6 +407,38 @@ fn fua_reopen_continues_the_log_and_recovers_across_lives() {
         fua_wal_segments_exist(&base),
         "segments are retained for recovery"
     );
+    let _ = std::fs::remove_dir_all(base.parent().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_recovered_fua_canonical_history_requires_anchor_before_new_segment() {
+    let base = fua_test_base("identity-recovered-raw-fua");
+    let identity = identity_test_value(41);
+    {
+        let mut wal =
+            WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("create FUA WAL");
+        wal.append(canonical_identity_test_record(1, identity));
+        wal.flush_all().expect("initial canonical FUA flush");
+    }
+    let recovered = recover_fua_wal_records(&base).expect("recover canonical FUA history");
+    std::fs::remove_file(durable_identity_path(&base)).expect("remove identity anchor");
+    let mut files_before = std::fs::read_dir(base.parent().unwrap())
+        .expect("list FUA directory")
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    files_before.sort();
+
+    let error = WalBuffer::with_recovered_fua_durable_segment(&base, recovered, 8, 1 << 20)
+        .expect_err("raw canonical FUA recovery must require its anchor before creating a segment");
+    assert!(error.to_string().contains("anchor is missing"));
+    let mut files_after = std::fs::read_dir(base.parent().unwrap())
+        .expect("relist FUA directory")
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    files_after.sort();
+    assert_eq!(files_after, files_before);
+    assert_eq!(read_durable_identity(&base).unwrap(), None);
     let _ = std::fs::remove_dir_all(base.parent().unwrap());
 }
 

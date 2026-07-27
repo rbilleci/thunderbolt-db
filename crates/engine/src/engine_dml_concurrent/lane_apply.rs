@@ -23,9 +23,10 @@ impl Engine {
         if apply_leader {
             return self.wave_batch_visible_locate(table, filter_idx, needles, snapshots);
         }
-        let lanes = self.intent_lanes.as_ref()?;
-        let _device_guard = lanes
-            .device_apply_lock
+        let _device_guard = self
+            .read_state
+            .residency
+            .mutation_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         struct DeviceGuardFlag;
@@ -159,7 +160,7 @@ impl Engine {
     }
 
     /// Apply one canonically claimed optimized request. The canonical commit lock prevents a
-    /// second lane request from reaching this phase concurrently; `device_apply_lock` serializes
+    /// second lane request from reaching this phase concurrently; the residency mutation gate serializes
     /// against optimistic validation/rebuild activity. Any incomplete device publication panics
     /// and the caller wedges before acknowledgement.
     pub(super) fn lane_apply_request(

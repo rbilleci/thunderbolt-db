@@ -196,11 +196,9 @@ impl Engine {
                         .values()
                         .any(|sequence| sequence.oid == sequence_oid)
                     {
-                        return Err(
-                            ExecuteError::Serialization(format!(
-                                "transaction-created sequence \"{sequence}\" stable identity left its private catalog before WAL binding"
-                            ))
-                        );
+                        return Err(ExecuteError::Serialization(format!(
+                            "transaction-created sequence \"{sequence}\" stable identity left its private catalog before WAL binding"
+                        )));
                     }
                     created_sequence_oids.insert(sequence.clone(), sequence_oid);
                 }

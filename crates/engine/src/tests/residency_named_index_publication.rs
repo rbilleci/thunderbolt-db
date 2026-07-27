@@ -317,6 +317,113 @@ fn resident_named_indexes_publish_and_extend_without_rebuild() {
     );
 }
 
+/// A capacity-horizon directory must remain one device allocation through every physical row that
+/// can be appended to its open shard. This combines distinct inserts, duplicate secondary postings,
+/// and an MVCC version append so the no-premature-purge guarantee covers the complete mutation mix.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn resident_named_index_survives_full_physical_append_horizon_without_rebuild() {
+    let engine = Engine::new_local();
+    engine.set_shard_residency_enabled(true);
+    engine.set_auto_admit_on_commit(true);
+    engine.set_shard_size_target(64);
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE capacity_idx (id INT, tenant_id INT, status SMALLINT, PRIMARY KEY (id))",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            2,
+            "CREATE INDEX capacity_idx_by_status ON capacity_idx (tenant_id, status)",
+        )
+        .unwrap();
+    engine
+        .execute_text(3, "INSERT INTO capacity_idx VALUES (1, 7, 2), (2, 7, 2)")
+        .unwrap();
+    engine
+        .publish_relational_resident_indexes("capacity_idx")
+        .unwrap();
+
+    let table = engine.relational_catalog_table("capacity_idx").unwrap();
+    let secondary_ordinal = table
+        .indexes
+        .iter()
+        .position(|index| index.name == "capacity_idx_by_status")
+        .unwrap();
+    let secondary_key_id = crate::engine_residency::index_probe_key_id(
+        &table,
+        &table.indexes[secondary_ordinal],
+        secondary_ordinal,
+    )
+    .unwrap();
+    let shards = engine.read_residency_shards();
+    let shard = shards["capacity_idx"]
+        .iter()
+        .find(|shard| shard.row_count != 0)
+        .expect("one non-empty capacity fixture shard");
+    assert_eq!(
+        shard.capacity, 64,
+        "the fixture keeps one open 64-row shard"
+    );
+    let shard_id = shard.shard_id;
+    let (index_before, table_mask, hash_shift, rows_before) =
+        resident_named_index_cache_entry(&engine, "capacity_idx", shard_id, secondary_key_id);
+    let duplicate_key = crate::engine_residency::compound_key_fingerprint(&[7, 2]);
+    assert_eq!(
+        resident_named_index_physical_hit_count(
+            &index_before,
+            table_mask,
+            hash_shift,
+            rows_before,
+            duplicate_key,
+        ),
+        2,
+        "duplicate secondary keys must retain separate postings before the MVCC append"
+    );
+    let rebuilds_before = engine
+        .read_state
+        .residency
+        .lane_diag_rebuilds
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    engine
+        .execute_text(4, "UPDATE capacity_idx SET status = 3 WHERE id = 1")
+        .unwrap();
+    for id in 3..=63_i32 {
+        engine
+            .execute_text(
+                100 + id as u64,
+                &format!("INSERT INTO capacity_idx VALUES ({id}, 11, 1)"),
+            )
+            .unwrap();
+    }
+
+    let (index_at_capacity, _, _, rows_at_capacity) =
+        resident_named_index_cache_entry(&engine, "capacity_idx", shard_id, secondary_key_id);
+    assert!(Arc::ptr_eq(&index_before, &index_at_capacity));
+    assert_eq!(rows_at_capacity, 64);
+    assert_eq!(
+        engine
+            .execute_relational_select_text("SELECT id, status FROM capacity_idx WHERE id = 1")
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Int4(1), SqlValue::Int2(3)],
+        "the full-lifetime posting chain must resolve the MVCC-visible version"
+    );
+    assert_eq!(
+        engine
+            .read_state
+            .residency
+            .lane_diag_rebuilds
+            .load(std::sync::atomic::Ordering::Relaxed),
+        rebuilds_before,
+        "the resident index must not purge before physical capacity is consumed"
+    );
+}
+
 /// Resident index validity descriptors omit NULL-bearing keys without folding the physical zero
 /// placeholder. Publication and mandatory mutation coverage therefore preserve PostgreSQL
 /// NULLS-DISTINCT uniqueness entirely on-device.

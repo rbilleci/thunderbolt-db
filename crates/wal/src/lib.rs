@@ -46,7 +46,9 @@ pub use archive_timeline::{
 mod buffer;
 #[cfg(test)]
 use buffer::wal_prealloc_chunk_bytes;
-pub use buffer::{WalBuffer, WalDurability, WalGroupFlushBegin, WalGroupFlushJob};
+pub use buffer::{
+    FuaDurabilityTelemetry, WalBuffer, WalDurability, WalGroupFlushBegin, WalGroupFlushJob,
+};
 
 mod checkpoint;
 pub use checkpoint::{
@@ -60,9 +62,10 @@ mod canonical;
 pub use canonical::{
     canonical_logical_intent_outcome_bytes, canonical_request_digest, decode_canonical_envelope,
     decode_canonical_record_payload, encode_canonical_envelope, pack_canonical_record_payload,
-    CanonicalDigest, CanonicalEnvelope, CanonicalFragment, CanonicalFragmentKind,
-    CanonicalIdentity, CanonicalIsolation, CanonicalOutcome, CanonicalOutcomeKind,
-    CanonicalPhysicalRange, CanonicalPreApplyHeader, EncodedCanonicalEnvelope,
+    CanonicalCatalogTail, CanonicalDigest, CanonicalEnvelope, CanonicalFragment,
+    CanonicalFragmentKind, CanonicalIdentity, CanonicalIsolation, CanonicalOutcome,
+    CanonicalOutcomeKind, CanonicalPhysicalRange, CanonicalPreApplyHeader,
+    EncodedCanonicalEnvelope, PreparedCanonicalWalRecord,
 };
 
 mod identity;
@@ -258,6 +261,26 @@ fn sync_segment_parent_dir(segment_path: &Path) -> Result<(), EngineError> {
 pub fn write_wal_segment(path: impl AsRef<Path>, records: &[WalRecord]) -> Result<(), EngineError> {
     let path = path.as_ref();
     bind_or_install_durable_identity(path, records)?;
+    write_wal_segment_after_identity_check(path, records)
+}
+
+/// Rewrite an already-bound live WAL segment without granting a missing anchor a fresh-install
+/// path. Checkpoint rotation can retain an empty live suffix, so the binding rather than the
+/// retained records decides whether the anchor is required.
+pub(crate) fn rewrite_wal_segment_requiring_durable_identity(
+    path: impl AsRef<Path>,
+    records: &[WalRecord],
+    identity: CanonicalIdentity,
+) -> Result<(), EngineError> {
+    let path = path.as_ref();
+    identity::require_durable_identity(path, identity)?;
+    write_wal_segment_after_identity_check(path, records)
+}
+
+fn write_wal_segment_after_identity_check(
+    path: &Path,
+    records: &[WalRecord],
+) -> Result<(), EngineError> {
     if let Some(parent) = path.parent() {
         create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(

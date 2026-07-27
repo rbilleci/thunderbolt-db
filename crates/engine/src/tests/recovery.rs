@@ -51,6 +51,7 @@ fn canonical_test_lane_record(
         request_digest,
     )
     .expect("canonical test lane record")
+    .into_wal_record()
 }
 
 #[test]
@@ -2414,27 +2415,43 @@ fn w5a_binary_wal_records_replay_identically_to_text() {
     );
 }
 
-/// W5a — binary records survive a checkpoint rotation (they live inside the checkpoint segment)
-/// and interleave correctly with text records (DDL + serialized inserts) across replay: the
-/// row-id allocator stays in lock-step because binary applies advance it by rows_consumed.
+/// W5a — binary records survive a checkpoint rotation and interleave with an explicit-OFF text
+/// concurrent INSERT across replay; the row-id allocator stays in lock-step.
 #[test]
-fn w5a_binary_records_interleave_with_text_and_survive_rotation() {
+fn w5a_explicit_off_text_records_interleave_with_binary_and_survive_rotation() {
     let path = test_wal_path("w5a-rotation-mix");
     let control = gpu_db_wal::wal_checkpoint_control_path(&path);
     let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
     {
         let e = Engine::with_durable_wal_segment(&path);
-        e.set_binary_wal_records_enabled(true);
+        assert!(
+            e.binary_wal_records_enabled(),
+            "durable construction must inherit the product binary-WAL default"
+        );
+        e.set_auto_admit_on_commit(false);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
-        // Text-record inserts (serialized path) BEFORE elision.
-        e.execute_text(2, "INSERT INTO t (id, v) VALUES (100, 1)")
-            .unwrap();
         e.set_table_device_authoritative("t", true);
-        // Binary-record inserts (covered concurrent path).
+        // Explicit OFF preserves the text concurrent route even though constructors now default
+        // to resolved binary WAL. This text record and the following binary records must replay
+        // together across the checkpoint boundary.
+        e.set_binary_wal_records_enabled(false);
+        e.execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (100, 1)")
+            .unwrap();
+        let before_binary = e.durable_wal_records();
+        assert!(
+            crate::wal_binary::decode_binary_record(&before_binary[1].payload).is_err(),
+            "explicit OFF must preserve the text operation"
+        );
+        e.set_binary_wal_records_enabled(true);
         for i in 0..4 {
             e.execute_dml_concurrent(3 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 2)"))
                 .unwrap();
         }
+        let with_binary = e.durable_wal_records();
+        assert!(
+            crate::wal_binary::decode_binary_record(&with_binary[2].payload).is_ok(),
+            "re-enabling the product route must emit resolved binary WAL"
+        );
         // Rotate: the binary records move into the checkpoint segment.
         e.checkpoint_and_truncate_durable_wal_if_larger_than(&control, &checkpoint, 1)
             .unwrap();
@@ -2445,6 +2462,10 @@ fn w5a_binary_records_interleave_with_text_and_survive_rotation() {
         }
     }
     let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    assert!(
+        recovered.binary_wal_records_enabled(),
+        "reopen must reconstruct the product binary-WAL construction policy"
+    );
     let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
         unreachable!()
     };
@@ -2452,7 +2473,7 @@ fn w5a_binary_records_interleave_with_text_and_survive_rotation() {
     assert_eq!(
         rows,
         vec![vec![SqlValue::Int8(8)]],
-        "1 text + 7 binary inserts must all replay exactly once through the rotation"
+        "one explicit-OFF text record plus seven binary records must replay once through rotation"
     );
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&checkpoint));

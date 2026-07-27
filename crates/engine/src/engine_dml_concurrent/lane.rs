@@ -231,12 +231,12 @@ impl Engine {
                             item.txn_id
                         ))))
                     }
-                    std::collections::hash_map::Entry::Occupied(_) => {
-                        Some(Some(ExecuteError::Engine(EngineError::Durability(format!(
+                    std::collections::hash_map::Entry::Occupied(_) => Some(Some(
+                        ExecuteError::Engine(EngineError::Durability(format!(
                             "transaction id {} is already claimed earlier in this intent wave by a different request",
                             item.txn_id
-                        )))))
-                    }
+                        ))),
+                    )),
                 };
             }
             if let Some(error) = rejection {
@@ -296,7 +296,9 @@ impl Engine {
                     // allocator reservation. Both occupy `row_id_offset` (8 LE bytes) and draw the
                     // next id from the shared block in winners order; a delete draws none.
                     let off = item.row_id_offset as usize;
-                    let row_id = row_id_base + row_alloc_offset;
+                    let row_id = row_id_base
+                        .checked_add(row_alloc_offset)
+                        .expect("claimed lane row-id block covers every winner");
                     row_alloc_offset += 1;
                     let mut payload: std::sync::Arc<[u8]> =
                         std::sync::Arc::from(&item.template[..]);
@@ -362,7 +364,7 @@ impl Engine {
                 gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
             };
             let canonical = match Self::canonical_wal_record_with_commit_outcome(
-                &commit,
+                &mut commit,
                 raw.txn_id,
                 commit_seq,
                 canonical_lane,
@@ -384,7 +386,7 @@ impl Engine {
                     return true;
                 }
             };
-            commit.wal.append(canonical);
+            commit.wal.append_canonical(canonical);
         }
         let wal_position = commit.wal.len();
         if let Err(error) = commit.repl.wait_committed(
@@ -474,7 +476,11 @@ impl Engine {
                     LaneOpKind::Insert => {
                         rows.push(std::mem::take(&mut item.values));
                         stamps.push(seq);
-                        row_ids.push(row_id_base + row_alloc_offset);
+                        row_ids.push(
+                            row_id_base
+                                .checked_add(row_alloc_offset)
+                                .expect("claimed lane row-id block covers every winner"),
+                        );
                         row_alloc_offset += 1;
                     }
                     LaneOpKind::Delete => {
@@ -499,7 +505,9 @@ impl Engine {
                         // old version, tombstones it, and CONDITIONALLY appends the new image with
                         // the old version's GPU-returned stable identity. The allocator reservation
                         // is still consumed and WAL-patched for v1 recovery compatibility.
-                        let _reserved_row_id = row_id_base + row_alloc_offset;
+                        let _reserved_row_id = row_id_base
+                            .checked_add(row_alloc_offset)
+                            .expect("claimed lane row-id block covers every winner");
                         row_alloc_offset += 1;
                         let cell = item
                             .rows_affected_cell
@@ -565,7 +573,7 @@ impl Engine {
         };
         let publish_started = Instant::now();
         let tail_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.wait_group_durable(wal_position)
+            self.wait_group_durable(wal_position, true)
                 .and_then(|()| self.publish_ready_indices(first_seq..=last_seq).map(|_| ()))
                 .and_then(|()| self.wait_until_publication_covers(last_seq))
         }));
@@ -826,8 +834,10 @@ impl Engine {
         request: &mut crate::engine_intent_lanes::ApplyRequest,
     ) -> bool {
         let stat_start = Instant::now();
-        let _leader = lanes
-            .device_apply_lock
+        let _leader = self
+            .read_state
+            .residency
+            .mutation_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         lanes

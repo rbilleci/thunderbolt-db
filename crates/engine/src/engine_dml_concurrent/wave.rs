@@ -1,13 +1,15 @@
+use super::canonical::{WaveCanonicalFailure, WaveCanonicalOperation};
+use super::fixed_insert::FixedInsertPreflightResult;
 use super::{
     coerce_filter_literal, current_timestamp_micros, exact_device_verdict_cardinality,
     relational_key_prefix, try_encode_binary_insert, wave_device_phase_timing_enabled,
     wave_host_phase_timing_enabled, CatalogSnapshot, Command, CommitWaveItem, CommitWaveTail,
     DmlReadSnapshot, Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation,
-    LogReplicator, RelationalIndex, RelationalTable, SqlValue, WAVE_DEVICE_STATS, WAVE_HOST_STATS,
+    RelationalIndex, RelationalTable, SqlValue, WAVE_DEVICE_STATS, WAVE_HOST_STATS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(test)]
 type ShardedPostValidationHook = (
@@ -118,7 +120,7 @@ fn shard_index(slot_id: u64, value: i32, shards: usize) -> usize {
 /// instead of hanging. Forgotten (`std::mem::forget`) on the successful path.
 struct CommitWaveBatchGuard<'a> {
     engine: &'a Engine,
-    items: &'a [CommitWaveItem],
+    outcomes: &'a [super::CommitWaveOutcome],
 }
 
 impl Drop for CommitWaveBatchGuard<'_> {
@@ -133,7 +135,14 @@ impl Drop for CommitWaveBatchGuard<'_> {
         // Fail everything still queued too — no sequencer will ever run it.
         let stranded: Vec<CommitWaveItem> = queue.items.drain(..).collect();
         drop(queue);
-        for item in self.items.iter().chain(stranded.iter()) {
+        for outcome in self.outcomes {
+            if !outcome.done.load(AtomicOrdering::Acquire) {
+                outcome.set_outcome(Err(ExecuteError::Indeterminate(format!(
+                    "the concurrent commit path is wedged pending restart recovery: {reason}"
+                ))));
+            }
+        }
+        for item in &stranded {
             if !item.outcome.done.load(AtomicOrdering::Acquire) {
                 item.set_outcome(Err(ExecuteError::Indeterminate(format!(
                     "the concurrent commit path is wedged pending restart recovery: {reason}"
@@ -184,6 +193,16 @@ impl Engine {
         &self,
         batch: Vec<CommitWaveItem>,
     ) -> Option<CommitWaveTail> {
+        #[cfg(feature = "probe-timing")]
+        {
+            let insert_items = batch
+                .iter()
+                .filter(|item| matches!(&item.cmd, Command::Insert(_)))
+                .count() as u64;
+            if insert_items != 0 {
+                self.record_insert_probe_wave(insert_items);
+            }
+        }
         // The entire wave (conflict-check, device re-resolve, flush, apply, publish) runs inside
         // one commit critical section. The internal-read marker preserves the existing lock
         // discipline for catalog/materialized-view work without enabling a DML repair fallback.
@@ -424,7 +443,7 @@ impl Engine {
         verdicts
     }
 
-    fn sequence_commit_wave_inner(&self, batch: Vec<CommitWaveItem>) -> Option<CommitWaveTail> {
+    fn sequence_commit_wave_inner(&self, mut batch: Vec<CommitWaveItem>) -> Option<CommitWaveTail> {
         // E2.4a VARIANT 1 — shared-WAL sharded sequencing. When the whole wave is homogeneous
         // covered-INSERT intents (the flagship OLTP shape), fan the expensive per-item prep
         // (conflict check/record, value + WAL-record clones) out to N parallel shard workers and
@@ -444,9 +463,13 @@ impl Engine {
                 return self.sequence_commit_wave_sharded(batch, shards);
             }
         }
+        let guard_outcomes = batch
+            .iter()
+            .map(|item| std::sync::Arc::clone(&item.outcome))
+            .collect::<Vec<_>>();
         let guard = CommitWaveBatchGuard {
             engine: self,
-            items: &batch,
+            outcomes: &guard_outcomes,
         };
         let wall_clock = current_timestamp_micros();
         let mut wave_tail: Option<(Index, usize)> = None;
@@ -517,7 +540,16 @@ impl Engine {
         // are unique violations -> aborted in the loop below with the byte-identical 23505.
         let hostphase = wave_host_phase_timing_enabled();
         let wave_validate_started = hostphase.then(Instant::now);
+        #[cfg(feature = "probe-timing")]
+        let probe_device_validate_started = batch
+            .iter()
+            .any(|item| matches!(&item.cmd, Command::Insert(_)))
+            .then(Instant::now);
         let wave_unique_verdicts = self.wave_batch_validate_unique(&batch);
+        #[cfg(feature = "probe-timing")]
+        if let Some(started) = probe_device_validate_started {
+            self.record_insert_probe_device_validate_nanos(started.elapsed().as_nanos() as u64);
+        }
         if let Some(started) = wave_validate_started {
             WAVE_HOST_STATS[0]
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -562,7 +594,7 @@ impl Engine {
             if let Some(ref mut t) = _hp {
                 *t = Instant::now();
             }
-            let request_digest = gpu_db_wal::canonical_request_digest(&batch[position].payload);
+            let request_digest = batch[position].request.digest();
             match commit
                 .resolve_transaction_retry_digest_outcome(batch[position].txn_id, request_digest)
             {
@@ -655,44 +687,45 @@ impl Engine {
                     .unique_slots_i32
                     .iter()
                     .any(|slot| wave_unique_slots_i32.contains(slot));
-            let device_unique_conflict =
-                if !has_unique || wave_unique_conflict {
-                    false
-                } else {
-                    match item.offlock_delta.as_ref().and_then(|delta| {
+            let device_unique_conflict = if !has_unique || wave_unique_conflict {
+                false
+            } else {
+                match item.offlock_prepared.as_ref().and_then(|prepared| {
+                    prepared.legacy_delta().and_then(|delta| {
                         self.device_unique_write_conflicts(delta, item.read_snapshot)
-                    }) {
-                        Some(conflict) => conflict,
-                        None => {
-                            // Host-neutral specification fixtures keep their parity ledger without
-                            // claiming execution. Production has no host authority: a missing device
-                            // history verdict fails closed. Test builds follow that same law once a
-                            // table is device-authoritative, so an actual-GPU acceptance target cannot
-                            // pass via the cfg(test) parity map.
-                            #[cfg(test)]
-                            {
-                                let device_authoritative = match &item.cmd {
-                                    Command::Insert(insert) => Some(insert.table.as_str()),
-                                    Command::Update(update) => Some(update.table.as_str()),
-                                    Command::Delete(delete) => Some(delete.table.as_str()),
-                                    _ => None,
-                                }
-                                .is_some_and(|table| {
-                                    self.table_device_authoritative(table)
-                                        || self.table_chunk_authoritative(table).is_some()
-                                });
-                                device_authoritative
-                                    || commit
-                                        .ledger
-                                        .conflicts_unique(&item.write_set, item.read_snapshot)
+                    })
+                }) {
+                    Some(conflict) => conflict,
+                    None => {
+                        // Host-neutral specification fixtures keep their parity ledger without
+                        // claiming execution. Production has no host authority: a missing device
+                        // history verdict fails closed. Test builds follow that same law once a
+                        // table is device-authoritative, so an actual-GPU acceptance target cannot
+                        // pass via the cfg(test) parity map.
+                        #[cfg(test)]
+                        {
+                            let device_authoritative = match &item.cmd {
+                                Command::Insert(insert) => Some(insert.table.as_str()),
+                                Command::Update(update) => Some(update.table.as_str()),
+                                Command::Delete(delete) => Some(delete.table.as_str()),
+                                _ => None,
                             }
-                            #[cfg(not(test))]
-                            {
-                                true
-                            }
+                            .is_some_and(|table| {
+                                self.table_device_authoritative(table)
+                                    || self.table_chunk_authoritative(table).is_some()
+                            });
+                            device_authoritative
+                                || commit
+                                    .ledger
+                                    .conflicts_unique(&item.write_set, item.read_snapshot)
+                        }
+                        #[cfg(not(test))]
+                        {
+                            true
                         }
                     }
-                };
+                }
+            };
             if row_conflict || wave_unique_conflict || device_unique_conflict {
                 let read_snapshot = batch[position].read_snapshot;
                 batch[position].set_outcome(Err(ExecuteError::Serialization(format!(
@@ -702,112 +735,183 @@ impl Engine {
             }
             hp!(1);
 
-            // E2.3 — INTENT INTEGER FAST LANE. A single-row covered-INSERT intent (pre-encoded
-            // binary WAL template + reuse-eligible off-lock delta + catalog generation unchanged
-            // since prepare + table still device-authoritative) owes NO String row key: its row id
-            // is the wave's integer `next_row_id`, its W5a record is patched in place, and its values
-            // flow straight into the batched device append. This collapses the general path's
-            // `rekey_offlock_insert_delta` (row-key `format!` + write-set/value clones) AND the
-            // `insert_append` value-clone + String→u64 parse — the two top host buckets (reresolve,
-            // apply) for the flagship shape — into one value clone + one WAL patch. Any drift (gen
-            // bump or non-intent item) falls through to the general device path below.
+            let mut force_full_reprepare = false;
+            let fixed_candidate = batch[position]
+                .offlock_prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.is_fixed_insert());
+            if fixed_candidate {
+                flush_appends(&mut pending_appends, &mut committed);
+                let reuse_eligible = wave_catalog_seq == batch[position].prepared_catalog_seq;
+                match self.prepare_fixed_insert_pre_wal(
+                    &mut batch[position],
+                    &wave_catalog,
+                    wave_catalog_seq,
+                    next_row_id,
+                    reuse_eligible,
+                ) {
+                    FixedInsertPreflightResult::Ready(fixed) => {
+                        let (operation, fixed_apply) = fixed.into_canonical_operation_and_apply();
+                        let commit_seq = commit.repl.peek_next_index();
+                        #[cfg(feature = "probe-timing")]
+                        let probe_wal_started = Instant::now();
+                        let canonical = match self.append_canonical_wave_operation(
+                            &mut commit,
+                            batch[position].txn_id,
+                            commit_seq,
+                            wall_clock,
+                            fixed_apply.request_digest(),
+                            &batch[position].write_set,
+                            operation,
+                        ) {
+                            Ok(canonical) => canonical,
+                            Err(WaveCanonicalFailure::PreDurable(error)) => {
+                                batch[position].set_outcome(Err(error));
+                                continue;
+                            }
+                        };
+                        #[cfg(feature = "probe-timing")]
+                        self.record_insert_probe_canonical_wal_nanos(
+                            probe_wal_started.elapsed().as_nanos() as u64,
+                        );
+                        let proposed_range = canonical.proposed_range.expect(
+                        "fixed INSERT canonical operation must return its original row-id proposal",
+                    );
+                        hp!(3);
+                        wave_unique_slots
+                            .extend(batch[position].write_set.unique_slots.iter().cloned());
+                        wave_unique_slots_i32
+                            .extend(batch[position].write_set.unique_slots_i32.iter().copied());
+                        hp!(4);
+                        let rows = fixed_apply.row_count();
+                        #[cfg(feature = "probe-timing")]
+                        let probe_device_append_started = Instant::now();
+                        let table = fixed_apply.apply(self, canonical.commit_seq, proposed_range);
+                        #[cfg(feature = "probe-timing")]
+                        self.record_insert_probe_device_append_nanos(
+                            probe_device_append_started.elapsed().as_nanos() as u64,
+                        );
+                        if self.table_chunk_authoritative(&table).is_some() {
+                            self.read_state
+                                .residency
+                                .chunk_class_device_commits
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        } else {
+                            if !self.table_device_authoritative(&table) {
+                                let snapshot = self.catalog_snapshot();
+                                if self.table_device_authority_eligible(&snapshot, &table) {
+                                    self.set_table_device_authoritative(&table, true);
+                                }
+                            }
+                            self.read_state
+                                .residency
+                                .device_authoritative_commits
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        #[cfg(feature = "probe-timing")]
+                        {
+                            batch[position].fixed_insert_typed = true;
+                        }
+                        commit.repl.mark_applied(canonical.commit_seq);
+                        next_row_id = self.read_state.mvcc.current_row_id();
+                        wave_tail = Some((canonical.commit_seq, canonical.wal_position));
+                        committed.push((position, canonical.commit_seq, rows));
+                        hp!(5);
+                        continue;
+                    }
+                    FixedInsertPreflightResult::PreWalFailure(error) => {
+                        batch[position].set_outcome(Err(error));
+                        continue;
+                    }
+                    FixedInsertPreflightResult::RetryableDecline => {
+                        #[cfg(feature = "probe-timing")]
+                        self.record_insert_probe_fixed_insert_retryable_decline();
+                        batch[position].set_outcome(Err(ExecuteError::Serialization(
+                            "device-authoritative fixed INSERT residency preflight declined before \
+                             WAL; retry after admission pressure clears".to_string(),
+                        )));
+                        continue;
+                    }
+                    FixedInsertPreflightResult::FullReprepare => {
+                        // The direct carrier is intentionally delta-free. Its binding drift is
+                        // repaired only by the existing full preparation below, never by a
+                        // synthetic or predicted-key reconstruction.
+                        batch[position].offlock_prepared = None;
+                        force_full_reprepare = true;
+                        #[cfg(feature = "probe-timing")]
+                        self.record_insert_probe_fixed_insert_legacy_fallback();
+                    }
+                }
+            }
+
             let intent_fast = wave_catalog_seq == batch[position].prepared_catalog_seq
                 && batch[position].binary_wal_template.is_some()
-                && matches!(&batch[position].offlock_delta, Some(d)
-                    if Self::reresolve_reuse_eligible(d, &wave_catalog)
-                        && matches!(&d.mutation,
-                            crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
-                                if inserted_rows.len() == 1))
+                && matches!(&batch[position].offlock_prepared, Some(prepared)
+                    if prepared.legacy_delta().is_some_and(|delta|
+                        Self::reresolve_reuse_eligible(delta, &wave_catalog)
+                            && matches!(&delta.mutation,
+                                crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
+                                    if inserted_rows.len() == 1)))
                 && match &batch[position].cmd {
                     Command::Insert(insert) => self.table_device_authoritative(&insert.table),
                     _ => false,
                 };
             if intent_fast {
                 let commit_seq = commit.repl.peek_next_index();
-                // The row id is the wave's integer cursor — IDENTICAL to what the general path's
-                // `rekey` would `format!` into `rel/{table}/{row_id:020}` and then parse back out.
                 let row_id = next_row_id;
-                // WAL: patch the pre-encoded W5a record's 8-byte row id at its fixed offset (no
-                // key parse, no `encode_relational_row`, no `try_encode_binary_insert`).
+                if row_id.checked_add(1).is_none() {
+                    batch[position].set_outcome(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(
+                            "row identity space exhausted before canonical intent WAL".to_string(),
+                        ),
+                    )));
+                    continue;
+                }
                 let wal_payload: std::sync::Arc<[u8]> = {
                     let (template, offset) = batch[position]
                         .binary_wal_template
                         .as_ref()
                         .expect("intent_fast requires a binary WAL template");
                     let off = *offset as usize;
-                    // ONE copy: clone the template straight into the Arc allocation and patch the
-                    // row id in place (the fresh Arc is unique). `to_vec()` + `Arc::from(vec)`
-                    // was two full copies of every WAL record on the serial cut.
+                    // Clone once into the unique Arc allocation and patch its row-id field.
                     let mut payload: std::sync::Arc<[u8]> = std::sync::Arc::from(&template[..]);
                     std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
                         [off..off + 8]
                         .copy_from_slice(&row_id.to_le_bytes());
                     payload
                 };
-                let wal_len_before = commit.wal.len();
-                let token = match commit.repl.propose(wal_payload.clone()) {
-                    Ok(token) => token,
-                    Err(err) => {
-                        batch[position].set_outcome(Err(ExecuteError::Engine(err)));
+                let canonical = match self.append_canonical_wave_operation(
+                    &mut commit,
+                    batch[position].txn_id,
+                    commit_seq,
+                    wall_clock,
+                    batch[position].request.digest(),
+                    &batch[position].write_set,
+                    WaveCanonicalOperation::Resolved {
+                        wal_payload,
+                        outcome_kind: gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
+                        affected_rows: 1,
+                    },
+                ) {
+                    Ok(canonical) => canonical,
+                    Err(WaveCanonicalFailure::PreDurable(error)) => {
+                        batch[position].set_outcome(Err(error));
                         continue;
                     }
                 };
-                let record = match Self::canonical_wal_record_with_commit_request_digest(
-                    &commit,
-                    batch[position].txn_id,
-                    token.index,
-                    0,
-                    &wal_payload,
-                    gpu_db_wal::canonical_request_digest(&batch[position].payload),
-                ) {
-                    Ok(record) => record,
-                    Err(err) => {
-                        commit.repl.rollback_unapplied_from(token.index);
-                        batch[position].set_outcome(Err(ExecuteError::Engine(err)));
-                        continue;
-                    }
-                };
-                commit.wal.append(record);
-                let wal_position = commit.wal.len();
-                debug_assert_eq!(
-                    token.index, commit_seq,
-                    "the sequencer is the single proposer: the proposed index must equal the peek"
-                );
-                if let Err(err) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
-                    commit.repl.rollback_unapplied_from(commit_seq);
-                    commit.wal.truncate(wal_len_before);
-                    batch[position].set_outcome(Err(ExecuteError::Engine(err)));
-                    continue;
-                }
-                if let Err(error) = commit.record_transaction_status_digest_outcome(
-                    batch[position].txn_id,
-                    gpu_db_wal::canonical_request_digest(&batch[position].payload),
-                    token.index,
-                    1,
-                ) {
-                    commit.repl.rollback_unapplied_from(commit_seq);
-                    commit.wal.truncate(wal_len_before);
-                    batch[position].set_outcome(Err(ExecuteError::Engine(error)));
-                    continue;
-                }
-                let timestamp_micros =
-                    wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
-                commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
                 hp!(3);
-                commit.ledger.record(&batch[position].write_set, commit_seq);
                 wave_unique_slots.extend(batch[position].write_set.unique_slots.iter().cloned());
                 wave_unique_slots_i32
                     .extend(batch[position].write_set.unique_slots_i32.iter().copied());
                 hp!(4);
-                // Device-authoritative apply advances the durable row-id allocator and authority
-                // counter, exactly `apply_delta`'s insert branch for one row. Clone the row
-                // image + table out of the carried delta straight into the batched append (one value
-                // clone total, vs the general path's two + the String round-trip).
+                // Carry the single row directly into the batched device append.
                 let (table, values) = {
                     let delta = batch[position]
-                        .offlock_delta
+                        .offlock_prepared
                         .as_ref()
-                        .expect("intent_fast requires an off-lock delta");
+                        .expect("intent_fast requires an off-lock preparation")
+                        .legacy_delta()
+                        .expect("intent_fast requires a legacy delta");
                     let crate::write_path::PreparedMutation::Insert {
                         table,
                         inserted_rows,
@@ -818,7 +922,15 @@ impl Engine {
                     };
                     (table.clone(), inserted_rows[0].1.clone())
                 };
-                self.read_state.mvcc.advance_row_id(1);
+                self.read_state
+                    .mvcc
+                    .advance_row_id(1)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                        "commit-path invariant violation: intent INSERT row-id allocator advanced \
+                         after canonical WAL at commit_seq {commit_seq}: {error}"
+                    )
+                    });
                 self.read_state
                     .residency
                     .device_authoritative_commits
@@ -829,45 +941,43 @@ impl Engine {
                 entry.3.push(commit_seq);
                 entry.0.push(values);
                 entry.1.push(row_id);
-                // Intent fast-lane items are single-row covered INSERTs by eligibility.
                 entry.2.push((position, commit_seq, 1));
-                wave_tail = Some((commit_seq, wal_position));
+                wave_tail = Some((commit_seq, canonical.wal_position));
                 hp!(5);
                 continue;
             }
             let item = &batch[position];
+            #[cfg(feature = "probe-timing")]
+            let probe_reresolve_started =
+                matches!(&item.cmd, Command::Insert(_)).then(Instant::now);
 
-            // (3b) Re-resolve at the peeked commit seq — sees every PRIOR wave item's applied
-            // delta (they are installed already), so wave order is the only order there is. A
-            // failure is a legal concurrent interleaving (constraint phantom): retryable,
-            // pre-durable, side-effect-free.
+            // (3b) Re-resolve at the peeked sequence; concurrent constraint phantoms are retryable.
             let commit_seq = commit.repl.peek_next_index();
             let install_snapshot = DmlReadSnapshot {
                 commit_seq,
                 next_row_id,
             };
-            // Ledger #18: FK-free INSERT re-resolves skip the redundant unique/CHECK pass —
-            // the conflicts() check above IS the commit-time guard (coverage proof on
-            // InsertPrepareValidation) — but ONLY while the catalog generation still matches
-            // the off-lock prepare's (audit fix): a constraint-adding DDL committed since S
-            // is absent from the prepared key projection and the item's write_set lacks slots for the new
-            // index, so the skip would silently bypass it. Any DDL bumps the stamp -> Full
-            // (always correct; DDL is rare so the hot path keeps the skip).
-            let insert_validation = if wave_catalog_seq == item.prepared_catalog_seq {
-                InsertPrepareValidation::ReResolveDeviceCovered
-            } else {
-                InsertPrepareValidation::Full
-            };
-            // DELTA-REUSE (B): a reuse-eligible elided insert whose catalog generation still
-            // matches (`ReResolveDeviceCovered`) owes no re-validation — RE-KEY the off-lock delta
-            // at the wave's `next_row_id` instead of re-coercing + rebuilding it. A generation
-            // drift (Full) or a non-eligible item falls through to the authoritative re-prepare.
-            let prepared = match &item.offlock_delta {
-                Some(delta)
+            // A catalog-generation change forces full validation so new constraints cannot be skipped.
+            let insert_validation =
+                if !force_full_reprepare && wave_catalog_seq == item.prepared_catalog_seq {
+                    InsertPrepareValidation::ReResolveDeviceCovered
+                } else {
+                    InsertPrepareValidation::Full
+                };
+            // Reuse only a generation-matched covered INSERT; every other shape re-prepares.
+            let prepared = match &item.offlock_prepared {
+                Some(prepared)
                     if insert_validation == InsertPrepareValidation::ReResolveDeviceCovered
-                        && Self::reresolve_reuse_eligible(delta, &wave_catalog) =>
+                        && prepared.legacy_delta().is_some_and(|delta| {
+                            Self::reresolve_reuse_eligible(delta, &wave_catalog)
+                        }) =>
                 {
-                    Ok(Self::rekey_offlock_insert_delta(delta, install_snapshot))
+                    Self::rekey_offlock_insert_delta(
+                        prepared
+                            .legacy_delta()
+                            .expect("reuse-eligible off-lock preparation is legacy"),
+                        install_snapshot,
+                    )
                 }
                 _ => self.prepare_dml(&item.cmd, install_snapshot, insert_validation),
             };
@@ -884,6 +994,11 @@ impl Engine {
                     continue;
                 }
             };
+            #[cfg(feature = "probe-timing")]
+            if force_full_reprepare && matches!(&item.cmd, Command::Insert(_)) {
+                self.record_insert_probe_legacy_insert_delta_build(delta.rows_consumed);
+                self.record_insert_probe_fixed_insert_legacy_commit_validation_reresolve();
+            }
             let item_rows = delta.rows_affected();
             let returning = match self.project_dml_returning(&item.cmd, &delta, commit_seq) {
                 Ok(returning) => returning,
@@ -894,14 +1009,16 @@ impl Engine {
             };
             item.outcome.set_returning(returning);
             hp!(2);
+            #[cfg(feature = "probe-timing")]
+            if let Some(started) = probe_reresolve_started {
+                self.record_insert_probe_commit_validation_reresolve_nanos(
+                    started.elapsed().as_nanos() as u64,
+                );
+            }
+            #[cfg(feature = "probe-timing")]
+            let probe_wal_started = matches!(&item.cmd, Command::Insert(_)).then(Instant::now);
 
-            // (3c) Assign the seq for real: WAL append + propose (the sequencer is the single
-            // proposer under the commit_mutex). The fsync is deferred to the wave tail.
-            // W5a: covered inserts (the delta-reuse class — elided, FK/CHECK-free, no sequence
-            // defaults, device-history-covered uniqueness) log the RESOLVED BINARY record instead of the
-            // SQL text: replay becomes decode+install (no parse, no re-resolve), the record
-            // carries the ORIGINAL row ids, and checkpoints shrink. Everything else keeps the
-            // SQL-text payload unchanged.
+            // (3c) Build the legacy input for the common serial canonical owner.
             let wal_payload: std::sync::Arc<[u8]> = if self.binary_wal_records_enabled()
                 && Self::reresolve_reuse_eligible(&delta, &wave_catalog)
             {
@@ -913,11 +1030,7 @@ impl Engine {
                 else {
                     unreachable!("reuse-eligible is insert-shaped");
                 };
-                // E2.2(b): a single-row covered-INSERT intent carries its W5a record PRE-ENCODED
-                // (built off the sequencer at intent-build time). The only wave-time-dependent
-                // field is the row id, at a fixed offset — patch it in place instead of parsing the
-                // row key + re-encoding the row image. The reuse re-key assigns the single row's id
-                // as `next_row_id + 0`, i.e. this item's `install_snapshot.next_row_id`.
+                // Covered single-row intents patch their pre-encoded W5a row-id field in place.
                 match &item.binary_wal_template {
                     Some((template, offset)) if inserted_rows.len() == 1 => {
                         let row_id = install_snapshot.next_row_id;
@@ -949,82 +1062,47 @@ impl Engine {
                         match try_encode_binary_insert(table, &id_rows) {
                             Some(payload) => payload.into(),
                             // Width-exceeding shape (unrealistic; audit 21eddaa7 C): keep the text.
-                            None => item.payload.clone(),
+                            None => item.request.payload_arc(),
                         }
                     }
                 }
             } else {
-                item.payload.clone()
+                item.request.payload_arc()
             };
-            let wal_len_before = commit.wal.len();
-            let token = match commit.repl.propose(wal_payload.clone()) {
-                Ok(token) => token,
-                Err(err) => {
-                    item.set_outcome(Err(ExecuteError::Engine(err)));
-                    continue;
-                }
-            };
-            let record = match Self::canonical_wal_record_with_commit_outcome(
-                &commit,
+            let canonical = match self.append_canonical_wave_operation(
+                &mut commit,
                 item.txn_id,
-                token.index,
-                0,
-                &wal_payload,
-                gpu_db_wal::canonical_request_digest(&item.payload),
-                if item_rows == 0 {
-                    gpu_db_wal::CanonicalOutcomeKind::CommitNoOp
-                } else {
-                    gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
+                commit_seq,
+                wall_clock,
+                item.request.digest(),
+                &item.write_set,
+                WaveCanonicalOperation::Resolved {
+                    wal_payload,
+                    outcome_kind: if item_rows == 0 {
+                        gpu_db_wal::CanonicalOutcomeKind::CommitNoOp
+                    } else {
+                        gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
+                    },
+                    affected_rows: item_rows,
                 },
-                item_rows,
             ) {
-                Ok(record) => record,
-                Err(err) => {
-                    commit.repl.rollback_unapplied_from(token.index);
-                    item.set_outcome(Err(ExecuteError::Engine(err)));
+                Ok(canonical) => canonical,
+                Err(WaveCanonicalFailure::PreDurable(error)) => {
+                    item.set_outcome(Err(error));
                     continue;
                 }
             };
-            commit.wal.append(record);
-            let wal_position = commit.wal.len();
-            debug_assert_eq!(
-                token.index, commit_seq,
-                "the sequencer is the single proposer: the proposed index must equal the peek"
-            );
-            if let Err(err) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
-                commit.repl.rollback_unapplied_from(commit_seq);
-                commit.wal.truncate(wal_len_before);
-                item.set_outcome(Err(ExecuteError::Engine(err)));
-                continue;
-            }
-            if let Err(error) = commit.record_transaction_status_digest_outcome(
-                item.txn_id,
-                gpu_db_wal::canonical_request_digest(&item.payload),
-                token.index,
-                item_rows,
-            ) {
-                commit.repl.rollback_unapplied_from(commit_seq);
-                commit.wal.truncate(wal_len_before);
-                item.set_outcome(Err(ExecuteError::Engine(error)));
-                continue;
-            }
-            let timestamp_micros =
-                wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
-            commit.record_commit_timestamp(item.txn_id, timestamp_micros);
             hp!(3);
+            #[cfg(feature = "probe-timing")]
+            if let Some(started) = probe_wal_started {
+                self.record_insert_probe_canonical_wal_nanos(started.elapsed().as_nanos() as u64);
+            }
 
-            // (3e) Record the write-set for future conflict detection (also read by LATER items
-            // in this same wave — the intra-wave conflict path above).
-            commit.ledger.record(&item.write_set, commit_seq);
             wave_unique_slots.extend(item.write_set.unique_slots.iter().cloned());
             wave_unique_slots_i32.extend(item.write_set.unique_slots_i32.iter().copied());
             hp!(4);
 
-            // (3d) Install the re-validated delta now (apply-before-durable, D3b). A
-            // failure here is a true invariant violation — PANIC, poisoning the commit_mutex; the
-            // batch guard fails the wave's remaining outcomes and wedges the queue.
-            // RETIREMENT A1: carry the inserted rows' host identities (parsed from their keys) so
-            // the residency append can stamp the row-identity region.
+            // (3d) Apply failure after canonical WAL is fatal; row identities stamp residency.
             enum DeviceMaintenance {
                 Insert(String, Vec<Vec<SqlValue>>, Vec<u64>),
                 Delete(String, Vec<Vec<SqlValue>>, Vec<u64>),
@@ -1113,7 +1191,7 @@ impl Engine {
             // Residency, before publish: INSERT rows buffer into the wave-batched append; UPDATE
             // and DELETE maintain the same authoritative generation in place. A device decline
             // invalidates and schedules an exact re-admission before the next wave.
-            wave_tail = Some((commit_seq, wal_position));
+            wave_tail = Some((commit_seq, canonical.wal_position));
             match device_maintenance {
                 DeviceMaintenance::Insert(table, rows, row_ids) => {
                     let entry = pending_appends.entry(table).or_default();
@@ -1221,6 +1299,8 @@ impl Engine {
         if pending.is_empty() {
             return;
         }
+        #[cfg(feature = "probe-timing")]
+        let probe_device_append_started = Instant::now();
         for (table, (rows, row_ids, items, stamps)) in std::mem::take(pending) {
             // D3 (ADR-013 pre1): the batched flush spans MULTIPLE commit seqs — each row
             // carries its own birth stamp (the per-row slice the D3-COMPOSE note called for).
@@ -1248,6 +1328,10 @@ impl Engine {
                 committed.push((position, seq, rows));
             }
         }
+        #[cfg(feature = "probe-timing")]
+        self.record_insert_probe_device_append_nanos(
+            probe_device_append_started.elapsed().as_nanos() as u64,
+        );
     }
 
     /// E2.4a — is `item` a covered-INSERT intent the SHARDED sequencer can fan out? The exact serial
@@ -1267,11 +1351,12 @@ impl Engine {
             && item.write_set.unique_slots_i32.len() == 1
             && item.write_set.unique_slots.is_empty()
             && item.write_set.rows.is_empty()
-            && matches!(&item.offlock_delta, Some(d)
-                if Self::reresolve_reuse_eligible(d, wave_catalog)
-                    && matches!(&d.mutation,
-                        crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
-                            if inserted_rows.len() == 1))
+            && matches!(&item.offlock_prepared, Some(prepared)
+                if prepared.legacy_delta().is_some_and(|delta|
+                    Self::reresolve_reuse_eligible(delta, wave_catalog)
+                        && matches!(&delta.mutation,
+                            crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
+                                if inserted_rows.len() == 1)))
             && match &item.cmd {
                 Command::Insert(insert) => self.table_device_authoritative(&insert.table),
                 _ => false,
@@ -1356,30 +1441,22 @@ impl Engine {
         conflicts
     }
 
-    /// E2.4a VARIANT 1 — sequence a HOMOGENEOUS covered-INSERT-intent wave with N parallel shard
-    /// workers over ONE ordered WAL + ONE global commit-seq.
-    ///
-    /// Stage 1 (device, coordinator): the wave-batched PK-unique locate — one device call, the
-    /// committed-dup 23505 verdicts. Stage 2 (N parallel workers under the coordinator's retained
-    /// publication boundary): each worker owns the wave positions whose unique slot hashes to its
-    /// shard and, in wave-position order, consumes the batched device-history verdict plus a
-    /// per-shard PRIVATE dedup set
-    /// (same-slot → same shard, so the lowest-position writer wins — byte-identical to the serial
-    /// record-as-you-go single-winner), then clones the row image + WAL record. Stage 3 (thin
-    /// serial cut, commit lock): walk the wave in order, and for each committing item claim the
-    /// next commit-seq + integer row id, patch the WAL record's row id, append + propose, record the
-    /// commit timestamp + row-identity write-set record, advance the
-    /// elided row-id allocator, and buffer the row into the per-table device append. The device
-    /// append flushes ONCE per table at the tail (one HtoD/wave); the durability tail is returned
-    /// for the W2 pipeline exactly as the serial path.
+    /// E2.4a variant 1: homogeneous covered-INSERT wave over N shard workers and one WAL order.
+    /// The device unique verdict and shard-local dedup choose the earliest same-slot writer.
+    /// The serial cut binds row ids, appends/proposes canonical WAL, and buffers one device append
+    /// per table; its durability tail follows the ordinary W2 publication pipeline.
     fn sequence_commit_wave_sharded(
         &self,
         batch: Vec<CommitWaveItem>,
         shards: usize,
     ) -> Option<CommitWaveTail> {
+        let guard_outcomes = batch
+            .iter()
+            .map(|item| std::sync::Arc::clone(&item.outcome))
+            .collect::<Vec<_>>();
         let guard = CommitWaveBatchGuard {
             engine: self,
-            items: &batch,
+            outcomes: &guard_outcomes,
         };
         let wall_clock = current_timestamp_micros();
         let n = batch.len();
@@ -1414,7 +1491,16 @@ impl Engine {
         // is intentionally conservative: the verdict cannot become stale before Stage 3.
         let hostphase = wave_host_phase_timing_enabled();
         let wave_validate_started = hostphase.then(Instant::now);
+        #[cfg(feature = "probe-timing")]
+        let probe_device_validate_started = batch
+            .iter()
+            .any(|item| matches!(&item.cmd, Command::Insert(_)))
+            .then(Instant::now);
         let wave_unique_verdicts = self.wave_batch_validate_unique(&batch);
+        #[cfg(feature = "probe-timing")]
+        if let Some(started) = probe_device_validate_started {
+            self.record_insert_probe_device_validate_nanos(started.elapsed().as_nanos() as u64);
+        }
         let mut wave_history_conflicts = self.sharded_intent_history_conflicts(&batch);
         wave_history_conflicts.extend(wave_unique_verdicts.declined.iter().copied());
         let serialized_catalog_seq = self.catalog_snapshot().commit_seq;
@@ -1430,7 +1516,7 @@ impl Engine {
         // later exact duplicates remain pending on that owner, while payload mismatch fails loud.
         let mut wave_transaction_claims = BTreeMap::new();
         for (position, item) in batch.iter().enumerate() {
-            let request_digest = gpu_db_wal::canonical_request_digest(&item.payload);
+            let request_digest = item.request.digest();
             match commit.resolve_transaction_retry_digest_outcome(item.txn_id, request_digest) {
                 Ok(Some((token, affected_rows))) if self.committed_seq() >= token.index => {
                     item.set_outcome(Ok(affected_rows));
@@ -1532,8 +1618,7 @@ impl Engine {
             WAVE_HOST_STATS[0]
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
         }
-        // Stage 2 — parallel shard prep against the device-history verdict plus per-shard private
-        // same-wave dedup. The coordinator resumes the ordered commit cut after join.
+        // Stage 2: parallel shard prep from the device-history verdict and same-wave dedup.
         let shard_started = hostphase.then(Instant::now);
         let mut verdicts = self.shard_prepare_intents(
             &batch,
@@ -1547,14 +1632,7 @@ impl Engine {
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
         }
 
-        // Stage 3 — the thin serial cut, E2.5b BATCHED: one commit-seq block claim, one
-        // repl propose_batch, one row-id block, one applied mark, one timestamp for the whole
-        // wave. The per-item body is reduced to the WAL push, row-identity record, and the
-        // device-buffer push — the E2.4a measurement showed the per-item repl round-trips,
-        // BTreeMap timestamp insert, and allocator atomics WERE the ordered cut (~1.3us/item).
-        // Aborts never consume a commit seq (same as the serial path's peek-before-propose), and
-        // a propose_batch failure aborts the WHOLE wave — identical semantics to a first-item
-        // propose failure, since the single-node leader either accepts all or is not leader.
+        // Stage 3: one ordered canonical cut; aborts never consume a commit sequence.
         let mut wave_tail: Option<(Index, usize)> = None;
         let mut committed: Vec<(usize, Index, u64)> = Vec::with_capacity(n);
         let mut pending_appends: WavePendingAppends = BTreeMap::new();
@@ -1581,23 +1659,35 @@ impl Engine {
             let k = winners.len() as u64;
             let first_seq = commit.repl.peek_next_index();
             let row_id_base = self.read_state.mvcc.current_row_id();
+            if row_id_base.checked_add(k).is_none() {
+                for (position, _table, _values, _record, _offset) in winners {
+                    batch[position].set_outcome(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(
+                            "row identity space exhausted before canonical wave WAL".to_string(),
+                        ),
+                    )));
+                }
+                return None;
+            }
             let wal_len_before = commit.wal.len();
             let mut payloads: Vec<std::sync::Arc<[u8]>> = Vec::with_capacity(winners.len());
             for (offset, (position, _table, _values, wal_record, wal_offset)) in
                 winners.iter_mut().enumerate()
             {
                 // Patch the pre-encoded W5a record's 8-byte row id (the only wave-time field).
-                let row_id = row_id_base + offset as u64;
+                let row_id = row_id_base
+                    .checked_add(offset as u64)
+                    .expect("prevalidated canonical wave row-id range");
                 wal_record[*wal_offset..*wal_offset + 8].copy_from_slice(&row_id.to_le_bytes());
                 let wal_payload: std::sync::Arc<[u8]> =
                     std::sync::Arc::from(std::mem::take(wal_record));
                 let canonical = match Self::canonical_wal_record_with_commit_request_digest(
-                    &commit,
+                    &mut commit,
                     batch[*position].txn_id,
                     first_seq + offset as u64,
                     0,
                     &wal_payload,
-                    gpu_db_wal::canonical_request_digest(&batch[*position].payload),
+                    batch[*position].request.digest(),
                 ) {
                     Ok(record) => record,
                     Err(err) => {
@@ -1612,7 +1702,7 @@ impl Engine {
                         return None;
                     }
                 };
-                commit.wal.append(canonical);
+                commit.wal.append_canonical(canonical);
                 payloads.push(wal_payload);
             }
             match commit.repl.propose_batch(payloads) {
@@ -1622,10 +1712,7 @@ impl Engine {
                         "the sequencer is the single proposer: the batch must start at the peek"
                     );
                     let last_seq = first_seq + k - 1;
-                    // Per-winner UNIQUE timestamps (audit F1): base + offset reproduces the serial
-                    // path's strictly-increasing per-txn stamps (the max-guard chain), keeping
-                    // PITR-to-timestamp unambiguous at wave boundaries. `record_commit_timestamp`
-                    // bumps the running max per call, so later waves stay monotonic.
+                    // Per-winner timestamps preserve serial, strictly increasing transaction stamps.
                     let base_timestamp_micros =
                         wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
                     for (offset, (position, table, values, _record, _off)) in
@@ -1635,7 +1722,7 @@ impl Engine {
                         if commit
                             .record_transaction_status_digest_outcome(
                                 batch[position].txn_id,
-                                gpu_db_wal::canonical_request_digest(&batch[position].payload),
+                                batch[position].request.digest(),
                                 commit_seq,
                                 1,
                             )
@@ -1647,19 +1734,29 @@ impl Engine {
                             batch[position].txn_id,
                             base_timestamp_micros + offset as u64,
                         );
-                        // Record row identities in wave order. Unique-slot history is already
-                        // resolved by device history + worker-local single-winner arbitration.
+                        // Record identities in wave order after device/local unique arbitration.
                         commit.ledger.record(&batch[position].write_set, commit_seq);
                         let entry = pending_appends.entry(table).or_default();
                         entry.3.push(commit_seq);
                         entry.0.push(values);
-                        entry.1.push(row_id_base + offset as u64);
+                        entry.1.push(
+                            row_id_base
+                                .checked_add(offset as u64)
+                                .expect("prevalidated canonical wave row-id range"),
+                        );
                         // Sharded winners are single-row covered INSERTs by eligibility.
                         entry.2.push((position, commit_seq, 1));
                     }
-                    // Device-authoritative batched apply: advance the row-id allocator and authority
-                    // counter by the whole wave, then mark the block applied once.
-                    self.read_state.mvcc.advance_row_id(k);
+                    // Advance identities and authority once for the device-applied wave.
+                    self.read_state
+                        .mvcc
+                        .advance_row_id(k)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "commit-path invariant violation: sharded INSERT row-id allocator \
+                             advanced after canonical WAL at commit_seq {last_seq}: {error}"
+                            )
+                        });
                     self.read_state
                         .residency
                         .device_authoritative_commits
@@ -1668,7 +1765,6 @@ impl Engine {
                     wave_tail = Some((last_seq, commit.wal.len()));
                 }
                 Err(err) => {
-                    // Whole-wave abort: nothing proposed, nothing durable, no seq consumed.
                     commit.wal.truncate(wal_len_before);
                     let message = format!("wave propose failed: {err}");
                     for (position, _table, _values, _record, _offset) in winners.into_iter() {
@@ -1681,8 +1777,7 @@ impl Engine {
         }
         self.flush_wave_pending_appends(&mut pending_appends, &mut committed);
         if let Some(started) = cut_started {
-            // Charge the ordered serial cut (WAL append + commit-seq + row record +
-            // device buffer) to the `sequence` bucket — raw nanos; the bench divides by items.
+            // Charge the ordered cut to the `sequence` bucket; the bench divides by items.
             WAVE_HOST_STATS[3]
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
         }
@@ -1783,9 +1878,11 @@ impl Engine {
                                         .as_ref()
                                         .expect("sharded eligibility requires a binary WAL template");
                                     let delta = item
-                                        .offlock_delta
+                                        .offlock_prepared
                                         .as_ref()
-                                        .expect("sharded eligibility requires an off-lock delta");
+                                        .expect("sharded eligibility requires an off-lock preparation")
+                                        .legacy_delta()
+                                        .expect("sharded eligibility requires a legacy delta");
                                     let crate::write_path::PreparedMutation::Insert {
                                         table,
                                         inserted_rows,

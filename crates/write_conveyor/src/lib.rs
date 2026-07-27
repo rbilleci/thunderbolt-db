@@ -1418,13 +1418,24 @@ pub fn stats_for_range(first_client_seq: u64, count: u64) -> DrainStats {
 }
 
 #[cfg(unix)]
+mod fua_controller;
+#[cfg(unix)]
 mod fua_frame_log;
 #[cfg(unix)]
 mod fua_wal;
 #[cfg(unix)]
+pub use fua_controller::{
+    FuaControllerDecision, FuaControllerEligibility, FuaControllerPhase, FuaControllerReason,
+    FuaControllerSampleKind, FuaControllerSampleToken, FuaControllerTelemetry,
+    FuaPhysicalController, FUA_CONTROLLER_FAST_NANOS, FUA_CONTROLLER_QD16_FRAGMENTS,
+    FUA_CONTROLLER_SUSTAINED_GROUPS,
+};
+#[cfg(unix)]
 pub use fua_frame_log::{
-    frame_log_capacity_bytes, invalidate_frame_log_suffix, recover_frame_log_by_scan, FrameHandle,
-    FuaFrameLog, FuaFrameLogAppender, FuaFrameLogConfig, FuaFrameLogFencePool, RecoveredFrame,
+    frame_log_capacity_bytes, fua_frame_padded_bytes, invalidate_frame_log_suffix,
+    recover_frame_log_by_scan, FrameBatchHandle, FrameGroupMetadata, FrameHandle, FuaFrameLog,
+    FuaFrameLogAppender, FuaFrameLogConfig, FuaFrameLogFencePool, FuaFrameLogTelemetry,
+    RecoveredFrame, FUA_IN_FLIGHT_DEPTH_BUCKETS,
 };
 #[cfg(unix)]
 mod wal_segment;

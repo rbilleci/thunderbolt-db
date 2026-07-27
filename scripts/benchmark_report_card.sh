@@ -41,6 +41,10 @@
 #   GPU_GAP            quick-screen cool-down, seconds      (default 12; full mode is fixed at 12)
 #   BENCH_TARGET_DIR   caller-owned EMPTY build directory   (default: fresh target/benchmark-report-card.*)
 #   BENCH_KEEP_TARGET  retain the auto-created target       (default 0; set to 1 for diagnosis)
+#
+# Acceptance floor:
+#   Section B batch-65,536 production-compact whole-run wall throughput must be
+#   at least 260,000,000 lookups/s. Missing, malformed, or duplicate metrics fail closed.
 
 set -uo pipefail
 
@@ -58,6 +62,8 @@ readonly FULL_POINT_BATCHES_OUT_OF_L2="300"
 readonly FULL_POINT_WARMUP="20"
 readonly FULL_POINT_THREADS_IN_L2="1,2,4,8"
 readonly FULL_POINT_INSERT_CHUNK="1000"
+readonly FULL_POINT_IN_L2_FLOOR_BATCH="65536"
+readonly FULL_POINT_IN_L2_MIN_LOOKUPS_PER_S="260000000"
 readonly FULL_GPU_GAP="12"
 
 usage() {
@@ -110,6 +116,70 @@ section_output_complete() {
   [[ "$command_rc" -eq 0 ]] &&
     [[ "$tee_rc" -eq 0 ]] &&
     grep -Fq "$completion_marker" "$section_log"
+}
+
+point_production_throughput_for_batch() {
+  local section_log="$1"
+  local target_batch="$2"
+  awk -v target_batch="$target_batch" '
+    $0 == "### batch=" target_batch {
+      target_headers += 1
+      in_target_batch = 1
+      next
+    }
+    /^##/ {
+      in_target_batch = 0
+    }
+    in_target_batch && $1 == "prod-compact" {
+      prod_lines += 1
+      for (field = 1; field <= NF; field += 1) {
+        if ($field == "lookups/s") {
+          candidate = $(field - 1)
+          throughput_tokens += 1
+          if ((candidate == "0" || candidate ~ /^[1-9][0-9]*$/) &&
+              length(candidate) <= 10) {
+            valid_tokens += 1
+            throughput = candidate
+          }
+        }
+      }
+    }
+    END {
+      if (target_headers == 1 &&
+          prod_lines == 1 &&
+          throughput_tokens == 1 &&
+          valid_tokens == 1) {
+        print throughput
+        exit 0
+      }
+      exit 1
+    }
+  ' "$section_log"
+}
+
+enforce_point_production_throughput_floor() {
+  local section_log="$1"
+  local target_batch="$2"
+  local minimum_lookups_per_s="$3"
+  local measured_lookups_per_s
+  if ! [[
+    "$minimum_lookups_per_s" =~ ^(0|[1-9][0-9]*)$ &&
+      "${#minimum_lookups_per_s}" -le 10
+  ]]; then
+    echo "point_read_throughput_gate_status=fail cache_regime=in_l2 batch=${target_batch} metric=whole_run_wall_lookups_per_s minimum=${minimum_lookups_per_s} reason=invalid_minimum"
+    return 1
+  fi
+  if ! measured_lookups_per_s="$(
+    point_production_throughput_for_batch "$section_log" "$target_batch"
+  )"; then
+    echo "point_read_throughput_gate_status=fail cache_regime=in_l2 batch=${target_batch} metric=whole_run_wall_lookups_per_s minimum=${minimum_lookups_per_s} reason=missing_malformed_or_duplicate"
+    return 1
+  fi
+  if ((10#$measured_lookups_per_s < 10#$minimum_lookups_per_s)); then
+    echo "point_read_throughput_gate_status=fail cache_regime=in_l2 batch=${target_batch} metric=whole_run_wall_lookups_per_s measured=${measured_lookups_per_s} minimum=${minimum_lookups_per_s} reason=below_floor"
+    return 1
+  fi
+  echo "point_read_throughput_gate_status=pass cache_regime=in_l2 batch=${target_batch} metric=whole_run_wall_lookups_per_s measured=${measured_lookups_per_s} minimum=${minimum_lookups_per_s}"
 }
 
 candidate_remained_frozen_in() {
@@ -235,6 +305,78 @@ run_self_check() {
   run_section OUTPUT "self-check tee failure" 5 "control-marker=complete" \
     bash -c 'printf "%s\n" "control-marker=complete"' >/dev/null 2>&1
   [[ "${section_failures[*]}" == "OUTPUT:output" ]] || failures=$((failures + 1))
+  mkdir -p -- "$scratch/point-floor"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  prod-compact p50= 117us p99= 130us | 260000000 lookups/s (0.004 us/lookup)" \
+    >"$scratch/point-floor/pass.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  prod-compact p50= 117us p99= 130us | 259999999 lookups/s (0.004 us/lookup)" \
+    >"$scratch/point-floor/below.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  compat-public p50= 8000us p99= 9000us | 8000000 lookups/s (0.125 us/lookup)" \
+    >"$scratch/point-floor/missing.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  prod-compact p50= 117us p99= 130us | 270000000 lookups/s (0.004 us/lookup)" \
+    "  prod-compact p50= 117us p99= 130us | 270000001 lookups/s (0.004 us/lookup)" \
+    >"$scratch/point-floor/duplicate.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  compat-public p50= 8000us p99= 9000us | 8000000 lookups/s (0.125 us/lookup)" \
+    "## ONE-CALLER summary" \
+    "  prod-compact p50= 117us p99= 130us | 270000000 lookups/s (0.004 us/lookup)" \
+    >"$scratch/point-floor/post-summary-decoy.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  prod-compact p50= 117us | 270000000 lookups/s | 270000001 lookups/s" \
+    >"$scratch/point-floor/two-tokens.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  prod-compact p50= 117us | malformed lookups/s | 270000000 lookups/s" \
+    >"$scratch/point-floor/malformed-and-valid.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  prod-compact p50= 117us p99= 130us | 0259999999 lookups/s (0.004 us/lookup)" \
+    >"$scratch/point-floor/zero-prefixed.log"
+  printf '%s\n' \
+    "### batch=65536" \
+    "  prod-compact p50= 117us p99= 130us | 270000000 lookups/s (0.004 us/lookup)" \
+    "### batch=65536" \
+    "  prod-compact p50= 117us p99= 130us | 270000000 lookups/s (0.004 us/lookup)" \
+    >"$scratch/point-floor/duplicate-header.log"
+  enforce_point_production_throughput_floor \
+    "$scratch/point-floor/pass.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/below.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/missing.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/duplicate.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/post-summary-decoy.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/two-tokens.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/malformed-and-valid.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/zero-prefixed.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/duplicate-header.log" 65536 260000000 >/dev/null ||
+    failures=$((failures + 1))
+  ! enforce_point_production_throughput_floor \
+    "$scratch/point-floor/pass.log" 65536 0260000000 >/dev/null ||
+    failures=$((failures + 1))
   bench_target_dir="$saved_bench_target_dir"
   section_failures=("${saved_section_failures[@]}")
 
@@ -399,9 +541,10 @@ if [[ "$mode" == "full" ]]; then
     echo "failed to export the exact staged candidate tree" >&2
     exit 1
   fi
-  # The candidate's .cargo/config.toml maps TMPDIR to this source-relative path.
-  mkdir -p -- "$build_root/target/tmp"
 fi
+# The source tree's .cargo/config.toml maps TMPDIR to this source-relative path.
+# Recreate it after an intentional target cleanup in both quick and full modes.
+mkdir -p -- "$build_root/target/tmp"
 
 l2_mb=128
 out_of_l2_col_mb=$(( OUT_OF_L2_ROWS * 4 / 1000000 ))
@@ -554,6 +697,16 @@ sleep "${GPU_GAP}"
 # ---- Section B: lpb/wave ENGINE POINT READS, IN-L2 (default 1M rows; full concurrent section) ----
 run_section B "lpb/wave ENGINE POINT READS -- IN-L2 (1M rows = 4MB/col, cache-resident)" "${SECTION_B_TIMEOUT}" \
   "$point_b_completion_marker" "${point_b_command[@]}"
+
+if [[ "${#section_failures[@]}" -eq 0 ]]; then
+  if ! enforce_point_production_throughput_floor \
+    "$bench_target_dir/report-card-section-B.log" \
+    "$FULL_POINT_IN_L2_FLOOR_BATCH" \
+    "$FULL_POINT_IN_L2_MIN_LOOKUPS_PER_S" |
+    tee -a "$bench_target_dir/report-card-section-B.log"; then
+    section_failures+=("B:in-l2-throughput-floor")
+  fi
+fi
 
 if [[ "${#section_failures[@]}" -ne 0 ]]; then
   print_execution_status "incomplete" "failed_sections=${section_failures[*]}"

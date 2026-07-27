@@ -15,7 +15,10 @@ use gpu_db_facade::{
     SharedEngine, SharedSession, SubmissionRequest,
 };
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
-use gpu_db_protocol::{parse_frontend_message, CopyToStdout, DescribeTarget, FrontendMessage};
+use gpu_db_protocol::{
+    canonicalize_sql_for_exact_match, parse_frontend_message, CopyToStdout, DescribeTarget,
+    FrontendMessage,
+};
 
 #[derive(Debug, Clone)]
 struct Statement {
@@ -743,6 +746,14 @@ impl ExtendedSession {
                 | None => query.clone(),
             },
         };
+        // The lexical gates deliberately return early for ordinary SQL. Preserve the historic
+        // extended-Parse diagnostic precedence by proving quote/comment/dollar lexical validity
+        // before semantic parameter-OID mapping. COPY owns its syntax proof above; SQL EXECUTE
+        // and ordinary shape/name/plan parsing intentionally retain their old post-OID order.
+        if copy.is_none() {
+            canonicalize_sql_for_exact_match(&analysis_sql)
+                .map_err(|error| ExtendedError::new("42601", error.to_string()))?;
+        }
         let parameter_type_hints = parameter_type_oids
             .iter()
             .map(|oid| {

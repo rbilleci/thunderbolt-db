@@ -80,12 +80,13 @@ impl Engine {
         let _apply = if apply_leader {
             None
         } else {
-            self.intent_lanes.as_ref().map(|lanes| {
-                lanes
-                    .device_apply_lock
+            Some(
+                self.read_state
+                    .residency
+                    .mutation_gate
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            })
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
         };
         // R3-004: normal DML no longer keeps a host tuple-store shadow. An explicit warmup of an
         // already authoritative table therefore means "retain the current device generation", not
@@ -273,7 +274,16 @@ impl Engine {
             // make a correctly configured small STRATA budget impossible to establish.
             0
         } else if purely_int4 || fixed_width_sections {
-            let doubled = row_count.saturating_mul(2).next_power_of_two();
+            // Keep admission's established bounded-budget cap and deterministic eviction policy;
+            // only the checked fixed-width growth geometry is shared with rollover planning.
+            let doubled = super::rollover::ResidentRolloverPlan::fixed_width_desired_capacity(
+                row_count, None,
+            )
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{table}\" fixed-width admission capacity overflowed"
+                )))
+            })?;
             // S-d2c: on the shard path, CAP the open shard at the target size (`row_count` if it already
             // exceeds it — a large admit is one dense shard) so it seals + rolls over at the target rather
             // than growing unbounded. The single buffer is uncapped (its cap is the 536M guard above).

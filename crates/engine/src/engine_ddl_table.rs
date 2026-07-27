@@ -1528,7 +1528,7 @@ impl Engine {
         let old_tuple_ids: Vec<TupleId> = moves.iter().map(|(tuple_id, _)| *tuple_id).collect();
         for (_old_tuple_id, value) in &moves {
             let row_id = self.read_state.mvcc.current_row_id();
-            self.read_state.mvcc.advance_row_id(1);
+            self.read_state.mvcc.advance_row_id(1)?;
             let new_key = relational_row_key(&rename.new_name, row_id);
             let new_tuple_id = self.read_state.mvcc.reserve_tuple_id();
             let values = decode_relational_row(value, &table.columns)

@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use gpu_db_types::EngineError;
 use gpu_db_write_conveyor::recover_frame_log_by_scan;
 
-use crate::fua::{fua_segment_paths_sorted, FuaWalBackend};
+use crate::fua::{fua_segment_paths_sorted, recover_fua_wal_runs, FuaWalBackend};
 use crate::{decode_wal_record_run, encode_record_into, WalRecord};
 
 /// Busy-spins before falling back to `yield_now` in [`FuaWalLaneSet::wait_durable`] (same law as
@@ -517,21 +517,15 @@ fn recover_lanes_detailed(
     for (lane_id, lane_end) in lane_ends.iter_mut().enumerate() {
         let lane_base = lane_base_path(base, lane_id);
         for segment_path in fua_segment_paths_sorted(&lane_base)? {
-            let frames = recover_frame_log_by_scan(&segment_path).map_err(|err| {
-                EngineError::Durability(format!(
-                    "failed to scan-recover FUA WAL lane {lane_id} segment {}: {err}",
-                    segment_path.display()
-                ))
-            })?;
-            for frame in frames {
-                let decoded = decode_wal_record_run(&frame.payload)?;
-                if decoded.len() as u64 != frame.seq_count as u64 {
+            for run in recover_fua_wal_runs(&segment_path)? {
+                let decoded = decode_wal_record_run(&run.payload)?;
+                if decoded.len() as u64 != run.seq_count as u64 {
                     return Err(EngineError::Durability(format!(
-                        "FUA WAL lane {lane_id} segment {} frame {} declares {} records but its \
+                        "FUA WAL lane {lane_id} segment {} terminal frame {} declares {} records but its \
                          payload decodes to {}",
                         segment_path.display(),
-                        frame.frame_id,
-                        frame.seq_count,
+                        run.terminal_frame_id,
+                        run.seq_count,
                         decoded.len()
                     )));
                 }
@@ -541,11 +535,11 @@ fn recover_lanes_detailed(
                             "FUA WAL lane recovery record offset exceeds u64".to_string(),
                         )
                     })?;
-                    let seq = frame.first_seq.checked_add(offset).ok_or_else(|| {
+                    let seq = run.first_seq.checked_add(offset).ok_or_else(|| {
                         EngineError::Durability(format!(
-                            "FUA WAL lane {lane_id} sequence overflow in segment {} frame {}",
+                            "FUA WAL lane {lane_id} sequence overflow in segment {} terminal frame {}",
                             segment_path.display(),
-                            frame.frame_id
+                            run.terminal_frame_id
                         ))
                     })?;
                     if seq < baseline {
@@ -579,14 +573,14 @@ fn recover_lanes_detailed(
                         )));
                     }
                 }
-                let end = frame
+                let end = run
                     .first_seq
-                    .checked_add(u64::from(frame.seq_count))
+                    .checked_add(u64::from(run.seq_count))
                     .ok_or_else(|| {
                         EngineError::Durability(format!(
-                            "FUA WAL lane {lane_id} frame range overflow in segment {} frame {}",
+                            "FUA WAL lane {lane_id} frame range overflow in segment {} terminal frame {}",
                             segment_path.display(),
-                            frame.frame_id
+                            run.terminal_frame_id
                         ))
                     })?;
                 *lane_end = (*lane_end).max(end);
@@ -863,6 +857,7 @@ pub fn lane_segment_capacity_bytes(
 mod tests {
     use super::*;
     use gpu_db_types::TxnId;
+    use gpu_db_write_conveyor::{FuaFrameLog, FuaFrameLogConfig};
 
     fn test_base(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("fua-lane-set-tests");
@@ -971,6 +966,139 @@ mod tests {
         assert!(set.append_encoded(0, 0, 0, 0, &payload).is_err());
         assert_eq!(recover_lanes(&base, 1).expect("empty recovery"), vec![]);
         drop(set);
+        cleanup(&base, 1);
+    }
+
+    /// The legacy lane primitive shares the physical appender/recovery machinery, but it has no
+    /// synchronous direct-service observation owner and must never issue controller actions.
+    #[test]
+    fn legacy_lane_append_keeps_controller_telemetry_at_zero() {
+        let base = test_base("controller-disabled");
+        let set = FuaWalLaneSet::create(&base, 1, 16, SEGMENT_BYTES).expect("create");
+        set.append(0, 0, &[record(0)]).expect("append");
+        set.wait_durable(1).expect("durable");
+
+        let telemetry = set.lanes[0].backend.telemetry();
+        assert_eq!(telemetry.logical_groups, 1);
+        assert_eq!(telemetry.published_frames, 1);
+        let controller_fields = [
+            telemetry.controller_sustained_actions,
+            telemetry.controller_pending_probe_cover_actions,
+            telemetry.controller_qd1_samples,
+            telemetry.controller_qd1_sparse_actions,
+            telemetry.controller_qd1_verify_actions,
+            telemetry.controller_qd1_fast_actions,
+            telemetry.controller_unfragmented_actions,
+            telemetry.controller_pool_too_narrow,
+            telemetry.controller_empty_chunk,
+            telemetry.controller_insufficient_free_slots,
+            telemetry.controller_natural_depth,
+            telemetry.controller_segment_boundary,
+            telemetry.controller_amplification_cap,
+            telemetry.controller_fast_samples,
+            telemetry.controller_nonfast_samples,
+            telemetry.controller_transitions_to_verify,
+            telemetry.controller_transitions_to_fast,
+            telemetry.controller_transitions_to_sustained,
+            telemetry.controller_stale_qd1_samples,
+            telemetry.controller_unavailable_qd1_samples,
+            telemetry.controller_abandoned_qd1_samples,
+            telemetry.controller_protocol_faults,
+            telemetry.controller_protocol_fallback_actions,
+            telemetry.controller_phase,
+            telemetry.controller_verify_fast_streak,
+            telemetry.controller_sustained_remaining,
+            telemetry.controller_generation,
+            telemetry.controller_pending_qd1_samples,
+            telemetry.controller_fast_in_flight,
+            telemetry.controller_fast_in_flight_max,
+            telemetry.controller_generation_exhausted,
+            telemetry.controller_ordinal_exhausted,
+            telemetry.controller_action_reconciliation,
+            telemetry.controller_sample_reconciliation,
+        ];
+        assert!(
+            controller_fields.iter().all(|&field| field == 0),
+            "legacy append must not expose controller activity: {controller_fields:?}"
+        );
+
+        drop(set);
+        assert_eq!(
+            recover_lanes(&base, 1).expect("recover"),
+            vec![record(0)],
+            "controller-disabled publication keeps the same recovered lane representation"
+        );
+        cleanup(&base, 1);
+    }
+
+    #[test]
+    fn recovery_coalesces_a_large_fragmented_lane_run_before_decoding() {
+        let base = test_base("fragmented-lane-run");
+        let lane_base = lane_base_path(&base, 0);
+        let lane_name = lane_base.file_name().unwrap().to_str().unwrap();
+        let segment = lane_base.with_file_name(format!("{lane_name}.fua.1"));
+        let expected: Vec<_> = (0..96).map(record).collect();
+        let payload = encode_lane_frame_payload(&expected).expect("encode run");
+        let fragments = 16usize;
+        let base_len = payload.len() / fragments;
+        let remainder = payload.len() % fragments;
+        let mut offset = 0usize;
+        let mut chunks = Vec::with_capacity(fragments);
+        for index in 0..fragments {
+            let len = base_len + usize::from(index < remainder);
+            chunks.push(&payload[offset..offset + len]);
+            offset += len;
+        }
+        let log = unsafe {
+            FuaFrameLog::create(FuaFrameLogConfig {
+                path: segment,
+                segment_id: 1,
+                capacity_bytes: 1 << 20,
+            })
+            .expect("create lane segment")
+        };
+        let pool = log.spawn_fence_pool(16);
+        let mut appender = log.appender();
+        appender
+            .publish_batch(&chunks, 0, u32::try_from(expected.len()).unwrap())
+            .expect("publish complete logical lane run");
+        appender.finish();
+        pool.join().expect("fence lane run");
+        drop(log);
+
+        assert_eq!(
+            recover_lanes(&base, 1).expect("coalesced recovery"),
+            expected
+        );
+        cleanup(&base, 1);
+    }
+
+    #[test]
+    fn frame_appender_rejects_zero_and_overflow_ranges_before_visibility() {
+        let base = test_base("frame-range-boundaries");
+        let lane_base = lane_base_path(&base, 0);
+        let lane_name = lane_base.file_name().unwrap().to_str().unwrap();
+        let segment = lane_base.with_file_name(format!("{lane_name}.fua.1"));
+        let log = unsafe {
+            FuaFrameLog::create(FuaFrameLogConfig {
+                path: segment.clone(),
+                segment_id: 1,
+                capacity_bytes: 16 << 10,
+            })
+            .expect("create frame log")
+        };
+        let mut appender = log.appender();
+        assert!(appender.publish_frame(b"one", 0, 0).is_err());
+        assert!(appender.publish_frame(b"one", u64::MAX, 1).is_err());
+        assert!(appender.publish_batch(&[b"one", b"two"], 0, 0).is_err());
+        assert!(appender
+            .publish_batch(&[b"one", b"two"], u64::MAX, 1)
+            .is_err());
+        assert!(recover_frame_log_by_scan(&segment)
+            .expect("empty scan")
+            .is_empty());
+        drop(appender);
+        drop(log);
         cleanup(&base, 1);
     }
 
