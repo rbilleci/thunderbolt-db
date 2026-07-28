@@ -1,9 +1,13 @@
 use crate::tests::assert_recovered_relational_access_path;
 use crate::{
-    Engine, RelationalAccessPath, RelationalCheckConstraint, RelationalColumn, RelationalIndex,
-    FIRST_USER_COLUMN_ID, FIRST_USER_RELATION_OID, PUBLIC_SCHEMA_NAME,
+    CheckOperandIdentityVersion, Engine, EngineError, ExecuteError, RelationalAccessPath,
+    RelationalCheckConstraint, RelationalColumn, RelationalIndex, FIRST_USER_COLUMN_ID,
+    FIRST_USER_RELATION_OID, PUBLIC_SCHEMA_NAME,
 };
-use gpu_db_sql::{parse_command, Command, SelectFilterOp, SqlType, SqlValue};
+use gpu_db_sql::{
+    parse_command, CheckLiteralProvenance, Command, Decimal128, SelectFilterOp, SqlType, SqlValue,
+    NUMERIC_DEFAULT_PRECISION,
+};
 
 const FIRST_TABLE_INDEX_OID: u32 = FIRST_USER_RELATION_OID + 1;
 
@@ -369,6 +373,8 @@ fn relational_check_constraints_enforce_and_replay_from_wal() {
             column: "id".to_string(),
             op: SelectFilterOp::Gt,
             value: SqlValue::Int4(0),
+            resolved_input_type: SqlType::Int4,
+            identity_version: CheckOperandIdentityVersion::ResolvedV2,
         }]
     );
 
@@ -465,6 +471,533 @@ fn relational_check_constraints_enforce_and_replay_from_wal() {
         .unwrap_err()
         .to_string()
         .contains("violates check constraint"));
+}
+
+fn normalized_check_literal_values() -> Vec<SqlValue> {
+    vec![
+        SqlValue::Int4(7),
+        SqlValue::Int4(7),
+        SqlValue::Int4(7),
+        SqlValue::Numeric(Decimal128::new(12, 0)),
+        SqlValue::Bool(true),
+        SqlValue::Text("open".to_string()),
+        SqlValue::Date(gpu_db_sql::datetime::parse_date("2024-02-03").unwrap()),
+        SqlValue::Timestamp(gpu_db_sql::datetime::parse_timestamp("2024-02-03 04:05:06").unwrap()),
+        SqlValue::Uuid(
+            gpu_db_sql::uuid::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+        ),
+    ]
+}
+
+fn assert_normalized_check_literals(engine: &Engine, table: &str) {
+    assert_eq!(
+        engine
+            .relational_catalog_table(table)
+            .unwrap()
+            .check_constraints
+            .iter()
+            .map(|constraint| constraint.value.clone())
+            .collect::<Vec<_>>(),
+        normalized_check_literal_values(),
+    );
+}
+
+/// CHECK literals use comparison semantics rather than INSERT assignment casts. This covers every
+/// scalar in `SUPPORTED_SQL_TYPES` for both CREATE and ADD, and verifies replay re-binds the same
+/// resolved catalog values from the raw WAL command.
+#[test]
+fn check_literals_use_comparison_resolution_for_create_add_and_wal_replay() {
+    let engine = Engine::new_local_test_engine();
+    engine.execute_text(1, "CREATE TABLE check_create (s SMALLINT, i INT, b BIGINT, n NUMERIC(8,2), flag BOOLEAN, note TEXT, d DATE, ts TIMESTAMP, u UUID, CONSTRAINT s_check CHECK (s >= 7), CONSTRAINT i_check CHECK (i >= 7), CONSTRAINT b_check CHECK (b >= 7), CONSTRAINT n_check CHECK (n >= 12), CONSTRAINT flag_check CHECK (flag = true), CONSTRAINT note_check CHECK (note = 'open'), CONSTRAINT d_check CHECK (d >= '2024-02-03'), CONSTRAINT ts_check CHECK (ts >= '2024-02-03 04:05:06'), CONSTRAINT u_check CHECK (u = '00112233-4455-6677-8899-aabbccddeeff'))").unwrap();
+    assert_normalized_check_literals(&engine, "check_create");
+
+    engine
+        .execute_text(2, "CREATE DOMAIN check_code AS BIGINT")
+        .unwrap();
+    engine
+        .execute_text(
+            3,
+            "CREATE TABLE check_domain (code check_code, CHECK (code >= 7))",
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .relational_catalog_table("check_domain")
+            .unwrap()
+            .check_constraints[0]
+            .value,
+        SqlValue::Int4(7),
+    );
+
+    engine.execute_text(4, "CREATE TABLE check_add (s SMALLINT, i INT, b BIGINT, n NUMERIC(8,2), flag BOOLEAN, note TEXT, d DATE, ts TIMESTAMP, u UUID)").unwrap();
+    engine.execute_text(5, "INSERT INTO check_add VALUES (7, 7, 7, 12, true, 'open', '2024-02-03', '2024-02-03 04:05:06', '00112233-4455-6677-8899-aabbccddeeff')").unwrap();
+    for (seq, sql) in [
+        "ALTER TABLE check_add ADD CONSTRAINT add_s_check CHECK (s >= 7)",
+        "ALTER TABLE check_add ADD CONSTRAINT add_i_check CHECK (i >= 7)",
+        "ALTER TABLE check_add ADD CONSTRAINT add_b_check CHECK (b >= 7)",
+        "ALTER TABLE check_add ADD CONSTRAINT add_n_check CHECK (n >= 12)",
+        "ALTER TABLE check_add ADD CONSTRAINT add_flag_check CHECK (flag = true)",
+        "ALTER TABLE check_add ADD CONSTRAINT add_note_check CHECK (note = 'open')",
+        "ALTER TABLE check_add ADD CONSTRAINT add_d_check CHECK (d >= '2024-02-03')",
+        "ALTER TABLE check_add ADD CONSTRAINT add_ts_check CHECK (ts >= '2024-02-03 04:05:06')",
+        "ALTER TABLE check_add ADD CONSTRAINT add_u_check CHECK (u = '00112233-4455-6677-8899-aabbccddeeff')",
+    ].into_iter().enumerate() {
+        engine.execute_text(6 + seq as u64, sql).unwrap();
+    }
+    assert_normalized_check_literals(&engine, "check_add");
+
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert_normalized_check_literals(&recovered, "check_create");
+    assert_eq!(
+        recovered
+            .relational_catalog_table("check_domain")
+            .unwrap()
+            .check_constraints[0]
+            .value,
+        SqlValue::Int4(7),
+    );
+    assert_normalized_check_literals(&recovered, "check_add");
+}
+
+#[test]
+fn check_comparison_literals_preserve_out_of_range_and_cross_scale_values() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE check_cross_create (s SMALLINT, i INT, n NUMERIC(8,2), CONSTRAINT cross_create_s CHECK (s < 32768), CONSTRAINT cross_create_i CHECK (i < 2147483648), CONSTRAINT cross_create_n CHECK (n < 12.345))",
+        )
+        .unwrap();
+    let expected = vec![
+        SqlValue::Int4(32_768),
+        SqlValue::Int8(2_147_483_648),
+        SqlValue::Numeric(Decimal128::new(12_345, 3)),
+    ];
+    assert_eq!(
+        engine
+            .relational_catalog_table("check_cross_create")
+            .unwrap()
+            .check_constraints
+            .iter()
+            .map(|constraint| constraint.value.clone())
+            .collect::<Vec<_>>(),
+        expected,
+    );
+
+    engine
+        .execute_text(
+            2,
+            "CREATE TABLE check_cross_add (s SMALLINT, i INT, n NUMERIC(8,2))",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            3,
+            "INSERT INTO check_cross_add VALUES (-32768, -2147483648, 12.34)",
+        )
+        .unwrap();
+    for (seq, sql) in [
+        "ALTER TABLE check_cross_add ADD CONSTRAINT cross_add_s CHECK (s < 32768)",
+        "ALTER TABLE check_cross_add ADD CONSTRAINT cross_add_i CHECK (i < 2147483648)",
+        "ALTER TABLE check_cross_add ADD CONSTRAINT cross_add_n CHECK (n < 12.345)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        engine.execute_text(4 + seq as u64, sql).unwrap();
+    }
+    assert_eq!(
+        engine
+            .relational_catalog_table("check_cross_add")
+            .unwrap()
+            .check_constraints
+            .iter()
+            .map(|constraint| constraint.value.clone())
+            .collect::<Vec<_>>(),
+        expected,
+    );
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert!(recovered
+        .catalog_snapshot()
+        .same_contents(engine.catalog_snapshot().as_ref()));
+}
+
+#[test]
+fn invalid_check_comparison_literal_rejects_atomically_before_wal() {
+    let engine = Engine::new_local_test_engine();
+    let create_catalog_before = engine.catalog_snapshot();
+    let create_wal_before = engine.durable_wal_records().len();
+    let create_error = engine
+        .execute_text(
+            1,
+            "CREATE TABLE bad_check_create (d DATE, CHECK (d > 'not-a-date'))",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        create_error,
+        ExecuteError::Engine(EngineError::InvalidDatetimeFormat(message))
+            if message.contains("invalid input syntax for type date")
+    ));
+    assert!(engine
+        .catalog_snapshot()
+        .same_contents(create_catalog_before.as_ref()));
+    assert_eq!(engine.durable_wal_records().len(), create_wal_before);
+
+    engine
+        .execute_text(2, "CREATE TABLE bad_check_add (d DATE)")
+        .unwrap();
+    let add_catalog_before = engine.catalog_snapshot();
+    let add_wal_before = engine.durable_wal_records().len();
+    let add_error = engine
+        .execute_text(
+            3,
+            "ALTER TABLE bad_check_add ADD CONSTRAINT bad_date CHECK (d > 'not-a-date')",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        add_error,
+        ExecuteError::Engine(EngineError::InvalidDatetimeFormat(message))
+            if message.contains("invalid input syntax for type date")
+    ));
+    assert!(engine
+        .catalog_snapshot()
+        .same_contents(add_catalog_before.as_ref()));
+    assert_eq!(engine.durable_wal_records().len(), add_wal_before);
+
+    let overflow_catalog_before = engine.catalog_snapshot();
+    let overflow_wal_before = engine.durable_wal_records().len();
+    let overflow_error = engine
+        .execute_text(
+            4,
+            "ALTER TABLE bad_check_add ADD CONSTRAINT date_field_retry CHECK (d > '2024-02-30')",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        overflow_error,
+        ExecuteError::Engine(EngineError::DatetimeFieldOverflow(message))
+            if message.contains("invalid input syntax for type date")
+    ));
+    assert!(engine
+        .catalog_snapshot()
+        .same_contents(overflow_catalog_before.as_ref()));
+    assert_eq!(engine.durable_wal_records().len(), overflow_wal_before);
+    engine
+        .execute_text(
+            5,
+            "ALTER TABLE bad_check_add ADD CONSTRAINT date_field_retry CHECK (d > '2024-01-01')",
+        )
+        .expect("overflowing ALTER must leave the same constraint name reusable");
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert!(recovered
+        .catalog_snapshot()
+        .same_contents(engine.catalog_snapshot().as_ref()));
+}
+
+#[test]
+fn check_literal_provenance_preserves_unknown_explicit_and_legacy_replay_semantics() {
+    let explicit =
+        parse_command("CREATE TABLE explicit_provenance (s SMALLINT, CHECK (s > '7'::int4))")
+            .unwrap();
+    let Command::CreateTable(create) = &explicit else {
+        panic!("expected CREATE TABLE");
+    };
+    assert_eq!(
+        create.check_constraints[0].literal_provenance,
+        CheckLiteralProvenance::Known(SqlType::Int4)
+    );
+    let explicit_bytes = serde_json::to_vec(&explicit).unwrap();
+    assert!(std::str::from_utf8(&explicit_bytes)
+        .unwrap()
+        .contains("literal_provenance"),);
+    let explicit_replayed: Command = serde_json::from_slice(&explicit_bytes).unwrap();
+    assert_eq!(explicit_replayed, explicit);
+
+    // Old typed catalog payloads omitted the field. Their serialization remains byte-identical;
+    // decoding deliberately preserves the ambiguity instead of pretending this was a new parse.
+    let mut legacy_source =
+        parse_command("CREATE TABLE legacy_provenance (s SMALLINT, CHECK (s > 7))").unwrap();
+    let Command::CreateTable(legacy_create) = &mut legacy_source else {
+        panic!("expected CREATE TABLE");
+    };
+    legacy_create.check_constraints[0].literal_provenance = CheckLiteralProvenance::LegacyAmbiguous;
+    let legacy_bytes = serde_json::to_vec(&legacy_source).unwrap();
+    let legacy_replayed: Command = serde_json::from_slice(&legacy_bytes).unwrap();
+    let Command::CreateTable(legacy_create) = &legacy_replayed else {
+        panic!("expected CREATE TABLE");
+    };
+    assert_eq!(
+        legacy_create.check_constraints[0].literal_provenance,
+        CheckLiteralProvenance::LegacyAmbiguous
+    );
+    assert_eq!(serde_json::to_vec(&legacy_replayed).unwrap(), legacy_bytes);
+
+    let engine = Engine::new_local_test_engine();
+    let wal_before = engine.durable_wal_records().len();
+    let quoted_smallint = engine
+        .execute_text(
+            1,
+            "CREATE TABLE rejected_unknown_smallint (s SMALLINT, CHECK (s > '32768'))",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        quoted_smallint.contains("smallint out of range"),
+        "{quoted_smallint}"
+    );
+    assert_eq!(engine.durable_wal_records().len(), wal_before);
+
+    let explicit_text = engine
+        .execute_text(
+            2,
+            "CREATE TABLE rejected_explicit_text (s SMALLINT, CHECK (s > '32768'::text))",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        explicit_text.contains("operator does not exist"),
+        "{explicit_text}"
+    );
+    assert_eq!(engine.durable_wal_records().len(), wal_before);
+
+    engine
+        .execute_text(
+            3,
+            "CREATE TABLE comparison_provenance (s SMALLINT, t TEXT, n NUMERIC(8,2), CHECK (s > 32768), CHECK (t = 'x'), CHECK (n < '12.345'))",
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .relational_catalog_table("comparison_provenance")
+            .unwrap()
+            .check_constraints
+            .iter()
+            .map(|check| check.value.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            SqlValue::Int4(32_768),
+            SqlValue::Text("x".to_string()),
+            SqlValue::Numeric(Decimal128::new(12_345, 3)),
+        ]
+    );
+    engine
+        .execute_text(
+            4,
+            "CREATE TABLE explicit_recovery (s SMALLINT, CHECK (s > '7'::int4))",
+        )
+        .unwrap();
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert!(recovered
+        .catalog_snapshot()
+        .same_contents(engine.catalog_snapshot().as_ref()));
+    assert_eq!(
+        recovered
+            .relational_catalog_table("explicit_recovery")
+            .unwrap()
+            .check_constraints[0]
+            .value,
+        SqlValue::Int4(7),
+    );
+}
+
+#[test]
+fn legacy_check_numeric_operand_keeps_its_natural_type_after_catalog_resolution() {
+    let numeric_column = SqlType::Numeric {
+        precision: 3,
+        scale: 0,
+    };
+    let (value, resolved_input_type) = crate::resolve_check_comparison_operand(
+        SqlValue::Numeric(Decimal128::new(1_000, 0)),
+        CheckLiteralProvenance::LegacyAmbiguous,
+        numeric_column,
+        SelectFilterOp::Gt,
+        "n",
+    )
+    .expect("legacy numeric literal remains a compatible numeric operand");
+    assert_eq!(value, SqlValue::Numeric(Decimal128::new(1_000, 0)));
+    assert_eq!(
+        resolved_input_type,
+        SqlType::Numeric {
+            precision: NUMERIC_DEFAULT_PRECISION,
+            scale: 0,
+        }
+    );
+    let legacy_constraint = RelationalCheckConstraint {
+        name: "legacy_numeric".to_string(),
+        column: "n".to_string(),
+        op: SelectFilterOp::Gt,
+        value,
+        resolved_input_type,
+        identity_version: CheckOperandIdentityVersion::LegacyV1,
+    };
+    crate::check_violation_expr::validate_check_literal_at_evaluation(&legacy_constraint)
+        .expect("legacy numeric must not inherit the column numeric typmod");
+
+    let (_, null_input_type) = crate::resolve_check_comparison_operand(
+        SqlValue::Null,
+        CheckLiteralProvenance::LegacyAmbiguous,
+        SqlType::Timestamp,
+        SelectFilterOp::Eq,
+        "created_at",
+    )
+    .expect("legacy NULL binds to the comparison target");
+    assert_eq!(null_input_type, SqlType::Timestamp);
+}
+
+#[test]
+fn check_schema_digest_keeps_legacy_v1_and_new_check_ddl_upgrades_to_v2() {
+    let mut legacy_engine = Engine::new_local_test_engine();
+    let mut historical_catalog = legacy_engine.ddl_catalog_mut().clone();
+    let mut legacy_command =
+        parse_command("CREATE TABLE legacy_digest (id int4, CHECK (id > 0))").unwrap();
+    let Command::CreateTable(legacy_create) = &mut legacy_command else {
+        panic!("expected CREATE TABLE");
+    };
+    legacy_create.check_constraints[0].literal_provenance = CheckLiteralProvenance::LegacyAmbiguous;
+    let Command::CreateTable(legacy_create) = legacy_command else {
+        unreachable!("CREATE command was matched above");
+    };
+    legacy_engine
+        .apply_create_table(&mut historical_catalog, legacy_create)
+        .expect("historical CREATE replay");
+    let historical = historical_catalog.relational_catalog["legacy_digest"].clone();
+    assert_eq!(
+        crate::engine_transaction_reset::table_schema_digest_version(&historical),
+        1
+    );
+    let historical_digest = crate::engine_transaction_reset::table_schema_digest(&historical)
+        .expect("legacy schema digest");
+    assert_eq!(
+        historical_digest,
+        crate::engine_transaction_reset::table_schema_digest(&historical)
+            .expect("legacy digest is deterministic")
+    );
+
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(2, "CREATE TABLE digest_upgrade (id int4)")
+        .unwrap();
+    let before = engine.relational_catalog_table("digest_upgrade").unwrap();
+    assert_eq!(
+        crate::engine_transaction_reset::table_schema_digest_version(&before),
+        1
+    );
+    engine
+        .execute_text(
+            3,
+            "ALTER TABLE digest_upgrade ADD CONSTRAINT digest_upgrade_check CHECK (id > 0)",
+        )
+        .unwrap();
+    let upgraded = engine.relational_catalog_table("digest_upgrade").unwrap();
+    assert_eq!(
+        crate::engine_transaction_reset::table_schema_digest_version(&upgraded),
+        2
+    );
+    assert!(upgraded
+        .check_constraints
+        .iter()
+        .all(|constraint| constraint.identity_version == CheckOperandIdentityVersion::ResolvedV2));
+    let upgraded_digest = crate::engine_transaction_reset::table_schema_digest(&upgraded)
+        .expect("upgraded schema digest");
+    assert_ne!(historical_digest, upgraded_digest);
+    assert_eq!(
+        upgraded_digest,
+        crate::engine_transaction_reset::table_schema_digest(&upgraded)
+            .expect("upgraded digest is deterministic")
+    );
+}
+
+#[test]
+fn temporal_check_casts_cover_create_add_null_recovery_and_schema_proof() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE temporal_checks (ts timestamp, d date, \
+             CONSTRAINT ts_before_day CHECK (ts < '2000-01-01'::date), \
+             CONSTRAINT day_after_pre_epoch CHECK (d > '1999-12-31 23:59:59.999999'::timestamp))",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            2,
+            "INSERT INTO temporal_checks VALUES ('1999-12-31 23:59:59.999999'::timestamp, '2000-01-01'::date)",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            3,
+            "INSERT INTO temporal_checks VALUES ('1999-12-31 23:59:59.999999'::timestamp, NULL)",
+        )
+        .unwrap();
+    let wal_before = engine.durable_wal_records().len();
+    let row_id_before = engine.read_state.mvcc.current_row_id();
+    let error = engine
+        .execute_text(
+            4,
+            "INSERT INTO temporal_checks VALUES ('2000-01-01'::timestamp, '2000-01-01'::date)",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExecuteError::Engine(EngineError::CheckViolation(message)) if message.contains("ts_before_day")
+    ));
+    assert_eq!(engine.durable_wal_records().len(), wal_before);
+    assert_eq!(engine.read_state.mvcc.current_row_id(), row_id_before);
+
+    engine
+        .execute_text(5, "CREATE TABLE temporal_add (d date, ts timestamp)")
+        .unwrap();
+    engine
+        .execute_text(
+            6,
+            "INSERT INTO temporal_add VALUES ('2000-01-01'::date, '2000-01-01'::timestamp)",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            7,
+            "ALTER TABLE temporal_add ADD CONSTRAINT day_before_plus_one CHECK (d < '2000-01-01 00:00:00.000001'::timestamp)",
+        )
+        .unwrap();
+    let add_wal_before = engine.durable_wal_records().len();
+    let error = engine
+        .execute_text(
+            8,
+            "ALTER TABLE temporal_add ADD CONSTRAINT timestamp_before_day CHECK (ts < '2000-01-01'::date)",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExecuteError::Engine(EngineError::CheckViolation(_))
+    ));
+    assert_eq!(engine.durable_wal_records().len(), add_wal_before);
+    engine
+        .execute_text(
+            9,
+            "ALTER TABLE temporal_add ADD CONSTRAINT timestamp_before_day CHECK (ts <= '2000-01-01'::date)",
+        )
+        .unwrap();
+
+    let table = engine.relational_catalog_table("temporal_checks").unwrap();
+    assert_eq!(
+        table.check_constraints[0].resolved_input_type,
+        SqlType::Date
+    );
+    assert_eq!(
+        table.check_constraints[1].resolved_input_type,
+        SqlType::Timestamp
+    );
+    let digest = crate::engine_transaction_reset::table_schema_digest(&table).unwrap();
+    let mut sabotaged = table.clone();
+    sabotaged.check_constraints[0].resolved_input_type = SqlType::Timestamp;
+    assert_ne!(
+        digest,
+        crate::engine_transaction_reset::table_schema_digest(&sabotaged).unwrap()
+    );
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert!(recovered
+        .catalog_snapshot()
+        .same_contents(engine.catalog_snapshot().as_ref()));
 }
 
 /// PG 3VL: a CHECK constraint is violated only when its predicate evaluates to FALSE — a NULL

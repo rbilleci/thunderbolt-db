@@ -620,6 +620,208 @@ impl CudaResidentIndexStatus {
     }
 }
 
+type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+#[allow(clippy::type_complexity)]
+type CuLaunchKernel = unsafe extern "C" fn(
+    *mut c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut c_void,
+    *mut *mut c_void,
+    *mut *mut c_void,
+) -> i32;
+
+/// Drain queued default-stream work before its pooled buffers return; an unsubmitted token keeps
+/// this armed guard so descriptor setup cannot outlive its leases.
+struct NullStreamDrain {
+    primary: Arc<crate::GpuPrimaryContext>,
+    armed: bool,
+}
+
+impl Drop for NullStreamDrain {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(test)]
+            PREPARED_MULTI_INDEX_DRAINS.with(|drains| drains.set(drains.get() + 1));
+            let _ = self.primary.set_current();
+            unsafe {
+                let _ = (self.primary.cu_stream_synchronize)(std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// Exact pre-WAL pooled bytes: three u64 words/index, four words/typed-or-validity column, and
+/// the separately bucketed four-byte terminal; this excludes resident source/index allocations.
+pub fn resident_typed_indexes_insert_preparation_bytes(
+    index_count: usize,
+    descriptor_column_count: usize,
+) -> Option<u64> {
+    let descriptor_words = index_count
+        .checked_mul(3)?
+        .checked_add(descriptor_column_count.checked_mul(4)?)?;
+    let descriptor_bytes = descriptor_words.checked_mul(std::mem::size_of::<u64>())?;
+    let descriptor_pool = crate::cuda_context::checked_output_buffer_bucket(descriptor_bytes)?;
+    let verdict_pool =
+        crate::cuda_context::checked_output_buffer_bucket(std::mem::size_of::<u32>())?;
+    u64::try_from(descriptor_pool)
+        .ok()?
+        .checked_add(u64::try_from(verdict_pool).ok()?)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARED_MULTI_INDEX_PREPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PREPARED_MULTI_INDEX_SUBMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PREPARED_MULTI_INDEX_DRAINS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FAIL_PREPARED_MULTI_INDEX_AFTER_LEASES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_PREPARED_MULTI_INDEX_AFTER_LAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedResidentTypedIndexesInsertCounters {
+    pub prepares: u64,
+    pub submits: u64,
+    pub drains: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_resident_typed_indexes_insert_counters(
+) -> PreparedResidentTypedIndexesInsertCounters {
+    PreparedResidentTypedIndexesInsertCounters {
+        prepares: PREPARED_MULTI_INDEX_PREPARES.with(std::cell::Cell::get),
+        submits: PREPARED_MULTI_INDEX_SUBMITS.with(std::cell::Cell::get),
+        drains: PREPARED_MULTI_INDEX_DRAINS.with(std::cell::Cell::get),
+    }
+}
+
+/// Fail immediately after both pooled leases have been acquired.  The next prepare consumes this
+/// arm, proving that an abandoned pre-WAL token drains its leases and leaves the shared context
+/// reusable before any launch can occur.
+#[cfg(test)]
+pub(crate) fn fail_next_prepared_resident_typed_indexes_insert_after_leases() {
+    FAIL_PREPARED_MULTI_INDEX_AFTER_LEASES.with(|fail| fail.set(true));
+}
+
+/// Inject a return after a successful fused launch but before its terminal D2H.  The token's
+/// drain guard must synchronize before its pooled leases can return to the shared pool.
+#[cfg(test)]
+pub(crate) fn fail_next_prepared_resident_typed_indexes_insert_after_launch() {
+    FAIL_PREPARED_MULTI_INDEX_AFTER_LAUNCH.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn take_fail_after_prepared_multi_index_launch() -> bool {
+    FAIL_PREPARED_MULTI_INDEX_AFTER_LAUNCH.with(|fail| fail.replace(false))
+}
+
+/// Move-only launch ownership for one fused resident-index tail insert.
+///
+/// Preparation validates every index basis, resolves the cached kernel, queues the compact
+/// descriptor image and verdict initialization, and leases both device buffers. Submission can
+/// therefore cross a durability boundary without allocating, reloading a module, looking up a
+/// cache entry, or rebuilding host descriptors. Dropping an unsubmitted token drains setup before
+/// returning its owned leases to the execution pool; it cannot mutate an index.
+pub struct PreparedResidentTypedIndexesInsert {
+    primary: Arc<crate::GpuPrimaryContext>,
+    /// Strong allocation guards keep both source and every destination index alive even if their
+    /// cache entries are retired after preparation and before the consuming launch.
+    _source_owner: Arc<crate::resident_memory::CudaResidentDeviceAllocation>,
+    _index_owners: Box<[Arc<crate::resident_memory::CudaResidentDeviceAllocation>]>,
+    // Field order is load-bearing: drain queued null-stream setup before either pooled buffer
+    // returns to the shared pool on an abandoned token or an error path.
+    preparation_drain: Option<NullStreamDrain>,
+    descriptor_guard: crate::PooledDeviceBufferOwned,
+    decline_guard: crate::PooledDeviceBufferOwned,
+    function: *mut c_void,
+    source_ptr: u64,
+    index_count: u32,
+    base_row: u32,
+    row_count: u32,
+    work_items: u32,
+    cu_memcpy_dtoh: CuMemcpyDtoH,
+    cu_launch_kernel: CuLaunchKernel,
+}
+
+// SAFETY: exclusive allocations/leases and `primary` pin the module function; submit/drop rebind
+// that context before CUDA use. The single-consumption token is intentionally not `Sync`.
+unsafe impl Send for PreparedResidentTypedIndexesInsert {}
+
+impl PreparedResidentTypedIndexesInsert {
+    /// Exact pooled descriptor + terminal capacity held across the WAL boundary.
+    pub fn preparation_bytes(&self) -> u64 {
+        u64::try_from(self.descriptor_guard.capacity)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(self.decline_guard.capacity).unwrap_or(u64::MAX))
+    }
+
+    /// Consume the sealed launch exactly once.  All allocation and module-cache work happened
+    /// during preparation; this performs only the kernel launch and its bounded four-byte D2H
+    /// status fence.
+    pub fn submit(mut self) -> Result<CudaResidentIndexStatus, CudaRuntimeProbeError> {
+        #[cfg(test)]
+        PREPARED_MULTI_INDEX_SUBMITS.with(|submits| submits.set(submits.get() + 1));
+        self.primary.set_current()?;
+        let mut stream_drain = self
+            .preparation_drain
+            .take()
+            .expect("prepared resident index launch retains its drain guard");
+        let mut source_arg = self.source_ptr;
+        let mut descriptors_arg = self.descriptor_guard.ptr;
+        let mut index_count_arg = self.index_count;
+        let mut base_row_arg = self.base_row;
+        let mut row_count_arg = self.row_count;
+        let mut decline_arg = self.decline_guard.ptr;
+        let mut args = [
+            (&mut source_arg as *mut u64).cast::<c_void>(),
+            (&mut descriptors_arg as *mut u64).cast::<c_void>(),
+            (&mut index_count_arg as *mut u32).cast::<c_void>(),
+            (&mut base_row_arg as *mut u32).cast::<c_void>(),
+            (&mut row_count_arg as *mut u32).cast::<c_void>(),
+            (&mut decline_arg as *mut u64).cast::<c_void>(),
+        ];
+        let threads = 128_u32;
+        check_cuda(unsafe {
+            (self.cu_launch_kernel)(
+                self.function,
+                self.work_items.div_ceil(threads),
+                1,
+                1,
+                threads,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        #[cfg(test)]
+        if take_fail_after_prepared_multi_index_launch() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-1));
+        }
+        // Blocking null-stream D2H is the completion fence before owned leases return to pool.
+        let mut decline = 0_u32;
+        check_cuda(unsafe {
+            (self.cu_memcpy_dtoh)(
+                (&mut decline as *mut u32).cast::<c_void>(),
+                self.decline_guard.ptr,
+                std::mem::size_of::<u32>(),
+            )
+        })?;
+        stream_drain.armed = false;
+        Ok(CudaResidentIndexStatus::from_bits(decline))
+    }
+}
+
 impl CudaResidentDeviceMemory {
     /// Build `index` from typed columns in this resident allocation. Returns `true` only for a
     /// semantic decline (duplicate in a non-tolerant index, malformed text offsets, or probe-cap
@@ -751,24 +953,20 @@ impl CudaResidentDeviceMemory {
         base_row: usize,
         row_count: usize,
     ) -> Result<CudaResidentIndexStatus, CudaRuntimeProbeError> {
-        type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
-        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
-        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-        #[allow(clippy::type_complexity)]
-        type CuLaunchKernel = unsafe extern "C" fn(
-            *mut c_void,
-            u32,
-            u32,
-            u32,
-            u32,
-            u32,
-            u32,
-            u32,
-            *mut c_void,
-            *mut *mut c_void,
-            *mut *mut c_void,
-        ) -> i32;
+        self.prepare_resident_typed_indexes_insert(indexes, base_row, row_count)?
+            .submit()
+    }
 
+    /// Preallocate and seal the one fused resident-index tail-insert launch.  The returned token
+    /// pins the source plus every index owner, retains the uploaded descriptor and verdict leases,
+    /// and resolves the kernel before the caller crosses WAL.  Its consuming `submit` has no
+    /// allocation, module-cache lookup, or revalidation path.
+    pub fn prepare_resident_typed_indexes_insert(
+        &self,
+        indexes: &[CudaResidentTypedIndexInsert],
+        base_row: usize,
+        row_count: usize,
+    ) -> Result<PreparedResidentTypedIndexesInsert, CudaRuntimeProbeError> {
         if indexes.is_empty() || row_count == 0 {
             return Err(CudaRuntimeProbeError::InvalidInputLength(row_count));
         }
@@ -788,18 +986,34 @@ impl CudaResidentDeviceMemory {
             .checked_mul(row_count_u32)
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let primary = self.primary_arc();
-        let mut index_descriptors = Vec::<u64>::with_capacity(indexes.len() * 3);
-        let column_count = indexes.iter().try_fold(0usize, |total, index| {
-            total.checked_add(index.columns.len())
-        });
-        let mut column_descriptors = Vec::<u64>::with_capacity(
-            column_count.ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))? * 4,
-        );
+        let index_descriptor_capacity = indexes
+            .len()
+            .checked_mul(3)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let column_count = indexes
+            .iter()
+            .try_fold(0usize, |total, index| {
+                total.checked_add(index.columns.len())
+            })
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let column_descriptor_capacity = column_count
+            .checked_mul(4)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let mut index_descriptors = Vec::<u64>::with_capacity(index_descriptor_capacity);
+        let mut column_descriptors = Vec::<u64>::with_capacity(column_descriptor_capacity);
+        // The token pins all allocations until submit, so these device addresses are stable for
+        // this validation interval.  Reject physical aliases here: logical key-id coalescing is
+        // an upstream concern, while one fused launch must never use its source as a destination
+        // or insert the same directory twice concurrently.
+        let source_ptr = self.device_ptr();
+        let mut destination_ptrs = std::collections::BTreeSet::new();
         let mut column_start = 0_u32;
         for request in indexes {
             if request.columns.is_empty()
                 || !Arc::ptr_eq(&primary, &request.index.primary_arc())
                 || request.index.device_ptr() == 0
+                || request.index.device_ptr() == source_ptr
+                || !destination_ptrs.insert(request.index.device_ptr())
             {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(0));
             }
@@ -908,10 +1122,20 @@ impl CudaResidentDeviceMemory {
         let mut descriptors = index_descriptors;
         descriptors.extend_from_slice(&column_descriptors);
         let descriptor_bytes = std::mem::size_of_val(&*descriptors);
+        let exact_preparation_bytes =
+            resident_typed_indexes_insert_preparation_bytes(indexes.len(), column_count)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        // Refuse the complete two-lease geometry before taking either lease.  A budget failure is
+        // therefore pre-WAL and leaves no partially prepared token or pooled scratch ownership.
+        crate::CudaAllocationScope::ensure_available(exact_preparation_bytes)?;
 
         primary.set_current()?;
         let descriptor_guard = primary.lease_device_buffer_owned(descriptor_bytes)?;
         let decline_guard = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
+        #[cfg(test)]
+        if FAIL_PREPARED_MULTI_INDEX_AFTER_LEASES.with(|fail| fail.replace(false)) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
         let cu_memset_d8 = unsafe {
             *primary
                 .lib()
@@ -939,6 +1163,20 @@ impl CudaResidentDeviceMemory {
                 .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
                 .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
         };
+        // Resolve every potentially failing driver/module dependency before queueing the first
+        // default-stream operation. The token then owns queued descriptor setup plus both leases;
+        // its later same-stream launch is ordered after this setup without an extra sync.
+        let mut ptx = Vec::with_capacity(RESIDENT_MULTI_INDEX_INSERT_PTX.len() + 1);
+        ptx.extend_from_slice(RESIDENT_MULTI_INDEX_INSERT_PTX);
+        ptx.push(0);
+        let function =
+            primary.cached_function(c"gpu_db_resident_typed_multi_index_insert", &ptx)?;
+        // Arm before the first null-stream HtoD/memset. Any setup error after this point drains
+        // queued work before the owned descriptor/verdict leases return to the pool.
+        let stream_drain = NullStreamDrain {
+            primary: Arc::clone(&primary),
+            armed: true,
+        };
         check_cuda(unsafe {
             cu_memcpy_htod(
                 descriptor_guard.ptr,
@@ -947,51 +1185,27 @@ impl CudaResidentDeviceMemory {
             )
         })?;
         check_cuda(unsafe { cu_memset_d8(decline_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
-
-        let mut ptx = Vec::with_capacity(RESIDENT_MULTI_INDEX_INSERT_PTX.len() + 1);
-        ptx.extend_from_slice(RESIDENT_MULTI_INDEX_INSERT_PTX);
-        ptx.push(0);
-        let function =
-            primary.cached_function(c"gpu_db_resident_typed_multi_index_insert", &ptx)?;
-        let mut source_arg = self.device_ptr();
-        let mut descriptors_arg = descriptor_guard.ptr;
-        let mut index_count_arg = index_count_u32;
-        let mut base_row_arg = base_row_u32;
-        let mut row_count_arg = row_count_u32;
-        let mut decline_arg = decline_guard.ptr;
-        let mut args = [
-            (&mut source_arg as *mut u64).cast::<c_void>(),
-            (&mut descriptors_arg as *mut u64).cast::<c_void>(),
-            (&mut index_count_arg as *mut u32).cast::<c_void>(),
-            (&mut base_row_arg as *mut u32).cast::<c_void>(),
-            (&mut row_count_arg as *mut u32).cast::<c_void>(),
-            (&mut decline_arg as *mut u64).cast::<c_void>(),
-        ];
-        let threads = 128_u32;
-        check_cuda(unsafe {
-            cu_launch_kernel(
-                function,
-                work_items.div_ceil(threads),
-                1,
-                1,
-                threads,
-                1,
-                1,
-                0,
-                std::ptr::null_mut(),
-                args.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        })?;
-        let mut decline = 0_u32;
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                (&mut decline as *mut u32).cast::<c_void>(),
-                decline_guard.ptr,
-                std::mem::size_of::<u32>(),
-            )
-        })?;
-        Ok(CudaResidentIndexStatus::from_bits(decline))
+        #[cfg(test)]
+        PREPARED_MULTI_INDEX_PREPARES.with(|prepares| prepares.set(prepares.get() + 1));
+        Ok(PreparedResidentTypedIndexesInsert {
+            primary,
+            _source_owner: self.allocation_arc(),
+            _index_owners: indexes
+                .iter()
+                .map(|request| request.index.allocation_arc())
+                .collect::<Box<[_]>>(),
+            preparation_drain: Some(stream_drain),
+            descriptor_guard,
+            decline_guard,
+            function,
+            source_ptr: self.device_ptr(),
+            index_count: index_count_u32,
+            base_row: base_row_u32,
+            row_count: row_count_u32,
+            work_items,
+            cu_memcpy_dtoh,
+            cu_launch_kernel,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

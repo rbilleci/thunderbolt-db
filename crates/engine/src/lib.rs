@@ -28,20 +28,21 @@ use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine}
 use gpu_db_snapshot::{SnapshotCell, SnapshotHandle};
 use gpu_db_sql::{
     parse_command, parse_command_allowing_catalog, AclRelationKind, AddCheckConstraint,
-    AddForeignKey, AddUniqueConstraint, AlterRoleLogin, ColumnDef, ColumnDefault, Command,
-    CommentTarget, CopyColumn, CopyFromStdin, CreateDatabase, CreateDomain, CreateExtension,
-    CreateIndex, CreateMaterializedView, CreatePublication, CreateRole, CreateSchema,
-    CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
-    DatabasePrivilege, Decimal128, Delete, DropConstraint, DropDatabase, DropDomain, DropExtension,
-    DropIndex, DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence,
-    DropSubscription, DropTable, DropTablespace, DropView, FunctionPrivilege, GroupedAggKind,
-    GroupedAggregate, Insert, ParseError, PreparedCatalogProgram, PreparedCommand,
-    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
-    RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
-    RenameTablespace, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction,
-    SelectLiteral, SelectProjection, SequenceNextVal, SequenceRestart, SequenceSetVal, SqlType,
-    SqlValue, TablePrivilege, TablespacePrivilege, TransactionCharacteristics, TruncateTable,
-    Update, NUMERIC_DEFAULT_PRECISION, PROJECTION_WILDCARD_SENTINEL,
+    AddForeignKey, AddUniqueConstraint, AlterRoleLogin, CheckLiteralProvenance, ColumnDef,
+    ColumnDefault, Command, CommentTarget, CopyColumn, CopyFromStdin, CreateDatabase, CreateDomain,
+    CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication, CreateRole,
+    CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
+    DatabasePrivilege, Decimal128, DefaultInputType, Delete, DropConstraint, DropDatabase,
+    DropDomain, DropExtension, DropIndex, DropMaterializedView, DropPublication, DropRole,
+    DropSchema, DropSequence, DropSubscription, DropTable, DropTablespace, DropView,
+    FunctionPrivilege, GroupedAggKind, GroupedAggregate, Insert, InsertCell, ParseError,
+    PreparedCatalogProgram, PreparedCommand, PublicationTarget, RefreshMaterializedView,
+    RenameColumn, RenameConstraint, RenameDatabase, RenameFunction, RenameIndex,
+    RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView,
+    SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectLiteral, SelectProjection,
+    SequenceNextVal, SequenceRestart, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
+    TablespacePrivilege, TransactionCharacteristics, TruncateTable, Update,
+    NUMERIC_DEFAULT_PRECISION, PROJECTION_WILDCARD_SENTINEL,
 };
 #[cfg(test)]
 use gpu_db_storage::TupleVersion;
@@ -73,6 +74,8 @@ mod rel_exec_catalog;
 pub(crate) use rel_exec_catalog::*;
 mod rel_exec_helpers;
 pub(crate) use rel_exec_helpers::*;
+mod column_default;
+pub(crate) use column_default::*;
 mod wal_binary;
 pub(crate) use wal_binary::*;
 mod write_path;
@@ -109,11 +112,14 @@ pub use engine_dml_concurrent::DmlExecutionResult;
 mod engine_insert_probe;
 #[cfg(feature = "probe-timing")]
 pub use engine_insert_probe::{InsertProbeConfig, InsertProbeSnapshot};
+mod check_violation_expr;
 mod engine_canonical_operation;
 mod engine_dml_intent;
 mod engine_durability;
+mod engine_insert_plan;
 mod engine_intent_lanes;
-mod prepared_insert_batch;
+mod insert_semantic_ir;
+mod typed_insert_batch;
 pub use engine_dml_intent::{
     CoveredDeleteRoute, CoveredInsertRoute, CoveredUpdateRoute, IntentTicket, SynchronousCommit,
 };
@@ -336,9 +342,38 @@ impl ExecuteError {
         matches!(self, Self::Engine(EngineError::NumericValueOutOfRange(_)))
     }
 
+    pub fn is_datatype_mismatch(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::DatatypeMismatch(_)))
+            || matches!(self, Self::DatatypeMismatch(_))
+    }
+
+    pub fn is_invalid_datetime_format(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::InvalidDatetimeFormat(_)))
+    }
+
+    pub fn is_datetime_field_overflow(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::DatetimeFieldOverflow(_)))
+    }
+
+    pub fn is_invalid_text_representation(&self) -> bool {
+        matches!(
+            self,
+            Self::Engine(EngineError::InvalidTextRepresentation(_))
+        )
+    }
+
+    pub fn is_undefined_operator(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::UndefinedOperator(_)))
+    }
+
     pub fn is_undefined_column(&self) -> bool {
         matches!(self, Self::Engine(EngineError::UndefinedColumn(_)))
             || matches!(self, Self::UndefinedColumn(_))
+    }
+
+    pub fn is_undefined_relation(&self) -> bool {
+        matches!(self, Self::Engine(EngineError::UndefinedRelation(_)))
+            || matches!(self, Self::UndefinedRelation(_))
     }
 
     pub fn is_duplicate_column(&self) -> bool {

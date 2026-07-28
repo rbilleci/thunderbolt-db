@@ -83,12 +83,11 @@ enum OfflockPreparedDmlKind {
     },
     /// A legacy item must not inflate to the fixed batch's columnar size. The box is only enum
     /// layout isolation: the inner carrier owns the batch by value (never through `Arc`).
-    FixedInsert(Box<OfflockFixedInsert>),
+    TypedInsert(Box<OfflockTypedInsert>),
 }
 
-struct OfflockFixedInsert {
-    batch: crate::prepared_insert_batch::PreparedInsertBatch,
-    template: crate::wal_binary::PreparedBinaryInsertTemplate,
+struct OfflockTypedInsert {
+    prepared_plan: crate::engine_insert_plan::PreparedDeviceInsertPlan,
     /// A cloned allocation witness keeps the fixed carrier bound to the precise sealed request
     /// that entered admission.  Digest equality alone is not enough at preflight.
     request_payload: Arc<[u8]>,
@@ -100,28 +99,19 @@ struct OfflockFixedInsert {
 /// The only pre-WAL hand-off that may consume a sealed fixed INSERT carrier. It carries no
 /// legacy mutation state: any pre-WAL typed mismatch discards it and invokes the established
 /// full preparation once from the parsed command held by the wave item.
-pub(super) struct FixedInsertPreflight {
-    source: crate::prepared_insert_batch::PreparedI32AppendSource,
-    template: crate::wal_binary::PreparedBinaryInsertTemplate,
+pub(super) struct TypedInsertPreflight {
+    prepared_plan: crate::engine_insert_plan::PreparedDeviceInsertPlan,
     request_digest: gpu_db_wal::CanonicalDigest,
-    row_count: u32,
 }
 
-impl FixedInsertPreflight {
+impl TypedInsertPreflight {
     pub(super) fn into_parts(
         self,
     ) -> (
-        crate::prepared_insert_batch::PreparedI32AppendSource,
-        crate::wal_binary::PreparedBinaryInsertTemplate,
+        crate::engine_insert_plan::PreparedDeviceInsertPlan,
         gpu_db_wal::CanonicalDigest,
-        u32,
     ) {
-        (
-            self.source,
-            self.template,
-            self.request_digest,
-            self.row_count,
-        )
+        (self.prepared_plan, self.request_digest)
     }
 }
 
@@ -136,24 +126,25 @@ impl OfflockPreparedDml {
     /// Pair a fixed batch with the precise sealed request that entered admission. The carrier
     /// retains an allocation witness, so no caller can attach a batch to an unrelated payload or
     /// separately supplied digest.
-    pub(super) fn fixed_insert(
-        batch: crate::prepared_insert_batch::PreparedInsertBatch,
+    pub(super) fn typed_insert(
+        batch: crate::typed_insert_batch::TypedInsertBatch,
+        engine: &Engine,
+        catalog: &CatalogSnapshot,
         request: &CanonicalRequest,
         read_snapshot: Index,
     ) -> Result<Self, EngineError> {
-        let template = batch.binary_insert_template()?;
+        let prepared_plan = crate::engine_insert_plan::PreparedDeviceInsertPlan::from_typed_batch(
+            batch, engine, catalog,
+        )?;
         let write_set = WriteSet {
-            tables: std::collections::BTreeSet::from([batch
-                .binary_insert_template_table_name()
-                .to_string()]),
+            tables: std::collections::BTreeSet::from([prepared_plan.table_name().to_string()]),
             rows: Vec::new(),
             unique_slots: Vec::new(),
             unique_slots_i32: Vec::new(),
         };
-        Ok(Self(OfflockPreparedDmlKind::FixedInsert(Box::new(
-            OfflockFixedInsert {
-                batch,
-                template,
+        Ok(Self(OfflockPreparedDmlKind::TypedInsert(Box::new(
+            OfflockTypedInsert {
+                prepared_plan,
                 request_payload: request.payload_arc(),
                 request_digest: request.digest(),
                 read_snapshot,
@@ -165,7 +156,7 @@ impl OfflockPreparedDml {
     pub(super) fn legacy_delta(&self) -> Option<&crate::write_path::WriteDelta> {
         match &self.0 {
             OfflockPreparedDmlKind::Legacy { delta, .. } => Some(delta),
-            OfflockPreparedDmlKind::FixedInsert(_) => None,
+            OfflockPreparedDmlKind::TypedInsert(_) => None,
         }
     }
 
@@ -174,7 +165,7 @@ impl OfflockPreparedDml {
     pub(super) fn write_set(&self) -> &WriteSet {
         match &self.0 {
             OfflockPreparedDmlKind::Legacy { delta, .. } => &delta.write_set,
-            OfflockPreparedDmlKind::FixedInsert(fixed) => &fixed.write_set,
+            OfflockPreparedDmlKind::TypedInsert(fixed) => &fixed.write_set,
         }
     }
 
@@ -183,7 +174,7 @@ impl OfflockPreparedDml {
     pub(super) fn read_snapshot(&self) -> Index {
         match &self.0 {
             OfflockPreparedDmlKind::Legacy { read_snapshot, .. } => *read_snapshot,
-            OfflockPreparedDmlKind::FixedInsert(fixed) => fixed.read_snapshot,
+            OfflockPreparedDmlKind::TypedInsert(fixed) => fixed.read_snapshot,
         }
     }
 
@@ -191,7 +182,7 @@ impl OfflockPreparedDml {
     /// same live statement. The `Err` value lets the caller distinguish a direct-carrier binding
     /// mismatch from a normal legacy item, then discard the typed carrier before full prepare.
     #[allow(clippy::result_large_err)]
-    pub(super) fn into_fixed_insert_preflight(
+    pub(super) fn into_typed_insert_preflight(
         self,
         request: &CanonicalRequest,
         expected_write_set: &WriteSet,
@@ -199,53 +190,46 @@ impl OfflockPreparedDml {
         prepared_catalog_seq: Index,
         read_snapshot: Index,
         reuse_eligible: bool,
-    ) -> Result<FixedInsertPreflight, Self> {
+    ) -> Result<TypedInsertPreflight, Self> {
         let Self(kind) = self;
-        let OfflockPreparedDmlKind::FixedInsert(fixed) = kind else {
+        let OfflockPreparedDmlKind::TypedInsert(fixed) = kind else {
             return Err(Self(kind));
         };
         let exact_request =
             fixed.request_digest == request.digest() && request.same_origin(&fixed.request_payload);
-        let batch_matches = fixed.batch.matches_direct_fixed_insert(
+        let plan_matches = fixed.prepared_plan.matches_current_binding(
             expected_write_set,
             catalog,
             prepared_catalog_seq,
         );
-        let template_matches =
-            fixed.template.count() == fixed.batch.binary_insert_template_row_count();
         if !exact_request
             || fixed.read_snapshot != read_snapshot
             || !reuse_eligible
             || fixed.write_set != *expected_write_set
-            || !batch_matches
-            || !template_matches
+            || !plan_matches
         {
-            return Err(Self(OfflockPreparedDmlKind::FixedInsert(fixed)));
+            return Err(Self(OfflockPreparedDmlKind::TypedInsert(fixed)));
         }
-        let OfflockFixedInsert {
-            batch,
-            template,
+        let OfflockTypedInsert {
+            prepared_plan,
             request_digest,
             ..
         } = *fixed;
-        let row_count = batch.binary_insert_template_row_count();
-        Ok(FixedInsertPreflight {
-            source: batch.into_i32_append_source(),
-            template,
+        Ok(TypedInsertPreflight {
+            prepared_plan,
             request_digest,
-            row_count,
         })
     }
 
-    pub(super) fn is_fixed_insert(&self) -> bool {
-        matches!(self.0, OfflockPreparedDmlKind::FixedInsert(_))
+    pub(super) fn is_typed_insert(&self) -> bool {
+        matches!(self.0, OfflockPreparedDmlKind::TypedInsert(_))
     }
 
     #[cfg(any(test, debug_assertions))]
     pub(super) fn matches_request(&self, request: &CanonicalRequest) -> bool {
         match &self.0 {
             OfflockPreparedDmlKind::Legacy { .. } => true,
-            OfflockPreparedDmlKind::FixedInsert(fixed) => {
+            OfflockPreparedDmlKind::TypedInsert(fixed) => {
                 fixed.request_digest == request.digest()
                     && request.same_origin(&fixed.request_payload)
             }
@@ -266,11 +250,14 @@ mod offlock_prepared_tests {
         let insert = crate::Insert {
             table: "accounts".to_string(),
             columns: Vec::new(),
-            rows: vec![vec![SqlValue::Int4(7), SqlValue::Int4(70)]],
+            rows: gpu_db_sql::Insert::programmatic_rows(vec![vec![
+                SqlValue::Int4(7),
+                SqlValue::Int4(70),
+            ]]),
             returning: Vec::new(),
         };
         let catalog = engine.catalog_snapshot();
-        let batch = crate::prepared_insert_batch::try_prepare_direct_fixed_insert_batch(
+        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch(
             &Command::Insert(insert),
             &catalog,
             catalog.commit_seq,
@@ -279,21 +266,24 @@ mod offlock_prepared_tests {
         .unwrap()
         .expect("the exact NULL-free int4 shape is a direct fixed candidate");
         let request = CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
-        let prepared =
-            OfflockPreparedDml::fixed_insert(batch, &request, engine.committed_seq()).unwrap();
+        let prepared = OfflockPreparedDml::typed_insert(
+            batch,
+            &engine,
+            &catalog,
+            &request,
+            engine.committed_seq(),
+        )
+        .unwrap();
         assert!(prepared.matches_request(&request));
         let other_request =
             CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (8, 80)");
         assert!(!prepared.matches_request(&other_request));
         assert!(prepared.legacy_delta().is_none());
         assert_eq!(prepared.read_snapshot(), engine.committed_seq());
-        let OfflockPreparedDmlKind::FixedInsert(fixed) = &prepared.0 else {
-            unreachable!("fixed constructor must retain the batch and template atomically");
+        let OfflockPreparedDmlKind::TypedInsert(fixed) = &prepared.0 else {
+            unreachable!("typed constructor must retain the prepared plan atomically");
         };
-        assert_eq!(
-            fixed.batch.binary_insert_template_row_count(),
-            fixed.template.count()
-        );
+        assert_eq!(fixed.prepared_plan.row_count(), 1);
         let write_set = WriteSet {
             tables: std::collections::BTreeSet::from(["accounts".to_string()]),
             rows: Vec::new(),
@@ -302,7 +292,7 @@ mod offlock_prepared_tests {
         };
         assert_eq!(prepared.write_set(), &write_set);
         assert!(prepared
-            .into_fixed_insert_preflight(
+            .into_typed_insert_preflight(
                 &request,
                 &write_set,
                 &catalog,
@@ -322,11 +312,14 @@ mod offlock_prepared_tests {
         let insert = crate::Insert {
             table: "accounts".to_string(),
             columns: Vec::new(),
-            rows: vec![vec![SqlValue::Int4(7), SqlValue::Int4(70)]],
+            rows: gpu_db_sql::Insert::programmatic_rows(vec![vec![
+                SqlValue::Int4(7),
+                SqlValue::Int4(70),
+            ]]),
             returning: Vec::new(),
         };
         let catalog = engine.catalog_snapshot();
-        let batch = crate::prepared_insert_batch::try_prepare_direct_fixed_insert_batch(
+        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch(
             &Command::Insert(insert),
             &catalog,
             catalog.commit_seq,
@@ -335,8 +328,14 @@ mod offlock_prepared_tests {
         .unwrap()
         .expect("the exact NULL-free int4 shape is a direct fixed candidate");
         let request = CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
-        let prepared =
-            OfflockPreparedDml::fixed_insert(batch, &request, engine.committed_seq()).unwrap();
+        let prepared = OfflockPreparedDml::typed_insert(
+            batch,
+            &engine,
+            &catalog,
+            &request,
+            engine.committed_seq(),
+        )
+        .unwrap();
         let same_bytes_different_request =
             CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
 
@@ -349,7 +348,7 @@ mod offlock_prepared_tests {
             unique_slots_i32: Vec::new(),
         };
         assert!(prepared
-            .into_fixed_insert_preflight(
+            .into_typed_insert_preflight(
                 &same_bytes_different_request,
                 &write_set,
                 &catalog,

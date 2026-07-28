@@ -3,32 +3,83 @@ use crate::{ExecuteError, RelationalColumn};
 use gpu_db_sql::{Decimal128, SqlType, SqlValue};
 use gpu_db_types::EngineError;
 
-pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
-    values
-        .iter()
-        .map(|value| match value {
-            // Stored type-independently as the reserved prefix-free token; decodes back to
-            // `SqlValue::Null` regardless of column type (see `decode_relational_value`).
-            SqlValue::Null => NULL_TOKEN.to_string(),
-            SqlValue::Int2(value) => format!("i2:{value}"),
-            SqlValue::Int4(value) => format!("i:{value}"),
-            SqlValue::Int8(value) => format!("n:{value}"),
-            // Storage preserves the value's declared scale (`d:<mantissa>:<scale>`); the
-            // value-index canonicalizes separately for scale-insensitive equality lookups.
-            SqlValue::Numeric(value) => format!("d:{}:{}", value.mantissa, value.scale),
-            SqlValue::Bool(value) => format!("b:{}", if *value { 't' } else { 'f' }),
-            SqlValue::Text(value) => {
-                format!("t:{}", value.replace('\\', "\\\\").replace('|', "\\|"))
+/// A borrowed relational cell accepted by the canonical row encoder.  The typed INSERT carrier
+/// uses this directly, so its WAL template never has to materialize a `SqlValue` solely to reuse
+/// the historical row codec.
+pub(crate) enum RelationalCellRef<'a> {
+    Null,
+    Int2(i16),
+    Int4(i32),
+    Int8(i64),
+    Numeric { mantissa: i128, scale: u8 },
+    Bool(bool),
+    Text(&'a str),
+    Date(i32),
+    Timestamp(i64),
+    Uuid(&'a [u8; 16]),
+}
+
+/// Append exactly one canonical, escaped relational cell. This is the one codec authority for
+/// both legacy row images and sealed typed INSERT WAL templates.
+pub(crate) fn append_relational_cell(out: &mut Vec<u8>, cell: RelationalCellRef<'_>) {
+    match cell {
+        RelationalCellRef::Null => out.extend_from_slice(NULL_TOKEN.as_bytes()),
+        RelationalCellRef::Int2(value) => out.extend_from_slice(format!("i2:{value}").as_bytes()),
+        RelationalCellRef::Int4(value) => out.extend_from_slice(format!("i:{value}").as_bytes()),
+        RelationalCellRef::Int8(value) => out.extend_from_slice(format!("n:{value}").as_bytes()),
+        RelationalCellRef::Numeric { mantissa, scale } => {
+            out.extend_from_slice(format!("d:{mantissa}:{scale}").as_bytes())
+        }
+        RelationalCellRef::Bool(value) => {
+            out.extend_from_slice(if value { b"b:t" } else { b"b:f" })
+        }
+        RelationalCellRef::Text(value) => {
+            out.extend_from_slice(b"t:");
+            for byte in value.bytes() {
+                if matches!(byte, b'\\' | b'|') {
+                    out.push(b'\\');
+                }
+                out.push(byte);
             }
-            SqlValue::Date(value) => format!("date:{value}"),
-            SqlValue::Timestamp(value) => format!("ts:{value}"),
-            SqlValue::Uuid(bytes) => format!("uuid:{}", gpu_db_sql::uuid::format_uuid(bytes)),
+        }
+        RelationalCellRef::Date(value) => out.extend_from_slice(format!("date:{value}").as_bytes()),
+        RelationalCellRef::Timestamp(value) => {
+            out.extend_from_slice(format!("ts:{value}").as_bytes())
+        }
+        RelationalCellRef::Uuid(bytes) => {
+            out.extend_from_slice(b"uuid:");
+            out.extend_from_slice(gpu_db_sql::uuid::format_uuid(bytes).as_bytes());
+        }
+    }
+}
+
+pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
+    let mut out = Vec::new();
+    for (position, value) in values.iter().enumerate() {
+        if position != 0 {
+            out.push(b'|');
+        }
+        let cell = match value {
+            SqlValue::Null => RelationalCellRef::Null,
+            SqlValue::Int2(value) => RelationalCellRef::Int2(*value),
+            SqlValue::Int4(value) => RelationalCellRef::Int4(*value),
+            SqlValue::Int8(value) => RelationalCellRef::Int8(*value),
+            SqlValue::Numeric(value) => RelationalCellRef::Numeric {
+                mantissa: value.mantissa,
+                scale: value.scale,
+            },
+            SqlValue::Bool(value) => RelationalCellRef::Bool(*value),
+            SqlValue::Text(value) => RelationalCellRef::Text(value),
+            SqlValue::Date(value) => RelationalCellRef::Date(*value),
+            SqlValue::Timestamp(value) => RelationalCellRef::Timestamp(*value),
+            SqlValue::Uuid(bytes) => RelationalCellRef::Uuid(bytes),
             SqlValue::Parameter { .. } => {
                 unreachable!("stored rows never contain unbound prepared parameters")
             }
-        })
-        .collect::<Vec<_>>()
-        .join("|")
+        };
+        append_relational_cell(&mut out, cell);
+    }
+    String::from_utf8(out).expect("relational row codec preserves UTF-8 text")
 }
 
 pub(crate) fn decode_relational_row(

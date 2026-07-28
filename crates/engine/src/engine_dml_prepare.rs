@@ -5,7 +5,6 @@
 //! engine_write_apply (which installs the WriteDelta under the commit lock).
 
 use super::*;
-use crate::engine_expr_ir::{ResidentBinaryOp, ResidentExpr};
 
 mod contracts;
 pub(crate) use contracts::{device_structural_tuple_predicate, device_structural_tuple_predicates};
@@ -96,29 +95,83 @@ impl Engine {
         };
         let row_prepare_started = Instant::now();
         let mut new_rows = Vec::with_capacity(insert.rows.len());
-        // Sequence advancement scratch: keeps `prepare_insert` pure (no `&mut self`) while
-        // evaluating `nextval` column defaults. Seeded lazily from the engine's sequence catalog,
-        // advanced per row in source order (matching the old in-line apply), then installed by
-        // `apply_delta`.
-        let mut seq_state: BTreeMap<String, (i64, bool)> = BTreeMap::new();
+        // Identify the omitted/default cells before source coercion.  This shape pass has no
+        // semantic conversion side effects; source values still get coerced in row/source order
+        // below before any default can report an error.
+        let mut default_requested = vec![true; table.columns.len()];
+        for target_idx in &column_indexes {
+            default_requested[*target_idx] = false;
+        }
         for row in &insert.rows {
             if row.len() != column_indexes.len() {
                 return Err(EngineError::ApplyFailed(
                     "INSERT value count must match target columns".to_string(),
                 ));
             }
+            for (source_idx, target_idx) in column_indexes.iter().copied().enumerate() {
+                if row[source_idx].value().is_none() {
+                    default_requested[target_idx] = true;
+                }
+            }
+        }
+        let mut pending_rows = Vec::with_capacity(insert.rows.len());
+        for row in &insert.rows {
             let mut values = vec![None; table.columns.len()];
             for (source_idx, target_idx) in column_indexes.iter().copied().enumerate() {
-                let value = row[source_idx].clone();
+                let Some(value) = row[source_idx].value() else {
+                    // Explicit DEFAULT is intentionally distinct at the AST/semantic boundary,
+                    // then reaches this compatibility lowering as an unresolved default request.
+                    continue;
+                };
                 let expected_ty = table.columns[target_idx].ty;
-                let coerced =
-                    coerce_insert_value(value, expected_ty, &table.columns[target_idx].name)?;
+                let coerced = coerce_insert_value(
+                    value.clone(),
+                    expected_ty,
+                    &table.columns[target_idx].name,
+                )?;
                 values[target_idx] = Some(coerced);
             }
+            pending_rows.push(values);
+        }
+        // Scalar defaults are statement constants. Resolve each one only when at least one row
+        // requests it, then broadcast that value through the legacy row lowering below. This is
+        // the same authority as typed_insert_batch::defaults::resolve; RETURNING deliberately
+        // defers there and lands here, so it must not regain a per-row scalar evaluator.
+        let scalar_defaults = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                if !default_requested[idx] {
+                    return Ok(None);
+                }
+                match column.default.as_ref() {
+                    Some(default) if !is_sequence(default) => {
+                        evaluate_scalar(default, column.ty, &column.name).map(Some)
+                    }
+                    Some(_) | None => Ok(None),
+                }
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        // Sequence advancement scratch: keeps `prepare_insert` pure (no `&mut self`) while
+        // evaluating `nextval` column defaults. Seeded lazily from the engine's sequence catalog,
+        // advanced per row in source order (matching the old in-line apply), then installed by
+        // `apply_delta`.
+        let mut seq_state: BTreeMap<String, (i64, bool)> = BTreeMap::new();
+        for mut values in pending_rows {
             for (idx, value) in values.iter_mut().enumerate() {
                 if value.is_none() {
-                    if let Some(default) = table.columns[idx].default.clone() {
-                        *value = Some(self.evaluate_column_default_pure(&default, &mut seq_state)?);
+                    if let Some(default) = table.columns[idx].default.as_ref() {
+                        *value = if is_sequence(default) {
+                            Some(self.evaluate_column_default_pure(
+                                default,
+                                table.columns[idx].ty,
+                                &table.columns[idx].name,
+                                &mut seq_state,
+                            )?)
+                        } else {
+                            scalar_defaults[idx].clone()
+                        };
                     }
                 }
             }
@@ -1288,11 +1341,9 @@ impl Engine {
         )))
     }
 
-    /// Evaluate row-local CHECK violations over a transient device relation. The predicate is the
-    /// exact logical complement of the stored CHECK comparison; SQL NULLs satisfy CHECK because
-    /// the device validity mask excludes them from both the comparison and its complement. The
-    /// compacted candidate coordinates are only marshaled into the device threshold primitive;
-    /// its one status bit is the constraint verdict.
+    /// Evaluate row-local CHECK violations over a transient device relation. The catalog-resolved
+    /// compiler emits the violation directly; SQL NULLs satisfy CHECK because every violation
+    /// expression is validity-masked. The terminal device mask produces the one-bit verdict.
     fn validate_check_constraints_on_device(
         &self,
         table: &RelationalTable,
@@ -1300,6 +1351,9 @@ impl Engine {
     ) -> Result<(), EngineError> {
         if new_images.is_empty() || table.check_constraints.is_empty() {
             return Ok(());
+        }
+        for constraint in &table.check_constraints {
+            crate::check_violation_expr::validate_check_literal_at_evaluation(constraint)?;
         }
         let (snapshot, memory) = self
             .build_transient_relation_residency(table, new_images)
@@ -1312,47 +1366,25 @@ impl Engine {
         for constraint in &table.check_constraints {
             let column = relational_column_index(table, &constraint.column)
                 .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
-            let predicate = dml_filter_groups_to_device_predicate(
-                table,
-                &[vec![(column, constraint.op, constraint.value.clone())]],
-            )
-            .ok_or_else(|| {
-                EngineError::ApplyFailed(format!(
-                    "device CHECK predicate unavailable for constraint \"{}\"",
-                    constraint.name
-                ))
-            })?;
-            let ResidentExpr::Binary { op, lhs, rhs } = predicate else {
-                return Err(EngineError::ApplyFailed(format!(
-                    "device CHECK predicate shape unavailable for constraint \"{}\"",
-                    constraint.name
-                )));
-            };
-            let violation_op = match op {
-                ResidentBinaryOp::Eq => ResidentBinaryOp::Ne,
-                ResidentBinaryOp::Lt => ResidentBinaryOp::Ge,
-                ResidentBinaryOp::Le => ResidentBinaryOp::Gt,
-                ResidentBinaryOp::Gt => ResidentBinaryOp::Le,
-                ResidentBinaryOp::Ge => ResidentBinaryOp::Lt,
-                _ => {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "device CHECK operator unavailable for constraint \"{}\"",
-                        constraint.name
-                    )))
-                }
-            };
-            let violation = ResidentExpr::Binary {
-                op: violation_op,
-                lhs,
-                rhs,
-            };
-            let candidates = self
-                .lower_resident_predicate(
-                    &violation,
+            let violation =
+                crate::check_violation_expr::compile_check_violation(table, constraint, column)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "device CHECK violation unavailable for constraint \"{}\"",
+                            constraint.name
+                        ))
+                    })?;
+            let mask = self
+                .resident_predicate_device_mask(
+                    Some(&violation),
                     table,
                     &snapshot,
                     &memory,
-                    new_images.len() as u64,
+                    u32::try_from(new_images.len()).map_err(|_| {
+                        EngineError::ApplyFailed(
+                            "device CHECK row count exceeds u32 mask capacity".to_string(),
+                        )
+                    })?,
                     None,
                 )
                 .map_err(|error| {
@@ -1361,17 +1393,18 @@ impl Engine {
                         constraint.name
                     ))
                 })?
-                .into_iter()
-                .map(u64::from)
-                .collect::<Vec<_>>();
-            let violated = memory
-                .unique_coordinate_threshold_reached(&candidates, &[], 1)
-                .map_err(|error| {
+                .ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
-                        "device CHECK verdict failed for constraint \"{}\": {error}",
+                        "device CHECK mask is unavailable for constraint \"{}\"",
                         constraint.name
                     ))
                 })?;
+            let violated = mask.any_true().map_err(|error| {
+                EngineError::ApplyFailed(format!(
+                    "device CHECK verdict failed for constraint \"{}\": {error}",
+                    constraint.name
+                ))
+            })?;
             if violated {
                 return Err(EngineError::CheckViolation(format!(
                     "new row for relation \"{}\" violates check constraint \"{}\"",
@@ -1464,9 +1497,9 @@ impl Engine {
                 }
             }
         }
-        // 2. CHECK: a transient device relation evaluates the complement predicate and the device
-        // threshold bit decides whether any non-NULL row violates it. Survivors passed at their own
-        // write; ADD CHECK validates existing rows at DDL time.
+        // 2. CHECK: a transient device relation evaluates the catalog-resolved violation mask and
+        // its terminal device bit decides whether any non-NULL row violates it. Survivors passed
+        // at their own write; ADD CHECK validates existing rows at DDL time.
         self.validate_check_constraints_on_device(table, new_images)?;
         // 3. OUTBOUND FK (this table is the child): each new image's FK value must have a visible
         //    provider. For a self-FK, another new image in this statement may provide it.

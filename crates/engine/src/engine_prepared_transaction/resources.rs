@@ -310,10 +310,13 @@ fn fixed_insert_row(
         ));
     }
     let mut row = vec![None; table.columns.len()];
-    for (value, position) in source.iter().cloned().zip(positions) {
+    for (cell, position) in source.iter().zip(positions) {
+        let Some(value) = cell.value() else {
+            return Ok(None);
+        };
         row[position] = Some(
             coerce_insert_value(
-                value,
+                value.clone(),
                 table.columns[position].ty,
                 &table.columns[position].name,
             )
@@ -326,7 +329,9 @@ fn fixed_insert_row(
         }
         *value = match &table.columns[position].default {
             Some(ColumnDefault::Literal(value)) => Some(value.clone()),
-            Some(ColumnDefault::SequenceNextVal { .. }) | None => return Ok(None),
+            Some(ColumnDefault::DeferredScalar { .. })
+            | Some(ColumnDefault::SequenceNextVal { .. })
+            | None => return Ok(None),
         };
     }
     Ok(Some(

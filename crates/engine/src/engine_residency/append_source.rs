@@ -6,7 +6,7 @@ use super::*;
 /// differs. Publication, device locks, indexes, sidecars, and descriptors remain in `mutation`.
 pub(super) enum ResidentAppendSource<'source, 'plan> {
     Rows(&'source [Vec<SqlValue>]),
-    FixedI32Plan(&'source mut super::fixed_insert::PreparedI32OpenShardAppendPlan<'plan>),
+    DevicePlan(&'source mut super::fixed_insert::ResidentOpenShardAppendPlan<'plan>),
 }
 
 pub(super) enum ResidentAppendI32Columns<'a> {
@@ -34,14 +34,14 @@ impl ResidentAppendSource<'_, '_> {
     pub(super) fn row_count(&self) -> usize {
         match self {
             Self::Rows(rows) => rows.len(),
-            Self::FixedI32Plan(plan) => plan.row_count(),
+            Self::DevicePlan(plan) => plan.row_count(),
         }
     }
 
     pub(super) fn rows(&self) -> Option<&[Vec<SqlValue>]> {
         match self {
             Self::Rows(rows) => Some(rows),
-            Self::FixedI32Plan(_) => None,
+            Self::DevicePlan(_) => None,
         }
     }
 
@@ -50,7 +50,17 @@ impl ResidentAppendSource<'_, '_> {
             Self::Rows(rows) => rows
                 .iter()
                 .any(|row| row.iter().any(|value| matches!(value, SqlValue::Null))),
-            Self::FixedI32Plan(_) => false,
+            Self::DevicePlan(plan) => plan.source().requires_dense_rollover(),
+        }
+    }
+
+    pub(super) fn requires_dense_rollover(&self) -> bool {
+        match self {
+            Self::Rows(rows) => rows.iter().any(|row| {
+                row.iter().any(|value| matches!(value, SqlValue::Null))
+                    || row.iter().any(|value| matches!(value, SqlValue::Text(_)))
+            }),
+            Self::DevicePlan(plan) => plan.source().requires_dense_rollover(),
         }
     }
 
@@ -62,7 +72,7 @@ impl ResidentAppendSource<'_, '_> {
     ) -> bool {
         match self {
             Self::Rows(_) => true,
-            Self::FixedI32Plan(plan) => plan.catalog_matches(table, catalog_seq),
+            Self::DevicePlan(plan) => plan.catalog_matches(table, catalog_seq),
         }
     }
 
@@ -76,7 +86,7 @@ impl ResidentAppendSource<'_, '_> {
     ) -> bool {
         match self {
             Self::Rows(_) => true,
-            Self::FixedI32Plan(plan) => plan.identity_matches(open, pressured),
+            Self::DevicePlan(plan) => plan.identity_matches(open, pressured),
         }
     }
 
@@ -85,7 +95,7 @@ impl ResidentAppendSource<'_, '_> {
     pub(super) fn holds_budget_reservation(&self) -> bool {
         match self {
             Self::Rows(_) => false,
-            Self::FixedI32Plan(plan) => plan.holds_budget_reservation(),
+            Self::DevicePlan(plan) => plan.holds_budget_reservation(),
         }
     }
 
@@ -99,13 +109,12 @@ impl ResidentAppendSource<'_, '_> {
             Self::Rows(rows) => {
                 compute_open_shard_int4_append_chunks(column_types, capacity, row_start, rows)
             }
-            Self::FixedI32Plan(plan) => {
+            Self::DevicePlan(plan) => {
                 let source = plan.source();
-                if column_types.len() != source.columns().len()
-                    || !column_types.iter().all(|ty| *ty == SqlType::Int4)
-                {
+                if column_types != source.column_types().as_slice() {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "sealed typed append no longer matches an int4 descriptor".to_string(),
+                        "sealed typed append no longer matches its fixed-width descriptor"
+                            .to_string(),
                     )));
                 }
                 plan.chunks_for_in_place(capacity, row_start)
@@ -130,23 +139,14 @@ impl ResidentAppendSource<'_, '_> {
                     })
                     .collect(),
             )),
-            Self::FixedI32Plan(plan) => {
+            Self::DevicePlan(plan) => {
                 let source = plan.source();
-                if source.columns().len() != column_count
-                    || source
-                        .columns()
-                        .iter()
-                        .any(|column| column.values().len() != source.row_count())
-                {
+                if source.columns().len() != column_count {
                     return None;
                 }
-                Some(ResidentAppendI32Columns::Fixed(
-                    source
-                        .columns()
-                        .iter()
-                        .map(|column| column.values())
-                        .collect(),
-                ))
+                source
+                    .i32_column_slices()
+                    .map(ResidentAppendI32Columns::Fixed)
             }
         }
     }
@@ -169,12 +169,8 @@ impl ResidentAppendSource<'_, '_> {
                     })
                     .collect(),
             ),
-            Self::FixedI32Plan(plan) => {
-                if !column_types.iter().all(|ty| *ty == SqlType::Int4) {
-                    return None;
-                }
-                Some(plan.int4_min_max().to_vec())
-            }
+            Self::DevicePlan(plan) => (column_types == plan.source().column_types().as_slice())
+                .then(|| plan.int4_min_max().to_vec()),
         }
     }
 }

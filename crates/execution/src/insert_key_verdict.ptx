@@ -1,0 +1,394 @@
+.version 6.0
+.target sm_30
+.address_size 64
+
+// Descriptor records are 32 bytes: [offset:u64, tag:u32, pad:u32, blob_offset:u64, blob_len:u64].
+// Tags: 0=text, 1/2/4=fixed 32-bit words, UINT_MAX=bool bitmap,
+// UINT_MAX-1=validity bitmap. The host validates every payload span; text endpoints are checked
+// again here before every byte dereference so a malformed resident payload fails closed.
+.visible .entry gpu_db_insert_batch_key_verdict(
+    .param .u64 base_ptr,
+    .param .u64 descriptors_ptr,
+    .param .u32 data_count,
+    .param .u32 descriptor_count,
+    .param .u32 row_count,
+    .param .u64 directory_ptr,
+    .param .u64 first_rows_ptr,
+    .param .u64 slot_count,
+    .param .u64 verdict_ptr,
+    .param .u32 mode
+)
+{
+    .reg .pred %p<32>;
+    .reg .b32 %r<80>;
+    .reg .b64 %rd<80>;
+
+    ld.param.u64 %rd1, [base_ptr];
+    ld.param.u64 %rd2, [descriptors_ptr];
+    ld.param.u32 %r1, [data_count];
+    ld.param.u32 %r2, [descriptor_count];
+    ld.param.u32 %r3, [row_count];
+    ld.param.u64 %rd3, [directory_ptr];
+    ld.param.u64 %rd4, [first_rows_ptr];
+    ld.param.u64 %rd5, [slot_count];
+    ld.param.u64 %rd6, [verdict_ptr];
+    ld.param.u32 %r4, [mode];
+
+    // Every row index, grid stride, descriptor address, and probe address stays u64. The API
+    // accepts the complete u32 row domain, so truncating grid-stride arithmetic could hang near
+    // u32::MAX even though the final stored row ordinal is u32.
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %nctaid.x;
+    mul.wide.u32 %rd7, %r6, %r7;
+    cvt.u64.u32 %rd8, %r5;
+    add.u64 %rd9, %rd7, %rd8;
+    mul.wide.u32 %rd10, %r8, %r7;
+    cvt.u64.u32 %rd11, %r3;
+    add.u64 %rd12, %rd6, 8;             // duplicate row terminal
+    add.u64 %rd13, %rd6, 12;            // status terminal
+    sub.u64 %rd14, %rd5, 1;             // power-of-two slot mask
+
+ROW_LOOP:
+    setp.ge.u64 %p1, %rd9, %rd11;
+    @%p1 bra DONE;
+
+    // NULLS DISTINCT: pack (row, validity ordinal) so one atomic minimum picks the first row
+    // and, within that row, the first validity suffix member. Any NULL skips the complete key.
+    mov.u32 %r9, %r1;
+VALIDITY_LOOP:
+    setp.ge.u32 %p2, %r9, %r2;
+    @%p2 bra VALIDITY_DONE;
+    mul.wide.u32 %rd15, %r9, 32;
+    add.u64 %rd16, %rd2, %rd15;
+    ld.global.u64 %rd17, [%rd16];
+    shr.u64 %rd18, %rd9, 3;
+    add.u64 %rd19, %rd1, %rd17;
+    add.u64 %rd19, %rd19, %rd18;
+    ld.global.u8 %r10, [%rd19];
+    cvt.u32.u64 %r11, %rd9;
+    and.b32 %r11, %r11, 7;
+    shr.u32 %r10, %r10, %r11;
+    and.b32 %r10, %r10, 1;
+    setp.ne.u32 %p3, %r10, 0;
+    @%p3 bra VALIDITY_NEXT;
+    sub.u32 %r12, %r9, %r1;
+    shl.b64 %rd20, %rd9, 32;
+    cvt.u64.u32 %rd21, %r12;
+    or.b64 %rd20, %rd20, %rd21;
+    // PTX's sm_30-safe CAS loop replaces a u64 atomic minimum: only a strictly earlier packed
+    // `(row, validity_ordinal)` claims the terminal, and a raced CAS retries with the observed
+    // value. The sentinel is u64::MAX; a valid suffix ordinal can never equal that sentinel.
+    ld.global.u64 %rd22, [%rd6];
+NULL_CAS_MIN_LOOP:
+    setp.le.u64 %p25, %rd22, %rd20;
+    @%p25 bra ROW_NEXT;
+    atom.global.cas.b64 %rd23, [%rd6], %rd22, %rd20;
+    setp.ne.u64 %p25, %rd23, %rd22;
+    @%p25 bra NULL_CAS_RETRY;
+    bra ROW_NEXT;
+NULL_CAS_RETRY:
+    mov.u64 %rd22, %rd23;
+    bra NULL_CAS_MIN_LOOP;
+VALIDITY_NEXT:
+    add.u32 %r9, %r9, 1;
+    bra VALIDITY_LOOP;
+
+VALIDITY_DONE:
+    // Canonical FNV/rotate fold, byte-for-byte compatible with the resident compound-fold ABI.
+    mov.u32 %r13, 2166136261;
+    mov.u32 %r14, 0;
+HASH_COLUMN_LOOP:
+    setp.ge.u32 %p4, %r14, %r1;
+    @%p4 bra HASH_DONE;
+    mul.wide.u32 %rd23, %r14, 32;
+    add.u64 %rd24, %rd2, %rd23;
+    ld.global.u64 %rd25, [%rd24];
+    ld.global.u32 %r15, [%rd24+8];
+    ld.global.u64 %rd26, [%rd24+16];
+    ld.global.u64 %rd27, [%rd24+24];
+    setp.eq.u32 %p5, %r15, 0;
+    @%p5 bra HASH_TEXT;
+    setp.eq.u32 %p5, %r15, 4294967295;
+    @%p5 bra HASH_BOOL;
+
+    // Fixed descriptors have one, two, or four 32-bit words. The host already rejected every
+    // other tag, so this loop cannot index a variable-width payload.
+    cvt.u64.u32 %rd28, %r15;
+    mul.lo.u64 %rd29, %rd9, %rd28;
+    mul.lo.u64 %rd29, %rd29, 4;
+    add.u64 %rd30, %rd1, %rd25;
+    add.u64 %rd30, %rd30, %rd29;
+    mov.u32 %r16, 0;
+HASH_FIXED_WORD_LOOP:
+    setp.ge.u32 %p6, %r16, %r15;
+    @%p6 bra HASH_COLUMN_NEXT;
+    mul.wide.u32 %rd31, %r16, 4;
+    add.u64 %rd32, %rd30, %rd31;
+    ld.global.u32 %r17, [%rd32];
+    xor.b32 %r13, %r13, %r17;
+    mul.lo.u32 %r13, %r13, 16777619;
+    shl.b32 %r18, %r13, 13;
+    shr.b32 %r19, %r13, 19;
+    or.b32 %r13, %r18, %r19;
+    add.u32 %r13, %r13, 2654435761;
+    add.u32 %r16, %r16, 1;
+    bra HASH_FIXED_WORD_LOOP;
+
+HASH_BOOL:
+    shr.u64 %rd28, %rd9, 3;
+    add.u64 %rd29, %rd1, %rd25;
+    add.u64 %rd29, %rd29, %rd28;
+    ld.global.u8 %r17, [%rd29];
+    cvt.u32.u64 %r18, %rd9;
+    and.b32 %r18, %r18, 7;
+    shr.u32 %r17, %r17, %r18;
+    and.b32 %r17, %r17, 1;
+    xor.b32 %r13, %r13, %r17;
+    mul.lo.u32 %r13, %r13, 16777619;
+    shl.b32 %r18, %r13, 13;
+    shr.b32 %r19, %r13, 19;
+    or.b32 %r13, %r18, %r19;
+    add.u32 %r13, %r13, 2654435761;
+    bra HASH_COLUMN_NEXT;
+
+HASH_TEXT:
+    mul.lo.u64 %rd28, %rd9, 8;
+    add.u64 %rd29, %rd1, %rd25;
+    add.u64 %rd30, %rd29, %rd28;
+    ld.global.u64 %rd31, [%rd30];       // start
+    ld.global.u64 %rd32, [%rd30+8];     // end
+    setp.gt.u64 %p7, %rd31, %rd32;
+    @%p7 bra BAD_CURRENT_TEXT;
+    setp.gt.u64 %p7, %rd32, %rd27;
+    @%p7 bra BAD_CURRENT_TEXT;
+    add.u64 %rd33, %rd1, %rd26;
+    mov.u32 %r20, 2166136261;
+    mov.u64 %rd34, %rd31;
+HASH_TEXT_BYTE_LOOP:
+    setp.ge.u64 %p8, %rd34, %rd32;
+    @%p8 bra HASH_TEXT_DONE;
+    add.u64 %rd35, %rd33, %rd34;
+    ld.global.u8 %r21, [%rd35];
+    xor.b32 %r20, %r20, %r21;
+    mul.lo.u32 %r20, %r20, 16777619;
+    add.u64 %rd34, %rd34, 1;
+    bra HASH_TEXT_BYTE_LOOP;
+HASH_TEXT_DONE:
+    xor.b32 %r13, %r13, %r20;
+    mul.lo.u32 %r13, %r13, 16777619;
+    shl.b32 %r18, %r13, 13;
+    shr.b32 %r19, %r13, 19;
+    or.b32 %r13, %r18, %r19;
+    add.u32 %r13, %r13, 2654435761;
+
+HASH_COLUMN_NEXT:
+    add.u32 %r14, %r14, 1;
+    bra HASH_COLUMN_LOOP;
+
+HASH_DONE:
+    // The directory word is (hash << 32) | (representative_row + 1); low zero remains EMPTY.
+    mul.wide.u32 %rd36, %r13, 2654435761;
+    and.b64 %rd37, %rd36, %rd14;
+    mov.u64 %rd38, 0;
+
+PROBE_LOOP:
+    mul.lo.u64 %rd39, %rd37, 8;
+    add.u64 %rd40, %rd3, %rd39;
+    ld.global.u64 %rd41, [%rd40];
+    setp.eq.u64 %p9, %rd41, 0;
+    @%p9 bra EMPTY_SLOT;
+    bra PRESENT_SLOT;
+
+EMPTY_SLOT:
+    setp.ne.u32 %p10, %r4, 0;
+    @%p10 bra MISSING_REPRESENTATIVE;
+    cvt.u64.u32 %rd42, %r13;
+    shl.b64 %rd42, %rd42, 32;
+    add.u64 %rd43, %rd9, 1;
+    or.b64 %rd42, %rd42, %rd43;
+    atom.global.cas.b64 %rd44, [%rd40], 0, %rd42;
+    setp.eq.u64 %p11, %rd44, 0;
+    @%p11 bra CLAIMED_SLOT;
+    mov.u64 %rd41, %rd44;
+    bra PRESENT_SLOT;
+
+CLAIMED_SLOT:
+    mul.lo.u64 %rd45, %rd37, 4;
+    add.u64 %rd46, %rd4, %rd45;
+    cvt.u32.u64 %r22, %rd9;
+    atom.global.min.u32 %r23, [%rd46], %r22;
+    bra ROW_NEXT;
+
+PRESENT_SLOT:
+    shr.u64 %rd47, %rd41, 32;
+    cvt.u32.u64 %r24, %rd47;
+    setp.ne.u32 %p12, %r24, %r13;
+    @%p12 bra PROBE_NEXT;
+    cvt.u32.u64 %r25, %rd41;
+    sub.u32 %r25, %r25, 1;              // immutable representative row
+    // A privately-constructed directory cannot encode an out-of-range representative, but do
+    // not trust it before fixed/bool/text dereferences. This is the malformed-representative
+    // status contract rather than an implicit host-side assumption.
+    setp.ge.u32 %p26, %r25, %r3;
+    @%p26 bra BAD_REPRESENTATIVE;
+    mov.u32 %r26, 0;
+
+EXACT_COLUMN_LOOP:
+    setp.ge.u32 %p13, %r26, %r1;
+    @%p13 bra EXACT_EQUAL;
+    mul.wide.u32 %rd48, %r26, 32;
+    add.u64 %rd49, %rd2, %rd48;
+    ld.global.u64 %rd50, [%rd49];
+    ld.global.u32 %r27, [%rd49+8];
+    ld.global.u64 %rd51, [%rd49+16];
+    ld.global.u64 %rd52, [%rd49+24];
+    setp.eq.u32 %p14, %r27, 0;
+    @%p14 bra EXACT_TEXT;
+    setp.eq.u32 %p14, %r27, 4294967295;
+    @%p14 bra EXACT_BOOL;
+
+    cvt.u64.u32 %rd53, %r27;
+    mul.lo.u64 %rd54, %rd9, %rd53;
+    mul.lo.u64 %rd54, %rd54, 4;
+    add.u64 %rd55, %rd1, %rd50;
+    add.u64 %rd55, %rd55, %rd54;
+    cvt.u64.u32 %rd56, %r25;
+    mul.lo.u64 %rd56, %rd56, %rd53;
+    mul.lo.u64 %rd56, %rd56, 4;
+    add.u64 %rd57, %rd1, %rd50;
+    add.u64 %rd57, %rd57, %rd56;
+    mov.u32 %r28, 0;
+EXACT_FIXED_WORD_LOOP:
+    setp.ge.u32 %p15, %r28, %r27;
+    @%p15 bra EXACT_COLUMN_NEXT;
+    mul.wide.u32 %rd58, %r28, 4;
+    add.u64 %rd59, %rd55, %rd58;
+    add.u64 %rd60, %rd57, %rd58;
+    ld.global.u32 %r29, [%rd59];
+    ld.global.u32 %r30, [%rd60];
+    setp.ne.u32 %p16, %r29, %r30;
+    @%p16 bra NOT_EQUAL;
+    add.u32 %r28, %r28, 1;
+    bra EXACT_FIXED_WORD_LOOP;
+
+EXACT_BOOL:
+    shr.u64 %rd53, %rd9, 3;
+    add.u64 %rd54, %rd1, %rd50;
+    add.u64 %rd54, %rd54, %rd53;
+    ld.global.u8 %r29, [%rd54];
+    cvt.u32.u64 %r30, %rd9;
+    and.b32 %r30, %r30, 7;
+    shr.u32 %r29, %r29, %r30;
+    and.b32 %r29, %r29, 1;
+    cvt.u64.u32 %rd55, %r25;
+    shr.u64 %rd55, %rd55, 3;
+    add.u64 %rd56, %rd1, %rd50;
+    add.u64 %rd56, %rd56, %rd55;
+    ld.global.u8 %r31, [%rd56];
+    mov.u32 %r32, %r25;
+    and.b32 %r32, %r32, 7;
+    shr.u32 %r31, %r31, %r32;
+    and.b32 %r31, %r31, 1;
+    setp.ne.u32 %p16, %r29, %r31;
+    @%p16 bra NOT_EQUAL;
+    bra EXACT_COLUMN_NEXT;
+
+EXACT_TEXT:
+    mul.lo.u64 %rd53, %rd9, 8;
+    add.u64 %rd54, %rd1, %rd50;
+    add.u64 %rd55, %rd54, %rd53;
+    ld.global.u64 %rd56, [%rd55];
+    ld.global.u64 %rd57, [%rd55+8];
+    setp.gt.u64 %p17, %rd56, %rd57;
+    @%p17 bra BAD_CURRENT_TEXT;
+    setp.gt.u64 %p17, %rd57, %rd52;
+    @%p17 bra BAD_CURRENT_TEXT;
+    cvt.u64.u32 %rd58, %r25;
+    mul.lo.u64 %rd58, %rd58, 8;
+    add.u64 %rd59, %rd54, %rd58;
+    ld.global.u64 %rd60, [%rd59];
+    ld.global.u64 %rd61, [%rd59+8];
+    setp.gt.u64 %p18, %rd60, %rd61;
+    @%p18 bra BAD_REPRESENTATIVE;
+    setp.gt.u64 %p18, %rd61, %rd52;
+    @%p18 bra BAD_REPRESENTATIVE;
+    sub.u64 %rd62, %rd57, %rd56;
+    sub.u64 %rd63, %rd61, %rd60;
+    setp.ne.u64 %p19, %rd62, %rd63;
+    @%p19 bra NOT_EQUAL;
+    add.u64 %rd64, %rd1, %rd51;
+    mov.u64 %rd65, 0;
+EXACT_TEXT_BYTE_LOOP:
+    setp.ge.u64 %p20, %rd65, %rd62;
+    @%p20 bra EXACT_COLUMN_NEXT;
+    add.u64 %rd66, %rd64, %rd56;
+    add.u64 %rd66, %rd66, %rd65;
+    add.u64 %rd67, %rd64, %rd60;
+    add.u64 %rd67, %rd67, %rd65;
+    ld.global.u8 %r33, [%rd66];
+    ld.global.u8 %r34, [%rd67];
+    setp.ne.u32 %p21, %r33, %r34;
+    @%p21 bra NOT_EQUAL;
+    add.u64 %rd65, %rd65, 1;
+    bra EXACT_TEXT_BYTE_LOOP;
+
+EXACT_COLUMN_NEXT:
+    add.u32 %r26, %r26, 1;
+    bra EXACT_COLUMN_LOOP;
+
+EXACT_EQUAL:
+    setp.eq.u32 %p22, %r4, 0;
+    @%p22 bra BUILD_EQUAL;
+    mul.lo.u64 %rd68, %rd37, 4;
+    add.u64 %rd69, %rd4, %rd68;
+    ld.global.u32 %r35, [%rd69];
+    cvt.u32.u64 %r36, %rd9;
+    setp.le.u32 %p23, %r36, %r35;
+    @%p23 bra ROW_NEXT;
+    atom.global.min.u32 %r37, [%rd12], %r36;
+    bra ROW_NEXT;
+
+BUILD_EQUAL:
+    mul.lo.u64 %rd68, %rd37, 4;
+    add.u64 %rd69, %rd4, %rd68;
+    cvt.u32.u64 %r36, %rd9;
+    atom.global.min.u32 %r37, [%rd69], %r36;
+    bra ROW_NEXT;
+
+NOT_EQUAL:
+PROBE_NEXT:
+    add.u64 %rd37, %rd37, 1;
+    and.b64 %rd37, %rd37, %rd14;
+    add.u64 %rd38, %rd38, 1;
+    setp.lt.u64 %p24, %rd38, %rd5;
+    @%p24 bra PROBE_LOOP;
+    bra PROBE_EXHAUSTED;
+
+MISSING_REPRESENTATIVE:
+    mov.u32 %r38, 2;
+    atom.global.or.b32 %r39, [%rd13], %r38;
+    bra ROW_NEXT;
+
+BAD_CURRENT_TEXT:
+    mov.u32 %r38, 1;
+    atom.global.or.b32 %r39, [%rd13], %r38;
+    bra ROW_NEXT;
+
+BAD_REPRESENTATIVE:
+    mov.u32 %r38, 2;
+    atom.global.or.b32 %r39, [%rd13], %r38;
+    bra ROW_NEXT;
+
+PROBE_EXHAUSTED:
+    mov.u32 %r38, 4;
+    atom.global.or.b32 %r39, [%rd13], %r38;
+
+ROW_NEXT:
+    add.u64 %rd9, %rd9, %rd10;
+    bra ROW_LOOP;
+
+DONE:
+    ret;
+}

@@ -176,6 +176,201 @@ impl CudaPredicateMaskI32 {
         self.mask.capacity as u64
     }
 
+    /// Reduce a device-resident SQL-3VL mask to one host-visible flag.  The host reads exactly the
+    /// device-computed terminal word; it never receives row coordinates or mask values.  A TRUE
+    /// bit means a row matched, while FALSE and UNKNOWN remain zero by the predicate VM contract.
+    pub fn any_true(&self) -> Result<bool, CudaRuntimeProbeError> {
+        const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_predicate_mask_any_true(
+    .param .u64 mask, .param .u32 rows, .param .u64 verdict)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [mask];
+    ld.param.u32 %r1, [rows];
+    ld.param.u64 %rd2, [verdict];
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %nctaid.x;
+    mul.wide.u32 %rd3, %r3, %r4;
+    cvt.u64.u32 %rd0, %r2;
+    add.u64 %rd3, %rd3, %rd0;
+    mul.wide.u32 %rd4, %r5, %r4;
+    cvt.u64.u32 %rd5, %r1;
+LOOP:
+    setp.ge.u64 %p1, %rd3, %rd5;
+    @%p1 bra DONE;
+    mul.lo.u64 %rd6, %rd3, 4;
+    add.u64 %rd7, %rd1, %rd6;
+    ld.global.u32 %r6, [%rd7];
+    setp.eq.u32 %p2, %r6, 0;
+    @%p2 bra NEXT;
+    atom.global.or.b32 %r7, [%rd2], 1;
+NEXT:
+    add.u64 %rd3, %rd3, %rd4;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+        Ok(self.reduce_mask_terminal_u32(PTX, c"gpu_db_predicate_mask_any_true", 0)? != 0)
+    }
+
+    /// Return the lowest device row ordinal whose SQL-3VL mask value is TRUE.
+    ///
+    /// The GPU reduces all matching rows through `atomicMin`; the only host readback is one u32
+    /// terminal word.  `None` means no TRUE row, while FALSE and UNKNOWN remain zero under the
+    /// predicate VM's mask contract.  This is deliberately not a coordinate materialization API.
+    pub fn first_true_row(&self) -> Result<Option<u32>, CudaRuntimeProbeError> {
+        const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_predicate_mask_first_true_row(
+    .param .u64 mask, .param .u32 rows, .param .u64 verdict)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [mask];
+    ld.param.u32 %r1, [rows];
+    ld.param.u64 %rd2, [verdict];
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %nctaid.x;
+    mul.wide.u32 %rd3, %r3, %r4;
+    cvt.u64.u32 %rd0, %r2;
+    add.u64 %rd3, %rd3, %rd0;
+    mul.wide.u32 %rd4, %r5, %r4;
+    cvt.u64.u32 %rd5, %r1;
+LOOP:
+    setp.ge.u64 %p1, %rd3, %rd5;
+    @%p1 bra DONE;
+    mul.lo.u64 %rd6, %rd3, 4;
+    add.u64 %rd7, %rd1, %rd6;
+    ld.global.u32 %r6, [%rd7];
+    setp.eq.u32 %p2, %r6, 0;
+    @%p2 bra NEXT;
+    cvt.u32.u64 %r8, %rd3;
+    atom.global.min.u32 %r9, [%rd2], %r8;
+NEXT:
+    add.u64 %rd3, %rd3, %rd4;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+        let row =
+            self.reduce_mask_terminal_u32(PTX, c"gpu_db_predicate_mask_first_true_row", u32::MAX)?;
+        Ok((row != u32::MAX).then_some(row))
+    }
+
+    /// Launch a one-word device terminal and synchronously copy that one u32 verdict back.
+    fn reduce_mask_terminal_u32(
+        &self,
+        ptx: &[u8],
+        entry: &'static std::ffi::CStr,
+        initial: u32,
+    ) -> Result<u32, CudaRuntimeProbeError> {
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+        let required = usize::try_from(self.row_count)
+            .ok()
+            .and_then(|rows| rows.checked_mul(std::mem::size_of::<i32>()))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if self.mask.capacity < required.max(1) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(required));
+        }
+        if self.row_count == 0 {
+            return Ok(initial);
+        }
+        let primary = &self.mask.primary;
+        primary.set_current()?;
+        let verdict = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
+        let fill = match initial {
+            0 => 0,
+            u32::MAX => u8::MAX,
+            _ => return Err(CudaRuntimeProbeError::InvalidInputLength(initial as usize)),
+        };
+        let memset = unsafe {
+            primary
+                .lib()
+                .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        check_cuda(unsafe { memset(verdict.ptr, fill, std::mem::size_of::<u32>()) })?;
+        let launch = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let mut ptx = ptx.to_vec();
+        ptx.push(0);
+        let function = primary.cached_function(entry, &ptx)?;
+        let mut a0 = self.mask.ptr;
+        let mut a1 = self.row_count;
+        let mut a2 = verdict.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast(),
+            (&mut a1 as *mut u32).cast(),
+            (&mut a2 as *mut u64).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(
+                function,
+                self.row_count.div_ceil(256).clamp(1, 65_535),
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        let dtoh = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let mut host_verdict = 0_u32;
+        // Synchronous DtoH on the null stream is the terminal synchronization boundary: a CUDA
+        // launch or execution fault is returned before callers can construct a semantic proof.
+        check_cuda(unsafe {
+            dtoh(
+                std::ptr::from_mut(&mut host_verdict).cast(),
+                verdict.ptr,
+                std::mem::size_of::<u32>(),
+            )
+        })?;
+        Ok(host_verdict)
+    }
+
     pub(super) fn device_ptr(&self) -> u64 {
         self.mask.ptr
     }

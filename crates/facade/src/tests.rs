@@ -2,6 +2,9 @@ use super::*;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
+#[path = "tests/temporal_sqlstate.rs"]
+mod temporal_sqlstate;
+
 #[derive(Clone, Copy)]
 struct HarnessSessionId(u64);
 
@@ -1177,6 +1180,146 @@ fn general_insert_binding_failures_preserve_postgres_sqlstates_and_pre_effect_at
 }
 
 #[test]
+fn check_literal_resolution_preserves_postgres_sqlstates_and_ddl_atomicity() {
+    let shared = SharedEngine::new();
+    // These failures originate while parsing an explicit scalar cast; they must retain their
+    // typed SQLSTATE family through the direct façade path rather than becoming 42601.
+    for (sql, category) in [
+        (
+            "CREATE TABLE explicit_bad_date (d date, CHECK (d > 'not-a-date'::date))",
+            ErrorCategory::InvalidDatetimeFormat,
+        ),
+        (
+            "CREATE TABLE explicit_bad_bool (b bool, CHECK (b = 'not-a-bool'::bool))",
+            ErrorCategory::InvalidTextRepresentation,
+        ),
+        (
+            "CREATE TABLE explicit_bad_timestamp (t timestamp, CHECK (t > 'not-a-timestamp'::timestamp))",
+            ErrorCategory::InvalidDatetimeFormat,
+        ),
+        (
+            "CREATE TABLE explicit_bad_uuid (u uuid, CHECK (u = 'not-a-uuid'::uuid))",
+            ErrorCategory::InvalidTextRepresentation,
+        ),
+        (
+            "CREATE TABLE explicit_bad_numeric (n numeric, CHECK (n > 'not-a-number'::numeric))",
+            ErrorCategory::InvalidTextRepresentation,
+        ),
+        (
+            "ALTER TABLE explicit_missing ADD CONSTRAINT explicit_bad_int CHECK (i > 'x'::int2)",
+            ErrorCategory::InvalidTextRepresentation,
+        ),
+        (
+            "ALTER TABLE explicit_missing ADD CONSTRAINT explicit_range CHECK (i > '32768'::int2)",
+            ErrorCategory::NumericValueOutOfRange,
+        ),
+    ] {
+        let error = submit_ephemeral_text(&shared, sql).expect_err("explicit cast must fail");
+        assert_eq!(error.category, category, "{sql}: {error:?}");
+    }
+    for (sql, expected_sqlstate) in [
+        (
+            "CREATE TABLE bad_check_date (d date, CHECK (d > 'not-a-date'))",
+            "22007",
+        ),
+        (
+            "CREATE TABLE bad_check_bool (b bool, CHECK (b = 'not-a-bool'))",
+            "22P02",
+        ),
+        (
+            "CREATE TABLE bad_check_uuid (u uuid, CHECK (u = 'not-a-uuid'))",
+            "22P02",
+        ),
+        (
+            "CREATE TABLE bad_check_operator \
+             (s smallint, CHECK (s > '32768'::text))",
+            "42883",
+        ),
+        (
+            "CREATE TABLE bad_check_smallint \
+             (s smallint, CHECK (s > '32768'))",
+            "22003",
+        ),
+    ] {
+        let error = submit_ephemeral_text(&shared, sql).expect_err("CHECK DDL must fail");
+        assert_eq!(
+            pg_adapter::error_sqlstate(error.category),
+            expected_sqlstate,
+            "{sql}: {error:?}"
+        );
+    }
+
+    submit_ephemeral_text(
+        &shared,
+        "CREATE TABLE check_error_reuse (id int4, CHECK (id > 0))",
+    )
+    .expect("failed CHECK DDL must leave catalog/WAL allocation reusable");
+
+    submit_ephemeral_text(
+        &shared,
+        "CREATE TABLE explicit_cast_atomic (id int4, CHECK (id > 'bad'::int4))",
+    )
+    .expect_err("malformed CREATE CHECK cast must not publish DDL");
+    submit_ephemeral_text(
+        &shared,
+        "CREATE TABLE explicit_cast_atomic (id int4, CHECK (id > 0))",
+    )
+    .expect("failed CREATE leaves its relation name reusable");
+
+    submit_ephemeral_text(&shared, "CREATE TABLE explicit_alter_atomic (id int4)").unwrap();
+    submit_ephemeral_text(
+        &shared,
+        "ALTER TABLE explicit_alter_atomic ADD CONSTRAINT explicit_alter_check CHECK (id > 'bad'::int4)",
+    )
+    .expect_err("malformed ALTER CHECK cast must not publish its constraint");
+    submit_ephemeral_text(
+        &shared,
+        "ALTER TABLE explicit_alter_atomic ADD CONSTRAINT explicit_alter_check CHECK (id > 0)",
+    )
+    .expect("failed ALTER leaves its constraint name reusable");
+}
+
+#[test]
+fn deferred_numeric_check_casts_raise_range_on_evaluation_and_keep_alter_atomic() {
+    let shared = SharedEngine::new();
+    submit_ephemeral_text(
+        &shared,
+        "CREATE TABLE numeric_create_deferred (n numeric(8,2), CHECK (n > 999.5::numeric(3,0)))",
+    )
+    .expect("well-formed numeric cast is publishable at CREATE time");
+
+    let error = submit_ephemeral_text(&shared, "INSERT INTO numeric_create_deferred VALUES (NULL)")
+        .expect_err(
+            "CHECK constant numeric typmod overflow is evaluated before NULL row semantics",
+        );
+    assert_eq!(error.category, ErrorCategory::NumericValueOutOfRange);
+    assert_eq!(pg_adapter::error_sqlstate(error.category), "22003");
+    let QueryOutcome::Rows { rows, .. } =
+        submit_ephemeral_text(&shared, "SELECT COUNT(*) FROM numeric_create_deferred").unwrap()
+    else {
+        panic!("COUNT must return rows");
+    };
+    assert_eq!(rows, vec![vec![DbValue::Int8(0)]]);
+
+    submit_ephemeral_text(
+        &shared,
+        "CREATE TABLE numeric_alter_deferred (n numeric(8,2))",
+    )
+    .unwrap();
+    let error = submit_ephemeral_text(
+        &shared,
+        "ALTER TABLE numeric_alter_deferred ADD CONSTRAINT numeric_delayed CHECK (n > 1000::numeric(3,0))",
+    )
+    .expect_err("ALTER evaluates overflowing CHECK constants even on an empty table");
+    assert_eq!(error.category, ErrorCategory::NumericValueOutOfRange);
+    submit_ephemeral_text(
+        &shared,
+        "ALTER TABLE numeric_alter_deferred ADD CONSTRAINT numeric_delayed CHECK (n > 0)",
+    )
+    .expect("failed ALTER must not publish the rejected constraint");
+}
+
+#[test]
 fn select_from_unknown_table_returns_neutral_error() {
     let mut facade = MultiSessionHarness::new();
     let session = facade.open_session();
@@ -1267,6 +1410,49 @@ fn relational_parse_failures_use_the_stable_client_diagnostic() {
         error.message,
         "query shape is not supported by the compatibility stub"
     );
+}
+
+#[test]
+fn typed_parse_errors_keep_categories_through_direct_and_execute_error_facades() {
+    for (direct, execute, expected) in [
+        (
+            ParseError::InvalidDatetimeFormat {
+                input: "bad-date".to_string(),
+            },
+            ParseError::InvalidDatetimeFormat {
+                input: "bad-date".to_string(),
+            },
+            ErrorCategory::InvalidDatetimeFormat,
+        ),
+        (
+            ParseError::InvalidTextRepresentation {
+                ty: "boolean",
+                input: "bad-bool".to_string(),
+            },
+            ParseError::InvalidTextRepresentation {
+                ty: "boolean",
+                input: "bad-bool".to_string(),
+            },
+            ErrorCategory::InvalidTextRepresentation,
+        ),
+        (
+            ParseError::NumericValueOutOfRange {
+                ty: "integer",
+                input: "2147483648".to_string(),
+            },
+            ParseError::NumericValueOutOfRange {
+                ty: "integer",
+                input: "2147483648".to_string(),
+            },
+            ErrorCategory::NumericValueOutOfRange,
+        ),
+    ] {
+        assert_eq!(map_parse_error(direct).category, expected);
+        assert_eq!(
+            map_execute_error(ExecuteError::Parse(execute)).category,
+            expected
+        );
+    }
 }
 
 #[test]
@@ -1895,6 +2081,46 @@ fn ordinary_sequence_defaults_materialize_before_failure_and_user_rollback() {
         ),
         vec![vec![DbValue::Int4(4), DbValue::Int4(11), DbValue::Int4(0)]]
     );
+}
+
+#[test]
+fn explicit_sequence_default_has_the_ordinary_insert_completion_tag() {
+    let mut facade = MultiSessionHarness::new();
+    let session = facade.open_session();
+    facade
+        .execute(session, "CREATE SEQUENCE explicit_default_tag_value")
+        .unwrap();
+    facade
+        .execute(
+            session,
+            "CREATE TABLE explicit_default_tag_rows \
+             (id INT DEFAULT nextval('explicit_default_tag_value'::regclass), note INT)",
+        )
+        .unwrap();
+
+    let omitted = facade
+        .execute(
+            session,
+            "INSERT INTO explicit_default_tag_rows (note) VALUES (1)",
+        )
+        .unwrap();
+    let explicit = facade
+        .execute(
+            session,
+            "INSERT INTO explicit_default_tag_rows (id, note) VALUES (DEFAULT, 2)",
+        )
+        .unwrap();
+    assert_eq!(
+        explicit,
+        QueryOutcome::Command {
+            tag: CommandTag::Insert,
+            rows_affected: Some(1),
+        }
+    );
+    let omitted_tag = pg_adapter::command_complete_tag(&omitted);
+    let explicit_tag = pg_adapter::command_complete_tag(&explicit);
+    assert_eq!(omitted_tag.as_bytes(), explicit_tag.as_bytes());
+    assert_eq!(explicit_tag, "INSERT 0 1");
 }
 
 #[test]

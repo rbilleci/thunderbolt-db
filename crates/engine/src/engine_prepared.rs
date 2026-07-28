@@ -379,8 +379,10 @@ fn infer_insert_parameters(
                 "INSERT row has a different column count than its target list".to_string(),
             )));
         }
-        for (value, column) in row.iter().zip(&columns) {
-            infer_value(value, column.ty, parameter_types)?;
+        for (cell, column) in row.iter().zip(&columns) {
+            if let Some(value) = cell.value() {
+                infer_value(value, column.ty, parameter_types)?;
+            }
         }
     }
     Ok(())

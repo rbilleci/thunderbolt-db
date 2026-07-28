@@ -32,9 +32,7 @@ impl Engine {
             Some(_) => Err(EngineError::ApplyFailed(format!(
                 "relation \"{name}\" is not a sequence"
             ))),
-            None => Err(EngineError::ApplyFailed(format!(
-                "sequence \"{name}\" does not exist"
-            ))),
+            None => Err(EngineError::UndefinedRelation(name.to_string())),
         }
     }
 
@@ -43,20 +41,18 @@ impl Engine {
         name: &str,
     ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
-        if cat.relational_catalog.contains_key(name)
-            || cat.relational_views.contains_key(name)
-            || cat.relational_materialized_views.contains_key(name)
-        {
+        // Historical WAL can carry an acknowledged sequence/index name collision.  Legacy
+        // replay preserves that sequence binding; current `pg_class` resolution intentionally
+        // fails the same ambiguous name closed after the index-identity epoch.
+        if cat.relational_sequences.contains_key(name) {
+            return Ok(());
+        }
+        if cat.pg_class_relation_kind(name)?.is_some() {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{name}\" is not a sequence"
             )));
         }
-        if !cat.relational_sequences.contains_key(name) {
-            return Err(EngineError::ApplyFailed(format!(
-                "sequence \"{name}\" does not exist"
-            )));
-        }
-        Ok(())
+        Err(EngineError::UndefinedRelation(name.to_string()))
     }
 
     pub(crate) fn preflight_table_acl_target(&self, table: &str) -> Result<(), EngineError> {

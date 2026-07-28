@@ -1492,11 +1492,25 @@ fn table_reset_request_digest(
 pub(crate) fn table_schema_digest(
     table: &RelationalTable,
 ) -> Result<gpu_db_wal::CanonicalDigest, ExecuteError> {
-    // This is a durable v1 encoding, not a derived serializer. Field and variant tags stay
-    // explicit so adding a Rust field or changing serde representation cannot silently make an
-    // already-acknowledged reset unreplayable after an upgrade.
+    // This is a durable, versioned encoding, not a derived serializer. Historical CHECKs retain
+    // v1 identity until a newly parsed CHECK upgrades the table; v2 adds every concrete
+    // input/cast type, which affects delayed numeric-cast evaluation.
     let mut body = Vec::new();
-    body.extend_from_slice(b"GPUDBTABLESCHEMA1");
+    let has_resolved_check_input_type = table
+        .check_constraints
+        .iter()
+        .any(|constraint| constraint.identity_version == CheckOperandIdentityVersion::ResolvedV2);
+    let has_deferred_scalar_default = table
+        .columns
+        .iter()
+        .any(|column| matches!(column.default, Some(ColumnDefault::DeferredScalar { .. })));
+    body.extend_from_slice(if has_deferred_scalar_default {
+        b"GPUDBTABLESCHEMA3"
+    } else if has_resolved_check_input_type {
+        b"GPUDBTABLESCHEMA2"
+    } else {
+        b"GPUDBTABLESCHEMA1"
+    });
     digest_push_string(&mut body, &table.schema)?;
     digest_push_string(&mut body, &table.name)?;
     body.extend_from_slice(&table.oid.to_le_bytes());
@@ -1518,6 +1532,22 @@ pub(crate) fn table_schema_digest(
             Some(ColumnDefault::Literal(value)) => {
                 body.push(1);
                 digest_push_value(&mut body, value)?;
+            }
+            Some(ColumnDefault::DeferredScalar { value, input }) => {
+                body.push(3);
+                digest_push_value(&mut body, value)?;
+                match input {
+                    DefaultInputType::Unknown => body.push(0),
+                    DefaultInputType::TargetTyped => body.push(1),
+                    DefaultInputType::Inferred(ty) => {
+                        body.push(2);
+                        digest_push_sql_type(&mut body, *ty);
+                    }
+                    DefaultInputType::Explicit(ty) => {
+                        body.push(3);
+                        digest_push_sql_type(&mut body, *ty);
+                    }
+                }
             }
             Some(ColumnDefault::SequenceNextVal {
                 sequence,
@@ -1560,6 +1590,9 @@ pub(crate) fn table_schema_digest(
             SelectFilterOp::LikePrefix => 5,
         });
         digest_push_value(&mut body, &constraint.value)?;
+        if has_resolved_check_input_type {
+            digest_push_sql_type(&mut body, constraint.resolved_input_type);
+        }
     }
     digest_push_count(&mut body, table.foreign_keys.len())?;
     for foreign_key in &table.foreign_keys {
@@ -1582,6 +1615,19 @@ pub(crate) fn table_schema_digest(
         }
     }
     Ok(gpu_db_wal::canonical_request_digest(&body))
+}
+
+#[cfg(test)]
+pub(crate) fn table_schema_digest_version(table: &RelationalTable) -> u8 {
+    if table
+        .check_constraints
+        .iter()
+        .any(|constraint| constraint.identity_version == CheckOperandIdentityVersion::ResolvedV2)
+    {
+        2
+    } else {
+        1
+    }
 }
 
 fn digest_push_count(body: &mut Vec<u8>, count: usize) -> Result<(), ExecuteError> {

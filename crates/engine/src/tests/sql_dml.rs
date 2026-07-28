@@ -734,7 +734,10 @@ fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
     assert_eq!(table.columns[1].default, None);
     assert_eq!(
         table.columns[2].default,
-        Some(ColumnDefault::Literal(SqlValue::Int4(7)))
+        Some(ColumnDefault::DeferredScalar {
+            value: SqlValue::Int4(7),
+            input: DefaultInputType::Inferred(SqlType::Int4),
+        })
     );
     let recovered_result = recovered.execute_relational_select(&select).unwrap();
     assert_eq!(recovered_result.rows, result.rows);
@@ -804,7 +807,10 @@ fn relational_add_column_default_rewrites_rows_and_replays() {
     assert_eq!(table.columns[2].attnum, 3);
     assert_eq!(
         table.columns[2].default,
-        Some(ColumnDefault::Literal(SqlValue::Int4(7)))
+        Some(ColumnDefault::DeferredScalar {
+            value: SqlValue::Int4(7),
+            input: DefaultInputType::Inferred(SqlType::Int4),
+        })
     );
     let recovered_result = recovered.execute_relational_select(&select).unwrap();
     assert_eq!(recovered_result.rows, result.rows);
@@ -815,7 +821,10 @@ fn relational_add_column_default_rewrites_rows_and_replays() {
             "ALTER TABLE public.default_people ADD COLUMN bucket INT DEFAULT 9",
         )
         .unwrap_err();
-    assert!(duplicate.to_string().contains("already exists"));
+    assert!(matches!(
+        duplicate,
+        ExecuteError::Engine(EngineError::DuplicateColumn(ref name)) if name == "bucket"
+    ));
     let no_default = Engine::new_local_test_engine();
     no_default
         .execute_text(1, "CREATE TABLE default_people (id INT)")
@@ -942,9 +951,10 @@ fn relational_add_column_sequence_default_rewrites_rows_and_replays() {
                 "ALTER TABLE default_people ADD COLUMN missing_bucket INT DEFAULT nextval('missing_bucket_seq'::regclass)",
             )
             .unwrap_err();
-    assert!(missing
-        .to_string()
-        .contains("sequence \"missing_bucket_seq\" does not exist"));
+    assert!(matches!(
+        missing,
+        ExecuteError::Engine(EngineError::UndefinedRelation(ref name)) if name == "missing_bucket_seq"
+    ));
     assert!(e
         .relational_catalog_table("default_people")
         .unwrap()
@@ -2228,9 +2238,10 @@ fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
                 "CREATE TABLE missing_default (id INT DEFAULT nextval('missing_seq'::regclass), name TEXT)",
             )
             .unwrap_err();
-    assert!(missing
-        .to_string()
-        .contains("sequence \"missing_seq\" does not exist"));
+    assert!(matches!(
+        missing,
+        ExecuteError::Engine(EngineError::UndefinedRelation(ref name)) if name == "missing_seq"
+    ));
     assert!(e.relational_catalog_table("missing_default").is_none());
 
     let table_target = e
@@ -2249,9 +2260,10 @@ fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
                 "ALTER TABLE manual_people ALTER COLUMN id SET DEFAULT nextval('still_missing_seq'::regclass)",
             )
             .unwrap_err();
-    assert!(missing_alter
-        .to_string()
-        .contains("sequence \"still_missing_seq\" does not exist"));
+    assert!(matches!(
+        missing_alter,
+        ExecuteError::Engine(EngineError::UndefinedRelation(ref name)) if name == "still_missing_seq"
+    ));
 }
 
 #[test]

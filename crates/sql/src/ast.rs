@@ -293,6 +293,13 @@ pub struct AddUniqueConstraint {
 pub struct CheckConstraint {
     pub name: Option<String>,
     pub filter: SelectFilter,
+    /// CHECK-only input typing. Older AST/WAL payloads omit this field and deliberately retain
+    /// `LegacyAmbiguous` rather than being guessed as a new SQL spelling.
+    #[serde(
+        default,
+        skip_serializing_if = "CheckLiteralProvenance::is_legacy_ambiguous"
+    )]
+    pub literal_provenance: CheckLiteralProvenance,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -300,6 +307,34 @@ pub struct AddCheckConstraint {
     pub table: String,
     pub name: String,
     pub filter: SelectFilter,
+    /// See [`CheckConstraint::literal_provenance`].
+    #[serde(
+        default,
+        skip_serializing_if = "CheckLiteralProvenance::is_legacy_ambiguous"
+    )]
+    pub literal_provenance: CheckLiteralProvenance,
+}
+
+/// The SQL input type of a CHECK predicate literal. This intentionally lives alongside CHECK
+/// nodes instead of widening generic SELECT filters: uncast quoted literals and `NULL` are SQL
+/// `unknown` only at the comparison site, while a `SqlValue::Text` alone cannot distinguish that
+/// spelling from explicit `::text`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckLiteralProvenance {
+    /// Historical AST/WAL omitted provenance. Replay applies a narrowly documented compatibility
+    /// rule, never treating it as evidence that the original spelling was uncast/unknown.
+    #[default]
+    LegacyAmbiguous,
+    /// An uncast quoted literal or uncast NULL, bound at the CHECK comparison target.
+    Unknown,
+    /// An inferred non-text scalar or explicit `::type` cast.
+    Known(SqlType),
+}
+
+impl CheckLiteralProvenance {
+    pub const fn is_legacy_ambiguous(&self) -> bool {
+        matches!(self, Self::LegacyAmbiguous)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -638,6 +673,17 @@ pub struct DropExtension {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ColumnDefault {
+    /// A scalar SQL DEFAULT whose input type is retained until assignment evaluation.
+    ///
+    /// SQL parsing writes this variant instead of eagerly collapsing a value to the
+    /// column type.  That preserves source `numeric(p,s)` checks and makes CREATE /
+    /// ALTER publication independent from a later INSERT failure.  `Literal` remains
+    /// the historical/programmatic compatibility representation and its serde shape
+    /// must not change.
+    DeferredScalar {
+        value: SqlValue,
+        input: DefaultInputType,
+    },
     Literal(SqlValue),
     SequenceNextVal {
         sequence: String,
@@ -645,11 +691,260 @@ pub enum ColumnDefault {
     },
 }
 
+/// Type authority carried by a deferred scalar column DEFAULT.
+///
+/// `Unknown` is an in-flight parser representation for `ALTER ... SET DEFAULT`;
+/// binding to the target column normalizes it to `TargetTyped` before catalog
+/// publication.  The other variants are durable because they affect source-side
+/// assignment checks (notably `numeric(p,s)`).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultInputType {
+    Unknown,
+    TargetTyped,
+    Inferred(SqlType),
+    Explicit(SqlType),
+}
+
+/// Source authority for a supplied INSERT value.
+///
+/// Live parsed/bound commands retain this provenance through semantic preparation. Historical
+/// typed-command JSON predates it: decoding an old raw `SqlValue` row deliberately labels the
+/// value `Programmatic`, because recovery must not invent a literal/bind distinction that was
+/// never persisted. The canonical typed INSERT envelope will carry resolved semantics directly;
+/// it must not rely on reserializing this AST to recover provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertValueProvenance {
+    Literal,
+    Parameter { index: usize },
+    BoundParameter { index: usize },
+    Programmatic,
+}
+
+/// Source authority for an explicit INSERT `DEFAULT` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertDefaultProvenance {
+    SqlKeyword,
+    Programmatic,
+}
+
+/// One syntactic INSERT cell.
+///
+/// `DEFAULT` is an expression request, not a scalar value and therefore must not be represented
+/// by a `SqlValue` sentinel. The value/provenance pair remains one authority from parse through
+/// Bind; an explicit parameter becomes `BoundParameter` without rendering or reparsing SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertCell {
+    Value {
+        value: SqlValue,
+        provenance: InsertValueProvenance,
+    },
+    Default {
+        provenance: InsertDefaultProvenance,
+    },
+}
+
+impl InsertCell {
+    pub fn literal(value: SqlValue) -> Self {
+        Self::Value {
+            value,
+            provenance: InsertValueProvenance::Literal,
+        }
+    }
+
+    pub fn programmatic(value: SqlValue) -> Self {
+        Self::Value {
+            value,
+            provenance: InsertValueProvenance::Programmatic,
+        }
+    }
+
+    pub fn sql_default() -> Self {
+        Self::Default {
+            provenance: InsertDefaultProvenance::SqlKeyword,
+        }
+    }
+
+    pub fn programmatic_default() -> Self {
+        Self::Default {
+            provenance: InsertDefaultProvenance::Programmatic,
+        }
+    }
+
+    pub(crate) fn from_parsed_value(value: SqlValue) -> Self {
+        match value {
+            SqlValue::Parameter { index, cast } => Self::Value {
+                value: SqlValue::Parameter { index, cast },
+                provenance: InsertValueProvenance::Parameter { index },
+            },
+            value => Self::literal(value),
+        }
+    }
+
+    pub(crate) fn parameter_slot(&self) -> Option<(usize, Option<SqlType>)> {
+        let Self::Value {
+            value: SqlValue::Parameter { index, cast },
+            provenance:
+                InsertValueProvenance::Parameter {
+                    index: provenance_index,
+                },
+        } = self
+        else {
+            return None;
+        };
+        (*index == *provenance_index).then_some((*index, *cast))
+    }
+
+    pub(crate) fn bind_parameter(&mut self, value: SqlValue, index: usize) {
+        *self = Self::Value {
+            value,
+            provenance: InsertValueProvenance::BoundParameter { index },
+        };
+    }
+
+    pub fn value(&self) -> Option<&SqlValue> {
+        match self {
+            Self::Value { value, .. } => Some(value),
+            Self::Default { .. } => None,
+        }
+    }
+
+    pub fn value_provenance(&self) -> Option<InsertValueProvenance> {
+        match self {
+            Self::Value { provenance, .. } => Some(*provenance),
+            Self::Default { .. } => None,
+        }
+    }
+
+    pub fn default_provenance(&self) -> Option<InsertDefaultProvenance> {
+        match self {
+            Self::Value { .. } => None,
+            Self::Default { provenance } => Some(*provenance),
+        }
+    }
+}
+
+impl Insert {
+    /// Test/parser expectation helper for literal scalar cells. SQL parsing itself also records
+    /// literals with this provenance, while parsed parameters use their dedicated provenance.
+    pub fn literal_rows(rows: Vec<Vec<SqlValue>>) -> Vec<Vec<InsertCell>> {
+        rows.into_iter()
+            .map(|row| row.into_iter().map(InsertCell::literal).collect())
+            .collect()
+    }
+
+    /// Compatibility/programmatic ingress helper. It creates the same one-cell representation
+    /// as the parser, but truthfully marks values that did not originate from SQL text or Bind.
+    pub fn programmatic_rows(rows: Vec<Vec<SqlValue>>) -> Vec<Vec<InsertCell>> {
+        rows.into_iter()
+            .map(|row| row.into_iter().map(InsertCell::programmatic).collect())
+            .collect()
+    }
+}
+
+impl From<SqlValue> for InsertCell {
+    fn from(value: SqlValue) -> Self {
+        Self::programmatic(value)
+    }
+}
+
+/// A reserved object shape that cannot collide with serde's externally tagged `SqlValue` enum.
+/// The dollar-prefixed key is intentionally reserved for this AST transport only.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum InsertDefaultWireKind {
+    #[serde(rename = "default_v1")]
+    Default,
+    #[serde(rename = "programmatic_default_v1")]
+    ProgrammaticDefault,
+}
+
+/// A format-generic, externally tagged compatibility mirror of every serializable `SqlValue`
+/// arm, plus the one reserved DEFAULT marker. This intentionally avoids `#[serde(untagged)]`:
+/// untagged buffering cannot faithfully replay every scalar representation (notably `i128`
+/// NUMERIC payloads) to a nested enum deserializer.
+///
+/// Keep the scalar variants in `SqlValue` declaration order. That retains legacy binary enum
+/// discriminants as well as the established JSON objects/strings. `Parameter` has no legacy wire
+/// form (`SqlValue` skips it and `InsertCell` rejects it during serialization), so it is not a
+/// compatibility arm here.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum InsertCellWire {
+    Null,
+    Int4(i32),
+    Int8(i64),
+    Numeric(super::Decimal128),
+    Bool(bool),
+    Text(String),
+    Date(i32),
+    Timestamp(i64),
+    Uuid([u8; 16]),
+    Int2(i16),
+    #[serde(rename = "$gpu_db_insert_cell")]
+    Default(InsertDefaultWireKind),
+}
+
+impl From<InsertCellWire> for InsertCell {
+    fn from(wire: InsertCellWire) -> Self {
+        match wire {
+            InsertCellWire::Null => Self::programmatic(SqlValue::Null),
+            InsertCellWire::Int4(value) => Self::programmatic(SqlValue::Int4(value)),
+            InsertCellWire::Int8(value) => Self::programmatic(SqlValue::Int8(value)),
+            InsertCellWire::Numeric(value) => Self::programmatic(SqlValue::Numeric(value)),
+            InsertCellWire::Bool(value) => Self::programmatic(SqlValue::Bool(value)),
+            InsertCellWire::Text(value) => Self::programmatic(SqlValue::Text(value)),
+            InsertCellWire::Date(value) => Self::programmatic(SqlValue::Date(value)),
+            InsertCellWire::Timestamp(value) => Self::programmatic(SqlValue::Timestamp(value)),
+            InsertCellWire::Uuid(value) => Self::programmatic(SqlValue::Uuid(value)),
+            InsertCellWire::Int2(value) => Self::programmatic(SqlValue::Int2(value)),
+            InsertCellWire::Default(InsertDefaultWireKind::Default) => Self::sql_default(),
+            InsertCellWire::Default(InsertDefaultWireKind::ProgrammaticDefault) => {
+                Self::programmatic_default()
+            }
+        }
+    }
+}
+
+impl serde::Serialize for InsertCell {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Value {
+                value: SqlValue::Parameter { .. },
+                ..
+            } => Err(serde::ser::Error::custom(
+                "unbound INSERT parameter cannot be serialized",
+            )),
+            // Preserve pre-INSERT-001 typed-command byte shape for ordinary value rows. The
+            // value's in-memory provenance is intentionally not a durable SQL-AST contract.
+            Self::Value { value, .. } => serde::Serialize::serialize(value, serializer),
+            Self::Default { provenance } => serde::Serialize::serialize(
+                &InsertCellWire::Default(match provenance {
+                    InsertDefaultProvenance::SqlKeyword => InsertDefaultWireKind::Default,
+                    InsertDefaultProvenance::Programmatic => {
+                        InsertDefaultWireKind::ProgrammaticDefault
+                    }
+                }),
+                serializer,
+            ),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InsertCell {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <InsertCellWire as serde::Deserialize>::deserialize(deserializer).map(Into::into)
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Insert {
     pub table: String,
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<SqlValue>>,
+    pub rows: Vec<Vec<InsertCell>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub returning: Vec<String>,
 }

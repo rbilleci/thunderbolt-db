@@ -16,7 +16,7 @@ pub(super) enum WaveCanonicalOperation {
         outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
         affected_rows: u64,
     },
-    FixedInsert {
+    TypedInsert {
         proposal_payload: Arc<[u8]>,
         bound: crate::wal_binary::BoundBinaryInsert,
     },
@@ -35,7 +35,7 @@ pub(super) enum WaveCanonicalFailure {
 impl Engine {
     /// The sole serial-wave proposal -> canonical record -> append -> status buffer -> ledger
     /// sequence. It returns before device apply, physical group durability, and publication/ack;
-    /// `FixedInsert` is only a sealed-operation input, not another WAL/status authority.
+    /// `TypedInsert` is only a sealed-operation input, not another WAL/status authority.
     #[allow(clippy::too_many_arguments)] // one canonical transaction boundary, not a public API
     pub(super) fn append_canonical_wave_operation(
         &self,
@@ -49,7 +49,7 @@ impl Engine {
     ) -> Result<WaveCanonicalCommit, WaveCanonicalFailure> {
         let proposal_payload = match &operation {
             WaveCanonicalOperation::Resolved { wal_payload, .. } => Arc::clone(wal_payload),
-            WaveCanonicalOperation::FixedInsert {
+            WaveCanonicalOperation::TypedInsert {
                 proposal_payload, ..
             } => Arc::clone(proposal_payload),
         };
@@ -86,7 +86,7 @@ impl Engine {
                     )));
                 }
             },
-            WaveCanonicalOperation::FixedInsert { bound, .. } => {
+            WaveCanonicalOperation::TypedInsert { bound, .. } => {
                 match Self::canonical_wal_record_with_commit_bound_insert(
                     commit,
                     txn_id,

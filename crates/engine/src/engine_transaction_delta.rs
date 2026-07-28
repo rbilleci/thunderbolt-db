@@ -223,7 +223,9 @@ impl Engine {
                     .relational_sequences
                     .get(sequence)
                     .map(|sequence| sequence.oid),
-                None | Some(ColumnDefault::Literal(_)) => None,
+                None
+                | Some(ColumnDefault::Literal(_))
+                | Some(ColumnDefault::DeferredScalar { .. }) => None,
             })
             .collect::<BTreeSet<_>>();
         snapshot

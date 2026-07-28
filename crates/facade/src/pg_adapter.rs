@@ -24,6 +24,11 @@ pub enum PgValueCodecError {
         logical_type: LogicalType,
         format: i16,
     },
+    #[error("{logical_type:?} parameter has a date/time field outside the supported range")]
+    DatetimeFieldOverflow {
+        logical_type: LogicalType,
+        format: i16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,12 +130,32 @@ fn decode_text_parameter(
             }
         }
         LogicalType::Uuid => parse_pg_uuid(text).map(DbValue::Uuid).ok_or_else(invalid),
-        LogicalType::Date => gpu_db_sql::datetime::parse_date(text)
+        LogicalType::Date => gpu_db_sql::datetime::parse_date_detailed(text)
             .map(DbValue::Date)
-            .ok_or_else(invalid),
-        LogicalType::Timestamp => gpu_db_sql::datetime::parse_timestamp(text)
+            .map_err(|error| datetime_codec_error(logical_type, error)),
+        LogicalType::Timestamp => gpu_db_sql::datetime::parse_timestamp_detailed(text)
             .map(DbValue::Timestamp)
-            .ok_or_else(invalid),
+            .map_err(|error| datetime_codec_error(logical_type, error)),
+    }
+}
+
+fn datetime_codec_error(
+    logical_type: LogicalType,
+    error: gpu_db_sql::datetime::DatetimeParseError,
+) -> PgValueCodecError {
+    match error {
+        gpu_db_sql::datetime::DatetimeParseError::MalformedFormat => {
+            PgValueCodecError::InvalidValue {
+                logical_type,
+                format: 0,
+            }
+        }
+        gpu_db_sql::datetime::DatetimeParseError::FieldOverflow => {
+            PgValueCodecError::DatetimeFieldOverflow {
+                logical_type,
+                format: 0,
+            }
+        }
     }
 }
 
@@ -531,13 +556,27 @@ fn decode_binary_parameter(
         LogicalType::Date => value
             .try_into()
             .map(i32::from_be_bytes)
-            .map(DbValue::Date)
-            .map_err(|_| invalid()),
+            .map_err(|_| invalid())
+            .and_then(|days| {
+                gpu_db_sql::datetime::validate_date_carrier(days)
+                    .map(DbValue::Date)
+                    .map_err(|_| PgValueCodecError::DatetimeFieldOverflow {
+                        logical_type,
+                        format: 1,
+                    })
+            }),
         LogicalType::Timestamp => value
             .try_into()
             .map(i64::from_be_bytes)
-            .map(DbValue::Timestamp)
-            .map_err(|_| invalid()),
+            .map_err(|_| invalid())
+            .and_then(|micros| {
+                gpu_db_sql::datetime::validate_timestamp_carrier(micros)
+                    .map(DbValue::Timestamp)
+                    .map_err(|_| PgValueCodecError::DatetimeFieldOverflow {
+                        logical_type,
+                        format: 1,
+                    })
+            }),
     }
 }
 
@@ -842,6 +881,10 @@ pub fn error_sqlstate(category: ErrorCategory) -> &'static str {
         ErrorCategory::ForeignKeyViolation => "23503",
         ErrorCategory::CheckViolation => "23514",
         ErrorCategory::NumericValueOutOfRange => "22003",
+        ErrorCategory::InvalidDatetimeFormat => "22007",
+        ErrorCategory::DatetimeFieldOverflow => "22008",
+        ErrorCategory::InvalidTextRepresentation => "22P02",
+        ErrorCategory::UndefinedOperator => "42883",
         ErrorCategory::Engine => "XX000",
         ErrorCategory::Internal => "XX000",
         // Class 40 — Transaction Rollback; 40001 serialization_failure is the retryable code
@@ -1034,6 +1077,143 @@ mod tests {
     }
 
     #[test]
+    fn text_temporal_parameters_distinguish_bad_syntax_from_field_overflow() {
+        for (oid, text) in [
+            (1082, b"not-a-date".as_slice()),
+            (1114, b"not-a-timestamp"),
+            (1114, b"2024-01-01T"),
+            (1114, b"4714-11-24 BC 00:00:00"),
+        ] {
+            assert!(matches!(
+                decode_parameter(oid, 0, Some(text)),
+                Err(PgValueCodecError::InvalidValue { format: 0, .. })
+            ));
+        }
+        for (oid, text) in [
+            (1082, b"2024-02-30".as_slice()),
+            (1114, b"2024-01-01 25:00:00"),
+            (1114, b"294277-12-31 00:00:00"),
+            (1114, b"294276-12-31 23:59:60"),
+            (1082, b"0000-01-01 BC"),
+        ] {
+            assert!(matches!(
+                decode_parameter(oid, 0, Some(text)),
+                Err(PgValueCodecError::DatetimeFieldOverflow { format: 0, .. })
+            ));
+        }
+        for (oid, text, expected) in [
+            (
+                1082,
+                b"4714-11-24 BC".as_slice(),
+                DbValue::Date(gpu_db_sql::datetime::PG_DATE_MIN_DAYS),
+            ),
+            (
+                1114,
+                b"4714-11-24 00:00:00 BC".as_slice(),
+                DbValue::Timestamp(gpu_db_sql::datetime::PG_TIMESTAMP_MIN_MICROS),
+            ),
+        ] {
+            assert_eq!(decode_parameter(oid, 0, Some(text)), Ok(expected));
+        }
+        let next_midnight = DbValue::Timestamp(
+            gpu_db_sql::datetime::parse_timestamp_detailed("2024-01-02 00:00:00").unwrap(),
+        );
+        for text in [
+            b"2024-01-01 24:00".as_slice(),
+            b"2024-01-01 24:00:00.0000000",
+            b"2024-01-01 24:00:00.0000005",
+            b"2024-01-01 23:59:60.0000000",
+            b"2024-01-01 23:59:60.0000005",
+        ] {
+            assert_eq!(
+                decode_parameter(1114, 0, Some(text)),
+                Ok(next_midnight.clone())
+            );
+        }
+        for (text, expected) in [
+            (b"2024-01-01 10:00:60".as_slice(), "2024-01-01 10:01:00"),
+            (
+                b"2024-01-01 10:00:60.0000005000001",
+                "2024-01-01 10:01:00.000001",
+            ),
+            (b"2024-01-01 10:00:60.0001255", "2024-01-01 10:01:00.000125"),
+            (b"2024-01-01 10:00:60.0001265", "2024-01-01 10:01:00.000127"),
+            (b"2024-01-01 23:58:60".as_slice(), "2024-01-01 23:59:00"),
+            (b"2024-01-01 23:58:60.9999995", "2024-01-01 23:59:01"),
+        ] {
+            assert_eq!(
+                decode_parameter(1114, 0, Some(text)),
+                Ok(DbValue::Timestamp(
+                    gpu_db_sql::datetime::parse_timestamp_detailed(expected).unwrap()
+                ))
+            );
+        }
+        for text in [
+            b"2024-01-01 24:00:00.0000005000001".as_slice(),
+            b"2024-01-01 23:59:60.999999",
+            b"2024-01-01 23:59:60.9999995",
+        ] {
+            assert!(matches!(
+                decode_parameter(1114, 0, Some(text)),
+                Err(PgValueCodecError::DatetimeFieldOverflow { format: 0, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn binary_temporal_parameters_enforce_postgresql_finite_carriers() {
+        use gpu_db_sql::datetime::{
+            PG_DATE_END_DAYS_EXCLUSIVE, PG_DATE_MIN_DAYS, PG_TIMESTAMP_END_MICROS_EXCLUSIVE,
+            PG_TIMESTAMP_MIN_MICROS,
+        };
+
+        for (oid, bytes, expected) in [
+            (
+                1082,
+                PG_DATE_MIN_DAYS.to_be_bytes().to_vec(),
+                DbValue::Date(PG_DATE_MIN_DAYS),
+            ),
+            (
+                1082,
+                (PG_DATE_END_DAYS_EXCLUSIVE - 1).to_be_bytes().to_vec(),
+                DbValue::Date(PG_DATE_END_DAYS_EXCLUSIVE - 1),
+            ),
+            (
+                1114,
+                PG_TIMESTAMP_MIN_MICROS.to_be_bytes().to_vec(),
+                DbValue::Timestamp(PG_TIMESTAMP_MIN_MICROS),
+            ),
+            (
+                1114,
+                (PG_TIMESTAMP_END_MICROS_EXCLUSIVE - 1)
+                    .to_be_bytes()
+                    .to_vec(),
+                DbValue::Timestamp(PG_TIMESTAMP_END_MICROS_EXCLUSIVE - 1),
+            ),
+        ] {
+            assert_eq!(decode_parameter(oid, 1, Some(&bytes)), Ok(expected));
+        }
+        for (oid, bytes) in [
+            (1082, (PG_DATE_MIN_DAYS - 1).to_be_bytes().to_vec()),
+            (1082, PG_DATE_END_DAYS_EXCLUSIVE.to_be_bytes().to_vec()),
+            (1082, i32::MAX.to_be_bytes().to_vec()),
+            (1082, i32::MIN.to_be_bytes().to_vec()),
+            (1114, (PG_TIMESTAMP_MIN_MICROS - 1).to_be_bytes().to_vec()),
+            (
+                1114,
+                PG_TIMESTAMP_END_MICROS_EXCLUSIVE.to_be_bytes().to_vec(),
+            ),
+            (1114, i64::MAX.to_be_bytes().to_vec()),
+            (1114, i64::MIN.to_be_bytes().to_vec()),
+        ] {
+            assert!(matches!(
+                decode_parameter(oid, 1, Some(&bytes)),
+                Err(PgValueCodecError::DatetimeFieldOverflow { format: 1, .. })
+            ));
+        }
+    }
+
+    #[test]
     fn integer_text_syntax_and_range_errors_remain_distinct() {
         for (oid, malformed) in [(21, b"12z".as_slice()), (23, b"0x7__fff"), (20, b"0b102")] {
             assert!(matches!(
@@ -1075,6 +1255,19 @@ mod tests {
             error_sqlstate(ErrorCategory::NumericValueOutOfRange),
             "22003"
         );
+        assert_eq!(
+            error_sqlstate(ErrorCategory::InvalidDatetimeFormat),
+            "22007"
+        );
+        assert_eq!(
+            error_sqlstate(ErrorCategory::DatetimeFieldOverflow),
+            "22008"
+        );
+        assert_eq!(
+            error_sqlstate(ErrorCategory::InvalidTextRepresentation),
+            "22P02"
+        );
+        assert_eq!(error_sqlstate(ErrorCategory::UndefinedOperator), "42883");
         assert_eq!(error_sqlstate(ErrorCategory::Engine), "XX000");
     }
 

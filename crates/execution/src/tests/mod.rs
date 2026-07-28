@@ -1028,6 +1028,13 @@ fn cuda_chunk_bloom_probe_has_no_false_negatives() {
     );
 }
 
+#[path = "insert_key_verdict.rs"]
+mod insert_key_verdict;
+#[path = "insert_resident_key_verdict.rs"]
+mod insert_resident_key_verdict;
+#[path = "predicate_mask.rs"]
+mod predicate_mask;
+
 include!("sort_join.rs");
 
 mod cuda_generation_lifetime;

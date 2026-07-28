@@ -1,11 +1,13 @@
 //! Fit-aware fixed-width shard rollover planning and private device construction.
 //!
 //! The plan is deliberately independent from descriptor publication. It first selects a capacity
-//! from the exact currently retained budget, then [`PendingResidentShard`] owns every allocation
-//! until payload rows, MVCC birth stamps, stable identities, and the row-count header are complete.
-//! A failed construction therefore leaves no public descriptor or side-map owner behind.
+//! from the exact currently retained budget, then [`PendingResidentShard`] and
+//! [`PendingDenseResidentShard`] own every allocation until payload rows, MVCC birth stamps,
+//! stable identities, and the row-count header are complete. A failed construction therefore
+//! leaves no public descriptor or side-map owner behind.
 
 use super::*;
+use crate::typed_insert_batch::PreparedResidentDensePayload;
 
 /// Sealed allocation geometry for one fixed-width, NULL-free rollover.
 ///
@@ -161,6 +163,20 @@ impl ResidentRolloverPlan {
     pub(super) fn capacity_scan_entries(&self) -> u64 {
         self.capacity_scan_entries
     }
+
+    pub(super) fn bool_layouts(&self) -> &[ResidentDeviceBoolColumnLayout] {
+        &self.bool_layouts
+    }
+
+    pub(super) fn descriptor_bool_layouts_match(
+        table: &RelationalTable,
+        column_types: &[SqlType],
+        capacity: usize,
+        actual: &[ResidentDeviceBoolColumnLayout],
+    ) -> bool {
+        fixed_width_payload_layout(table, column_types, capacity)
+            .is_ok_and(|(_, expected)| expected == actual)
+    }
 }
 
 /// A fully private fixed-width rollover generation. Its Arcs are handed to the published shard only
@@ -174,6 +190,452 @@ pub(super) struct PendingResidentShard {
     pub(super) live_h2d_bytes: u64,
     pub(super) sidecar_fill_bytes: u64,
     pub(super) persistent_allocation_count: u64,
+}
+
+/// A fully private fixed-width generation reserved before WAL. Its immutable column chunks,
+/// BoolBits, and exact row-identity sidecar are already device-resident; apply may only stamp
+/// birth versions and publish the sealed count header last.
+pub(super) struct PendingFixedResidentShard {
+    pub(super) device_memory: Arc<CudaResidentDeviceMemory>,
+    pub(super) created_by_region: Arc<CudaResidentDeviceMemory>,
+    pub(super) row_id_region: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(super) bool_layouts: Vec<ResidentDeviceBoolColumnLayout>,
+    pub(super) int4_stats: Vec<ResidentDeviceInt4ColumnStats>,
+    pub(super) payload_bytes: u64,
+    pub(super) created_by_bytes: u64,
+    pub(super) row_id_bytes: u64,
+    pub(super) created_by_stamp_bytes: usize,
+    pub(super) allocation_bytes: u64,
+    pub(super) final_count_header: [u8; std::mem::size_of::<u64>()],
+    /// Device zero-fill of the capacity-sized created-by sidecar, distinct from H2D.
+    pub(super) sidecar_fill_bytes: u64,
+    /// Pre-WAL immutable payload/BoolBits/row-ID H2D plus post-WAL stamps and final header.
+    pub(super) live_h2d_bytes: u64,
+    pub(super) persistent_allocation_count: u64,
+}
+
+/// A capacity-sized created-by sidecar allocated before WAL for a typed in-place append whose
+/// established open descriptor has no version region yet.
+pub(super) struct PendingInPlaceCreatedBy {
+    pub(super) region: Arc<CudaResidentDeviceMemory>,
+    pub(super) capacity_bytes: u64,
+    pub(super) allocation_bytes: u64,
+}
+
+/// A fully private nullable/text rollover generation reserved before WAL. The typed plan may
+/// carry this opaque allocation set through WAL, but only this allocation owner creates its
+/// device buffers or performs the pre-WAL payload uploads.
+pub(super) struct PendingDenseResidentShard {
+    pub(super) payload: PreparedResidentDensePayload,
+    pub(super) device_memory: Arc<CudaResidentDeviceMemory>,
+    pub(super) created_by_region: Arc<CudaResidentDeviceMemory>,
+    pub(super) row_id_region: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(super) payload_bytes: u64,
+    pub(super) created_by_bytes: usize,
+    pub(super) created_by_bytes_u64: u64,
+    pub(super) allocation_bytes: u64,
+    /// Exact device-side zero fill for the created-by sidecar. This is not H2D traffic.
+    pub(super) sidecar_fill_bytes: u64,
+    /// Exact dense traffic across the whole retained plan: pre-WAL payload (including its zero
+    /// count header), pre-WAL row IDs when present, post-WAL created-by stamps, and the final
+    /// header rewrite.
+    pub(super) live_h2d_bytes: u64,
+    pub(super) persistent_allocation_count: u64,
+}
+
+impl PendingDenseResidentShard {
+    /// Allocate and upload the dense physical generation before WAL. The payload count remains
+    /// zero until mutation writes its sealed final header after stamping every created-by slot.
+    pub(super) fn reserve_pre_wal(
+        engine: &Engine,
+        gpu_id: u16,
+        mut payload: PreparedResidentDensePayload,
+        created_by_bytes_u64: u64,
+        row_id_payload: Option<Vec<u8>>,
+    ) -> Result<Self, ExecuteError> {
+        let created_by_bytes = usize::try_from(created_by_bytes_u64).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "dense rollover created-by allocation does not fit host address space".to_string(),
+            ))
+        })?;
+        let row_id_preupload_bytes = row_id_payload
+            .as_ref()
+            .map(|bytes| u64::try_from(bytes.len()))
+            .transpose()
+            .map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "dense rollover row-id payload does not fit device accounting".to_string(),
+                ))
+            })?
+            .unwrap_or(0);
+        if row_id_preupload_bytes != 0 && row_id_preupload_bytes != created_by_bytes_u64 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "dense rollover row-id payload lost its sealed sidecar geometry".to_string(),
+            )));
+        }
+        let payload_bytes = payload.device_payload_len().ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "dense rollover payload length does not fit device accounting".to_string(),
+            ))
+        })?;
+        let upload = payload.take_pre_wal_upload().ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "dense rollover payload lost its final row-count header".to_string(),
+            ))
+        })?;
+        let payload_preupload_bytes = u64::try_from(upload.len()).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "dense rollover payload upload does not fit device accounting".to_string(),
+            ))
+        })?;
+        if payload_preupload_bytes != payload_bytes {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "dense rollover payload upload lost its sealed byte length".to_string(),
+            )));
+        }
+        let device_memory = engine
+            .relational_residency_device_memory(gpu_id, &upload)
+            .map(Arc::new)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "dense rollover payload allocation failed".to_string(),
+                ))
+            })?;
+        let created_by_region = Arc::new(
+            engine
+                .cuda_driver_probe_runtime()
+                .retain_device_memory_zeroed(gpu_id, created_by_bytes_u64)
+                .map_err(device_allocation_error("dense created-by sidecar"))?,
+        );
+        let row_id_region = match row_id_payload {
+            Some(payload) => Some(
+                engine
+                    .relational_residency_device_memory(gpu_id, &payload)
+                    .map(Arc::new)
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "dense rollover row-id allocation failed".to_string(),
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+        let allocation_bytes = device_memory
+            .metadata()
+            .allocated_bytes
+            .checked_add(created_by_region.metadata().allocated_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    row_id_region
+                        .as_ref()
+                        .map_or(0, |region| region.metadata().allocated_bytes),
+                )
+            })
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "dense rollover allocation accounting overflowed".to_string(),
+                ))
+            })?;
+        let (sidecar_fill_bytes, live_h2d_bytes) = dense_probe_accounting(
+            payload_preupload_bytes,
+            row_id_preupload_bytes,
+            created_by_bytes_u64,
+        )
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "dense rollover live upload accounting overflowed".to_string(),
+            ))
+        })?;
+        let persistent_allocation_count = 2 + u64::from(row_id_region.is_some());
+        Ok(Self {
+            payload,
+            device_memory,
+            created_by_region,
+            row_id_region,
+            payload_bytes,
+            created_by_bytes,
+            created_by_bytes_u64,
+            allocation_bytes,
+            sidecar_fill_bytes,
+            live_h2d_bytes,
+            persistent_allocation_count,
+        })
+    }
+}
+
+impl PendingFixedResidentShard {
+    /// Reserve the exact fixed-width rollover generation and upload every immutable byte before
+    /// WAL. The payload allocation is zeroed, so stripping the final count chunk leaves the
+    /// unpublished header at zero until the post-WAL mutation owner writes it last.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reserve_pre_wal(
+        engine: &Engine,
+        gpu_id: u16,
+        plan: &ResidentRolloverPlan,
+        rows: usize,
+        mut chunks: Vec<CudaOwnedDeviceMemoryChunk>,
+        bool_uploads: Vec<(u64, Box<[u8]>)>,
+        int4_stats: Vec<ResidentDeviceInt4ColumnStats>,
+        row_id_payload: Option<Vec<u8>>,
+    ) -> Result<Self, ExecuteError> {
+        if rows == 0
+            || rows > plan.capacity
+            || bool_uploads.len() != plan.bool_layouts.len()
+            || bool_uploads
+                .iter()
+                .zip(&plan.bool_layouts)
+                .any(|((offset, values), layout)| {
+                    *offset != layout.bitmap_byte_offset || values.len() != rows
+                })
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "sealed fixed-width rollover lost its private payload geometry".to_string(),
+            )));
+        }
+        let final_count_header = u64::try_from(rows)
+            .map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "sealed fixed-width rollover row count overflowed".to_string(),
+                ))
+            })?
+            .to_le_bytes();
+        let header = chunks
+            .pop()
+            .filter(|chunk| {
+                chunk.byte_offset == 0 && chunk.bytes.as_slice() == final_count_header.as_slice()
+            })
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "sealed fixed-width rollover omitted its final row-count header".to_string(),
+                ))
+            })?;
+        let immutable_payload_h2d = chunks.iter().try_fold(0_u64, |bytes, chunk| {
+            u64::try_from(chunk.bytes.len())
+                .ok()
+                .and_then(|chunk_bytes| bytes.checked_add(chunk_bytes))
+        });
+        let bool_h2d = bool_uploads.iter().try_fold(0_u64, |bytes, (_, values)| {
+            u64::try_from(values.len())
+                .ok()
+                .and_then(|value_bytes| bytes.checked_add(value_bytes))
+        });
+        let created_by_stamp_bytes =
+            rows.checked_mul(std::mem::size_of::<u64>())
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "sealed fixed-width rollover stamp geometry overflowed".to_string(),
+                    ))
+                })?;
+        let created_by_stamp_bytes_u64 = u64::try_from(created_by_stamp_bytes).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "sealed fixed-width rollover stamp bytes exceed device accounting".to_string(),
+            ))
+        })?;
+        let row_id_preupload_bytes = row_id_payload
+            .as_ref()
+            .map(|bytes| u64::try_from(bytes.len()))
+            .transpose()
+            .map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "sealed fixed-width rollover row-id bytes exceed device accounting".to_string(),
+                ))
+            })?
+            .unwrap_or(0);
+        if row_id_payload.is_some() != (plan.row_id_bytes != 0)
+            || (row_id_payload.is_some() && row_id_preupload_bytes != created_by_stamp_bytes_u64)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "sealed fixed-width rollover row-id geometry drifted".to_string(),
+            )));
+        }
+        let runtime = engine.cuda_driver_probe_runtime();
+        let device_memory = Arc::new(
+            runtime
+                .retain_device_memory_zeroed(gpu_id, plan.payload_bytes)
+                .map_err(device_allocation_error("sealed fixed-width payload"))?,
+        );
+        let created_by_region = Arc::new(
+            runtime
+                .retain_device_memory_zeroed(gpu_id, plan.created_by_bytes)
+                .map_err(device_allocation_error(
+                    "sealed fixed-width created-by sidecar",
+                ))?,
+        );
+        let row_id_region = if plan.row_id_bytes == 0 {
+            None
+        } else {
+            Some(Arc::new(
+                runtime
+                    .retain_device_memory_recompacted(
+                        gpu_id,
+                        plan.row_id_bytes,
+                        &[],
+                        &[gpu_db_execution::RecompactFill {
+                            byte_offset: 0,
+                            len: plan.row_id_bytes,
+                            fill_byte: ROW_ID_UNSTAMPED_FILL_BYTE,
+                        }],
+                        &[],
+                    )
+                    .map_err(device_allocation_error("sealed fixed-width row-id sidecar"))?,
+            ))
+        };
+        if device_memory.metadata().allocated_bytes < plan.payload_bytes
+            || created_by_region.metadata().allocated_bytes < plan.created_by_bytes
+            || row_id_region
+                .as_ref()
+                .is_some_and(|region| region.metadata().allocated_bytes < plan.row_id_bytes)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "sealed fixed-width rollover allocation was smaller than its pre-WAL geometry"
+                    .to_string(),
+            )));
+        }
+        device_memory
+            .append_owned_chunks(chunks)
+            .map_err(device_write_error("sealed fixed-width payload preupload"))?;
+        for (offset, values) in bool_uploads {
+            device_memory
+                .set_bool_bitmap_range(offset, 0, &values)
+                .map_err(device_write_error("sealed fixed-width bool preupload"))?;
+        }
+        if let (Some(region), Some(payload)) = (&row_id_region, row_id_payload) {
+            region
+                .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: payload,
+                }))
+                .map_err(device_write_error("sealed fixed-width row-id preupload"))?;
+        }
+        let allocation_bytes = device_memory
+            .metadata()
+            .allocated_bytes
+            .checked_add(created_by_region.metadata().allocated_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    row_id_region
+                        .as_ref()
+                        .map_or(0, |region| region.metadata().allocated_bytes),
+                )
+            })
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "sealed fixed-width allocation accounting overflowed".to_string(),
+                ))
+            })?;
+        let live_h2d_bytes = immutable_payload_h2d
+            .and_then(|bytes| bool_h2d.and_then(|bool_bytes| bytes.checked_add(bool_bytes)))
+            .and_then(|bytes| bytes.checked_add(row_id_preupload_bytes))
+            .and_then(|bytes| bytes.checked_add(created_by_stamp_bytes_u64))
+            .and_then(|bytes| bytes.checked_add(u64::try_from(header.bytes.len()).ok()?))
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "sealed fixed-width live upload accounting overflowed".to_string(),
+                ))
+            })?;
+        let sidecar_fill_bytes = plan
+            .created_by_bytes
+            .checked_add(plan.row_id_bytes)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "sealed fixed-width sidecar fill accounting overflowed".to_string(),
+                ))
+            })?;
+        Ok(Self {
+            device_memory,
+            created_by_region,
+            row_id_region,
+            bool_layouts: plan.bool_layouts.clone(),
+            int4_stats,
+            payload_bytes: plan.payload_bytes,
+            created_by_bytes: plan.created_by_bytes,
+            row_id_bytes: plan.row_id_bytes,
+            created_by_stamp_bytes,
+            allocation_bytes,
+            final_count_header,
+            sidecar_fill_bytes,
+            live_h2d_bytes,
+            persistent_allocation_count: 2 + u64::from(plan.row_id_bytes != 0),
+        })
+    }
+
+    /// Finish the only mutable portion after WAL: exact created-by stamps, then the sealed count
+    /// header. The generation remains private until mutation publishes its descriptor.
+    pub(super) fn finish_post_wal(self, stamps: &[Index]) -> Result<Self, ExecuteError> {
+        if stamps.is_empty()
+            || std::mem::size_of_val(stamps) != self.created_by_stamp_bytes
+            || self.device_memory.metadata().allocated_bytes < self.payload_bytes
+            || self.created_by_region.metadata().allocated_bytes < self.created_by_bytes
+            || self
+                .row_id_region
+                .as_ref()
+                .is_some_and(|region| region.metadata().allocated_bytes < self.row_id_bytes)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "sealed fixed-width rollover drifted before post-WAL header publication"
+                    .to_string(),
+            )));
+        }
+        self.created_by_region
+            .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+                byte_offset: 0,
+                bytes: encode_u64(stamps),
+            }))
+            .map_err(device_write_error("sealed fixed-width created-by stamps"))?;
+        self.device_memory
+            .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+                byte_offset: 0,
+                bytes: self.final_count_header.to_vec(),
+            }))
+            .map_err(device_write_error(
+                "sealed fixed-width final row-count header",
+            ))?;
+        Ok(self)
+    }
+}
+
+impl PendingInPlaceCreatedBy {
+    /// Reserve a missing open-shard created-by region before WAL. The zero fill preserves the
+    /// born-visible meaning until apply stamps the planned live slots and publishes row_count.
+    pub(super) fn reserve_pre_wal(
+        engine: &Engine,
+        gpu_id: u16,
+        capacity: usize,
+    ) -> Result<Self, ExecuteError> {
+        let capacity_bytes = u64::try_from(capacity)
+            .ok()
+            .and_then(|rows| rows.checked_mul(std::mem::size_of::<u64>() as u64))
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "sealed in-place created-by sidecar geometry overflowed".to_string(),
+                ))
+            })?;
+        let region = Arc::new(
+            engine
+                .cuda_driver_probe_runtime()
+                .retain_device_memory_zeroed(gpu_id, capacity_bytes)
+                .map_err(device_allocation_error(
+                    "sealed in-place created-by sidecar",
+                ))?,
+        );
+        Ok(Self {
+            allocation_bytes: region.metadata().allocated_bytes,
+            region,
+            capacity_bytes,
+        })
+    }
+
+    /// Consume the private pre-WAL allocation only if it still has the exact capacity geometry.
+    /// Mutation owns the subsequent descriptor and side-map publication.
+    pub(super) fn into_region(self, capacity: usize) -> Option<Arc<CudaResidentDeviceMemory>> {
+        let expected_bytes = u64::try_from(capacity)
+            .ok()
+            .and_then(|rows| rows.checked_mul(std::mem::size_of::<u64>() as u64))?;
+        (self.capacity_bytes == expected_bytes
+            && self.allocation_bytes >= expected_bytes
+            && self.region.metadata().allocated_bytes >= expected_bytes)
+            .then_some(self.region)
+    }
 }
 
 impl PendingResidentShard {
@@ -249,52 +711,6 @@ impl PendingResidentShard {
             row_ids,
             plan.bool_layouts.clone(),
             int4_stats(table, column_types, rows),
-        )
-    }
-
-    /// Consume chunks and statistics prepared before WAL for an all-INT4 rollover. This method
-    /// owns the first CUDA allocation, all private writes, and the final-header publication;
-    /// the sealed plan never allocates or publishes on its own.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_i32_chunks(
-        engine: &Engine,
-        gpu_id: u16,
-        table: &RelationalTable,
-        rows: usize,
-        chunks: Vec<CudaOwnedDeviceMemoryChunk>,
-        stamps: &[Index],
-        row_ids: Option<&[u64]>,
-        plan: &ResidentRolloverPlan,
-        int4_stats: Vec<ResidentDeviceInt4ColumnStats>,
-    ) -> Result<Self, ExecuteError> {
-        if rows == 0
-            || table
-                .columns
-                .iter()
-                .any(|column| column.ty != SqlType::Int4)
-            || int4_stats.len() != table.columns.len()
-            || stamps.len() != rows
-            || row_ids.is_some_and(|ids| ids.len() != rows)
-            || row_ids.is_some() != (plan.row_id_bytes != 0)
-            || rows > plan.capacity
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "typed fixed-width rollover inputs lost their NULL-free parallel geometry"
-                    .to_string(),
-            )));
-        }
-
-        Self::build_from_chunks(
-            engine,
-            gpu_id,
-            plan,
-            rows,
-            chunks,
-            Vec::new(),
-            stamps,
-            row_ids,
-            Vec::new(),
-            int4_stats,
         )
     }
 
@@ -401,6 +817,21 @@ impl PendingResidentShard {
             persistent_allocation_count: 2 + u64::from(plan.row_id_bytes != 0),
         })
     }
+}
+
+/// Accounting for one dense plan's whole device-transfer lifecycle. The initial zero-count header
+/// is part of `payload_preupload_bytes`; the final post-WAL header rewrite is always one u64.
+fn dense_probe_accounting(
+    payload_preupload_bytes: u64,
+    row_id_preupload_bytes: u64,
+    created_by_bytes: u64,
+) -> Option<(u64, u64)> {
+    let final_header_bytes = std::mem::size_of::<u64>() as u64;
+    let live_h2d_bytes = payload_preupload_bytes
+        .checked_add(row_id_preupload_bytes)?
+        .checked_add(created_by_bytes)?
+        .checked_add(final_header_bytes)?;
+    Some((created_by_bytes, live_h2d_bytes))
 }
 
 fn is_fixed_width(column_types: &[SqlType]) -> bool {
@@ -514,7 +945,7 @@ fn device_allocation_error(
 ) -> impl FnOnce(gpu_db_execution::CudaRuntimeProbeError) -> ExecuteError {
     move |error| {
         ExecuteError::Engine(EngineError::ApplyFailed(format!(
-            "fixed-width rollover {owner} allocation failed: {error}"
+            "resident INSERT {owner} allocation failed: {error}"
         )))
     }
 }
@@ -524,7 +955,7 @@ fn device_write_error(
 ) -> impl FnOnce(gpu_db_execution::CudaRuntimeProbeError) -> ExecuteError {
     move |error| {
         ExecuteError::Engine(EngineError::ApplyFailed(format!(
-            "fixed-width rollover {owner} write failed: {error}"
+            "resident INSERT {owner} write failed: {error}"
         )))
     }
 }
@@ -539,6 +970,24 @@ mod tests {
             .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
             .unwrap();
         engine.relational_catalog_table("accounts").unwrap()
+    }
+
+    #[test]
+    fn dense_probe_accounting_includes_preuploads_and_final_header_for_both_identity_shapes() {
+        // Three `(id int4, body text nullable)` rows occupy: u64 count header (8), id (12),
+        // one NULL bitmap word (4), four text offsets (32), and the UTF-8 `naïve` bytes (6).
+        let payload_bytes = 62;
+        let created_by_bytes = 3 * std::mem::size_of::<u64>() as u64;
+        assert_eq!(
+            dense_probe_accounting(payload_bytes, created_by_bytes, created_by_bytes),
+            Some((created_by_bytes, 118)),
+            "payload + preuploaded row IDs + post-WAL stamps + final header"
+        );
+        assert_eq!(
+            dense_probe_accounting(payload_bytes, 0, created_by_bytes),
+            Some((created_by_bytes, 94)),
+            "synthetic no-identity plans omit only the row-ID preupload"
+        );
     }
 
     #[test]
@@ -589,6 +1038,49 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn fixed_width_descriptor_bool_layout_requires_exact_catalog_identity_and_offset() {
+        let engine = Engine::new_local_test_engine();
+        engine
+            .execute_text(
+                1,
+                "CREATE TABLE descriptor_shape (id int4, tick int8, amount numeric(10,2), token uuid, flag bool)",
+            )
+            .unwrap();
+        let table = engine.relational_catalog_table("descriptor_shape").unwrap();
+        let types = table
+            .columns
+            .iter()
+            .map(|column| column.ty)
+            .collect::<Vec<_>>();
+        let plan =
+            ResidentRolloverPlan::fixed_width_null_free(&table, &types, 2, 16, true, false, None)
+                .unwrap()
+                .unwrap();
+        assert!(ResidentRolloverPlan::descriptor_bool_layouts_match(
+            &table,
+            &types,
+            plan.capacity(),
+            plan.bool_layouts(),
+        ));
+        let mut mislabeled = plan.bool_layouts().to_vec();
+        mislabeled[0].name = "wrong_flag".to_string();
+        assert!(!ResidentRolloverPlan::descriptor_bool_layouts_match(
+            &table,
+            &types,
+            plan.capacity(),
+            &mislabeled,
+        ));
+        let mut wrong_offset = plan.bool_layouts().to_vec();
+        wrong_offset[0].bitmap_byte_offset += 4;
+        assert!(!ResidentRolloverPlan::descriptor_bool_layouts_match(
+            &table,
+            &types,
+            plan.capacity(),
+            &wrong_offset,
+        ));
     }
 
     #[test]

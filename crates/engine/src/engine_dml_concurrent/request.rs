@@ -192,8 +192,8 @@ impl Engine {
         let probe_insert = matches!(&cmd, Command::Insert(_));
         #[cfg(feature = "probe-timing")]
         let probe_prepare_started = probe_insert.then(Instant::now);
-        let direct_fixed = if self.binary_wal_records_enabled() {
-            crate::prepared_insert_batch::try_prepare_direct_fixed_insert_batch(
+        let direct_typed = if self.binary_wal_records_enabled() {
+            crate::typed_insert_batch::try_prepare_typed_insert_batch(
                 &cmd,
                 &pinned_catalog,
                 prepared_catalog_seq,
@@ -202,9 +202,15 @@ impl Engine {
         } else {
             None
         };
-        let (write_set, offlock_prepared) = if let Some(batch) = direct_fixed {
-            let prepared = OfflockPreparedDml::fixed_insert(batch, &request, read_snapshot)
-                .map_err(ExecuteError::Engine)?;
+        let (write_set, offlock_prepared) = if let Some(batch) = direct_typed {
+            let prepared = OfflockPreparedDml::typed_insert(
+                batch,
+                self,
+                &pinned_catalog,
+                &request,
+                read_snapshot,
+            )
+            .map_err(ExecuteError::Engine)?;
             let write_set = prepared.write_set().clone();
             debug_assert_eq!(prepared.read_snapshot(), read_snapshot);
             #[cfg(feature = "probe-timing")]
@@ -278,19 +284,59 @@ fn insert_device_statement_bytes_estimate(command: &Command) -> u64 {
         .rows
         .iter()
         .map(|row| {
-            let values = row.iter().fold(0_u64, |bytes, value| {
-                bytes.saturating_add(match value {
-                    SqlValue::Null | SqlValue::Parameter { .. } => 0,
-                    SqlValue::Bool(_) => 1,
-                    SqlValue::Int2(_) => 2,
-                    SqlValue::Int4(_) | SqlValue::Date(_) => 4,
-                    SqlValue::Int8(_) | SqlValue::Timestamp(_) => 8,
-                    SqlValue::Numeric(_) | SqlValue::Uuid(_) => 16,
-                    SqlValue::Text(text) => text.len() as u64,
+            let values = row.iter().fold(0_u64, |bytes, cell| {
+                bytes.saturating_add(match cell {
+                    InsertCell::Default { .. } => 0,
+                    InsertCell::Value { value, .. } => match value {
+                        // This estimator runs before semantic lowering. An unresolved parameter
+                        // cannot have staging bytes yet, just like an explicit DEFAULT request.
+                        SqlValue::Null | SqlValue::Parameter { .. } => 0,
+                        SqlValue::Bool(_) => 1,
+                        SqlValue::Int2(_) => 2,
+                        SqlValue::Int4(_) | SqlValue::Date(_) => 4,
+                        SqlValue::Int8(_) | SqlValue::Timestamp(_) => 8,
+                        SqlValue::Numeric(_) | SqlValue::Uuid(_) => 16,
+                        SqlValue::Text(text) => text.len() as u64,
+                    },
                 })
             });
             // The append seam retains row identity and MVCC birth metadata alongside values.
             values.saturating_add(16)
         })
         .sum()
+}
+
+#[cfg(all(test, feature = "probe-timing"))]
+mod probe_timing_tests {
+    use super::*;
+
+    #[test]
+    fn insert_payload_estimate_keeps_default_and_unbound_parameter_at_zero_bytes() {
+        let command = Command::Insert(Insert {
+            table: "probe_cells".to_string(),
+            columns: vec![
+                "id".to_string(),
+                "defaulted".to_string(),
+                "parameter".to_string(),
+                "note".to_string(),
+                "nullable".to_string(),
+            ],
+            rows: vec![vec![
+                InsertCell::literal(SqlValue::Int4(7)),
+                InsertCell::sql_default(),
+                InsertCell::Value {
+                    value: SqlValue::Parameter {
+                        index: 1,
+                        cast: None,
+                    },
+                    provenance: gpu_db_sql::InsertValueProvenance::Parameter { index: 1 },
+                },
+                InsertCell::programmatic(SqlValue::Text("gpu".to_string())),
+                InsertCell::literal(SqlValue::Null),
+            ]],
+            returning: Vec::new(),
+        });
+
+        assert_eq!(insert_device_statement_bytes_estimate(&command), 16 + 4 + 3);
+    }
 }

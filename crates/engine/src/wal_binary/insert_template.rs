@@ -1,6 +1,6 @@
 //! Sealed v1 binary INSERT templates for the fixed-width INSERT-001 carrier.
 //!
-//! A template is created only from `PreparedInsertBatch`; it contains neither an allocator claim
+//! A template is created only from `TypedInsertBatch`; it contains neither an allocator claim
 //! nor a publish capability. Binding a checked proposed range consumes the template and patches
 //! the payload plus its canonical operation body together, so no caller can mix either artifact
 //! with separately supplied row ids, counts, or high-water metadata.
@@ -74,7 +74,7 @@ impl ProposedRowIdRange {
 /// An off-lock v1 INSERT payload and resolved-binary operation-body template with zero id slots.
 ///
 /// The row-id offsets are private and both byte sequences are owned by this one token. It cannot
-/// be assembled from raw bytes or metadata; `PreparedInsertBatch` is the only construction input.
+/// be assembled from raw bytes or metadata; `TypedInsertBatch` is the only construction input.
 pub(crate) struct PreparedBinaryInsertTemplate {
     payload: Arc<[u8]>,
     payload_row_id_offsets: Box<[usize]>,
@@ -85,7 +85,7 @@ pub(crate) struct PreparedBinaryInsertTemplate {
 
 impl PreparedBinaryInsertTemplate {
     pub(crate) fn from_sealed_batch(
-        batch: &crate::prepared_insert_batch::PreparedInsertBatch,
+        batch: &crate::typed_insert_batch::TypedInsertBatch,
     ) -> Result<Self, EngineError> {
         let count = batch.binary_insert_template_row_count();
         let table = batch.binary_insert_template_table_name();
@@ -240,31 +240,20 @@ mod tests {
 
     fn sealed_accounts_batch(
         sql: &str,
-    ) -> (
-        Engine,
-        Command,
-        crate::prepared_insert_batch::PreparedInsertBatch,
-    ) {
+    ) -> (Engine, Command, crate::typed_insert_batch::TypedInsertBatch) {
         let engine = Engine::new_local();
         engine
             .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
             .unwrap();
         let command = parse_command(sql).expect("canonical accounts INSERT parses");
         let catalog = engine.catalog_snapshot();
-        let delta = engine
-            .prepare_dml(
-                &command,
-                engine.dml_read_snapshot(engine.committed_seq()),
-                InsertPrepareValidation::WaveOffLock,
-            )
-            .expect("authoritative off-lock prepare accepts the workload");
-        let batch = crate::prepared_insert_batch::try_prepare_fixed_insert_batch(
+        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch(
             &command,
-            &delta,
             &catalog,
             catalog.commit_seq,
             None,
         )
+        .expect("direct typed preparation succeeds")
         .expect("fixed-width accounts INSERT is eligible");
         (engine, command, batch)
     }
@@ -306,11 +295,20 @@ mod tests {
             unreachable!("test SQL is an INSERT");
         };
         let first = 8_000_001_u64;
+        let values = insert
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.value().expect("fixed test has no DEFAULT").clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let ids_rows = insert
             .rows
             .iter()
             .enumerate()
-            .map(|(offset, row)| (first + offset as u64, row.as_slice()))
+            .map(|(offset, _)| (first + offset as u64, values[offset].as_slice()))
             .collect::<Vec<_>>();
         let expected = try_encode_binary_insert("accounts", &ids_rows).unwrap();
         let bound = batch

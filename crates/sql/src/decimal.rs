@@ -62,7 +62,15 @@ impl Decimal128 {
         }
         // Reducing scale: divide by 10^(drop), rounding half-up on the discarded digits.
         let drop = self.scale - target_scale;
-        let factor = Self::pow10(drop).ok_or(NumericOverflow)?;
+        // Every representable i128 magnitude is strictly less than 10^39. A
+        // divisor outside i128 therefore makes the magnitude (and its
+        // half-up rounded value) zero; the missing divisor is not overflow.
+        let Some(factor) = Self::pow10(drop) else {
+            return Ok(Self {
+                mantissa: 0,
+                scale: target_scale,
+            });
+        };
         let negative = self.mantissa < 0;
         let abs = self.mantissa.unsigned_abs();
         let factor_abs = factor as u128;
@@ -395,6 +403,26 @@ mod tests {
         assert_eq!(
             Decimal128::new(5, 1).rescale(0).unwrap(),
             Decimal128::new(1, 0)
+        );
+    }
+
+    #[test]
+    fn downscale_beyond_i128_divisor_rounds_tiny_values_to_zero() {
+        // Five at scale 40 is 5e-40.  Reducing to scale 0 needs 10^40, which is
+        // larger than i128 even though the decimal itself is representable.
+        let positive = Decimal128::parse(&format!("0.{}5", "0".repeat(39))).unwrap();
+        let negative = Decimal128::parse(&format!("-0.{}5", "0".repeat(39))).unwrap();
+        assert_eq!(positive.scale, 40);
+        assert_eq!(negative.scale, 40);
+        assert_eq!(positive.rescale(0), Ok(Decimal128::new(0, 0)));
+        assert_eq!(negative.rescale(0), Ok(Decimal128::new(0, 0)));
+        // A representable divisor retains ordinary half-up behavior at a nonzero target scale.
+        assert_eq!(positive.rescale(39), Ok(Decimal128::new(1, 39)));
+        assert_eq!(negative.rescale(39), Ok(Decimal128::new(-1, 39)));
+        // The downscale fast result must not change the established upscale overflow boundary.
+        assert_eq!(
+            Decimal128::new(i128::MAX, 0).rescale(1),
+            Err(NumericOverflow)
         );
     }
 

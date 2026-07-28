@@ -525,7 +525,10 @@ impl Engine {
         Insert {
             table: copy.table.clone(),
             columns,
-            rows,
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(InsertCell::programmatic).collect())
+                .collect(),
             returning: Vec::new(),
         }
     }

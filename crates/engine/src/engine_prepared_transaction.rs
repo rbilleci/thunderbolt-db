@@ -979,6 +979,7 @@ fn prepared_parameter_value(value: SqlValue, expected: SqlType) -> Result<SqlVal
             | (SqlType::Uuid, SqlValue::Uuid(_))
     );
     if compatible {
+        crate::rel_exec_helpers::validate_datetime_carrier(&value, expected)?;
         Ok(value)
     } else {
         let actual = match value {

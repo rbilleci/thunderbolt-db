@@ -1144,7 +1144,11 @@ impl Engine {
         let cmd = Command::Insert(Insert {
             table: route.table.clone(),
             columns: Vec::new(),
-            rows: vec![values.clone()],
+            rows: vec![values
+                .clone()
+                .into_iter()
+                .map(InsertCell::programmatic)
+                .collect()],
             returning: Vec::new(),
         });
         // E2.2(b): pre-encode the W5a binary record with a PLACEHOLDER row id (0). The sequencer

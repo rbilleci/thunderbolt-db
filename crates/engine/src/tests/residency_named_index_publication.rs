@@ -1,4 +1,4 @@
-fn resident_named_index_cache_entry(
+pub(super) fn resident_named_index_cache_entry(
     engine: &Engine,
     table: &str,
     shard_id: u32,
@@ -29,7 +29,7 @@ fn resident_named_index_cache_entry(
     )
 }
 
-fn resident_named_index_physical_hit_count(
+pub(super) fn resident_named_index_physical_hit_count(
     index: &Arc<CudaResidentDeviceMemory>,
     table_mask: u32,
     hash_shift: u32,
@@ -302,10 +302,12 @@ fn resident_named_indexes_publish_and_extend_without_rebuild() {
         .expect("NULL-bearing rollover publishes every named index before visibility");
     assert_eq!(rollover_report.indexed_rows, 3);
     assert_eq!(rollover_report.shard_count, 2);
-    assert!(rollover_report
-        .indexes
-        .iter()
-        .all(|entry| entry.indexed_rows == 3 && entry.shard_count == 2));
+    assert!(
+        rollover_report
+            .indexes
+            .iter()
+            .all(|entry| entry.indexed_rows == 3 && entry.shard_count == 2)
+    );
     assert_eq!(
         null_engine
             .read_state
@@ -484,9 +486,11 @@ fn resident_named_index_publication_and_mutation_omit_indexed_nulls() {
     mutation
         .execute_text(5, "INSERT INTO nullable_mut VALUES (3, NULL)")
         .expect("enrolled unique index admits a second NULL posting");
-    assert!(mutation
-        .execute_text(6, "INSERT INTO nullable_mut VALUES (4, 5)")
-        .is_err());
+    assert!(
+        mutation
+            .execute_text(6, "INSERT INTO nullable_mut VALUES (4, 5)")
+            .is_err()
+    );
     assert_eq!(
         mutation
             .execute_relational_select_text("SELECT id, code FROM nullable_mut ORDER BY id")

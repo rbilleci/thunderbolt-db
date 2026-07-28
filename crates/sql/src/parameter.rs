@@ -557,4 +557,25 @@ mod tests {
         );
         assert!(crate::ParsedCommand::parse(&lowered).is_ok());
     }
+
+    #[test]
+    fn temporal_parameters_render_and_reparse_postgresql_bc_text_at_finite_lower_boundaries() {
+        let lowered = lower_sql_parameters(
+            "INSERT INTO temporal_boundary (d, t) VALUES ($1, $2)",
+            &[
+                SqlValue::Date(crate::datetime::PG_DATE_MIN_DAYS),
+                SqlValue::Timestamp(crate::datetime::PG_TIMESTAMP_MIN_MICROS),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            lowered,
+            "INSERT INTO temporal_boundary (d, t) VALUES ('4714-11-24 BC'::date, \
+             '4714-11-24 00:00:00 BC'::timestamp)"
+        );
+        assert!(
+            crate::ParsedCommand::parse(&lowered).is_ok(),
+            "the canonical parameter source must remain coercible through the SQL parser"
+        );
+    }
 }

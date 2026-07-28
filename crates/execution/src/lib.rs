@@ -49,9 +49,16 @@ mod resident_visible_digest;
 use resident_visible_digest::launch_cuda_resident_visible_digest;
 pub use resident_visible_digest::{CudaVisibleDigestColumn, CudaVisibleSourceDigest};
 mod resident_index_build;
+#[cfg(test)]
+pub(crate) use resident_index_build::{
+    fail_next_prepared_resident_typed_indexes_insert_after_launch,
+    fail_next_prepared_resident_typed_indexes_insert_after_leases,
+    prepared_resident_typed_indexes_insert_counters,
+};
 pub use resident_index_build::{
-    resident_index_allocated_bytes, resident_index_hash_bytes, CudaResidentIndexStatus,
-    CudaResidentTypedIndexInsert,
+    resident_index_allocated_bytes, resident_index_hash_bytes,
+    resident_typed_indexes_insert_preparation_bytes, CudaResidentIndexStatus,
+    CudaResidentTypedIndexInsert, PreparedResidentTypedIndexesInsert,
 };
 mod resident_sort;
 use resident_sort::{
@@ -122,6 +129,17 @@ pub use derived_column::{
 mod predicate_mask;
 pub use predicate_mask::CudaPredicateMaskI32;
 use predicate_mask::{compact_mask_i32_to_indices, retain_predicate_mask_i32};
+mod insert_key_verdict;
+pub use insert_key_verdict::{
+    insert_batch_key_verdict_scratch_bytes, CudaInsertBatchKeyVerdict, CudaInsertBatchNull,
+    INSERT_BATCH_KEY_VERDICT_READBACK_BYTES,
+};
+mod insert_resident_key_verdict;
+pub use insert_resident_key_verdict::{
+    insert_resident_key_verdict_scratch_bytes, CudaInsertResidentKeyShard,
+    CudaInsertResidentKeySidecar, CudaInsertResidentKeyVerdict,
+    INSERT_RESIDENT_KEY_VERDICT_READBACK_BYTES,
+};
 mod version_conflict;
 pub use version_conflict::CudaVersionConflictVerdict;
 mod resident_gather;

@@ -149,7 +149,7 @@ pub enum SelectFilterOp {
 }
 
 impl SelectFilterOp {
-    fn flipped(self) -> Self {
+    pub(super) fn flipped(self) -> Self {
         match self {
             Self::Eq => Self::Eq,
             Self::Lt => Self::Gt,
@@ -599,7 +599,7 @@ fn parse_select_like_prefix_filter(input: &str) -> Result<Option<SelectFilter>, 
     }))
 }
 
-fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
+pub(super) fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
     for (token, op) in [
         ("<=", SelectFilterOp::Lte),
         (">=", SelectFilterOp::Gte),

@@ -5,12 +5,15 @@
 
 use super::*;
 
+mod datetime;
 mod row_codec;
 // Preserve the former crate-private facade for codec-focused tests and future internal callers;
 // some build modes do not consume the direct cell/split helpers.
+pub(crate) use datetime::{coerce_datetime_text, validate_datetime_carrier};
 #[allow(unused_imports)]
 pub(crate) use row_codec::{
-    decode_relational_row, decode_relational_value, encode_relational_row, split_escaped_row,
+    append_relational_cell, decode_relational_row, decode_relational_value, encode_relational_row,
+    split_escaped_row, RelationalCellRef,
 };
 
 pub(crate) fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
@@ -85,22 +88,10 @@ pub(crate) fn coerce_insert_value(
     if let SqlValue::Text(text) = &value {
         match ty {
             SqlType::Date => {
-                return gpu_db_sql::datetime::parse_date(text)
-                    .map(SqlValue::Date)
-                    .ok_or_else(|| {
-                        EngineError::ApplyFailed(format!(
-                            "invalid input syntax for type date: \"{text}\""
-                        ))
-                    });
+                return coerce_datetime_text(text, ty);
             }
             SqlType::Timestamp => {
-                return gpu_db_sql::datetime::parse_timestamp(text)
-                    .map(SqlValue::Timestamp)
-                    .ok_or_else(|| {
-                        EngineError::ApplyFailed(format!(
-                            "invalid input syntax for type timestamp: \"{text}\""
-                        ))
-                    });
+                return coerce_datetime_text(text, ty);
             }
             SqlType::Uuid => {
                 return gpu_db_sql::uuid::parse_uuid(text)
@@ -120,6 +111,7 @@ pub(crate) fn coerce_insert_value(
             "invalid value for column \"{column_name}\""
         )));
     }
+    validate_datetime_carrier(&value, ty)?;
     match (value, ty) {
         (SqlValue::Numeric(decimal), SqlType::Numeric { precision, scale }) => {
             let rescaled = decimal.rescale(scale).map_err(|_| {
@@ -136,6 +128,276 @@ pub(crate) fn coerce_insert_value(
     }
 }
 
+/// Resolve a CHECK predicate literal and its concrete catalog RHS input/cast type.
+///
+/// This is intentionally NOT an INSERT assignment cast: unknown SQL strings are parsed at their
+/// comparison target without NUMERIC typmod rounding, while known numeric-tower values use only
+/// comparison coercions. The raw AST/WAL command remains the retry/recovery authority.
+pub(crate) fn resolve_check_comparison_operand(
+    value: SqlValue,
+    provenance: CheckLiteralProvenance,
+    column_ty: SqlType,
+    op: SelectFilterOp,
+    column_name: &str,
+) -> Result<(SqlValue, SqlType), EngineError> {
+    let invalid_value =
+        || EngineError::ApplyFailed(format!("invalid value for column \"{column_name}\""));
+    let provenance = normalize_check_literal_provenance(&value, provenance, &invalid_value)?;
+    let literal = match provenance {
+        CheckLiteralProvenance::Unknown => {
+            resolve_unknown_check_literal(value, column_ty, column_name)?
+        }
+        CheckLiteralProvenance::Known(right_base) => {
+            if !matches!(value, SqlValue::Null) && !literal_matches_type(&value, right_base) {
+                return Err(invalid_value());
+            }
+            if !check_comparison_types_compatible(column_ty, right_base) {
+                return Err(EngineError::UndefinedOperator(format!(
+                    "{} {} {} for CHECK column \"{column_name}\"",
+                    column_ty.catalog_name(),
+                    check_operator_name(op),
+                    right_base.catalog_name()
+                )));
+            }
+            resolve_known_check_literal(value, column_ty, right_base)
+        }
+        CheckLiteralProvenance::LegacyAmbiguous => {
+            unreachable!("legacy provenance normalized above")
+        }
+    };
+
+    if op == SelectFilterOp::LikePrefix
+        && !(column_ty == SqlType::Text && matches!(literal, SqlValue::Text(_)))
+    {
+        return Err(invalid_value());
+    }
+    Ok((
+        literal.clone(),
+        resolved_check_operand_type(provenance, column_ty, &literal),
+    ))
+}
+
+fn resolved_check_operand_type(
+    provenance: CheckLiteralProvenance,
+    column_ty: SqlType,
+    literal: &SqlValue,
+) -> SqlType {
+    match (provenance, literal) {
+        // Unknown binds at the comparison target, including NULL.
+        (CheckLiteralProvenance::Unknown, _) => column_ty,
+        // Preserve a NUMERIC cast typmod: it controls deferred CHECK evaluation.
+        (CheckLiteralProvenance::Known(ty @ SqlType::Numeric { .. }), SqlValue::Numeric(_)) => ty,
+        // Same-family inputs retain their explicit/inferred type. Cross numeric inputs are
+        // represented by the resolved operand type so the catalog cannot carry mismatched value
+        // and metadata shapes.
+        (CheckLiteralProvenance::Known(ty), SqlValue::Null) => ty,
+        (CheckLiteralProvenance::Known(ty), value) if literal_matches_type(value, ty) => ty,
+        (CheckLiteralProvenance::Known(_), value) => {
+            natural_check_literal_type(value).unwrap_or(column_ty)
+        }
+        (CheckLiteralProvenance::LegacyAmbiguous, _) => {
+            unreachable!("legacy provenance normalized")
+        }
+    }
+}
+
+/// Resolve a CHECK predicate literal where the caller needs only the comparison value. DDL
+/// publication uses [`resolve_check_comparison_operand`] so catalog metadata shares the exact
+/// same legacy normalization rule.
+pub(crate) fn resolve_check_comparison_literal(
+    value: SqlValue,
+    provenance: CheckLiteralProvenance,
+    column_ty: SqlType,
+    op: SelectFilterOp,
+    column_name: &str,
+) -> Result<SqlValue, EngineError> {
+    resolve_check_comparison_operand(value, provenance, column_ty, op, column_name)
+        .map(|(value, _)| value)
+}
+
+fn normalize_check_literal_provenance(
+    value: &SqlValue,
+    provenance: CheckLiteralProvenance,
+    invalid_value: &dyn Fn() -> EngineError,
+) -> Result<CheckLiteralProvenance, EngineError> {
+    match provenance {
+        // Pre-provenance WAL cannot tell an uncast string from explicit `::text`. Keep the old
+        // scalar shapes compatible: non-text values retain their natural input type, while Text
+        // and NULL retain the historical target-directed/unknown handling. New parser output
+        // never uses this variant.
+        CheckLiteralProvenance::LegacyAmbiguous => match value {
+            SqlValue::Text(_) | SqlValue::Null => Ok(CheckLiteralProvenance::Unknown),
+            _ => natural_check_literal_type(value)
+                .map(CheckLiteralProvenance::Known)
+                .ok_or_else(invalid_value),
+        },
+        provenance => Ok(provenance),
+    }
+}
+
+fn resolve_unknown_check_literal(
+    value: SqlValue,
+    column_ty: SqlType,
+    column_name: &str,
+) -> Result<SqlValue, EngineError> {
+    // An uncast NULL is unknown and is accepted for every comparable target. The CHECK verdict
+    // machinery later turns its comparison into UNKNOWN, which satisfies the constraint.
+    if matches!(value, SqlValue::Null) {
+        return Ok(value);
+    }
+    let SqlValue::Text(text) = value else {
+        return Err(EngineError::ApplyFailed(format!(
+            "invalid value for column \"{column_name}\""
+        )));
+    };
+    let value = match column_ty {
+        SqlType::Int2 | SqlType::Int4 | SqlType::Int8 => {
+            let parsed = text.parse::<i128>().map_err(|_| {
+                EngineError::InvalidTextRepresentation(format!(
+                    "invalid input syntax for type {}: \"{text}\"",
+                    column_ty.catalog_name()
+                ))
+            })?;
+            match column_ty {
+                SqlType::Int2 => i16::try_from(parsed).map(SqlValue::Int2).map_err(|_| {
+                    EngineError::NumericValueOutOfRange("smallint out of range".to_string())
+                })?,
+                SqlType::Int4 => i32::try_from(parsed).map(SqlValue::Int4).map_err(|_| {
+                    EngineError::NumericValueOutOfRange("integer out of range".to_string())
+                })?,
+                SqlType::Int8 => i64::try_from(parsed).map(SqlValue::Int8).map_err(|_| {
+                    EngineError::NumericValueOutOfRange("bigint out of range".to_string())
+                })?,
+                _ => unreachable!(),
+            }
+        }
+        SqlType::Numeric { .. } => {
+            Decimal128::parse(&text)
+                .map(SqlValue::Numeric)
+                .ok_or_else(|| {
+                    EngineError::InvalidTextRepresentation(format!(
+                        "invalid input syntax for type numeric: \"{text}\""
+                    ))
+                })?
+        }
+        SqlType::Bool => gpu_db_sql::parse_bool_value(&text)
+            .map(SqlValue::Bool)
+            .ok_or_else(|| {
+                EngineError::InvalidTextRepresentation(format!(
+                    "invalid input syntax for type boolean: \"{text}\""
+                ))
+            })?,
+        SqlType::Text => SqlValue::Text(text),
+        SqlType::Date | SqlType::Timestamp => coerce_datetime_text(&text, column_ty)?,
+        SqlType::Uuid => gpu_db_sql::uuid::parse_uuid(&text)
+            .map(SqlValue::Uuid)
+            .ok_or_else(|| {
+                EngineError::InvalidTextRepresentation(format!(
+                    "invalid input syntax for type uuid: \"{text}\""
+                ))
+            })?,
+    };
+    Ok(value)
+}
+
+/// Apply only the comparison matrix for a known literal. This deliberately has no dependency on
+/// the generic filter coercer: CHECK DDL must preserve its source value unless the comparison
+/// itself promotes the integer side to numeric. Operator-base binding is not catalog state in this
+/// slice; the matrix is kept here so a later device lowering can persist it without changing DDL
+/// semantics.
+fn resolve_known_check_literal(value: SqlValue, left: SqlType, right: SqlType) -> SqlValue {
+    match (left, right) {
+        // Integer/integer comparisons retain each side's source type, including a literal that is
+        // outside the column's assignment range (`smallint < 32768`).
+        (left, right) if is_integer_type(left) && is_integer_type(right) => value,
+        // The known literal is already NUMERIC; promote only the column comparison base, not the
+        // literal's scale or mantissa.
+        (left, SqlType::Numeric { .. }) if is_integer_type(left) => value,
+        // A numeric column compared to a known integer is evaluated in the numeric family. Its
+        // literal becomes an exact scale-0 decimal; NULL stays typeless.
+        (SqlType::Numeric { .. }, right) if is_integer_type(right) => {
+            integer_literal_as_numeric(value)
+        }
+        // Numeric/numeric comparisons retain the literal's natural scale.
+        (SqlType::Numeric { .. }, SqlType::Numeric { .. }) => value,
+        // The compatibility gate already ruled out all cross-family cases.
+        _ => value,
+    }
+}
+
+fn is_integer_type(ty: SqlType) -> bool {
+    matches!(ty, SqlType::Int2 | SqlType::Int4 | SqlType::Int8)
+}
+
+fn integer_literal_as_numeric(value: SqlValue) -> SqlValue {
+    match value {
+        SqlValue::Int2(value) => SqlValue::Numeric(Decimal128::new(i128::from(value), 0)),
+        SqlValue::Int4(value) => SqlValue::Numeric(Decimal128::new(i128::from(value), 0)),
+        SqlValue::Int8(value) => SqlValue::Numeric(Decimal128::new(i128::from(value), 0)),
+        SqlValue::Null => SqlValue::Null,
+        _ => unreachable!("known integer literal type was validated before numeric promotion"),
+    }
+}
+
+fn natural_check_literal_type(value: &SqlValue) -> Option<SqlType> {
+    match value {
+        SqlValue::Int2(_) => Some(SqlType::Int2),
+        SqlValue::Int4(_) => Some(SqlType::Int4),
+        SqlValue::Int8(_) => Some(SqlType::Int8),
+        SqlValue::Numeric(value) => Some(SqlType::Numeric {
+            precision: NUMERIC_DEFAULT_PRECISION,
+            scale: value.scale,
+        }),
+        SqlValue::Bool(_) => Some(SqlType::Bool),
+        SqlValue::Date(_) => Some(SqlType::Date),
+        SqlValue::Timestamp(_) => Some(SqlType::Timestamp),
+        SqlValue::Uuid(_) => Some(SqlType::Uuid),
+        SqlValue::Null | SqlValue::Text(_) | SqlValue::Parameter { .. } => None,
+    }
+}
+
+fn literal_matches_type(value: &SqlValue, ty: SqlType) -> bool {
+    matches!(
+        (value, ty),
+        (SqlValue::Int2(_), SqlType::Int2)
+            | (SqlValue::Int4(_), SqlType::Int4)
+            | (SqlValue::Int8(_), SqlType::Int8)
+            | (SqlValue::Numeric(_), SqlType::Numeric { .. })
+            | (SqlValue::Bool(_), SqlType::Bool)
+            | (SqlValue::Text(_), SqlType::Text)
+            | (SqlValue::Date(_), SqlType::Date)
+            | (SqlValue::Timestamp(_), SqlType::Timestamp)
+            | (SqlValue::Uuid(_), SqlType::Uuid)
+    )
+}
+
+fn check_comparison_types_compatible(left: SqlType, right: SqlType) -> bool {
+    matches!(
+        (left, right),
+        (
+            SqlType::Int2 | SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. },
+            SqlType::Int2 | SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. }
+        ) | (SqlType::Bool, SqlType::Bool)
+            | (SqlType::Text, SqlType::Text)
+            | (SqlType::Date, SqlType::Date)
+            | (SqlType::Timestamp, SqlType::Timestamp)
+            | (SqlType::Date, SqlType::Timestamp)
+            | (SqlType::Timestamp, SqlType::Date)
+            | (SqlType::Uuid, SqlType::Uuid)
+    )
+}
+
+fn check_operator_name(op: SelectFilterOp) -> &'static str {
+    match op {
+        SelectFilterOp::Eq => "=",
+        SelectFilterOp::Lt => "<",
+        SelectFilterOp::Lte => "<=",
+        SelectFilterOp::Gt => ">",
+        SelectFilterOp::Gte => ">=",
+        SelectFilterOp::LikePrefix => "LIKE",
+    }
+}
+
 /// Coerce a column DEFAULT to `ty` with the same lossless integer→numeric widening and
 /// scale/precision handling as an INSERT value, so a cross-type default literal
 /// (`bal NUMERIC DEFAULT 0`, `big BIGINT DEFAULT 5`) is accepted and stored at the
@@ -148,21 +410,7 @@ pub(crate) fn coerce_column_default(
     ty: SqlType,
     column_name: &str,
 ) -> Result<ColumnDefault, EngineError> {
-    match default {
-        ColumnDefault::Literal(value) => Ok(ColumnDefault::Literal(coerce_insert_value(
-            value,
-            ty,
-            column_name,
-        )?)),
-        ColumnDefault::SequenceNextVal { .. } => {
-            if ty != SqlType::Int4 {
-                return Err(EngineError::ApplyFailed(format!(
-                    "invalid default for column \"{column_name}\""
-                )));
-            }
-            Ok(default)
-        }
-    }
+    bind_to_column(default, ty, column_name)
 }
 
 /// Whether `mantissa` needs more than `precision` significant decimal digits (the
@@ -243,15 +491,11 @@ pub(crate) fn coerce_filter_literal(value: SqlValue, column_ty: SqlType) -> SqlV
 
 pub(crate) fn add_column_default_supported(default: &ColumnDefault) -> bool {
     match default {
-        ColumnDefault::Literal(_) => true,
+        ColumnDefault::Literal(_) | ColumnDefault::DeferredScalar { .. } => true,
         ColumnDefault::SequenceNextVal {
             create_if_missing, ..
         } => !create_if_missing,
     }
-}
-
-pub(crate) fn sequence_defaults(columns: &[ColumnDef]) -> impl Iterator<Item = &ColumnDefault> {
-    columns.iter().filter_map(|column| column.default.as_ref())
 }
 
 pub(crate) fn relational_row_key(table: &str, row_id: u64) -> String {
@@ -331,7 +575,10 @@ pub(crate) fn render_relational_insert(insert: &Insert) -> Result<String, Engine
         .map(|row| {
             let rendered_values = row
                 .iter()
-                .map(render_sql_value_literal)
+                .map(|cell| match cell {
+                    InsertCell::Value { value, .. } => render_sql_value_literal(value),
+                    InsertCell::Default { .. } => Ok("DEFAULT".to_string()),
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("({})", rendered_values.join(", ")))
         })

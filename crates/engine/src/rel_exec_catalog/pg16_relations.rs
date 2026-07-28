@@ -128,13 +128,8 @@ pub(super) fn synthesize_pg_attrdef(
             let Some(default) = &column.default else {
                 continue;
             };
-            let expression = match default {
-                ColumnDefault::Literal(value) => pg16_column_default_expression(value)
-                    .expect("catalog defaults never retain unbound parameters"),
-                ColumnDefault::SequenceNextVal { sequence, .. } => {
-                    format!("nextval('{}'::regclass)", sequence.replace('\'', "''"))
-                }
-            };
+            let expression = render_expression(default)
+                .expect("catalog defaults never retain unbound parameters");
             let oid = relation
                 .oid
                 .wrapping_mul(128)

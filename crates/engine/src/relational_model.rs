@@ -58,6 +58,18 @@ pub struct RelationalCheckConstraint {
     pub column: String,
     pub op: SelectFilterOp,
     pub value: SqlValue,
+    /// Concrete catalog-resolved RHS input/cast type. Legacy and uncast inputs are normalized to
+    /// the comparison column type; explicit casts retain their type, including `numeric(p,s)`.
+    pub resolved_input_type: SqlType,
+    /// Schema-digest encoding ownership, separate from the concrete execution operand type.
+    /// Historical WAL gets `LegacyV1`; any current parsed CHECK gets `ResolvedV2`.
+    pub identity_version: CheckOperandIdentityVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckOperandIdentityVersion {
+    LegacyV1,
+    ResolvedV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

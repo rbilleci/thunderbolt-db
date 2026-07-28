@@ -215,6 +215,10 @@ pub enum ErrorCategory {
     ForeignKeyViolation,
     CheckViolation,
     NumericValueOutOfRange,
+    InvalidDatetimeFormat,
+    DatetimeFieldOverflow,
+    InvalidTextRepresentation,
+    UndefinedOperator,
     Engine,
     Internal,
     /// A retryable Snapshot-Isolation write-write serialization conflict (write-half MVCC, Stage 4):
@@ -1844,12 +1848,7 @@ fn in_failed_transaction_error() -> DbError {
 }
 
 fn map_parse_error(err: ParseError) -> DbError {
-    let category = match &err {
-        ParseError::Unsupported(source) if gpu_db_sql::is_copy_statement(source) => {
-            ErrorCategory::Unsupported
-        }
-        _ => ErrorCategory::Syntax,
-    };
+    let category = parse_error_category(&err);
     DbError {
         category,
         message: match err {
@@ -1867,6 +1866,19 @@ fn map_parse_error(err: ParseError) -> DbError {
     }
 }
 
+fn parse_error_category(err: &ParseError) -> ErrorCategory {
+    match err {
+        ParseError::Unsupported(source) if gpu_db_sql::is_copy_statement(source) => {
+            ErrorCategory::Unsupported
+        }
+        ParseError::NumericValueOutOfRange { .. } => ErrorCategory::NumericValueOutOfRange,
+        ParseError::InvalidDatetimeFormat { .. } => ErrorCategory::InvalidDatetimeFormat,
+        ParseError::DatetimeFieldOverflow { .. } => ErrorCategory::DatetimeFieldOverflow,
+        ParseError::InvalidTextRepresentation { .. } => ErrorCategory::InvalidTextRepresentation,
+        _ => ErrorCategory::Syntax,
+    }
+}
+
 fn map_execute_error(err: ExecuteError) -> DbError {
     // Protocol classification is based only on typed failures. Text remains diagnostic data, so
     // invariant and durability faults continue to map to `Engine`/XX000.
@@ -1880,13 +1892,25 @@ fn map_execute_error(err: ExecuteError) -> DbError {
         ErrorCategory::CheckViolation
     } else if err.is_numeric_value_out_of_range() {
         ErrorCategory::NumericValueOutOfRange
+    } else if err.is_datatype_mismatch() {
+        ErrorCategory::DatatypeMismatch
+    } else if err.is_invalid_datetime_format() {
+        ErrorCategory::InvalidDatetimeFormat
+    } else if err.is_datetime_field_overflow() {
+        ErrorCategory::DatetimeFieldOverflow
+    } else if err.is_invalid_text_representation() {
+        ErrorCategory::InvalidTextRepresentation
+    } else if err.is_undefined_operator() {
+        ErrorCategory::UndefinedOperator
     } else if err.is_duplicate_column() {
         ErrorCategory::DuplicateColumn
+    } else if err.is_undefined_relation() {
+        ErrorCategory::UndefinedRelation
     } else if err.is_undefined_column() {
         ErrorCategory::UndefinedColumn
     } else {
         match &err {
-            ExecuteError::Parse(_) => ErrorCategory::Syntax,
+            ExecuteError::Parse(error) => parse_error_category(error),
             ExecuteError::NonReadCommand(_) | ExecuteError::Unsupported(_) => {
                 ErrorCategory::Unsupported
             }

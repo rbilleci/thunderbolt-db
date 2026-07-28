@@ -1183,6 +1183,330 @@ fn ordinary_default_transition_precedes_and_is_referenced_by_user_wal() {
 }
 
 #[test]
+fn explicit_sequence_default_cells_use_catalog_order_and_only_requested_cells_transition() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .submit_transaction(
+            7_150,
+            parsed("CREATE SEQUENCE explicit_default_cells_value"),
+        )
+        .unwrap();
+    engine
+        .submit_transaction(
+            7_151,
+            parsed(
+                "CREATE TABLE explicit_default_cells \
+                 (a INT DEFAULT nextval('explicit_default_cells_value'::regclass), \
+                  b INT DEFAULT nextval('explicit_default_cells_value'::regclass), \
+                  marker INT UNIQUE)",
+            ),
+        )
+        .unwrap();
+
+    // PostgreSQL evaluates volatile defaults row-major and then in catalog-column order, rather
+    // than INSERT source-column order. The source says (b, a), but a receives 1 and b receives 2.
+    let reversed_source = "INSERT INTO explicit_default_cells (b, a, marker) \
+                           VALUES (DEFAULT, DEFAULT, 1)";
+    let command = parsed(reversed_source);
+    assert!(engine.insert_sequence_default_route(command.command()).0);
+    let wal_before = engine.durable_wal_records().len();
+    let TransactionAdmissionResult::Dml(result) =
+        engine.submit_transaction(7_200, command).unwrap()
+    else {
+        panic!("explicit sequence defaults must use the DML route");
+    };
+    assert_eq!(result.rows_affected, 1);
+    let records = engine.durable_wal_records();
+    let transitions = records[wal_before..]
+        .iter()
+        .filter_map(|record| {
+            let payload = operation_payload(record);
+            let BinaryWalRecord::SequenceValueTransition(transition) =
+                decode_binary_record(&payload).unwrap()
+            else {
+                return None;
+            };
+            Some((
+                transition.statement_ordinal,
+                transition.expression_ordinal,
+                transition.returned_value,
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(transitions, vec![(0, 0, 1), (0, 1, 2)]);
+
+    // Both sequence-default columns are present in this statement, but each row asks for just
+    // one. Reserve the skipped potential positions so the durable expression identities remain
+    // row-major/catalog-order coordinates.
+    let wal_before = engine.durable_wal_records().len();
+    let TransactionAdmissionResult::Dml(result) = engine
+        .submit_transaction(
+            7_300,
+            parsed(
+                "INSERT INTO explicit_default_cells (b, a, marker) \
+                 VALUES (DEFAULT, 40, 2), (50, DEFAULT, 3)",
+            ),
+        )
+        .unwrap()
+    else {
+        panic!("mixed explicit defaults must use the DML route");
+    };
+    assert_eq!(result.rows_affected, 2);
+    let records = engine.durable_wal_records();
+    let transitions = records[wal_before..]
+        .iter()
+        .filter_map(|record| {
+            let payload = operation_payload(record);
+            let BinaryWalRecord::SequenceValueTransition(transition) =
+                decode_binary_record(&payload).unwrap()
+            else {
+                return None;
+            };
+            Some((transition.expression_ordinal, transition.returned_value))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(transitions, vec![(1, 3), (2, 4)]);
+
+    // The implicit target list is catalog ordered too. Explicit NULL and scalar literals are
+    // supplied values, so neither can take the sequence-default transition route.
+    let implicit_default =
+        parsed("INSERT INTO explicit_default_cells VALUES (DEFAULT, DEFAULT, 4)");
+    assert!(
+        engine
+            .insert_sequence_default_route(implicit_default.command())
+            .0
+    );
+    let TransactionAdmissionResult::Dml(result) =
+        engine.submit_transaction(7_400, implicit_default).unwrap()
+    else {
+        panic!("implicit catalog-order defaults must use the DML route");
+    };
+    assert_eq!(result.rows_affected, 1);
+    let literal = parsed("INSERT INTO explicit_default_cells (a, b, marker) VALUES (99, 100, 7)");
+    assert!(!engine.insert_sequence_default_route(literal.command()).0);
+    let literal_result = engine.submit_transaction(7_500, literal).unwrap();
+    assert!(matches!(
+        literal_result,
+        TransactionAdmissionResult::Command
+    ));
+    let null = parsed("INSERT INTO explicit_default_cells (a, b, marker) VALUES (NULL, 100, 8)");
+    assert!(!engine.insert_sequence_default_route(null.command()).0);
+    assert!(matches!(
+        engine.submit_transaction(7_600, null).unwrap(),
+        TransactionAdmissionResult::Command
+    ));
+    assert_eq!(
+        engine
+            .relational_catalog_sequence("explicit_default_cells_value")
+            .unwrap()
+            .last_value,
+        6,
+        "explicit NULL and literal values must not consume the sequence"
+    );
+
+    // An omitted published default remains a per-row request, not a single statement request.
+    let omitted = parsed("INSERT INTO explicit_default_cells (marker) VALUES (5), (6)");
+    assert!(engine.insert_sequence_default_route(omitted.command()).0);
+    let TransactionAdmissionResult::Dml(result) =
+        engine.submit_transaction(7_700, omitted).unwrap()
+    else {
+        panic!("omitted published defaults must use the DML route");
+    };
+    assert_eq!(result.rows_affected, 2);
+
+    // Bind keeps DEFAULT as a semantic request while preserving the parameter's bound provenance.
+    engine
+        .submit_transaction(
+            7_800,
+            parsed(
+                "CREATE TABLE prepared_explicit_default_cell \
+                 (id INT DEFAULT nextval('explicit_default_cells_value'::regclass), \
+                  marker INT UNIQUE)",
+            ),
+        )
+        .unwrap();
+    let bound = gpu_db_sql::PreparedCommand::parse(
+        "INSERT INTO prepared_explicit_default_cell (id, marker) VALUES (DEFAULT, $1)",
+    )
+    .unwrap()
+    .bind(&[SqlValue::Int4(77)])
+    .unwrap();
+    let Command::Insert(insert) = bound.command() else {
+        panic!("bound statement must retain INSERT semantics");
+    };
+    assert!(matches!(
+        insert.rows[0][0],
+        InsertCell::Default {
+            provenance: gpu_db_sql::InsertDefaultProvenance::SqlKeyword
+        }
+    ));
+    assert!(matches!(
+        insert.rows[0][1],
+        InsertCell::Value {
+            value: SqlValue::Int4(77),
+            provenance: gpu_db_sql::InsertValueProvenance::BoundParameter { index: 1 }
+        }
+    ));
+    assert!(engine.insert_sequence_default_route(bound.command()).0);
+    let TransactionAdmissionResult::Dml(result) = engine.submit_transaction(7_900, bound).unwrap()
+    else {
+        panic!("prepared explicit DEFAULT must use the DML route");
+    };
+    assert_eq!(result.rows_affected, 1);
+
+    // DEFAULT remains an ordinary literal default when the published column is not nextval.
+    engine
+        .submit_transaction(
+            8_000,
+            parsed(
+                "CREATE TABLE literal_explicit_default_cell \
+                 (id INT DEFAULT 19, marker INT UNIQUE)",
+            ),
+        )
+        .unwrap();
+    let literal_default =
+        parsed("INSERT INTO literal_explicit_default_cell (id, marker) VALUES (DEFAULT, 1)");
+    assert!(
+        !engine
+            .insert_sequence_default_route(literal_default.command())
+            .0
+    );
+    assert!(matches!(
+        engine.submit_transaction(8_100, literal_default).unwrap(),
+        TransactionAdmissionResult::Command | TransactionAdmissionResult::Dml(_)
+    ));
+    assert_eq!(
+        durable_ids(&engine, "literal_explicit_default_cell"),
+        vec![19]
+    );
+
+    let Command::Select(select) =
+        parse_command("SELECT a, b, marker FROM explicit_default_cells ORDER BY marker").unwrap()
+    else {
+        panic!("expected SELECT");
+    };
+    assert_eq!(
+        engine.execute_relational_select(&select).unwrap().rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int4(1)],
+            vec![SqlValue::Int4(40), SqlValue::Int4(3), SqlValue::Int4(2)],
+            vec![SqlValue::Int4(4), SqlValue::Int4(50), SqlValue::Int4(3)],
+            vec![SqlValue::Int4(5), SqlValue::Int4(6), SqlValue::Int4(4)],
+            vec![SqlValue::Int4(7), SqlValue::Int4(8), SqlValue::Int4(5)],
+            vec![SqlValue::Int4(9), SqlValue::Int4(10), SqlValue::Int4(6)],
+            vec![SqlValue::Int4(99), SqlValue::Int4(100), SqlValue::Int4(7)],
+            vec![SqlValue::Null, SqlValue::Int4(100), SqlValue::Int4(8)],
+        ]
+    );
+}
+
+#[test]
+fn explicit_sequence_default_gap_retry_recovery_preserves_nontransactional_transition() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .submit_transaction(7_170, parsed("CREATE SEQUENCE explicit_default_gap_value"))
+        .unwrap();
+    engine
+        .submit_transaction(
+            7_171,
+            parsed(
+                "CREATE TABLE explicit_default_gap \
+                 (id INT DEFAULT nextval('explicit_default_gap_value'::regclass), \
+                  marker INT UNIQUE)",
+            ),
+        )
+        .unwrap();
+
+    let first = parsed("INSERT INTO explicit_default_gap (id, marker) VALUES (DEFAULT, 1)");
+    assert!(engine.insert_sequence_default_route(first.command()).0);
+    let TransactionAdmissionResult::Dml(result) = engine.submit_transaction(7_200, first).unwrap()
+    else {
+        panic!("explicit DEFAULT must enter the sequence DML route");
+    };
+    assert_eq!(result.rows_affected, 1);
+
+    let failing = "INSERT INTO explicit_default_gap (id, marker) VALUES (DEFAULT, 1)";
+    let wal_before_failure = engine.durable_wal_records().len();
+    let failure = engine
+        .submit_transaction(7_300, parsed(failing))
+        .unwrap_err();
+    assert_eq!(
+        engine
+            .relational_catalog_sequence("explicit_default_gap_value")
+            .unwrap()
+            .last_value,
+        2,
+        "a failed explicit DEFAULT statement keeps its independently durable gap: {failure}"
+    );
+    assert_eq!(engine.durable_wal_records().len(), wal_before_failure + 1);
+    assert!(engine.submit_transaction(7_300, parsed(failing)).is_err());
+    assert_eq!(
+        engine.durable_wal_records().len(),
+        wal_before_failure + 1,
+        "the exact retry reuses its durable explicit-default transition"
+    );
+
+    let TransactionAdmissionResult::Dml(result) = engine
+        .submit_transaction(
+            7_400,
+            parsed("INSERT INTO explicit_default_gap (id, marker) VALUES (DEFAULT, 3)"),
+        )
+        .unwrap()
+    else {
+        panic!("explicit DEFAULT success must return DML metadata");
+    };
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(durable_ids(&engine, "explicit_default_gap"), vec![1, 3]);
+
+    engine.submit_transaction(7_500, parsed("BEGIN")).unwrap();
+    engine
+        .submit_transaction(
+            7_500,
+            parsed("INSERT INTO explicit_default_gap (id, marker) VALUES (DEFAULT, 4)"),
+        )
+        .unwrap();
+    engine
+        .submit_transaction(7_500, parsed("ROLLBACK"))
+        .unwrap();
+    assert_eq!(durable_ids(&engine, "explicit_default_gap"), vec![1, 3]);
+    assert_eq!(
+        engine
+            .relational_catalog_sequence("explicit_default_gap_value")
+            .unwrap()
+            .last_value,
+        4,
+        "explicit DEFAULT remains nontransactional across user rollback"
+    );
+
+    let records = engine.durable_wal_records();
+    let recovered = Engine::recover_from_durable_wal(&records).unwrap();
+    assert_eq!(durable_ids(&recovered, "explicit_default_gap"), vec![1, 3]);
+    assert_eq!(
+        recovered
+            .relational_catalog_sequence("explicit_default_gap_value")
+            .unwrap()
+            .last_value,
+        4
+    );
+    let recovered_wal_before_retry = recovered.durable_wal_records().len();
+    let TransactionAdmissionResult::Dml(retry) = recovered
+        .submit_transaction(
+            7_400,
+            parsed("INSERT INTO explicit_default_gap (id, marker) VALUES (DEFAULT, 3)"),
+        )
+        .unwrap()
+    else {
+        panic!("recovered explicit DEFAULT retry must resolve terminal DML metadata");
+    };
+    assert_eq!(retry.rows_affected, 1);
+    assert_eq!(
+        recovered.durable_wal_records().len(),
+        recovered_wal_before_retry,
+        "recovery retry must append no duplicate transition or user envelope"
+    );
+}
+
+#[test]
 fn failed_default_retry_reuses_the_durable_expression_identity() {
     let engine = Engine::new_local_test_engine();
     engine

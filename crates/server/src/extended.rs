@@ -1646,6 +1646,7 @@ fn codec_error(error: pg_adapter::PgValueCodecError, kind: &str) -> ExtendedErro
         pg_adapter::PgValueCodecError::InvalidValue { format: 1, .. } => "22P03",
         pg_adapter::PgValueCodecError::InvalidValue { .. } => "22P02",
         pg_adapter::PgValueCodecError::NumericValueOutOfRange { .. } => "22003",
+        pg_adapter::PgValueCodecError::DatetimeFieldOverflow { .. } => "22008",
         pg_adapter::PgValueCodecError::UnsupportedFormat(_) => "22023",
         _ => "0A000",
     };
@@ -1657,13 +1658,19 @@ fn parameter_codec_error(
     oid: u32,
     value: Option<&[u8]>,
 ) -> ExtendedError {
-    if matches!(
-        &error,
-        pg_adapter::PgValueCodecError::InvalidValue { format: 0, .. }
-    ) {
+    if let pg_adapter::PgValueCodecError::InvalidValue {
+        logical_type,
+        format: 0,
+    } = &error
+    {
         let value = value.map_or_else(String::new, |raw| String::from_utf8_lossy(raw).into_owned());
+        let code = if matches!(logical_type, LogicalType::Date | LogicalType::Timestamp) {
+            "22007"
+        } else {
+            "22P02"
+        };
         return ExtendedError::new(
-            "22P02",
+            code,
             format!("invalid input syntax for parameter type oid {oid}: {value:?}"),
         );
     }

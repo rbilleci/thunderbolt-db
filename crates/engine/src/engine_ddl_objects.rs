@@ -653,13 +653,59 @@ impl Engine {
         self.preflight_column_default_target_with_replay_policy(default, true)
     }
 
+    /// Phase one of `nextval(regclass)` default validation.  Resolve only the explicit
+    /// regclass name before assignment binding so an absent target wins over a later type
+    /// mismatch.  An existing non-sequence deliberately proceeds to the binder; phase two
+    /// (`preflight_column_default_target`) validates its relation kind after a successful bind.
+    pub(crate) fn preflight_column_default_target_before_binding(
+        &self,
+        default: &ColumnDefault,
+    ) -> Result<(), EngineError> {
+        self.preflight_column_default_target_before_binding_with_replay_policy(default, false)
+    }
+
+    pub(crate) fn preflight_column_default_target_before_binding_legacy_replay(
+        &self,
+        default: &ColumnDefault,
+    ) -> Result<(), EngineError> {
+        self.preflight_column_default_target_before_binding_with_replay_policy(default, true)
+    }
+
+    fn preflight_column_default_target_before_binding_with_replay_policy(
+        &self,
+        default: &ColumnDefault,
+        legacy_replay: bool,
+    ) -> Result<(), EngineError> {
+        match default {
+            ColumnDefault::Literal(_) | ColumnDefault::DeferredScalar { .. } => Ok(()),
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: true,
+            } if legacy_replay => self.preflight_implicit_sequence_name_legacy_replay(sequence),
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: true,
+            } => self.preflight_implicit_sequence_name(sequence),
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: false,
+            } if legacy_replay || self.apply_uses_legacy_index_semantics() => {
+                self.preflight_explicit_regclass_target_exists_legacy_replay(sequence)
+            }
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: false,
+            } => self.preflight_explicit_regclass_target_exists(sequence),
+        }
+    }
+
     fn preflight_column_default_target_with_replay_policy(
         &self,
         default: &ColumnDefault,
         legacy_replay: bool,
     ) -> Result<(), EngineError> {
         match default {
-            ColumnDefault::Literal(_) => Ok(()),
+            ColumnDefault::Literal(_) | ColumnDefault::DeferredScalar { .. } => Ok(()),
             ColumnDefault::SequenceNextVal {
                 sequence,
                 create_if_missing: true,
@@ -676,6 +722,34 @@ impl Engine {
                 sequence,
                 create_if_missing: false,
             } => self.preflight_sequence_target(sequence),
+        }
+    }
+
+    fn preflight_explicit_regclass_target_exists(&self, name: &str) -> Result<(), EngineError> {
+        if self
+            .catalog_snapshot()
+            .pg_class_relation_kind(name)?
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(EngineError::UndefinedRelation(name.to_string()))
+        }
+    }
+
+    fn preflight_explicit_regclass_target_exists_legacy_replay(
+        &self,
+        name: &str,
+    ) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
+        // Legacy WAL has one acknowledged sequence/index shadow case.  Retain its sequence
+        // binding while current catalog resolution rejects the post-epoch ambiguity.
+        if cat.relational_sequences.contains_key(name)
+            || cat.pg_class_relation_kind(name)?.is_some()
+        {
+            Ok(())
+        } else {
+            Err(EngineError::UndefinedRelation(name.to_string()))
         }
     }
 
@@ -728,9 +802,13 @@ impl Engine {
         &self,
         cat: &mut DdlCatalogState,
         default: &ColumnDefault,
+        target: SqlType,
+        column_name: &str,
     ) -> Result<SqlValue, EngineError> {
         match default {
-            ColumnDefault::Literal(value) => Ok(value.clone()),
+            ColumnDefault::Literal(_) | ColumnDefault::DeferredScalar { .. } => {
+                evaluate_scalar(default, target, column_name)
+            }
             ColumnDefault::SequenceNextVal { sequence, .. } => {
                 let value = self.apply_sequence_nextval(
                     cat,
@@ -747,19 +825,20 @@ impl Engine {
         }
     }
 
-    /// PURE column-default evaluation for `prepare_insert` (write-half MVCC, Stage 2). Identical
-    /// arithmetic to [`Engine::evaluate_column_default`] / [`Engine::apply_sequence_nextval`], but
-    /// `nextval` advances a per-call `seq_state` scratch (seeded lazily from the engine's sequence
-    /// catalog) instead of mutating `self`. The scratch's final `(last_value, is_called)` per
-    /// sequence is installed by `apply_delta`, so a prepare→apply pair advances the sequence by
-    /// exactly what the old in-line apply did — while prepare stays `&self`.
+    /// PURE per-row sequence-default evaluation for `prepare_insert` (write-half MVCC, Stage 2).
+    /// Scalar defaults are resolved once per requested column before row lowering; only `nextval`
+    /// reaches this helper because it advances a per-call `seq_state` scratch (seeded lazily from
+    /// the engine's sequence catalog) instead of mutating `self`. The scratch's final
+    /// `(last_value, is_called)` per sequence is installed by `apply_delta`, so a prepare→apply
+    /// pair advances the sequence exactly once per requesting row while prepare stays `&self`.
     pub(crate) fn evaluate_column_default_pure(
         &self,
         default: &ColumnDefault,
+        _target: SqlType,
+        _column_name: &str,
         seq_state: &mut BTreeMap<String, (i64, bool)>,
     ) -> Result<SqlValue, EngineError> {
         match default {
-            ColumnDefault::Literal(value) => Ok(value.clone()),
             ColumnDefault::SequenceNextVal { sequence, .. } => {
                 self.preflight_sequence_target(sequence)?;
                 let scoped_snapshot = self.current_transaction_read_snapshot();
@@ -803,6 +882,11 @@ impl Engine {
                         "sequence value is out of range for int4 default".to_string(),
                     )
                 })
+            }
+            ColumnDefault::Literal(_) | ColumnDefault::DeferredScalar { .. } => {
+                Err(EngineError::ApplyFailed(
+                    "scalar default reached the per-row sequence evaluator".to_string(),
+                ))
             }
         }
     }

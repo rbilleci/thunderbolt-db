@@ -20,12 +20,27 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
   Its final audit accepted the Section C whole-loop variance; PERF-002 remains the point-read baseline and floor.
 - **PERF-002 completed and received final independent acceptance on 2026-07-26.** The canonical 1M-row,
   one-caller, production-compact batch-65,536 route is now permanently gated at **260M whole-run lookups/s** in
-  both quick and full report cards. Missing, malformed, duplicate, decoy, zero-prefixed, and below-floor evidence
-  fails closed before Section C.
+  both quick and full report cards. The fixed three-sample rule requires a 2/3 median pass; 1/3 is
+  environment-invalid and 0/3 is candidate-performance failure. Malformed, reused, candidate/config/binary-drifted,
+  or structurally incomplete evidence fails execution-invalid before Section C; GPU/context identity drift is
+  environment-invalid.
 - The accepted clean quick measured **270.893M/p50 116us**. The canonical full card passed the floor at
   **267.086M/p50 117us**, measured **250.007M/p50 139us** out-of-L2 after a **2,303.5s** fixed-fixture build,
   completed A/B/C, and removed its isolated target. Raw out-of-L2 roofline was **1,427.0 GB/s** and grouped
   execution **1,672.9 M-elem/s**; the post-card auditor found no material regression.
+- **WRITE-001 is the active PLAN convergence/migration owner.** Its non-owning contract is
+  [`design/write-001-general-insert-pipeline.md`](design/write-001-general-insert-pipeline.md): all INSERT inputs
+  converge on move-only `TypedInsertBatch` and composable `DeviceInsertPlan`, with the accepted i32 append retained
+  only as a physical strategy beneath the one canonical allocator/WAL/status/apply/poison/publication path.
+- WRITE-001's 2026-07-28 checkpoint accepted device pre-WAL CHECK/primary-key NULL/dense-batch key/current-resident
+  key proof, exact diagnostic ordering, default/sequence error precedence, and an inert test-only indexed in-place
+  append/index-delta ownership proof. The accepted runtime/card seal is tree `e1a7713f633403a9552b9f202fc8c87932fe3305`,
+  diff `eef525f70d0807f1f9ac882a9c675ed849d2fb37849fa7550c2f8e35e4b5ffde`, with 99 staged paths and no drift.
+  HAZARD passed three serial plus two simultaneous cohorts; the canonical card is
+  `target/write001-full-e1a7713f-20260728/runner.log` (SHA-256
+  `1183ab7c8140e778640fa6df38b1973ee79ecb642cfec5b26fd6c3caee56c330`) and received post-card **FINAL ACCEPT**.
+  Its B samples were **247.196M / 266.784M / 273.832M** (median **266.784M**, p50 **113us**); C was
+  **257.313M**, p50 **129us**, after a **460.6s** 48M build.
 - Regenerable benchmark/build state was reduced from about **143 GB to 4.9 GB**. The runner now recreates the
   source-relative temporary directory required by clean quick and exported-full builds.
 - **PRODUCT-001 completed and received final independent acceptance on 2026-07-26.** The superseded listener,
@@ -52,7 +67,8 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**CARD-001** is the sole active **NOW** task: attribute and reduce whole report-card phase and development-cycle wall
-time using INSERT-001's accepted phase records as the before-baseline. **COPY-001** remains blocked on CARD-001.
+**WRITE-001** is the sole active **NOW** task. Resume at the next independently reviewable checkpoint in WRITE-001's
+`PLAN.md` row; do not promote another live operation or authority before that PLAN-owned proof is accepted.
+**CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read
 floor, and INSERT-001's sealed qualification, differential, HAZARD, and canonical-card evidence in `STATUS.md`.

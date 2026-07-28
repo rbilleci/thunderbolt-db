@@ -17,6 +17,9 @@ mod sequence_lifecycle;
 #[path = "tests/view_lifecycle.rs"]
 mod view_lifecycle;
 
+#[path = "tests/temporal_sqlstate.rs"]
+mod temporal_sqlstate;
+
 /// Thread-3 default-on: an unset `GPU_DB_BATCHING` enables batching. A default-started
 /// async server (no env) therefore constructs a `PointLookupBatcher` and routes batchable
 /// point-lookups through it. (Decoded via the pure helper so the test does not mutate

@@ -33,6 +33,10 @@ pub struct InsertProbeSnapshot {
     pub predicted_row_keys_materialized: u64,
     /// Direct fixed-width carriers materialized without a `WriteDelta` or predicted row keys.
     pub direct_fixed_insert_carriers: u64,
+    /// GPU CHECK mask launches from the typed pre-queue row-local proof.
+    pub row_local_check_launches: u64,
+    /// One-u32 device terminal verdicts read for those typed CHECK masks.
+    pub row_local_check_verdicts: u64,
     /// Calls to the sole canonical request-identity digest derivation constructor. This is the
     /// engine's parser-delimited request domain, not raw pgwire Query-message attribution.
     pub raw_request_digest_derivations: u64,
@@ -210,6 +214,8 @@ impl InsertProbeSnapshot {
             legacy_insert_delta_builds: delta!(legacy_insert_delta_builds),
             predicted_row_keys_materialized: delta!(predicted_row_keys_materialized),
             direct_fixed_insert_carriers: delta!(direct_fixed_insert_carriers),
+            row_local_check_launches: delta!(row_local_check_launches),
+            row_local_check_verdicts: delta!(row_local_check_verdicts),
             raw_request_digest_derivations: delta!(raw_request_digest_derivations),
             raw_request_digest_derivation_bytes: delta!(raw_request_digest_derivation_bytes),
             successful_insert_source_bytes: delta!(successful_insert_source_bytes),
@@ -377,6 +383,8 @@ pub(crate) struct InsertProbeCounters {
     legacy_insert_delta_builds: AtomicU64,
     predicted_row_keys_materialized: AtomicU64,
     direct_fixed_insert_carriers: AtomicU64,
+    row_local_check_launches: AtomicU64,
+    row_local_check_verdicts: AtomicU64,
     raw_request_digest_derivations: AtomicU64,
     raw_request_digest_derivation_bytes: AtomicU64,
     successful_insert_source_bytes: AtomicU64,
@@ -429,6 +437,8 @@ impl InsertProbeCounters {
             legacy_insert_delta_builds: load!(legacy_insert_delta_builds),
             predicted_row_keys_materialized: load!(predicted_row_keys_materialized),
             direct_fixed_insert_carriers: load!(direct_fixed_insert_carriers),
+            row_local_check_launches: load!(row_local_check_launches),
+            row_local_check_verdicts: load!(row_local_check_verdicts),
             raw_request_digest_derivations: load!(raw_request_digest_derivations),
             raw_request_digest_derivation_bytes: load!(raw_request_digest_derivation_bytes),
             successful_insert_source_bytes: load!(successful_insert_source_bytes),
@@ -513,6 +523,16 @@ impl InsertProbeCounters {
 
     fn record_direct_fixed_insert_carrier(&self) {
         self.direct_fixed_insert_carriers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_row_local_check_launch(&self) {
+        self.row_local_check_launches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_row_local_check_verdict(&self) {
+        self.row_local_check_verdicts
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -793,6 +813,14 @@ impl Engine {
 
     pub(crate) fn record_insert_probe_direct_fixed_insert_carrier(&self) {
         self.insert_probe.record_direct_fixed_insert_carrier();
+    }
+
+    pub(crate) fn record_insert_probe_row_local_check_launch(&self) {
+        self.insert_probe.record_row_local_check_launch();
+    }
+
+    pub(crate) fn record_insert_probe_row_local_check_verdict(&self) {
+        self.insert_probe.record_row_local_check_verdict();
     }
 
     /// Build-only accounting for the exact request bytes that canonical identity hashes.

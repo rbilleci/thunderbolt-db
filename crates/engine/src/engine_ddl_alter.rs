@@ -227,9 +227,11 @@ impl Engine {
         cat: &mut DdlCatalogState,
         alter: gpu_db_sql::AlterColumnDefault,
     ) -> Result<(), EngineError> {
-        // Coerce the new default to the column type (parity with INSERT/CREATE) before the
-        // mutable borrow, so `ALTER ... SET DEFAULT 0` on a numeric column is accepted and
-        // stored at the column scale rather than rejected as a type mismatch.
+        // Resolve an explicit nextval regclass name before binding the target type, matching
+        // CREATE and preflight.  A missing target therefore wins over a later assignment
+        // mismatch, while full sequence-kind validation follows the successful bind.  The
+        // coercion remains before the mutable borrow so
+        // `ALTER ... SET DEFAULT 0` on a numeric column is stored at the column scale.
         let coerced_default = if let Some(default) = alter.default {
             let table = cat.relational_catalog.get(&alter.table).ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", alter.table))
@@ -241,6 +243,7 @@ impl Engine {
                 .ok_or_else(|| {
                     EngineError::ApplyFailed(format!("column \"{}\" does not exist", alter.column))
                 })?;
+            self.preflight_column_default_target_before_binding(&default)?;
             let coerced = coerce_column_default(default, column.ty, &alter.column)?;
             self.preflight_column_default_target(&coerced)?;
             Some(coerced)
@@ -271,7 +274,6 @@ impl Engine {
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         let mut column_def = add.column;
-        let (type_oid, type_size) = self.resolve_column_domain_type(&mut column_def)?;
         if cat.relational_views.contains_key(&add.table)
             || cat.relational_materialized_views.contains_key(&add.table)
             || cat.relational_sequences.contains_key(&add.table)
@@ -281,6 +283,22 @@ impl Engine {
                 add.table
             )));
         }
+        // Resolve the structural target before touching DEFAULT semantics.  Keep this ordering
+        // identical to preflight so apply cannot turn missing-table/duplicate-column diagnostics
+        // into a DEFAULT failure.
+        let table = cat
+            .relational_catalog
+            .get(&add.table)
+            .ok_or_else(|| EngineError::UndefinedRelation(add.table.clone()))?
+            .clone();
+        if table
+            .columns
+            .iter()
+            .any(|column| column.name == column_def.name)
+        {
+            return Err(EngineError::DuplicateColumn(column_def.name.clone()));
+        }
+        let (type_oid, type_size) = self.resolve_column_domain_type(&mut column_def)?;
         let Some(default) = column_def.default.clone() else {
             return Err(EngineError::ApplyFailed(
                 "ADD COLUMN requires a supported DEFAULT in the bootstrap relational subset"
@@ -292,29 +310,19 @@ impl Engine {
                 "ADD COLUMN SERIAL is unsupported in the bootstrap relational subset".to_string(),
             ));
         }
-        // Coerce a cross-type default literal to the column type (parity with INSERT/CREATE),
-        // storing it back so both the existing-row backfill and `from_def` use the coerced
-        // value; also re-validates a nextval default against the int4 restriction.
+        // Resolve explicit regclass existence before binding, then validate full sequence kind
+        // only after a successful bind.  Store the coercion so existing-row backfill and
+        // `from_def` share the same durable default expression.
+        self.preflight_column_default_target_before_binding(&default)?;
         let default = coerce_column_default(default, column_def.ty, &column_def.name)?;
-        column_def.default = Some(default.clone());
-        let table = cat
-            .relational_catalog
-            .get(&add.table)
-            .ok_or_else(|| {
-                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
-            })?
-            .clone();
-        if table
-            .columns
-            .iter()
-            .any(|column| column.name == column_def.name)
-        {
-            return Err(EngineError::ApplyFailed(format!(
-                "column \"{}\" of relation \"{}\" already exists",
-                column_def.name, add.table
-            )));
-        }
         self.preflight_column_default_target(&default)?;
+        column_def.default = Some(default.clone());
+        // ADD COLUMN evaluates scalar defaults once at the DDL boundary even for an
+        // empty relation.  The durable expression remains on the new column for
+        // future INSERTs; only the computed scalar is broadcast into rewritten rows.
+        let eager_scalar_default = (!is_sequence(&default))
+            .then(|| evaluate_scalar(&default, column_def.ty, &column_def.name))
+            .transpose()?;
         let row_count = self
             .visible_relational_rows(
                 &table,
@@ -324,7 +332,12 @@ impl Engine {
             )?
             .len();
         let default_values = (0..row_count)
-            .map(|_| self.evaluate_column_default(cat, &default))
+            .map(|_| match &eager_scalar_default {
+                Some(value) => Ok(value.clone()),
+                None => {
+                    self.evaluate_column_default(cat, &default, column_def.ty, &column_def.name)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let next_attnum = i16::try_from(table.columns.len() + 1).map_err(|_| {
             EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())

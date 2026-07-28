@@ -636,12 +636,7 @@ fn pg16_dump_attrdef_metadata_relation(
             let Some(default) = &column.default else {
                 continue;
             };
-            let expression = match default {
-                ColumnDefault::Literal(value) => pg16_dump_default_expression(value)?,
-                ColumnDefault::SequenceNextVal { sequence, .. } => {
-                    format!("nextval('{}'::regclass)", sequence.replace('\'', "''"))
-                }
-            };
+            let expression = render_expression(default)?;
             rows.push(vec![
                 SqlValue::Int4(2604),
                 SqlValue::Int4((30_000_u32 + relation.oid + column.attnum as u32) as i32),
@@ -652,10 +647,6 @@ fn pg16_dump_attrdef_metadata_relation(
         }
     }
     Ok((table, rows))
-}
-
-fn pg16_dump_default_expression(value: &SqlValue) -> Result<String, ExecuteError> {
-    pg16_column_default_expression(value).map_err(ExecuteError::Engine)
 }
 
 fn pg16_dump_language_metadata_relation() -> (RelationalTable, Vec<Vec<SqlValue>>) {

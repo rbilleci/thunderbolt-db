@@ -42,11 +42,20 @@ pub enum EngineError {
     ProposalFailed(String),
     #[error("apply failed: {0}")]
     ApplyFailed(String),
+    /// A parsed value/default has a concrete source type that cannot be assigned to its target
+    /// column type (PostgreSQL 42804).  Keep this distinct from syntax and conversion failures so
+    /// protocol façades never have to classify a diagnostic string.
+    #[error("datatype mismatch: {0}")]
+    DatatypeMismatch(String),
     /// A relational bind resolved a target column name that is absent from the table schema.
     /// Kept typed through the engine boundary so neutral protocol adapters can emit 42703
     /// without inspecting a diagnostic string.
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
+    /// A durable/default regclass target is absent from the catalog.  Keep this distinct from
+    /// generic apply failures so neutral protocol adapters can emit PostgreSQL 42P01.
+    #[error("relation \"{0}\" does not exist")]
+    UndefinedRelation(String),
     /// A relational target list named the same column more than once. This is a pre-effect
     /// binding failure (42701), not an internal apply error.
     #[error("column \"{0}\" specified more than once")]
@@ -61,6 +70,18 @@ pub enum EngineError {
     CheckViolation(String),
     #[error("numeric value out of range: {0}")]
     NumericValueOutOfRange(String),
+    /// A date or timestamp input failed its type's textual input rules (PostgreSQL 22007).
+    #[error("invalid datetime format: {0}")]
+    InvalidDatetimeFormat(String),
+    /// A syntactically numeric date/time field or timestamp range is not representable (22008).
+    #[error("date/time field value out of range: {0}")]
+    DatetimeFieldOverflow(String),
+    /// A non-datetime scalar input failed its type's textual input rules (PostgreSQL 22P02).
+    #[error("invalid text representation: {0}")]
+    InvalidTextRepresentation(String),
+    /// No comparison operator exists for the resolved operand types (PostgreSQL 42883).
+    #[error("operator does not exist: {0}")]
+    UndefinedOperator(String),
     #[error("durability failure: {0}")]
     Durability(String),
     #[error("pending mutation queue overloaded: pending={pending} cap={cap}")]

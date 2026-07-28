@@ -20,13 +20,14 @@ pub use acl::{
 };
 pub use ast::{
     AddCheckConstraint, AddColumn, AddForeignKey, AddPrimaryKey, AddUniqueConstraint,
-    AlterColumnDefault, AlterRoleLogin, CheckConstraint, ColumnDef, ColumnDefault, Command,
-    CommentOn, CommentTarget, CreateDatabase, CreateDomain, CreateExtension, CreateFunction,
-    CreateIndex, CreateMaterializedView, CreatePublication, CreateRole, CreateSchema,
-    CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView, Delete,
-    DropColumn, DropConstraint, DropDatabase, DropDomain, DropExtension, DropFunction, DropIndex,
-    DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
-    DropTable, DropTablespace, DropView, Insert, PreparedCatalogProgram, PrimaryKey,
+    AlterColumnDefault, AlterRoleLogin, CheckConstraint, CheckLiteralProvenance, ColumnDef,
+    ColumnDefault, Command, CommentOn, CommentTarget, CreateDatabase, CreateDomain,
+    CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView, CreatePublication,
+    CreateRole, CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace,
+    CreateView, DefaultInputType, Delete, DropColumn, DropConstraint, DropDatabase, DropDomain,
+    DropExtension, DropFunction, DropIndex, DropMaterializedView, DropPublication, DropRole,
+    DropSchema, DropSequence, DropSubscription, DropTable, DropTablespace, DropView, Insert,
+    InsertCell, InsertDefaultProvenance, InsertValueProvenance, PreparedCatalogProgram, PrimaryKey,
     PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
     RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
     RenameTablespace, RenameView, SelectFunction, SelectLiteral, SequenceCurrVal, SequenceNextVal,
@@ -45,6 +46,7 @@ pub use copy::{
 mod decimal;
 mod lexical;
 mod parameter;
+mod parse_error;
 mod parsed;
 mod prepared;
 mod relation;
@@ -54,11 +56,13 @@ mod select;
 pub use decimal::{Decimal128, NumericOverflow};
 pub use lexical::sql_may_start_with_any_keyword;
 pub use parameter::{canonicalize_sql_for_exact_match, lower_sql_parameters};
+pub use parse_error::ParseError;
 pub use parsed::ParsedCommand;
 pub use prepared::PreparedCommand;
 pub mod datetime;
 pub use scalar::{
-    SqlType, SqlValue, NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE, SUPPORTED_SQL_TYPES,
+    parse_bool_value, parse_default_numeric_literal, parse_typed_value_from_str, SqlType, SqlValue,
+    NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE, SUPPORTED_SQL_TYPES,
 };
 pub use select::{
     GroupedAggKind, GroupedAggregate, Select, SelectFilter, SelectFilterOp, SelectOrder,
@@ -68,35 +72,10 @@ pub mod uuid;
 
 use relation::parse_relational_command;
 use scalar::{
-    parse_bool_value, parse_sql_value, parse_supported_sql_type_name, parse_typed_value_from_str,
+    parse_sql_default_value_with_input_provenance, parse_sql_value,
+    parse_sql_value_with_input_type, parse_supported_sql_type_name, ScalarInputTypeProvenance,
 };
-use select::{parse_select, parse_select_filter, parse_select_filter_groups};
-
-#[derive(Debug, thiserror::Error)]
-pub enum ParseError {
-    #[error("empty command")]
-    Empty,
-    #[error("unsupported command: {0}")]
-    Unsupported(String),
-    #[error("invalid SET syntax; expected: SET key=value or SET key TO value")]
-    InvalidSet,
-    #[error("invalid DEL/DELETE syntax; expected: DEL key or DELETE [FROM] key")]
-    InvalidDel,
-    #[error("invalid GET syntax; expected: GET key")]
-    InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), CREATE [UNIQUE] INDEX name ON table (column), DROP INDEX [IF EXISTS] name, INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
-    InvalidRelationalSql,
-    #[error("invalid SQL parameter reference")]
-    InvalidParameterReference,
-    #[error("SQL parameter count mismatch: expected {expected}, got {actual}")]
-    InvalidParameterCount { expected: usize, actual: usize },
-    #[error("LIMIT must not be negative")]
-    NegativeLimit,
-    #[error("OFFSET must not be negative")]
-    NegativeOffset,
-    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
-    InvalidReset,
-}
+use select::{parse_select, parse_select_filter_groups};
 
 fn strip_keyword_prefix_case_insensitive<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
     if input.len() < keyword.len() || !input[..keyword.len()].eq_ignore_ascii_case(keyword) {

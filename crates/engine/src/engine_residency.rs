@@ -65,8 +65,11 @@ pub(crate) fn estimated_named_index_bytes_for_shard(
 mod admission;
 /// Logical input forms for the one mutation-owned resident append publisher.
 mod append_source;
-/// Sealed INSERT-001 typed-column adaptation for the serial-wave cutover.
+/// Typed INSERT device-plan compilation and physical residency adaptation.
 mod fixed_insert;
+/// Test-only inert indexed-append preparation ownership.
+#[cfg(test)]
+pub(crate) mod index_delta;
 /// Vacuum, serialized rehydration, and device-gather ownership.
 mod maintenance;
 /// Resident append, rollover, sparse-version stamping, and fused-apply ownership.
@@ -84,19 +87,18 @@ mod transient;
 
 #[allow(unused_imports)] // some sealed apply errors are asserted only by focused tests
 pub(crate) use fixed_insert::{
-    PreparedI32AppendApplyError, PreparedI32AppendPrepareError, PreparedI32AppendRowIds,
-    PreparedI32OpenShardAppendPlan,
+    DeviceInsertPlan, DeviceInsertPlanApplyError, DeviceInsertPlanPrepareError, DeviceInsertRowIds,
 };
 pub(crate) use payload::{
     build_relational_device_payload, build_relational_device_payload_with_capacity,
-    compound_index_row_fingerprint, compound_key_fingerprint, compound_key_type_supported,
-    compound_unique_slot_id, compute_open_shard_i32_column_append_chunks,
-    compute_open_shard_int4_append_chunks, i32_section_needle, index_all_key_columns_foldable,
-    index_is_compound, index_key_column_positions, index_probe_key_id, index_uses_fingerprint,
-    key_column_width_words, parse_relational_row_id, probe_key_id_positions, sql_value_as_int4,
-    sql_value_from_i32_section, sql_value_from_i64_section, sql_value_key_words, AppendCreatedBy,
-    UnifiedResidentSnapshotParts, COMPOUND_KEY_ID_FLAG, CREATED_BY_VISIBLE_FILL_BYTE,
-    DELETED_BY_LIVE_FILL_BYTE, ROW_ID_UNSTAMPED_FILL_BYTE,
+    checked_fixed_width_append_geometry, compound_index_row_fingerprint, compound_key_fingerprint,
+    compound_key_type_supported, compound_unique_slot_id, compute_open_shard_int4_append_chunks,
+    i32_section_needle, index_all_key_columns_foldable, index_is_compound,
+    index_key_column_positions, index_probe_key_id, index_uses_fingerprint, key_column_width_words,
+    parse_relational_row_id, probe_key_id_positions, sql_value_as_int4, sql_value_from_i32_section,
+    sql_value_from_i64_section, sql_value_key_words, AppendCreatedBy, UnifiedResidentSnapshotParts,
+    COMPOUND_KEY_ID_FLAG, CREATED_BY_VISIBLE_FILL_BYTE, DELETED_BY_LIVE_FILL_BYTE,
+    ROW_ID_UNSTAMPED_FILL_BYTE,
 };
 
 #[cfg(test)]

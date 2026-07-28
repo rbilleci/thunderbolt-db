@@ -92,19 +92,23 @@ impl PreparedCommand {
         }
 
         let mut command = self.command.clone();
-        visit_command_values_mut(&mut command, &mut |value| {
-            let SqlValue::Parameter { index, cast } = value else {
-                return Ok(());
-            };
-            let supplied = parameters.get(index.saturating_sub(1)).ok_or(
-                ParseError::InvalidParameterCount {
-                    expected: *index,
-                    actual: parameters.len(),
-                },
-            )?;
-            *value = coerce_explicit_cast(supplied, *cast)?;
-            Ok(())
-        })?;
+        if let Command::Insert(insert) = &mut command {
+            bind_insert_parameters(insert, parameters)?;
+        } else {
+            visit_command_values_mut(&mut command, &mut |value| {
+                let SqlValue::Parameter { index, cast } = value else {
+                    return Ok(());
+                };
+                let supplied = parameters.get(index.saturating_sub(1)).ok_or(
+                    ParseError::InvalidParameterCount {
+                        expected: *index,
+                        actual: parameters.len(),
+                    },
+                )?;
+                *value = coerce_explicit_cast(supplied, *cast)?;
+                Ok(())
+            })?;
+        }
         bind_select_limit_parameter(&mut command, parameters)?;
         debug_assert_eq!(command_parameter_count(&command), 0);
 
@@ -116,6 +120,34 @@ impl PreparedCommand {
             command,
         ))
     }
+}
+
+/// Bind INSERT cells without erasing the parameter provenance held by the parsed AST. The
+/// resulting `BoundParameter` cell remains the one value authority; no canonical SQL text is
+/// inspected or reparsed here.
+fn bind_insert_parameters(
+    insert: &mut crate::Insert,
+    parameters: &[SqlValue],
+) -> Result<(), ParseError> {
+    for row in &mut insert.rows {
+        for cell in row {
+            if let Some((index, cast)) = cell.parameter_slot() {
+                let supplied = parameters.get(index.saturating_sub(1)).ok_or(
+                    ParseError::InvalidParameterCount {
+                        expected: index,
+                        actual: parameters.len(),
+                    },
+                )?;
+                let value = coerce_explicit_cast(supplied, cast)?;
+                cell.bind_parameter(value, index);
+            } else if matches!(cell.value(), Some(SqlValue::Parameter { .. })) {
+                // Programmatic AST construction may not smuggle an unowned parameter into a
+                // bound command. The parser always creates the matched Parameter provenance.
+                return Err(ParseError::InvalidParameterReference);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn supports_parameterized_command(source: &str) -> bool {
@@ -232,8 +264,10 @@ fn visit_command_values(command: &Command, visit: &mut impl FnMut(&SqlValue)) {
         Command::SelectLiteral(literal) => visit(&literal.value),
         Command::Insert(insert) => {
             for row in &insert.rows {
-                for value in row {
-                    visit(value);
+                for cell in row {
+                    if let Some(value) = cell.value() {
+                        visit(value);
+                    }
                 }
             }
         }
@@ -276,7 +310,10 @@ fn visit_command_values(command: &Command, visit: &mut impl FnMut(&SqlValue)) {
 }
 
 fn visit_default(default: Option<&crate::ColumnDefault>, visit: &mut impl FnMut(&SqlValue)) {
-    if let Some(crate::ColumnDefault::Literal(value)) = default {
+    if let Some(
+        crate::ColumnDefault::Literal(value) | crate::ColumnDefault::DeferredScalar { value, .. },
+    ) = default
+    {
         visit(value);
     }
 }
@@ -321,8 +358,13 @@ fn visit_command_values_mut(
         Command::SelectLiteral(literal) => visit(&mut literal.value)?,
         Command::Insert(insert) => {
             for row in &mut insert.rows {
-                for value in row {
-                    visit(value)?;
+                for cell in row {
+                    let Some(value) = cell.value() else {
+                        continue;
+                    };
+                    if matches!(value, SqlValue::Parameter { .. }) {
+                        return Err(ParseError::InvalidParameterReference);
+                    }
                 }
             }
         }

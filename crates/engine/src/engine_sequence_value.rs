@@ -31,12 +31,65 @@ struct SequenceValueTarget {
     private_descriptor_digest: Option<gpu_db_wal::CanonicalDigest>,
 }
 
+/// One catalog sequence-default column that has at least one SQL default request in the current
+/// INSERT. `None` is an omitted target column; `Some` addresses an in-place `InsertCell::Default`.
+/// The same plan drives routing and published-value materialization, so DEFAULT never acquires a
+/// second scalar/default authority.
+struct SequenceDefaultMaterialization {
+    column_name: String,
+    column_id: u32,
+    source_column_index: Option<usize>,
+    sequence: String,
+    target: SequenceValueTarget,
+    private: bool,
+}
+
 pub(crate) struct SequenceDefaultStatementIdentity {
     pub(crate) parent_txn_id: TxnId,
     pub(crate) parent_autocommit: bool,
     pub(crate) statement_ordinal: u32,
     pub(crate) expression_ordinal_base: u32,
     pub(crate) parent_request_digest: gpu_db_wal::CanonicalDigest,
+}
+
+/// Maps a catalog column to its source-list cell. An implicit target list is catalog ordered;
+/// a named list may omit the column entirely.
+fn insert_source_column_index(
+    insert: &Insert,
+    column_name: &str,
+    catalog_index: usize,
+) -> Option<usize> {
+    if insert.columns.is_empty() {
+        Some(catalog_index)
+    } else {
+        insert
+            .columns
+            .iter()
+            .position(|column| column == column_name)
+    }
+}
+
+/// A missing column requests its default for every row; a present column requests its default
+/// only where the first-class AST says `DEFAULT`. Explicit NULL and values never enter this route.
+fn insert_sequence_default_requested(insert: &Insert, source_column_index: Option<usize>) -> bool {
+    source_column_index.is_none_or(|source_column_index| {
+        insert
+            .rows
+            .iter()
+            .any(|row| insert_sequence_default_requested_in_row(row, Some(source_column_index)))
+    })
+}
+
+fn insert_sequence_default_requested_in_row(
+    row: &[InsertCell],
+    source_column_index: Option<usize>,
+) -> bool {
+    source_column_index.is_none_or(|source_column_index| {
+        matches!(
+            row.get(source_column_index),
+            Some(InsertCell::Default { .. })
+        )
+    })
 }
 
 impl Engine {
@@ -69,19 +122,24 @@ impl Engine {
             return (false, None);
         };
         let catalog = self.catalog_snapshot();
-        if insert.columns.is_empty() {
-            return (false, Some(catalog.commit_seq));
-        }
-        let omitted = catalog
-            .relational_catalog
-            .get(&insert.table)
-            .is_some_and(|table| {
-                table.columns.iter().any(|column| {
-                    !insert.columns.contains(&column.name)
-                        && matches!(column.default, Some(ColumnDefault::SequenceNextVal { .. }))
-                })
-            });
-        (omitted, Some(catalog.commit_seq))
+        let requests_published_default =
+            catalog
+                .relational_catalog
+                .get(&insert.table)
+                .is_some_and(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .any(|(catalog_index, column)| {
+                            matches!(column.default, Some(ColumnDefault::SequenceNextVal { .. }))
+                                && insert_sequence_default_requested(
+                                    insert,
+                                    insert_source_column_index(insert, &column.name, catalog_index),
+                                )
+                        })
+                });
+        (requests_published_default, Some(catalog.commit_seq))
     }
 
     pub(crate) fn execute_sequence_default_autocommit(
@@ -472,9 +530,10 @@ impl Engine {
             .collect()
     }
 
-    /// Replace omitted defaults backed by unchanged published sequences with their already-durable
-    /// values. Private CREATE/RESTART identities remain omitted so the existing pure default
-    /// evaluator keeps them inside the user transaction's catalog/value overlay.
+    /// Replace omission and explicit `DEFAULT` requests backed by unchanged published sequences
+    /// with their already-durable values. Private CREATE/RESTART identities remain unresolved so
+    /// the existing pure default evaluator keeps them inside the user transaction's catalog/value
+    /// overlay.
     pub(crate) fn materialize_published_sequence_defaults(
         &self,
         snapshot: &TransactionSnapshot,
@@ -486,64 +545,67 @@ impl Engine {
         let Command::Insert(insert) = command else {
             return Ok(Vec::new());
         };
-        if insert.columns.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let mut provided = BTreeSet::new();
-        for column in &insert.columns {
-            if !provided.insert(column.as_str()) {
-                return Err(ExecuteError::Engine(EngineError::DuplicateColumn(
-                    column.clone(),
-                )));
-            }
-            if !table
-                .columns
-                .iter()
-                .any(|candidate| candidate.name == *column)
-            {
-                return Err(ExecuteError::Engine(EngineError::UndefinedColumn(
-                    column.clone(),
-                )));
+        if !insert.columns.is_empty() {
+            for column in &insert.columns {
+                if !provided.insert(column.as_str()) {
+                    return Err(ExecuteError::Engine(EngineError::DuplicateColumn(
+                        column.clone(),
+                    )));
+                }
+                if !table
+                    .columns
+                    .iter()
+                    .any(|candidate| candidate.name == *column)
+                {
+                    return Err(ExecuteError::Engine(EngineError::UndefinedColumn(
+                        column.clone(),
+                    )));
+                }
             }
         }
-        if insert
-            .rows
-            .iter()
-            .any(|row| row.len() != insert.columns.len())
-        {
+        let target_width = if insert.columns.is_empty() {
+            table.columns.len()
+        } else {
+            insert.columns.len()
+        };
+        if insert.rows.iter().any(|row| row.len() != target_width) {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "INSERT value count must match target columns".to_string(),
             )));
         }
 
-        let mut omitted = Vec::new();
-        for column in &table.columns {
-            if provided.contains(column.name.as_str()) {
-                continue;
-            }
+        let mut defaults = Vec::new();
+        for (catalog_index, column) in table.columns.iter().enumerate() {
             let Some(ColumnDefault::SequenceNextVal { sequence, .. }) = &column.default else {
                 continue;
             };
+            let source_column_index =
+                insert_source_column_index(insert, &column.name, catalog_index);
+            if !insert_sequence_default_requested(insert, source_column_index) {
+                continue;
+            }
             let target =
                 self.sequence_value_target(sequence, transaction_catalog, Some(snapshot))?;
             let private = self.transaction_sequence_value_is_private(snapshot, target.sequence_oid);
-            omitted.push((
-                column.name.clone(),
-                column.id,
-                sequence.clone(),
+            defaults.push(SequenceDefaultMaterialization {
+                column_name: column.name.clone(),
+                column_id: column.id,
+                source_column_index,
+                sequence: sequence.clone(),
                 target,
                 private,
-            ));
+            });
         }
-        if omitted.is_empty() {
+        if defaults.is_empty() {
             return Ok(Vec::new());
         }
 
         let expression_count = insert
             .rows
             .len()
-            .checked_mul(omitted.len())
+            .checked_mul(defaults.len())
             .ok_or_else(|| {
                 ExecuteError::Unsupported(
                     "INSERT sequence-default expression count overflow".to_string(),
@@ -557,16 +619,16 @@ impl Engine {
 
         let mut references = Vec::new();
         for (row_index, row) in insert.rows.iter_mut().enumerate() {
-            for (column_index, (_, column_id, sequence, target, private)) in
-                omitted.iter().enumerate()
-            {
-                if *private {
+            for (column_index, default) in defaults.iter().enumerate() {
+                let requested =
+                    insert_sequence_default_requested_in_row(row, default.source_column_index);
+                if !requested || default.private {
                     continue;
                 }
                 let expression_ordinal = identity
                     .expression_ordinal_base
                     .checked_add(
-                        u32::try_from(row_index * omitted.len() + column_index)
+                        u32::try_from(row_index * defaults.len() + column_index)
                             .expect("bounded above"),
                     )
                     .ok_or_else(|| {
@@ -581,7 +643,7 @@ impl Engine {
                     statement_ordinal: identity.statement_ordinal,
                     expression_ordinal,
                     parent_request_digest: identity.parent_request_digest,
-                    source_name: sequence,
+                    source_name: &default.sequence,
                     operation,
                     set_value: None,
                 });
@@ -589,7 +651,7 @@ impl Engine {
                 let outcome = self.commit_sequence_value_transition(
                     transition_txn_id,
                     input_digest,
-                    target.clone(),
+                    default.target.clone(),
                     identity.parent_txn_id,
                     identity.parent_autocommit,
                     identity.statement_ordinal,
@@ -605,7 +667,23 @@ impl Engine {
                             "sequence value is out of range for int4 default".to_string(),
                         ))
                     })?;
-                row.push(value);
+                match default.source_column_index {
+                    Some(source_column_index) => {
+                        let cell = row.get_mut(source_column_index).ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "explicit INSERT DEFAULT left its validated source row".to_string(),
+                            ))
+                        })?;
+                        if !matches!(cell, InsertCell::Default { .. }) {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "explicit INSERT DEFAULT changed before sequence materialization"
+                                    .to_string(),
+                            )));
+                        }
+                        *cell = InsertCell::programmatic(value);
+                    }
+                    None => row.push(InsertCell::programmatic(value)),
+                }
                 references.push(BinarySequenceValueReference {
                     transition_txn_id: outcome.transition_txn_id,
                     parent_txn_id: identity.parent_txn_id,
@@ -615,7 +693,7 @@ impl Engine {
                     returned_value: outcome.value,
                     input_digest,
                     table_oid: table.oid,
-                    column_id: *column_id,
+                    column_id: default.column_id,
                     staging_row_ordinal: u32::try_from(row_index)
                         .expect("expression count bounded above"),
                     row_id: 0,
@@ -625,10 +703,10 @@ impl Engine {
             }
         }
         insert.columns.extend(
-            omitted
+            defaults
                 .iter()
-                .filter(|(_, _, _, _, private)| !private)
-                .map(|(column, _, _, _, _)| column.clone()),
+                .filter(|default| default.source_column_index.is_none() && !default.private)
+                .map(|default| default.column_name.clone()),
         );
         Ok(references)
     }

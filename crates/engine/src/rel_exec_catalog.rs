@@ -643,14 +643,10 @@ pub(crate) fn synthesize_information_schema_tables(
 fn information_schema_column_default(column: &RelationalColumn) -> SqlValue {
     match &column.default {
         None => SqlValue::Null,
-        Some(ColumnDefault::Literal(value)) => SqlValue::Text(
-            pg16_column_default_expression(value)
+        Some(default) => SqlValue::Text(
+            render_expression(default)
                 .expect("catalog column defaults cannot retain unbound parameters"),
         ),
-        Some(ColumnDefault::SequenceNextVal { sequence, .. }) => SqlValue::Text(format!(
-            "nextval('{}'::regclass)",
-            sequence.replace('\'', "''")
-        )),
     }
 }
 
@@ -1804,12 +1800,8 @@ fn catalog_attribute_default_expr(
     };
     match &column.default {
         None => Ok(SqlValue::Null),
-        Some(ColumnDefault::Literal(value)) => pg16_column_default_expression(value)
+        Some(default) => render_expression(default)
             .map(SqlValue::Text)
             .map_err(ExecuteError::Engine),
-        Some(ColumnDefault::SequenceNextVal { sequence, .. }) => Ok(SqlValue::Text(format!(
-            "nextval('{}'::regclass)",
-            sequence.replace('\'', "''")
-        ))),
     }
 }

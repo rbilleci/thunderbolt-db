@@ -125,6 +125,7 @@ default: None,
                         op: SelectFilterOp::Gt,
                         value: SqlValue::Int4(0),
                     },
+                    literal_provenance: CheckLiteralProvenance::Known(SqlType::Int4),
                 },
                 CheckConstraint {
                     name: None,
@@ -133,6 +134,7 @@ default: None,
                         op: SelectFilterOp::Eq,
                         value: SqlValue::Text("Ada".to_string()),
                     },
+                    literal_provenance: CheckLiteralProvenance::Unknown,
                 },
             ],
         })
@@ -177,6 +179,7 @@ default: None,
                 op: SelectFilterOp::Gt,
                 value: SqlValue::Int4(0),
             },
+            literal_provenance: CheckLiteralProvenance::Known(SqlType::Int4),
         })
     );
     assert!(matches!(
@@ -470,13 +473,19 @@ default: None,
                     name: "id".to_string(),
                     ty: SqlType::Int4,
                     domain: None,
-                    default: Some(ColumnDefault::Literal(SqlValue::Int4(7))),
+                    default: Some(ColumnDefault::DeferredScalar {
+                        value: SqlValue::Int4(7),
+                        input: DefaultInputType::Inferred(SqlType::Int4),
+                    }),
                 },
                 ColumnDef {
                     name: "name".to_string(),
                     ty: SqlType::Text,
                     domain: None,
-                    default: Some(ColumnDefault::Literal(SqlValue::Text("Ada's".to_string()))),
+                    default: Some(ColumnDefault::DeferredScalar {
+                        value: SqlValue::Text("Ada's".to_string()),
+                        input: DefaultInputType::Explicit(SqlType::Text),
+                    }),
                 },
             ],
             primary_key: None,
@@ -486,7 +495,7 @@ default: None,
     );
     assert!(matches!(
         parse_command("CREATE TABLE invalid_default (id INT DEFAULT 'bad'::text)"),
-        Err(ParseError::InvalidRelationalSql)
+        Ok(Command::CreateTable(_))
     ));
     assert_eq!(
         parse_command("CREATE TABLE serial_people (id SERIAL PRIMARY KEY, name TEXT)").unwrap(),
@@ -539,10 +548,19 @@ default: Some(ColumnDefault::SequenceNextVal {
             check_constraints: Vec::new(),
         })
     );
-    assert!(matches!(
-        parse_command("CREATE TABLE invalid_serial (id TEXT DEFAULT nextval('people_seq'))"),
-        Err(ParseError::InvalidRelationalSql)
-    ));
+    let Command::CreateTable(nextval_text) =
+        parse_command("CREATE TABLE invalid_serial (id TEXT DEFAULT nextval('people_seq'))")
+            .unwrap()
+    else {
+        panic!("expected CREATE TABLE");
+    };
+    assert_eq!(
+        nextval_text.columns[0].default,
+        Some(ColumnDefault::SequenceNextVal {
+            sequence: "people_seq".to_string(),
+            create_if_missing: false,
+        })
+    );
     assert_eq!(
         parse_command("CREATE TABLE type_named_columns (integer_col integer, text_col text)")
             .unwrap(),
@@ -575,7 +593,10 @@ default: Some(ColumnDefault::SequenceNextVal {
         Command::AlterColumnDefault(AlterColumnDefault {
             table: "default_people".to_string(),
             column: "name".to_string(),
-            default: Some(ColumnDefault::Literal(SqlValue::Text("Grace".to_string()))),
+            default: Some(ColumnDefault::DeferredScalar {
+                value: SqlValue::Text("Grace".to_string()),
+                input: DefaultInputType::Explicit(SqlType::Text),
+            }),
         })
     );
     assert_eq!(
@@ -608,7 +629,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                 name: "tag".to_string(),
                 ty: SqlType::Text,
                 domain: None,
-                default: Some(ColumnDefault::Literal(SqlValue::Text("new".to_string()))),
+                default: Some(ColumnDefault::DeferredScalar {
+                    value: SqlValue::Text("new".to_string()),
+                    input: DefaultInputType::Explicit(SqlType::Text),
+                }),
             },
         })
     );
@@ -620,7 +644,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                 name: "bucket".to_string(),
                 ty: SqlType::Int4,
                 domain: None,
-                default: Some(ColumnDefault::Literal(SqlValue::Int4(4))),
+                default: Some(ColumnDefault::DeferredScalar {
+                    value: SqlValue::Int4(4),
+                    input: DefaultInputType::Inferred(SqlType::Int4),
+                }),
             },
         })
     );
@@ -1512,10 +1539,10 @@ default: Some(ColumnDefault::SequenceNextVal {
         Command::Insert(Insert {
             table: "people".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
-            rows: vec![
+            rows: Insert::literal_rows(vec![
                 vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                 vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
-            ],
+            ]),
             returning: Vec::new(),
         })
     );
@@ -1525,10 +1552,10 @@ default: Some(ColumnDefault::SequenceNextVal {
         Command::Insert(Insert {
             table: "people".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
-            rows: vec![vec![
+            rows: Insert::literal_rows(vec![vec![
                 SqlValue::Int4(1),
                 SqlValue::Text("O'Brien".to_string())
-            ]],
+            ]]),
             returning: Vec::new(),
         })
     );
@@ -1538,10 +1565,10 @@ default: Some(ColumnDefault::SequenceNextVal {
         Command::Insert(Insert {
             table: "people".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
-            rows: vec![
+            rows: Insert::literal_rows(vec![
                 vec![SqlValue::Int4(-1), SqlValue::Text("Minus".to_string())],
                 vec![SqlValue::Int4(0), SqlValue::Text("Zero".to_string())],
-            ],
+            ]),
             returning: Vec::new(),
         })
     );
@@ -1551,7 +1578,10 @@ default: Some(ColumnDefault::SequenceNextVal {
         Command::Insert(Insert {
             table: "people".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
-            rows: vec![vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())]],
+            rows: Insert::literal_rows(vec![vec![
+                SqlValue::Int4(3),
+                SqlValue::Text("Grace".to_string()),
+            ]]),
             returning: Vec::new(),
         })
     );
@@ -1561,10 +1591,10 @@ default: Some(ColumnDefault::SequenceNextVal {
         Command::Insert(Insert {
             table: "people".to_string(),
             columns: Vec::new(),
-            rows: vec![
+            rows: Insert::literal_rows(vec![
                 vec![SqlValue::Int4(4), SqlValue::Text("Katherine".to_string())],
                 vec![SqlValue::Int4(5), SqlValue::Text("Mary".to_string())],
-            ],
+            ]),
             returning: Vec::new(),
         })
     );

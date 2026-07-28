@@ -162,6 +162,14 @@ impl Engine {
         for (idx, mut column) in create.columns.into_iter().enumerate() {
             let (type_oid, type_size) = self.resolve_column_domain_type(&mut column)?;
             if let Some(default) = column.default.take() {
+                // Resolve explicit regclass existence before binding.  A present non-sequence
+                // intentionally reaches the binder first; full sequence-kind validation follows
+                // successful binding for transactional CREATE TABLE and ordinary apply alike.
+                if legacy_replay.is_some() {
+                    self.preflight_column_default_target_before_binding_legacy_replay(&default)?;
+                } else {
+                    self.preflight_column_default_target_before_binding(&default)?;
+                }
                 // Coerce a cross-type default literal to the column type (parity with INSERT),
                 // e.g. `bal NUMERIC DEFAULT 0` -> Numeric at the column scale.
                 let default = coerce_column_default(default, column.ty, &column.name)?;
@@ -266,21 +274,22 @@ impl Engine {
             });
         }
         for check in check_constraints {
-            let Some(column) = columns
+            let column = columns
                 .iter()
                 .find(|column| column.name == check.filter.column)
-            else {
-                return Err(EngineError::ApplyFailed(format!(
-                    "column \"{}\" does not exist",
-                    check.filter.column
-                )));
-            };
-            if !sql_value_matches_type(&check.filter.value, column.ty) {
-                return Err(EngineError::ApplyFailed(format!(
-                    "invalid value for column \"{}\"",
-                    check.filter.column
-                )));
-            }
+                .ok_or_else(|| {
+                    EngineError::ApplyFailed(format!(
+                        "column \"{}\" does not exist",
+                        check.filter.column
+                    ))
+                })?;
+            let (literal, resolved_input_type) = resolve_check_comparison_operand(
+                check.filter.value,
+                check.literal_provenance,
+                column.ty,
+                check.filter.op,
+                &check.filter.column,
+            )?;
             let constraint_name = check
                 .name
                 .unwrap_or_else(|| format!("{}_{}_check", name, check.filter.column));
@@ -298,7 +307,13 @@ impl Engine {
                 name: constraint_name,
                 column: check.filter.column,
                 op: check.filter.op,
-                value: check.filter.value,
+                value: literal,
+                resolved_input_type,
+                identity_version: if check.literal_provenance.is_legacy_ambiguous() {
+                    CheckOperandIdentityVersion::LegacyV1
+                } else {
+                    CheckOperandIdentityVersion::ResolvedV2
+                },
             });
         }
         for sequence in &implicit_sequences {
@@ -642,7 +657,12 @@ impl Engine {
         cat: &mut DdlCatalogState,
         add: AddCheckConstraint,
     ) -> Result<(), EngineError> {
-        self.preflight_add_check_constraint(&add)?;
+        let (literal, resolved_input_type) = self.preflight_add_check_constraint(&add)?;
+        let identity_version = if add.literal_provenance.is_legacy_ambiguous() {
+            CheckOperandIdentityVersion::LegacyV1
+        } else {
+            CheckOperandIdentityVersion::ResolvedV2
+        };
         let table = cat
             .relational_catalog
             .get_mut(&add.table)
@@ -651,7 +671,9 @@ impl Engine {
             name: add.name,
             column: add.filter.column,
             op: add.filter.op,
-            value: add.filter.value,
+            value: literal,
+            resolved_input_type,
+            identity_version,
         });
         Ok(())
     }
@@ -1025,7 +1047,7 @@ impl Engine {
     pub(crate) fn preflight_add_check_constraint(
         &self,
         add: &AddCheckConstraint,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(SqlValue, SqlType), EngineError> {
         let cat = self.catalog_snapshot();
         let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
@@ -1050,14 +1072,31 @@ impl Engine {
                 add.name
             )));
         }
+        // Keep this owned binding through existing-row validation and catalog publication; the
+        // parsed DDL command itself remains untouched for WAL/replay/retry.
         let column_idx = relational_column_index(table, &add.filter.column)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        if !sql_value_matches_type(&add.filter.value, table.columns[column_idx].ty) {
-            return Err(EngineError::ApplyFailed(format!(
-                "invalid value for column \"{}\"",
-                add.filter.column
-            )));
-        }
+        let (literal, resolved_input_type) = resolve_check_comparison_operand(
+            add.filter.value.clone(),
+            add.literal_provenance,
+            table.columns[column_idx].ty,
+            add.filter.op,
+            &add.filter.column,
+        )?;
+        crate::check_violation_expr::validate_check_literal_at_evaluation(
+            &RelationalCheckConstraint {
+                name: add.name.clone(),
+                column: add.filter.column.clone(),
+                op: add.filter.op,
+                value: literal.clone(),
+                resolved_input_type,
+                identity_version: if add.literal_provenance.is_legacy_ambiguous() {
+                    CheckOperandIdentityVersion::LegacyV1
+                } else {
+                    CheckOperandIdentityVersion::ResolvedV2
+                },
+            },
+        )?;
         let rows = self.visible_relational_rows(
             table,
             StorageVisibility {
@@ -1070,14 +1109,18 @@ impl Engine {
             if matches!(row[column_idx], SqlValue::Null) {
                 continue;
             }
-            if !select_filter_matches(&row[column_idx], add.filter.op, &add.filter.value) {
+            if !crate::check_violation_expr::check_comparison_satisfies(
+                &row[column_idx],
+                add.filter.op,
+                &literal,
+            ) {
                 return Err(EngineError::CheckViolation(format!(
                     "check constraint \"{}\" is violated by some row",
                     add.name
                 )));
             }
         }
-        Ok(())
+        Ok((literal, resolved_input_type))
     }
 
     pub(crate) fn preflight_add_foreign_key(

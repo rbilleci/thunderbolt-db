@@ -1,26 +1,29 @@
 //! Relational dispatch and schema, table, index, and DML parsing.
 
+use super::select::split_select_filter;
 use super::{
     acl, find_char_outside_quotes, find_keyword_outside_quotes, find_matching_paren,
     normalize_identifier, normalize_relation_identifier, parse_alter_role, parse_comment_on,
     parse_create_database, parse_create_domain, parse_create_extension, parse_create_function,
     parse_create_materialized_view, parse_create_publication, parse_create_role,
     parse_create_sequence, parse_create_subscription, parse_create_tablespace, parse_create_view,
-    parse_drop_database, parse_drop_domain, parse_drop_extension, parse_drop_function,
-    parse_drop_materialized_view, parse_drop_publication, parse_drop_role, parse_drop_sequence,
-    parse_drop_subscription, parse_drop_tablespace, parse_drop_view, parse_i64_literal,
-    parse_refresh_materialized_view, parse_rename_database, parse_rename_function,
-    parse_rename_materialized_view, parse_rename_tablespace, parse_rename_view, parse_select,
-    parse_select_filter, parse_select_filter_groups, parse_select_function, parse_select_literal,
-    parse_select_pg_dump_builtin, parse_sequence_regclass_arg, parse_sequence_value_function,
-    parse_sql_value, parse_supported_sql_type_name, parse_typed_value_from_str, split_csv,
-    strip_keyword_prefix_case_insensitive, strip_keyword_suffix_case_insensitive,
+    parse_default_numeric_literal, parse_drop_database, parse_drop_domain, parse_drop_extension,
+    parse_drop_function, parse_drop_materialized_view, parse_drop_publication, parse_drop_role,
+    parse_drop_sequence, parse_drop_subscription, parse_drop_tablespace, parse_drop_view,
+    parse_i64_literal, parse_refresh_materialized_view, parse_rename_database,
+    parse_rename_function, parse_rename_materialized_view, parse_rename_tablespace,
+    parse_rename_view, parse_select, parse_select_filter_groups, parse_select_function,
+    parse_select_literal, parse_select_pg_dump_builtin, parse_sequence_regclass_arg,
+    parse_sequence_value_function, parse_sql_default_value_with_input_provenance, parse_sql_value,
+    parse_sql_value_with_input_type, parse_supported_sql_type_name, parse_typed_value_from_str,
+    split_csv, strip_keyword_prefix_case_insensitive, strip_keyword_suffix_case_insensitive,
     AddCheckConstraint, AddColumn, AddForeignKey, AddPrimaryKey, AddUniqueConstraint,
-    AlterColumnDefault, CheckConstraint, ColumnDef, ColumnDefault, Command, CreateIndex,
-    CreateSchema, CreateTable, Delete, DropColumn, DropConstraint, DropIndex, DropSchema,
-    DropTable, Insert, ParseError, PrimaryKey, RenameColumn, RenameConstraint, RenameIndex,
-    RenameTable, SelectFilter, SelectFilterOp, SequenceRestart, SqlType, SqlValue, TruncateTable,
-    UniqueConstraint, Update, UpdateAssignment,
+    AlterColumnDefault, CheckConstraint, CheckLiteralProvenance, ColumnDef, ColumnDefault, Command,
+    CreateIndex, CreateSchema, CreateTable, DefaultInputType, Delete, DropColumn, DropConstraint,
+    DropIndex, DropSchema, DropTable, Insert, InsertCell, ParseError, PrimaryKey, RenameColumn,
+    RenameConstraint, RenameIndex, RenameTable, ScalarInputTypeProvenance, SelectFilter,
+    SelectFilterOp, SequenceRestart, SqlType, SqlValue, TruncateTable, UniqueConstraint, Update,
+    UpdateAssignment,
 };
 
 fn parse_alter_sequence(input: &str) -> Result<Command, ParseError> {
@@ -377,11 +380,12 @@ fn parse_add_unique_constraint(input: &str) -> Result<AddUniqueConstraint, Parse
 
 fn parse_add_check_constraint(input: &str) -> Result<AddCheckConstraint, ParseError> {
     let (table, name, rest) = parse_alter_table_add_constraint(input)?;
-    let filter = parse_check_constraint_filter(rest)?;
+    let (filter, literal_provenance) = parse_check_constraint_filter(rest)?;
     Ok(AddCheckConstraint {
         table,
         name,
         filter,
+        literal_provenance,
     })
 }
 
@@ -676,15 +680,26 @@ fn parse_column_default_expr(
     input: &str,
     implicit_serial_sequence: Option<String>,
 ) -> Result<ColumnDefault, ParseError> {
+    parse_column_default_expr_with_input_provenance(input, implicit_serial_sequence)
+        .map(|(default, _)| default)
+}
+
+fn parse_column_default_expr_with_input_provenance(
+    input: &str,
+    implicit_serial_sequence: Option<String>,
+) -> Result<(ColumnDefault, Option<ScalarInputTypeProvenance>), ParseError> {
     let trimmed = input.trim();
     if let Some(sequence) = implicit_serial_sequence {
         if !trimmed.is_empty() {
             return Err(ParseError::InvalidRelationalSql);
         }
-        return Ok(ColumnDefault::SequenceNextVal {
-            sequence,
-            create_if_missing: true,
-        });
+        return Ok((
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: true,
+            },
+            None,
+        ));
     }
     let function = trimmed
         .strip_prefix("pg_catalog.")
@@ -706,12 +721,22 @@ fn parse_column_default_expr(
         let [target] = parts.as_slice() else {
             return Err(ParseError::InvalidRelationalSql);
         };
-        return Ok(ColumnDefault::SequenceNextVal {
-            sequence: parse_sequence_regclass_arg(target.trim())?,
-            create_if_missing: false,
-        });
+        return Ok((
+            ColumnDefault::SequenceNextVal {
+                sequence: parse_sequence_regclass_arg(target.trim())?,
+                create_if_missing: false,
+            },
+            None,
+        ));
     }
-    Ok(ColumnDefault::Literal(parse_sql_value(trimmed)?))
+    let (value, provenance) = parse_sql_default_value_with_input_provenance(trimmed)?;
+    Ok((
+        ColumnDefault::DeferredScalar {
+            value,
+            input: default_input_type(provenance),
+        },
+        Some(provenance),
+    ))
 }
 
 fn parse_typed_column_default(
@@ -719,51 +744,52 @@ fn parse_typed_column_default(
     ty: SqlType,
     implicit_serial_sequence: Option<String>,
 ) -> Result<ColumnDefault, ParseError> {
-    let default = parse_column_default_expr(input, implicit_serial_sequence)?;
+    let (default, _) =
+        parse_column_default_expr_with_input_provenance(input, implicit_serial_sequence)?;
     match default {
-        // A literal default is coerced to the column's declared type, so e.g. `DEFAULT 0`
-        // on a NUMERIC column is stored as a `Numeric` (not the inferred `Int4`), and
-        // `DEFAULT TRUE` on a BOOL column is a `Bool`. We re-parse from the rendered
-        // literal text rather than trusting the inferred variant.
-        // A NULL default is the typeless SQL null — it stays NULL for a column of ANY type, so it
-        // skips the type re-coercion (which would otherwise round-trip it through its rendered text
-        // "NULL" and mis-parse it as e.g. the text value 'NULL').
-        ColumnDefault::Literal(SqlValue::Null) => Ok(ColumnDefault::Literal(SqlValue::Null)),
-        ColumnDefault::Literal(value) => {
-            let rendered = render_default_literal_for_coercion(&value)?;
-            let coerced = parse_typed_value_from_str(&rendered, ty)?;
-            Ok(ColumnDefault::Literal(coerced))
+        ColumnDefault::DeferredScalar { value, input } => {
+            // An unknown string literal binds lexically at the declared target, but NUMERIC
+            // typmod/range enforcement remains deferred to INSERT/ADD COLUMN evaluation.
+            // Concrete input types retain their raw parsed source and source typmod.
+            let (value, input) = match input {
+                DefaultInputType::Unknown => (
+                    resolve_unknown_default_at_target(value, ty)?,
+                    DefaultInputType::TargetTyped,
+                ),
+                other => (value, other),
+            };
+            Ok(ColumnDefault::DeferredScalar { value, input })
         }
-        // `nextval(...)` (serial) is integer-only, as before.
-        ColumnDefault::SequenceNextVal { .. } if ty == SqlType::Int4 => Ok(default),
-        ColumnDefault::SequenceNextVal { .. } => Err(ParseError::InvalidRelationalSql),
+        // Preserve both implicit SERIAL and explicit nextval ASTs.  The engine binder owns the
+        // target-type restriction so explicit non-int defaults report 42804, not syntax.
+        ColumnDefault::SequenceNextVal { .. } => Ok(default),
+        ColumnDefault::Literal(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
 
-/// Render an inferred default literal back to the textual form `parse_typed_value_from_str`
-/// expects, so it can be re-parsed at the column's declared type.
-fn render_default_literal_for_coercion(value: &SqlValue) -> Result<String, ParseError> {
-    Ok(match value {
-        SqlValue::Null => "NULL".to_string(),
-        SqlValue::Int2(value) => value.to_string(),
-        SqlValue::Int4(value) => value.to_string(),
-        SqlValue::Int8(value) => value.to_string(),
-        SqlValue::Numeric(value) => value.to_decimal_string(),
-        SqlValue::Bool(value) => {
-            if *value {
-                "true".to_string()
-            } else {
-                "false".to_string()
+fn default_input_type(provenance: ScalarInputTypeProvenance) -> DefaultInputType {
+    match provenance {
+        ScalarInputTypeProvenance::Unknown => DefaultInputType::Unknown,
+        ScalarInputTypeProvenance::Inferred(ty) => DefaultInputType::Inferred(ty),
+        ScalarInputTypeProvenance::Explicit(ty) => DefaultInputType::Explicit(ty),
+    }
+}
+
+fn resolve_unknown_default_at_target(
+    value: SqlValue,
+    target: SqlType,
+) -> Result<SqlValue, ParseError> {
+    match value {
+        SqlValue::Null => Ok(SqlValue::Null),
+        SqlValue::Text(text) => match target {
+            SqlType::Numeric { .. } => {
+                parse_default_numeric_literal(&text, target).map(SqlValue::Numeric)
             }
-        }
-        SqlValue::Text(value) => value.clone(),
-        SqlValue::Date(value) => crate::datetime::format_date(*value),
-        SqlValue::Timestamp(value) => crate::datetime::format_timestamp(*value),
-        SqlValue::Uuid(value) => crate::uuid::format_uuid(value),
-        SqlValue::Parameter { .. } => {
-            return Err(ParseError::InvalidParameterReference);
-        }
-    })
+            _ => parse_typed_value_from_str(&text, target),
+        },
+        SqlValue::Parameter { .. } => Err(ParseError::InvalidParameterReference),
+        _ => Err(ParseError::InvalidRelationalSql),
+    }
 }
 
 fn parse_drop_table_constraint(input: &str) -> Result<DropConstraint, ParseError> {
@@ -846,7 +872,9 @@ fn parse_alter_table_add_constraint(input: &str) -> Result<(String, String, &str
     Ok((table, name, rest[constraint_pos..].trim_start()))
 }
 
-fn parse_check_constraint_filter(rest: &str) -> Result<SelectFilter, ParseError> {
+fn parse_check_constraint_filter(
+    rest: &str,
+) -> Result<(SelectFilter, CheckLiteralProvenance), ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(rest, "CHECK")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
@@ -857,11 +885,60 @@ fn parse_check_constraint_filter(rest: &str) -> Result<SelectFilter, ParseError>
     if close != rest.len() - 1 {
         return Err(ParseError::InvalidRelationalSql);
     }
-    let filter = parse_select_filter(&rest[1..close])?;
+    let (left, op, right) = split_select_filter(&rest[1..close])?;
+    let left = left.trim();
+    let right = right.trim();
+    let right_literal = parse_sql_value_with_input_type(right);
+    let left_literal = parse_sql_value_with_input_type(left);
+    let (filter, literal_provenance) = match (right_literal, left_literal) {
+        (Ok((value, input_type)), _) => (
+            SelectFilter {
+                column: normalize_identifier(left)?,
+                op,
+                value,
+            },
+            input_type
+                .map(CheckLiteralProvenance::Known)
+                .unwrap_or(CheckLiteralProvenance::Unknown),
+        ),
+        (Err(_), Ok((value, input_type))) => (
+            SelectFilter {
+                column: normalize_identifier(right)?,
+                op: op.flipped(),
+                value,
+            },
+            input_type
+                .map(CheckLiteralProvenance::Known)
+                .unwrap_or(CheckLiteralProvenance::Unknown),
+        ),
+        (Err(right_error), Err(left_error)) => {
+            return Err(prefer_typed_literal_error(right_error, left_error));
+        }
+    };
     if matches!(filter.op, SelectFilterOp::LikePrefix) {
         return Err(ParseError::InvalidRelationalSql);
     }
-    Ok(filter)
+    Ok((filter, literal_provenance))
+}
+
+fn prefer_typed_literal_error(right: ParseError, left: ParseError) -> ParseError {
+    if is_typed_literal_error(&right) {
+        right
+    } else if is_typed_literal_error(&left) {
+        left
+    } else {
+        ParseError::InvalidRelationalSql
+    }
+}
+
+fn is_typed_literal_error(error: &ParseError) -> bool {
+    matches!(
+        error,
+        ParseError::InvalidTextRepresentation { .. }
+            | ParseError::InvalidDatetimeFormat { .. }
+            | ParseError::DatetimeFieldOverflow { .. }
+            | ParseError::NumericValueOutOfRange { .. }
+    )
 }
 
 /// Parse a constraint column LIST `(a, b, ...)` — the compound-key form of
@@ -990,9 +1067,11 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
                     columns,
                 });
             } else if strip_keyword_prefix_case_insensitive(rest, "CHECK").is_some() {
+                let (filter, literal_provenance) = parse_check_constraint_filter(rest)?;
                 check_constraints.push(CheckConstraint {
                     name: Some(name),
-                    filter: parse_check_constraint_filter(rest)?,
+                    filter,
+                    literal_provenance,
                 });
             } else {
                 return Err(ParseError::InvalidRelationalSql);
@@ -1024,9 +1103,11 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             continue;
         }
         if strip_keyword_prefix_case_insensitive(trimmed, "CHECK").is_some() {
+            let (filter, literal_provenance) = parse_check_constraint_filter(trimmed)?;
             check_constraints.push(CheckConstraint {
                 name: None,
-                filter: parse_check_constraint_filter(trimmed)?,
+                filter,
+                literal_provenance,
             });
             continue;
         }
@@ -1376,7 +1457,13 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
         let close = find_matching_paren(tail, open).ok_or(ParseError::InvalidRelationalSql)?;
         let row = split_csv(&tail[open + 1..close])?
             .into_iter()
-            .map(parse_sql_value)
+            .map(|cell| {
+                if cell.trim().eq_ignore_ascii_case("DEFAULT") {
+                    Ok(InsertCell::sql_default())
+                } else {
+                    parse_sql_value(cell).map(InsertCell::from_parsed_value)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if !columns.is_empty() && row.len() != columns.len() {
             return Err(ParseError::InvalidRelationalSql);
@@ -1504,6 +1591,9 @@ fn split_returning_clause(input: &str) -> Result<(&str, Vec<String>), ParseError
 }
 
 #[cfg(test)]
+mod default_assignment_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1562,6 +1652,136 @@ mod tests {
                 matches!(parse_relational_command(invalid, false), Some(Err(_))),
                 "unexpectedly accepted {invalid:?}"
             );
+        }
+    }
+
+    #[test]
+    fn check_literals_retain_input_provenance_without_widening_select_filters() {
+        let Command::CreateTable(create) = parse_relational_command(
+            "CREATE TABLE checks (s SMALLINT, t TEXT, n NUMERIC(8,2), CHECK (s > '32768'), CHECK (s > 32768), CHECK (t = 'x'), CHECK (s > '32768'::text), CHECK (n < '12.345'))",
+            false,
+        )
+        .unwrap()
+        .unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(
+            create
+                .check_constraints
+                .iter()
+                .map(|check| (check.filter.value.clone(), check.literal_provenance))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    SqlValue::Text("32768".to_string()),
+                    CheckLiteralProvenance::Unknown
+                ),
+                (
+                    SqlValue::Int4(32768),
+                    CheckLiteralProvenance::Known(SqlType::Int4)
+                ),
+                (
+                    SqlValue::Text("x".to_string()),
+                    CheckLiteralProvenance::Unknown
+                ),
+                (
+                    SqlValue::Text("32768".to_string()),
+                    CheckLiteralProvenance::Known(SqlType::Text),
+                ),
+                (
+                    SqlValue::Text("12.345".to_string()),
+                    CheckLiteralProvenance::Unknown,
+                ),
+            ]
+        );
+
+        let Command::AddCheckConstraint(add) = parse_relational_command(
+            "ALTER TABLE checks ADD CONSTRAINT literal_left CHECK ('7'::int4 < s)",
+            false,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!("expected ADD CHECK");
+        };
+        assert_eq!(add.filter.column, "s");
+        assert_eq!(add.filter.op, SelectFilterOp::Gt);
+        assert_eq!(add.filter.value, SqlValue::Int4(7));
+        assert_eq!(
+            add.literal_provenance,
+            CheckLiteralProvenance::Known(SqlType::Int4)
+        );
+
+        let Command::CreateTable(temporal) = parse_relational_command(
+            "CREATE TABLE temporal_checks (ts TIMESTAMP, CHECK ('2000-01-01'::date > ts))",
+            false,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!("expected CREATE TABLE");
+        };
+        let check = &temporal.check_constraints[0];
+        assert_eq!(check.filter.column, "ts");
+        assert_eq!(check.filter.op, SelectFilterOp::Lt);
+        assert_eq!(check.filter.value, SqlValue::Date(0));
+        assert_eq!(
+            check.literal_provenance,
+            CheckLiteralProvenance::Known(SqlType::Date)
+        );
+    }
+
+    #[test]
+    fn explicit_check_cast_failures_escape_create_and_alter_with_typed_errors() {
+        for (sql, expected) in [
+            (
+                "CREATE TABLE check_cast_date (d date, CHECK (d > 'bad'::date))",
+                "datetime",
+            ),
+            (
+                "CREATE TABLE check_cast_bool (b bool, CHECK (b = 'bad'::bool))",
+                "text",
+            ),
+            (
+                "CREATE TABLE check_cast_timestamp (t timestamp, CHECK (t > 'bad'::timestamp))",
+                "datetime",
+            ),
+            (
+                "CREATE TABLE check_cast_date_overflow (d date, CHECK ('2024-02-30'::date < d))",
+                "datetime-field",
+            ),
+            (
+                "CREATE TABLE check_cast_timestamp_overflow (t timestamp, CHECK ('294277-12-31 00:00:00'::timestamp < t))",
+                "datetime-field",
+            ),
+            (
+                "CREATE TABLE check_cast_uuid (u uuid, CHECK (u = 'bad'::uuid))",
+                "text",
+            ),
+            (
+                "ALTER TABLE check_cast_add ADD CONSTRAINT check_cast_int CHECK (i > 'bad'::int2)",
+                "text",
+            ),
+            (
+                "ALTER TABLE check_cast_add ADD CONSTRAINT check_cast_range CHECK (i > '32768'::int2)",
+                "range",
+            ),
+            (
+                "ALTER TABLE check_cast_add ADD CONSTRAINT check_cast_numeric CHECK (n > 'bad'::numeric)",
+                "text",
+            ),
+        ] {
+            let error = parse_relational_command(sql, false)
+                .expect("relational shape")
+                .expect_err("explicit malformed cast must not collapse to syntax");
+            match expected {
+                "datetime" => assert!(matches!(error, ParseError::InvalidDatetimeFormat { .. })),
+                "datetime-field" => {
+                    assert!(matches!(error, ParseError::DatetimeFieldOverflow { .. }))
+                }
+                "text" => assert!(matches!(error, ParseError::InvalidTextRepresentation { .. })),
+                "range" => assert!(matches!(error, ParseError::NumericValueOutOfRange { .. })),
+                _ => unreachable!(),
+            }
         }
     }
 

@@ -142,7 +142,7 @@ pub enum SqlValue {
 /// Accepts the canonical wire forms plus the spelled-out / single-letter aliases
 /// PostgreSQL recognizes, case-insensitively. Distinct from [`parse_bool_literal`],
 /// which is the stricter `true`/`t`/`false`/`f`-only parser for option arguments.
-pub(super) fn parse_bool_value(input: &str) -> Option<bool> {
+pub fn parse_bool_value(input: &str) -> Option<bool> {
     let trimmed = input.trim();
     if trimmed.eq_ignore_ascii_case("t")
         || trimmed.eq_ignore_ascii_case("true")
@@ -237,7 +237,42 @@ fn parse_numeric_typmod(typmod: Option<&str>) -> Option<SqlType> {
     Some(SqlType::Numeric { precision, scale })
 }
 
+/// The source of a scalar's SQL input type.  Typed DEFAULT parsing needs the distinction between
+/// an uncast `unknown` string and an explicit `::text`; the latter is not assignment-coercible to
+/// an arbitrary column just because its rendered characters happen to parse at that target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScalarInputTypeProvenance {
+    Unknown,
+    Inferred(SqlType),
+    Explicit(SqlType),
+}
+
+impl ScalarInputTypeProvenance {
+    pub(super) const fn concrete_type(self) -> Option<SqlType> {
+        match self {
+            Self::Unknown => None,
+            Self::Inferred(ty) | Self::Explicit(ty) => Some(ty),
+        }
+    }
+}
+
 pub(super) fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
+    parse_sql_value_with_input_provenance(input).map(|(value, _)| value)
+}
+
+/// Compatibility projection for CHECK parsing, which only needs to know whether the scalar is
+/// concrete. Typed DEFAULT parsing calls the provenance-preserving entry point below.
+pub(super) fn parse_sql_value_with_input_type(
+    input: &str,
+) -> Result<(SqlValue, Option<SqlType>), ParseError> {
+    parse_sql_value_with_input_provenance(input)
+        .map(|(value, provenance)| (value, provenance.concrete_type()))
+}
+
+/// Parse a scalar while preserving whether its concrete type was inferred or explicitly cast.
+pub(super) fn parse_sql_value_with_input_provenance(
+    input: &str,
+) -> Result<(SqlValue, ScalarInputTypeProvenance), ParseError> {
     let (s, cast) = split_supported_sql_value_cast(input.trim())?;
     if let Some(digits) = s.strip_prefix('$') {
         if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -249,12 +284,20 @@ pub(super) fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
         if index == 0 {
             return Err(ParseError::InvalidParameterReference);
         }
-        return Ok(SqlValue::Parameter { index, cast });
+        let provenance = cast.map_or(
+            ScalarInputTypeProvenance::Unknown,
+            ScalarInputTypeProvenance::Explicit,
+        );
+        return Ok((SqlValue::Parameter { index, cast }, provenance));
     }
     // NULL remains typeless even with an explicit cast; the cast supplies only its eventual SQL
     // type. This also keeps a bound `$n::type` NULL canonical source parseable for recovery.
     if s.eq_ignore_ascii_case("NULL") {
-        return Ok(SqlValue::Null);
+        let provenance = cast.map_or(
+            ScalarInputTypeProvenance::Unknown,
+            ScalarInputTypeProvenance::Explicit,
+        );
+        return Ok((SqlValue::Null, provenance));
     }
     if s.starts_with('\'') {
         if !s.ends_with('\'') || s.len() < 2 {
@@ -263,8 +306,13 @@ pub(super) fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
         let inner = &s[1..s.len() - 1];
         let value = inner.replace("''", "'");
         return match cast {
-            None | Some(SqlType::Text) => Ok(SqlValue::Text(value)),
-            Some(ty) => parse_typed_value_from_str(&value, ty),
+            None => Ok((SqlValue::Text(value), ScalarInputTypeProvenance::Unknown)),
+            Some(SqlType::Text) => Ok((
+                SqlValue::Text(value),
+                ScalarInputTypeProvenance::Explicit(SqlType::Text),
+            )),
+            Some(ty) => parse_typed_value_from_str(&value, ty)
+                .map(|value| (value, ScalarInputTypeProvenance::Explicit(ty))),
         };
     }
     // Unquoted literal. A cast pins the target type; otherwise we infer it (a bare
@@ -272,17 +320,84 @@ pub(super) fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
     // `TRUE`/`FALSE` → Bool, a value with a decimal point → Numeric, and an integer
     // that overflows i32 → Int8).
     match cast {
-        Some(ty) => parse_typed_value_from_str(s, ty),
-        None => parse_inferred_unquoted_literal(s),
+        Some(ty) => parse_typed_value_from_str(s, ty)
+            .map(|value| (value, ScalarInputTypeProvenance::Explicit(ty))),
+        None => {
+            let value = parse_inferred_unquoted_literal(s)?;
+            let ty = match &value {
+                SqlValue::Int2(_) => SqlType::Int2,
+                SqlValue::Int4(_) => SqlType::Int4,
+                SqlValue::Int8(_) => SqlType::Int8,
+                SqlValue::Numeric(value) => SqlType::Numeric {
+                    precision: NUMERIC_DEFAULT_PRECISION,
+                    scale: value.scale,
+                },
+                SqlValue::Bool(_) => SqlType::Bool,
+                // The early NULL branch and quoted branch own these; keep this parser fail-closed
+                // if a new inferred variant is introduced without an input-type rule.
+                SqlValue::Null
+                | SqlValue::Text(_)
+                | SqlValue::Date(_)
+                | SqlValue::Timestamp(_)
+                | SqlValue::Uuid(_)
+                | SqlValue::Parameter { .. } => return Err(ParseError::InvalidRelationalSql),
+            };
+            Ok((value, ScalarInputTypeProvenance::Inferred(ty)))
+        }
     }
+}
+
+/// DEFAULT-specific scalar parsing.  Unlike ordinary scalar expressions, a numeric
+/// DEFAULT must retain its natural mantissa/scale until the engine evaluates its
+/// source cast and then the assignment target.  In particular,
+/// `999.5::numeric(3,0)` is stored as `9995@scale=1`, not as the already-rounded
+/// `1000@scale=0` carrier.
+pub(super) fn parse_sql_default_value_with_input_provenance(
+    input: &str,
+) -> Result<(SqlValue, ScalarInputTypeProvenance), ParseError> {
+    let (source, cast) = split_supported_sql_value_cast(input.trim())?;
+    let Some(numeric @ SqlType::Numeric { .. }) = cast else {
+        return parse_sql_value_with_input_provenance(input);
+    };
+    if source.eq_ignore_ascii_case("NULL") || source.starts_with('$') {
+        return parse_sql_value_with_input_provenance(input);
+    }
+    let text = if source.starts_with('\'') {
+        if !source.ends_with('\'') || source.len() < 2 {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        source[1..source.len() - 1].replace("''", "'")
+    } else {
+        source.to_string()
+    };
+    parse_default_numeric_literal(&text, numeric).map(|value| {
+        (
+            SqlValue::Numeric(value),
+            ScalarInputTypeProvenance::Explicit(numeric),
+        )
+    })
+}
+
+/// Parse a NUMERIC input without applying its typmod.  The input is still syntactically
+/// validated here; precision/range checks are intentionally the later evaluator's job.
+pub fn parse_default_numeric_literal(text: &str, ty: SqlType) -> Result<Decimal128, ParseError> {
+    let SqlType::Numeric { .. } = ty else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Decimal128::parse(text).ok_or_else(|| {
+        if numeric_text_is_well_formed(text) {
+            numeric_range_error(ty, text)
+        } else {
+            invalid_text_error(ty, text)
+        }
+    })
 }
 
 /// Parse a bounded scalar projection and retain the type that PostgreSQL exposes in RowDescription.
 /// Unlike storage literals, a projected NULL must have a concrete output type; PostgreSQL resolves
 /// an otherwise-unknown top-level NULL to text, while an explicit cast owns the type.
 pub(super) fn parse_typed_sql_literal(input: &str) -> Result<(SqlType, SqlValue), ParseError> {
-    let (_, cast) = split_supported_sql_value_cast(input.trim())?;
-    let value = parse_sql_value(input)?;
+    let (value, cast) = parse_sql_value_with_input_type(input)?;
     let ty = match (cast, &value) {
         (Some(ty), _) => ty,
         (None, SqlValue::Null | SqlValue::Text(_)) => SqlType::Text,
@@ -307,36 +422,120 @@ pub(super) fn parse_typed_sql_literal(input: &str) -> Result<(SqlType, SqlValue)
 
 /// Parse `text` into a specific [`SqlType`] (used for an explicit `::type` cast and
 /// for a quoted literal carrying a cast). The numeric arm rounds to the column scale.
-pub(super) fn parse_typed_value_from_str(text: &str, ty: SqlType) -> Result<SqlValue, ParseError> {
+pub fn parse_typed_value_from_str(text: &str, ty: SqlType) -> Result<SqlValue, ParseError> {
     match ty {
         SqlType::Int2 => text
             .parse::<i16>()
             .map(SqlValue::Int2)
-            .map_err(|_| ParseError::InvalidRelationalSql),
+            .map_err(|error| integer_parse_error(SqlType::Int2, text, error.kind())),
         SqlType::Int4 => text
             .parse::<i32>()
             .map(SqlValue::Int4)
-            .map_err(|_| ParseError::InvalidRelationalSql),
+            .map_err(|error| integer_parse_error(SqlType::Int4, text, error.kind())),
         SqlType::Int8 => text
             .parse::<i64>()
             .map(SqlValue::Int8)
-            .map_err(|_| ParseError::InvalidRelationalSql),
-        SqlType::Numeric { scale, .. } => Decimal128::parse_at_scale(text, scale)
-            .map(SqlValue::Numeric)
-            .ok_or(ParseError::InvalidRelationalSql),
+            .map_err(|error| integer_parse_error(SqlType::Int8, text, error.kind())),
+        // Do not apply `numeric(p,s)` precision here. A CHECK's explicit scalar cast is
+        // cataloged successfully in PostgreSQL and its overflow is raised when the CHECK is
+        // evaluated (INSERT / ALTER ADD CHECK validation). The caller retains the target type in
+        // the catalog-resolved input type, which is the deferred typmod authority.
+        SqlType::Numeric { scale, .. } => {
+            parse_numeric_at_scale(text, scale).map(SqlValue::Numeric)
+        }
         SqlType::Bool => parse_bool_value(text)
             .map(SqlValue::Bool)
-            .ok_or(ParseError::InvalidRelationalSql),
+            .ok_or_else(|| invalid_text_error(ty, text)),
         SqlType::Text => Ok(SqlValue::Text(text.to_string())),
-        SqlType::Date => crate::datetime::parse_date(text)
+        SqlType::Date => crate::datetime::parse_date_detailed(text)
             .map(SqlValue::Date)
-            .ok_or(ParseError::InvalidRelationalSql),
-        SqlType::Timestamp => crate::datetime::parse_timestamp(text)
+            .map_err(|error| datetime_parse_error(text, error)),
+        SqlType::Timestamp => crate::datetime::parse_timestamp_detailed(text)
             .map(SqlValue::Timestamp)
-            .ok_or(ParseError::InvalidRelationalSql),
+            .map_err(|error| datetime_parse_error(text, error)),
         SqlType::Uuid => crate::uuid::parse_uuid(text)
             .map(SqlValue::Uuid)
-            .ok_or(ParseError::InvalidRelationalSql),
+            .ok_or_else(|| invalid_text_error(ty, text)),
+    }
+}
+
+fn datetime_parse_error(text: &str, error: crate::datetime::DatetimeParseError) -> ParseError {
+    match error {
+        crate::datetime::DatetimeParseError::MalformedFormat => ParseError::InvalidDatetimeFormat {
+            input: text.to_string(),
+        },
+        crate::datetime::DatetimeParseError::FieldOverflow => ParseError::DatetimeFieldOverflow {
+            input: text.to_string(),
+        },
+    }
+}
+
+fn integer_parse_error(ty: SqlType, input: &str, kind: &std::num::IntErrorKind) -> ParseError {
+    match kind {
+        std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+            numeric_range_error(ty, input)
+        }
+        _ => invalid_text_error(ty, input),
+    }
+}
+
+fn parse_numeric_at_scale(text: &str, scale: u8) -> Result<Decimal128, ParseError> {
+    let parsed = Decimal128::parse(text).ok_or_else(|| {
+        if numeric_text_is_well_formed(text) {
+            numeric_range_error(
+                SqlType::Numeric {
+                    precision: NUMERIC_DEFAULT_PRECISION,
+                    scale,
+                },
+                text,
+            )
+        } else {
+            invalid_text_error(
+                SqlType::Numeric {
+                    precision: NUMERIC_DEFAULT_PRECISION,
+                    scale,
+                },
+                text,
+            )
+        }
+    })?;
+    parsed.rescale(scale).map_err(|_| {
+        numeric_range_error(
+            SqlType::Numeric {
+                precision: NUMERIC_DEFAULT_PRECISION,
+                scale,
+            },
+            text,
+        )
+    })
+}
+
+fn numeric_text_is_well_formed(input: &str) -> bool {
+    let input = input.trim();
+    let input = input
+        .strip_prefix('-')
+        .or_else(|| input.strip_prefix('+'))
+        .unwrap_or(input);
+    if input.is_empty() {
+        return false;
+    }
+    let (whole, fraction) = input.split_once('.').unwrap_or((input, ""));
+    !(whole.is_empty() && fraction.is_empty())
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn invalid_text_error(ty: SqlType, input: &str) -> ParseError {
+    ParseError::InvalidTextRepresentation {
+        ty: ty.catalog_name(),
+        input: input.to_string(),
+    }
+}
+
+fn numeric_range_error(ty: SqlType, input: &str) -> ParseError {
+    ParseError::NumericValueOutOfRange {
+        ty: ty.catalog_name(),
+        input: input.to_string(),
     }
 }
 
@@ -489,5 +688,61 @@ mod decimal_tests {
         );
         assert_eq!(parse_sql_value("'t'::bool").unwrap(), SqlValue::Bool(true));
         assert_eq!(parse_sql_value("'42'::int8").unwrap(), SqlValue::Int8(42));
+    }
+
+    #[test]
+    fn explicit_scalar_casts_keep_typed_error_categories_and_defer_numeric_precision() {
+        for input in [
+            "'not-a-bool'::bool",
+            "'not-a-uuid'::uuid",
+            "'x'::int2",
+            "'x'::int4",
+            "'x'::numeric",
+        ] {
+            assert!(matches!(
+                parse_sql_value(input),
+                Err(ParseError::InvalidTextRepresentation { .. })
+            ));
+        }
+        for input in ["'not-a-date'::date", "'not-a-timestamp'::timestamp"] {
+            assert!(matches!(
+                parse_sql_value(input),
+                Err(ParseError::InvalidDatetimeFormat { .. })
+            ));
+        }
+        for input in [
+            "'2024-02-30'::date",
+            "'0000-01-01'::date",
+            "'2024-01-01 25:00:00'::timestamp",
+            "'294277-12-31 00:00:00'::timestamp",
+        ] {
+            assert!(matches!(
+                parse_sql_value(input),
+                Err(ParseError::DatetimeFieldOverflow { .. })
+            ));
+        }
+        for input in [
+            "'32768'::int2",
+            "'2147483648'::int4",
+            "'999999999999999999999999999999999999999'::numeric(38,0)",
+        ] {
+            assert!(matches!(
+                parse_sql_value(input),
+                Err(ParseError::NumericValueOutOfRange { .. })
+            ));
+        }
+
+        // PostgreSQL accepts this scalar cast in CREATE CHECK and defers its typmod failure
+        // until the published expression is evaluated. Keep both the rounded value and cast type.
+        assert_eq!(
+            parse_sql_value_with_input_type("999.5::numeric(3,0)").unwrap(),
+            (
+                SqlValue::Numeric(Decimal128::new(1_000, 0)),
+                Some(SqlType::Numeric {
+                    precision: 3,
+                    scale: 0,
+                })
+            )
+        );
     }
 }

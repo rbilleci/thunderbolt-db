@@ -66,6 +66,66 @@ fn int4_parameters(rows: impl IntoIterator<Item = Vec<i32>>) -> Vec<Vec<SqlValue
         .collect()
 }
 
+#[test]
+fn prepared_insert_rejects_out_of_domain_typed_temporal_carriers_before_execution() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(1, "CREATE TABLE prepared_temporal (d date, t timestamp)")
+        .unwrap();
+    for (sql, ty, value) in [
+        (
+            "INSERT INTO prepared_temporal (d) VALUES ($1)",
+            SqlType::Date,
+            SqlValue::Date(gpu_db_sql::datetime::PG_DATE_END_DAYS_EXCLUSIVE),
+        ),
+        (
+            "INSERT INTO prepared_temporal (t) VALUES ($1)",
+            SqlType::Timestamp,
+            SqlValue::Timestamp(gpu_db_sql::datetime::PG_TIMESTAMP_MIN_MICROS - 1),
+        ),
+    ] {
+        let route = engine
+            .prepare_transaction_route(
+                vec![PreparedCommand::parse(sql).unwrap()],
+                vec![vec![Some(ty)]],
+                TransactionCharacteristics::READ_COMMITTED_READ_WRITE,
+            )
+            .unwrap();
+        assert!(matches!(
+            route.bind(vec![vec![value]]),
+            Err(ExecuteError::Engine(EngineError::DatetimeFieldOverflow(_)))
+        ));
+    }
+}
+
+#[test]
+fn prepared_insert_executes_finite_temporal_lower_boundaries_with_bc_canonical_source() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(1, "CREATE TABLE prepared_temporal_bc (d date, t timestamp)")
+        .unwrap();
+    let route = engine
+        .prepare_transaction_route(
+            vec![
+                PreparedCommand::parse("INSERT INTO prepared_temporal_bc (d, t) VALUES ($1, $2)")
+                    .unwrap(),
+            ],
+            vec![vec![Some(SqlType::Date), Some(SqlType::Timestamp)]],
+            TransactionCharacteristics::READ_COMMITTED_READ_WRITE,
+        )
+        .unwrap();
+    let bound = route
+        .bind(vec![vec![
+            SqlValue::Date(gpu_db_sql::datetime::PG_DATE_MIN_DAYS),
+            SqlValue::Timestamp(gpu_db_sql::datetime::PG_TIMESTAMP_MIN_MICROS),
+        ]])
+        .expect("finite lower carriers bind through the BC-form canonical source");
+    assert!(matches!(
+        engine.submit_transaction(2, bound),
+        Ok(TransactionAdmissionResult::Predeclared(_))
+    ));
+}
+
 fn selected_int4(result: &PredeclaredOperationResult) -> i32 {
     let PredeclaredOperationResult::Read(result) = result else {
         panic!("expected prepared read result")

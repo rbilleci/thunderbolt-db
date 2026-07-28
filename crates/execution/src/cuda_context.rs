@@ -57,6 +57,15 @@ const MIN_POOLED_BUFFER_BYTES: usize = 256;
 /// of pooling, so a one-off oversized request can't pin device memory for process lifetime.
 const POOLED_OUTPUT_BYTES_CAP: usize = 1 << 30; // 1 GiB
 
+/// Fallibly round a buffer request up to its pool bucket (power of two, floored at
+/// `MIN_POOLED_BUFFER_BYTES`) so a release maps straight back to the bucket it came from.
+/// Public prepared-geometry preflight uses this before it can reach an allocator.
+pub(super) fn checked_output_buffer_bucket(min_bytes: usize) -> Option<usize> {
+    min_bytes
+        .max(MIN_POOLED_BUFFER_BYTES)
+        .checked_next_power_of_two()
+}
+
 /// Round a buffer request up to its pool bucket (power of two, floored at
 /// `MIN_POOLED_BUFFER_BYTES`) so a release maps straight back to the bucket it came from.
 pub(super) fn output_buffer_bucket(min_bytes: usize) -> usize {
@@ -1023,5 +1032,20 @@ impl Drop for CudaEventGuard {
         unsafe {
             (self.destroy)(self.event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_output_buffer_bucket;
+
+    #[test]
+    fn pooled_buffer_bucket_rounding_rejects_the_first_unroundable_request() {
+        let largest_bucket = 1_usize << (usize::BITS - 1);
+        assert_eq!(
+            checked_output_buffer_bucket(largest_bucket),
+            Some(largest_bucket)
+        );
+        assert_eq!(checked_output_buffer_bucket(largest_bucket + 1), None);
     }
 }

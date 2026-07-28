@@ -1,5 +1,5 @@
 use super::canonical::{WaveCanonicalFailure, WaveCanonicalOperation};
-use super::fixed_insert::FixedInsertPreflightResult;
+use super::fixed_insert::TypedInsertPreflightResult;
 use super::{
     coerce_filter_literal, current_timestamp_micros, exact_device_verdict_cardinality,
     relational_key_prefix, try_encode_binary_insert, wave_device_phase_timing_enabled,
@@ -739,18 +739,18 @@ impl Engine {
             let fixed_candidate = batch[position]
                 .offlock_prepared
                 .as_ref()
-                .is_some_and(|prepared| prepared.is_fixed_insert());
+                .is_some_and(|prepared| prepared.is_typed_insert());
             if fixed_candidate {
                 flush_appends(&mut pending_appends, &mut committed);
                 let reuse_eligible = wave_catalog_seq == batch[position].prepared_catalog_seq;
-                match self.prepare_fixed_insert_pre_wal(
+                match self.prepare_typed_insert_pre_wal(
                     &mut batch[position],
                     &wave_catalog,
                     wave_catalog_seq,
                     next_row_id,
                     reuse_eligible,
                 ) {
-                    FixedInsertPreflightResult::Ready(fixed) => {
+                    TypedInsertPreflightResult::Ready(fixed) => {
                         let (operation, fixed_apply) = fixed.into_canonical_operation_and_apply();
                         let commit_seq = commit.repl.peek_next_index();
                         #[cfg(feature = "probe-timing")]
@@ -819,11 +819,11 @@ impl Engine {
                         hp!(5);
                         continue;
                     }
-                    FixedInsertPreflightResult::PreWalFailure(error) => {
+                    TypedInsertPreflightResult::PreWalFailure(error) => {
                         batch[position].set_outcome(Err(error));
                         continue;
                     }
-                    FixedInsertPreflightResult::RetryableDecline => {
+                    TypedInsertPreflightResult::RetryableDecline => {
                         #[cfg(feature = "probe-timing")]
                         self.record_insert_probe_fixed_insert_retryable_decline();
                         batch[position].set_outcome(Err(ExecuteError::Serialization(
@@ -832,7 +832,7 @@ impl Engine {
                         )));
                         continue;
                     }
-                    FixedInsertPreflightResult::FullReprepare => {
+                    TypedInsertPreflightResult::FullReprepare => {
                         // The direct carrier is intentionally delta-free. Its binding drift is
                         // repaired only by the existing full preparation below, never by a
                         // synthetic or predicted-key reconstruction.
@@ -1932,7 +1932,7 @@ fn insert_i32_unique_needle_at(
     } else {
         insert.columns.iter().position(|c| c == unique_column)?
     };
-    let raw = row.get(source_pos)?.clone();
+    let raw = row.get(source_pos)?.value()?.clone();
     let coerced = coerce_filter_literal(raw, column_ty);
     let needle = crate::engine_residency::i32_section_needle(column_ty, &coerced)?;
     Some((filter_idx, needle))
@@ -1958,9 +1958,12 @@ fn insert_key_column_bind(
     // Coerce the raw literal to the column TYPE the way the INSERT apply does (Text -> Uuid via
     // parse_uuid; Numeric rescaled to the column's scale) so the folded WORDS match the stored b128
     // section bytes exactly — `coerce_filter_literal` leaves a uuid/numeric literal as Text/unscaled.
-    let coerced =
-        crate::rel_exec_helpers::coerce_insert_value(row.get(source_pos)?.clone(), column_ty, name)
-            .ok()?;
+    let coerced = crate::rel_exec_helpers::coerce_insert_value(
+        row.get(source_pos)?.value()?.clone(),
+        column_ty,
+        name,
+    )
+    .ok()?;
     Some((filter_idx, coerced))
 }
 

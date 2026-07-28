@@ -7,8 +7,8 @@ use gpu_db_types::{EngineError, TxnId};
 use crate::{
     add_column_default_supported, coerce_column_default,
     engine_ddl_table::{create_table_implicit_index_names, duplicate_index_key_column},
-    sequence_defaults, CatalogSnapshot, DmlReadSnapshot, Engine, PgClassRelationKind,
-    MAX_CATALOG_OID, PUBLIC_SCHEMA_NAME,
+    evaluate_scalar, is_sequence, resolve_check_comparison_literal, CatalogSnapshot,
+    DmlReadSnapshot, Engine, PgClassRelationKind, MAX_CATALOG_OID, PUBLIC_SCHEMA_NAME,
 };
 
 fn preflight_relational_oid_capacity(
@@ -444,20 +444,51 @@ impl Engine {
                             )));
                         }
                     }
-                }
-                for default in sequence_defaults(&create.columns) {
-                    if let ColumnDefault::SequenceNextVal {
-                        sequence,
-                        create_if_missing: true,
-                    } = default
-                    {
-                        if !implicit_sequences.insert(sequence.clone()) {
-                            return Err(EngineError::ApplyFailed(format!(
-                                "relation \"{sequence}\" already exists"
-                            )));
+                    if let Some(default) = column.default.clone() {
+                        // Validate DEFAULTs in declaration order.  An explicit regclass lookup,
+                        // assignment binding, and sequence-kind check are one diagnostic unit;
+                        // do not pre-scan later defaults and let them overtake an earlier error.
+                        if let ColumnDefault::SequenceNextVal {
+                            sequence,
+                            create_if_missing: true,
+                        } = &default
+                        {
+                            if !implicit_sequences.insert(sequence.clone()) {
+                                return Err(EngineError::ApplyFailed(format!(
+                                    "relation \"{sequence}\" already exists"
+                                )));
+                            }
                         }
+                        self.preflight_column_default_target_before_binding(&default)?;
+                        let bound = coerce_column_default(default, column.ty, &column.name)?;
+                        self.preflight_column_default_target(&bound)?;
                     }
-                    self.preflight_column_default_target(default)?;
+                }
+                // A CREATE CHECK must be accepted or rejected before WAL just like INSERT's
+                // assignment cast. Resolve domains on a clone so the parsed command remains the
+                // replay authority; apply will run the exact same shared coercion before storing
+                // its normalized catalog binding.
+                let mut check_columns = create.columns.clone();
+                for column in &mut check_columns {
+                    self.resolve_column_domain_type(column)?;
+                }
+                for check in &create.check_constraints {
+                    let column = check_columns
+                        .iter()
+                        .find(|column| column.name == check.filter.column)
+                        .ok_or_else(|| {
+                            EngineError::ApplyFailed(format!(
+                                "column \"{}\" does not exist",
+                                check.filter.column
+                            ))
+                        })?;
+                    let _ = resolve_check_comparison_literal(
+                        check.filter.value.clone(),
+                        check.literal_provenance,
+                        column.ty,
+                        check.filter.op,
+                        &check.filter.column,
+                    )?;
                 }
                 let implicit_index_names = create_table_implicit_index_names(create);
                 let mut new_relation_names = BTreeSet::from([create.table.clone()]);
@@ -732,7 +763,9 @@ impl Engine {
                     "relational catalog OID allocation exhausted",
                 )?;
             }
-            Command::AddCheckConstraint(add) => self.preflight_add_check_constraint(add)?,
+            Command::AddCheckConstraint(add) => {
+                let _ = self.preflight_add_check_constraint(add)?;
+            }
             Command::AddForeignKey(add) => self.preflight_add_foreign_key(add, txn_id)?,
             Command::AddColumn(add) => {
                 if cat.relational_views.contains_key(&add.table)
@@ -743,6 +776,20 @@ impl Engine {
                         "relation \"{}\" is not a table",
                         add.table
                     )));
+                }
+                // Relation lookup and existing-column detection are structural DDL checks.
+                // They precede every DEFAULT action so a missing table (42P01) or duplicate
+                // column (42701) cannot be overtaken by binding or evaluating the default.
+                let table = cat
+                    .relational_catalog
+                    .get(&add.table)
+                    .ok_or_else(|| EngineError::UndefinedRelation(add.table.clone()))?;
+                if table
+                    .columns
+                    .iter()
+                    .any(|column| column.name == add.column.name)
+                {
+                    return Err(EngineError::DuplicateColumn(add.column.name.clone()));
                 }
                 let Some(default) = add.column.default.as_ref() else {
                     return Err(EngineError::ApplyFailed(
@@ -756,23 +803,36 @@ impl Engine {
                             .to_string(),
                     ));
                 }
-                // Validate the default is coercible to the column type (parity with apply);
-                // this concurrent-DDL preflight only checks — apply coerces and stores.
-                coerce_column_default(default.clone(), add.column.ty, &add.column.name)?;
-                let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
-                    EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
+                // Bind on a clone and eagerly evaluate scalar ADD COLUMN defaults before
+                // WAL, including an empty relation.  Apply repeats this deterministic
+                // publication preparation with the same expression.
+                self.preflight_column_default_target_before_binding(default)?;
+                let bound =
+                    coerce_column_default(default.clone(), add.column.ty, &add.column.name)?;
+                self.preflight_column_default_target(&bound)?;
+                if !is_sequence(&bound) {
+                    let _ = evaluate_scalar(&bound, add.column.ty, &add.column.name)?;
+                }
+            }
+            Command::AlterColumnDefault(alter) => {
+                let table = cat.relational_catalog.get(&alter.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{}\" does not exist", alter.table))
                 })?;
-                if table
+                let column = table
                     .columns
                     .iter()
-                    .any(|column| column.name == add.column.name)
-                {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "column \"{}\" of relation \"{}\" already exists",
-                        add.column.name, add.table
-                    )));
+                    .find(|column| column.name == alter.column)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "column \"{}\" does not exist",
+                            alter.column
+                        ))
+                    })?;
+                if let Some(default) = alter.default.clone() {
+                    self.preflight_column_default_target_before_binding(&default)?;
+                    let bound = coerce_column_default(default, column.ty, &column.name)?;
+                    self.preflight_column_default_target(&bound)?;
                 }
-                self.preflight_column_default_target(default)?;
             }
             Command::RenameTable(rename) => {
                 match cat.pg_class_relation_kind(&rename.old_name)? {
