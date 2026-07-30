@@ -1044,6 +1044,82 @@ fn sequence_reference_wrapper_round_trips_and_rejects_noncanonical_references() 
         final_value_overwritten: false,
         default_expression: false,
     };
+    assert_eq!(ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES, 86);
+    let mut exact_reference = [0xa5; ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
+    encode_sequence_value_reference_into_exact(&reference, &mut exact_reference).unwrap();
+    let mut golden_reference = [0; ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
+    golden_reference[0..8].copy_from_slice(&22_u64.to_le_bytes());
+    golden_reference[8..16].copy_from_slice(&21_u64.to_le_bytes());
+    golden_reference[16..20].copy_from_slice(&0_u32.to_le_bytes());
+    golden_reference[20..24].copy_from_slice(&0_u32.to_le_bytes());
+    golden_reference[24..28].copy_from_slice(&51_u32.to_le_bytes());
+    golden_reference[28..36].copy_from_slice(&1_i64.to_le_bytes());
+    golden_reference[36..68].copy_from_slice(&input_digest);
+    assert_eq!(
+        exact_reference, golden_reference,
+        "standalone reference layout"
+    );
+    assert_eq!(
+        decode_sequence_value_reference_exact(&exact_reference).unwrap(),
+        reference
+    );
+    for retained in 0..ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES {
+        assert!(decode_sequence_value_reference_exact(&exact_reference[..retained]).is_err());
+    }
+    let mut surplus_reference = exact_reference.to_vec();
+    surplus_reference.push(0);
+    assert!(decode_sequence_value_reference_exact(&surplus_reference).is_err());
+    let mut zero_transition = exact_reference;
+    zero_transition[0..8].fill(0);
+    assert!(decode_sequence_value_reference_exact(&zero_transition).is_err());
+    let mut zero_digest = exact_reference;
+    zero_digest[36..68].fill(0);
+    assert!(decode_sequence_value_reference_exact(&zero_digest).is_err());
+    for flag in [84, 85] {
+        let mut invalid_boolean = exact_reference;
+        invalid_boolean[flag] = 2;
+        assert!(decode_sequence_value_reference_exact(&invalid_boolean).is_err());
+    }
+    let mut invalid_staging = reference.clone();
+    invalid_staging.staging_row_ordinal = 1;
+    assert!(
+        encode_sequence_value_reference_into_exact(&invalid_staging, &mut exact_reference).is_err()
+    );
+
+    let mut first_default = reference.clone();
+    first_default.transition_txn_id = 30;
+    first_default.expression_ordinal = 5;
+    first_default.table_oid = 71;
+    first_default.column_id = 81;
+    first_default.row_id = 91;
+    first_default.default_expression = true;
+    first_default.final_value_overwritten = true;
+    let mut second_default = first_default.clone();
+    second_default.transition_txn_id = 31;
+    second_default.expression_ordinal = 6;
+    second_default.column_id = 82;
+    assert_eq!(second_default.sequence_oid, first_default.sequence_oid);
+    assert!(valid_sequence_value_reference_closure(&[
+        first_default.clone(),
+        second_default.clone(),
+    ]));
+    let mut duplicate_expression = second_default.clone();
+    duplicate_expression.transition_txn_id = 32;
+    duplicate_expression.expression_ordinal = first_default.expression_ordinal;
+    duplicate_expression.column_id = 83;
+    assert!(!valid_sequence_value_reference_closure(&[
+        first_default.clone(),
+        duplicate_expression,
+    ]));
+    let mut duplicate_default_binding = second_default;
+    duplicate_default_binding.transition_txn_id = 32;
+    duplicate_default_binding.expression_ordinal = 7;
+    duplicate_default_binding.column_id = first_default.column_id;
+    assert!(!valid_sequence_value_reference_closure(&[
+        first_default,
+        duplicate_default_binding,
+    ]));
+
     let base = BinaryTransactionRecord {
         catalog_epoch: BinaryTransactionCatalogEpoch::Legacy,
         allocator_high_water: 1,
@@ -1074,6 +1150,13 @@ fn sequence_reference_wrapper_round_trips_and_rejects_noncanonical_references() 
             WAL_BINARY_VERSION,
             OP_SEQUENCE_REFERENCED_TRANSACTION
         ]
+    );
+    let standalone_offset =
+        15 + usize::try_from(u64::from_le_bytes(payload[3..11].try_into().unwrap())).unwrap();
+    assert_eq!(
+        &payload[standalone_offset..standalone_offset + ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES],
+        &exact_reference,
+        "opcode-21 framing must reuse the standalone reference bytes"
     );
     assert!(matches!(
         decode_binary_record(&payload).unwrap(),

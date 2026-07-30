@@ -671,6 +671,7 @@ fn serial_identity_anchor_failure_preserves_durable_cut_and_retries_unverified_t
     match wal.begin_group_flush().expect("retry after anchor restore") {
         WalGroupFlushBegin::Job(job) => assert_eq!(job.commit().unwrap(), 2),
         WalGroupFlushBegin::Clean { .. } => panic!("unverified record must still need a flush"),
+        WalGroupFlushBegin::Busy => panic!("single test flusher must own an available descriptor"),
     }
     assert_eq!(wal.flushed_count(), 2);
     assert_eq!(wal.durable_identity_verified_records_for_test(), 2);
@@ -792,8 +793,11 @@ fn raw_recovered_serial_canonical_history_requires_anchor_before_segment_reopen(
     let segment_before = fs::read(&path).expect("snapshot live segment");
     fs::remove_file(durable_identity_path(&path)).expect("remove identity anchor");
 
-    let error = WalBuffer::with_recovered_durable_segment(&path, recovery.records.clone(), &recovery)
-        .expect_err("raw canonical recovery must require its existing anchor before segment mutation");
+    let error =
+        WalBuffer::with_recovered_durable_segment(&path, recovery.records.clone(), &recovery)
+            .expect_err(
+                "raw canonical recovery must require its existing anchor before segment mutation",
+            );
     assert!(error.to_string().contains("anchor is missing"));
     assert_eq!(fs::read(&path).unwrap(), segment_before);
     assert_eq!(read_durable_identity(&path).unwrap(), None);
@@ -819,11 +823,7 @@ fn raw_recovered_serial_rejects_suffix_mismatch_before_identity_or_segment_mutat
         &recovery,
     )
     .expect_err("release recovery must reject a mismatched suffix before touching durable state");
-    assert!(
-        error
-            .to_string()
-            .contains("exact recovered segment suffix")
-    );
+    assert!(error.to_string().contains("exact recovered segment suffix"));
     assert_eq!(fs::read(&path).unwrap(), segment_before);
     assert_eq!(read_durable_identity(&path).unwrap(), None);
     remove_segment_files(&path);
@@ -1147,6 +1147,7 @@ fn w4a_growth_crosses_the_prealloc_chunk_group_job() {
     let flushed = match begun {
         WalGroupFlushBegin::Job(job) => job.commit().unwrap(),
         WalGroupFlushBegin::Clean { flushed_records } => flushed_records,
+        WalGroupFlushBegin::Busy => panic!("single test flusher must own an available descriptor"),
     };
     assert_eq!(flushed, 1);
     wal.append(WalRecord {

@@ -1,87 +1,39 @@
-//! Inert, test-only ownership for one already-published indexed in-place append proof.
+//! Physical ownership for one already-published indexed in-place reservation.
 //!
 //! This leaf prepares no canonical operation and exposes no device mutation entry point.  It
 //! exists to make the exact resource/lifetime handoff auditable before WRITE-001 intentionally
-//! connects it to a live commit path.
+//! connects it to the one live commit path.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#![allow(dead_code)] // deliberately compiled reservation; live strategy selection remains closed
+
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::fixed_insert::ResidentOpenShardAppendPlan;
+use super::index_delta_preview::{
+    IndexDeltaResourceLedger, IndexedInPlacePreview, PhysicalIndexBinding, RawIndexLogicalBinding,
+};
+use super::indexed_forecast::{
+    IndexedPhysicalGenerationWitness, IndexedPhysicalResourceForecast, IndexedPhysicalTargetWitness,
+};
 use crate::engine_insert_plan::batch_key_constraints::BatchKeyConstraintProof;
-use crate::engine_insert_plan::resident_key_constraints::{self, ResidentKeyValidationSeal};
+use crate::engine_insert_plan::host_retention::{HostRetentionGeometry, HostRetentionReport};
+use crate::engine_insert_plan::resident_key_constraints::ResidentKeyValidationSeal;
 use crate::engine_state::TransactionNamedIndexPublicationGuard;
 use crate::relational_model::RelationalTable;
+#[cfg(test)]
 use crate::typed_insert_batch::TypedInsertBatch;
-use crate::{Engine, ExecuteError, Index, RelationalResidentShard};
+use crate::{Engine, ExecuteError, Index};
 use gpu_db_execution::{
-    resident_index_allocated_bytes, resident_typed_indexes_insert_preparation_bytes,
-    CudaAllocationScope, CudaResidentDeviceMemory, CudaResidentTypedIndexInsert,
-    PreparedResidentTypedIndexesInsert,
+    CudaAllocationScope, CudaResidentDeviceMemory, PreparedResidentTypedIndexesInsert,
 };
 
-/// Every catalog index is represented here in raw catalog order.  Multiple raw indexes may use
-/// one physical directory only when the established `index_probe_key_id` says they do.
-struct RawIndexLogicalBinding {
-    raw_ordinal: usize,
-    key_id: usize,
-    physical_ordinal: usize,
-}
+#[cfg(test)]
+pub(crate) use super::index_delta_preview::IndexedInPlacePreviewReport;
 
-struct PhysicalIndexLogicalBinding {
-    raw_ordinal: usize,
-    key_id: usize,
-    descriptor_count: usize,
-}
-
-pub(super) struct PreparedIndexDeltaLogicalBindings {
-    raw: Box<[RawIndexLogicalBinding]>,
-    physical: Box<[PhysicalIndexLogicalBinding]>,
-    preparation_bytes: u64,
-}
-
-impl PreparedIndexDeltaLogicalBindings {
-    pub(super) fn preparation_bytes(&self) -> u64 {
-        self.preparation_bytes
-    }
-}
-
-/// Cache evidence for one distinct physical request.  The Arc pins are deliberately retained
-/// independently of the cache map so retirement cannot invalidate the prepared token's basis.
-struct PhysicalIndexBinding {
-    cache_key: (String, u32, usize),
-    key_id: usize,
-    device_index: Arc<CudaResidentDeviceMemory>,
-    published_row_count: Arc<AtomicUsize>,
-    published_has_postings: Arc<AtomicBool>,
-    has_postings_at_prepare: bool,
-    source_ptr: u64,
-    base_row: usize,
-    end_row: usize,
-    capacity: usize,
-    table_mask: u32,
-    hash_shift: u32,
-    gc_boundary: Index,
-    allocated_bytes: u64,
-}
-
-/// Exact resource accounting for one inert prepared token.  Persistent index allocations are
-/// pinned rather than allocated here; transient bytes are the two pooled leases retained by the
-/// existing execution token until this owner drops.
-struct IndexDeltaResourceLedger {
-    pinned_persistent_index_bytes: u64,
-    transient_preparation_bytes: u64,
-    descriptor_bytes: u64,
-    descriptor_count: usize,
-    bounded_readback_bytes: u64,
-    allocation_pin_count: usize,
-    raw_index_count: usize,
-    physical_index_count: usize,
-}
-
-/// Scalar-only observation available to proof tests.  Device pointers, CUDA tokens, append
+/// Scalar-only observation available to reservation tests. Device pointers, CUDA tokens, append
 /// sources, cache entries, and lifecycle guards never cross this reporting boundary.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IndexedInPlaceProofReport {
     pub(crate) raw_index_count: usize,
@@ -89,6 +41,9 @@ pub(crate) struct IndexedInPlaceProofReport {
     pub(crate) base_row: usize,
     pub(crate) incoming_rows: usize,
     pub(crate) preparation_bytes: u64,
+    pub(crate) index_preparation_bytes: u64,
+    pub(crate) fused_preparation_bytes: u64,
+    pub(crate) fused_pooled_allocation_slots: u64,
     pub(crate) original_read_snapshot: Index,
     pub(crate) predecessor_boundary: Index,
     pub(crate) pinned_persistent_index_bytes: u64,
@@ -96,6 +51,12 @@ pub(crate) struct IndexedInPlaceProofReport {
     pub(crate) descriptor_count: usize,
     pub(crate) bounded_readback_bytes: u64,
     pub(crate) allocation_pin_count: usize,
+    pub(crate) host_retained_bytes: u64,
+    pub(crate) host_allocation_slots: u64,
+    pub(crate) host_generation_pin_slots: u64,
+    pub(crate) peak_host_retained_bytes: u64,
+    pub(crate) peak_host_allocation_slots: u64,
+    pub(crate) peak_host_generation_pin_slots: u64,
 }
 
 /// Move-only device-index preparation and its exact proof/pin ledger.  Launch setup drops before
@@ -103,6 +64,9 @@ pub(crate) struct IndexedInPlaceProofReport {
 struct PreparedResidentIndexDelta {
     launch: PreparedResidentTypedIndexesInsert,
     source_payload: Arc<CudaResidentDeviceMemory>,
+    _created_by_region: Option<Arc<CudaResidentDeviceMemory>>,
+    _row_id_region: Option<Arc<CudaResidentDeviceMemory>>,
+    _deleted_by_region: Option<Arc<CudaResidentDeviceMemory>>,
     key_proof: BatchKeyConstraintProof,
     validation: ResidentKeyValidationSeal,
     raw_bindings: Box<[RawIndexLogicalBinding]>,
@@ -110,19 +74,132 @@ struct PreparedResidentIndexDelta {
     mutation_epoch: Arc<AtomicU64>,
     mutation_epoch_expected_even: u64,
     ledger: IndexDeltaResourceLedger,
+    host_retention_peak_before_finalization: HostRetentionGeometry,
 }
 
-/// Move-only inert owner.  Declaration order is load-bearing: abandoning the proof drains its
-/// whole prepared index delta first, then releases the ordinary append reservation, and only then
-/// releases named-index lifecycle protection.
-pub(super) struct PreparedIndexedInPlaceProof<'a> {
+impl PreparedResidentIndexDelta {
+    fn host_retention_report(&self) -> Result<HostRetentionReport, ExecuteError> {
+        let mut report = HostRetentionReport::default();
+        self.key_proof.append_host_retention(&mut report)?;
+        self.validation.append_host_retention(&mut report)?;
+        report.retain_boxed_slice(&self.raw_bindings)?;
+        report.retain_boxed_slice(&self.physical_bindings)?;
+        for binding in self.physical_bindings.iter() {
+            binding.append_host_retention(&mut report)?;
+        }
+        report.retain_arc_owner(&self.mutation_epoch)?;
+        let launch = self.launch.host_retention_report().map_err(|error| {
+            decline(format!(
+                "indexed append launch host retention failed: {error}"
+            ))
+        })?;
+        if let Some(identity) = launch.owner_array_backing_identity {
+            report.retain_external_backing(identity, launch.owner_array_backing_bytes)?;
+        }
+        Ok(report)
+    }
+}
+
+/// Move-only physical reservation. Declaration order is load-bearing: abandoning it drains its
+/// whole prepared fused/index tail first, then releases the ordinary append reservation, and only
+/// then releases named-index lifecycle protection.
+pub(super) struct PreparedIndexedInPlaceReservation<'a> {
+    fused: super::fixed_insert::PreparedIndexedInPlaceFusedApply,
     index_delta: PreparedResidentIndexDelta,
     append: ResidentOpenShardAppendPlan<'a>,
-    report: IndexedInPlaceProofReport,
+    forecast: IndexedPhysicalResourceForecast,
+    fused_materialization_peak: HostRetentionGeometry,
+    target_witness: IndexedPhysicalTargetWitness,
+    generation_witness: IndexedPhysicalGenerationWitness,
     _named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
 }
 
-impl PreparedIndexedInPlaceProof<'_> {
+impl PreparedIndexedInPlaceReservation<'_> {
+    fn host_retention_report(&self) -> Result<HostRetentionReport, ExecuteError> {
+        let mut report = self.append.host_retention_report()?;
+        report.merge(self.fused.host_retention_report()?)?;
+        report.merge(self.index_delta.host_retention_report()?)?;
+        Ok(report)
+    }
+
+    fn host_retention_peak(&self) -> Result<HostRetentionGeometry, ExecuteError> {
+        let fused_final = self.fused.host_retention_report()?.geometry()?;
+        let mut index_materialization_peak =
+            self.index_delta.host_retention_peak_before_finalization;
+        index_materialization_peak.checked_add_disjoint(
+            fused_final,
+            "indexed in-place fused final owner alongside index preparation",
+        )?;
+        Ok(self
+            .fused_materialization_peak
+            .peak(index_materialization_peak)
+            .peak(self.host_retention_report()?.geometry()?))
+    }
+
+    fn actual_resource_forecast(&self) -> Result<IndexedPhysicalResourceForecast, ExecuteError> {
+        let host = self.host_retention_report()?.geometry()?;
+        let peak = self.host_retention_peak()?;
+        let delta = &self.index_delta;
+        let fused = &self.fused;
+        let fused_footprint = fused.preparation_footprint();
+        let incremental_allocation_slots = u64::try_from(
+            delta
+                .ledger
+                .pending_created_by_allocation_count
+                .checked_add(delta.ledger.transient_allocation_slot_count)
+                .and_then(|slots| {
+                    usize::try_from(fused_footprint.pooled_device_scratch_slots)
+                        .ok()
+                        .and_then(|fused_slots| slots.checked_add(fused_slots))
+                })
+                .ok_or_else(|| decline("indexed append forecast allocation-slot overflow"))?,
+        )
+        .map_err(|_| decline("indexed append forecast allocation-slot conversion overflow"))?;
+        let simultaneous_preparation_bytes = delta
+            .ledger
+            .transient_preparation_bytes
+            .checked_add(fused.preparation_bytes())
+            .ok_or_else(|| decline("indexed append combined preparation-byte overflow"))?;
+        Ok(IndexedPhysicalResourceForecast {
+            final_host_retained_bytes: host.retained_bytes(),
+            final_host_allocation_slots: host.allocation_slots(),
+            final_host_generation_pin_slots: host.generation_pin_slots(),
+            peak_host_retained_bytes: peak.retained_bytes(),
+            peak_host_allocation_slots: peak.allocation_slots(),
+            peak_host_generation_pin_slots: peak.generation_pin_slots(),
+            old_generation_pinned_bytes: delta.ledger.retained_persistent_bytes,
+            new_persistent_bytes: delta.ledger.pending_created_by_bytes,
+            retained_device_transient_bytes: simultaneous_preparation_bytes,
+            retained_device_result_bytes: 0,
+            incremental_allocation_slots,
+            generation_pin_slots: u64::try_from(delta.ledger.retained_allocation_pin_count)
+                .map_err(|_| decline("indexed append forecast generation-pin overflow"))?,
+            maximum_concurrent_device_scratch_bytes: simultaneous_preparation_bytes,
+            maximum_host_readback_bytes: delta
+                .ledger
+                .bounded_readback_bytes
+                .max(fused_footprint.status_readback_bytes),
+        })
+    }
+
+    fn forecast_matches_actual(&self) -> Result<bool, ExecuteError> {
+        let actual = self.actual_resource_forecast()?;
+        let delta = &self.index_delta;
+        let (_, base_row, catalog_seq) = self.append.indexed_in_place_reservation_basis();
+        Ok(actual == self.forecast
+            && self.target_witness.gpu_id == delta.source_payload.metadata().gpu_id
+            && self.generation_witness.catalog_seq == catalog_seq
+            && self.generation_witness.open_shard_id
+                == self.append.indexed_in_place_reservation_basis().0
+            && self.generation_witness.row_count == u64::try_from(base_row).unwrap_or(u64::MAX)
+            && self.generation_witness.index_mutation_epoch_even
+                == delta.mutation_epoch_expected_even
+            && self.fused.stamps_match_expected_commit())
+    }
+}
+
+#[cfg(test)]
+impl PreparedIndexedInPlaceReservation<'_> {
     /// Consume the inert owner after exposing only its scalar accounting report.  There is no
     /// forwarding surface for the prepared CUDA token or append carrier.
     pub(super) fn inspect<R>(
@@ -135,14 +212,57 @@ impl PreparedIndexedInPlaceProof<'_> {
 
     fn scalar_report_if_intact(&self) -> Result<IndexedInPlaceProofReport, ExecuteError> {
         let delta = &self.index_delta;
-        let (shard_id, base_row, _) = self.append.proof_only_open_shard_basis();
+        let host = self.host_retention_report()?;
+        let host_geometry = host.geometry()?;
+        let host_peak = self.host_retention_peak()?;
+        let (shard_id, base_row, _) = self.append.indexed_in_place_reservation_basis();
+        let fused_footprint = self.fused.preparation_footprint();
+        let index_preparation_bytes = delta.ledger.transient_preparation_bytes;
+        let fused_preparation_bytes = self.fused.preparation_bytes();
+        let preparation_bytes = index_preparation_bytes
+            .checked_add(fused_preparation_bytes)
+            .ok_or_else(|| decline("indexed append proof combined preparation bytes overflow"))?;
+        let report = IndexedInPlaceProofReport {
+            raw_index_count: delta.ledger.raw_index_count,
+            physical_index_count: delta.ledger.physical_index_count,
+            base_row,
+            incoming_rows: self.append.row_count(),
+            preparation_bytes,
+            index_preparation_bytes,
+            fused_preparation_bytes,
+            fused_pooled_allocation_slots: fused_footprint.pooled_device_scratch_slots,
+            original_read_snapshot: delta.validation.original_read_snapshot(),
+            predecessor_boundary: delta.validation.predecessor_boundary(),
+            pinned_persistent_index_bytes: delta.ledger.pinned_persistent_index_bytes,
+            descriptor_bytes: delta.ledger.descriptor_bytes,
+            descriptor_count: delta.ledger.descriptor_count,
+            bounded_readback_bytes: delta
+                .ledger
+                .bounded_readback_bytes
+                .max(fused_footprint.status_readback_bytes),
+            allocation_pin_count: delta.ledger.retained_allocation_pin_count,
+            host_retained_bytes: host_geometry.retained_bytes(),
+            host_allocation_slots: host_geometry.allocation_slots(),
+            host_generation_pin_slots: host_geometry.generation_pin_slots(),
+            peak_host_retained_bytes: host_peak.retained_bytes(),
+            peak_host_allocation_slots: host_peak.allocation_slots(),
+            peak_host_generation_pin_slots: host_peak.generation_pin_slots(),
+        };
         if !self.append.holds_budget_reservation()
-            || base_row != self.report.base_row
-            || self.append.row_count() != self.report.incoming_rows
+            || base_row != report.base_row
+            || self.append.row_count() != report.incoming_rows
             || delta.launch.preparation_bytes() != delta.ledger.transient_preparation_bytes
-            || self.report.preparation_bytes != delta.ledger.transient_preparation_bytes
-            || self.report.original_read_snapshot != delta.validation.original_read_snapshot()
-            || self.report.predecessor_boundary != delta.validation.predecessor_boundary()
+            || report.index_preparation_bytes != delta.ledger.transient_preparation_bytes
+            || report.fused_preparation_bytes != self.fused.preparation_bytes()
+            || report.preparation_bytes
+                != report
+                    .index_preparation_bytes
+                    .saturating_add(report.fused_preparation_bytes)
+            || report.fused_pooled_allocation_slots != fused_footprint.pooled_device_scratch_slots
+            || self.fused.preparation_bytes() != fused_footprint.pooled_device_scratch_bytes
+            || !self.fused.stamps_match_expected_commit()
+            || report.original_read_snapshot != delta.validation.original_read_snapshot()
+            || report.predecessor_boundary != delta.validation.predecessor_boundary()
             || delta.mutation_epoch.load(Ordering::Acquire) != delta.mutation_epoch_expected_even
             || delta.mutation_epoch_expected_even & 1 != 0
             || delta.key_proof.indexes().len() != delta.raw_bindings.len()
@@ -160,19 +280,57 @@ impl PreparedIndexedInPlaceProof<'_> {
                     .checked_add(binding.allocated_bytes)
                     .ok_or_else(|| decline("indexed append proof retained byte sum overflows"))
             })?;
+        let mut retained_allocations = std::collections::BTreeMap::<usize, u64>::new();
+        let mut retain = |memory: &Arc<CudaResidentDeviceMemory>| -> Result<(), ExecuteError> {
+            let identity = memory.allocation_identity();
+            let bytes = memory.metadata().allocated_bytes;
+            if let Some(existing) = retained_allocations.insert(identity, bytes) {
+                if existing != bytes {
+                    return Err(decline(
+                        "indexed append proof allocation identity byte drifted",
+                    ));
+                }
+            }
+            Ok(())
+        };
+        retain(&delta.source_payload)?;
+        for binding in delta.physical_bindings.iter() {
+            retain(&binding.device_index)?;
+        }
+        for memory in [
+            delta._created_by_region.as_ref(),
+            delta._row_id_region.as_ref(),
+            delta._deleted_by_region.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            retain(memory)?;
+        }
+        let retained_bytes = retained_allocations
+            .values()
+            .try_fold(0_u64, |total, bytes| {
+                total
+                    .checked_add(*bytes)
+                    .ok_or_else(|| decline("indexed append proof retained total overflows"))
+            })?;
         if pinned_bytes != delta.ledger.pinned_persistent_index_bytes
             || delta.ledger.raw_index_count != delta.raw_bindings.len()
             || delta.ledger.physical_index_count != delta.physical_bindings.len()
-            || delta.ledger.allocation_pin_count != delta.physical_bindings.len() + 1
+            || delta.ledger.retained_persistent_bytes != retained_bytes
+            || delta.ledger.retained_allocation_pin_count != retained_allocations.len()
             || delta.ledger.bounded_readback_bytes != std::mem::size_of::<u32>() as u64
-            || self.report.raw_index_count != delta.ledger.raw_index_count
-            || self.report.physical_index_count != delta.ledger.physical_index_count
-            || self.report.pinned_persistent_index_bytes
-                != delta.ledger.pinned_persistent_index_bytes
-            || self.report.descriptor_bytes != delta.ledger.descriptor_bytes
-            || self.report.descriptor_count != delta.ledger.descriptor_count
-            || self.report.bounded_readback_bytes != delta.ledger.bounded_readback_bytes
-            || self.report.allocation_pin_count != delta.ledger.allocation_pin_count
+            || report.raw_index_count != delta.ledger.raw_index_count
+            || report.physical_index_count != delta.ledger.physical_index_count
+            || report.pinned_persistent_index_bytes != delta.ledger.pinned_persistent_index_bytes
+            || report.descriptor_bytes != delta.ledger.descriptor_bytes
+            || report.descriptor_count != delta.ledger.descriptor_count
+            || report.bounded_readback_bytes
+                != delta
+                    .ledger
+                    .bounded_readback_bytes
+                    .max(fused_footprint.status_readback_bytes)
+            || report.allocation_pin_count != delta.ledger.retained_allocation_pin_count
         {
             return Err(decline("indexed append proof retained ledger drifted"));
         }
@@ -203,7 +361,7 @@ impl PreparedIndexedInPlaceProof<'_> {
                 || physical.device_index.metadata().allocated_bytes != physical.allocated_bytes
                 || physical.published_row_count.load(Ordering::Acquire) != physical.base_row
                 || physical.published_has_postings.load(Ordering::Acquire)
-                    != physical.has_postings_at_prepare
+                    != physical.has_postings_at_preview
                 || physical.gc_boundary > delta.validation.original_read_snapshot()
                 || physical.table_mask == 0
                 || physical.hash_shift != 32 - (u64::from(physical.table_mask) + 1).trailing_zeros()
@@ -211,13 +369,14 @@ impl PreparedIndexedInPlaceProof<'_> {
                 return Err(decline("indexed append proof physical pin drifted"));
             }
         }
-        Ok(self.report)
+        Ok(report)
     }
 }
 
 /// Assemble and inspect the inert proof while the caller retains the canonical commit guard and
-/// has passed its already-held residency mutation gate into the normal append core.
+/// passes only a short proof alongside its already-held residency mutation gate.
 #[allow(clippy::too_many_arguments)] // proof ownership stays explicit; no opaque live-operation carrier
+#[cfg(test)]
 pub(crate) fn inspect_prepared_indexed_in_place<'a, R>(
     engine: &'a Engine,
     table: &RelationalTable,
@@ -228,429 +387,198 @@ pub(crate) fn inspect_prepared_indexed_in_place<'a, R>(
     validation: ResidentKeyValidationSeal,
     mutation_gate: std::sync::MutexGuard<'a, ()>,
     named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
+    commit_proof: &std::sync::MutexGuard<'_, crate::CommitState>,
+    permit: crate::engine_insert_plan::IndexedPhysicalMaterializationPermit,
     inspect: impl FnOnce(IndexedInPlaceProofReport) -> R,
 ) -> Result<R, ExecuteError> {
-    let logical = prepare_logical_bindings(engine, table, &key_proof)?;
-    let source = batch
-        .into_resident_append_source()
-        .ok_or_else(|| decline("indexed append proof lost its resident append source"))?;
-    let append = engine
-        .prepare_resident_open_shard_append_indexed_in_place_proof(
-            source,
-            row_ids,
-            mutation_gate,
-            logical.preparation_bytes(),
-        )
-        .map_err(|_| {
-            decline("indexed append proof is ineligible for fixed in-place preparation")
-        })?;
+    let preview = super::index_delta_preview::prepare(
+        engine,
+        table,
+        predecessor_boundary,
+        batch,
+        row_ids,
+        key_proof,
+        validation,
+        mutation_gate,
+        named_index_lifecycle,
+        commit_proof,
+    )?;
     prepare(
         engine,
         table,
-        predecessor_boundary,
-        append,
-        key_proof,
-        validation,
-        logical,
-        named_index_lifecycle,
+        preview,
+        commit_proof.repl.peek_next_index(),
+        permit,
     )
-    .and_then(|prepared| prepared.inspect(inspect))
+    .map(super::indexed_reservation::PreparedIndexedPhysicalReservation::in_place)
+    .and_then(|prepared| prepared.inspect_in_place(inspect))
 }
 
-pub(super) fn prepare_logical_bindings(
-    engine: &Engine,
-    table: &RelationalTable,
-    keys: &BatchKeyConstraintProof,
-) -> Result<PreparedIndexDeltaLogicalBindings, ExecuteError> {
-    if keys.indexes().len() != table.indexes.len() || table.indexes.is_empty() {
-        return Err(decline(
-            "indexed append proof lost exact raw catalog enrollment",
-        ));
-    }
-    let mut raw = Vec::with_capacity(table.indexes.len());
-    let mut physical = Vec::with_capacity(table.indexes.len());
-    let mut physical_by_key = BTreeMap::new();
-    let mut descriptor_count = 0_usize;
-    let shard_map = engine.read_state.residency.shards.load_full();
-    let open = shard_map
-        .get(&table.name)
-        .and_then(|shards| shards.last())
-        .ok_or_else(|| decline("indexed append proof has no current open shard"))?;
-    for (raw_ordinal, index) in table.indexes.iter().enumerate() {
-        let binding = keys
-            .indexes()
-            .get(raw_ordinal)
-            .filter(|binding| binding.raw_ordinal() == raw_ordinal)
-            .ok_or_else(|| decline("indexed append proof lost a raw catalog binding"))?;
-        if !crate::engine_residency::index_all_key_columns_foldable(table, index) {
-            return Err(decline(
-                "indexed append proof found a non-foldable named index",
-            ));
-        }
-        let key_id = crate::engine_residency::index_probe_key_id(table, index, raw_ordinal)
-            .ok_or_else(|| decline("indexed append proof found no resident index key id"))?;
-        let physical_ordinal = if let Some(&ordinal) = physical_by_key.get(&key_id) {
-            ordinal
-        } else {
-            let ordinal = physical.len();
-            let count =
-                resident_key_constraints::resident_columns(engine, table, open, binding)?.len();
-            descriptor_count = descriptor_count
-                .checked_add(count)
-                .ok_or_else(|| decline("indexed append proof descriptor count overflows"))?;
-            physical.push(PhysicalIndexLogicalBinding {
-                raw_ordinal,
-                key_id,
-                descriptor_count: count,
-            });
-            physical_by_key.insert(key_id, ordinal);
-            ordinal
-        };
-        raw.push(RawIndexLogicalBinding {
-            raw_ordinal,
-            key_id,
-            physical_ordinal,
-        });
-    }
-    let preparation_bytes =
-        resident_typed_indexes_insert_preparation_bytes(physical.len(), descriptor_count)
-            .ok_or_else(|| decline("indexed append proof preparation geometry overflows"))?;
-    Ok(PreparedIndexDeltaLogicalBindings {
-        raw: raw.into(),
-        physical: physical.into(),
-        preparation_bytes,
-    })
-}
-
+/// Scalar-only preview inspection. This deliberately stops before the append compiler and every
+/// CUDA preparation resource while retaining the same commit -> named-index -> mutation guards.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare<'a>(
+pub(crate) fn inspect_prepared_indexed_in_place_preview<'a, R>(
     engine: &'a Engine,
     table: &RelationalTable,
     predecessor_boundary: Index,
-    append: ResidentOpenShardAppendPlan<'a>,
+    batch: TypedInsertBatch,
+    row_ids: super::DeviceInsertRowIds,
     key_proof: BatchKeyConstraintProof,
     validation: ResidentKeyValidationSeal,
-    logical: PreparedIndexDeltaLogicalBindings,
+    mutation_gate: std::sync::MutexGuard<'a, ()>,
     named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
-) -> Result<PreparedIndexedInPlaceProof<'a>, ExecuteError> {
-    let (shard_id, base_row, catalog_seq) = append.proof_only_open_shard_basis();
-    let shard_map = engine.read_state.residency.shards.load_full();
-    let open = shard_map
-        .get(&table.name)
-        .and_then(|shards| shards.iter().find(|shard| shard.shard_id == shard_id))
-        .ok_or_else(|| decline("indexed append proof lost its open shard"))?;
-    if !validation.matches_in_place_append(table, catalog_seq, open, predecessor_boundary)
-        || validation.original_read_snapshot() > predecessor_boundary
-        || open.row_count != base_row
-    {
-        return Err(decline("indexed append proof generation witness drifted"));
-    }
-    let source_ptr = open
-        .device_memory
-        .as_ref()
-        .map(|memory| memory.device_ptr())
-        .filter(|pointer| *pointer != 0)
-        .ok_or_else(|| decline("indexed append proof lost its resident source allocation"))?;
-    let end_row = base_row
-        .checked_add(append.row_count())
-        .filter(|end| *end <= open.capacity)
-        .ok_or_else(|| decline("indexed append proof escaped its pinned open-shard extent"))?;
-    let (requests, physical_bindings) = bind_physical_indexes(
+    commit_proof: &std::sync::MutexGuard<'_, crate::CommitState>,
+    inspect: impl FnOnce(IndexedInPlacePreviewReport) -> R,
+) -> Result<R, ExecuteError> {
+    super::index_delta_preview::inspect_prepared_indexed_in_place_preview(
         engine,
         table,
-        open,
-        source_ptr,
-        base_row,
-        end_row,
-        &key_proof,
-        &logical,
-        validation.original_read_snapshot(),
-    )?;
-    let expected_columns = logical
-        .physical
-        .iter()
-        .try_fold(0_usize, |total, binding| {
-            total.checked_add(binding.descriptor_count)
-        })
-        .ok_or_else(|| decline("indexed append proof descriptor total overflows"))?;
-    let observed_columns = requests
-        .iter()
-        .map(|request| request.columns.len())
-        .sum::<usize>();
-    if requests.len() != logical.physical.len() || observed_columns != expected_columns {
-        return Err(decline("indexed append proof descriptor authority drifted"));
-    }
-    let mutation_epoch = engine
-        .read_state
-        .residency
-        .point_index_mutation_epoch(&table.name);
-    let mutation_epoch_expected_even = mutation_epoch.load(Ordering::Acquire);
-    if mutation_epoch_expected_even & 1 != 0 {
+        predecessor_boundary,
+        batch,
+        row_ids,
+        key_proof,
+        validation,
+        mutation_gate,
+        named_index_lifecycle,
+        commit_proof,
+        inspect,
+    )
+}
+
+pub(super) fn prepare<'a>(
+    engine: &'a Engine,
+    table: &RelationalTable,
+    preview: IndexedInPlacePreview<'a>,
+    expected_commit_seq: Index,
+    permit: crate::engine_insert_plan::IndexedPhysicalMaterializationPermit,
+) -> Result<PreparedIndexedInPlaceReservation<'a>, ExecuteError> {
+    let parts = preview.into_append_and_parts(engine, table, permit)?;
+    let materialized_host_retention = parts.host_retention_report()?;
+    let preview_host_retention = parts.preview_host_retention;
+    let super::index_delta_preview::PreviewPreparedParts {
+        append,
+        source_payload,
+        created_by_region,
+        row_id_region,
+        deleted_by_region,
+        key_proof,
+        validation,
+        logical,
+        requests,
+        physical_bindings,
+        mutation_epoch,
+        mutation_epoch_expected_even,
+        ledger,
+        fused_footprint,
+        fused_final_host_geometry,
+        fused_materialization_scratch,
+        fused_materialization_peak: forecast_fused_materialization_peak,
+        target_witness,
+        generation_witness,
+        preview_host_retention: _,
+        resource_forecast,
+        materialized_append_host_geometry: _,
+        named_index_lifecycle,
+    } = parts;
+    let (_, base_row, _) = append.indexed_in_place_reservation_basis();
+    let fused_inputs = append
+        .prepare_indexed_in_place_fused_apply_inputs(expected_commit_seq)
+        .map_err(|_| decline("indexed append fused preparation inputs declined"))?;
+    let fused_preparation_bytes = fused_inputs.preparation_bytes();
+    if fused_inputs.preparation_footprint() != fused_footprint
+        || fused_inputs.materialization_host_scratch() != fused_materialization_scratch
+    {
         return Err(decline(
-            "indexed append proof observed an active mutation epoch",
+            "indexed append fused preparation inputs diverged from the admitted forecast",
         ));
     }
-    let allocation_scope = CudaAllocationScope::with_budget(logical.preparation_bytes);
-    let source_payload = open
-        .device_memory
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| decline("indexed append proof lost pinned open payload"))?;
+    let simultaneous_preparation_bytes = logical
+        .preparation_bytes()
+        .checked_add(fused_preparation_bytes)
+        .ok_or_else(|| decline("indexed append combined preparation-byte overflow"))?;
+    append
+        .ensure_indexed_in_place_preparation_budget(engine, simultaneous_preparation_bytes)
+        .map_err(|_| decline("indexed append combined preparation budget declined"))?;
+    let allocation_scope = CudaAllocationScope::with_budget(simultaneous_preparation_bytes);
+    let fused_materialization_scratch = fused_inputs.materialization_host_scratch();
+    let fused = fused_inputs
+        .materialize()
+        .map_err(|_| decline("indexed append fused CUDA preparation declined"))?;
+    let fused_host_retention = fused.host_retention_report()?;
+    if fused_host_retention.geometry()? != fused_final_host_geometry {
+        return Err(decline(
+            "indexed append fused final host retention diverged from the admitted forecast",
+        ));
+    }
+    let mut fused_materialization_overlap = materialized_host_retention.clone();
+    fused_materialization_overlap.merge(fused_host_retention)?;
+    let mut fused_materialization_peak = fused_materialization_overlap.geometry()?;
+    fused_materialization_peak.checked_add_disjoint(
+        fused_materialization_scratch,
+        "indexed in-place fused temporary materialization backing",
+    )?;
+    if fused_materialization_peak != forecast_fused_materialization_peak {
+        return Err(decline(
+            "indexed append fused materialization peak diverged from the admitted forecast",
+        ));
+    }
     let index_delta = source_payload
         .prepare_resident_typed_indexes_insert(&requests, base_row, append.row_count())
         .map_err(|_| decline("indexed append proof CUDA preparation declined"))?;
-    if index_delta.preparation_bytes() != logical.preparation_bytes {
-        return Err(decline(
-            "indexed append proof pooled preparation size drifted",
-        ));
+    let launch_host_retention = index_delta.host_retention_report().map_err(|error| {
+        decline(format!(
+            "indexed append launch host retention failed: {error}"
+        ))
+    })?;
+    let mut materialized_launch_overlap = materialized_host_retention;
+    if let Some(identity) = launch_host_retention.owner_array_backing_identity {
+        materialized_launch_overlap
+            .retain_external_backing(identity, launch_host_retention.owner_array_backing_bytes)?;
     }
-    if mutation_epoch.load(Ordering::Acquire) != mutation_epoch_expected_even {
+    let host_retention_peak_before_finalization =
+        preview_host_retention.peak(materialized_launch_overlap.geometry()?);
+    if index_delta.preparation_bytes() != logical.preparation_bytes()
+        || fused.preparation_bytes() != fused_preparation_bytes
+        || mutation_epoch.load(Ordering::Acquire) != mutation_epoch_expected_even
+        || mutation_epoch_expected_even & 1 != 0
+        || allocation_scope.peak_bytes() != simultaneous_preparation_bytes
+    {
         return Err(decline(
-            "indexed append proof mutation epoch changed during preparation",
-        ));
-    }
-    if allocation_scope.peak_bytes() != logical.preparation_bytes {
-        return Err(decline(
-            "indexed append proof pooled preparation peak drifted",
+            "indexed append proof allocating preparation drifted",
         ));
     }
     drop(allocation_scope);
-    let index_delta_ledger = resource_ledger(&logical, &physical_bindings)?;
-    let report = IndexedInPlaceProofReport {
-        raw_index_count: index_delta_ledger.raw_index_count,
-        physical_index_count: index_delta_ledger.physical_index_count,
-        base_row,
-        incoming_rows: append.row_count(),
-        preparation_bytes: index_delta_ledger.transient_preparation_bytes,
-        original_read_snapshot: validation.original_read_snapshot(),
-        predecessor_boundary,
-        pinned_persistent_index_bytes: index_delta_ledger.pinned_persistent_index_bytes,
-        descriptor_bytes: index_delta_ledger.descriptor_bytes,
-        descriptor_count: index_delta_ledger.descriptor_count,
-        bounded_readback_bytes: index_delta_ledger.bounded_readback_bytes,
-        allocation_pin_count: index_delta_ledger.allocation_pin_count,
-    };
-    Ok(PreparedIndexedInPlaceProof {
+    let reservation = PreparedIndexedInPlaceReservation {
+        fused,
         index_delta: PreparedResidentIndexDelta {
             launch: index_delta,
             source_payload,
+            _created_by_region: created_by_region,
+            _row_id_region: row_id_region,
+            _deleted_by_region: deleted_by_region,
             key_proof,
             validation,
             raw_bindings: logical.raw,
-            physical_bindings: physical_bindings.into(),
+            physical_bindings,
             mutation_epoch,
             mutation_epoch_expected_even,
-            ledger: index_delta_ledger,
+            ledger,
+            host_retention_peak_before_finalization,
         },
         append,
-        report,
+        forecast: resource_forecast,
+        fused_materialization_peak,
+        target_witness,
+        generation_witness,
         _named_index_lifecycle: named_index_lifecycle,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn bind_physical_indexes(
-    engine: &Engine,
-    table: &RelationalTable,
-    open: &RelationalResidentShard,
-    source_ptr: u64,
-    base_row: usize,
-    end_row: usize,
-    keys: &BatchKeyConstraintProof,
-    logical: &PreparedIndexDeltaLogicalBindings,
-    original_read_snapshot: Index,
-) -> Result<(Vec<CudaResidentTypedIndexInsert>, Vec<PhysicalIndexBinding>), ExecuteError> {
-    let horizon = expected_index_horizon(open)?;
-    let open_payload = open
-        .device_memory
-        .as_ref()
-        .ok_or_else(|| decline("indexed append proof lost its open payload before cache bind"))?;
-    let route_publish = engine
-        .read_state
-        .residency
-        .sharded_point_route_publish_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let cache = engine
-        .read_state
-        .residency
-        .shard_pk_device_index
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let coverage = engine
-        .read_state
-        .residency
-        .named_index_coverage
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let complete = engine
-        .read_state
-        .residency
-        .named_index_coverage_complete
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let publications = engine
-        .read_state
-        .residency
-        .named_index_publications
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if publications.get(&table.oid) != Some(&table.indexes)
-        || !complete
-            .get(&table.name)
-            .is_some_and(|(oid, indexes)| *oid == table.oid && indexes == &table.indexes)
-    {
+    };
+    if !reservation.forecast_matches_actual()? {
         return Err(decline(
-            "indexed append proof requires complete named-index enrollment",
+            "indexed append materialization owner ledger diverged from forecast",
         ));
     }
-    let mut requests = Vec::with_capacity(logical.physical.len());
-    let mut physical = Vec::with_capacity(logical.physical.len());
-    let mut destinations = BTreeSet::new();
-    for logical_binding in logical.physical.iter() {
-        let binding = keys
-            .indexes()
-            .get(logical_binding.raw_ordinal)
-            .filter(|binding| binding.raw_ordinal() == logical_binding.raw_ordinal)
-            .ok_or_else(|| decline("indexed append proof raw binding changed before cache bind"))?;
-        let index = table
-            .indexes
-            .get(logical_binding.raw_ordinal)
-            .ok_or_else(|| decline("indexed append proof catalog index disappeared"))?;
-        if crate::engine_residency::index_probe_key_id(table, index, logical_binding.raw_ordinal)
-            != Some(logical_binding.key_id)
-        {
-            return Err(decline("indexed append proof logical key id drifted"));
-        }
-        let cache_key = (table.name.clone(), open.shard_id, logical_binding.key_id);
-        let covered = coverage.get(&cache_key) == Some(&(source_ptr, base_row));
-        let entry = cache
-            .get(&cache_key)
-            .ok_or_else(|| decline("indexed append proof has no enrolled physical index"))?;
-        let device_index = entry
-            .device_index
-            .as_ref()
-            .filter(|memory| {
-                entry.resident_device_ptr == source_ptr
-                    && entry.row_count == base_row
-                    && Arc::ptr_eq(&entry._resident_guard, open_payload)
-                    && entry.gc_boundary <= original_read_snapshot
-                    && entry.published_row_count.load(Ordering::Acquire) == base_row
-                    && entry.published_has_postings.load(Ordering::Acquire) == entry.has_postings
-                    && entry.table_mask == horizon.table_mask
-                    && entry.hash_shift == horizon.hash_shift
-                    && memory.metadata().allocated_bytes == horizon.allocated_bytes
-            })
-            .cloned()
-            .ok_or_else(|| decline("indexed append proof physical index basis drifted"))?;
-        if !covered
-            || device_index.device_ptr() == source_ptr
-            || !destinations.insert(device_index.device_ptr())
-        {
-            return Err(decline(
-                "indexed append proof lost complete distinct cache coverage",
-            ));
-        }
-        let columns = resident_key_constraints::resident_columns(engine, table, open, binding)?;
-        if columns.len() != logical_binding.descriptor_count {
-            return Err(decline(
-                "indexed append proof input descriptor count drifted",
-            ));
-        }
-        requests.push(CudaResidentTypedIndexInsert {
-            index: Arc::clone(&device_index),
-            table_mask: entry.table_mask,
-            hash_shift: entry.hash_shift,
-            columns,
-        });
-        physical.push(PhysicalIndexBinding {
-            cache_key,
-            key_id: logical_binding.key_id,
-            device_index,
-            published_row_count: Arc::clone(&entry.published_row_count),
-            published_has_postings: Arc::clone(&entry.published_has_postings),
-            has_postings_at_prepare: entry.published_has_postings.load(Ordering::Acquire),
-            source_ptr,
-            base_row,
-            end_row,
-            capacity: open.capacity,
-            table_mask: entry.table_mask,
-            hash_shift: entry.hash_shift,
-            gc_boundary: entry.gc_boundary,
-            allocated_bytes: horizon.allocated_bytes,
-        });
-    }
-    drop(publications);
-    drop(complete);
-    drop(coverage);
-    drop(cache);
-    drop(route_publish);
-    Ok((requests, physical))
-}
-
-struct IndexHorizon {
-    table_mask: u32,
-    hash_shift: u32,
-    allocated_bytes: u64,
-}
-
-fn expected_index_horizon(open: &RelationalResidentShard) -> Result<IndexHorizon, ExecuteError> {
-    let rows = u64::try_from(open.row_count)
-        .map_err(|_| decline("indexed append proof row count overflows"))?;
-    let capacity = u64::try_from(open.capacity)
-        .map_err(|_| decline("indexed append proof capacity overflows"))?;
-    let table_size = crate::engine_residency::resident_shard_index_table_size(rows, capacity)
-        .ok_or_else(|| decline("indexed append proof has no index horizon geometry"))?;
-    let table_mask = (table_size - 1) as u32;
-    let allocated_bytes = resident_index_allocated_bytes(table_mask, capacity.max(rows))
-        .ok_or_else(|| decline("indexed append proof index allocation geometry overflows"))?;
-    Ok(IndexHorizon {
-        table_mask,
-        hash_shift: 32 - table_size.trailing_zeros(),
-        allocated_bytes,
-    })
-}
-
-fn resource_ledger(
-    logical: &PreparedIndexDeltaLogicalBindings,
-    physical: &[PhysicalIndexBinding],
-) -> Result<IndexDeltaResourceLedger, ExecuteError> {
-    let descriptor_count = logical
-        .physical
-        .iter()
-        .try_fold(0_usize, |total, binding| {
-            total.checked_add(binding.descriptor_count)
-        })
-        .ok_or_else(|| decline("indexed append proof ledger descriptor count overflows"))?;
-    let descriptor_words = logical
-        .physical
-        .len()
-        .checked_mul(3)
-        .and_then(|words| words.checked_add(descriptor_count.checked_mul(4)?))
-        .ok_or_else(|| decline("indexed append proof ledger descriptor words overflow"))?;
-    let descriptor_bytes = u64::try_from(descriptor_words)
-        .ok()
-        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>() as u64))
-        .ok_or_else(|| decline("indexed append proof ledger descriptor bytes overflow"))?;
-    let pinned_persistent_index_bytes = physical.iter().try_fold(0_u64, |total, binding| {
-        total
-            .checked_add(binding.allocated_bytes)
-            .ok_or_else(|| decline("indexed append proof ledger persistent bytes overflow"))
-    })?;
-    let allocation_pin_count = physical
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| decline("indexed append proof ledger pin count overflows"))?;
-    Ok(IndexDeltaResourceLedger {
-        pinned_persistent_index_bytes,
-        transient_preparation_bytes: logical.preparation_bytes,
-        descriptor_bytes,
-        descriptor_count,
-        bounded_readback_bytes: std::mem::size_of::<u32>() as u64,
-        allocation_pin_count,
-        raw_index_count: logical.raw.len(),
-        physical_index_count: logical.physical.len(),
-    })
+    Ok(reservation)
 }
 
 fn decline(message: impl Into<String>) -> ExecuteError {
@@ -659,6 +587,8 @@ fn decline(message: impl Into<String>) -> ExecuteError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     fn indexed_resident_engine() -> Option<crate::Engine> {
@@ -737,7 +667,14 @@ mod tests {
         let epoch = engine
             .read_state
             .residency
-            .point_index_mutation_epoch("inert_index_delta");
+            .point_index_mutation_epoch_for_table(
+                &engine.read_state,
+                catalog
+                    .relational_catalog
+                    .get("inert_index_delta")
+                    .expect("inert proof table remains catalog-visible"),
+            )
+            .expect("exact inert proof table installs its point slot");
         let epoch_before = epoch.load(Ordering::Acquire);
         let wal_before = engine.durable_wal_records().len();
         let boundary_before = engine.committed_seq();
@@ -890,10 +827,25 @@ mod tests {
         assert_eq!(report.physical_index_count, 4);
         assert_eq!(report.base_row, 1);
         assert_eq!(report.incoming_rows, 1);
-        assert_eq!(report.preparation_bytes, 512);
+        assert_eq!(report.index_preparation_bytes, 512);
+        assert!(report.fused_preparation_bytes > 0);
+        assert_eq!(
+            report.preparation_bytes,
+            report
+                .index_preparation_bytes
+                .checked_add(report.fused_preparation_bytes)
+                .unwrap()
+        );
+        assert!(report.fused_pooled_allocation_slots > 0);
         assert_eq!(report.bounded_readback_bytes, 4);
-        assert_eq!(report.allocation_pin_count, 5);
+        assert_eq!(report.allocation_pin_count, 7);
         assert!(report.pinned_persistent_index_bytes > 0);
+        assert!(report.host_retained_bytes > 0);
+        assert!(report.host_allocation_slots > 0);
+        assert_eq!(report.host_generation_pin_slots, 0);
+        assert!(report.peak_host_retained_bytes >= report.host_retained_bytes);
+        assert!(report.peak_host_allocation_slots >= report.host_allocation_slots);
+        assert!(report.peak_host_generation_pin_slots >= report.host_generation_pin_slots);
         assert_eq!(report.descriptor_bytes, 256);
         assert_eq!(report.descriptor_count, 5);
         assert_eq!(epoch.load(Ordering::Acquire), epoch_before);
@@ -1136,6 +1088,59 @@ mod tests {
     }
 
     #[test]
+    fn indexed_preparation_refuses_the_fused_plus_index_sum_before_wal() {
+        let Some(mut engine) = indexed_resident_engine() else {
+            return;
+        };
+        let baseline_plan = indexed_proof_plan(&engine);
+        let baseline_proposal = baseline_plan
+            .prepare_row_id_proposal(engine.read_state.mvcc.current_row_id())
+            .unwrap();
+        let baseline = baseline_plan
+            .inspect_current_resident_index_delta(&engine, baseline_proposal, |report| report)
+            .unwrap();
+        assert!(baseline.fused_preparation_bytes > 0);
+        assert_eq!(
+            baseline.preparation_bytes,
+            baseline
+                .index_preparation_bytes
+                .checked_add(baseline.fused_preparation_bytes)
+                .unwrap()
+        );
+        // Construct the ordinary typed plan while unrestricted. The budget below targets the
+        // indexed physical materializer, where the append core may admit the index lease alone
+        // but must reject the exact simultaneous index-plus-fused lease before CUDA setup.
+        let plan = indexed_proof_plan(&engine);
+        let gpu_id = engine
+            .read_state
+            .residency
+            .shards
+            .load_full()
+            .get("inert_index_delta")
+            .and_then(|shards| shards.last())
+            .unwrap()
+            .gpu_id;
+        let resident = engine.relational_resident_bytes_for_gpu(gpu_id);
+        // This admits the indexed multi-lease alone but not the simultaneously retained fused
+        // lease. The second reservation check must reject before a WAL record or commit step.
+        engine.set_relational_residency_budget_bytes(
+            gpu_id,
+            resident + baseline.preparation_bytes - 1,
+        );
+        let proposal = plan
+            .prepare_row_id_proposal(engine.read_state.mvcc.current_row_id())
+            .unwrap();
+        let wal_before = engine.durable_wal_records().len();
+        let boundary_before = engine.committed_seq();
+        assert!(matches!(
+            plan.inspect_current_resident_index_delta(&engine, proposal, |_| ()),
+            Err(ExecuteError::Serialization(_))
+        ));
+        assert_eq!(engine.durable_wal_records().len(), wal_before);
+        assert_eq!(engine.committed_seq(), boundary_before);
+    }
+
+    #[test]
     fn indexed_preparation_revalidates_target_binding_at_an_advanced_predecessor_boundary() {
         let Some(engine) = indexed_resident_engine() else {
             return;
@@ -1162,47 +1167,55 @@ mod tests {
     }
 
     #[test]
-    fn inert_owner_exposes_only_scalar_inspection() {
+    fn reservation_owner_exposes_only_scalar_inspection() {
         let source = include_str!("index_delta.rs")
             .split("\n#[cfg(test)]\nmod tests")
             .next()
-            .expect("production proof owner precedes tests");
-        assert!(source.contains("struct PreparedIndexedInPlaceProof"));
+            .expect("production reservation owner precedes tests");
+        assert!(source.contains("struct PreparedIndexedInPlaceReservation"));
         assert!(source.contains("struct PreparedResidentIndexDelta"));
+        assert!(source.contains("PreparedIndexedInPlaceFusedApply"));
         assert!(source.contains("launch: PreparedResidentTypedIndexesInsert"));
+        assert!(source.contains("fused: super::fixed_insert::PreparedIndexedInPlaceFusedApply"));
         assert!(source.contains("index_delta: PreparedResidentIndexDelta"));
         assert!(source.contains("append: ResidentOpenShardAppendPlan"));
         assert!(source.contains("key_proof: BatchKeyConstraintProof"));
         assert!(source.contains("validation: ResidentKeyValidationSeal"));
-        assert!(source.contains("struct IndexDeltaResourceLedger"));
+        let preview_source = include_str!("index_delta_preview.rs");
+        assert!(preview_source.contains("struct IndexDeltaResourceLedger"));
         assert!(source.contains("mutation_epoch_expected_even"));
+        assert!(source.contains("CudaAllocationScope::with_budget(simultaneous_preparation_bytes)"));
+        assert!(source.contains("ensure_indexed_in_place_preparation_budget"));
+        assert!(source.contains("fused.preparation_bytes() != fused_preparation_bytes"));
         assert!(source.contains("_named_index_lifecycle"));
+        assert!(!source.contains("MutexGuard<'a, crate::CommitState>"));
         assert!(!source.contains("begin_point_index_mutation"));
         let wrapper = source
-            .split("struct PreparedIndexedInPlaceProof")
+            .split("struct PreparedIndexedInPlaceReservation")
             .nth(1)
             .and_then(|section| {
                 section
-                    .split("\n}\n\nimpl PreparedIndexedInPlaceProof")
+                    .split("\n}\n\n#[cfg(test)]\nimpl PreparedIndexedInPlaceReservation")
                     .next()
             })
             .expect("wrapper declaration");
         assert!(
-            wrapper.find("index_delta:") < wrapper.find("append:")
+            wrapper.find("fused:") < wrapper.find("index_delta:")
+                && wrapper.find("index_delta:") < wrapper.find("append:")
                 && wrapper.find("append:") < wrapper.find("_named_index_lifecycle:"),
-            "drop order must remain index delta -> append -> lifecycle"
+            "drop order must remain fused/index delta -> append -> lifecycle"
         );
-        let owner = source
-            .split("impl PreparedIndexedInPlaceProof")
+        let owner = include_str!("indexed_reservation.rs")
+            .split("impl PreparedIndexedPhysicalReservation")
             .nth(1)
-            .and_then(|section| section.split("\n/// Assemble").next())
-            .expect("inert owner inspection impl");
+            .and_then(|section| section.split("\n#[cfg(test)]\nmod tests").next())
+            .expect("scalar-only physical reservation inspection");
         for forbidden in ["submit", "apply", "into_parts", "wal", "status", "poison"] {
             assert!(
                 !owner.contains(forbidden),
-                "inert owner must not expose {forbidden}"
+                "physical reservation owner must not expose {forbidden}"
             );
         }
-        assert!(owner.contains("fn inspect"));
+        assert!(owner.contains("inspect_in_place"));
     }
 }

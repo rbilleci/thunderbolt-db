@@ -6,7 +6,7 @@ use super::{
     CachedShardPkDeviceIndex, CachedShardedPointRoute, CudaCompoundFoldColumn,
     CudaResidentDeviceMemory, Engine, EngineError, ExecuteError, Index,
     RelationalResidencySnapshot, RelationalTable, ShardDeviceIndexKey, ShardPkHit, SqlType,
-    WriteLocateShard, MAX_CACHED_SHARDED_POINT_ROUTES,
+    WriteLocateShard,
 };
 use crate::RelationalResidentShard;
 
@@ -815,19 +815,9 @@ impl Engine {
                 // Only then replace the map entry. No durable-allocation preflight can observe neither owner,
                 // because `_budget_allocation` covers this whole sequence. In-flight readers may retain their
                 // own plan Arc, but the global cache no longer makes that allocation durable.
-                let current_routes = self.read_state.residency.sharded_point_routes.load();
-                if current_routes
-                    .keys()
-                    .any(|(cached_table, _, _)| cached_table == table_name)
-                {
-                    let mut next_routes = (**current_routes).clone();
-                    next_routes
-                        .retain(|(cached_table, _, _), _| cached_table.as_str() != table_name);
-                    self.read_state
-                        .residency
-                        .sharded_point_routes
-                        .store(Arc::new(next_routes));
-                }
+                self.read_state
+                    .residency
+                    .purge_table_point_routes_under_publish_lock(table_name);
             }
             cache.insert(cache_key, entry);
         }
@@ -882,6 +872,17 @@ impl Engine {
         debug_assert!(table_shards
             .iter()
             .all(|shard| { Arc::ptr_eq(&table_generation, &shard.point_route_generation) }));
+        // Retained routes are only a latest-global cache. An older statement snapshot can keep
+        // reading its captured generation, but it must never install a slot for a relation that a
+        // concurrent DROP/recreate has already replaced under the same name.
+        let latest_catalog = self.read_state.latest_catalog();
+        let latest_table_is_current = latest_catalog
+            .relational_catalog
+            .get(&table.name)
+            .is_some_and(|latest| latest.oid == table.oid);
+        if !latest_table_is_current {
+            return Ok(None);
+        }
         let globally_current = self
             .read_state
             .residency
@@ -895,31 +896,100 @@ impl Engine {
         }
         let runtime_snapshot = self.router.runtime().snapshot();
         let n = needles.len();
-        let route_key = (table.name.clone(), filter_idx, selected_indexes.to_vec());
-        let cached_route = {
-            let cache = self.read_state.residency.sharded_point_routes.load();
-            cache.get(&route_key).and_then(|entry| {
-                (Arc::ptr_eq(&entry.table_generation, &table_generation)
-                    // The prepared indexes may omit rows deleted at or below their build boundary. Such a
-                    // route is safe only for an equal/newer read; an older pinned reader must rebuild with a
-                    // more conservative GC boundary.
-                    && entry.read_boundary <= read_boundary)
-                    .then(|| {
-                        (
-                            entry.gpu_id,
-                            Arc::clone(&entry.launch_resident),
-                            Arc::clone(&entry.plan),
-                            Arc::clone(&entry.index_mutation_epoch),
-                            entry.prepared_index_epoch,
-                        )
-                    })
+        let route_key = (filter_idx, selected_indexes.to_vec());
+        // A retained route is safe to use without re-comparing the complete relation shape only for a
+        // latest-boundary reader. An older pinned reader must pass through the full-shape fence below: a
+        // newer same-OID DDL generation can otherwise publish the same route key into this slot while the
+        // old reader is still entitled only to its pre-cut Arc.
+        let fast_cached_route = (latest_catalog.commit_seq == read_boundary)
+            .then(|| {
+                self.read_state
+                    .residency
+                    .table_point_slot(&table.name, table.oid)
             })
-        };
-        if cached_route.as_ref().is_some_and(|(gpu_id, _, _, _, _)| {
-            runtime_snapshot.memory_pressured_gpu_ids.contains(gpu_id)
-        }) {
-            return Ok(None);
-        }
+            .flatten()
+            .and_then(|slot| {
+                let slot_identity = Arc::clone(&slot.slot_identity);
+                if !self.read_state.residency.table_point_slot_is_current(
+                    &table.name,
+                    table.oid,
+                    &slot,
+                    &slot_identity,
+                ) {
+                    return None;
+                }
+                let cached_route = {
+                    let cache = slot.sharded_route.load();
+                    cache.as_ref().and_then(|entry| {
+                        (entry.route_key == route_key
+                            && Arc::ptr_eq(&entry.table_generation, &table_generation)
+                            // The prepared indexes may omit rows deleted at or below their build boundary.
+                            // Such a route is safe only for an equal/newer read; an older pinned reader must
+                            // rebuild with a more conservative GC boundary.
+                            && entry.read_boundary <= read_boundary)
+                            .then(|| {
+                                (
+                                    entry.gpu_id,
+                                    Arc::clone(&entry.launch_resident),
+                                    Arc::clone(&entry.plan),
+                                    Arc::clone(&entry.index_mutation_epoch),
+                                    entry.prepared_index_epoch,
+                                )
+                            })
+                    })
+                };
+                cached_route
+                    .filter(|(gpu_id, _, _, _, _)| {
+                        !runtime_snapshot.memory_pressured_gpu_ids.contains(gpu_id)
+                    })
+                    .map(|cached_route| (slot, slot_identity, cached_route))
+            });
+        let (table_slot, slot_identity, cached_route) =
+            if let Some((table_slot, slot_identity, cached_route)) = fast_cached_route {
+                (table_slot, slot_identity, Some(cached_route))
+            } else {
+                // A missing, mismatched, pressured, stale-boundary, or otherwise ineligible retained route
+                // must re-establish complete table equality before either miss eligibility or GPU work.
+                let Some(table_slot) = self
+                    .read_state
+                    .residency
+                    .ensure_table_point_slot(&self.read_state, table)
+                else {
+                    return Ok(None);
+                };
+                let slot_identity = Arc::clone(&table_slot.slot_identity);
+                if !self.read_state.residency.table_point_slot_is_current(
+                    &table.name,
+                    table.oid,
+                    &table_slot,
+                    &slot_identity,
+                ) {
+                    return Ok(None);
+                }
+                let cached_route = {
+                    let cache = table_slot.sharded_route.load();
+                    cache.as_ref().and_then(|entry| {
+                        (entry.route_key == route_key
+                            && Arc::ptr_eq(&entry.table_generation, &table_generation)
+                            && entry.read_boundary <= read_boundary)
+                            .then(|| {
+                                (
+                                    entry.gpu_id,
+                                    Arc::clone(&entry.launch_resident),
+                                    Arc::clone(&entry.plan),
+                                    Arc::clone(&entry.index_mutation_epoch),
+                                    entry.prepared_index_epoch,
+                                )
+                            })
+                    })
+                };
+                if cached_route.as_ref().is_some_and(|(gpu_id, _, _, _, _)| {
+                    runtime_snapshot.memory_pressured_gpu_ids.contains(gpu_id)
+                }) {
+                    return Ok(None);
+                }
+                (table_slot, slot_identity, cached_route)
+            };
         if cached_route.is_some() {
             self.read_state
                 .residency
@@ -975,10 +1045,7 @@ impl Engine {
         } else {
             // Sample before reading any cached index basis. If a writer overlaps descriptor assembly, its
             // odd/advanced epoch forces the capacity-bounded posting path for this one captured plan.
-            let index_mutation_epoch = self
-                .read_state
-                .residency
-                .point_index_mutation_epoch(&table.name);
+            let index_mutation_epoch = Arc::clone(&table_slot.index_epoch);
             let prepared_index_epoch =
                 index_mutation_epoch.load(std::sync::atomic::Ordering::Acquire);
             // A cache miss prepares the exact immutable shard generation once: validate every descriptor,
@@ -1138,8 +1205,8 @@ impl Engine {
                 // Index GC-boundary replacement does not rotate the table generation. Revalidate every plan
                 // index under the same budget -> route -> index lock order used by replacement/accounting; a
                 // concurrent older-boundary builder may have replaced these allocations after preparation.
-                // Such a losing plan remains safe for this one in-flight read but must never become a durable,
-                // unaccounted cache owner.
+                // A losing plan must decline before submission rather than execute as a transient, unaccounted
+                // alternate apply path.
                 let indexes_are_current = {
                     let cache = self
                         .read_state
@@ -1164,48 +1231,58 @@ impl Engine {
                             .is_some_and(|current| Arc::ptr_eq(current, prepared))
                     })
                 };
-                let current = self.read_state.residency.sharded_point_routes.load();
-                if generation_is_current
-                    && indexes_are_current
-                    && current.get(&route_key).is_none_or(|entry| {
-                        !Arc::ptr_eq(&entry.table_generation, &table_generation)
-                            // For one generation/shape, the oldest boundary is the semantic superset: it
-                            // retains every key a newer reader could need and lets MVCC sidecars filter.
-                            // Never replace that route with a newer, narrower index.
-                            || read_boundary < entry.read_boundary
-                    })
-                {
-                    let mut next = (**current).clone();
-                    // At most one shape per table. This bounds projection churn without coupling unrelated
-                    // tables; a later shape simply replaces the table's latency hint.
-                    next.retain(|(cached_table, _, _), _| cached_table != &table.name);
-                    if next.len() >= MAX_CACHED_SHARDED_POINT_ROUTES {
-                        if let Some(evicted) = next.keys().next().cloned() {
-                            next.remove(&evicted);
-                        }
-                    }
-                    next.insert(
-                        route_key,
-                        CachedShardedPointRoute {
-                            table_generation: Arc::clone(&table_generation),
-                            read_boundary,
-                            gpu_id,
-                            launch_resident: Arc::clone(&launch_resident),
-                            plan: Arc::clone(&plan),
-                            index_mutation_epoch: Arc::clone(&index_mutation_epoch),
-                            prepared_index_epoch,
-                        },
+                let slot_is_current = self.read_state.residency.table_point_slot_is_current(
+                    &table.name,
+                    table.oid,
+                    &table_slot,
+                    &slot_identity,
+                );
+                let catalog_is_current = self
+                    .read_state
+                    .residency
+                    .published_catalog_contains_exact_table_under_publish_lock(
+                        &self.read_state,
+                        table,
                     );
-                    let route_bytes_on_gpu = next
-                        .values()
+                // The plan was built from the captured table and shard generation. Once any of its authority
+                // fences changes, it may not be submitted as a one-off fallback: a post-DDL caller must
+                // decline and let its current catalog snapshot prepare the sole eligible route instead.
+                if !(generation_is_current
+                    && slot_is_current
+                    && catalog_is_current
+                    && indexes_are_current)
+                {
+                    return Ok(None);
+                }
+                let current = table_slot.sharded_route.load_full();
+                if current.as_ref().is_none_or(|entry| {
+                    entry.route_key != route_key
+                        || !Arc::ptr_eq(&entry.table_generation, &table_generation)
+                        // For one generation/shape, the oldest boundary is the semantic superset: it
+                        // retains every key a newer reader could need and lets MVCC sidecars filter.
+                        // Never replace that route with a newer, narrower index.
+                        || read_boundary < entry.read_boundary
+                }) && self
+                    .read_state
+                    .residency
+                    .reserve_table_point_route_under_publish_lock(
+                        &table.name,
+                        table.oid,
+                        &table_slot,
+                        &slot_identity,
+                    )
+                {
+                    let current_route_bytes_on_gpu = self
+                        .read_state
+                        .residency
+                        .sharded_point_route_descriptor_bytes_for_gpu(gpu_id);
+                    let replaced_route_bytes = current
+                        .as_ref()
                         .filter(|entry| entry.gpu_id == gpu_id)
-                        .map(|entry| entry.plan.descriptor_allocated_bytes())
-                        .sum::<u64>();
-                    let current_route_bytes_on_gpu = current
-                        .values()
-                        .filter(|entry| entry.gpu_id == gpu_id)
-                        .map(|entry| entry.plan.descriptor_allocated_bytes())
-                        .sum::<u64>();
+                        .map_or(0, |entry| entry.plan.descriptor_allocated_bytes());
+                    let route_bytes_on_gpu = current_route_bytes_on_gpu
+                        .saturating_sub(replaced_route_bytes)
+                        .saturating_add(plan.descriptor_allocated_bytes());
                     let retained_without_routes = self
                         .relational_resident_bytes_for_gpu(gpu_id)
                         .saturating_sub(current_route_bytes_on_gpu);
@@ -1215,10 +1292,18 @@ impl Engine {
                                 retained_without_routes.saturating_add(route_bytes_on_gpu) <= budget
                             });
                     if within_budget {
-                        self.read_state
-                            .residency
-                            .sharded_point_routes
-                            .store(Arc::new(next));
+                        table_slot
+                            .sharded_route
+                            .store(Some(Arc::new(CachedShardedPointRoute {
+                                route_key,
+                                table_generation: Arc::clone(&table_generation),
+                                read_boundary,
+                                gpu_id,
+                                launch_resident: Arc::clone(&launch_resident),
+                                plan: Arc::clone(&plan),
+                                index_mutation_epoch: Arc::clone(&index_mutation_epoch),
+                                prepared_index_epoch,
+                            })));
                     }
                 }
                 Some((
@@ -1258,6 +1343,12 @@ impl Engine {
                 )));
             }
             let launch_epoch = index_mutation_epoch.load(std::sync::atomic::Ordering::Acquire);
+            if launch_epoch == crate::engine_state::POINT_INDEX_MUTATION_POISON {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "point-index mutation is poisoned; commit-path recovery is required"
+                        .to_string(),
+                )));
+            }
             let force_posting = launch_epoch & 1 != 0 || launch_epoch != prepared_index_epoch;
             let submission = if force_posting {
                 launch_resident.submit_prepared_multi_shard_i32_index_probe_dense_posting_retry(
@@ -1306,6 +1397,11 @@ impl Engine {
                         )))
                     })?;
             let completed_epoch = index_mutation_epoch.load(std::sync::atomic::Ordering::Acquire);
+            if completed_epoch == crate::engine_state::POINT_INDEX_MUTATION_POISON {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "point-index mutation poisoned while point read completed".to_string(),
+                )));
+            }
             if !force_posting && (completed_epoch & 1 != 0 || completed_epoch != launch_epoch) {
                 // A writer overlapped the singleton launch. Discard its result and retry the same captured
                 // descriptor through the capacity-bounded posting walker: future rows are traversable but

@@ -436,8 +436,8 @@ pub(super) fn reject_unsupported_join_clauses(stmt: &SelectStmt) -> Result<(), E
         (!stmt.group_clause.is_empty(), "GROUP BY"),
         (stmt.having_clause.is_some(), "HAVING"),
         (
-            !stmt.distinct_clause.is_empty()
-                && !(stmt.distinct_clause.len() == 1 && stmt.distinct_clause[0].node.is_none()),
+            !(stmt.distinct_clause.is_empty()
+                || stmt.distinct_clause.len() == 1 && stmt.distinct_clause[0].node.is_none()),
             "DISTINCT ON",
         ),
         (!stmt.window_clause.is_empty(), "window functions"),

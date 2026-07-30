@@ -1,9 +1,11 @@
 //! Commit-wave and lane item ownership shared by the concurrent DML subpaths.
 
+use super::CommitPathFailure;
 use super::{
     AtomicOrdering, AtomicU64, CatalogSnapshot, Command, Engine, EngineError, ExecuteError, Index,
     Mutex, RelationalSelectResult, SqlValue, WriteSet,
 };
+use gpu_db_types::DurabilityFault;
 use std::sync::Arc;
 
 /// One immutable request allocation and the canonical identity derived from its exact bytes.
@@ -138,7 +140,9 @@ impl OfflockPreparedDml {
         )?;
         let write_set = WriteSet {
             tables: std::collections::BTreeSet::from([prepared_plan.table_name().to_string()]),
+            table_oids: vec![prepared_plan.table_oid()],
             rows: Vec::new(),
+            stable_rows: Vec::new(),
             unique_slots: Vec::new(),
             unique_slots_i32: Vec::new(),
         };
@@ -242,6 +246,14 @@ mod offlock_prepared_tests {
     use super::*;
 
     #[test]
+    fn commit_wave_done_payload_size_is_owned_by_its_value_layout() {
+        assert_eq!(
+            commit_wave_done_payload_bytes(),
+            std::mem::size_of::<CommitWaveDone>()
+        );
+    }
+
+    #[test]
     fn direct_fixed_batch_is_paired_to_the_same_request_and_snapshot() {
         let engine = Engine::new_local();
         engine
@@ -286,7 +298,9 @@ mod offlock_prepared_tests {
         assert_eq!(fixed.prepared_plan.row_count(), 1);
         let write_set = WriteSet {
             tables: std::collections::BTreeSet::from(["accounts".to_string()]),
+            table_oids: vec![catalog.relational_catalog["accounts"].oid],
             rows: Vec::new(),
+            stable_rows: Vec::new(),
             unique_slots: Vec::new(),
             unique_slots_i32: Vec::new(),
         };
@@ -343,7 +357,9 @@ mod offlock_prepared_tests {
         assert!(!prepared.matches_request(&same_bytes_different_request));
         let write_set = WriteSet {
             tables: std::collections::BTreeSet::from(["accounts".to_string()]),
+            table_oids: vec![catalog.relational_catalog["accounts"].oid],
             rows: Vec::new(),
+            stable_rows: Vec::new(),
             unique_slots: Vec::new(),
             unique_slots_i32: Vec::new(),
         };
@@ -488,6 +504,12 @@ pub(crate) struct CommitWaveDone {
     returning: Mutex<Option<RelationalSelectResult>>,
 }
 
+/// Payload bytes of one completion value. Capacity slots, rather than this helper, account for
+/// the enclosing `Arc` and allocator overhead.
+pub(crate) const fn commit_wave_done_payload_bytes() -> usize {
+    std::mem::size_of::<CommitWaveDone>()
+}
+
 impl CommitWaveDone {
     pub(crate) fn is_done(&self) -> bool {
         self.done.load(AtomicOrdering::Acquire)
@@ -559,6 +581,9 @@ pub(crate) struct LaneIntent {
     pub(crate) filter_idx: u32,
     pub(crate) row_id_offset: u32,
     pub(crate) table: Arc<str>,
+    /// Stable catalog identity carried through every lean-lane writer so its
+    /// post-canonical table-root entry never falls back to a table name.
+    pub(crate) table_oid: u32,
     pub(crate) template: Arc<[u8]>,
     pub(crate) values: Vec<SqlValue>,
     pub(crate) outcome: CommitWaveOutcome,
@@ -734,8 +759,21 @@ pub(super) struct CommitWaveTail {
     /// durable-commit point, in wave order (aborted items' outcomes were already set in-section).
     /// `rows_affected` is the applied delta's exact row count — the Ok payload of the ack (U1).
     pub(super) committed: Vec<(usize, Index, u64)>,
+    /// Typed INSERT claims remain pinned until the publication coordinator has
+    /// made their commit sequence visible.  The tail owns these linear receipts
+    /// so fsync/publication failure leaves the ledger claim armed for recovery.
+    pub(super) typed_ledger_receipts: Vec<crate::write_path::LedgerClaimReceipt>,
     pub(super) last_position: usize,
     pub(super) armed: bool,
+    /// A structured serial-WAL failure selected by the owning completion handoff.  Its `Copy`
+    /// payload lets tail drop settle every member without constructing a string.
+    pub(super) durability_fault: Option<DurabilityFault>,
+}
+
+impl CommitWaveTail {
+    pub(super) fn set_fixed_durability_failure(&mut self, fault: DurabilityFault) {
+        self.durability_fault = Some(fault);
+    }
 }
 
 impl Drop for CommitWaveTail {
@@ -743,10 +781,25 @@ impl Drop for CommitWaveTail {
         if !self.armed {
             return;
         }
+        // The tail's failure path has already selected restart recovery. Keep
+        // the ledger cells Pending (and therefore non-prunable), but consume
+        // the linear receipts explicitly so this intentional failure returns
+        // its established indeterminate outcome instead of a destructor panic.
+        for receipt in self.typed_ledger_receipts.drain(..) {
+            receipt.abandon_for_recovery();
+        }
         // The durability half of the wave died before acking (the group-fsync-failure panic
         // path, or claimer death): fail every still-unset member outcome. Queue wedging + the
         // finished-counter bump need `&Engine` and are handled by `finish_wave_tail`'s
         // unwind-safe completion guard.
+        if let Some(fault) = self.durability_fault {
+            for item in &self.batch {
+                if !item.outcome.done.load(AtomicOrdering::Acquire) {
+                    item.set_outcome(Err(ExecuteError::IndeterminateDurability(fault)));
+                }
+            }
+            return;
+        }
         for item in &self.batch {
             if !item.outcome.done.load(AtomicOrdering::Acquire) {
                 item.set_outcome(Err(ExecuteError::Indeterminate(
@@ -765,5 +818,5 @@ pub(super) struct CommitWaveQueue {
     pub(super) sequencer_active: bool,
     /// Sticky: a wave failed after its deltas were applied (durability failure mid-wave). No
     /// further concurrent commits may run until restart recovery.
-    pub(super) wedged: Option<String>,
+    pub(super) wedged: Option<CommitPathFailure>,
 }

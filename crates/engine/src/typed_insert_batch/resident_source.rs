@@ -29,11 +29,58 @@ pub(crate) struct PreparedResidentAppendColumn {
     pub(super) values: Option<TypedInsertColumnValues>,
 }
 
-/// A plan-owned bitmap upload staging view. Bool values stay bit-packed in the semantic source;
-/// this byte-per-row view exists only for the retained in-place fixed-width operator.
-pub(crate) struct PreparedResidentBoolUpload {
-    pub(crate) column_id: u32,
+/// One exact fixed-width device upload retained across WAL.  The source encoder writes this
+/// final boxed owner directly; it must not first build a growable CUDA chunk and re-box it in
+/// the plan compiler.
+pub(crate) struct PreparedResidentFixedChunk {
+    pub(crate) byte_offset: u64,
+    pub(crate) bytes: Box<[u8]>,
+}
+
+impl PreparedResidentFixedChunk {
+    pub(crate) fn append_host_retention(
+        &self,
+        report: &mut HostRetentionReport,
+    ) -> Result<(), EngineError> {
+        report.retain_boxed_slice(&self.bytes)
+    }
+}
+
+/// Paired exact owners move together so fused offset descriptors cannot outlive, or require
+/// rebuilding from, their fixed upload owner after WAL.
+pub(crate) struct PreparedResidentFixedChunkOwners {
+    pub(crate) chunks: Box<[PreparedResidentFixedChunk]>,
+    pub(crate) offsets: Box<[u64]>,
+}
+
+impl PreparedResidentFixedChunkOwners {
+    pub(crate) fn append_host_retention(
+        &self,
+        report: &mut HostRetentionReport,
+    ) -> Result<(), EngineError> {
+        report.retain_boxed_slice(&self.chunks)?;
+        for chunk in self.chunks.iter() {
+            chunk.append_host_retention(report)?;
+        }
+        report.retain_boxed_slice(&self.offsets)
+    }
+}
+
+/// A plan-owned bitmap upload. Bool values stay bit-packed in the semantic source; this
+/// byte-per-row view and its exact catalog name are the final fixed-plan owners.
+pub(crate) struct PreparedResidentFixedBoolUpload {
+    pub(crate) name: Box<str>,
     pub(crate) values: Box<[u8]>,
+}
+
+impl PreparedResidentFixedBoolUpload {
+    pub(crate) fn append_host_retention(
+        &self,
+        report: &mut HostRetentionReport,
+    ) -> Result<(), EngineError> {
+        report.retain_boxed_str(&self.name)?;
+        report.retain_boxed_slice(&self.values)
+    }
 }
 
 /// Exact dense device bytes and descriptor metadata sealed from the catalog-order vectors before
@@ -60,6 +107,33 @@ pub(crate) struct PreparedDenseDescriptorParts {
 }
 
 impl PreparedResidentDensePayload {
+    /// Host backings retained by the dense rollover payload before its private device allocation
+    /// consumes it. Device buffers and row IDs belong to physical/row-id domains, respectively.
+    #[allow(dead_code)] // Adopted by the inert reservation carrier next.
+    pub(crate) fn host_retention_report(&self) -> Result<HostRetentionReport, EngineError> {
+        let mut report = HostRetentionReport::default();
+        if let Some(payload) = self.device_payload.as_ref() {
+            report.retain_vec(payload)?;
+        }
+        report.retain_vec(&self.text_layouts)?;
+        for layout in self.text_layouts.iter() {
+            report.retain_string(&layout.name)?;
+        }
+        report.retain_vec(&self.bool_layouts)?;
+        for layout in self.bool_layouts.iter() {
+            report.retain_string(&layout.name)?;
+        }
+        report.retain_vec(&self.int4_stats)?;
+        for stat in self.int4_stats.iter() {
+            report.retain_string(&stat.name)?;
+        }
+        report.retain_vec(&self.null_layouts)?;
+        for layout in self.null_layouts.iter() {
+            report.retain_string(&layout.name)?;
+        }
+        Ok(report)
+    }
+
     pub(crate) fn device_payload_len(&self) -> Option<u64> {
         self.device_payload
             .as_ref()

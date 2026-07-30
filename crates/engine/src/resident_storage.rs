@@ -61,6 +61,27 @@ pub(crate) struct CachedShardPkDeviceIndex {
     pub(crate) hash_shift: u32,
 }
 
+impl CachedShardPkDeviceIndex {
+    /// Copy one already-published cache record into a prebuilt successor map.  This deliberately
+    /// preserves every Arc/atomic identity: a prepared publication may replace the map root, but
+    /// must not manufacture a second tail counter, resident ABA guard, or device allocation.
+    pub(crate) fn clone_for_prepared_successor(&self) -> Self {
+        Self {
+            resident_device_ptr: self.resident_device_ptr,
+            row_count: self.row_count,
+            published_row_count: Arc::clone(&self.published_row_count),
+            gc_boundary: self.gc_boundary,
+            duplicate_tolerant: self.duplicate_tolerant,
+            has_postings: self.has_postings,
+            published_has_postings: Arc::clone(&self.published_has_postings),
+            _resident_guard: Arc::clone(&self._resident_guard),
+            device_index: self.device_index.as_ref().map(Arc::clone),
+            table_mask: self.table_mask,
+            hash_shift: self.hash_shift,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CompoundPointRouteCharge {
     gpu_id: u16,
@@ -99,7 +120,10 @@ impl Drop for CompoundPointRouteCharge {
             .live_bytes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = (self.gpu_id, self.table.clone());
+        // The terminal manifest finalizer can retire the last compound route after WAL.  Move
+        // the already-owned table key into this lookup instead of cloning it: the route-drain
+        // path is part of the allocation-free terminal envelope.
+        let key = (self.gpu_id, std::mem::take(&mut self.table));
         let entry = live
             .get_mut(&key)
             .expect("compound route charge disappeared before its owner");
@@ -122,6 +146,7 @@ pub(crate) struct CachedCompoundI32I64PointPlan {
 /// keeps the existing latency path's concrete plan type and lookup shape unchanged.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedCompoundI32I64PointRoute {
+    pub(crate) route_key: CompoundPointRouteKey,
     pub(crate) table_generation: Arc<()>,
     pub(crate) read_boundary: Index,
     pub(crate) gpu_id: u16,
@@ -129,15 +154,17 @@ pub(crate) struct CachedCompoundI32I64PointRoute {
     pub(crate) plan: Arc<CachedCompoundI32I64PointPlan>,
 }
 
-pub(crate) type CompoundPointRouteKey = (String, usize, Vec<usize>);
-pub(crate) type CompoundPointRouteMap =
-    BTreeMap<CompoundPointRouteKey, CachedCompoundI32I64PointRoute>;
+/// One compound point-route shape within a table-owned point slot. The table name deliberately
+/// does not participate: the enclosing [`TablePointSlot`] is the table identity and an OID/Arc
+/// recheck protects DROP/recreate and rename from name reuse.
+pub(crate) type CompoundPointRouteKey = (usize, Vec<usize>);
 
 /// Prepared GPU-native point route for one exact published shard generation and projection shape.
 /// `table_generation` is the immutable per-table publication identity; `plan` owns the device descriptor
 /// table and pins the exact payload/index/MVCC resources it names. Unrelated tables do not invalidate it.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedShardedPointRoute {
+    pub(crate) route_key: ShardedPointRouteKey,
     pub(crate) table_generation: Arc<()>,
     pub(crate) read_boundary: Index,
     pub(crate) gpu_id: u16,
@@ -147,8 +174,9 @@ pub(crate) struct CachedShardedPointRoute {
     pub(crate) prepared_index_epoch: u64,
 }
 
-pub(crate) type ShardedPointRouteKey = (String, usize, Vec<usize>);
-pub(crate) type ShardedPointRouteMap = BTreeMap<ShardedPointRouteKey, CachedShardedPointRoute>;
+/// One sharded point-route shape within a table-owned point slot. See
+/// [`CompoundPointRouteKey`] for why a table name is not part of this key.
+pub(crate) type ShardedPointRouteKey = (usize, Vec<usize>);
 
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
 /// generation. A reader `get`s an owned `Arc` (a refcount bump, no borrow of the map)

@@ -537,7 +537,7 @@ fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
         1
     );
     assert_eq!(
-        engine.commit_state().ledger.table_root_index("t"),
+        engine.test_table_root_index("t"),
         engine.committed_seq(),
         "lane INSERT must advance the canonical table root"
     );
@@ -593,7 +593,7 @@ fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
         1
     );
     assert_eq!(
-        engine.commit_state().ledger.table_root_index("t"),
+        engine.test_table_root_index("t"),
         engine.committed_seq(),
         "nonempty lane UPDATE must advance the canonical table root"
     );
@@ -640,7 +640,7 @@ fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
         1
     );
     assert_eq!(
-        engine.commit_state().ledger.table_root_index("t"),
+        engine.test_table_root_index("t"),
         engine.committed_seq(),
         "lane DELETE must advance the canonical table root"
     );
@@ -677,7 +677,7 @@ fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
         0
     );
     assert_eq!(
-        engine.commit_state().ledger.table_root_index("t"),
+        engine.test_table_root_index("t"),
         engine.committed_seq(),
         "zero-row DELETE replay still carries a table mutation footprint"
     );
@@ -690,7 +690,7 @@ fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
         .unwrap();
 
     let update_route = engine.prepare_covered_update_route("t").unwrap();
-    let root_before_zero_update = engine.commit_state().ledger.table_root_index("t");
+    let root_before_zero_update = engine.test_table_root_index("t");
     assert_eq!(
         settle(
             &engine,
@@ -701,7 +701,7 @@ fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
         0
     );
     assert_eq!(
-        engine.commit_state().ledger.table_root_index("t"),
+        engine.test_table_root_index("t"),
         root_before_zero_update,
         "zero-row UPDATE replay carries no AppliedRowMutation and must not move the live root"
     );
@@ -767,6 +767,7 @@ fn central_commit_wedge_drains_queued_lane_intents() {
             filter_idx: 0,
             row_id_offset: 0,
             table: std::sync::Arc::from("t"),
+            table_oid: 1,
             template: std::sync::Arc::from(&b""[..]),
             values: Vec::new(),
             outcome: std::sync::Arc::clone(&outcome),

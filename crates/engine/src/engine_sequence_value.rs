@@ -1244,8 +1244,30 @@ impl Engine {
         &self,
         references: &[BinarySequenceValueReference],
     ) -> Result<(), EngineError> {
-        self.sequence_value_reference_records(references)
-            .map(|_| ())
+        self.validate_sequence_value_reference_iter(references.iter())
+    }
+
+    /// Validate already-owned sequence references against the durable transition index.
+    ///
+    /// This is deliberately a borrowed, allocation-free seam: codec-5 can validate its owned
+    /// S5 values while holding the recovered transition map once, without materializing cloned
+    /// transition records. Lifecycle replay still uses [`Self::sequence_value_reference_records`]
+    /// because it needs those complete records to reconstruct the visible sequence chain.
+    pub(crate) fn validate_sequence_value_reference_iter<'reference, References>(
+        &self,
+        references: References,
+    ) -> Result<(), EngineError>
+    where
+        References: IntoIterator<Item = &'reference BinarySequenceValueReference>,
+    {
+        let outcomes = self
+            .sequence_value_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for reference in references {
+            durable_sequence_value_record_for_reference(&outcomes, reference)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn sequence_value_reference_records(
@@ -1258,30 +1280,8 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut records = Vec::with_capacity(references.len());
         for reference in references {
-            let applied = outcomes.get(&reference.transition_txn_id).ok_or_else(|| {
-                EngineError::Durability(format!(
-                    "user transaction references missing sequence transition {}",
-                    reference.transition_txn_id
-                ))
-            })?;
-            if applied.record.sequence_oid != reference.sequence_oid
-                || applied.record.parent_txn_id != reference.parent_txn_id
-                || applied.record.returned_value != reference.returned_value
-                || applied.record.input_digest != reference.input_digest
-                || applied.record.statement_ordinal != reference.statement_ordinal
-                || applied.record.expression_ordinal != reference.expression_ordinal
-                || (reference.default_expression
-                    != matches!(
-                        applied.record.operation,
-                        BinarySequenceValueOperation::Default
-                    ))
-            {
-                return Err(EngineError::Durability(format!(
-                    "user transaction sequence reference {} does not match its durable transition",
-                    reference.transition_txn_id
-                )));
-            }
-            records.push(applied.record.clone());
+            records
+                .push(durable_sequence_value_record_for_reference(&outcomes, reference)?.clone());
         }
         Ok(records)
     }
@@ -1411,6 +1411,51 @@ impl Engine {
     }
 }
 
+/// Resolve one user-envelope reference against the durable transition lookup index.
+///
+/// Both the allocation-free codec-5 seam and lifecycle replay call this sole semantic authority.
+/// A transition identity is the lookup key; every remaining field binds the user envelope to the
+/// already-published operation without allowing replay to re-evaluate `nextval` or `setval`.
+fn durable_sequence_value_record_for_reference<'outcomes>(
+    outcomes: &'outcomes HashMap<TxnId, AppliedSequenceValueTransition>,
+    reference: &BinarySequenceValueReference,
+) -> Result<&'outcomes BinarySequenceValueTransitionRecord, EngineError> {
+    let applied = outcomes.get(&reference.transition_txn_id).ok_or_else(|| {
+        EngineError::Durability(format!(
+            "user transaction references missing sequence transition {}",
+            reference.transition_txn_id
+        ))
+    })?;
+    if !sequence_value_reference_matches_durable_transition(reference, &applied.record) {
+        return Err(EngineError::Durability(format!(
+            "user transaction sequence reference {} does not match its durable transition",
+            reference.transition_txn_id
+        )));
+    }
+    Ok(&applied.record)
+}
+
+/// Exact durable binding predicate for one sequence reference.
+///
+/// Keep this separate from opcode-21 structural validation: that codec owns the reference's
+/// local field and closure rules, while this predicate proves the referenced published transition
+/// has the same sequence, parent, returned value, input, statement/expression identity, and
+/// Default-versus-explicit operation class.
+fn sequence_value_reference_matches_durable_transition(
+    reference: &BinarySequenceValueReference,
+    record: &BinarySequenceValueTransitionRecord,
+) -> bool {
+    record.transition_txn_id == reference.transition_txn_id
+        && record.sequence_oid == reference.sequence_oid
+        && record.parent_txn_id == reference.parent_txn_id
+        && record.returned_value == reference.returned_value
+        && record.input_digest == reference.input_digest
+        && record.statement_ordinal == reference.statement_ordinal
+        && record.expression_ordinal == reference.expression_ordinal
+        && (reference.default_expression
+            == matches!(record.operation, BinarySequenceValueOperation::Default))
+}
+
 fn sequence_value_outcome(
     transition_txn_id: TxnId,
     record: &BinarySequenceValueTransitionRecord,
@@ -1423,5 +1468,179 @@ fn sequence_value_outcome(
             BinarySequenceValueOperation::NextVal | BinarySequenceValueOperation::Default => true,
             BinarySequenceValueOperation::SetVal { is_called } => is_called,
         },
+    }
+}
+
+#[cfg(test)]
+mod sequence_reference_validation_tests {
+    use super::*;
+
+    fn durable_default_transition() -> BinarySequenceValueTransitionRecord {
+        let parent_request_digest = [0x41; 32];
+        let input_digest = sequence_value_input_digest(SequenceValueInput {
+            parent_txn_id: 202,
+            parent_autocommit: false,
+            statement_ordinal: 3,
+            expression_ordinal: 5,
+            parent_request_digest,
+            source_name: "reference_validation_sequence",
+            operation: BinarySequenceValueOperation::Default,
+            set_value: None,
+        });
+        BinarySequenceValueTransitionRecord {
+            transition_txn_id: 101,
+            parent_txn_id: 202,
+            parent_autocommit: false,
+            statement_ordinal: 3,
+            expression_ordinal: 5,
+            parent_request_digest,
+            input_digest,
+            sequence_oid: 303,
+            source_name: "reference_validation_sequence".to_string(),
+            effective_name: "reference_validation_sequence".to_string(),
+            published_name: "reference_validation_sequence".to_string(),
+            base_catalog_generation: 1,
+            prior_last_value: 7,
+            prior_is_called: false,
+            new_last_value: 7,
+            new_is_called: true,
+            returned_value: 7,
+            private_descriptor_digest: None,
+            operation: BinarySequenceValueOperation::Default,
+        }
+    }
+
+    fn matching_default_reference(
+        record: &BinarySequenceValueTransitionRecord,
+    ) -> BinarySequenceValueReference {
+        BinarySequenceValueReference {
+            transition_txn_id: record.transition_txn_id,
+            parent_txn_id: record.parent_txn_id,
+            statement_ordinal: record.statement_ordinal,
+            expression_ordinal: record.expression_ordinal,
+            sequence_oid: record.sequence_oid,
+            returned_value: record.returned_value,
+            input_digest: record.input_digest,
+            table_oid: 404,
+            column_id: 6,
+            staging_row_ordinal: 0,
+            row_id: 8,
+            final_value_overwritten: false,
+            default_expression: true,
+        }
+    }
+
+    fn engine_with_durable_transition() -> (Engine, BinarySequenceValueTransitionRecord) {
+        let engine = Engine::new_local();
+        let record = durable_default_transition();
+        engine
+            .sequence_value_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                record.transition_txn_id,
+                AppliedSequenceValueTransition {
+                    commit_seq: 1,
+                    record: record.clone(),
+                },
+            );
+        (engine, record)
+    }
+
+    #[test]
+    fn borrowed_sequence_reference_validation_accepts_exact_durable_default() {
+        let (engine, record) = engine_with_durable_transition();
+        let reference = matching_default_reference(&record);
+
+        engine
+            .validate_sequence_value_reference_iter(std::iter::once(&reference))
+            .expect("borrowed S5 reference must validate without materializing a transition Vec");
+        assert_eq!(
+            engine
+                .sequence_value_reference_records(&[reference])
+                .unwrap(),
+            vec![record]
+        );
+    }
+
+    #[test]
+    fn borrowed_sequence_reference_validation_rejects_operation_missing_and_field_sabotage() {
+        let (engine, record) = engine_with_durable_transition();
+        let reference = matching_default_reference(&record);
+
+        let mut explicit = reference.clone();
+        explicit.default_expression = false;
+        explicit.table_oid = 0;
+        explicit.column_id = 0;
+        explicit.row_id = 0;
+        assert!(engine
+            .validate_sequence_value_reference_iter(std::iter::once(&explicit))
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its durable transition"));
+
+        let mut missing = reference.clone();
+        missing.transition_txn_id += 1;
+        assert!(engine
+            .validate_sequence_value_reference_iter(std::iter::once(&missing))
+            .unwrap_err()
+            .to_string()
+            .contains("missing sequence transition"));
+
+        let (inconsistent_engine, inconsistent_record) = engine_with_durable_transition();
+        let inconsistent_reference = matching_default_reference(&inconsistent_record);
+        inconsistent_engine
+            .sequence_value_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&inconsistent_reference.transition_txn_id)
+            .expect("test fixture inserts the transition at the reference key")
+            .record
+            .transition_txn_id += 1;
+        assert!(inconsistent_engine
+            .validate_sequence_value_reference_iter(std::iter::once(&inconsistent_reference))
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its durable transition"));
+
+        let mismatches = [
+            {
+                let mut value = reference.clone();
+                value.sequence_oid += 1;
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value.parent_txn_id += 1;
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value.returned_value += 1;
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value.input_digest[0] ^= 1;
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value.statement_ordinal += 1;
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value.expression_ordinal += 1;
+                value
+            },
+        ];
+        for mismatch in &mismatches {
+            assert!(engine
+                .validate_sequence_value_reference_iter(std::iter::once(mismatch))
+                .unwrap_err()
+                .to_string()
+                .contains("does not match its durable transition"));
+        }
     }
 }

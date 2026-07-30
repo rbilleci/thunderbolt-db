@@ -9,6 +9,7 @@ use super::*;
 use crate::engine_canonical_operation::{
     ENGINE_OPERATION_CODEC_RESOLVED_BINARY, ENGINE_OPERATION_MAGIC,
 };
+use crate::engine_insert_plan::host_retention::HostRetentionReport;
 
 /// A checked, side-effect-free proposal for the row identities one INSERT will later consume.
 ///
@@ -149,6 +150,28 @@ impl PreparedBinaryInsertTemplate {
         self.count
     }
 
+    /// Backing allocations retained by this template before row-id binding. Payload ownership is
+    /// shared only through this Arc slice, so its data store is deduplicated by the report while
+    /// the two private offset boxes and operation-body capacity remain distinct allocations.
+    #[allow(dead_code)] // Adopted by the inert reservation carrier next.
+    pub(crate) fn host_retention_report(&self) -> Result<HostRetentionReport, EngineError> {
+        let mut report = HostRetentionReport::default();
+        report.retain_arc_slice(&self.payload)?;
+        report.retain_boxed_slice(&self.payload_row_id_offsets)?;
+        report.retain_vec(&self.operation_body)?;
+        report.retain_boxed_slice(&self.operation_row_id_offsets)?;
+        Ok(report)
+    }
+
+    /// Exact already-wrapped canonical operation fragment-body bytes. This is the pre-bind
+    /// geometry carried by the live binary template; it does not clone the proposal payload.
+    #[allow(dead_code)] // Consumed by the inert pre-WAL adapter before the live promotion slice.
+    pub(crate) fn operation_fragment_body_bytes(&self) -> Result<u64, EngineError> {
+        u64::try_from(self.operation_body.len()).map_err(|_| {
+            EngineError::Durability("sealed INSERT operation-body length overflows".to_string())
+        })
+    }
+
     /// Consume this zero-id template, patching the payload and its operation body in lock-step.
     pub(crate) fn bind(
         mut self,
@@ -205,6 +228,7 @@ impl PreparedBinaryInsertTemplate {
             self.operation_body[*offset..*offset + 8].copy_from_slice(&row_id.to_le_bytes());
         }
         Ok(BoundBinaryInsert {
+            #[cfg(test)]
             payload: self.payload,
             operation_body: self.operation_body,
             proposed,
@@ -217,6 +241,9 @@ impl PreparedBinaryInsertTemplate {
 /// The token is consumed by `SealedCanonicalOperation`; callers may cheaply clone only the exact
 /// proposal payload needed by the replication proposal before doing so.
 pub(crate) struct BoundBinaryInsert {
+    /// Test-only parity witness for the inert v1 adapter. Live canonical WAL consumes the already
+    /// sealed operation body and does not retain a duplicate proposal encoding.
+    #[cfg(test)]
     payload: Arc<[u8]>,
     operation_body: Vec<u8>,
     /// The exact move-only proposal that patched both owned byte artifacts. Later allocator
@@ -225,6 +252,16 @@ pub(crate) struct BoundBinaryInsert {
 }
 
 impl BoundBinaryInsert {
+    /// Exact already-wrapped operation fragment-body bytes after row-id binding. Binding patches
+    /// in place, so this must remain equal to the source template's pre-bind geometry.
+    #[allow(dead_code)] // Parity witness for the inert adapter; binding itself remains unchanged.
+    pub(crate) fn operation_fragment_body_bytes(&self) -> Result<u64, EngineError> {
+        u64::try_from(self.operation_body.len()).map_err(|_| {
+            EngineError::Durability("bound INSERT operation-body length overflows".to_string())
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn proposal_payload(&self) -> Arc<[u8]> {
         Arc::clone(&self.payload)
     }
@@ -274,10 +311,15 @@ mod tests {
         let (_engine, _command, batch) = sealed_accounts_batch(&accounts_workload(1_000));
         let template = batch.binary_insert_template().unwrap();
         assert_eq!(template.count(), 1_000);
+        let operation_body_bytes = template.operation_fragment_body_bytes().unwrap();
         assert!(ProposedRowIdRange::new(0, 1_000).is_err());
         let bound = template
             .bind(ProposedRowIdRange::new(41, 1_000).unwrap())
             .unwrap();
+        assert_eq!(
+            bound.operation_fragment_body_bytes().unwrap(),
+            operation_body_bytes
+        );
         let payload = bound.proposal_payload();
         let decoded = decode_binary_insert(&payload).unwrap();
         assert_eq!(decoded.table, "accounts");

@@ -11,6 +11,11 @@ use crate::{
     CudaVisibleDigestColumn, CudaVisibleSourceDigest,
 };
 
+mod prepared_u64_publish;
+#[cfg(test)]
+pub(crate) use prepared_u64_publish::fail_next_prepared_u64_htod_publication;
+pub use prepared_u64_publish::PreparedU64HtoDPublication;
+
 pub struct CudaResidentDeviceMemory {
     pub(super) metadata: CudaDeviceMemoryProof,
     pub(super) device_ptr: u64,
@@ -221,6 +226,13 @@ impl CudaResidentReadSource for CudaResidentDeviceMemoryReadView {
 }
 
 impl CudaResidentDeviceMemory {
+    /// Stable identity of the underlying CUDA allocation, independent of this outer resource
+    /// wrapper. Retained plan accounting uses it to avoid double-charging aliases created for a
+    /// different primary-context witness in tests or recovery probes.
+    pub fn allocation_identity(&self) -> usize {
+        Arc::as_ptr(&self.allocation) as usize
+    }
+
     /// Transfer one freshly allocated raw device pointer into the shared owner/read-view lifetime.
     /// Every construction path funnels through this helper so a safe read view can never outlive the
     /// allocation it addresses.
@@ -463,6 +475,20 @@ impl CudaResidentDeviceMemory {
             metadata: self.metadata.clone(),
             device_ptr: self.device_ptr,
             primary,
+            allocation: Arc::clone(&self.allocation),
+            last_kernel_event_elapsed_us: Mutex::new(None),
+        }
+    }
+
+    /// Build a distinct outer resource wrapper which retains the same underlying allocation.
+    /// Cross-crate probe tests use this to prove accounting keys the allocation owner, not the
+    /// wrapper Arc identity.
+    #[cfg(any(test, feature = "probe-timing"))]
+    pub fn distinct_wrapper_for_accounting_test(&self) -> Self {
+        Self {
+            metadata: self.metadata.clone(),
+            device_ptr: self.device_ptr,
+            primary: Arc::clone(&self.primary),
             allocation: Arc::clone(&self.allocation),
             last_kernel_event_elapsed_us: Mutex::new(None),
         }

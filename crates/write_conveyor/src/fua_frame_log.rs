@@ -22,6 +22,16 @@ use std::thread::JoinHandle;
 use crate::fua_wal::{fua_open_direct, prewrite_extents, AlignedStaging, PaddedAtomicU64};
 use crate::wal_segment::{bytes_of, invalid_data, read_struct_at, write_all_at};
 
+mod fault;
+mod fence;
+mod scatter;
+
+pub use fault::{FuaFrameFault, FuaFrameFaultStage, FuaFramePoison, FUA_FRAME_FAULT_NO_FRAME};
+pub use fence::{FuaFrameLogFixedFencePool, FUA_FIXED_FENCE_POOL_MAX_LANES};
+pub use scatter::{
+    FuaScatterPlan, FuaScatterReservation, FuaScatterSource, FUA_SCATTER_MAX_FRAGMENTS,
+};
+
 const FRAME_LOG_MAGIC: u64 = 0x4655_4146_4c4f_4731; // "FUAFLOG1"
 const FRAME_MAGIC: u64 = 0x4655_4146_524d_4831; // "FUAFRMH1"
 const FRAME_LOG_VERSION: u32 = 1;
@@ -280,6 +290,13 @@ pub struct FuaFrameLog {
     fences_completed: PaddedAtomicU64,
     publishing_finished: AtomicBool,
     fence_failed: AtomicBool,
+    /// First fixed post-publication fence/pool fault. Dynamic compatibility APIs only render
+    /// this value after the protected path has returned.
+    fixed_poison: FuaFramePoison,
+    /// Deterministic post-publication syscall fault seam. Production builds have no hook or
+    /// alternate fence route.
+    #[cfg(test)]
+    fixed_fence_test_fault: Mutex<Option<FuaFrameFault>>,
     /// PARK-WHEN-IDLE for fence lanes: idle lanes previously `yield_now`-spun
     /// waiting for frames — with many lane sets (N logs x 16 lanes) the
     /// spinning threads starve the whole host at low load (measured: 160
@@ -424,6 +441,9 @@ impl FuaFrameLog {
             fences_completed: PaddedAtomicU64::zero(),
             publishing_finished: AtomicBool::new(false),
             fence_failed: AtomicBool::new(false),
+            fixed_poison: FuaFramePoison::new(),
+            #[cfg(test)]
+            fixed_fence_test_fault: Mutex::new(None),
         };
         log.write_file_header()?;
         Ok(Arc::new(log))
@@ -464,183 +484,6 @@ impl FuaFrameLog {
             next_frame: 0,
             next_offset: 0,
         }
-    }
-
-    /// Spawn fence lanes; lanes exit after [`FuaFrameLogAppender::finish`]
-    /// once every published frame is durable.
-    pub fn spawn_fence_pool(self: &Arc<Self>, lanes: usize) -> FuaFrameLogFencePool {
-        let lanes = lanes.max(1);
-        let handles = (0..lanes)
-            .map(|_| {
-                let log = Arc::clone(self);
-                std::thread::spawn(move || log.fence_lane_loop())
-            })
-            .collect();
-        FuaFrameLogFencePool { handles }
-    }
-
-    fn fence_lane_loop(&self) -> std::io::Result<u64> {
-        // Spin briefly before parking: at high rates the next frame lands
-        // within the window and the mutex is never touched.
-        const SPINS_BEFORE_PARK: u32 = 2_000;
-        let mut fenced = 0_u64;
-        loop {
-            // WAIT for an unclaimed published frame, then CAS-claim it. Claims
-            // are taken only when work exists, so any parked lane can serve
-            // any frame and a single `notify_one` per publish suffices (no
-            // pre-assigned frame = no missed-wake hang, no thundering herd).
-            let (frame, claim_ns) = loop {
-                let claimed = self.fence_cursor.load_acquire();
-                let published = self.published_frames.load_acquire();
-                if published > claimed {
-                    if self.fence_cursor.compare_exchange(claimed, claimed + 1) {
-                        let claim_ns = self.stat_now_nanos();
-                        self.claim_ns[(claimed as usize) % FRAME_SLOTS]
-                            .store(claim_ns, Ordering::Relaxed);
-                        let published_ns = self.publish_ns[(claimed as usize) % FRAME_SLOTS]
-                            .load(Ordering::Relaxed);
-                        saturating_add(
-                            &self.stat_publish_to_claim_ns,
-                            claim_ns.saturating_sub(published_ns),
-                        );
-                        saturating_add(&self.stat_publish_to_claim_frames, 1);
-                        break (claimed, claim_ns);
-                    }
-                    continue; // lost the claim race; re-check immediately
-                }
-                if self.publishing_finished.load(Ordering::Acquire) {
-                    return Ok(fenced);
-                }
-                let mut spins = 0_u32;
-                let should_park = loop {
-                    let published = self.published_frames.load_acquire();
-                    if published > self.fence_cursor.load_acquire()
-                        || self.publishing_finished.load(Ordering::Acquire)
-                    {
-                        break false;
-                    }
-                    spins += 1;
-                    if spins >= SPINS_BEFORE_PARK {
-                        break true;
-                    }
-                    std::thread::yield_now();
-                };
-                if should_park {
-                    let mut parked = self.park.lock().unwrap_or_else(|p| p.into_inner());
-                    // Re-check UNDER the mutex (the publisher notifies under
-                    // it) so a publish between our check and the wait cannot
-                    // be missed.
-                    if self.published_frames.load_acquire() <= self.fence_cursor.load_acquire()
-                        && !self.publishing_finished.load(Ordering::Acquire)
-                    {
-                        *parked += 1;
-                        parked = self
-                            .park_wake
-                            .wait(parked)
-                            .unwrap_or_else(|p| p.into_inner());
-                        *parked = parked.saturating_sub(1);
-                    }
-                }
-            };
-            if let Err(error) = self.fence_frame(frame, claim_ns) {
-                saturating_add(&self.stat_fence_failures, 1);
-                self.fence_failed.store(true, Ordering::Release);
-                // Wake everyone so sibling lanes observe the failure/finish
-                // promptly instead of parking forever.
-                self.park_wake.notify_all();
-                return Err(error);
-            }
-            fenced += 1;
-        }
-    }
-
-    /// Wake fence lanes after state they wait on changed. A batch exposes several independent
-    /// fenceable frames at one release point, so wake up to that many parked lanes; `all` is for
-    /// finish/failure draining.
-    fn wake_fence_lanes(&self, frames: usize, all: bool) {
-        // The mutex bounds the race with a parking lane (it re-checks under
-        // the lock before waiting); an EMPTY critical section is enough.
-        let parked = self.park.lock().unwrap_or_else(|p| p.into_inner());
-        if *parked > 0 {
-            if all {
-                self.park_wake.notify_all();
-            } else {
-                for _ in 0..frames.min(*parked) {
-                    self.park_wake.notify_one();
-                }
-            }
-        }
-    }
-
-    fn fence_frame(&self, frame_id: u64, claim_ns: u64) -> std::io::Result<()> {
-        let slot = &self.slots[(frame_id as usize) % FRAME_SLOTS];
-        let offset = slot.offset.load(Ordering::Acquire) as usize;
-        let padded_len = slot.padded_len.load(Ordering::Acquire) as usize;
-        unsafe {
-            write_all_at(
-                &self.file,
-                std::slice::from_raw_parts(self.staging.ptr().add(offset), padded_len),
-                (FRAME_LOG_HEADER_BYTES + offset) as u64,
-            )?;
-        }
-        let write_done_ns = self.stat_now_nanos();
-        self.write_done_ns[(frame_id as usize) % FRAME_SLOTS]
-            .store(write_done_ns, Ordering::Relaxed);
-        saturating_add(
-            &self.stat_claim_to_write_done_ns,
-            write_done_ns.saturating_sub(claim_ns),
-        );
-        saturating_add(&self.stat_claim_to_write_done_frames, 1);
-        slot.fenced.store(true, Ordering::Release);
-        let published = self.publish_ns[(frame_id as usize) % FRAME_SLOTS].load(Ordering::Relaxed);
-        saturating_add(&self.stat_fence_ns, write_done_ns.saturating_sub(published));
-        saturating_add(&self.stat_fenced_frames, 1);
-        self.fences_completed.fetch_add(1);
-        let mut frontier = self
-            .durable_frontier
-            .lock()
-            .map_err(|_| std::io::Error::other("FUA frame log frontier poisoned"))?;
-        let mut advanced = *frontier;
-        while advanced < self.published_frames.load_acquire() {
-            let slot = &self.slots[(advanced as usize) % FRAME_SLOTS];
-            if !slot.fenced.load(Ordering::Acquire) {
-                break;
-            }
-            advanced += 1;
-        }
-        if advanced != *frontier {
-            let previous = *frontier;
-            let cut_ns = self.stat_now_nanos();
-            for cut_frame in previous..advanced {
-                let write_done_ns =
-                    self.write_done_ns[(cut_frame as usize) % FRAME_SLOTS].load(Ordering::Relaxed);
-                saturating_add(
-                    &self.stat_write_done_to_cut_ns,
-                    cut_ns.saturating_sub(write_done_ns),
-                );
-            }
-            let advanced_frames = advanced.saturating_sub(previous);
-            saturating_add(&self.stat_write_done_to_cut_frames, advanced_frames);
-            saturating_add(&self.stat_cut_events, 1);
-            saturating_add(&self.stat_cut_advanced_frames, advanced_frames);
-            self.stat_cut_advance_max_frames
-                .fetch_max(advanced_frames, Ordering::Relaxed);
-            *frontier = advanced;
-            // Publish the timestamp before the cut itself; an acquire load of durable_seq then
-            // observes the cut time without a waiter-side event allocation.
-            self.durable_cut_ns
-                .store(cut_ns.saturating_add(1), Ordering::Relaxed);
-            self.durable_frames.store_release(advanced);
-            let end_seq = self.slots[((advanced - 1) as usize) % FRAME_SLOTS]
-                .end_seq
-                .load(Ordering::Relaxed);
-            // Continuation fragments carry `seq_count=0` and therefore their group start as
-            // `end_seq`; never let a durable cut regress (or acknowledge past) the preceding
-            // terminal group's logical boundary. Only the terminal fragment advances it.
-            let prior_end = self.durable_seq.load_relaxed();
-            self.durable_seq.store_release(prior_end.max(end_seq));
-        }
-        Ok(())
     }
 
     /// True once any fence lane failed; pacing loops and waiters must abort.

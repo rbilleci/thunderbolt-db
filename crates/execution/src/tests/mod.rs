@@ -115,6 +115,8 @@ fn build_pk_hash(keys: &[i32]) -> (Vec<u64>, u32, u32) {
 
 include!("write_index.rs");
 include!("version_conflict.rs");
+#[path = "prepared_u64_htod_publication.rs"]
+mod prepared_u64_htod_publication;
 
 #[test]
 fn cuda_driver_runtime_routes_only_detected_devices() {
@@ -260,6 +262,11 @@ fn resident_visibility_count_validates_alignment_and_exact_primary_context() {
 
     let distinct_primary = distinct_gpu_primary_context_for_test(0).unwrap();
     let wrong_context = resident.clone_with_primary_for_test(distinct_primary);
+    assert_eq!(
+        resident.allocation_identity(),
+        wrong_context.allocation_identity(),
+        "a wrapper with a different primary-context witness still aliases one allocation"
+    );
     assert!(matches!(
         resident.count_visible_rows(1, 1, Some((&wrong_context, 8)), None),
         Err(CudaRuntimeProbeError::InvalidInputLength(_))
@@ -1028,6 +1035,8 @@ fn cuda_chunk_bloom_probe_has_no_false_negatives() {
     );
 }
 
+#[path = "insert_foreign_key_verdict.rs"]
+mod insert_foreign_key_verdict;
 #[path = "insert_key_verdict.rs"]
 mod insert_key_verdict;
 #[path = "insert_resident_key_verdict.rs"]

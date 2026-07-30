@@ -180,10 +180,7 @@ fn copy_and_explicit_transaction_roots_feed_reset_recovery() {
     );
     let copy_root = engine.committed_seq();
     assert_eq!(
-        engine
-            .commit_state()
-            .ledger
-            .table_root_index("copy_reset_root"),
+        engine.test_table_root_index("copy_reset_root"),
         copy_root,
         "direct-current COPY must advance the canonical table root"
     );
@@ -204,10 +201,7 @@ fn copy_and_explicit_transaction_roots_feed_reset_recovery() {
     engine.submit_transaction(184, parsed("COMMIT")).unwrap();
     let transaction_root = engine.committed_seq();
     assert_eq!(
-        engine
-            .commit_state()
-            .ledger
-            .table_root_index("txn_reset_root"),
+        engine.test_table_root_index("txn_reset_root"),
         transaction_root,
         "an explicit transaction mutation must advance the canonical table root"
     );
@@ -747,10 +741,7 @@ fn every_live_autocommit_truncate_surface_emits_typed_reset_wal() {
         .unwrap();
     let before_submit = engine.durable_wal_records().len();
     let table = engine.catalog_snapshot().relational_catalog["autocommit_reset"].clone();
-    let source_commit_seq = engine
-        .commit_state()
-        .ledger
-        .table_root_index("autocommit_reset");
+    let source_commit_seq = engine.test_table_root_index("autocommit_reset");
     let expected_before = engine
         .table_reset_device_root_proof(&table, source_commit_seq, engine.committed_seq())
         .unwrap()
@@ -1292,10 +1283,7 @@ fn grouped_drop_recreate_root_matches_record_replay_before_reset() {
         panic!("grouped reset lifecycle failed: {}", failure.error);
     }
     assert_eq!(
-        engine
-            .commit_state()
-            .ledger
-            .table_root_index("grouped_reset"),
+        engine.test_table_root_index("grouped_reset"),
         0,
         "the final OID must start at its own empty root"
     );
@@ -1467,10 +1455,7 @@ fn reset_drop_recreate_retires_root_and_fence_after_snapshot_epoch() {
     engine
         .submit_transaction(384, parsed("DROP TABLE reset_churn"))
         .unwrap();
-    assert_eq!(
-        engine.commit_state().ledger.table_root_index("reset_churn"),
-        0
-    );
+    assert_eq!(engine.test_table_root_index("reset_churn"), 0);
     assert_eq!(
         engine.read_state.table_rewrite_fences.load().get(&old_oid),
         Some(&fence),
@@ -1493,7 +1478,7 @@ fn reset_drop_recreate_retires_root_and_fence_after_snapshot_epoch() {
         )
         .unwrap();
     assert_eq!(
-        engine.commit_state().ledger.table_root_index("reset_churn"),
+        engine.test_table_root_index("reset_churn"),
         0,
         "a recreated name must start from its new OID's empty root"
     );

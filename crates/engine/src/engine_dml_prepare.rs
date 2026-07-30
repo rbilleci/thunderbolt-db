@@ -133,6 +133,13 @@ impl Engine {
             }
             pending_rows.push(values);
         }
+        if !insert.returning.is_empty() {
+            crate::typed_insert_batch::validate_legacy_insert_returning(
+                table,
+                &insert.returning,
+                pending_rows.len(),
+            )?;
+        }
         // Scalar defaults are statement constants. Resolve each one only when at least one row
         // requests it, then broadcast that value through the legacy row lowering below. This is
         // the same authority as typed_insert_batch::defaults::resolve; RETURNING deliberately
@@ -288,7 +295,7 @@ impl Engine {
             inserted_rows.push((row_key, values));
         }
         let mut write_set = WriteSet::default();
-        write_set.tables.insert(insert.table.clone());
+        write_set.add_table(table);
         for (_row_key, values) in &inserted_rows {
             // An INSERT claims a FRESH, unique row id at install time (`apply_delta` reserves the
             // tuple id + advances `relational_next_row_id` under the commit lock), so its row slot
@@ -395,7 +402,7 @@ impl Engine {
         }
 
         let mut write_set = WriteSet::default();
-        write_set.tables.insert(delete.table.clone());
+        write_set.add_table(table);
         let mut tuple_ids = Vec::with_capacity(deletes.len());
         // SV4b: surface the resolved row images (catalog order) so the commit path can locate + tombstone
         // them on the resident GPU shard in place. Already decoded above for the filter/FK scan -- clone here.
@@ -403,10 +410,21 @@ impl Engine {
         for (tuple_id, key, row) in &deletes {
             tuple_ids.push(*tuple_id);
             deleted_rows.push(row.clone());
-            write_set.rows.push(RowWriteKey {
-                table: delete.table.clone(),
-                row_key: key.clone(),
-            });
+            // A class-authoritative resolve returns a packed physical
+            // coordinate in `tuple_id`; the formatted key is the retained
+            // logical identity.  Never let that coordinate alias the stable
+            // ledger row key across chunk epochs.
+            let row_id = crate::engine_residency::parse_relational_row_id(
+                key,
+                &relational_key_prefix(&table.name),
+            )
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "DELETE resolved relation \"{}\" without a stable logical row identity",
+                    table.name
+                ))
+            })?;
+            write_set.add_row(table, row_id, key.clone());
             // A delete releases the row's unique-index slots; record them as written so a
             // concurrent insert reusing the value conflicts (Stage 4 first-committer-wins).
             write_set.add_unique_slots(table, row);
@@ -1727,14 +1745,21 @@ impl Engine {
         }
 
         let mut write_set = WriteSet::default();
-        write_set.tables.insert(update.table.clone());
-        for (_, key, row) in &updates {
+        write_set.add_table(table);
+        for (_tuple_id, key, row) in &updates {
             // An UPDATE tombstones the old version and installs a new one at the SAME row key,
             // so the row slot is written once.
-            write_set.rows.push(RowWriteKey {
-                table: update.table.clone(),
-                row_key: key.clone(),
-            });
+            let row_id = crate::engine_residency::parse_relational_row_id(
+                key,
+                &relational_key_prefix(&table.name),
+            )
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "UPDATE resolved relation \"{}\" without a stable logical row identity",
+                    table.name
+                ))
+            })?;
+            write_set.add_row(table, row_id, key.clone());
             // The new image's unique-index slots are claimed by this txn.
             write_set.add_unique_slots(table, row);
         }
@@ -1800,6 +1825,7 @@ fn transaction_dml_dependencies(
 fn prepared_candidate_execute_error(error: ExecuteError) -> EngineError {
     match error {
         ExecuteError::Engine(error) => error,
+        ExecuteError::IndeterminateDurability(fault) => EngineError::DurabilityFault(fault),
         other => EngineError::ApplyFailed(other.to_string()),
     }
 }

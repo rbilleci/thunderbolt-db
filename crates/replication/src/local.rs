@@ -1,6 +1,18 @@
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{LogReplicator, RecoveryProgressGap, ReplicationProgress, ReplicationStatusSnapshot};
+
+static NEXT_PROPOSAL_RESERVATION_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_proposal_reservation_owner_id() -> u64 {
+    let owner_id = NEXT_PROPOSAL_RESERVATION_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(
+        owner_id, 0,
+        "LocalReplicator proposal reservation owner identifiers exhausted"
+    );
+    owner_id
+}
 
 #[derive(Debug)]
 pub struct LocalReplicator {
@@ -11,7 +23,32 @@ pub struct LocalReplicator {
     applied_term: Term,
     role: Role,
     entries: Vec<LogEntry>,
+    /// Bumped after every mutation that can make an outstanding reserved proposal stale.  A
+    /// reservation carries this value in addition to the exact frontier/length binding, so a
+    /// caller cannot keep a Vec slot across an intervening log transition and replay it later.
+    proposal_reservation_generation: u64,
+    /// Stable, process-local identity carried by every reservation so equal frontiers from two
+    /// independent replicators cannot consume one another's capacity token.
+    proposal_reservation_owner_id: u64,
     snapshot_id: u64,
+}
+
+/// One fallibly acquired, exact slot in [`LocalReplicator::entries`] for the next leader
+/// proposal.
+///
+/// The fields are deliberately private and this type is neither `Clone` nor `Copy`: only a
+/// [`LocalReplicator`] can issue it and only the same unmodified replicator can consume it through
+/// [`LocalReplicator::propose_reserved`].  Reserving capacity is not a log mutation; dropping an
+/// unused reservation therefore has no logical effect.
+#[must_use = "a reserved replication proposal slot must be consumed or deliberately abandoned before WAL"]
+pub struct LocalReplicatorProposalReservation {
+    expected_owner_id: u64,
+    expected_next_index: Index,
+    expected_entries_len: usize,
+    expected_entries_capacity: usize,
+    expected_term: Term,
+    expected_commit_index: Index,
+    expected_generation: u64,
 }
 
 impl LocalReplicator {
@@ -24,23 +61,35 @@ impl LocalReplicator {
             applied_term: 0,
             role: Role::Leader,
             entries: Vec::new(),
+            proposal_reservation_generation: 0,
+            proposal_reservation_owner_id: next_proposal_reservation_owner_id(),
             snapshot_id: 0,
         }
+    }
+
+    fn invalidate_proposal_reservations(&mut self) {
+        self.proposal_reservation_generation = self
+            .proposal_reservation_generation
+            .checked_add(1)
+            .expect("LocalReplicator proposal reservation generation exhausted");
     }
 
     pub fn become_follower(&mut self, term: Term) {
         self.term = self.term.max(term);
         self.role = Role::Follower;
+        self.invalidate_proposal_reservations();
     }
 
     pub fn become_leader(&mut self, term: Term) {
         self.term = self.term.max(term);
         self.role = Role::Leader;
+        self.invalidate_proposal_reservations();
     }
 
     pub fn become_candidate(&mut self, term: Term) {
         self.term = self.term.max(term);
         self.role = Role::Candidate;
+        self.invalidate_proposal_reservations();
     }
 
     /// The `Index` the NEXT [`LogReplicator::propose`] will assign, WITHOUT consuming it. The
@@ -105,6 +154,7 @@ impl LocalReplicator {
         if let Some(term) = self.entry_at(bounded).map(|entry| entry.term) {
             self.applied_term = term;
         }
+        self.invalidate_proposal_reservations();
     }
 
     /// W1b: drop the applied prefix (see [`LogReplicator::compact_applied_prefix`]). Keeps the
@@ -112,6 +162,7 @@ impl LocalReplicator {
     pub fn compact_applied_prefix_inner(&mut self) {
         let applied = self.applied_index;
         self.entries.retain(|e| e.index > applied);
+        self.invalidate_proposal_reservations();
     }
 
     /// E2.5b — batch propose for the wave sequencer: append `payloads` as consecutive leader
@@ -158,7 +209,85 @@ impl LocalReplicator {
         if self.next_index > first {
             self.commit_index = self.next_index - 1;
         }
+        if self.next_index != first {
+            self.invalidate_proposal_reservations();
+        }
         Ok(first)
+    }
+
+    /// Fallibly reserve the exact `entries` slot that the next typed canonical proposal will use.
+    /// This must be acquired before the caller crosses its WAL claim boundary.  The resulting
+    /// token is bound to the exact leader term, sequence frontier, log length/capacity, and
+    /// mutation generation; any intervening local-replication mutation rejects consumption.
+    pub fn reserve_next_proposal(
+        &mut self,
+    ) -> Result<LocalReplicatorProposalReservation, EngineError> {
+        if self.role != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+        if self.next_index == u64::MAX {
+            return Err(EngineError::ProposalFailed(
+                "commit sequence space exhausted".to_string(),
+            ));
+        }
+        self.entries.try_reserve_exact(1).map_err(|_| {
+            EngineError::ProposalFailed(
+                "unable to reserve the next local replication entry before WAL".to_string(),
+            )
+        })?;
+        Ok(LocalReplicatorProposalReservation {
+            expected_owner_id: self.proposal_reservation_owner_id,
+            expected_next_index: self.next_index,
+            expected_entries_len: self.entries.len(),
+            expected_entries_capacity: self.entries.capacity(),
+            expected_term: self.term,
+            expected_commit_index: self.commit_index,
+            expected_generation: self.proposal_reservation_generation,
+        })
+    }
+
+    /// Consume one [`Self::reserve_next_proposal`] token without letting `entries.push` grow its
+    /// backing allocation.  This is intentionally separate from [`LogReplicator::propose`]:
+    /// historical and resolved callers retain their legacy path, while typed canonical callers
+    /// cannot accidentally lose their pre-WAL capacity proof.
+    pub fn propose_reserved(
+        &mut self,
+        reservation: LocalReplicatorProposalReservation,
+        payload: std::sync::Arc<[u8]>,
+    ) -> Result<CommitToken, EngineError> {
+        if self.role != Role::Leader
+            || self.proposal_reservation_owner_id != reservation.expected_owner_id
+            || self.next_index != reservation.expected_next_index
+            || self.entries.len() != reservation.expected_entries_len
+            || self.entries.capacity() != reservation.expected_entries_capacity
+            || self.term != reservation.expected_term
+            || self.commit_index != reservation.expected_commit_index
+            || self.proposal_reservation_generation != reservation.expected_generation
+        {
+            return Err(EngineError::ProposalFailed(
+                "reserved local replication proposal state drifted before consumption".to_string(),
+            ));
+        }
+        debug_assert!(self.entries.len() < self.entries.capacity());
+        let capacity_before = self.entries.capacity();
+        let idx = self.next_index;
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .expect("reserved maximum commit sequence was refused");
+        self.entries.push(LogEntry {
+            term: self.term,
+            index: idx,
+            payload,
+        });
+        assert_eq!(
+            self.entries.capacity(),
+            capacity_before,
+            "reserved local replication proposal unexpectedly grew entries"
+        );
+        self.commit_index = idx;
+        self.invalidate_proposal_reservations();
+        Ok(CommitToken { index: idx })
     }
 
     pub fn rollback_unapplied_from(&mut self, index_inclusive: Index) {
@@ -173,10 +302,12 @@ impl LocalReplicator {
             .map(|e| e.index)
             .unwrap_or(self.applied_index);
         self.next_index = self.commit_index.saturating_add(1);
+        self.invalidate_proposal_reservations();
     }
 
     pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
         self.snapshot_id += 1;
+        self.invalidate_proposal_reservations();
         self.snapshot_meta()
     }
 
@@ -206,6 +337,7 @@ impl LocalReplicator {
             .map(|entry| entry.index)
             .unwrap_or(self.commit_index);
         self.next_index = tail_index.saturating_add(1);
+        self.invalidate_proposal_reservations();
     }
 
     pub fn progress(&self) -> ReplicationProgress {
@@ -272,6 +404,7 @@ impl LogReplicator for LocalReplicator {
 
         self.entries.push(entry);
         self.commit_index = idx;
+        self.invalidate_proposal_reservations();
 
         Ok(CommitToken { index: idx })
     }
@@ -337,5 +470,43 @@ mod boundary_tests {
             .unwrap_err();
         assert!(error.to_string().contains("sequence space exhausted"));
         assert_eq!(repl.progress(), before);
+    }
+
+    #[test]
+    fn reserved_proposal_consumes_the_exact_slot_without_growing_entries() {
+        let mut repl = LocalReplicator::leader();
+        let reservation = repl.reserve_next_proposal().expect("reserve one entry");
+        let capacity = repl.entries.capacity();
+        let token = repl
+            .propose_reserved(reservation, std::sync::Arc::from(&b"typed"[..]))
+            .expect("consume reserved entry");
+
+        assert_eq!(token.index, 1);
+        assert_eq!(repl.entries.len(), 1);
+        assert_eq!(repl.entries.capacity(), capacity);
+        assert_eq!(repl.commit_index, 1);
+    }
+
+    #[test]
+    fn reserved_proposal_rejects_generation_and_cross_owner_drift() {
+        let mut repl = LocalReplicator::leader();
+        let reservation = repl.reserve_next_proposal().expect("reserve one entry");
+        repl.export_snapshot_meta();
+        let before = repl.progress();
+        let error = repl
+            .propose_reserved(reservation, std::sync::Arc::from(&b"typed"[..]))
+            .expect_err("intervening mutation must reject the token");
+        assert!(error.to_string().contains("state drifted"));
+        assert_eq!(repl.progress(), before);
+
+        let mut first = LocalReplicator::leader();
+        let reservation = first.reserve_next_proposal().expect("reserve first owner");
+        let mut second = LocalReplicator::leader();
+        let before = second.progress();
+        let error = second
+            .propose_reserved(reservation, std::sync::Arc::from(&b"typed"[..]))
+            .expect_err("another replicator must reject this token");
+        assert!(error.to_string().contains("state drifted"));
+        assert_eq!(second.progress(), before);
     }
 }

@@ -341,14 +341,17 @@ impl Engine {
             #[cfg(feature = "probe-timing")]
             insert_probe: Default::default(),
             commit: Mutex::new(CommitState {
+                control_plane_reservation_owner_id: next_commit_state_control_plane_owner_id(),
                 canonical_identity: Self::fresh_canonical_identity(),
                 canonical_lineage_bound: false,
                 canonical_replay_seen: false,
                 transaction_status: HashMap::new(),
+                transaction_status_reservation_generation: 0,
                 last_applied_outcome: None,
                 repl: LocalReplicator::leader(),
                 wal: WalBuffer::default(),
                 wal_commit_timestamps_micros: HashMap::new(),
+                wal_commit_timestamp_reservation_generation: 0,
                 max_commit_timestamp_micros: 0,
                 ledger: RecentCommitsLedger::default(),
                 sm: KvStateMachine::default(),
@@ -525,8 +528,11 @@ impl Engine {
     }
 
     pub(crate) fn commit_path_unavailable_error(&self) -> EngineError {
+        if let Some(fault) = self.group_flush.fixed_poison.snapshot() {
+            return EngineError::DurabilityFault(fault);
+        }
         EngineError::Durability(
-            "commit path is wedged; restart recovery is required before reads or writes resume"
+            "commit path is wedged; restart recovery required before reads or writes resume"
                 .to_string(),
         )
     }
@@ -639,8 +645,8 @@ impl Engine {
         let mut engine = Self::with_planner_config(planner_cfg);
         // E1 step 2 — ONE authority for the durability backend: default SerialFdatasync, opt into
         // the FUA fence pool via `GPU_DB_WAL_DURABILITY=fua` (+ `GPU_DB_WAL_FUA_LANES` /
-        // `GPU_DB_WAL_FUA_SEGMENT_BYTES`). The FUA backend admits MULTIPLE durable jobs in flight;
-        // the concurrent-flush seam in `wait_group_durable` keys off `durability_is_concurrent()`.
+        // `GPU_DB_WAL_FUA_SEGMENT_BYTES`). Exact FUA owns its physical frame/fence lifecycle;
+        // the engine always admits exactly one logical durability group through its coordinator.
         let segment_path = segment_path.into();
         engine
             .install_fresh_durable_identity(&segment_path)
@@ -665,7 +671,6 @@ impl Engine {
             _ => WalBuffer::with_durable_segment_bound_to_identity(segment_path, durable_identity)
                 .expect("failed to create serial durable WAL segment"),
         };
-        engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
         engine.commit_state_mut().wal = wal;
         // Construct optional optimized preparation lanes. They share the canonical WalBuffer
         // above and never create a physical `.lane-*` log.
@@ -826,7 +831,6 @@ impl Engine {
                     segment_bytes,
                     durable_identity,
                 )?;
-                engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
                 engine.commit_state_mut().wal = wal;
                 // E2.5c-1: a reopened database accepts lane intents like a fresh one (no lane
                 // files existed here, so the set is created fresh; activation seeds base_seq
@@ -1061,7 +1065,6 @@ impl Engine {
                 )?,
             }
         };
-        engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
         engine.commit_state_mut().wal = wal;
 
         // Startup closes the retired physical reader after replay. Empty remnants do not impose
@@ -1449,13 +1452,12 @@ impl Engine {
             .map(|(_, (bytes, _owners))| *bytes)
             .sum::<u64>();
         drop(retained_gpu);
-        let sharded_point_routes = self.read_state.residency.sharded_point_routes.load();
-        accounting_entries = accounting_entries.saturating_add(sharded_point_routes.len() as u64);
-        let route_descriptors = sharded_point_routes
-            .values()
-            .filter(|route| route.gpu_id == gpu_id)
-            .map(|route| route.plan.descriptor_allocated_bytes())
-            .sum::<u64>();
+        accounting_entries = accounting_entries
+            .saturating_add(self.read_state.residency.sharded_point_route_count() as u64);
+        let route_descriptors = self
+            .read_state
+            .residency
+            .sharded_point_route_descriptor_bytes_for_gpu(gpu_id);
         let (live_compound_routes, compound_route_entries) =
             self.live_compound_point_route_bytes_and_entries_for_gpu(gpu_id);
         accounting_entries = accounting_entries.saturating_add(compound_route_entries);

@@ -1,11 +1,12 @@
-use super::canonical::{WaveCanonicalFailure, WaveCanonicalOperation};
+use super::canonical::{WaveCanonicalCommit, WaveCanonicalFailure, WaveCanonicalOperation};
 use super::fixed_insert::TypedInsertPreflightResult;
 use super::{
     coerce_filter_literal, current_timestamp_micros, exact_device_verdict_cardinality,
     relational_key_prefix, try_encode_binary_insert, wave_device_phase_timing_enabled,
-    wave_host_phase_timing_enabled, CatalogSnapshot, Command, CommitWaveItem, CommitWaveTail,
-    DmlReadSnapshot, Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation,
-    RelationalIndex, RelationalTable, SqlValue, WAVE_DEVICE_STATS, WAVE_HOST_STATS,
+    wave_host_phase_timing_enabled, CatalogSnapshot, Command, CommitPathFailure, CommitWaveItem,
+    CommitWaveTail, DmlReadSnapshot, Engine, EngineError, ExecuteError, Index, Insert,
+    InsertPrepareValidation, RelationalIndex, RelationalTable, SqlValue, WAVE_DEVICE_STATS,
+    WAVE_HOST_STATS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -126,31 +127,46 @@ struct CommitWaveBatchGuard<'a> {
 impl Drop for CommitWaveBatchGuard<'_> {
     fn drop(&mut self) {
         let mut queue = self.engine.lock_commit_wave_queue();
-        let reason = queue
-            .wedged
-            .clone()
-            .unwrap_or_else(|| "commit-wave sequencer died mid-wave".to_string());
-        queue.wedged = Some(reason.clone());
+        let failure = queue.wedged.clone().unwrap_or_else(|| {
+            CommitPathFailure::compatibility("commit-wave sequencer died mid-wave".to_string())
+        });
+        queue.wedged = Some(failure.clone());
         queue.sequencer_active = false;
         // Fail everything still queued too — no sequencer will ever run it.
         let stranded: Vec<CommitWaveItem> = queue.items.drain(..).collect();
         drop(queue);
         for outcome in self.outcomes {
             if !outcome.done.load(AtomicOrdering::Acquire) {
-                outcome.set_outcome(Err(ExecuteError::Indeterminate(format!(
-                    "the concurrent commit path is wedged pending restart recovery: {reason}"
-                ))));
+                outcome.set_outcome(Err(failure.outcome_error()));
             }
         }
         for item in &stranded {
             if !item.outcome.done.load(AtomicOrdering::Acquire) {
-                item.set_outcome(Err(ExecuteError::Indeterminate(format!(
-                    "the concurrent commit path is wedged pending restart recovery: {reason}"
-                ))));
+                item.set_outcome(Err(failure.outcome_error()));
             }
         }
         self.engine.commit_wave.cv.notify_all();
         self.engine.wedge_commit_path();
+    }
+}
+
+/// Preserve a fixed post-WAL durability identity when a locally held wave observes the service
+/// gate after another tail failed. Compatibility errors retain their established text outcome.
+fn settle_batch_after_commit_path_failure(batch: &[CommitWaveItem], error: EngineError) {
+    match error {
+        EngineError::DurabilityFault(fault) => {
+            for item in batch {
+                item.set_outcome(Err(ExecuteError::IndeterminateDurability(fault)));
+            }
+        }
+        error => {
+            let message = error.to_string();
+            for item in batch {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    message.clone(),
+                ))));
+            }
+        }
     }
 }
 
@@ -474,6 +490,9 @@ impl Engine {
         let wall_clock = current_timestamp_micros();
         let mut wave_tail: Option<(Index, usize)> = None;
         let mut committed: Vec<(usize, Index, u64)> = Vec::with_capacity(batch.len());
+        // At most one typed receipt per batch item. Reserve this tail-owned
+        // carrier before any post-WAL claim so receipt handoff cannot allocate.
+        let mut typed_ledger_receipts = Vec::with_capacity(batch.len());
 
         #[cfg(test)]
         {
@@ -498,12 +517,7 @@ impl Engine {
         // sharded waves, and optimized lanes all advance the same allocator under this cut.
         let mut next_row_id = self.read_state.mvcc.current_row_id();
         if let Err(error) = self.ensure_commit_path_available() {
-            let message = error.to_string();
-            for item in &batch {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                    message.clone(),
-                ))));
-            }
+            settle_batch_after_commit_path_failure(&batch, error);
             std::mem::forget(guard);
             return None;
         }
@@ -744,6 +758,7 @@ impl Engine {
                 flush_appends(&mut pending_appends, &mut committed);
                 let reuse_eligible = wave_catalog_seq == batch[position].prepared_catalog_seq;
                 match self.prepare_typed_insert_pre_wal(
+                    &mut commit,
                     &mut batch[position],
                     &wave_catalog,
                     wave_catalog_seq,
@@ -753,6 +768,11 @@ impl Engine {
                     TypedInsertPreflightResult::Ready(fixed) => {
                         let (operation, fixed_apply) = fixed.into_canonical_operation_and_apply();
                         let commit_seq = commit.repl.peek_next_index();
+                        assert_eq!(
+                            fixed_apply.expected_commit_seq(),
+                            commit_seq,
+                            "commit-path invariant violation: fixed INSERT lost the serial wave commit sequence before canonical append"
+                        );
                         #[cfg(feature = "probe-timing")]
                         let probe_wal_started = Instant::now();
                         let canonical = match self.append_canonical_wave_operation(
@@ -774,9 +794,11 @@ impl Engine {
                         self.record_insert_probe_canonical_wal_nanos(
                             probe_wal_started.elapsed().as_nanos() as u64,
                         );
-                        let proposed_range = canonical.proposed_range.expect(
-                        "fixed INSERT canonical operation must return its original row-id proposal",
-                    );
+                        let WaveCanonicalCommit::TypedInsert(authority) = canonical else {
+                            panic!(
+                                "commit-path invariant violation: typed INSERT canonical append returned a resolved result"
+                            );
+                        };
                         hp!(3);
                         wave_unique_slots
                             .extend(batch[position].write_set.unique_slots.iter().cloned());
@@ -786,21 +808,21 @@ impl Engine {
                         let rows = fixed_apply.row_count();
                         #[cfg(feature = "probe-timing")]
                         let probe_device_append_started = Instant::now();
-                        let table = fixed_apply.apply(self, canonical.commit_seq, proposed_range);
+                        let applied = fixed_apply.apply(self, authority);
                         #[cfg(feature = "probe-timing")]
                         self.record_insert_probe_device_append_nanos(
                             probe_device_append_started.elapsed().as_nanos() as u64,
                         );
-                        if self.table_chunk_authoritative(&table).is_some() {
+                        if self.table_chunk_authoritative(&applied.table).is_some() {
                             self.read_state
                                 .residency
                                 .chunk_class_device_commits
                                 .fetch_add(1, AtomicOrdering::Relaxed);
                         } else {
-                            if !self.table_device_authoritative(&table) {
+                            if !self.table_device_authoritative(&applied.table) {
                                 let snapshot = self.catalog_snapshot();
-                                if self.table_device_authority_eligible(&snapshot, &table) {
-                                    self.set_table_device_authoritative(&table, true);
+                                if self.table_device_authority_eligible(&snapshot, &applied.table) {
+                                    self.set_table_device_authoritative(&applied.table, true);
                                 }
                             }
                             self.read_state
@@ -812,10 +834,11 @@ impl Engine {
                         {
                             batch[position].fixed_insert_typed = true;
                         }
-                        commit.repl.mark_applied(canonical.commit_seq);
+                        commit.repl.mark_applied(applied.commit_seq);
                         next_row_id = self.read_state.mvcc.current_row_id();
-                        wave_tail = Some((canonical.commit_seq, canonical.wal_position));
-                        committed.push((position, canonical.commit_seq, rows));
+                        wave_tail = Some((applied.commit_seq, applied.wal_position));
+                        committed.push((position, applied.commit_seq, rows));
+                        typed_ledger_receipts.push(applied.ledger_receipt);
                         hp!(5);
                         continue;
                     }
@@ -899,6 +922,11 @@ impl Engine {
                         continue;
                     }
                 };
+                let canonical = canonical.into_resolved();
+                assert_eq!(
+                    canonical.commit_seq, commit_seq,
+                    "commit-path invariant violation: resolved intent canonical sequence drifted"
+                );
                 hp!(3);
                 wave_unique_slots.extend(batch[position].write_set.unique_slots.iter().cloned());
                 wave_unique_slots_i32
@@ -985,7 +1013,8 @@ impl Engine {
                 Ok(delta) => delta,
                 Err(err) => {
                     item.set_outcome(Err(match err {
-                        ExecuteError::Serialization(_) => err,
+                        ExecuteError::Serialization(_)
+                        | ExecuteError::IndeterminateDurability(_) => err,
                         other => ExecuteError::Serialization(format!(
                             "re-resolve at commit_seq {commit_seq} failed on a concurrent \
                              interleaving (retryable): {other}"
@@ -1092,6 +1121,11 @@ impl Engine {
                     continue;
                 }
             };
+            let canonical = canonical.into_resolved();
+            assert_eq!(
+                canonical.commit_seq, commit_seq,
+                "commit-path invariant violation: resolved canonical sequence drifted"
+            );
             hp!(3);
             #[cfg(feature = "probe-timing")]
             if let Some(started) = probe_wal_started {
@@ -1281,8 +1315,10 @@ impl Engine {
         Some(CommitWaveTail {
             batch,
             committed,
+            typed_ledger_receipts,
             last_position,
             armed: true,
+            durability_fault: None,
         })
     }
 
@@ -1466,12 +1502,7 @@ impl Engine {
         // between the device verdict and this wave's ordered WAL cut.
         let mut commit = self.commit_state();
         if let Err(error) = self.ensure_commit_path_available() {
-            let message = error.to_string();
-            for item in &batch {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                    message.clone(),
-                ))));
-            }
+            settle_batch_after_commit_path_failure(&batch, error);
             std::mem::forget(guard);
             return None;
         }
@@ -1812,8 +1843,10 @@ impl Engine {
         Some(CommitWaveTail {
             batch,
             committed,
+            typed_ledger_receipts: Vec::new(),
             last_position,
             armed: true,
+            durability_fault: None,
         })
     }
 

@@ -51,6 +51,16 @@ pub(crate) fn encode_binary_delete_by_key(
     Some(out)
 }
 
+/// Re-encode a decoded W5b by-key DELETE without rendering or re-resolving SQL.
+///
+/// The codec-5 executable-operation reader owns the decoded semantic record and compares this
+/// exact current-codec reconstruction to its durable payload before it retains the record.  It
+/// deliberately delegates to the one field encoder so this is not a second DELETE format.
+#[allow(dead_code)]
+pub(crate) fn reencode_binary_delete_by_key(record: &BinaryDeleteByKeyRecord) -> Option<Vec<u8>> {
+    encode_binary_delete_by_key(&record.table, &record.pk_column, record.pk_value)
+}
+
 /// Encode a W5b by-key UPDATE record (U2): table + pk column/value + the new version's row id +
 /// the new row image (all columns). `None` on width-exceeding shapes (caller falls back to SQL
 /// text). `new_row` is the full post-image in catalog order.
@@ -81,6 +91,35 @@ pub(crate) fn encode_binary_update_by_key(
     out.extend_from_slice(pk_column.as_bytes());
     out.extend_from_slice(&pk_value.to_le_bytes());
     out.extend_from_slice(&new_row_id.to_le_bytes());
+    out.extend_from_slice(&(encoded_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(encoded_bytes);
+    Some(out)
+}
+
+/// Re-encode a decoded W5b by-key UPDATE without rendering SQL or decoding/re-encoding the row
+/// image.  `new_row_encoded` is already the durable canonical relational-cell encoding, so a
+/// serde/SQL round trip would be both lossy and a second semantic authority.
+#[allow(dead_code)]
+pub(crate) fn reencode_binary_update_by_key(record: &BinaryUpdateByKeyRecord) -> Option<Vec<u8>> {
+    if record.table.len() > u16::MAX as usize || record.pk_column.len() > u16::MAX as usize {
+        return None;
+    }
+    let encoded_bytes = record.new_row_encoded.as_bytes();
+    if encoded_bytes.len() > u32::MAX as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(
+        3 + 2 + record.table.len() + 2 + record.pk_column.len() + 4 + 8 + 4 + encoded_bytes.len(),
+    );
+    out.push(WAL_BINARY_TAG);
+    out.push(WAL_BINARY_VERSION);
+    out.push(OP_UPDATE_BY_KEY);
+    out.extend_from_slice(&(record.table.len() as u16).to_le_bytes());
+    out.extend_from_slice(record.table.as_bytes());
+    out.extend_from_slice(&(record.pk_column.len() as u16).to_le_bytes());
+    out.extend_from_slice(record.pk_column.as_bytes());
+    out.extend_from_slice(&record.pk_value.to_le_bytes());
+    out.extend_from_slice(&record.new_row_id.to_le_bytes());
     out.extend_from_slice(&(encoded_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(encoded_bytes);
     Some(out)

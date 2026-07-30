@@ -41,6 +41,54 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
   `1183ab7c8140e778640fa6df38b1973ee79ecb642cfec5b26fd6c3caee56c330`) and received post-card **FINAL ACCEPT**.
   Its B samples were **247.196M / 266.784M / 273.832M** (median **266.784M**, p50 **113us**); C was
   **257.313M**, p50 **129us**, after a **460.6s** 48M build.
+- The accepted WRITE-001 checkpoint extends that inert proof to indexed fixed rollover without WAL, a live
+  operation, or publication. It privately allocates the complete successor payload and all four distinct index
+  generations before the first build, GPU-probes every destination against its sealed raw/fingerprinted key,
+  reserves exact persistent bytes plus maximum sequential build/probe scratch, and hardens full-build default-stream
+  draining. The first
+  pre-card audit rejected launch/status-only non-vacuity; swapped-directory and reversed-compound sabotage now close
+  that finding. Focused engine/execution CUDA gates pass **7/4**, ordinary suites pass **797/63**, three serial plus
+  two simultaneous repaired HAZARD cohorts are clean, and the preserved repaired quick point-read median is
+  **272.273M** at p50 **114–115us**. Independent pre-card re-audit accepted exact staged runtime tree
+  `66222cc3bf4ef3493c2128250fa31b4a837a3a7a` and diff
+  `e3f89bc4e473c9a145be48a0cc4b690d27b87cd12337eb09548fb78c8bdbf7fd` with no finding.
+- Its single canonical card is `target/write001-index-rollover-full-66222cc3-20260728.log` (SHA-256
+  `4f2127ddf2e82bacf840c5c466d8377827f7639fb956bea3e631ace42a6ef664`, **48,723 bytes**) and completed exact
+  A/B/C evidence. Section A recorded **1,433.3 GB/s** out-of-L2 roofline and **1,674.2M elements/s** grouped.
+  Section B passed all three samples (**273.334M / 272.526M / 263.766M**, median **272.526M**, p50 **112–114us**);
+  Section C measured **246.077M** at p50 **130us** after a **463.1s** build. Documentation-only ledger updates
+  follow the sealed runtime tree; independent post-card audit returned **FINAL ACCEPT** with no finding.
+- WRITE-001's accepted 2026-07-29 inert effect/codec checkpoint gives the move-only typed batch one pre-effect
+  statement digest shared by semantic preparation and the test-only effect terminal. Stable-OID sequence
+  classification, autocommit/explicit currentness locks, private predecessor chains, and ordered typed
+  `RETURNING` evidence remain side-effect-free. The private v1 codec adds an exact 100-byte header, eight ordered
+  logical sections, a 16 MiB inclusive ceiling, complete captured catalog/index/FK/domain/sequence closure, and a
+  hostile decoder that recomputes digests and byte-reencodes the parsed model. It has no live encoder/decoder
+  caller, WAL opcode, row identity, device plan, apply, recovery, status, or publication authority.
+- The repaired physical adapter declines unsupported constraint/`RETURNING`/requested-sequence shapes from the
+  shared pre-semantic carrier only after catalog/generation/target/currentness checks, so fallback evaluates each
+  scalar default once. The compatibility path reuses the typed `RETURNING` binder; supplied sequence columns remain
+  eligible and malformed FK closure still fails closed in direct semantic preparation.
+- Exact checkpoint gates pass canonical codec **27/27**, typed-batch **67 passed / 11 GPU-only ignored**,
+  pre-WAL effects **42/42**, and the serial all-feature engine library sweep **893 passed / 661 GPU-marked
+  ignored**, plus workspace all-target/all-feature check, strict Clippy, scoped formatting,
+  whitespace, source-boundary, and sub-1,500-line production-leaf checks. Rehashed sabotage covers sequence
+  geometry/mode/ownership, global catalog identities, temporal bounds, and catalog closure; raw structural
+  sabotage covers the unrepresentable UTF-8 split-offset form. Independent architecture review returned
+  **ACCEPT** with no blocker. GPU/HAZARD and report-card evidence are inapplicable because no device, residency,
+  read-kernel, result, WAL, or apply behavior moved.
+- The accepted codec-5 S1--S6 source checkpoint adds exact one-to-four-chunk aggregate, fixed status, borrowed
+  outer-envelope, allocation-free S1/S4 traversal, strict S2/S3 decoding, and compact sequence/outcome closure.
+  Its incomplete move-only draft has no replay conversion and deliberately stops before S7/S8. Independent repair
+  audit accepted exact tree `a17b68e4a994a3339c5e4b56ce8bd620b7edabab` and diff
+  `a3291bcfdcaec6af0ee4585797e8a1ac5fb9d8a5ee22623a404e2c0bd1efa159` across 172 staged paths with no
+  finding.
+- The accepted shared-image checkpoint adds one exact `GPUDBTYPEDIMAGE2` final-table/retained-response codec over
+  the same v1 typed-vector grammar. It covers all nine types, NULL placeholders, zero-row forms, exact persistent
+  and scratch allocation terms, raw pre-allocation sabotage, and one move-only decoded owner without a live
+  consumer. Independent re-audit accepted exact tree `bd313d349e5258af33d4f9ac9f9662736b10dfa4` and diff
+  `676b6bcb04864f2a36f0ce0e5a056cb6876af1a924c0c2b5d5cb0c23733968aa` across 177 staged paths with no
+  finding; GPU/HAZARD/recovery/card gates are inapplicable to the inert host codec.
 - Regenerable benchmark/build state was reduced from about **143 GB to 4.9 GB**. The runner now recreates the
   source-relative temporary directory required by clean quick and exported-full builds.
 - **PRODUCT-001 completed and received final independent acceptance on 2026-07-26.** The superseded listener,
@@ -67,8 +115,16 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. Resume at the next independently reviewable checkpoint in WRITE-001's
-`PLAN.md` row; do not promote another live operation or authority before that PLAN-owned proof is accepted.
+**WRITE-001** is the sole active **NOW** task. Resume with the PLAN-owned semantics-v2 S4 + S7 checkpoint. Before
+implementation, freeze and independently audit the exact S7 wire required by
+[`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md), then make row identity
+table-local, bind every disposition to its final table/transition, and encode plus strictly decode the complete
+final overlay using the shared typed image. The current `executable_semantics_v2` name is provisional debt: its
+physical aggregate is semantics 1, its S4 validator uses one global row cursor, and canceled/suppressed rows retain
+both absent references. Make dispatch version-specific, preserve semantics-v1 bytes, and leave exactly one
+normative S4 authority. Keep the new form unreachable from live WAL/recovery/apply. S8, final replay ownership,
+durable sequence validation, GPU replay compilation, and the complete pre-WAL capacity lease remain later
+WRITE-001 checkpoints; do not add another live operation, WAL, publication, or eligibility authority.
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read
 floor, and INSERT-001's sealed qualification, differential, HAZARD, and canonical-card evidence in `STATUS.md`.

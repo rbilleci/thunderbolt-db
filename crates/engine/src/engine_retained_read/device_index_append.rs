@@ -1,6 +1,6 @@
 use super::{
     shard_fixed_width_key_offset, shard_key_column_blob_len, shard_key_column_blob_offset,
-    shard_key_column_validity_offset, Engine, SqlValue,
+    shard_key_column_validity_offset, Engine, RelationalTable, SqlValue,
 };
 
 impl Engine {
@@ -51,27 +51,28 @@ impl Engine {
             base_row_count,
             false,
         );
-        if required_named.is_some() {
-            let catalog = self.catalog_snapshot();
-            if catalog
-                .relational_catalog
-                .get(table_name)
-                .is_some_and(|table| {
-                    table.indexes.iter().any(|index| {
-                        crate::engine_residency::index_key_column_positions(table, index)
-                            .is_none_or(|positions| {
-                                new_rows.iter().any(|row| {
-                                    positions.iter().any(|&position| {
-                                        row.get(position)
-                                            .is_none_or(|value| matches!(value, SqlValue::Null))
-                                    })
-                                })
+        let catalog = self.catalog_snapshot();
+        let Some(exact_table) = catalog.relational_catalog.get(table_name).cloned() else {
+            self.read_state
+                .residency
+                .purge_shard_pk_index_for_table(table_name);
+            return required_named.is_none();
+        };
+        if required_named.is_some()
+            && exact_table.indexes.iter().any(|index| {
+                crate::engine_residency::index_key_column_positions(&exact_table, index).is_none_or(
+                    |positions| {
+                        new_rows.iter().any(|row| {
+                            positions.iter().any(|&position| {
+                                row.get(position)
+                                    .is_none_or(|value| matches!(value, SqlValue::Null))
                             })
-                    })
-                })
-            {
-                return false;
-            }
+                        })
+                    },
+                )
+            })
+        {
+            return false;
         }
         // Single-column keys: the cache is keyed by the catalog COLUMN INDEX, and the appended tail
         // is that column's values verbatim (`column_values[col_idx]`).
@@ -82,6 +83,7 @@ impl Engine {
                 base_row_count,
                 new_count,
                 tail,
+                &exact_table,
             );
         }
         let fingerprints_ok = self.extend_shard_fingerprint_device_indexes_on_append(
@@ -269,10 +271,16 @@ impl Engine {
             bases.push(basis);
         }
         if !requests.is_empty() {
-            let _index_mutation = self
+            let Some(_index_mutation) = self
                 .read_state
                 .residency
-                .begin_point_index_mutation(table_name);
+                .begin_point_index_mutation_for_table(&self.read_state, table)
+            else {
+                self.read_state
+                    .residency
+                    .purge_shard_pk_index_for_table(table_name);
+                return required_named.is_none();
+            };
             match source.submit_resident_typed_indexes_insert_status(
                 &requests,
                 base_row_count,
@@ -434,6 +442,7 @@ impl Engine {
         base_row_count: usize,
         new_count: usize,
         tail: &[i32],
+        table: &RelationalTable,
     ) {
         {
             // Snapshot the entry basis under the lock (index Arc is cheap-cloned for the launch).
@@ -474,7 +483,16 @@ impl Engine {
             };
             // The kernel mutates the device index buffer IN PLACE (atom.cas). A launch failure ->
             // drop the entry (rebuild next probe); never a wrong index.
-            let _index_mutation = self.read_state.residency.begin_point_index_mutation(&key.0);
+            let Some(_index_mutation) = self
+                .read_state
+                .residency
+                .begin_point_index_mutation_for_table(&self.read_state, table)
+            else {
+                self.read_state
+                    .residency
+                    .purge_shard_pk_index_for_table(&key.0);
+                return;
+            };
             match index.submit_i32_index_insert_status(table_mask, hash_shift, tail, base_row_u32) {
                 Ok(status) => {
                     if status.declined {

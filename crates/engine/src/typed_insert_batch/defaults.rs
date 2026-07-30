@@ -8,7 +8,6 @@
 use super::*;
 
 pub(super) enum DefaultResolutionError {
-    Sequence { column_id: u32 },
     Engine(EngineError),
 }
 
@@ -29,16 +28,17 @@ pub(super) fn resolve(
 
     let mut rebuilt = columns
         .iter()
-        .map(|column| {
-            column
-                .input_states
-                .iter()
-                .any(|state| {
-                    matches!(
-                        state,
-                        TypedInsertInputState::Omitted | TypedInsertInputState::ExplicitDefault
-                    )
-                })
+        .zip(&table.columns)
+        .map(|(column, live)| {
+            let needs_default = column.input_states.iter().any(|state| {
+                matches!(
+                    state,
+                    TypedInsertInputState::Omitted | TypedInsertInputState::ExplicitDefault
+                )
+            });
+            // Stateful sequence cells remain visibly unresolved until their dedicated owner
+            // returns exact per-row receipts.  They must not be rebuilt into scalar placeholders.
+            (needs_default && !matches!(live.default, Some(ColumnDefault::SequenceNextVal { .. })))
                 .then(|| RebuiltDefaultColumn::new(column.ty, rows))
                 .transpose()
         })
@@ -62,9 +62,7 @@ pub(super) fn resolve(
                 return Ok(None);
             }
             match live.default.as_ref() {
-                Some(ColumnDefault::SequenceNextVal { .. }) => {
-                    Err(DefaultResolutionError::Sequence { column_id: live.id })
-                }
+                Some(ColumnDefault::SequenceNextVal { .. }) => Ok(None),
                 Some(
                     default @ (ColumnDefault::Literal(_) | ColumnDefault::DeferredScalar { .. }),
                 ) => evaluate_scalar(default, live.ty, &live.name)
@@ -120,7 +118,7 @@ pub(super) fn resolve(
                             }
                         }
                         Some(ColumnDefault::SequenceNextVal { .. }) => {
-                            return Err(DefaultResolutionError::Sequence { column_id: live.id });
+                            unreachable!("sequence defaults have no scalar replacement vector")
                         }
                     }
                 }

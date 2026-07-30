@@ -84,7 +84,7 @@ impl RowLocalConstraintProof {
     /// The proof-only indexed resident pass may observe an unrelated committed DML generation
     /// after its batch-local CHECK pass.  The checked table and its ordered constraints must
     /// still match exactly; only the monotonic global catalog sequence may have advanced.
-    #[cfg(test)]
+    #[allow(dead_code)] // current-generation reservation witness, not a live eligibility lift
     pub(super) fn matches_current_target_binding(&self, catalog: &CatalogSnapshot) -> bool {
         catalog.commit_seq >= self.catalog_seq && self.matches_catalog_binding(catalog)
     }

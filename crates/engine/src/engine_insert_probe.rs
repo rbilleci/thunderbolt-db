@@ -678,7 +678,7 @@ impl Engine {
         let commit = self.commit_state();
         let durability_backend = if !commit.wal.is_durable() {
             "memory"
-        } else if commit.wal.durability_is_concurrent() {
+        } else if commit.wal.is_fua_durable() {
             "fua"
         } else {
             "serial"

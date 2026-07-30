@@ -9,6 +9,18 @@ use super::*;
 mod canonical_envelope;
 
 const TRANSACTION_STATUS_MAGIC: &[u8; 12] = b"GPUDBSTATUS1";
+const CANONICAL_TRANSACTION_CLAIM_STATUS_BYTES: usize = TRANSACTION_STATUS_MAGIC.len()
+    + std::mem::size_of::<[u8; 16]>()
+    + std::mem::size_of::<[u8; 16]>()
+    + std::mem::size_of::<TxnId>()
+    + std::mem::size_of::<gpu_db_wal::CanonicalDigest>()
+    + std::mem::size_of::<u8>()
+    + 7
+    + std::mem::size_of::<u64>();
+
+pub(crate) const fn canonical_transaction_claim_status_len() -> usize {
+    CANONICAL_TRANSACTION_CLAIM_STATUS_BYTES
+}
 const ENGINE_OPERATION_CODEC_LEGACY_SQL: u8 = 1;
 /// Historical canonical typed commands contain bare canonical JSON and replay with pre-PRODUCT-001
 /// catalog semantics.
@@ -518,7 +530,7 @@ impl Engine {
         txn_id: TxnId,
         request_digest: gpu_db_wal::CanonicalDigest,
     ) -> Vec<u8> {
-        let mut body = Vec::with_capacity(96);
+        let mut body = Vec::with_capacity(canonical_transaction_claim_status_len());
         body.extend_from_slice(TRANSACTION_STATUS_MAGIC);
         body.extend_from_slice(&identity.database_id);
         body.extend_from_slice(&identity.timeline_id);
@@ -527,6 +539,7 @@ impl Engine {
         body.push(1); // durable claim pending publication; the terminal marker carries outcome
         body.extend_from_slice(&[0; 7]);
         body.extend_from_slice(&u64::MAX.to_le_bytes()); // retained/unexpired in the current policy
+        debug_assert_eq!(body.len(), canonical_transaction_claim_status_len());
         body
     }
 
@@ -536,7 +549,9 @@ impl Engine {
         txn_id: TxnId,
         request_digest: gpu_db_wal::CanonicalDigest,
     ) -> Result<(), EngineError> {
-        if body.len() != 100 || &body[..12] != TRANSACTION_STATUS_MAGIC {
+        if body.len() != canonical_transaction_claim_status_len()
+            || &body[..12] != TRANSACTION_STATUS_MAGIC
+        {
             return Err(EngineError::Durability(
                 "canonical WAL transaction-status fragment is malformed".to_string(),
             ));
@@ -1301,6 +1316,7 @@ impl Engine {
             match commit.transaction_status.entry(txn_id) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(status);
+                    commit.invalidate_transaction_status_reservations();
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {
                     return Err(EngineError::Durability(format!(
@@ -1351,6 +1367,7 @@ impl Engine {
                 Some(_) => {}
                 None => {
                     commit.transaction_status.insert(status.txn_id, recovered);
+                    commit.invalidate_transaction_status_reservations();
                 }
             }
         }
@@ -1394,6 +1411,17 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine_transaction_reset::table_schema_digest;
+
+    #[test]
+    fn transaction_claim_status_length_helper_matches_real_encoder() {
+        let body = Engine::encode_transaction_claim_status(
+            Engine::fresh_canonical_identity(),
+            73,
+            [0x5a; 32],
+        );
+        assert_eq!(canonical_transaction_claim_status_len(), 100);
+        assert_eq!(body.len(), canonical_transaction_claim_status_len());
+    }
 
     #[path = "product_001_tests.rs"]
     mod product_001_tests;

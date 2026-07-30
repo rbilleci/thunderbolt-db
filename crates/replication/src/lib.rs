@@ -8,7 +8,7 @@ mod progress;
 mod rpc;
 mod transport;
 
-pub use local::LocalReplicator;
+pub use local::{LocalReplicator, LocalReplicatorProposalReservation};
 pub use operational::{
     OperationalClusterSmokeReport, OperationalDeploymentPreflightReport,
     OperationalElectionSmokeReport, OperationalPackageSmokeReport, OperationalTransportSmokeReport,

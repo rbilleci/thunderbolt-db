@@ -29,17 +29,26 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
-use gpu_db_types::EngineError;
+#[cfg(test)]
+use gpu_db_types::DurabilityStage;
+use gpu_db_types::{DurabilityPoison, EngineError};
 use gpu_db_write_conveyor::{
     fua_frame_padded_bytes, recover_frame_log_by_scan, FuaControllerDecision,
     FuaControllerEligibility, FuaControllerPhase, FuaFrameLog, FuaFrameLogAppender,
-    FuaFrameLogConfig, FuaFrameLogFencePool, FuaFrameLogTelemetry, FuaPhysicalController,
-    FUA_CONTROLLER_QD16_FRAGMENTS,
+    FuaFrameLogConfig, FuaFrameLogFixedFencePool, FuaFrameLogTelemetry, FuaPhysicalController,
+    FUA_CONTROLLER_QD16_FRAGMENTS, FUA_FIXED_FENCE_POOL_MAX_LANES,
 };
 
+use crate::buffer::group::PreparedWalGroup;
 use crate::{decode_wal_record_run, FuaDurabilityTelemetry, WalGroupCommitStats, WalRecord};
+
+mod prestage;
+use prestage::{FuaSuccessorPreflight, FuaSuccessorReadiness, PreparedSuccessor, PrestageState};
+mod exact;
+use exact::{FuaExactHandoff, FuaExactLedger};
+pub(crate) use exact::{FuaExactReservation, FuaExactReservationAttempt};
 
 /// Busy-spins before falling back to `yield_now` in the durable-cut wait. Pure spin at low
 /// contention keeps the p50 ack near one fence latency; the yield fallback avoids burning a core
@@ -82,7 +91,7 @@ fn padded_chunks_bytes(chunks: &[&[u8]]) -> Option<usize> {
 struct ActiveSegment {
     log: Arc<FuaFrameLog>,
     appender: Option<FuaFrameLogAppender>,
-    pool: Option<FuaFrameLogFencePool>,
+    pool: Option<FuaFrameLogFixedFencePool>,
     segment_id: u64,
     /// Segment-chain aggregation. The existing active lock serializes a roll with snapshots, so
     /// retired segments are counted exactly once without retaining their staging buffers or adding
@@ -141,24 +150,6 @@ impl Drop for ControllerSampleSettlement {
     }
 }
 
-/// The pre-staged NEXT segment (Chronicle's pre-toucher). A background thread prewrites the
-/// next segment file at a temp path while the active segment fills, so a roll only drains,
-/// renames and swaps. Prewriting inline under the active lock (~100ms for a 64MiB segment)
-/// was a visibility stall: a rolling lane blocks the CROSS-LANE contiguous cut, so every
-/// lane's acks stall behind one lane's extent prewrite.
-enum PrestageSlot {
-    /// Nothing staged (transient: between a take and the follow-up kick, and before the
-    /// constructor's first kick).
-    Empty,
-    /// The background thread is prewriting segment `id` at the temp path.
-    Pending(u64),
-    /// Segment `id` is prewritten at the temp path, ready to rename + swap in; the bool
-    /// records whether it was RECYCLED from a retired file (telemetry).
-    Ready(u64, Arc<FuaFrameLog>, bool),
-    /// Pre-create failed; the next roll surfaces this and wedges the backend.
-    Failed(String),
-}
-
 /// The FUA fence-pool durability backend behind an optional field of [`WalBuffer`].
 pub(crate) struct FuaWalBackend {
     /// Base path; per-segment files are `<base>.fua.<segment_id>`.
@@ -185,11 +176,23 @@ pub(crate) struct FuaWalBackend {
     next_segment_id: AtomicU64,
     /// Fail-closed wedge reason; once set, every flush errors until restart recovery.
     poison: Mutex<Option<String>>,
+    /// First fixed exact-group failure.  Exact post-handoff code consults this before every
+    /// wake/poll and never constructs a compatibility diagnostic after a durable boundary.
+    fixed_poison: DurabilityPoison,
     /// Lock-free mirror of `poison.is_some()` — pumps poll poison state at iteration rate.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Sole logical exact-group permit/ledger.  Legacy compatibility FUA owns no right to
+    /// consume it, and an exact group cannot be replaced by an unreserved fallback path.
+    exact_ledger: Mutex<FuaExactLedger>,
+    /// Test-only deterministic post-handoff exact failure seam. Production has no alternate
+    /// execution route: this injects only an already-fixed terminal fault into the same drain.
+    #[cfg(test)]
+    exact_commit_test_fault: Mutex<Option<(DurabilityStage, Option<i32>)>>,
     stats: Mutex<WalGroupCommitStats>,
-    /// See [`PrestageSlot`]: the next segment, prewritten off the roll path.
-    prestaged: Arc<(Mutex<PrestageSlot>, Condvar)>,
+    /// One final-named, fully owned successor prepared off the roll path.  Its appender and
+    /// fixed fence pool exist before it becomes Ready, so a take is a move rather than an IO or
+    /// thread-creation operation.
+    prestaged: Arc<PrestageState>,
     /// RECYCLE pool (E2.5c-2): retired segment files offered back by checkpoint truncation.
     /// The pre-stager consumes one instead of prewriting a fresh file — the retired file's
     /// extents are already WRITTEN, so the ~100ms prewrite (whose fsync is a device-wide NVMe
@@ -236,7 +239,7 @@ impl FuaWalBackend {
         lanes: usize,
         segment_bytes: usize,
     ) -> Result<Self, EngineError> {
-        let lanes = lanes.max(1);
+        validate_fixed_fence_lanes(lanes)?;
         if segment_bytes == 0 {
             return Err(EngineError::Durability(
                 "FUA WAL segment_bytes must be non-zero".to_string(),
@@ -262,29 +265,25 @@ impl FuaWalBackend {
         }
         remove_stale_segments(&base_path);
         let segment_id = 1;
-        let log = open_segment(&base_path, segment_id, segment_bytes)?;
-        let pool = log.spawn_fence_pool(lanes);
-        let appender = log.appender();
+        let active = open_active_segment(&base_path, segment_id, segment_bytes, lanes)?;
         let backend = Self {
             base_path,
             lanes,
             segment_bytes,
-            active: Mutex::new(ActiveSegment {
-                log,
-                appender: Some(appender),
-                pool: Some(pool),
-                segment_id,
-                retired_telemetry: FuaFrameLogTelemetry::default(),
-            }),
+            active: Mutex::new(active),
             published: AtomicUsize::new(0),
             next_ticket: AtomicU64::new(0),
             publish_cursor: AtomicU64::new(0),
             rolled_baseline: AtomicU64::new(0),
             next_segment_id: AtomicU64::new(segment_id + 1),
             poison: Mutex::new(None),
+            fixed_poison: DurabilityPoison::new(),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            exact_ledger: Mutex::new(FuaExactLedger::default()),
+            #[cfg(test)]
+            exact_commit_test_fault: Mutex::new(None),
             stats: Mutex::new(WalGroupCommitStats::default()),
-            prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
+            prestaged: Arc::new(PrestageState::new()),
             recycle_pool: Arc::new(Mutex::new(Vec::new())),
             stat_recycled: AtomicU64::new(0),
             stat_logical_groups: AtomicU64::new(0),
@@ -296,7 +295,7 @@ impl FuaWalBackend {
             stat_waiter_cut_to_observe_count: AtomicU64::new(0),
             controller: Arc::new(Mutex::new(FuaPhysicalController::default())),
         };
-        backend.kick_prestage();
+        backend.kick_prestage(segment_id);
         Ok(backend)
     }
 
@@ -322,7 +321,7 @@ impl FuaWalBackend {
         segment_bytes: usize,
         recovered_records: usize,
     ) -> Result<Self, EngineError> {
-        let lanes = lanes.max(1);
+        validate_fixed_fence_lanes(lanes)?;
         if segment_bytes == 0 {
             return Err(EngineError::Durability(
                 "FUA WAL segment_bytes must be non-zero".to_string(),
@@ -338,30 +337,26 @@ impl FuaWalBackend {
         }
         // Open a FRESH segment ABOVE every existing id (never recycle a recovered file's epoch).
         let segment_id = highest_existing_segment_id(&base_path) + 1;
-        let log = open_segment(&base_path, segment_id, segment_bytes)?;
-        let pool = log.spawn_fence_pool(lanes);
-        let appender = log.appender();
+        let active = open_active_segment(&base_path, segment_id, segment_bytes, lanes)?;
         let recovered = recovered_records as u64;
         let backend = Self {
             base_path,
             lanes,
             segment_bytes,
-            active: Mutex::new(ActiveSegment {
-                log,
-                appender: Some(appender),
-                pool: Some(pool),
-                segment_id,
-                retired_telemetry: FuaFrameLogTelemetry::default(),
-            }),
+            active: Mutex::new(active),
             published: AtomicUsize::new(recovered_records),
             next_ticket: AtomicU64::new(0),
             publish_cursor: AtomicU64::new(0),
             rolled_baseline: AtomicU64::new(recovered),
             next_segment_id: AtomicU64::new(segment_id + 1),
             poison: Mutex::new(None),
+            fixed_poison: DurabilityPoison::new(),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            exact_ledger: Mutex::new(FuaExactLedger::default()),
+            #[cfg(test)]
+            exact_commit_test_fault: Mutex::new(None),
             stats: Mutex::new(WalGroupCommitStats::default()),
-            prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
+            prestaged: Arc::new(PrestageState::new()),
             recycle_pool: Arc::new(Mutex::new(Vec::new())),
             stat_recycled: AtomicU64::new(0),
             stat_logical_groups: AtomicU64::new(0),
@@ -373,7 +368,7 @@ impl FuaWalBackend {
             stat_waiter_cut_to_observe_count: AtomicU64::new(0),
             controller: Arc::new(Mutex::new(FuaPhysicalController::default())),
         };
-        backend.kick_prestage();
+        backend.kick_prestage(segment_id);
         Ok(backend)
     }
 
@@ -381,12 +376,41 @@ impl FuaWalBackend {
         &self.base_path
     }
 
-    /// Free fence lanes in the active segment's pool (the engine-seam PACING signal — a committer
-    /// may begin its own group flush only while a lane is free; see the engine's concurrent
-    /// durability wait).
+    /// Free fence lanes for the retained lane-set compatibility primitive. Typed exact admission
+    /// computes its sealed geometry directly under the active-segment owner instead.
     pub(crate) fn free_fence_slots(&self) -> usize {
+        if self.exact_fault().is_some() {
+            return 0;
+        }
         let active = self.lock_active();
         active.log.free_fence_slots(self.lanes)
+    }
+
+    /// Read-only state of the one final-named successor relative to the current active segment.
+    /// This never kicks, waits, or takes the owner; future typed FUA admission uses it before a
+    /// WAL claim to prove a roll cannot require post-claim preparation work.
+    #[allow(dead_code)] // Reserved pre-claim proof API; typed FUA admission is the next slice.
+    pub(crate) fn prestaged_readiness(&self) -> FuaSuccessorReadiness {
+        let active = self.lock_active();
+        self.prestaged.readiness(active.segment_id)
+    }
+
+    /// Read-only proof that the prebuilt successor is current and can hold a complete physical
+    /// group. `None` is a pre-claim refusal; it does not make progress by starting another
+    /// pre-stager or by waiting for this one.
+    #[allow(dead_code)] // Reserved pre-claim proof API; typed FUA admission is the next slice.
+    pub(crate) fn preflight_prestaged_successor(
+        &self,
+        required_padded_bytes: usize,
+        required_fence_slots: usize,
+    ) -> Option<FuaSuccessorPreflight> {
+        let active = self.lock_active();
+        self.prestaged.preflight(
+            active.segment_id,
+            required_padded_bytes,
+            required_fence_slots,
+            self.lanes,
+        )
     }
 
     /// Records already handed to frames (the `begin_group_flush` cursor; buffer outer lock held).
@@ -539,6 +563,9 @@ impl FuaWalBackend {
     /// newer) is never touched, and retired segments are by definition rolled-away (drained,
     /// byte-frozen).
     pub(crate) fn retire_segments_below(&self, cut_end: u64) -> Result<usize, EngineError> {
+        if let Some(fault) = self.exact_fault() {
+            return Err(EngineError::DurabilityFault(fault));
+        }
         let active_id = self.lock_active().segment_id;
         let Some(stem) = self.base_path.file_name().and_then(|n| n.to_str()) else {
             return Ok(0);
@@ -627,7 +654,36 @@ impl FuaWalBackend {
         self.poisoned.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Inject a fixed post-handoff fault into the exact owner. This is test-only sabotage of the
+    /// terminal drain; it cannot create a production fallback or a second publish path.
+    #[cfg(test)]
+    pub(crate) fn fail_next_exact_commit_for_test(
+        &self,
+        stage: DurabilityStage,
+        raw_os_error: Option<i32>,
+    ) {
+        let mut pending = self
+            .exact_commit_test_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            pending.replace((stage, raw_os_error)).is_none(),
+            "only one FUA exact test fault may be pending"
+        );
+    }
+
+    #[cfg(test)]
+    fn take_exact_commit_test_fault(&self) -> Option<(DurabilityStage, Option<i32>)> {
+        self.exact_commit_test_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
     pub(crate) fn poison_error(&self, reason: &str) -> EngineError {
+        if let Some(fault) = self.exact_fault() {
+            return EngineError::DurabilityFault(fault);
+        }
         EngineError::Durability(format!(
             "FUA WAL backend {} is wedged by an earlier failure ({reason}); restart to recover \
              from the durable cut",
@@ -650,6 +706,9 @@ impl FuaWalBackend {
         seq_count: u32,
         controller_enabled: bool,
     ) -> Result<PublishedGroup, EngineError> {
+        if let Some(fault) = self.exact_fault() {
+            return Err(EngineError::DurabilityFault(fault));
+        }
         // Wait our turn: publish frames in ticket (== `first_seq`) order. This is the ONLY ordering
         // point and it only gates a staging memcpy; the fence pool then pipelines the durability of
         // every published frame concurrently. A prior ticket that wedged the backend without
@@ -657,6 +716,9 @@ impl FuaWalBackend {
         let publish_turn_started = std::time::Instant::now();
         let mut spins = 0u32;
         while self.publish_cursor.load(Ordering::Acquire) != ticket {
+            if let Some(fault) = self.exact_fault() {
+                return Err(EngineError::DurabilityFault(fault));
+            }
             if let Some(reason) = self.poison_reason() {
                 return Err(self.poison_error(&reason));
             }
@@ -734,6 +796,7 @@ impl FuaWalBackend {
                 && matches!(batch_fit, Some(Err(ref err)) if err.kind() == std::io::ErrorKind::StorageFull)
             {
                 self.roll(&mut active)?;
+                self.kick_prestage(active.segment_id);
                 continue;
             }
             // The final choice, atomic frame-group visibility publication, and token issue are
@@ -797,6 +860,7 @@ impl FuaWalBackend {
                     // preflighted above). Nothing was visible, so a roll preserves all-or-nothing
                     // group ownership and lets the same ticket retry on one fresh segment.
                     self.roll(&mut active)?;
+                    self.kick_prestage(active.segment_id);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     // Slot ring momentarily full despite pacing (shouldn't happen with lanes <<
@@ -820,145 +884,26 @@ impl FuaWalBackend {
         }
     }
 
-    /// Kick the background pre-create of the NEXT segment: claim its id now (ids must ascend in
-    /// roll order for recovery) and prewrite the file at the TEMP path off-thread. The temp name
-    /// keeps half-prewritten files invisible to recovery/`highest_existing_segment_id` (both parse
-    /// only `<base>.fua.<id>` names); the roll renames it into place.
-    fn kick_prestage(&self) {
+    /// Kick the one background preparation of the NEXT final-named successor.  Its identifier is
+    /// assigned before work begins so recovery ordering is monotonic; the ready owner is already
+    /// scan-visible, directory-synchronised, and equipped with an appender plus fixed fence pool.
+    fn kick_prestage(&self, predecessor_id: u64) {
         let id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
-        {
-            let (lock, _) = &*self.prestaged;
-            *lock.lock().unwrap_or_else(|p| p.into_inner()) = PrestageSlot::Pending(id);
-        }
-        let slot = Arc::clone(&self.prestaged);
-        let temp = prestage_file_path(&self.base_path);
-        let segment_bytes = self.segment_bytes;
-        let recycle_pool = Arc::clone(&self.recycle_pool);
-        std::thread::spawn(move || {
-            // AUDIT (minor): the slot MUST leave Pending even if this body
-            // panics — Drop and take_prestaged wait on the Ready/Failed
-            // transition with no timeout; a panicking pre-stager wedges
-            // FAIL-CLOSED (Failed) instead of hanging shutdown/roll.
-            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> std::io::Result<(Arc<FuaFrameLog>, bool)> {
-                    // A stale temp from a crashed prior life (or an unrolled leftover) is ours
-                    // to clobber.
-                    match std::fs::remove_file(&temp) {
-                        Ok(()) => sync_parent_dir(&temp)?,
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => return Err(err),
-                    }
-                    // RECYCLE arm (E2.5c-2): reuse a retired segment file when one is offered —
-                    // its extents are already written, so the whole prewrite (fallocate +
-                    // zero-fill + the fsync that lands a device-wide NVMe FLUSH during live
-                    // fencing) is skipped. The fresh monotonic id epoch-stamps the header so the
-                    // previous life's frames are scan-rejected. Any recycle failure (geometry
-                    // drift, rename error) falls back to the fresh-create arm — recycle is an
-                    // optimization, never a correctness gate.
-                    let retired = recycle_pool.lock().unwrap_or_else(|p| p.into_inner()).pop();
-                    let recycled = if let Some(retired) = retired {
-                        std::fs::rename(&retired, &temp)?;
-                        sync_parent_dir(&temp)?;
-                        let config = FuaFrameLogConfig {
-                            path: temp.clone(),
-                            segment_id: id,
-                            capacity_bytes: segment_bytes,
-                        };
-                        // Safety: the temp path is owned exclusively by this backend (one
-                        // prestage in flight; renamed to its final segment name before any
-                        // other opener).
-                        match unsafe { FuaFrameLog::recycle(config) } {
-                            Ok(log) => Some(log),
-                            Err(_) => {
-                                std::fs::remove_file(&temp)?;
-                                sync_parent_dir(&temp)?;
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    match recycled {
-                        Some(log) => Ok((log, true)),
-                        None => {
-                            // Fresh create (a failed recycle above may have left a stale temp —
-                            // clobber).
-                            match std::fs::remove_file(&temp) {
-                                Ok(()) => sync_parent_dir(&temp)?,
-                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(err) => return Err(err),
-                            }
-                            let config = FuaFrameLogConfig {
-                                path: temp.clone(),
-                                segment_id: id,
-                                capacity_bytes: segment_bytes,
-                            };
-                            // Safety: as above — exclusive temp-path ownership.
-                            unsafe { FuaFrameLog::create(config) }.map(|log| (log, false))
-                        }
-                    }
-                },
-            ));
-            let (lock, cvar) = &*slot;
-            let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-            *guard = match body {
-                Ok(Ok((log, was_recycled))) => PrestageSlot::Ready(id, log, was_recycled),
-                Ok(Err(err)) => PrestageSlot::Failed(format!("{err}")),
-                Err(_) => PrestageSlot::Failed("pre-stager thread panicked".to_string()),
-            };
-            cvar.notify_all();
-        });
+        self.prestaged.kick(
+            &self.base_path,
+            id,
+            predecessor_id,
+            self.segment_bytes,
+            self.lanes,
+            Arc::clone(&self.recycle_pool),
+        );
     }
 
-    /// Take the pre-staged next segment, waiting if the prewrite is still in flight (a roll
-    /// arriving before ~100ms of prewrite finishes — only under tiny test segments), and rename
-    /// it to its final `<base>.fua.<id>` name. The rename (+ parent dir fsync) must be durable
-    /// BEFORE any frame lands in the segment: acked commits would otherwise sit in a file
-    /// recovery ignores.
-    fn take_prestaged(&self) -> Result<(u64, Arc<FuaFrameLog>), EngineError> {
-        let (lock, cvar) = &*self.prestaged;
-        let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let (id, log, was_recycled) = loop {
-            match std::mem::replace(&mut *guard, PrestageSlot::Empty) {
-                PrestageSlot::Ready(id, log, was_recycled) => break (id, log, was_recycled),
-                PrestageSlot::Failed(reason) => {
-                    return Err(EngineError::Durability(format!(
-                        "FUA segment pre-create failed: {reason}"
-                    )));
-                }
-                PrestageSlot::Pending(id) => {
-                    *guard = PrestageSlot::Pending(id);
-                    guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
-                }
-                PrestageSlot::Empty => {
-                    // No prestage in flight (constructor always kicks one; defensive): create
-                    // inline exactly like the pre-prestager roll did.
-                    drop(guard);
-                    let id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
-                    let log = open_segment(&self.base_path, id, self.segment_bytes)?;
-                    return Ok((id, log));
-                }
-            }
-        };
-        drop(guard);
-        let temp = prestage_file_path(&self.base_path);
-        let final_path = segment_file_path(&self.base_path, id);
-        std::fs::rename(&temp, &final_path).map_err(|err| {
-            EngineError::Durability(format!(
-                "failed to rename pre-staged FUA segment {} -> {}: {err}",
-                temp.display(),
-                final_path.display()
-            ))
-        })?;
-        sync_parent_dir(&final_path).map_err(|err| {
-            EngineError::Durability(format!(
-                "failed to fsync FUA WAL directory after segment rename: {err}"
-            ))
-        })?;
-        if was_recycled {
-            self.stat_recycled.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok((id, log))
+    /// Take the already-final-named successor for this active segment.  The child implementation
+    /// is intentionally a move-only wait/take boundary; all filesystem, allocation, appender,
+    /// and fence-pool work belongs to the background pre-stager before a typed claim.
+    fn take_prestaged(&self, active_segment_id: u64) -> Result<PreparedSuccessor, EngineError> {
+        self.prestaged.take_current(active_segment_id)
     }
 
     /// Roll the full active segment to a fresh one. The current segment is DRAINED (appender
@@ -970,7 +915,7 @@ impl FuaWalBackend {
             appender.finish();
         }
         if let Some(pool) = active.pool.take() {
-            pool.join().map_err(|err| {
+            pool.join_fixed().map_err(|err| {
                 let reason = format!("FUA segment drain (fence-pool join) failed: {err}");
                 self.set_poison(&reason);
                 self.poison_error(&reason)
@@ -990,14 +935,11 @@ impl FuaWalBackend {
                 Err(observed) => current = observed,
             }
         }
-        let (new_id, new_log) = self
-            .take_prestaged()
+        let successor = self
+            .take_prestaged(active.segment_id)
             .inspect_err(|err| self.set_poison(&format!("FUA segment roll failed: {err}")))?;
-        // Start prewriting the FOLLOWING segment while this one fills (the whole point: the
-        // ~100ms extent prewrite runs concurrent with normal appends, never under this lock).
-        self.kick_prestage();
-        let new_pool = new_log.spawn_fence_pool(self.lanes);
-        let new_appender = new_log.appender();
+        let was_recycled = successor.was_recycled();
+        let (new_id, new_log, new_appender, new_pool) = successor.into_parts();
         active
             .retired_telemetry
             .saturating_add_assign(active.log.telemetry());
@@ -1005,6 +947,9 @@ impl FuaWalBackend {
         active.appender = Some(new_appender);
         active.pool = Some(new_pool);
         active.segment_id = new_id;
+        if was_recycled {
+            self.stat_recycled.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -1018,6 +963,9 @@ impl FuaWalBackend {
         seq_count: u32,
         target: usize,
     ) -> Result<usize, EngineError> {
+        if let Some(fault) = self.exact_fault() {
+            return Err(EngineError::DurabilityFault(fault));
+        }
         if let Some(reason) = self.poison_reason() {
             return Err(self.poison_error(&reason));
         }
@@ -1078,6 +1026,9 @@ impl FuaWalBackend {
         first_seq: u64,
         seq_count: u32,
     ) -> Result<(), EngineError> {
+        if let Some(fault) = self.exact_fault() {
+            return Err(EngineError::DurabilityFault(fault));
+        }
         if let Some(reason) = self.poison_reason() {
             return Err(self.poison_error(&reason));
         }
@@ -1095,6 +1046,9 @@ impl FuaWalBackend {
     pub(crate) fn wait_durable(&self, target: usize) -> Result<(), EngineError> {
         let mut spins = 0u32;
         loop {
+            if let Some(fault) = self.exact_fault() {
+                return Err(EngineError::DurabilityFault(fault));
+            }
             if let Some(reason) = self.poison_reason() {
                 return Err(self.poison_error(&reason));
             }
@@ -1146,17 +1100,11 @@ impl Drop for FuaWalBackend {
             appender.finish();
         }
         if let Some(pool) = active.pool.take() {
-            let _ = pool.join();
+            let _ = pool.join_fixed();
         }
-        // Drain the pre-stager: a Pending thread still owns the temp path, and letting it outlive
-        // this backend could race a same-path successor's kick (its remove_file) in a rapid
-        // drop+reopen. The thread's slot fill is its last temp-path-relevant action, so waiting
-        // for Pending to clear is a full ownership handoff.
-        let (lock, cvar) = &*self.prestaged;
-        let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-        while matches!(*guard, PrestageSlot::Pending(_)) {
-            guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
-        }
+        // A ready successor owns parked fixed fence lanes.  Drain it only after a pending
+        // background preparation has completed, so no final-path action can race a rapid reopen.
+        self.prestaged.drain_ready_on_drop();
     }
 }
 
@@ -1166,15 +1114,30 @@ impl Drop for FuaWalBackend {
 /// `published` but never framed, which would be a permanent gap in the totally-ordered log.
 pub(crate) struct FuaFlushJob {
     backend: Arc<FuaWalBackend>,
-    ticket: u64,
-    payload: Vec<u8>,
-    first_seq: u64,
-    seq_count: u32,
-    target: usize,
+    kind: FuaFlushJobKind,
+}
+
+/// The legacy byte-materializing compatibility route is deliberately distinct from the typed
+/// exact owner.  Only the latter may consume a pre-WAL scatter reservation.
+// Exact handoff remains inline because boxing it after logical claim would introduce a forbidden
+// post-WAL allocation and a new failure branch.
+#[allow(clippy::large_enum_variant)]
+enum FuaFlushJobKind {
+    LegacyCompatibility {
+        ticket: u64,
+        payload: Vec<u8>,
+        first_seq: u64,
+        seq_count: u32,
+        target: usize,
+    },
+    Exact {
+        handoff: FuaExactHandoff,
+        group: PreparedWalGroup,
+    },
 }
 
 impl FuaFlushJob {
-    pub(crate) fn new(
+    pub(crate) fn new_legacy_compatibility(
         backend: Arc<FuaWalBackend>,
         ticket: u64,
         payload: Vec<u8>,
@@ -1184,27 +1147,53 @@ impl FuaFlushJob {
     ) -> Self {
         Self {
             backend,
-            ticket,
-            payload,
-            first_seq,
-            seq_count,
-            target,
+            kind: FuaFlushJobKind::LegacyCompatibility {
+                ticket,
+                payload,
+                first_seq,
+                seq_count,
+                target,
+            },
+        }
+    }
+
+    pub(crate) fn new_exact(
+        backend: Arc<FuaWalBackend>,
+        handoff: FuaExactHandoff,
+        group: PreparedWalGroup,
+    ) -> Self {
+        Self {
+            backend,
+            kind: FuaFlushJobKind::Exact { handoff, group },
         }
     }
 
     pub(crate) fn commit(self) -> Result<usize, EngineError> {
-        self.backend.commit_group(
-            self.ticket,
-            &self.payload,
-            self.first_seq,
-            self.seq_count,
-            self.target,
-        )
+        match self.kind {
+            FuaFlushJobKind::LegacyCompatibility {
+                ticket,
+                payload,
+                first_seq,
+                seq_count,
+                target,
+            } => self
+                .backend
+                .commit_group(ticket, &payload, first_seq, seq_count, target),
+            FuaFlushJobKind::Exact { handoff, group } => {
+                self.backend.commit_exact_group(handoff, group)
+            }
+        }
     }
 
     pub(crate) fn abandon(self) {
-        self.backend
-            .set_poison("FUA group flush abandoned between begin and commit");
+        match self.kind {
+            FuaFlushJobKind::LegacyCompatibility { .. } => self
+                .backend
+                .set_poison("FUA group flush abandoned between begin and commit"),
+            FuaFlushJobKind::Exact { handoff, group } => {
+                self.backend.abandon_exact_group(handoff, group)
+            }
+        }
     }
 }
 
@@ -1217,23 +1206,44 @@ fn segment_file_path(base: &Path, segment_id: u64) -> PathBuf {
     base.with_file_name(format!("{name}.fua.{segment_id}"))
 }
 
-/// `<base>.fua.prestage` — the temp path pre-created segments are prewritten at. The non-numeric
-/// suffix keeps the file invisible to [`parse_segment_id`] (recovery, reopen id scan, stale-file
-/// clobber) until the roll renames it to its final `<base>.fua.<id>` name.
-fn prestage_file_path(base: &Path) -> PathBuf {
-    let name = base
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("wal.segment");
-    base.with_file_name(format!("{name}.fua.prestage"))
-}
-
-/// fsync the parent directory so a just-renamed segment file's directory entry is durable.
+/// Fsync the parent directory after installing or retiring a final-named segment file.
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
         return Ok(());
     };
     std::fs::File::open(parent)?.sync_all()
+}
+
+fn validate_fixed_fence_lanes(lanes: usize) -> Result<(), EngineError> {
+    if (1..=FUA_FIXED_FENCE_POOL_MAX_LANES).contains(&lanes) {
+        Ok(())
+    } else {
+        Err(EngineError::Durability(format!(
+            "FUA WAL fixed fence pool requires 1..={FUA_FIXED_FENCE_POOL_MAX_LANES} lanes, got {lanes}"
+        )))
+    }
+}
+
+fn open_active_segment(
+    base: &Path,
+    segment_id: u64,
+    segment_bytes: usize,
+    lanes: usize,
+) -> Result<ActiveSegment, EngineError> {
+    let log = open_segment(base, segment_id, segment_bytes)?;
+    let appender = log.appender();
+    let pool = log.spawn_fixed_fence_pool(lanes).map_err(|fault| {
+        EngineError::Durability(format!(
+            "failed to spawn fixed FUA fence pool for segment {segment_id}: {fault}"
+        ))
+    })?;
+    Ok(ActiveSegment {
+        log,
+        appender: Some(appender),
+        pool: Some(pool),
+        segment_id,
+        retired_telemetry: FuaFrameLogTelemetry::default(),
+    })
 }
 
 /// Parse the `segment_id` out of a `<stem>.fua.<id>` file name.
@@ -1406,7 +1416,8 @@ pub(crate) fn recover_fua_wal_runs(path: &Path) -> Result<Vec<RecoveredFuaWalRun
                 let Some((expected, first_seq, payload)) = pending.as_mut() else {
                     return Err(EngineError::Durability(format!(
                         "FUA WAL segment {} frame {} has a fragmented continuation without a prefix",
-                        path.display(), frame.frame_id
+                        path.display(),
+                        frame.frame_id
                     )));
                 };
                 if metadata.total_payload_bytes != expected.total_payload_bytes
@@ -1427,7 +1438,8 @@ pub(crate) fn recover_fua_wal_runs(path: &Path) -> Result<Vec<RecoveredFuaWalRun
                     if payload.len() as u64 != expected.total_payload_bytes {
                         return Err(EngineError::Durability(format!(
                             "FUA WAL segment {} fragmented group ending at frame {} fails length validation",
-                            path.display(), frame.frame_id
+                            path.display(),
+                            frame.frame_id
                         )));
                     }
                     runs.push(RecoveredFuaWalRun {
@@ -1462,7 +1474,10 @@ pub fn recover_fua_wal_records(base_path: impl AsRef<Path>) -> Result<Vec<WalRec
             if decoded.len() as u64 != u64::from(run.seq_count) {
                 return Err(EngineError::Durability(format!(
                     "FUA WAL segment {} terminal frame {} declares {} records but its run decodes to {}",
-                    path.display(), run.terminal_frame_id, run.seq_count, decoded.len()
+                    path.display(),
+                    run.terminal_frame_id,
+                    run.seq_count,
+                    decoded.len()
                 )));
             }
             expected_first = run

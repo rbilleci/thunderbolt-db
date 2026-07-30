@@ -142,9 +142,7 @@ fn sharded_device_index_declines_at_residency_budget() {
         "the capped optional index must decline"
     );
     let result = e
-        .execute_relational_select_text(
-            "SELECT id, balance FROM capped_shard_index WHERE id = 20",
-        )
+        .execute_relational_select_text("SELECT id, balance FROM capped_shard_index WHERE id = 20")
         .expect("the SQL route falls back to the device scan");
     assert_eq!(
         result.rows.row(0),
@@ -183,12 +181,12 @@ fn active_transaction_pins_remain_globally_accounted_and_non_evictable() {
 
     e.execute_text(14, "BEGIN").unwrap();
     e.set_relational_residency_budget_bytes(0, current);
-    let result = e.admit_relational_residency_snapshot(
-        "pinned_budget_b",
-        0,
-        replacement.saturating_add(1),
+    let result =
+        e.admit_relational_residency_snapshot("pinned_budget_b", 0, replacement.saturating_add(1));
+    assert!(
+        result.is_err(),
+        "a pinned base generation must not be evicted"
     );
-    assert!(result.is_err(), "a pinned base generation must not be evicted");
     let shards = e.read_residency_shards();
     assert!(shards.contains_key("pinned_budget_a"));
     assert!(shards.contains_key("pinned_budget_b"));
@@ -201,11 +199,8 @@ fn active_transaction_pins_remain_globally_accounted_and_non_evictable() {
 fn same_table_replacement_cannot_hide_snapshot_retained_payload_from_budget() {
     let mut e = Engine::new_local();
     e.set_shard_residency_enabled(true);
-    e.execute_text(
-        15,
-        "CREATE TABLE pinned_same_table (id INT, value INT)",
-    )
-    .unwrap();
+    e.execute_text(15, "CREATE TABLE pinned_same_table (id INT, value INT)")
+        .unwrap();
     e.execute_text(16, "INSERT INTO pinned_same_table VALUES (1, 10)")
         .unwrap();
     repair_test_relational_host_copy(&e, "pinned_same_table");
@@ -239,7 +234,10 @@ fn same_table_replacement_cannot_hide_snapshot_retained_payload_from_budget() {
         .and_then(|shard| shard.device_memory.as_ref())
         .map(|memory| memory.device_ptr())
         .unwrap();
-    assert_eq!(after_ptr, first_ptr, "failed admission cannot publish a replacement");
+    assert_eq!(
+        after_ptr, first_ptr,
+        "failed admission cannot publish a replacement"
+    );
     assert_eq!(e.relational_resident_bytes_for_gpu(0), exact_current);
     e.execute_text(17, "ROLLBACK").unwrap();
 }
@@ -274,14 +272,7 @@ fn transaction_retained_index_stays_charged_after_cache_purge() {
         )
         .unwrap();
     // Isolate the retained CudaResidentDeviceMemory charge from route-plan descriptor charges.
-    e.read_state
-        .residency
-        .sharded_point_routes
-        .store(Arc::new(BTreeMap::new()));
-    e.read_state
-        .residency
-        .compound_point_routes
-        .store(Arc::new(BTreeMap::new()));
+    e.read_state.residency.reset_point_routes_for_test();
     let index_allocations = e
         .read_state
         .residency
@@ -300,13 +291,14 @@ fn transaction_retained_index_stays_charged_after_cache_purge() {
     e.read_state
         .residency
         .purge_shard_pk_index_for_table("pinned_index_budget");
-    assert!(e
-        .read_state
-        .residency
-        .shard_pk_device_index
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_empty());
+    assert!(
+        e.read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    );
     assert_eq!(
         e.relational_resident_bytes_for_gpu(0),
         before,
@@ -317,9 +309,10 @@ fn transaction_retained_index_stays_charged_after_cache_purge() {
         e.relational_resident_bytes_for_gpu(0) <= before.saturating_sub(index_bytes),
         "at least the purged index allocation must leave with the final transaction generation"
     );
-    assert!(e
-        .transaction_retained_gpu_allocations
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_empty());
+    assert!(
+        e.transaction_retained_gpu_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    );
 }

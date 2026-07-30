@@ -64,13 +64,13 @@ pub(crate) fn validate_binary_table_reset_source_roots(
     if let Some(reset) = record
         .table_resets
         .iter()
-        .find(|reset| ledger.table_root_index(&reset.table) != reset.source_commit_seq)
+        .find(|reset| ledger.table_root_index(reset.table_oid) != reset.source_commit_seq)
     {
         return Err(EngineError::Durability(format!(
             "transaction table reset source-root index mismatch for \"{}\": WAL names {}, current root is {}",
             reset.table,
             reset.source_commit_seq,
-            ledger.table_root_index(&reset.table)
+            ledger.table_root_index(reset.table_oid)
         )));
     }
     Ok(())
@@ -698,17 +698,17 @@ impl Engine {
                     )));
                 }
             }
-            if let Some(name) = reset
+            if let Some((name, _)) = reset
                 .dependency_identities
-                .keys()
-                .find(|name| ledger.table_changed_after(name, reset.read_snapshot))
+                .iter()
+                .find(|(_, oid)| ledger.table_changed_after(**oid, reset.read_snapshot))
             {
                 return Err(ExecuteError::Serialization(format!(
                     "table reset dependency relation \"{name}\" changed after snapshot {}",
                     reset.read_snapshot
                 )));
             }
-            let current_root = ledger.table_root_index(&reset.table);
+            let current_root = ledger.table_root_index(reset.table_oid);
             if current_root != reset.source_commit_seq {
                 return Err(ExecuteError::Serialization(format!(
                     "table reset source root for \"{}\" changed from {} to {}",
@@ -1005,7 +1005,7 @@ impl Engine {
                 .commit_state_after_wave_quiescence()
                 .map_err(ExecuteError::Engine)?;
             let source_commit_seq = if transaction_private {
-                if commit.ledger.table_root_index(&table.name) != 0 {
+                if commit.ledger.table_root_index(table.oid) != 0 {
                     return Err(ExecuteError::Serialization(format!(
                         "transaction-private reset target \"{}\" collided with prior table-root history",
                         table.name
@@ -1013,7 +1013,7 @@ impl Engine {
                 }
                 0
             } else {
-                commit.ledger.table_root_index(&table.name)
+                commit.ledger.table_root_index(table.oid)
             };
             let (expected_rows, before_digest) = self.table_reset_device_root_proof(
                 &table,
@@ -1803,6 +1803,10 @@ pub(crate) fn final_transaction_write_set(operations: &[TransactionOperation]) -
     for reset in resets {
         write_set.tables.insert(reset.table);
         write_set.tables.extend(reset.foreign_key_dependencies);
+        write_set.table_oids.push(reset.table_oid);
+        write_set
+            .table_oids
+            .extend(reset.dependency_identities.into_values());
     }
     write_set
 }

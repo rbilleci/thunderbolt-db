@@ -288,9 +288,81 @@ fn typed_column_encoder_matches_row_major_bytes_with_offset_and_extrema() {
         .unwrap()
         .checked_append_chunks(11, 4)
         .unwrap();
+    assert_eq!(
+        typed.chunks.last().unwrap().byte_offset,
+        0,
+        "header is final"
+    );
+    assert_eq!(
+        typed.chunks.last().unwrap().bytes.as_ref(),
+        (7_u64).to_le_bytes()
+    );
+    let typed = IntoIterator::into_iter(typed.chunks)
+        .map(|chunk| gpu_db_execution::CudaOwnedDeviceMemoryChunk {
+            byte_offset: chunk.byte_offset,
+            bytes: chunk.bytes.into_vec(),
+        })
+        .collect::<Vec<_>>();
     assert_eq!(typed, row_major);
-    assert_eq!(typed.last().unwrap().byte_offset, 0, "header is final");
-    assert_eq!(typed.last().unwrap().bytes, (7_u64).to_le_bytes());
+}
+
+#[test]
+fn resident_source_host_retention_prediction_matches_the_move_and_drops_semantic_only_backing() {
+    let engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE source_retention (id int4, flag bool)")
+        .unwrap();
+    let catalog = engine.catalog_snapshot();
+    let insert = Insert {
+        table: "source_retention".to_string(),
+        columns: Vec::new(),
+        rows: Insert::programmatic_rows(vec![
+            vec![SqlValue::Int4(7), SqlValue::Bool(true)],
+            vec![SqlValue::Int4(9), SqlValue::Bool(false)],
+        ]),
+        returning: Vec::new(),
+    };
+    let batch = ready_general_insert(&insert, &catalog);
+    let batch_report = batch.host_retention_report().unwrap();
+    let predicted = batch
+        .resident_append_source_host_retention_prediction()
+        .unwrap();
+    let source = batch.into_resident_append_source().unwrap();
+    let materialized = source.host_retention_report().unwrap();
+    assert!(predicted.matches(&materialized).unwrap());
+    assert!(
+        batch_report.retained_bytes() > materialized.retained_bytes(),
+        "input state/provenance and canonical semantic-only storage must retire at the move"
+    );
+    assert!(batch_report.allocation_slots().unwrap() > materialized.allocation_slots().unwrap());
+    assert_eq!(materialized.generation_pin_slots().unwrap(), 0);
+}
+
+#[test]
+fn binary_template_host_retention_keeps_only_its_four_declared_backings() {
+    let engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE template_retention (id int4)")
+        .unwrap();
+    let catalog = engine.catalog_snapshot();
+    let batch = ready_general_insert(
+        &Insert {
+            table: "template_retention".to_string(),
+            columns: Vec::new(),
+            rows: Insert::programmatic_rows(vec![vec![SqlValue::Int4(7)]]),
+            returning: Vec::new(),
+        },
+        &catalog,
+    );
+    let template = batch.binary_insert_template().unwrap();
+    let report = template.host_retention_report().unwrap();
+    assert_eq!(report.allocation_slots().unwrap(), 4);
+    assert_eq!(report.generation_pin_slots().unwrap(), 0);
+    assert!(
+        report.retained_bytes()
+            >= template.operation_fragment_body_bytes().unwrap()
+                + 2 * std::mem::size_of::<usize>() as u64
+    );
 }
 
 #[test]
@@ -446,9 +518,11 @@ fn typed_source_enters_the_shared_fused_and_unfused_open_shard_publisher() {
                     .is_err(),
                 "sealed plan holds the always-present residency gate with or without lanes"
             );
-            plan.apply(
+            plan.apply_after_typed_wal_claim(
                 &engine,
-                crate::engine_residency::AppendCreatedBy::InsertUniform(visible_stamp),
+                crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(
+                    visible_stamp,
+                ),
             )
             .expect("sealed plan reaches mutation's single publisher");
             assert!(
@@ -574,9 +648,9 @@ fn typed_in_place_missing_created_by_sidecar_stamps_the_pre_wal_arc() {
         .get(&("accounts".to_string(), before.shard_id))
         .is_none());
     let stamp = engine.committed_seq();
-    plan.apply(
+    plan.apply_after_typed_wal_claim(
         &engine,
-        crate::engine_residency::AppendCreatedBy::InsertUniform(stamp),
+        crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(stamp),
     )
     .expect("post-WAL mutation installs and stamps the sealed sidecar");
     let after = engine
@@ -648,9 +722,11 @@ fn mixed_fixed_width_typed_rollover_preuploads_all_sections_and_exact_row_ids() 
             exact_row_ids([3]),
         )
         .unwrap()
-        .apply(
+        .apply_after_typed_wal_claim(
             &engine,
-            crate::engine_residency::AppendCreatedBy::InsertUniform(engine.committed_seq()),
+            crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(
+                engine.committed_seq(),
+            ),
         )
         .expect("mixed typed in-place plan reaches the sole publisher");
     assert_eq!(
@@ -701,9 +777,11 @@ fn mixed_fixed_width_typed_rollover_preuploads_all_sections_and_exact_row_ids() 
             exact_row_ids([4, 5, 6]),
         )
         .unwrap()
-        .apply(
+        .apply_after_typed_wal_claim(
             &engine,
-            crate::engine_residency::AppendCreatedBy::InsertUniform(engine.committed_seq()),
+            crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(
+                engine.committed_seq(),
+            ),
         )
         .expect("mixed typed rollover remains a private build through the sole publisher");
     let rolled = engine
@@ -835,9 +913,11 @@ fn nullable_text_typed_plan_preallocates_dense_rollover_and_publishes_once() {
         .cloned()
         .unwrap();
     assert_eq!(planned.shard_id, before.shard_id, "pre-WAL plan is private");
-    plan.apply(
+    plan.apply_after_typed_wal_claim(
         &engine,
-        crate::engine_residency::AppendCreatedBy::InsertUniform(engine.committed_seq()),
+        crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(
+            engine.committed_seq(),
+        ),
     )
     .expect("post-WAL plan consumes its private allocations through mutation");
     let after = engine
@@ -1022,9 +1102,11 @@ fn typed_fixed_width_rollover_preallocates_generation_and_publishes_through_muta
             .is_err(),
         "the sealed rollover plan blocks a budget thief through WAL/apply"
     );
-    plan.apply(
+    plan.apply_after_typed_wal_claim(
         &engine,
-        crate::engine_residency::AppendCreatedBy::InsertUniform(unpublished_stamp),
+        crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(
+            unpublished_stamp,
+        ),
     )
     .expect("sealed rollover applies through mutation");
     assert!(
@@ -1360,9 +1442,11 @@ fn stale_sealed_plan_returns_fatal_drift_without_a_second_publication() {
             open.point_route_generation = std::sync::Arc::new(());
         });
     assert_eq!(
-        plan.apply(
+        plan.apply_after_typed_wal_claim(
             &engine,
-            crate::engine_residency::AppendCreatedBy::InsertUniform(engine.committed_seq(),),
+            crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(
+                engine.committed_seq(),
+            ),
         ),
         Err(crate::engine_residency::DeviceInsertPlanApplyError::PlanDrift)
     );
@@ -1499,9 +1583,9 @@ fn created_by_gc_runs_only_after_a_sealed_plan_releases_the_residency_gate() {
         )
         .expect("initial plan is eligible");
     first
-        .apply(
+        .apply_after_typed_wal_claim(
             &engine,
-            crate::engine_residency::AppendCreatedBy::InsertUniform(stamp),
+            crate::engine_dml_concurrent::issue_test_only_typed_insert_post_wal_apply_permit(stamp),
         )
         .expect("first append installs the created_by sidecar");
     assert!(engine
@@ -1697,7 +1781,10 @@ fn nullable_vectors_and_uninvoked_defaults_are_resident_candidates_while_constra
         .is_some(),
         "a table may define a default when every cell is supplied"
     );
-    let mut fk = catalog.clone();
+    engine
+        .execute_text(3, "CREATE TABLE parents (id int4 PRIMARY KEY)")
+        .unwrap();
+    let mut fk = (*engine.catalog_snapshot()).clone();
     fk.relational_catalog
         .get_mut("accounts")
         .unwrap()
@@ -1711,11 +1798,43 @@ fn nullable_vectors_and_uninvoked_defaults_are_resident_candidates_while_constra
     assert!(try_prepare_typed_insert_batch(
         &Command::Insert(insert.clone()),
         &fk,
-        catalog.commit_seq,
+        fk.commit_seq,
         None,
     )
     .unwrap()
     .is_none());
+    assert!(try_prepare_typed_insert_batch_proof_only(
+        &Command::Insert(insert.clone()),
+        &fk,
+        fk.commit_seq,
+    )
+    .unwrap()
+    .is_none());
+    let mut owner_drift = fk.clone();
+    let table = owner_drift.relational_catalog.get_mut("accounts").unwrap();
+    table.columns[0].table_oid = table.columns[0].table_oid.wrapping_add(1);
+    assert!(
+        matches!(
+            builder::build(
+                &insert,
+                &owner_drift,
+                owner_drift.commit_seq,
+                None,
+                TypedInsertBuildCapability::ProofOnly,
+            ),
+            Ok(TypedInsertBuildResult::Deferred(
+                TypedInsertDeferred::CatalogGeneration
+            )),
+        ),
+        "current catalog identity must decline before FK constraint eligibility"
+    );
+    assert!(try_prepare_typed_insert_batch_foreign_key_proof_only(
+        &Command::Insert(insert),
+        &fk,
+        fk.commit_seq,
+    )
+    .unwrap()
+    .is_some());
 }
 
 #[test]
@@ -2669,8 +2788,15 @@ fn live_fixed_width_builder_reorders_all_scalar_vectors_and_matches_row_major_ch
     )
     .unwrap();
     let source = batch.into_resident_append_source().unwrap();
-    assert_eq!(source.checked_append_chunks(11, 4).unwrap(), expected);
-    let bool_uploads = source.bool_uploads().unwrap();
+    let chunks = source.checked_append_chunks(11, 4).unwrap().chunks;
+    let actual = IntoIterator::into_iter(chunks)
+        .map(|chunk| gpu_db_execution::CudaOwnedDeviceMemoryChunk {
+            byte_offset: chunk.byte_offset,
+            bytes: chunk.bytes.into_vec(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    let bool_uploads = source.fixed_bool_uploads(table).unwrap();
     assert_eq!(bool_uploads.len(), 1);
     assert_eq!(bool_uploads[0].values.as_ref(), &[1, 0]);
     assert_eq!(source.int4_min_max().unwrap().len(), 3);

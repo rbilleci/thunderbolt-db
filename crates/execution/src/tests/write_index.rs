@@ -38,6 +38,10 @@ fn prepared_multi_index_token_is_move_only_and_owns_exact_scratch_geometry() {
     assert!(drain.contains("let _ = self.primary.set_current();"));
     assert!(source.contains("_source_owner:"));
     assert!(source.contains("_index_owners:"));
+    assert!(source.contains("PreparedResidentTypedIndexesInsertHostRetention"));
+    assert!(source.contains("pub fn host_retention_report"));
+    assert!(source.contains("owner_array_backing_identity"));
+    assert!(source.contains("self._index_owners.as_ptr()"));
     assert!(
         source.find("preparation_drain:") < source.find("descriptor_guard:"),
         "the drain must drop before pooled descriptor ownership"
@@ -46,6 +50,367 @@ fn prepared_multi_index_token_is_move_only_and_owns_exact_scratch_geometry() {
     assert!(source.contains("decline_guard:"));
     assert!(source.contains("pub fn submit(mut self)"));
     assert!(!source.contains("impl Clone for PreparedResidentTypedIndexesInsert"));
+}
+
+#[test]
+fn prepared_fused_apply_token_is_pre_wal_only_and_post_wal_build_free() {
+    fn assert_send<T: Send>() {}
+    assert_send::<PreparedI32FusedApply>();
+    assert_send::<PreparedI32FusedHeader>();
+    let source = include_str!("../write_apply/prepared_fused.rs");
+    let apply = source
+        .split("pub fn apply(")
+        .nth(1)
+        .and_then(|body| body.split("impl CudaResidentDeviceMemory").next())
+        .expect("prepared fused apply is bounded before preparation");
+    let before_header = source
+        .split("pub fn apply_before_header(")
+        .nth(1)
+        .and_then(|body| body.split("/// Preserve the original one-call behavior").next())
+        .expect("prepared fused payload application is bounded before its wrapper");
+    let publish_header = source
+        .split("pub fn publish(self)")
+        .nth(1)
+        .and_then(|body| body.split("impl CudaResidentDeviceMemory").next())
+        .expect("prepared fused header publication is bounded before preparation");
+    let prepare = source
+        .split("pub fn prepare_i32_fused_apply")
+        .nth(1)
+        .and_then(|body| body.split("fn validate_fused_apply_preparation").next())
+        .expect("prepared fused materialization is bounded before its validator");
+    assert!(source.contains("pub struct FusedApplyPreparation"));
+    assert!(source.contains("pub struct PreparedI32FusedApply"));
+    assert!(source.contains("staging: Box<[u8]>"));
+    assert!(source.contains("staging_guard: crate::PooledDeviceBufferOwned"));
+    assert!(source.contains("_owners: Box<[Arc<"));
+    assert!(source.contains("pub struct FusedApplyPreparationFootprint"));
+    assert!(source.contains("pub fn footprint("));
+    assert!(source.contains("checked_output_buffer_bucket"));
+    assert!(source.contains("allocation_identity"));
+    assert!(prepare.contains("new_uninit_slice"));
+    assert!(
+        !prepare.contains("Vec::"),
+        "exact boxed backings avoid unreported Vec capacity during materialization"
+    );
+    assert!(source.contains("pub fn host_retention_report"));
+    assert!(source.contains("pub fn prepare_i32_fused_apply"));
+    assert!(source.contains("live mutation route"));
+    for body in [apply, before_header, publish_header] {
+        for forbidden in [
+        "Vec",
+        "cached_function",
+        ".get::<",
+        "prepare_i32_fused_apply",
+        "to_string",
+        "collect",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "post-WAL prepared fused apply must not build {forbidden}"
+            );
+        }
+    }
+    assert!(before_header.contains("stamps.len() != self.stamp_count"));
+    assert!(before_header.contains("let mut stream_drain"));
+    assert!(before_header.contains("stream_drain.armed = false"));
+    assert!(apply.contains("self.apply_before_header(stamps)"));
+    assert!(apply.contains("header.publish()"));
+    assert!(publish_header.contains("(self.cu_memcpy_htod)"));
+    assert!(!source.contains("impl Clone for PreparedI32FusedApply"));
+    assert!(!source.contains("impl Clone for PreparedI32FusedHeader"));
+    let legacy = include_str!("../write_apply.rs")
+        .split("pub fn submit_i32_fused_apply_status")
+        .nth(1)
+        .and_then(|body| body.split("/// M1").next())
+        .expect("legacy fused apply is bounded before incremental index insert");
+    assert!(
+        !legacy.contains("prepare_i32_fused_apply"),
+        "the prepared token must remain production-ineligible"
+    );
+}
+
+#[test]
+fn scalar_fused_shape_footprint_matches_the_concrete_preparation_geometry() {
+    let scalar = i32_fused_apply_footprint_for_shape(1, 1, false, 1)
+        .expect("one-row aliased fused geometry is representable without CUDA allocation");
+    assert_eq!(scalar.pinned_cuda_allocation_count, 1);
+    assert_eq!(scalar.staging_backing_bytes, 104);
+    assert_eq!(scalar.pooled_device_scratch_bytes, 256);
+    assert_eq!(scalar.owner_array_allocation_slots, 1);
+    assert_eq!(scalar.staging_allocation_slots, 1);
+    assert_eq!(scalar.pooled_device_scratch_slots, 1);
+    assert_eq!(scalar.status_readback_bytes, 4);
+    assert_eq!(
+        scalar.maximum_temporary_host_scratch_bytes,
+        scalar.temporary_ptx_nul_staging_bytes
+    );
+    assert!(i32_fused_apply_footprint_for_shape(1, 1, true, 0).is_err());
+    assert!(i32_fused_apply_footprint_for_shape(1, 1, true, 4).is_ok());
+    assert!(i32_fused_apply_footprint_for_shape(1, 1, true, 5).is_err());
+    assert!(i32_fused_apply_footprint_for_shape(0, 1, true, 1).is_err());
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn prepared_fused_apply_owns_exact_host_geometry_and_drains_every_post_launch_failure() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let owner = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &[0_u8; 64])
+            .expect("prepared fused owner"),
+    );
+    let columns = [CudaWriteDestination {
+        memory: std::sync::Arc::clone(&owner),
+        byte_offset: 16,
+    }];
+    let preparation = FusedApplyPreparation {
+        columns: &columns,
+        values: &[7_i32],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 24,
+        },
+        row_ids: None,
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let footprint = preparation
+        .footprint(&owner)
+        .expect("allocation-free pre-materialization footprint");
+    assert_eq!(footprint.pinned_cuda_allocation_count, 1);
+    assert_eq!(footprint.staging_backing_bytes, 104);
+    assert_eq!(footprint.pooled_device_scratch_bytes, 256);
+    assert_eq!(footprint.status_readback_bytes, 4);
+    assert_eq!(footprint.temporary_destination_array_bytes, 0);
+    assert_eq!(footprint.owner_construction_spare_bytes, 0);
+    assert_eq!(
+        footprint.maximum_temporary_host_scratch_bytes,
+        footprint.temporary_ptx_nul_staging_bytes,
+        "the NUL-terminated PTX image is the sole temporary preparation backing"
+    );
+    let counters_before = prepared_i32_fused_apply_counters();
+    let token = owner
+        .prepare_i32_fused_apply(&preparation)
+        .expect("pre-WAL prepared fused token");
+    let retention = token.host_retention_report().unwrap();
+    assert_eq!(
+        retention.owner_array_element_count, footprint.pinned_cuda_allocation_count,
+        "four aliased wrapper roles retain one underlying CUDA allocation"
+    );
+    assert_eq!(
+        retention.owner_array_backing_bytes, footprint.owner_array_backing_bytes,
+        "materialized exact owner backing agrees with the allocation-free prediction"
+    );
+    assert_eq!(
+        retention.staging_backing_bytes, footprint.staging_backing_bytes,
+        "materialized exact staging backing agrees with the allocation-free prediction"
+    );
+    assert_eq!(
+        retention.owner_array_allocation_slots, footprint.owner_array_allocation_slots
+    );
+    assert_eq!(
+        retention.staging_allocation_slots, footprint.staging_allocation_slots
+    );
+    assert_eq!(
+        token.preparation_bytes(),
+        footprint.pooled_device_scratch_bytes,
+        "materialized checked CUDA pool bucket agrees with the prediction"
+    );
+    let mut one_byte_short = retention;
+    one_byte_short.staging_backing_bytes -= 1;
+    assert_ne!(one_byte_short, retention, "one byte short is rejected");
+    let mut one_slot_short = retention;
+    one_slot_short.staging_allocation_slots -= 1;
+    assert_ne!(one_slot_short, retention, "one slot short is rejected");
+    assert!(retention.owner_array_backing_identity.is_some());
+    assert!(retention.staging_backing_identity.is_some());
+    let mut one_device_slot_short = footprint;
+    one_device_slot_short.pooled_device_scratch_slots -= 1;
+    assert_ne!(
+        one_device_slot_short, footprint,
+        "one pooled CUDA allocation slot short is rejected"
+    );
+    assert_eq!(
+        prepared_i32_fused_apply_counters().prepares,
+        counters_before.prepares + 1
+    );
+    assert!(
+        token.apply(&[]).is_err(),
+        "malformed stamps decline before launch"
+    );
+    assert_eq!(
+        prepared_i32_fused_apply_counters().drains,
+        counters_before.drains,
+        "a pre-launch malformed request does not poison the default stream"
+    );
+
+    for inject in [
+        crate::write_apply::fail_next_prepared_i32_fused_apply_after_launch as fn(),
+        crate::write_apply::fail_next_prepared_i32_fused_apply_after_status as fn(),
+        crate::write_apply::fail_next_prepared_i32_fused_apply_before_header as fn(),
+    ] {
+        let token = owner
+            .prepare_i32_fused_apply(&preparation)
+            .expect("fresh prepared token for one sabotaged attempt");
+        let before = prepared_i32_fused_apply_counters();
+        inject();
+        assert!(
+            token.apply(&[11]).is_err(),
+            "sabotaged launched edge declines"
+        );
+        let after = prepared_i32_fused_apply_counters();
+        assert_eq!(
+            after.drains,
+            before.drains + 1,
+            "launched error drains pooled scratch"
+        );
+        assert_eq!(
+            after.submits, before.submits,
+            "failed token is consumed, never reused"
+        );
+        assert_eq!(
+            after.prepares, before.prepares,
+            "launched error drains without rebuilding after WAL"
+        );
+    }
+
+    let before = prepared_i32_fused_apply_counters();
+    let token = owner
+        .prepare_i32_fused_apply(&preparation)
+        .expect("retry must use a fresh pre-WAL token");
+    let (status, header) = token
+        .apply_before_header(&[13])
+        .expect("fresh prepared payload retry succeeds");
+    assert!(!status.declined);
+    assert_eq!(
+        owner
+            .read_resident_u64_column(0, 1)
+            .expect("count header remains readable before publication"),
+        vec![0],
+        "payload completion must not publish the row count"
+    );
+    assert_eq!(
+        owner
+            .read_resident_i32_column(16, 1)
+            .expect("payload landed before header"),
+        vec![7]
+    );
+    assert_eq!(
+        owner
+            .read_resident_u64_column(24, 1)
+            .expect("created-by stamp landed before header"),
+        vec![13]
+    );
+    assert_eq!(
+        prepared_i32_fused_apply_counters().submits,
+        before.submits,
+        "split payload completion is not a published submit"
+    );
+    header.publish().expect("prepared count header publishes");
+    assert_eq!(
+        owner
+            .read_resident_u64_column(0, 1)
+            .expect("published count header"),
+        vec![1]
+    );
+    let after = prepared_i32_fused_apply_counters();
+    assert_eq!(after.prepares, before.prepares + 1);
+    assert_eq!(after.submits, before.submits + 1);
+    assert_eq!(
+        after.drains, before.drains,
+        "successful completion disarms the drain"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn prepared_fused_apply_footprint_deduplicates_distinct_allocation_wrappers() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let owner = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &[0_u8; 64])
+            .expect("prepared fused owner"),
+    );
+    let alias = std::sync::Arc::new(owner.distinct_wrapper_for_accounting_test());
+    assert!(!std::sync::Arc::ptr_eq(&owner, &alias));
+    assert_eq!(owner.allocation_identity(), alias.allocation_identity());
+    let columns = [CudaWriteDestination {
+        memory: std::sync::Arc::clone(&alias),
+        byte_offset: 16,
+    }];
+    let preparation = FusedApplyPreparation {
+        columns: &columns,
+        values: &[7_i32],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 24,
+        },
+        row_ids: Some((
+            &[99_u64],
+            CudaWriteDestination {
+                memory: std::sync::Arc::clone(&alias),
+                byte_offset: 32,
+            },
+        )),
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let footprint = preparation
+        .footprint(&owner)
+        .expect("alias footprint is allocation-free");
+    assert_eq!(
+        footprint.pinned_cuda_allocation_count, 1,
+        "deduplication is by underlying allocation identity, not outer wrapper identity"
+    );
+    let token = owner
+        .prepare_i32_fused_apply(&preparation)
+        .expect("alias-aware prepared fused token");
+    let retention = token.host_retention_report().unwrap();
+    assert_eq!(
+        retention.owner_array_element_count, footprint.pinned_cuda_allocation_count
+    );
+    assert_eq!(
+        retention.owner_array_backing_bytes, footprint.owner_array_backing_bytes
+    );
+    assert_eq!(
+        retention.owner_array_allocation_slots, footprint.owner_array_allocation_slots
+    );
+    assert_eq!(
+        retention.staging_backing_bytes, footprint.staging_backing_bytes
+    );
+    assert_eq!(
+        token.preparation_bytes(), footprint.pooled_device_scratch_bytes
+    );
+}
+
+#[test]
+fn resident_typed_index_build_scratch_is_exact_and_total() {
+    assert_eq!(
+        resident_typed_index_build_preparation_bytes(0),
+        None,
+        "a full build requires at least one descriptor column"
+    );
+    assert_eq!(
+        resident_typed_index_build_preparation_bytes(1),
+        Some(1_280),
+        "one full build owns four descriptor buckets plus the verdict bucket"
+    );
+    assert_eq!(
+        resident_typed_index_build_preparation_bytes(usize::MAX),
+        None,
+        "full-build descriptor arithmetic must refuse before any device lease"
+    );
+    let source = include_str!("../resident_index_build.rs");
+    assert!(source.contains("TypedIndexBuildNullStreamDrain"));
+    assert!(source.contains("stream_drain.armed = false"));
 }
 
 /// M1 (ledger #24): the INCREMENTAL index-insert kernel == a full rebuild. Build an index for
@@ -255,23 +620,21 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
             .retain_device_memory_zeroed(0, resident_index_allocated_bytes(7, 2).unwrap())
             .expect("gc index"),
     );
-    assert!(
-        !twin_source
-            .submit_resident_typed_index_build(
-                &gc_index,
-                7,
-                29,
-                &[CudaCompoundFoldColumn::Fixed {
-                    byte_offset: 0,
-                    width_words: 1,
-                }],
-                twins.len(),
-                Some(&deleted),
-                5,
-                false,
-            )
-            .expect("GC-bound resident build")
-    );
+    assert!(!twin_source
+        .submit_resident_typed_index_build(
+            &gc_index,
+            7,
+            29,
+            &[CudaCompoundFoldColumn::Fixed {
+                byte_offset: 0,
+                width_words: 1,
+            }],
+            twins.len(),
+            Some(&deleted),
+            5,
+            false,
+        )
+        .expect("GC-bound resident build"));
     let after_gc = locate(gc_index, twins.len() as u32, &[30]);
     assert_eq!(after_gc.count, vec![1]);
     assert_eq!(after_gc.slot[0], 1);
@@ -422,13 +785,11 @@ fn resident_index_posting_chain_exceeds_256_versions() {
             .expect("second incremental posting index"),
     );
     for index in [&extended, &extended_twin] {
-        assert!(
-            !source
-                .submit_resident_typed_index_build(
-                    index, table_mask, hash_shift, &columns, PREFIX, None, 0, true,
-                )
-                .expect("posting prefix build")
-        );
+        assert!(!source
+            .submit_resident_typed_index_build(
+                index, table_mask, hash_shift, &columns, PREFIX, None, 0, true,
+            )
+            .expect("posting prefix build"));
     }
     let extended_status = source
         .submit_resident_typed_indexes_insert_status(
@@ -597,19 +958,20 @@ fn prepared_multi_index_insert_pins_resources_and_submit_allocates_nothing() {
     drop(source);
     drop(requests);
     drop(compound_index);
-    let (worker_before_submit, status, worker_after_submit, worker_peak) = std::thread::spawn(move || {
-        let before = prepared_resident_typed_indexes_insert_counters();
-        let worker_scope = CudaAllocationScope::with_budget(0);
-        let status = prepared.submit();
-        let worker_peak = worker_scope.peak_bytes();
-        assert_eq!(
-            worker_peak, 0,
-            "the consuming submit must not acquire any worker-local GPU lease"
-        );
-        drop(worker_scope);
-        let after = prepared_resident_typed_indexes_insert_counters();
-        (before, status, after, worker_peak)
-    })
+    let (worker_before_submit, status, worker_after_submit, worker_peak) =
+        std::thread::spawn(move || {
+            let before = prepared_resident_typed_indexes_insert_counters();
+            let worker_scope = CudaAllocationScope::with_budget(0);
+            let status = prepared.submit();
+            let worker_peak = worker_scope.peak_bytes();
+            assert_eq!(
+                worker_peak, 0,
+                "the consuming submit must not acquire any worker-local GPU lease"
+            );
+            drop(worker_scope);
+            let after = prepared_resident_typed_indexes_insert_counters();
+            (before, status, after, worker_peak)
+        })
         .join()
         .expect("prepared worker must not panic");
     let status = status.expect("consuming prepared launch on a worker thread");
@@ -647,6 +1009,162 @@ fn prepared_multi_index_insert_pins_resources_and_submit_allocates_nothing() {
         )
         .expect("raw key probe after prepared launch");
     assert_eq!(hits.count, vec![1, 1, 1]);
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn resident_typed_index_build_zero_based_drained_failures_reuse_exact_scratch() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let source = runtime
+        .retain_device_memory_copy(0, &[41_i32.to_le_bytes(), 42_i32.to_le_bytes()].concat())
+        .expect("two-row resident source");
+    let table_mask = 3;
+    let hash_shift = 30;
+    let index_bytes = resident_index_allocated_bytes(table_mask, 2).expect("index geometry");
+    let setup_index = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(0, index_bytes)
+            .expect("setup-failure destination"),
+    );
+    let launched_index = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(0, index_bytes)
+            .expect("launch-failure destination"),
+    );
+    let reused_index = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(0, index_bytes)
+            .expect("post-error reuse destination"),
+    );
+    let columns = [CudaCompoundFoldColumn::Fixed {
+        byte_offset: 0,
+        width_words: 1,
+    }];
+    let scratch = resident_typed_index_build_preparation_bytes(columns.len())
+        .expect("full-build scratch geometry");
+    assert_eq!(scratch, 1_280);
+
+    let build_before = resident_typed_index_build_counters();
+    let too_small_scope = CudaAllocationScope::with_budget(scratch - 1);
+    assert!(matches!(
+        source.submit_resident_typed_index_build_status(
+            &setup_index,
+            table_mask,
+            hash_shift,
+            &columns,
+            2,
+            None,
+            0,
+            true,
+        ),
+        Err(CudaRuntimeProbeError::AllocationBudgetExceeded { .. })
+    ));
+    assert_eq!(
+        too_small_scope.peak_bytes(),
+        0,
+        "a zero-based full build must refuse all five leases before taking one"
+    );
+    drop(too_small_scope);
+
+    let build_scope = CudaAllocationScope::with_budget(scratch);
+    fail_next_resident_typed_index_build_after_setup();
+    assert!(matches!(
+        source.submit_resident_typed_index_build_status(
+            &setup_index,
+            table_mask,
+            hash_shift,
+            &columns,
+            2,
+            None,
+            0,
+            true,
+        ),
+        Err(CudaRuntimeProbeError::KernelLaunchFailed(-1))
+    ));
+    let after_setup_failure = resident_typed_index_build_counters();
+    assert_eq!(after_setup_failure.launches, build_before.launches);
+    assert_eq!(after_setup_failure.drains, build_before.drains + 1);
+    assert_eq!(
+        build_scope.peak_bytes(),
+        scratch,
+        "a queued-setup failure must release all five pooled leases"
+    );
+    assert!(
+        !source
+            .submit_resident_typed_index_build_status(
+                &setup_index,
+                table_mask,
+                hash_shift,
+                &columns,
+                2,
+                None,
+                0,
+                true,
+            )
+            .expect("same exact scratch budget is reusable after setup drain")
+            .declined
+    );
+    let after_setup_reuse = resident_typed_index_build_counters();
+    assert_eq!(after_setup_reuse.launches, build_before.launches + 1);
+    assert_eq!(after_setup_reuse.drains, after_setup_failure.drains);
+
+    fail_next_resident_typed_index_build_after_launch();
+    assert!(matches!(
+        source.submit_resident_typed_index_build_status(
+            &launched_index,
+            table_mask,
+            hash_shift,
+            &columns,
+            2,
+            None,
+            0,
+            true,
+        ),
+        Err(CudaRuntimeProbeError::KernelLaunchFailed(-1))
+    ));
+    let after_launch_failure = resident_typed_index_build_counters();
+    assert_eq!(after_launch_failure.launches, build_before.launches + 2);
+    assert_eq!(after_launch_failure.drains, after_setup_reuse.drains + 1);
+    assert!(
+        !source
+            .submit_resident_typed_index_build_status(
+                &reused_index,
+                table_mask,
+                hash_shift,
+                &columns,
+                2,
+                None,
+                0,
+                true,
+            )
+            .expect("same exact scratch budget is reusable after launch drain")
+            .declined
+    );
+    let after_launch_reuse = resident_typed_index_build_counters();
+    assert_eq!(after_launch_reuse.launches, build_before.launches + 3);
+    assert_eq!(after_launch_reuse.drains, after_launch_failure.drains);
+    assert_eq!(build_scope.peak_bytes(), scratch);
+    drop(build_scope);
+
+    assert_eq!(
+        runtime
+            .launch_smoke_add_one(61)
+            .expect("drained build failures preserve context reuse"),
+        62
+    );
+    let hits = reused_index
+        .submit_multi_shard_i32_write_locate(
+            &[WriteLocateShard {
+                index: std::sync::Arc::clone(&reused_index),
+                table_mask,
+                hash_shift,
+                row_count: 2,
+            }],
+            &[41, 42],
+            2,
+        )
+        .expect("post-error full-build destination is usable");
+    assert_eq!(hits.count, vec![1, 1]);
 }
 
 #[test]
@@ -706,11 +1224,9 @@ fn prepared_multi_index_insert_after_launch_failure_drains_before_pool_reuse() {
         byte_offset: 0,
         width_words: 1,
     }];
-    assert!(
-        !source
-            .submit_resident_typed_index_build(&index, 3, 30, &columns, 1, None, 0, true,)
-            .expect("prefix build")
-    );
+    assert!(!source
+        .submit_resident_typed_index_build(&index, 3, 30, &columns, 1, None, 0, true,)
+        .expect("prefix build"));
     let request = CudaResidentTypedIndexInsert {
         index: std::sync::Arc::clone(&index),
         table_mask: 3,
@@ -739,20 +1255,9 @@ fn prepared_multi_index_insert_after_launch_failure_drains_before_pool_reuse() {
             .retain_device_memory_zeroed(0, resident_index_allocated_bytes(3, 2).unwrap())
             .expect("fresh index destination"),
     );
-    assert!(
-        !source
-            .submit_resident_typed_index_build(
-                &fresh_index,
-                3,
-                30,
-                &request.columns,
-                1,
-                None,
-                0,
-                true,
-            )
-            .expect("fresh prefix build")
-    );
+    assert!(!source
+        .submit_resident_typed_index_build(&fresh_index, 3, 30, &request.columns, 1, None, 0, true,)
+        .expect("fresh prefix build"));
     let fresh_request = CudaResidentTypedIndexInsert {
         index: std::sync::Arc::clone(&fresh_index),
         ..request
@@ -797,9 +1302,7 @@ fn prepared_multi_index_insert_drop_without_submit_drains_queued_setup_before_re
             .expect("abandoned destination"),
     );
     assert!(!source
-        .submit_resident_typed_index_build(
-            &abandoned_index, 3, 30, &columns, 1, None, 0, true,
-        )
+        .submit_resident_typed_index_build(&abandoned_index, 3, 30, &columns, 1, None, 0, true,)
         .expect("abandoned prefix build"));
     let counters_before = prepared_resident_typed_indexes_insert_counters();
     let abandoned = source
@@ -842,8 +1345,7 @@ fn prepared_multi_index_insert_drop_without_submit_drains_queued_setup_before_re
     assert_eq!(after_drop.prepares, after_prepare.prepares);
     assert_eq!(after_drop.submits, after_prepare.submits);
     assert_eq!(
-        after_drop.drains,
-        after_prepare.drains,
+        after_drop.drains, after_prepare.drains,
         "worker-local drain instrumentation must not leak into the preparation thread"
     );
     assert_eq!(worker_after_drop.prepares, worker_before_drop.prepares);
@@ -866,9 +1368,7 @@ fn prepared_multi_index_insert_drop_without_submit_drains_queued_setup_before_re
             .expect("fresh destination"),
     );
     assert!(!source
-        .submit_resident_typed_index_build(
-            &fresh_index, 3, 30, &columns, 1, None, 0, true,
-        )
+        .submit_resident_typed_index_build(&fresh_index, 3, 30, &columns, 1, None, 0, true,)
         .expect("fresh prefix build"));
     assert!(
         !source
@@ -1000,23 +1500,21 @@ fn dense_point_probe_finds_visible_version_beyond_256_postings() {
             )
             .expect("posting index"),
     );
-    assert!(
-        !resident
-            .submit_resident_typed_index_build(
-                &index,
-                table_mask,
-                hash_shift,
-                &[CudaCompoundFoldColumn::Fixed {
-                    byte_offset: 0,
-                    width_words: 1,
-                }],
-                ROWS,
-                None,
-                0,
-                true,
-            )
-            .expect("build version postings")
-    );
+    assert!(!resident
+        .submit_resident_typed_index_build(
+            &index,
+            table_mask,
+            hash_shift,
+            &[CudaCompoundFoldColumn::Fixed {
+                byte_offset: 0,
+                width_words: 1,
+            }],
+            ROWS,
+            None,
+            0,
+            true,
+        )
+        .expect("build version postings"));
     let created = (1..=ROWS as u64).collect::<Vec<_>>();
     let mut deleted = (2..=ROWS as u64 + 1).collect::<Vec<_>>();
     *deleted.last_mut().unwrap() = u64::MAX;
@@ -1211,10 +1709,9 @@ fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
         hash_shift,
         row_count: 1,
     }];
-    assert!(
-        ctx.submit_multi_shard_i32_write_locate(&bad_geometry, &[10], 1)
-            .is_err()
-    );
+    assert!(ctx
+        .submit_multi_shard_i32_write_locate(&bad_geometry, &[10], 1)
+        .is_err());
 
     let mut corrupt_words = valid_words.clone();
     let packed = corrupt_words.iter_mut().find(|word| **word != 0).unwrap();
@@ -1251,10 +1748,9 @@ fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
         deleted_by: None,
         row_id: None,
     }];
-    assert!(
-        ctx.submit_multi_shard_i32_visible_locate(&short_visible, &[10], &[1])
-            .is_err()
-    );
+    assert!(ctx
+        .submit_multi_shard_i32_visible_locate(&short_visible, &[10], &[1])
+        .is_err());
 
     let corrupt_visible = [VisibleLocateShard {
         index: corrupt_index,
@@ -1265,10 +1761,9 @@ fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
         deleted_by: None,
         row_id: None,
     }];
-    assert!(
-        ctx.submit_multi_shard_i32_visible_locate(&corrupt_visible, &[10], &[1])
-            .is_err()
-    );
+    assert!(ctx
+        .submit_multi_shard_i32_visible_locate(&corrupt_visible, &[10], &[1])
+        .is_err());
 
     let mut cyclic_bytes = valid_bytes.clone();
     let next_offset = valid_words.len() * std::mem::size_of::<u64>();
@@ -1316,10 +1811,9 @@ fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
             hash_shift,
             row_count: 1,
         }];
-        assert!(
-            ctx.submit_multi_shard_i32_write_locate(&foreign_shard, &[10], 1)
-                .is_err()
-        );
+        assert!(ctx
+            .submit_multi_shard_i32_write_locate(&foreign_shard, &[10], 1)
+            .is_err());
     }
 
     let valid = [WriteLocateShard {
@@ -1378,11 +1872,9 @@ fn write_apply_inputs_fail_closed_and_leave_context_reusable() {
     );
 
     assert!(owner.submit_i32_index_insert(2, 30, &[7], 0).is_err());
-    assert!(
-        owner
-            .submit_i32_index_insert(7, 29, &[7], u32::MAX)
-            .is_err()
-    );
+    assert!(owner
+        .submit_i32_index_insert(7, 29, &[7], u32::MAX)
+        .is_err());
     assert!(owner.submit_i32_index_insert(7, 29, &[7], 4).is_err());
 
     let invalid_column = [CudaWriteDestination {
@@ -1469,40 +1961,32 @@ fn write_apply_inputs_fail_closed_and_leave_context_reusable() {
         bytes_byte_offset: 16,
         bytes_len: 1,
     }];
-    assert!(
-        text_owner
-            .submit_compound_fold_fingerprints(&malformed, 1)
-            .is_err()
-    );
+    assert!(text_owner
+        .submit_compound_fold_fingerprints(&malformed, 1)
+        .is_err());
 
     let out_of_bounds = [CudaCompoundFoldColumn::Fixed {
         byte_offset: 63,
         width_words: 1,
     }];
-    assert!(
-        owner
-            .submit_compound_fold_fingerprints(&out_of_bounds, 1)
-            .is_err()
-    );
+    assert!(owner
+        .submit_compound_fold_fingerprints(&out_of_bounds, 1)
+        .is_err());
     let misaligned = [CudaCompoundFoldColumn::Fixed {
         byte_offset: 1,
         width_words: 1,
     }];
-    assert!(
-        owner
-            .submit_compound_fold_fingerprints(&misaligned, 1)
-            .is_err()
-    );
+    assert!(owner
+        .submit_compound_fold_fingerprints(&misaligned, 1)
+        .is_err());
     let misaligned_text = [CudaCompoundFoldColumn::Text {
         offsets_byte_offset: 1,
         bytes_byte_offset: 32,
         bytes_len: 1,
     }];
-    assert!(
-        owner
-            .submit_compound_fold_fingerprints(&misaligned_text, 1)
-            .is_err()
-    );
+    assert!(owner
+        .submit_compound_fold_fingerprints(&misaligned_text, 1)
+        .is_err());
 
     let valid_column = [CudaWriteDestination {
         memory: std::sync::Arc::clone(&owner),
@@ -1648,11 +2132,9 @@ fn resident_sidecar_inputs_fail_closed_and_leave_context_reusable() {
             .expect("bool gather readback"),
         0xffff_ffef_u32.to_le_bytes()
     );
-    assert!(
-        bool_dst
-            .gather_bool_bitmap_from_shard(5, 0, &bool_source, 3)
-            .is_err()
-    );
+    assert!(bool_dst
+        .gather_bool_bitmap_from_shard(5, 0, &bool_source, 3)
+        .is_err());
 
     let null_dst = runtime
         .retain_device_memory_copy(0, &[0_u8; 8])
@@ -1670,11 +2152,9 @@ fn resident_sidecar_inputs_fail_closed_and_leave_context_reusable() {
         memory: std::sync::Arc::clone(&owner),
         byte_offset: 32,
     };
-    assert!(
-        owner
-            .gather_bool_bitmap_from_shard(32, 1, &alias_source, 3)
-            .is_err()
-    );
+    assert!(owner
+        .gather_bool_bitmap_from_shard(32, 1, &alias_source, 3)
+        .is_err());
 
     let text_bytes = [0_u64, 2, 3]
         .into_iter()
@@ -1724,17 +2204,13 @@ fn resident_sidecar_inputs_fail_closed_and_leave_context_reusable() {
             bytes_byte_offset: 24,
             bytes_len: 3,
         };
-        assert!(
-            text_dst
-                .rebase_text_offsets_from_shard(0, 0, 0, &source, 3)
-                .is_err()
-        );
+        assert!(text_dst
+            .rebase_text_offsets_from_shard(0, 0, 0, &source, 3)
+            .is_err());
     }
-    assert!(
-        text_dst
-            .rebase_text_offsets_from_shard(0, 0, u64::MAX, &text_source, 3)
-            .is_err()
-    );
+    assert!(text_dst
+        .rebase_text_offsets_from_shard(0, 0, u64::MAX, &text_source, 3)
+        .is_err());
     let missing_blob = CudaTextOffsetSource {
         memory: std::sync::Arc::new(
             runtime
@@ -1745,22 +2221,18 @@ fn resident_sidecar_inputs_fail_closed_and_leave_context_reusable() {
         bytes_byte_offset: 24,
         bytes_len: 3,
     };
-    assert!(
-        text_dst
-            .rebase_text_offsets_from_shard(0, 0, 0, &missing_blob, 3)
-            .is_err()
-    );
+    assert!(text_dst
+        .rebase_text_offsets_from_shard(0, 0, 0, &missing_blob, 3)
+        .is_err());
     let aliased_text = CudaTextOffsetSource {
         memory: std::sync::Arc::clone(&text_dst),
         offsets_byte_offset: 0,
         bytes_byte_offset: 24,
         bytes_len: 0,
     };
-    assert!(
-        text_dst
-            .rebase_text_offsets_from_shard(0, 0, 0, &aliased_text, 3)
-            .is_err()
-    );
+    assert!(text_dst
+        .rebase_text_offsets_from_shard(0, 0, 0, &aliased_text, 3)
+        .is_err());
 
     if runtime.snapshot().device_count > 1 {
         let foreign = CudaSidecarSource {
@@ -1771,11 +2243,9 @@ fn resident_sidecar_inputs_fail_closed_and_leave_context_reusable() {
             ),
             byte_offset: 0,
         };
-        assert!(
-            bool_dst
-                .gather_bool_bitmap_from_shard(0, 0, &foreign, 3)
-                .is_err()
-        );
+        assert!(bool_dst
+            .gather_bool_bitmap_from_shard(0, 0, &foreign, 3)
+            .is_err());
     }
 
     text_dst

@@ -48,6 +48,7 @@ mod buffer;
 use buffer::wal_prealloc_chunk_bytes;
 pub use buffer::{
     FuaDurabilityTelemetry, WalBuffer, WalDurability, WalGroupFlushBegin, WalGroupFlushJob,
+    WalTypedExactAppendReservation,
 };
 
 mod checkpoint;
@@ -60,12 +61,17 @@ pub use checkpoint::{
 
 mod canonical;
 pub use canonical::{
-    canonical_logical_intent_outcome_bytes, canonical_request_digest, decode_canonical_envelope,
-    decode_canonical_record_payload, encode_canonical_envelope, pack_canonical_record_payload,
-    CanonicalCatalogTail, CanonicalDigest, CanonicalEnvelope, CanonicalFragment,
-    CanonicalFragmentKind, CanonicalIdentity, CanonicalIsolation, CanonicalOutcome,
-    CanonicalOutcomeKind, CanonicalPhysicalRange, CanonicalPreApplyHeader,
-    EncodedCanonicalEnvelope, PreparedCanonicalWalRecord,
+    canonical_fragment_body_limit, canonical_logical_intent_outcome_bytes,
+    canonical_request_digest, canonical_wal_footprint, decode_canonical_envelope,
+    decode_canonical_outcome_exact, decode_canonical_record_payload, encode_canonical_envelope,
+    encode_canonical_outcome_into_exact, encode_canonical_record_exact_from_borrowed,
+    encode_canonical_record_exact_into, measure_canonical_exact_buffers,
+    measure_canonical_exact_buffers_from_fragments, pack_canonical_record_payload,
+    prepare_exact_canonical_wal_record, CanonicalCatalogTail, CanonicalDigest, CanonicalEnvelope,
+    CanonicalFragment, CanonicalFragmentKind, CanonicalFragmentRef, CanonicalIdentity,
+    CanonicalIsolation, CanonicalOutcome, CanonicalOutcomeKind, CanonicalPhysicalRange,
+    CanonicalPreApplyHeader, CanonicalWalFootprint, EncodedCanonicalEnvelope,
+    ExactCanonicalRecordEncoding, PreparedCanonicalWalRecord, CANONICAL_OUTCOME_BYTES,
 };
 
 mod identity;
@@ -85,7 +91,7 @@ pub(crate) use sidecar_checksum::{append_sha256_trailer, verify_sha256_trailer};
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_ARCHIVE_MANIFEST_MAGIC_V1: &str = "GPUDBWALARCHIVE1";
 const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE2";
-const WAL_RECORD_HEADER_LEN: usize = 24;
+pub(crate) const WAL_RECORD_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
@@ -1829,15 +1835,26 @@ pub fn encode_wal_record_parts_into(buf: &mut Vec<u8>, txn_id: TxnId, payload: &
 }
 
 fn encode_record_into(buf: &mut Vec<u8>, record: &WalRecord) -> Result<(), EngineError> {
-    let payload_len = u64::try_from(record.payload.len()).map_err(|_| {
-        EngineError::Durability("WAL record payload length exceeds u64".to_string())
-    })?;
-    let checksum = wal_record_checksum(record.txn_id, payload_len, &record.payload);
-    buf.extend_from_slice(&record.txn_id.to_le_bytes());
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.extend_from_slice(&checksum.to_le_bytes());
+    let mut header = [0; WAL_RECORD_HEADER_LEN];
+    encode_record_header_into(&mut header, record);
+    buf.extend_from_slice(&header);
     buf.extend_from_slice(&record.payload);
     Ok(())
+}
+
+/// Encode the fixed on-disk WAL record header without materializing or copying the payload.
+///
+/// A `usize` payload length always fits the `u64` storage field on supported targets, so this
+/// cannot fail after a group has moved a claimed exact owner into its durable scatter list.
+pub(crate) fn encode_record_header_into(
+    header: &mut [u8; WAL_RECORD_HEADER_LEN],
+    record: &WalRecord,
+) {
+    let payload_len = record.payload.len() as u64;
+    let checksum = wal_record_checksum(record.txn_id, payload_len, &record.payload);
+    header[0..8].copy_from_slice(&record.txn_id.to_le_bytes());
+    header[8..16].copy_from_slice(&payload_len.to_le_bytes());
+    header[16..24].copy_from_slice(&checksum.to_le_bytes());
 }
 
 /// On-disk byte length of one serialized record.

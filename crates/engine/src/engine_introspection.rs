@@ -221,10 +221,8 @@ impl Engine {
             .values()
             .map(|table| table.oid)
             .collect::<BTreeSet<_>>();
-        let history = self.read_state.catalog_history.load();
         self.read_state
-            .catalog_history
-            .store(Arc::new(history.pushed(generation, prune_below)));
+            .publish_catalog_generation_with_point_slot_fence(generation, prune_below);
         // A dropped OID's fence remains until every retained read boundary that can predate it has
         // drained. Live OIDs keep their latest fence; dropped/recreated churn cannot grow the map.
         self.read_state
@@ -245,6 +243,22 @@ impl Engine {
         cat: &DdlCatalogState,
     ) {
         ledger.reconcile_table_roots(prior_identities, &Self::table_root_identities(cat));
+    }
+
+    /// Test-only name convenience over the production stable-OID ledger API.
+    /// The lookup is deliberately outside `RecentCommitsLedger`: production
+    /// callers must bind catalog identity before consulting a table root.
+    #[cfg(test)]
+    pub(crate) fn test_table_root_index(&self, table: &str) -> Index {
+        let Some(table_oid) = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(table)
+            .map(|relation| relation.oid)
+        else {
+            return 0;
+        };
+        self.commit_state().ledger.table_root_index(table_oid)
     }
 
     /// The oldest active read snapshot's prune boundary for the catalog ring: generations strictly

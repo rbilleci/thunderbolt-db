@@ -58,6 +58,13 @@ pub(crate) use sequence_value_codec::{
     valid_sequence_value_transition, validate_sequence_envelope_transaction_id,
     BinarySequenceValueOperation, BinarySequenceValueTransitionRecord, SequenceValueInput,
 };
+// Codec-5 S5/S6 owns these as an inert internal facade before any live route consumes them.
+// They are deliberately narrower than exposing the whole legacy sequence codec module.
+#[allow(unused_imports)]
+pub(crate) use sequence_value_codec::{
+    decode_sequence_value_reference_exact, encode_sequence_value_reference_into_exact,
+    valid_sequence_value_reference_closure, ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES,
+};
 pub(crate) use transaction_types::{
     BinarySequenceValueReference, BinaryTransactionCatalogCommand, BinaryTransactionCatalogEpoch,
     BinaryTransactionCatalogOutput, BinaryTransactionMutation, BinaryTransactionRecord,
@@ -246,7 +253,7 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
     }
     if !created_index_closure_valid
         || index_command_catalog != index_identity_catalog
-        || sequence_command_catalog != !record.sequence_lifecycle_operations.is_empty()
+        || sequence_command_catalog == record.sequence_lifecycle_operations.is_empty()
         || (!record.sequence_advances_by_oid.is_empty() && !sequence_identity_catalog)
         || (sequence_identity_catalog && !index_catalog)
         || (index_semantics_required && !index_catalog)

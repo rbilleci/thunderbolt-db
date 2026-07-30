@@ -2,7 +2,7 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 
 use super::resident_memory::CudaResidentReadSource;
-use super::{check_cuda, CudaResidentDeviceMemory, CudaRuntimeProbeError};
+use super::{check_cuda, CudaHostScratchGeometry, CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 /// M1 (charter-pure device WRITE-LOCATE): one shard's DEVICE hash index + its packing params. The
 /// write path (A2 DML resolve, A3 validators) probes these ON THE DEVICE — replacing the host
@@ -27,6 +27,86 @@ pub struct WriteLocateResult {
     pub slot: Vec<u32>,
     /// `needle_count`: hits found (u32::MAX = overflow).
     pub count: Vec<u32>,
+    /// Exact maximum call-local host backing observed while descriptor, index-guard, PTX, and
+    /// returned readback vectors were simultaneously live.
+    pub host_peak: CudaHostScratchGeometry,
+}
+
+/// Exact pooled-device and host-readback geometry for one
+/// [`CudaResidentDeviceMemory::submit_multi_shard_i32_write_locate`] call.  Callers that reserve
+/// an enclosing [`crate::CudaAllocationScope`] use this before the first lease so the locate
+/// primitive cannot fail after only part of its bounded scratch has been acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaWriteLocateResourceGeometry {
+    pub preparation_bytes: u64,
+    pub readback_bytes: u64,
+    pub host_peak_bytes: u64,
+    pub host_peak_allocation_slots: u64,
+}
+
+/// Return the exact resource geometry for a valid write-locate invocation.  The count-only form
+/// (`max_hits == 0`) deliberately omits the two hit windows, matching the launch implementation.
+pub fn multi_shard_i32_write_locate_resource_geometry(
+    shard_count: usize,
+    needle_count: usize,
+    max_hits: u32,
+) -> Option<CudaWriteLocateResourceGeometry> {
+    if shard_count == 0
+        || needle_count == 0
+        || u32::try_from(shard_count).is_err()
+        || u32::try_from(needle_count).is_err()
+    {
+        return None;
+    }
+    let needle_bytes = needle_count.checked_mul(std::mem::size_of::<i32>())?;
+    let count_bytes = needle_count.checked_mul(std::mem::size_of::<u32>())?;
+    let descriptor_bytes = shard_count
+        .checked_mul(3)?
+        .checked_mul(std::mem::size_of::<u64>())?;
+    let window_bytes = needle_count
+        .checked_mul(max_hits as usize)?
+        .checked_mul(std::mem::size_of::<u32>())?;
+    let requests = if max_hits == 0 {
+        [needle_bytes, count_bytes, descriptor_bytes, 0, 0]
+    } else {
+        [
+            needle_bytes,
+            count_bytes,
+            descriptor_bytes,
+            window_bytes,
+            window_bytes,
+        ]
+    };
+    let preparation_bytes =
+        requests
+            .into_iter()
+            .filter(|bytes| *bytes != 0)
+            .try_fold(0_u64, |total, bytes| {
+                let bucket = crate::cuda_context::checked_output_buffer_bucket(bytes)?;
+                total.checked_add(u64::try_from(bucket).ok()?)
+            })?;
+    let readback_bytes = count_bytes
+        .checked_add(if max_hits == 0 {
+            0
+        } else {
+            window_bytes.checked_mul(2)?
+        })
+        .and_then(|bytes| u64::try_from(bytes).ok())?;
+    let host_internal_bytes = descriptor_bytes
+        .checked_add(
+            shard_count.checked_mul(std::mem::size_of::<Arc<CudaResidentDeviceMemory>>())?,
+        )?
+        .checked_add(WRITE_LOCATE_PTX.len().checked_add(1)?)?;
+    let host_peak_bytes = u64::try_from(host_internal_bytes)
+        .ok()?
+        .checked_add(readback_bytes)?;
+    let host_peak_allocation_slots = if max_hits == 0 { 4 } else { 6 };
+    Some(CudaWriteLocateResourceGeometry {
+        preparation_bytes,
+        readback_bytes,
+        host_peak_bytes,
+        host_peak_allocation_slots,
+    })
 }
 
 /// U1 (lane DELETE intents): one shard's device hash index + its VERSION regions for the
@@ -457,6 +537,55 @@ DONE:
 }
 "#;
 
+fn observed_write_locate_host_peak(
+    descriptors: &Vec<u64>,
+    index_guards: &Vec<Arc<CudaResidentDeviceMemory>>,
+    ptx: &Vec<u8>,
+    shard_idx: &Vec<u32>,
+    slots: &Vec<u32>,
+    counts: &Vec<u32>,
+) -> Result<CudaHostScratchGeometry, CudaRuntimeProbeError> {
+    let owners = [
+        (
+            descriptors.capacity(),
+            std::mem::size_of::<u64>(),
+            "descriptor",
+        ),
+        (
+            index_guards.capacity(),
+            std::mem::size_of::<Arc<CudaResidentDeviceMemory>>(),
+            "index guard",
+        ),
+        (ptx.capacity(), std::mem::size_of::<u8>(), "PTX"),
+        (shard_idx.capacity(), std::mem::size_of::<u32>(), "shard"),
+        (slots.capacity(), std::mem::size_of::<u32>(), "slot"),
+        (counts.capacity(), std::mem::size_of::<u32>(), "count"),
+    ];
+    let mut bytes = 0_u64;
+    let mut allocation_slots = 0_u64;
+    for (capacity, element_bytes, _domain) in owners {
+        if capacity == 0 || element_bytes == 0 {
+            continue;
+        }
+        let owner_bytes = capacity
+            .checked_mul(element_bytes)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        bytes = bytes
+            .checked_add(
+                u64::try_from(owner_bytes)
+                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(owner_bytes))?,
+            )
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        allocation_slots = allocation_slots
+            .checked_add(1)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    }
+    Ok(CudaHostScratchGeometry {
+        bytes,
+        allocation_slots,
+    })
+}
+
 impl CudaResidentDeviceMemory {
     /// M1 (charter-pure): probe a BATCH of int4 `needles` against ALL `shards`' DEVICE hash indexes in
     /// ONE kernel launch, emitting each needle's `(shard_idx, slot)` hits. Replaces the host
@@ -689,6 +818,16 @@ impl CudaResidentDeviceMemory {
         if count.contains(&INVALID_COUNT) {
             return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
         }
+        let observed_host_peak =
+            observed_write_locate_host_peak(&desc, &index_guards, &ptx, &shard_idx, &slot, &count)?;
+        let expected_host_peak =
+            multi_shard_i32_write_locate_resource_geometry(shards.len(), needles.len(), max_hits)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if observed_host_peak.bytes != expected_host_peak.host_peak_bytes
+            || observed_host_peak.allocation_slots != expected_host_peak.host_peak_allocation_slots
+        {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
         stream_drain.armed = false;
         // The guards (device buffers + pinned indexes) drop here — after the sync, so the kernel is done.
         drop(index_guards);
@@ -697,6 +836,7 @@ impl CudaResidentDeviceMemory {
             shard_idx,
             slot,
             count,
+            host_peak: observed_host_peak,
         })
     }
 
@@ -975,7 +1115,7 @@ impl CudaResidentDeviceMemory {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_index_geometry;
+    use super::{multi_shard_i32_write_locate_resource_geometry, validate_index_geometry};
 
     #[test]
     fn write_locate_geometry_requires_exact_power_of_two_addressing() {
@@ -984,5 +1124,43 @@ mod tests {
         assert!(validate_index_geometry(132, 14, 28, 1).is_err());
         assert!(validate_index_geometry(132, 15, 27, 1).is_err());
         assert!(validate_index_geometry(u64::MAX, 0, 32, 1).is_err());
+    }
+
+    #[test]
+    fn write_locate_resource_geometry_counts_every_pooled_lease_and_readback() {
+        assert_eq!(
+            multi_shard_i32_write_locate_resource_geometry(1, 1, 1),
+            Some(super::CudaWriteLocateResourceGeometry {
+                preparation_bytes: 1_280,
+                readback_bytes: 12,
+                host_peak_bytes: (3 * std::mem::size_of::<u64>()
+                    + std::mem::size_of::<std::sync::Arc<super::CudaResidentDeviceMemory>>()
+                    + super::WRITE_LOCATE_PTX.len()
+                    + 1
+                    + 3 * std::mem::size_of::<u32>()) as u64,
+                host_peak_allocation_slots: 6,
+            })
+        );
+        assert_eq!(
+            multi_shard_i32_write_locate_resource_geometry(1, 1, 0),
+            Some(super::CudaWriteLocateResourceGeometry {
+                preparation_bytes: 768,
+                readback_bytes: 4,
+                host_peak_bytes: (3 * std::mem::size_of::<u64>()
+                    + std::mem::size_of::<std::sync::Arc<super::CudaResidentDeviceMemory>>()
+                    + super::WRITE_LOCATE_PTX.len()
+                    + 1
+                    + std::mem::size_of::<u32>()) as u64,
+                host_peak_allocation_slots: 4,
+            })
+        );
+        assert_eq!(
+            multi_shard_i32_write_locate_resource_geometry(0, 1, 1),
+            None
+        );
+        assert_eq!(
+            multi_shard_i32_write_locate_resource_geometry(1, 0, 1),
+            None
+        );
     }
 }

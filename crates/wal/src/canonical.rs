@@ -8,6 +8,16 @@
 
 use gpu_db_types::EngineError;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+
+mod exact;
+pub use exact::{
+    encode_canonical_record_exact_from_borrowed, encode_canonical_record_exact_into,
+    measure_canonical_exact_buffers, measure_canonical_exact_buffers_from_fragments,
+    CanonicalFragmentRef, ExactCanonicalRecordEncoding,
+};
+#[cfg(test)]
+mod exact_tests;
 
 pub type CanonicalDigest = [u8; 32];
 
@@ -22,8 +32,23 @@ const FRAME_FRAGMENT: u8 = 1;
 const FRAME_MARKER: u8 = 2;
 const FRAME_FIXED_BYTES: usize = 244;
 const FRAME_DIGEST_BYTES: usize = 32;
+const PREAPPLY_HEADER_BYTES: usize = 240;
+/// Exact byte width of a canonical terminal outcome.
+///
+/// This is an independently usable, fixed-width subcodec of the canonical envelope.  Callers
+/// that reserve a complete envelope can use [`encode_canonical_outcome_into_exact`] without an
+/// intermediate allocation, while readers must use [`decode_canonical_outcome_exact`] to retain
+/// the layout's no-truncation/no-surplus rule.
+pub const CANONICAL_OUTCOME_BYTES: usize = 92;
+const PACKED_RECORD_PREFIX_BYTES: usize = RECORD_MAGIC.len() + std::mem::size_of::<u32>();
+const PACKED_FRAME_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum raw canonical-fragment body accepted by the real envelope encoder.
+pub const fn canonical_fragment_body_limit() -> u64 {
+    MAX_FRAGMENT_BYTES as u64
+}
 
 const PREAPPLY_DOMAIN: &[u8] = b"gpu-db/adr014/preapply/v1";
 const FRAGMENT_LEAF_DOMAIN: &[u8] = b"gpu-db/adr014/fragment-leaf/v1";
@@ -33,6 +58,149 @@ const FRAME_DOMAIN: &[u8] = b"gpu-db/adr014/physical-frame/v1";
 
 fn durability(message: impl Into<String>) -> EngineError {
     EngineError::Durability(format!("canonical WAL: {}", message.into()))
+}
+
+/// Exact storage framing for canonical fragments before any physical range/header values exist.
+///
+/// This is an accounting-only projection of the canonical encoder and packer. It carries no WAL
+/// record, physical coordinates, or append capability, and every bound matches the real
+/// `encode_canonical_envelope`/`pack_canonical_record_payload` path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalWalFootprint {
+    pub fragment_count: u32,
+    /// Canonical fragment frames plus the one required terminal outcome-marker frame.
+    pub frame_count: u32,
+    /// Sum of the raw canonical fragment bodies, excluding fragment kinds and framing.
+    pub fragment_body_bytes: u64,
+    /// One pre-apply header plus the raw fragment bodies, the encoder's envelope-limit input.
+    pub preapply_bytes: u64,
+    /// All fragment frames including their digest tails, but excluding packed u32 lengths.
+    pub fragment_frame_bytes: u64,
+    /// The terminal outcome-marker frame including its digest tail, but excluding packed length.
+    pub marker_frame_bytes: u64,
+    /// Packed fragment slots, including each u32 frame length.
+    pub fragment_packed_bytes: u64,
+    /// Packed terminal marker slot, including its u32 frame length.
+    pub marker_packed_bytes: u64,
+    /// Exact `WalRecord::payload` bytes after canonical frame packing.
+    pub packed_record_bytes: u64,
+    /// Exact serialized record bytes including the immutable 24-byte outer WAL header.
+    pub serialized_record_bytes: u64,
+}
+
+/// Compute canonical framing bytes from already-bounded fragment-body lengths without encoding
+/// payload buffers. The caller supplies only body lengths: kind, header, digest, marker, packed
+/// slot, and outer-record costs remain owned here beside the real encoder.
+pub fn canonical_wal_footprint(
+    fragment_body_lengths: &[u64],
+) -> Result<CanonicalWalFootprint, EngineError> {
+    canonical_wal_footprint_by_index(fragment_body_lengths.len(), |index| {
+        Ok(fragment_body_lengths[index])
+    })
+}
+
+/// Shared framing arithmetic for the allocating v1 encoder, the public count-only projection,
+/// and the exact caller-buffer encoder. `body_len` is intentionally index-addressed so the exact
+/// path can traverse existing fragments without building a length collection.
+pub(super) fn canonical_wal_footprint_by_index(
+    fragment_len: usize,
+    mut body_len: impl FnMut(usize) -> Result<u64, EngineError>,
+) -> Result<CanonicalWalFootprint, EngineError> {
+    let fragment_count = u32::try_from(fragment_len)
+        .map_err(|_| durability("fragment count exceeds u32 framing"))?;
+    if fragment_count == 0 || fragment_count == u32::MAX {
+        return Err(durability("fragment count must be in 1..u32::MAX"));
+    }
+    let frame_count = fragment_count
+        .checked_add(1)
+        .ok_or_else(|| durability("frame count overflows"))?;
+
+    let max_fragment = u64::try_from(MAX_FRAGMENT_BYTES)
+        .map_err(|_| durability("fragment byte bound exceeds u64"))?;
+    let max_envelope = u64::try_from(MAX_ENVELOPE_BYTES)
+        .map_err(|_| durability("envelope byte bound exceeds u64"))?;
+    let preapply_header = u64::try_from(PREAPPLY_HEADER_BYTES)
+        .map_err(|_| durability("pre-apply header bytes exceed u64"))?;
+    let frame_fixed =
+        u64::try_from(FRAME_FIXED_BYTES).map_err(|_| durability("frame fixed bytes exceed u64"))?;
+    let frame_digest = u64::try_from(FRAME_DIGEST_BYTES)
+        .map_err(|_| durability("frame digest bytes exceed u64"))?;
+    let packed_prefix = u64::try_from(PACKED_RECORD_PREFIX_BYTES)
+        .map_err(|_| durability("packed record prefix exceeds u64"))?;
+    let packed_length = u64::try_from(PACKED_FRAME_LENGTH_BYTES)
+        .map_err(|_| durability("packed frame length exceeds u64"))?;
+    let outcome_bytes = u64::try_from(CANONICAL_OUTCOME_BYTES)
+        .map_err(|_| durability("outcome bytes exceed u64"))?;
+    let outer_record = u64::try_from(crate::WAL_RECORD_HEADER_LEN)
+        .map_err(|_| durability("outer WAL header exceeds u64"))?;
+
+    let mut fragment_body_bytes = 0_u64;
+    let mut fragment_frame_bytes = 0_u64;
+    for index in 0..fragment_len {
+        let body = body_len(index)?;
+        if body > max_fragment {
+            return Err(durability(format!("fragment {index} exceeds byte bound")));
+        }
+        fragment_body_bytes = fragment_body_bytes
+            .checked_add(body)
+            .ok_or_else(|| durability("fragment body byte sum overflows"))?;
+        let header = if index == 0 { preapply_header } else { 0 };
+        let frame = frame_fixed
+            .checked_add(header)
+            .and_then(|bytes| bytes.checked_add(body))
+            .and_then(|bytes| bytes.checked_add(frame_digest))
+            .ok_or_else(|| durability("fragment frame byte length overflows"))?;
+        fragment_frame_bytes = fragment_frame_bytes
+            .checked_add(frame)
+            .ok_or_else(|| durability("fragment frame byte sum overflows"))?;
+    }
+    let preapply_bytes = preapply_header
+        .checked_add(fragment_body_bytes)
+        .ok_or_else(|| durability("pre-apply envelope byte length overflows"))?;
+    if preapply_bytes > max_envelope {
+        return Err(durability("envelope exceeds byte bound"));
+    }
+
+    let marker_frame_bytes = frame_fixed
+        .checked_add(outcome_bytes)
+        .and_then(|bytes| bytes.checked_add(frame_digest))
+        .ok_or_else(|| durability("marker frame byte length overflows"))?;
+    let fragment_packed_bytes = fragment_frame_bytes
+        .checked_add(
+            packed_length
+                .checked_mul(u64::from(fragment_count))
+                .ok_or_else(|| durability("fragment packed length count overflows"))?,
+        )
+        .ok_or_else(|| durability("fragment packed byte sum overflows"))?;
+    let marker_packed_bytes = packed_length
+        .checked_add(marker_frame_bytes)
+        .ok_or_else(|| durability("marker packed byte length overflows"))?;
+    let packed_record_bytes = packed_prefix
+        .checked_add(fragment_packed_bytes)
+        .and_then(|bytes| bytes.checked_add(marker_packed_bytes))
+        .ok_or_else(|| durability("canonical record byte length overflow"))?;
+    let max_packed = max_envelope
+        .checked_add(1024 * 1024)
+        .ok_or_else(|| durability("canonical packed byte bound overflows"))?;
+    if packed_record_bytes > max_packed {
+        return Err(durability("canonical record exceeds byte bound"));
+    }
+    let serialized_record_bytes = packed_record_bytes
+        .checked_add(outer_record)
+        .ok_or_else(|| durability("serialized record byte length overflow"))?;
+
+    Ok(CanonicalWalFootprint {
+        fragment_count,
+        frame_count,
+        fragment_body_bytes,
+        preapply_bytes,
+        fragment_frame_bytes,
+        marker_frame_bytes,
+        fragment_packed_bytes,
+        marker_packed_bytes,
+        packed_record_bytes,
+        serialized_record_bytes,
+    })
 }
 
 fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> CanonicalDigest {
@@ -138,32 +306,40 @@ impl CanonicalPreApplyHeader {
     }
 
     fn encode(&self) -> Result<Vec<u8>, EngineError> {
-        self.validate()?;
-        let mut out = Vec::with_capacity(236);
-        out.extend_from_slice(HEADER_MAGIC);
-        put_u16(&mut out, FORMAT_VERSION);
-        put_u16(&mut out, SEMANTICS_VERSION);
-        put_u16(&mut out, MIN_READER_VERSION);
-        put_u16(&mut out, MAX_READER_VERSION);
-        out.extend_from_slice(&self.identity.database_id);
-        out.extend_from_slice(&self.identity.cluster_id);
-        out.extend_from_slice(&self.identity.timeline_id);
-        put_u64(&mut out, self.identity.format_epoch);
-        put_u64(&mut out, self.leader_epoch);
-        put_u64(&mut out, self.commit_seq);
-        put_u64(&mut out, self.stable_transaction_id);
-        out.extend_from_slice(&self.request_digest);
-        out.push(self.isolation as u8);
-        out.extend_from_slice(&[0; 3]);
-        put_u32(&mut out, self.flags);
-        put_u64(&mut out, self.catalog_before_epoch);
-        put_u64(&mut out, self.catalog_after_epoch);
-        out.extend_from_slice(&self.catalog_before_digest);
-        out.extend_from_slice(&self.catalog_after_digest);
-        put_u32(&mut out, self.operation_count);
-        put_u32(&mut out, self.table_block_count);
-        put_u64(&mut out, self.allocator_high_water);
+        let mut out = vec![0; PREAPPLY_HEADER_BYTES];
+        self.encode_into(&mut out)?;
         Ok(out)
+    }
+
+    /// Encode the immutable header into its one fixed v1 layout. The exact-buffer path shares
+    /// this field order with the legacy allocating encoder.
+    pub(super) fn encode_into(&self, out: &mut [u8]) -> Result<(), EngineError> {
+        self.validate()?;
+        let mut writer = FixedEncoder::new(out);
+        writer.bytes(HEADER_MAGIC)?;
+        writer.u16(FORMAT_VERSION)?;
+        writer.u16(SEMANTICS_VERSION)?;
+        writer.u16(MIN_READER_VERSION)?;
+        writer.u16(MAX_READER_VERSION)?;
+        writer.bytes(&self.identity.database_id)?;
+        writer.bytes(&self.identity.cluster_id)?;
+        writer.bytes(&self.identity.timeline_id)?;
+        writer.u64(self.identity.format_epoch)?;
+        writer.u64(self.leader_epoch)?;
+        writer.u64(self.commit_seq)?;
+        writer.u64(self.stable_transaction_id)?;
+        writer.bytes(&self.request_digest)?;
+        writer.u8(self.isolation as u8)?;
+        writer.bytes(&[0; 3])?;
+        writer.u32(self.flags)?;
+        writer.u64(self.catalog_before_epoch)?;
+        writer.u64(self.catalog_after_epoch)?;
+        writer.bytes(&self.catalog_before_digest)?;
+        writer.bytes(&self.catalog_after_digest)?;
+        writer.u32(self.operation_count)?;
+        writer.u32(self.table_block_count)?;
+        writer.u64(self.allocator_high_water)?;
+        writer.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
@@ -242,7 +418,12 @@ pub enum CanonicalFragmentKind {
 }
 
 impl CanonicalFragmentKind {
-    fn decode(value: u16) -> Result<Self, EngineError> {
+    /// Decode the exact v1 wire value for a canonical fragment kind.
+    ///
+    /// This is the sole numeric-kind authority for current canonical-envelope readers.
+    /// Callers must reject values not represented by this enum rather than assigning a
+    /// compatibility fallback.
+    pub fn decode(value: u16) -> Result<Self, EngineError> {
         match value {
             1 => Ok(Self::RowMutation),
             2 => Ok(Self::CatalogMutation),
@@ -296,7 +477,7 @@ pub struct CanonicalOutcome {
 }
 
 impl CanonicalOutcome {
-    fn encode(&self) -> Result<Vec<u8>, EngineError> {
+    fn validate(&self) -> Result<(), EngineError> {
         match (self.kind, self.sqlstate) {
             (CanonicalOutcomeKind::AbortError, Some(state))
                 if state.iter().all(u8::is_ascii_alphanumeric) => {}
@@ -306,17 +487,29 @@ impl CanonicalOutcome {
             (_, None) => {}
             (_, Some(_)) => return Err(durability("successful outcome must not carry SQLSTATE")),
         }
-        let mut out = Vec::with_capacity(88);
-        out.push(self.kind as u8);
-        out.push(u8::from(self.sqlstate.is_some()));
-        out.extend_from_slice(&[0; 2]);
-        put_u64(&mut out, self.affected_rows);
-        put_u64(&mut out, self.constraint_id);
-        out.extend_from_slice(&self.sqlstate.unwrap_or([0; 5]));
-        out.extend_from_slice(&[0; 3]);
-        out.extend_from_slice(&self.target_digest);
-        out.extend_from_slice(&self.returning_digest);
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, EngineError> {
+        let mut out = vec![0; CANONICAL_OUTCOME_BYTES];
+        self.encode_into(&mut out)?;
         Ok(out)
+    }
+
+    /// Encode the fixed terminal-outcome layout used by both v1 encoder forms.
+    pub(super) fn encode_into(&self, out: &mut [u8]) -> Result<(), EngineError> {
+        self.validate()?;
+        let mut writer = FixedEncoder::new(out);
+        writer.u8(self.kind as u8)?;
+        writer.u8(u8::from(self.sqlstate.is_some()))?;
+        writer.bytes(&[0; 2])?;
+        writer.u64(self.affected_rows)?;
+        writer.u64(self.constraint_id)?;
+        writer.bytes(&self.sqlstate.unwrap_or([0; 5]))?;
+        writer.bytes(&[0; 3])?;
+        writer.bytes(&self.target_digest)?;
+        writer.bytes(&self.returning_digest)?;
+        writer.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
@@ -333,6 +526,9 @@ impl CanonicalOutcome {
         let affected_rows = cursor.u64()?;
         let constraint_id = cursor.u64()?;
         let state: [u8; 5] = cursor.array()?;
+        if !has_sqlstate && state != [0; 5] {
+            return Err(durability("non-zero absent outcome SQLSTATE"));
+        }
         if cursor.take(3)? != [0; 3] {
             return Err(durability("non-zero outcome padding"));
         }
@@ -347,9 +543,35 @@ impl CanonicalOutcome {
             target_digest,
             returning_digest,
         };
-        outcome.encode()?;
+        outcome.validate()?;
         Ok(outcome)
     }
+}
+
+/// Encode one canonical terminal outcome into the exact fixed-width caller buffer.
+///
+/// The output remains untouched when validation fails.  This owns no envelope framing and makes
+/// no allocation; it is deliberately the same private layout writer used by v1 canonical
+/// envelopes.
+pub fn encode_canonical_outcome_into_exact(
+    outcome: &CanonicalOutcome,
+    out: &mut [u8; CANONICAL_OUTCOME_BYTES],
+) -> Result<(), EngineError> {
+    outcome.encode_into(out)
+}
+
+/// Decode one canonical terminal outcome only when `bytes` is the exact fixed width.
+///
+/// In addition to rejecting truncation and surplus, this enforces every reserved byte and the
+/// canonical SQLSTATE flag/value relation before yielding an outcome.
+pub fn decode_canonical_outcome_exact(bytes: &[u8]) -> Result<CanonicalOutcome, EngineError> {
+    if bytes.len() != CANONICAL_OUTCOME_BYTES {
+        return Err(durability(format!(
+            "canonical outcome length {} does not match exact width {CANONICAL_OUTCOME_BYTES}",
+            bytes.len()
+        )));
+    }
+    CanonicalOutcome::decode(bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +636,41 @@ pub struct CanonicalCatalogTail {
 pub struct PreparedCanonicalWalRecord {
     record: crate::WalRecord,
     tail: CanonicalCatalogTail,
+    /// Typed INSERT's pre-WAL owner retains the exact outer bytes and the immutable inputs that
+    /// produced them.  Generic/legacy canonical callers deliberately leave this absent and keep
+    /// the allocating compatibility encoder until they migrate to the typed lifecycle.
+    exact: Option<ExactCanonicalRecordAuthority>,
+}
+
+/// Immutable authority for one exact-buffer canonical record.
+///
+/// The packed bytes remain in the paired [`crate::WalRecord`] because replication owns that
+/// payload.  This value owns only the independently framed outer record used by `WalBuffer`,
+/// together with enough immutable evidence to reject a mismatched owner before it mutates a
+/// logical frontier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactCanonicalRecordAuthority {
+    serialized_record: Arc<[u8]>,
+    encoding: ExactCanonicalRecordEncoding,
+    physical: CanonicalPhysicalRange,
+    header: CanonicalPreApplyHeader,
+}
+
+impl ExactCanonicalRecordAuthority {
+    /// Exact v1 outer WAL bytes, including the 24-byte storage header and checksum.
+    pub(crate) fn serialized_record(&self) -> &Arc<[u8]> {
+        &self.serialized_record
+    }
+
+    /// Immutable geometry/digest proof from the exact encoder.
+    pub(crate) fn encoding(&self) -> ExactCanonicalRecordEncoding {
+        self.encoding
+    }
+
+    /// The identity/catalog/commit binding validated before proposal.
+    pub(crate) fn header(&self) -> &CanonicalPreApplyHeader {
+        &self.header
+    }
 }
 
 impl PreparedCanonicalWalRecord {
@@ -429,8 +686,38 @@ impl PreparedCanonicalWalRecord {
         self.record
     }
 
-    pub(crate) fn into_parts(self) -> (crate::WalRecord, CanonicalCatalogTail) {
-        (self.record, self.tail)
+    /// Typed callers use this to prove that replication receives the precise packed bytes which
+    /// remain paired with the prebuilt outer record.  It intentionally borrows the existing Arc;
+    /// no payload materialization or re-encoding is permitted after proposal.
+    pub(crate) fn exact_packed_payload(&self) -> Option<&Arc<[u8]>> {
+        self.exact.as_ref().map(|_| &self.record.payload)
+    }
+
+    /// Typed callers use this to hand the prebuilt outer bytes to `WalBuffer` unchanged.
+    pub(crate) fn exact_authority(&self) -> Option<&ExactCanonicalRecordAuthority> {
+        self.exact.as_ref()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::WalRecord,
+        CanonicalCatalogTail,
+        Option<ExactCanonicalRecordAuthority>,
+    ) {
+        (self.record, self.tail, self.exact)
+    }
+
+    pub(crate) fn from_parts(
+        record: crate::WalRecord,
+        tail: CanonicalCatalogTail,
+        exact: Option<ExactCanonicalRecordAuthority>,
+    ) -> Self {
+        Self {
+            record,
+            tail,
+            exact,
+        }
     }
 }
 
@@ -452,8 +739,83 @@ impl EncodedCanonicalEnvelope {
                 payload: payload.into(),
             },
             tail,
+            exact: None,
         })
     }
+}
+
+/// Build typed INSERT's one exact canonical record before replication proposal.
+///
+/// This is intentionally the sole constructor that couples the packed `WalRecord` payload with
+/// an Arc-backed outer serialized record.  Both buffers are exactly measured and filled before
+/// this function returns; after proposal the caller can only move this immutable owner through
+/// the reservation lifecycle.
+pub fn prepare_exact_canonical_wal_record(
+    txn_id: gpu_db_types::TxnId,
+    physical: CanonicalPhysicalRange,
+    header: CanonicalPreApplyHeader,
+    fragments: &[CanonicalFragment],
+    outcome: CanonicalOutcome,
+) -> Result<PreparedCanonicalWalRecord, EngineError> {
+    let footprint =
+        measure_canonical_exact_buffers_from_fragments(physical, &header, fragments, &outcome)?;
+    let packed_len = usize::try_from(footprint.packed_record_bytes)
+        .map_err(|_| durability("packed canonical record exceeds addressable memory"))?;
+    let serialized_len = usize::try_from(footprint.serialized_record_bytes)
+        .map_err(|_| durability("serialized canonical record exceeds addressable memory"))?;
+    // These are the persistent authority buffers.  They are allocated and Arc-backed before the
+    // proposal boundary; later lifecycle phases only clone/move their Arc handles.
+    let mut packed = exact_authority_buffer(packed_len, "packed canonical record")?;
+    let mut serialized = exact_authority_buffer(serialized_len, "serialized canonical record")?;
+    let encoding = encode_canonical_record_exact_into(
+        txn_id,
+        physical,
+        &header,
+        fragments,
+        &outcome,
+        &mut packed,
+        &mut serialized,
+    )?;
+    debug_assert_eq!(encoding.footprint, footprint);
+    let packed: Arc<[u8]> = packed.into();
+    let serialized: Arc<[u8]> = serialized.into();
+    let payload_start = crate::WAL_RECORD_HEADER_LEN;
+    if serialized.get(payload_start..) != Some(packed.as_ref()) {
+        return Err(durability(
+            "exact serialized record payload diverged from packed replication payload",
+        ));
+    }
+    let tail = CanonicalCatalogTail {
+        identity: header.identity,
+        catalog_after_epoch: header.catalog_after_epoch,
+        catalog_after_digest: header.catalog_after_digest,
+    };
+    Ok(PreparedCanonicalWalRecord {
+        record: crate::WalRecord {
+            txn_id,
+            payload: packed,
+        },
+        tail,
+        exact: Some(ExactCanonicalRecordAuthority {
+            serialized_record: serialized,
+            encoding,
+            physical,
+            header,
+        }),
+    })
+}
+
+fn exact_authority_buffer(len: usize, label: &str) -> Result<Vec<u8>, EngineError> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| {
+        durability(format!(
+            "unable to reserve exact {label} authority before replication proposal"
+        ))
+    })?;
+    // The reservation above fixes capacity; resize cannot allocate and simply initializes the
+    // exact caller-owned output range required by the encoder.
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
 /// Exact manifest-accounted logical intent/outcome bytes.
@@ -660,43 +1022,94 @@ fn encode_frame(
     root: CanonicalDigest,
     leaf_or_final: CanonicalDigest,
 ) -> Result<Vec<u8>, EngineError> {
+    let frame_len = canonical_frame_encoded_len(header_bytes.len(), body.len())?;
+    let mut frame = vec![0; frame_len];
+    encode_frame_into(
+        &mut frame,
+        frame_type,
+        physical,
+        header,
+        frame_index,
+        fragment_count,
+        kind,
+        header_bytes,
+        body,
+        header_digest,
+        root,
+        leaf_or_final,
+    )?;
+    Ok(frame)
+}
+
+pub(super) fn canonical_frame_encoded_len(
+    header_len: usize,
+    body_len: usize,
+) -> Result<usize, EngineError> {
+    FRAME_FIXED_BYTES
+        .checked_add(header_len)
+        .and_then(|bytes| bytes.checked_add(body_len))
+        .and_then(|bytes| bytes.checked_add(FRAME_DIGEST_BYTES))
+        .ok_or_else(|| durability("physical frame byte length overflow"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_frame_into(
+    frame: &mut [u8],
+    frame_type: u8,
+    physical: CanonicalPhysicalRange,
+    header: &CanonicalPreApplyHeader,
+    frame_index: u32,
+    fragment_count: u32,
+    kind: u16,
+    header_bytes: &[u8],
+    body: &[u8],
+    header_digest: CanonicalDigest,
+    root: CanonicalDigest,
+    leaf_or_final: CanonicalDigest,
+) -> Result<(), EngineError> {
     let header_len = u32::try_from(header_bytes.len())
         .map_err(|_| durability("pre-apply header length overflow"))?;
     let body_len = u32::try_from(body.len()).map_err(|_| durability("frame body overflow"))?;
-    let mut frame = Vec::with_capacity(
-        FRAME_FIXED_BYTES + header_bytes.len() + body.len() + FRAME_DIGEST_BYTES,
-    );
-    frame.extend_from_slice(FRAME_MAGIC);
-    put_u16(&mut frame, FORMAT_VERSION);
-    put_u16(&mut frame, SEMANTICS_VERSION);
-    frame.push(frame_type);
-    frame.extend_from_slice(&[0; 3]);
-    frame.extend_from_slice(&header.identity.database_id);
-    frame.extend_from_slice(&header.identity.cluster_id);
-    frame.extend_from_slice(&header.identity.timeline_id);
-    put_u64(&mut frame, header.identity.format_epoch);
-    put_u64(&mut frame, physical.log_epoch);
-    put_u32(&mut frame, physical.lane_id);
-    put_u32(&mut frame, 0);
-    put_u64(&mut frame, physical.segment_id);
-    put_u64(&mut frame, physical.first_frame_ordinal);
-    put_u64(&mut frame, header.stable_transaction_id);
-    put_u64(&mut frame, header.commit_seq);
-    put_u32(&mut frame, frame_index);
-    put_u32(&mut frame, fragment_count);
-    put_u16(&mut frame, kind);
-    put_u16(&mut frame, 0);
-    put_u32(&mut frame, header_len);
-    put_u32(&mut frame, body_len);
-    frame.extend_from_slice(&header_digest);
-    frame.extend_from_slice(&root);
-    frame.extend_from_slice(&leaf_or_final);
-    debug_assert_eq!(frame.len(), FRAME_FIXED_BYTES);
-    frame.extend_from_slice(header_bytes);
-    frame.extend_from_slice(body);
-    let frame_digest = digest_parts(FRAME_DOMAIN, &[&frame]);
-    frame.extend_from_slice(&frame_digest);
-    Ok(frame)
+    let expected = canonical_frame_encoded_len(header_bytes.len(), body.len())?;
+    if frame.len() != expected {
+        return Err(durability("exact physical frame buffer length mismatch"));
+    }
+    let without_digest = expected - FRAME_DIGEST_BYTES;
+    {
+        let mut writer = FixedEncoder::new(&mut frame[..without_digest]);
+        writer.bytes(FRAME_MAGIC)?;
+        writer.u16(FORMAT_VERSION)?;
+        writer.u16(SEMANTICS_VERSION)?;
+        writer.u8(frame_type)?;
+        writer.bytes(&[0; 3])?;
+        writer.bytes(&header.identity.database_id)?;
+        writer.bytes(&header.identity.cluster_id)?;
+        writer.bytes(&header.identity.timeline_id)?;
+        writer.u64(header.identity.format_epoch)?;
+        writer.u64(physical.log_epoch)?;
+        writer.u32(physical.lane_id)?;
+        writer.u32(0)?;
+        writer.u64(physical.segment_id)?;
+        writer.u64(physical.first_frame_ordinal)?;
+        writer.u64(header.stable_transaction_id)?;
+        writer.u64(header.commit_seq)?;
+        writer.u32(frame_index)?;
+        writer.u32(fragment_count)?;
+        writer.u16(kind)?;
+        writer.u16(0)?;
+        writer.u32(header_len)?;
+        writer.u32(body_len)?;
+        writer.bytes(&header_digest)?;
+        writer.bytes(&root)?;
+        writer.bytes(&leaf_or_final)?;
+        debug_assert_eq!(writer.position(), FRAME_FIXED_BYTES);
+        writer.bytes(header_bytes)?;
+        writer.bytes(body)?;
+        writer.finish()?;
+    }
+    let frame_digest = digest_parts(FRAME_DOMAIN, &[&frame[..without_digest]]);
+    frame[without_digest..].copy_from_slice(&frame_digest);
+    Ok(())
 }
 
 pub fn decode_canonical_envelope(frames: &[Vec<u8>]) -> Result<CanonicalEnvelope, EngineError> {
@@ -909,6 +1322,60 @@ fn decode_frame(frame: &[u8]) -> Result<DecodedFrame<'_>, EngineError> {
     })
 }
 
+/// A bounded fixed-slice writer shared by v1's allocating encoder and its allocation-free exact
+/// sibling. Every field writer refuses a mismatched geometry instead of extending storage.
+struct FixedEncoder<'a> {
+    bytes: &'a mut [u8],
+    position: usize,
+}
+
+impl<'a> FixedEncoder<'a> {
+    fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn position(&self) -> usize {
+        self.position
+    }
+
+    fn bytes(&mut self, value: &[u8]) -> Result<(), EngineError> {
+        let end = self
+            .position
+            .checked_add(value.len())
+            .ok_or_else(|| durability("fixed encoder byte length overflow"))?;
+        let target = self
+            .bytes
+            .get_mut(self.position..end)
+            .ok_or_else(|| durability("fixed encoder buffer length mismatch"))?;
+        target.copy_from_slice(value);
+        self.position = end;
+        Ok(())
+    }
+
+    fn u8(&mut self, value: u8) -> Result<(), EngineError> {
+        self.bytes(&[value])
+    }
+
+    fn u16(&mut self, value: u16) -> Result<(), EngineError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn u32(&mut self, value: u32) -> Result<(), EngineError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn u64(&mut self, value: u64) -> Result<(), EngineError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn finish(self) -> Result<(), EngineError> {
+        if self.position != self.bytes.len() {
+            return Err(durability("fixed encoder leaves unwritten bytes"));
+        }
+        Ok(())
+    }
+}
+
 fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -986,6 +1453,26 @@ mod tests {
         [byte; 32]
     }
 
+    #[test]
+    fn canonical_fragment_kind_decodes_every_wire_value_and_rejects_unknown_values() {
+        for (wire, expected) in [
+            (1, CanonicalFragmentKind::RowMutation),
+            (2, CanonicalFragmentKind::CatalogMutation),
+            (3, CanonicalFragmentKind::TableReset),
+            (4, CanonicalFragmentKind::TableRewrite),
+            (5, CanonicalFragmentKind::SequenceValueTransition),
+            (6, CanonicalFragmentKind::PrivateSequenceChild),
+            (7, CanonicalFragmentKind::AllocatorLease),
+            (8, CanonicalFragmentKind::TransactionClaimStatus),
+        ] {
+            assert_eq!(CanonicalFragmentKind::decode(wire).unwrap(), expected);
+        }
+
+        for wire in [0, 9, u16::MAX] {
+            assert!(CanonicalFragmentKind::decode(wire).is_err(), "wire={wire}");
+        }
+    }
+
     fn identity() -> CanonicalIdentity {
         CanonicalIdentity {
             database_id: [1; 16],
@@ -1052,6 +1539,75 @@ mod tests {
     }
 
     #[test]
+    fn standalone_outcome_codec_is_exact_strict_and_byte_identical() {
+        assert_eq!(CANONICAL_OUTCOME_BYTES, 92);
+        let outcome = CanonicalOutcome {
+            kind: CanonicalOutcomeKind::AbortError,
+            affected_rows: 0x0102_0304_0506_0708,
+            sqlstate: Some(*b"23505"),
+            constraint_id: 0x1112_1314_1516_1718,
+            target_digest: digest(0x29),
+            returning_digest: digest(0x3a),
+        };
+        let mut bytes = [0xff; CANONICAL_OUTCOME_BYTES];
+        encode_canonical_outcome_into_exact(&outcome, &mut bytes).unwrap();
+
+        let mut expected = [0; CANONICAL_OUTCOME_BYTES];
+        expected[0] = CanonicalOutcomeKind::AbortError as u8;
+        expected[1] = 1;
+        expected[4..12].copy_from_slice(&outcome.affected_rows.to_le_bytes());
+        expected[12..20].copy_from_slice(&outcome.constraint_id.to_le_bytes());
+        expected[20..25].copy_from_slice(b"23505");
+        expected[28..60].copy_from_slice(&outcome.target_digest);
+        expected[60..92].copy_from_slice(&outcome.returning_digest);
+        assert_eq!(bytes, expected, "every outcome field owns its fixed bytes");
+
+        let decoded = decode_canonical_outcome_exact(&bytes).unwrap();
+        assert_eq!(decoded, outcome);
+        let mut reencoded = [0; CANONICAL_OUTCOME_BYTES];
+        encode_canonical_outcome_into_exact(&decoded, &mut reencoded).unwrap();
+        assert_eq!(
+            reencoded, bytes,
+            "decode/reencode must preserve canonical bytes"
+        );
+        assert_eq!(outcome.encode().unwrap(), bytes);
+
+        for retained in 0..CANONICAL_OUTCOME_BYTES {
+            assert!(decode_canonical_outcome_exact(&bytes[..retained]).is_err());
+        }
+        let mut surplus = bytes.to_vec();
+        surplus.push(0);
+        assert!(decode_canonical_outcome_exact(&surplus).is_err());
+
+        for reserved_offset in [2, 3, 25, 26, 27] {
+            let mut sabotaged = bytes;
+            sabotaged[reserved_offset] = 1;
+            assert!(decode_canonical_outcome_exact(&sabotaged).is_err());
+        }
+        let mut invalid_kind = bytes;
+        invalid_kind[0] = 0;
+        assert!(decode_canonical_outcome_exact(&invalid_kind).is_err());
+        let mut invalid_flag = bytes;
+        invalid_flag[1] = 2;
+        assert!(decode_canonical_outcome_exact(&invalid_flag).is_err());
+
+        let mut absent_state = [0; CANONICAL_OUTCOME_BYTES];
+        let mut successful_outcome = outcome.clone();
+        successful_outcome.kind = CanonicalOutcomeKind::CommitSuccess;
+        successful_outcome.sqlstate = None;
+        encode_canonical_outcome_into_exact(&successful_outcome, &mut absent_state).unwrap();
+        absent_state[20] = b'2';
+        assert!(decode_canonical_outcome_exact(&absent_state).is_err());
+
+        let mut malformed_abort = outcome.clone();
+        malformed_abort.sqlstate = Some(*b"23-05");
+        assert!(encode_canonical_outcome_into_exact(&malformed_abort, &mut bytes).is_err());
+        let mut malformed_success = outcome;
+        malformed_success.kind = CanonicalOutcomeKind::CommitSuccess;
+        assert!(encode_canonical_outcome_into_exact(&malformed_success, &mut bytes).is_err());
+    }
+
+    #[test]
     fn canonical_fragmented_envelope_round_trips_with_explicit_mapping() {
         let encoded =
             encode_canonical_envelope(physical(), &header(), &fragments(), &outcome()).unwrap();
@@ -1088,6 +1644,85 @@ mod tests {
         );
         assert!(pack_canonical_record_payload(&first).unwrap().len() as u64 > logical);
         assert!(pack_canonical_record_payload(&second).unwrap().len() as u64 > logical);
+    }
+
+    fn assert_footprint_matches_real_framing(body_lengths: &[usize]) {
+        let fragments = body_lengths
+            .iter()
+            .enumerate()
+            .map(|(index, length)| CanonicalFragment {
+                kind: CanonicalFragmentKind::RowMutation,
+                body: vec![u8::try_from(index).expect("small fixture ordinal"); *length],
+            })
+            .collect::<Vec<_>>();
+        let mut header = header();
+        header.operation_count = u32::try_from(fragments.len()).expect("fixture count fits");
+        let footprint = canonical_wal_footprint(
+            &body_lengths
+                .iter()
+                .copied()
+                .map(|length| u64::try_from(length).expect("fixture length fits"))
+                .collect::<Vec<_>>(),
+        )
+        .expect("footprint accepts real encoder fixture");
+        let encoded = encode_canonical_envelope(physical(), &header, &fragments, &outcome())
+            .expect("real canonical envelope encodes");
+        let fragment_frame_bytes = encoded.frames[..fragments.len()]
+            .iter()
+            .map(|frame| u64::try_from(frame.len()).expect("frame length fits"))
+            .sum::<u64>();
+        let marker_frame_bytes =
+            u64::try_from(encoded.frames.last().expect("terminal marker frame").len())
+                .expect("marker length fits");
+        let packed = pack_canonical_record_payload(&encoded).expect("real record packs");
+        let prepared = encoded
+            .into_prepared_record(header.stable_transaction_id)
+            .expect("real envelope seals its WAL record");
+        let record = prepared.as_wal_record();
+        assert_eq!(record.payload.as_ref(), packed.as_slice());
+        let mut serialized = Vec::new();
+        crate::encode_record_into(&mut serialized, record).expect("outer record serializes");
+
+        assert_eq!(footprint.fragment_count as usize, fragments.len());
+        assert_eq!(footprint.frame_count as usize, fragments.len() + 1);
+        assert_eq!(
+            footprint.fragment_body_bytes,
+            body_lengths.iter().map(|length| *length as u64).sum()
+        );
+        assert_eq!(footprint.fragment_frame_bytes, fragment_frame_bytes);
+        assert_eq!(footprint.marker_frame_bytes, marker_frame_bytes);
+        assert_eq!(footprint.packed_record_bytes as usize, packed.len());
+        assert_eq!(footprint.serialized_record_bytes as usize, serialized.len());
+        assert_eq!(footprint.marker_packed_bytes, marker_frame_bytes + 4);
+    }
+
+    #[test]
+    fn canonical_wal_footprint_matches_one_two_many_and_max_real_envelopes() {
+        assert_footprint_matches_real_framing(&[17]);
+        assert_footprint_matches_real_framing(&[17, 100]);
+        assert_footprint_matches_real_framing(&[3, 19, 257, 4_096, 71]);
+        assert_footprint_matches_real_framing(&[MAX_FRAGMENT_BYTES]);
+    }
+
+    #[test]
+    fn canonical_wal_footprint_rejects_real_encoder_bound_violations() {
+        assert!(canonical_wal_footprint(&[]).is_err());
+        assert!(canonical_wal_footprint(&[MAX_FRAGMENT_BYTES as u64 + 1]).is_err());
+        assert!(canonical_wal_footprint(&[MAX_FRAGMENT_BYTES as u64; 4]).is_err());
+        // A zero-body fragment fanout can stay below the raw-body bound while overflowing the
+        // packed record's per-frame framing budget.
+        assert!(canonical_wal_footprint(&vec![0; 243_421]).is_err());
+    }
+
+    #[test]
+    fn canonical_wal_footprint_keeps_the_preapply_envelope_limit_inclusive() {
+        let body_limit = canonical_fragment_body_limit();
+        let exact = [body_limit, body_limit, body_limit, body_limit - 240];
+        let footprint = canonical_wal_footprint(&exact).expect("64 MiB pre-apply fits exactly");
+        assert_eq!(footprint.preapply_bytes, 64 * 1024 * 1024);
+
+        let one_byte_over = [body_limit, body_limit, body_limit, body_limit - 239];
+        assert!(canonical_wal_footprint(&one_byte_over).is_err());
     }
 
     #[test]

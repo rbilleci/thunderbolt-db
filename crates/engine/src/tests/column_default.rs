@@ -467,12 +467,32 @@ fn legacy_returning_broadcasts_scalar_defaults_once_per_column_and_skips_unused_
     engine
         .execute_text(
             3,
+            "CREATE TABLE returning_precedence_default (id INT, bad INT DEFAULT 999.5::numeric(3,0))",
+        )
+        .unwrap();
+    reset_scalar_default_evaluation_count("bad");
+    assert!(matches!(
+        engine.execute_dml_concurrent_with_result(
+            4,
+            "INSERT INTO returning_precedence_default (id) VALUES (1) RETURNING missing",
+        ),
+        Err(ExecuteError::Engine(EngineError::UndefinedColumn(name))) if name == "missing"
+    ));
+    assert_eq!(
+        scalar_default_evaluation_count("bad"),
+        0,
+        "RETURNING binding must precede default evaluation after the live typed adapter defers"
+    );
+
+    engine
+        .execute_text(
+            5,
             "CREATE TABLE bypass_bad_default (id INT, bypass_value_9f03 INT DEFAULT 999.5::numeric(3,0))",
         )
         .unwrap();
     reset_scalar_default_evaluation_count("bypass_value_9f03");
     engine
-        .execute_text(4, "INSERT INTO bypass_bad_default VALUES (1, 7), (2, 8)")
+        .execute_text(6, "INSERT INTO bypass_bad_default VALUES (1, 7), (2, 8)")
         .unwrap();
     assert_eq!(scalar_default_evaluation_count("bypass_value_9f03"), 0);
     assert_eq!(

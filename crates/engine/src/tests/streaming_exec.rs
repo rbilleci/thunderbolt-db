@@ -2740,7 +2740,7 @@ fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_sidecar_republish() {
     }
     seq += 1;
     engine
-        .execute_text(seq, "CREATE TABLE epoch_t (a INT PRIMARY KEY, v INT)")
+        .execute_text(seq, "CREATE TABLE epoch_t (a INT, v INT)")
         .unwrap();
     let values = (0..1000)
         .map(|i| format!("({i}, {i})"))
@@ -2792,6 +2792,29 @@ fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_sidecar_republish() {
     assert!(
         matches!(err, ExecuteError::Serialization(_)),
         "expected SI conflict, got {err:?}"
+    );
+
+    // Repeat the same pin/re-publish race for UPDATE.  Class resolve returns
+    // packed chunk coordinates in its physical carrier; the ledger must use
+    // the logical row id encoded by the retained row key, or this conflict can
+    // be missed after a chunk epoch changes.
+    let (pinned, resume) = crate::engine_streaming_exec::install_class_resolve_pin_hook();
+    let updating = std::sync::Arc::clone(&engine);
+    let update = std::thread::spawn(move || {
+        updating.execute_dml_concurrent(update_seq + 1, "UPDATE epoch_t SET v = -500 WHERE v = 500")
+    });
+    pinned.wait();
+    engine
+        .execute_text(update_seq + 2, "UPDATE epoch_t SET v = -501 WHERE a = 500")
+        .unwrap();
+    resume.wait();
+    let err = update
+        .join()
+        .expect("update thread")
+        .expect_err("the stale class UPDATE write-set must conflict");
+    assert!(
+        matches!(err, ExecuteError::Serialization(_)),
+        "expected class UPDATE SI conflict, got {err:?}"
     );
     let row = engine
         .execute_relational_select(&select("SELECT COUNT(*) FROM epoch_t WHERE a = 100"))

@@ -6,10 +6,56 @@
 
 use super::append_source::ResidentAppendSource;
 use super::*;
+use crate::engine_insert_plan::host_retention::{HostRetentionGeometry, HostRetentionReport};
+use crate::engine_insert_plan::IndexedPhysicalMaterializationPermit;
 use crate::typed_insert_batch::{
-    PreparedResidentAppendSource, PreparedResidentBoolUpload, TypedInsertBatch,
+    PreparedResidentAppendSource, PreparedResidentFixedBoolUpload, PreparedResidentFixedChunk,
+    PreparedResidentFixedChunkOwners, TypedInsertBatch,
 };
 use std::sync::MutexGuard;
+
+mod indexed_fused;
+mod retained_host;
+pub(super) use indexed_fused::{
+    indexed_in_place_fused_footprint_forecast, indexed_in_place_fused_host_retention_forecast,
+    indexed_in_place_fused_materialization_scratch_forecast, source_is_all_i32_fixed,
+    PreparedIndexedInPlaceFusedApply,
+};
+use retained_host::{
+    append_pending_bool_layout_box, append_pending_int4_stats_box,
+    indexed_fixed_rollover_materialization_scratch_prediction,
+    indexed_fixed_rollover_plan_owned_host_retention_prediction,
+    indexed_in_place_plan_owned_host_retention_prediction, PreparedOpenShardIdentity,
+};
+
+/// Allocation-free host owner geometry for an indexed in-place append before its sidecar/chunk
+/// owners exist.  The forecast boundary is the only sibling permitted to request it.
+pub(super) fn indexed_in_place_append_host_retention_forecast(
+    source: &PreparedResidentAppendSource,
+    row_ids: &DeviceInsertRowIds,
+    open: &RelationalResidentShard,
+    table: &RelationalTable,
+) -> Result<HostRetentionGeometry, EngineError> {
+    indexed_in_place_plan_owned_host_retention_prediction(source, row_ids, open, table)
+}
+
+/// Equivalent scalar host geometry for the fixed-rollover append branch.
+pub(super) fn indexed_fixed_rollover_append_host_retention_forecast(
+    source: &PreparedResidentAppendSource,
+    row_ids: &DeviceInsertRowIds,
+    open: &RelationalResidentShard,
+    table: &RelationalTable,
+) -> Result<HostRetentionGeometry, EngineError> {
+    indexed_fixed_rollover_plan_owned_host_retention_prediction(source, row_ids, open, table)
+}
+
+pub(super) fn indexed_fixed_rollover_append_host_scratch_forecast(
+    source: &PreparedResidentAppendSource,
+    row_ids: &DeviceInsertRowIds,
+    table: &RelationalTable,
+) -> Result<HostRetentionGeometry, EngineError> {
+    indexed_fixed_rollover_materialization_scratch_prediction(source, row_ids, table)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeviceInsertPlanPrepareError {
@@ -25,13 +71,12 @@ pub(crate) enum DeviceInsertPlanPrepareError {
     RetryableBoundBootstrapState,
 }
 
+#[allow(dead_code)] // reservation modes compile before live indexed selection is opened
 #[derive(Clone, Copy)]
 enum ResidentOpenShardAppendPreparationMode {
     LiveUnindexed,
-    #[cfg(test)]
-    IndexedInPlaceProof {
-        index_scratch_bytes: u64,
-    },
+    IndexedInPlaceReservation { index_scratch_bytes: u64 },
+    IndexedFixedRolloverReservation { max_index_scratch_bytes: u64 },
 }
 
 /// A post-WAL device-apply failure is terminal before physical group durability; the active wave
@@ -70,14 +115,14 @@ impl DeviceInsertRowIds {
         }
     }
 
-    fn is_exact(&self) -> bool {
+    pub(super) fn is_exact(&self) -> bool {
         matches!(
             &self.kind,
             DeviceInsertRowIdsKind::Exact(_) | DeviceInsertRowIdsKind::ConsumedExact
         )
     }
 
-    fn exact_len_matches(&self, rows: usize) -> bool {
+    pub(super) fn exact_len_matches(&self, rows: usize) -> bool {
         match &self.kind {
             DeviceInsertRowIdsKind::Exact(ids) => ids.len() == rows,
             DeviceInsertRowIdsKind::SyntheticNoIdentity => true,
@@ -97,6 +142,18 @@ impl DeviceInsertRowIds {
         }
     }
 
+    /// Borrow the one exact, still-unconsumed identity owner while a pre-WAL fused staging image
+    /// copies it.  The append plan retains ownership until the later publication-capable slice;
+    /// this method never permits replacing or consuming those identities.
+    fn exact_slice(&self) -> Option<&[u64]> {
+        match &self.kind {
+            DeviceInsertRowIdsKind::Exact(ids) => Some(ids),
+            DeviceInsertRowIdsKind::SyntheticNoIdentity | DeviceInsertRowIdsKind::ConsumedExact => {
+                None
+            }
+        }
+    }
+
     /// Row identities are fixed before WAL. Dense plans upload these into their private sidecar
     /// allocation during preflight; apply still owns the IDs to prevent a caller from replacing
     /// identity authority between WAL and descriptor publication.
@@ -109,66 +166,58 @@ impl DeviceInsertRowIds {
             DeviceInsertRowIdsKind::ConsumedExact => None,
         }
     }
-}
 
-#[derive(Clone)]
-struct PreparedOpenShardIdentity {
-    shard_id: u32,
-    capacity: usize,
-    row_count: usize,
-    row_start: usize,
-    gpu_id: u16,
-    schema: String,
-    int4_columns: Vec<String>,
-    int8_columns: Vec<String>,
-    numeric_columns: Vec<String>,
-    bool_layouts: Vec<ResidentDeviceBoolColumnLayout>,
-    text_layouts: Vec<ResidentDeviceTextColumnLayout>,
-    null_layouts: Vec<ResidentDeviceNullBitmapLayout>,
-    generation: Arc<()>,
-    created_by_region: Option<Arc<CudaResidentDeviceMemory>>,
-    row_id_region: Option<Arc<CudaResidentDeviceMemory>>,
-}
-
-impl PreparedOpenShardIdentity {
-    fn from_open(open: &RelationalResidentShard) -> Self {
-        Self {
-            shard_id: open.shard_id,
-            capacity: open.capacity,
-            row_count: open.row_count,
-            row_start: open.row_start,
-            gpu_id: open.gpu_id,
-            schema: open.schema.clone(),
-            int4_columns: open.resident_device_int4_columns.clone(),
-            int8_columns: open.resident_device_int8_columns.clone(),
-            numeric_columns: open.resident_device_numeric_columns.clone(),
-            bool_layouts: open.resident_device_bool_columns.clone(),
-            text_layouts: open.resident_device_text_columns.clone(),
-            null_layouts: open.resident_device_null_columns.clone(),
-            generation: Arc::clone(&open.point_route_generation),
-            created_by_region: open.created_by_region.clone(),
-            row_id_region: open.row_id_region.clone(),
+    /// Row-ID bytes are charged exclusively by the row-id domain. Their exact boxed owner is
+    /// still one generic host allocation slot while this plan retains it.
+    pub(super) fn append_host_allocation_slot(
+        &self,
+        report: &mut HostRetentionReport,
+    ) -> Result<(), EngineError> {
+        match &self.kind {
+            DeviceInsertRowIdsKind::Exact(ids) => report.retain_slot_only(ids.as_ptr() as usize),
+            DeviceInsertRowIdsKind::SyntheticNoIdentity | DeviceInsertRowIdsKind::ConsumedExact => {
+                Err(EngineError::ApplyFailed(
+                    "resident INSERT host retention requires exact unconsumed row identities"
+                        .to_string(),
+                ))
+            }
         }
     }
 
-    fn matches(&self, open: &RelationalResidentShard, pressured: bool) -> bool {
-        open.int4_appendable
-            && open.is_valid(pressured)
-            && open.shard_id == self.shard_id
-            && open.capacity == self.capacity
-            && open.row_count == self.row_count
-            && open.row_start == self.row_start
-            && open.gpu_id == self.gpu_id
-            && open.schema == self.schema
-            && open.resident_device_int4_columns == self.int4_columns
-            && open.resident_device_int8_columns == self.int8_columns
-            && open.resident_device_numeric_columns == self.numeric_columns
-            && open.resident_device_bool_columns == self.bool_layouts
-            && open.resident_device_text_columns == self.text_layouts
-            && open.resident_device_null_columns == self.null_layouts
-            && Arc::ptr_eq(&open.point_route_generation, &self.generation)
-            && same_optional_device_region(&open.created_by_region, &self.created_by_region)
-            && same_optional_device_region(&open.row_id_region, &self.row_id_region)
+    /// Allocation-free pre-lease geometry. The row-ID bytes are charged by their own domain;
+    /// this owner contributes only its one live boxed-allocation slot.
+    pub(super) fn host_allocation_geometry(
+        &self,
+    ) -> Result<crate::engine_insert_plan::host_retention::HostRetentionGeometry, EngineError> {
+        match &self.kind {
+            DeviceInsertRowIdsKind::Exact(_) => {
+                let mut geometry =
+                    crate::engine_insert_plan::host_retention::HostRetentionGeometry::default();
+                geometry.checked_add_allocation_slot()?;
+                Ok(geometry)
+            }
+            DeviceInsertRowIdsKind::SyntheticNoIdentity | DeviceInsertRowIdsKind::ConsumedExact => {
+                Err(EngineError::ApplyFailed(
+                    "resident INSERT host retention requires exact unconsumed row identities"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(super) fn predict_host_allocation_slot(
+        &self,
+        geometry: &mut HostRetentionGeometry,
+    ) -> Result<(), EngineError> {
+        match &self.kind {
+            DeviceInsertRowIdsKind::Exact(_) => geometry.checked_add_allocation_slot(),
+            DeviceInsertRowIdsKind::SyntheticNoIdentity | DeviceInsertRowIdsKind::ConsumedExact => {
+                Err(EngineError::ApplyFailed(
+                    "resident INSERT host retention requires exact unconsumed row identities"
+                        .to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -242,6 +291,10 @@ pub(super) struct PreparedFixedRollover {
     pub(super) new_row_start: usize,
     pub(super) capacity_fit_evaluations: u64,
     pub(super) budget_scan_entries: u64,
+    #[allow(dead_code)] // held for the unreachable indexed rollover reservation
+    pub(super) planned_index_allocation_bytes: u64,
+    #[allow(dead_code)] // held for the unreachable indexed rollover reservation
+    pub(super) max_index_scratch_bytes: u64,
 }
 
 pub(super) enum PreparedInPlaceCreatedBy {
@@ -276,9 +329,13 @@ pub(super) struct ResidentOpenShardAppendPlan<'a> {
     row_ids: DeviceInsertRowIds,
     bootstrap_sentinel: bool,
     branch: PreparedResidentAppendBranch,
-    fixed_chunks: Option<Vec<CudaOwnedDeviceMemoryChunk>>,
-    int4_min_max: Vec<(i32, i32)>,
-    bool_uploads: Option<Vec<FixedWidthBoolUpload>>,
+    fixed_chunks: Option<Box<[PreparedResidentFixedChunk]>>,
+    fixed_chunk_offsets: Option<Box<[u64]>>,
+    int4_min_max: Box<[(i32, i32)]>,
+    bool_uploads: Option<Box<[PreparedResidentFixedBoolUpload]>>,
+    // Scalar-only, allocation-free geometry captured before any fixed plan owner is built.  The
+    // identity-aware comparison occurs later in diagnostic retention reporting, never admission.
+    host_retention_prediction: Option<HostRetentionGeometry>,
     // Field order is load-bearing: Rust drops fields in declaration order, so a failed or
     // completed apply releases its budget reservation before it releases the device gate.
     budget_allocation: Option<MutexGuard<'a, ()>>,
@@ -288,9 +345,26 @@ pub(super) struct ResidentOpenShardAppendPlan<'a> {
     _device_apply: Option<MutexGuard<'a, ()>>,
 }
 
-struct FixedWidthBoolUpload {
-    name: String,
-    values: Box<[u8]>,
+#[allow(dead_code)] // scalar-only test inspection reads the reservation basis
+pub(super) struct ResidentFixedRolloverReservationBasis<'a> {
+    pub(super) predecessor_shard_id: u32,
+    pub(super) predecessor_row_count: usize,
+    pub(super) catalog_seq: Index,
+    pub(super) incoming_rows: usize,
+    pub(super) capacity: usize,
+    pub(super) new_shard_id: u32,
+    pub(super) new_row_start: usize,
+    pub(super) capacity_fit_evaluations: u64,
+    pub(super) budget_scan_entries: u64,
+    pub(super) payload: &'a Arc<CudaResidentDeviceMemory>,
+    pub(super) bool_layouts: &'a [ResidentDeviceBoolColumnLayout],
+    pub(super) payload_bytes: u64,
+    pub(super) created_by_bytes: u64,
+    pub(super) row_id_bytes: u64,
+    pub(super) payload_sidecar_allocation_bytes: u64,
+    pub(super) payload_sidecar_allocation_count: u64,
+    pub(super) planned_index_allocation_bytes: u64,
+    pub(super) max_index_scratch_bytes: u64,
 }
 
 impl ResidentOpenShardAppendPlan<'_> {
@@ -304,6 +378,59 @@ impl ResidentOpenShardAppendPlan<'_> {
 
     pub(super) fn row_count(&self) -> usize {
         self.source.row_count()
+    }
+
+    /// Retained host plan allocations for the materialized append plan. GPU allocation guards,
+    /// point-route generation, lock guards, and row-ID bytes are intentionally absent; the row
+    /// ID box contributes only its separate generic allocation slot.
+    fn plan_owned_host_retention_report(&self) -> Result<HostRetentionReport, ExecuteError> {
+        let mut report = HostRetentionReport::default();
+        self.identity.append_host_retention(&mut report)?;
+        self.row_ids.append_host_allocation_slot(&mut report)?;
+        match &self.branch {
+            PreparedResidentAppendBranch::InPlace(_)
+            | PreparedResidentAppendBranch::ConsumedDense => {}
+            PreparedResidentAppendBranch::FixedRollover(fixed) => {
+                append_pending_bool_layout_box(&mut report, &fixed.pending.bool_layouts)?;
+                append_pending_int4_stats_box(&mut report, &fixed.pending.int4_stats)?;
+            }
+            PreparedResidentAppendBranch::DenseRollover(dense) => {
+                report.merge(dense.pending.payload.host_retention_report()?)?;
+            }
+        }
+        if let Some(chunks) = self.fixed_chunks.as_ref() {
+            report.retain_boxed_slice(chunks)?;
+            for chunk in chunks.iter() {
+                chunk.append_host_retention(&mut report)?;
+            }
+        }
+        if let Some(offsets) = self.fixed_chunk_offsets.as_ref() {
+            report.retain_boxed_slice(offsets)?;
+        }
+        report.retain_boxed_slice(&self.int4_min_max)?;
+        if let Some(uploads) = self.bool_uploads.as_ref() {
+            report.retain_boxed_slice(uploads)?;
+            for upload in uploads.iter() {
+                upload.append_host_retention(&mut report)?;
+            }
+        }
+        Ok(report)
+    }
+
+    pub(super) fn host_retention_report(&self) -> Result<HostRetentionReport, ExecuteError> {
+        let plan_owned = self.plan_owned_host_retention_report()?;
+        if let Some(predicted) = self.host_retention_prediction {
+            if !predicted.matches(&plan_owned)? {
+                return Err(EngineError::ApplyFailed(
+                    "materialized fixed append host retention diverged from its pre-materialization prediction"
+                        .to_string(),
+                )
+                .into());
+            }
+        }
+        let mut report = self.source.host_retention_report()?;
+        report.merge(plan_owned)?;
+        Ok(report)
     }
 
     pub(super) fn catalog_matches(&self, table: &RelationalTable, catalog_seq: Index) -> bool {
@@ -330,13 +457,99 @@ impl ResidentOpenShardAppendPlan<'_> {
         self.budget_allocation.is_some()
     }
 
-    #[cfg(test)]
-    pub(super) fn proof_only_open_shard_basis(&self) -> (u32, usize, Index) {
+    pub(super) fn indexed_fixed_rollover_host_materialization_scratch(
+        &self,
+    ) -> Option<HostRetentionGeometry> {
+        match &self.branch {
+            PreparedResidentAppendBranch::FixedRollover(fixed) => {
+                Some(fixed.pending.host_materialization_scratch)
+            }
+            PreparedResidentAppendBranch::InPlace(_)
+            | PreparedResidentAppendBranch::DenseRollover(_)
+            | PreparedResidentAppendBranch::ConsumedDense => None,
+        }
+    }
+
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
+    pub(super) fn indexed_in_place_reservation_basis(&self) -> (u32, usize, Index) {
         (
             self.identity.shard_id,
             self.identity.row_count,
             self.catalog_seq,
         )
+    }
+
+    pub(super) fn prepare_indexed_in_place_fused_apply_inputs(
+        &self,
+        expected_commit_seq: Index,
+    ) -> Result<indexed_fused::IndexedInPlaceFusedApplyInputs<'_>, DeviceInsertPlanPrepareError>
+    {
+        indexed_fused::prepare_inputs(self, expected_commit_seq)
+    }
+
+    /// Recheck the exact private pre-WAL device envelope after the fused preparation footprint
+    /// is known, while the append reservation still owns the budget gate.  A missing
+    /// `created_by` sidecar was allocated by this same reservation but is not yet published in
+    /// the shard map, so it remains part of this private envelope rather than the resident scan.
+    pub(super) fn ensure_indexed_in_place_preparation_budget(
+        &self,
+        engine: &Engine,
+        simultaneous_preparation_bytes: u64,
+    ) -> Result<(), DeviceInsertPlanPrepareError> {
+        let PreparedResidentAppendBranch::InPlace(in_place) = &self.branch else {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        };
+        if self.budget_allocation.is_none() {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let pending_created_by_bytes = in_place
+            .pending_created_by
+            .as_ref()
+            .map_or(0, |pending| pending.allocation_bytes);
+        let required = pending_created_by_bytes
+            .checked_add(simultaneous_preparation_bytes)
+            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        let (resident_bytes, _) =
+            engine.relational_resident_bytes_and_entries_for_gpu(self.identity.gpu_id);
+        let remaining = match engine.relational_residency_budget_bytes(self.identity.gpu_id) {
+            Some(budget) => budget
+                .checked_sub(resident_bytes)
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?,
+            None => return Ok(()),
+        };
+        if required > remaining {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
+    pub(super) fn indexed_fixed_rollover_reservation_basis(
+        &self,
+    ) -> Option<ResidentFixedRolloverReservationBasis<'_>> {
+        let PreparedResidentAppendBranch::FixedRollover(fixed) = &self.branch else {
+            return None;
+        };
+        Some(ResidentFixedRolloverReservationBasis {
+            predecessor_shard_id: self.identity.shard_id,
+            predecessor_row_count: self.identity.row_count,
+            catalog_seq: self.catalog_seq,
+            incoming_rows: self.source.row_count(),
+            capacity: fixed.capacity,
+            new_shard_id: fixed.new_shard_id,
+            new_row_start: fixed.new_row_start,
+            capacity_fit_evaluations: fixed.capacity_fit_evaluations,
+            budget_scan_entries: fixed.budget_scan_entries,
+            payload: &fixed.pending.device_memory,
+            bool_layouts: &fixed.pending.bool_layouts,
+            payload_bytes: fixed.pending.payload_bytes,
+            created_by_bytes: fixed.pending.created_by_bytes,
+            row_id_bytes: fixed.pending.row_id_bytes,
+            payload_sidecar_allocation_bytes: fixed.pending.allocation_bytes,
+            payload_sidecar_allocation_count: fixed.pending.persistent_allocation_count,
+            planned_index_allocation_bytes: fixed.planned_index_allocation_bytes,
+            max_index_scratch_bytes: fixed.max_index_scratch_bytes,
+        })
     }
 
     fn sidecars_still_match(&self, engine: &Engine) -> bool {
@@ -371,14 +584,17 @@ impl ResidentOpenShardAppendPlan<'_> {
         &mut self,
         capacity: usize,
         row_start: usize,
-    ) -> Option<Vec<CudaOwnedDeviceMemoryChunk>> {
+    ) -> Option<PreparedResidentFixedChunkOwners> {
         if self.is_rollover()
             || self.identity.capacity != capacity
             || self.identity.row_count != row_start
         {
             return None;
         }
-        self.fixed_chunks.take()
+        let chunks = self.fixed_chunks.take()?;
+        let offsets = self.fixed_chunk_offsets.take()?;
+        (chunks.len() == offsets.len())
+            .then_some(PreparedResidentFixedChunkOwners { chunks, offsets })
     }
 
     fn apply_shape_matches(&self, created_by: &AppendCreatedBy<'_>) -> bool {
@@ -388,19 +604,13 @@ impl ResidentOpenShardAppendPlan<'_> {
     pub(super) fn take_bool_uploads(
         &mut self,
         layouts: &[ResidentDeviceBoolColumnLayout],
-    ) -> Option<Vec<(u64, Box<[u8]>)>> {
+    ) -> Option<Box<[PreparedResidentFixedBoolUpload]>> {
         let uploads = self.bool_uploads.take()?;
         (uploads.len() == layouts.len()
             && uploads.iter().zip(layouts).all(|(upload, layout)| {
-                upload.name == layout.name && upload.values.len() == self.row_count()
+                upload.name.as_ref() == layout.name && upload.values.len() == self.row_count()
             }))
-        .then(|| {
-            uploads
-                .into_iter()
-                .zip(layouts)
-                .map(|(upload, layout)| (layout.bitmap_byte_offset, upload.values))
-                .collect()
-        })
+        .then_some(uploads)
     }
 
     pub(super) fn dense_rollover_payload_len(&self) -> Option<u64> {
@@ -489,11 +699,15 @@ impl DeviceInsertPlan<'_> {
         }
     }
 
-    pub(crate) fn apply(
+    /// Consume this plan only after the canonical typed-INSERT claim has been issued.  The
+    /// opaque permit is minted exclusively by that claim, so residency never accepts a detached
+    /// commit stamp or an independently assembled post-WAL apply request.
+    pub(crate) fn apply_after_typed_wal_claim(
         self,
         engine: &Engine,
-        created_by: AppendCreatedBy<'_>,
+        permit: crate::engine_dml_concurrent::TypedInsertPostWalApplyPermit,
     ) -> Result<(), DeviceInsertPlanApplyError> {
+        let created_by = permit.into_append_created_by();
         match self.0 {
             DeviceInsertPlanKind::ResidentOpenShardAppend(plan) => {
                 engine.apply_resident_open_shard_append(plan, created_by)
@@ -546,6 +760,14 @@ impl Engine {
         preheld_device_apply: Option<MutexGuard<'a, ()>>,
     ) -> Result<ResidentOpenShardAppendPlan<'a>, DeviceInsertPlanPrepareError> {
         let live_unindexed = matches!(mode, ResidentOpenShardAppendPreparationMode::LiveUnindexed);
+        let indexed_in_place_proof = matches!(
+            mode,
+            ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation { .. }
+        );
+        let indexed_fixed_rollover_proof = matches!(
+            mode,
+            ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation { .. }
+        );
         let apply_leader =
             crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(std::cell::Cell::get);
         // A lane leader already owns this lock, but the current intentional general-path policy
@@ -563,10 +785,14 @@ impl Engine {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
             ),
-            #[cfg(test)]
-            (ResidentOpenShardAppendPreparationMode::IndexedInPlaceProof { .. }, Some(held)) => {
-                Some(held)
-            }
+            (
+                ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation { .. },
+                Some(held),
+            ) => Some(held),
+            (
+                ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation { .. },
+                Some(held),
+            ) => Some(held),
             _ => return Err(DeviceInsertPlanPrepareError::UnsupportedShape),
         };
         let catalog = self.catalog_snapshot();
@@ -582,14 +808,7 @@ impl Engine {
         let source_matches = if live_unindexed {
             source_matches_table(&source, table)
         } else {
-            #[cfg(test)]
-            {
-                source_matches_indexed_in_place_proof(&source, table)
-            }
-            #[cfg(not(test))]
-            {
-                false
-            }
+            source_matches_indexed_in_place_reservation(&source, table)
         };
         if source.row_count() == 0 || !catalog_matches || !source_matches {
             return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
@@ -608,7 +827,7 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .clone();
-        let (identity, gpu_id, bootstrap_sentinel) = {
+        let (identity, gpu_id, bootstrap_sentinel, host_retention_prediction) = {
             let shards = self.read_state.residency.shards.load();
             let table_shards = shards
                 .get(source.table_name())
@@ -616,62 +835,40 @@ impl Engine {
             let open = table_shards
                 .last()
                 .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            // The indexed proof paths capture this scalar shape before the identity, final
+            // chunks, or device generation exist.  It performs no CUDA work and allocates no
+            // retention identity map; post-materialization reporting verifies exact parity.
+            let host_retention_prediction = if indexed_in_place_proof {
+                Some(
+                    indexed_in_place_plan_owned_host_retention_prediction(
+                        &source, &row_ids, open, table,
+                    )
+                    .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?,
+                )
+            } else if indexed_fixed_rollover_proof {
+                Some(
+                    indexed_fixed_rollover_plan_owned_host_retention_prediction(
+                        &source, &row_ids, open, table,
+                    )
+                    .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?,
+                )
+            } else {
+                None
+            };
             let identity = PreparedOpenShardIdentity::from_open(open);
             // `matches` binds validity and the descriptor generation; the source checks above
             // bind the catalog. Keep the no-sidecar exception narrower than either ordinary
             // empty or ordinary missing-sidecar states, which must still decline before WAL.
             let bootstrap_sentinel =
                 is_empty_bootstrap_sentinel(self, source.table_name(), table_shards, &identity);
-            let source_types = source.column_types();
-            let expected_i32 = source_types
-                .iter()
-                .filter(|ty| matches!(ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date))
-                .count();
-            let expected_i64 = source_types
-                .iter()
-                .filter(|ty| matches!(ty, SqlType::Int8 | SqlType::Timestamp))
-                .count();
-            let expected_b128 = source_types
-                .iter()
-                .filter(|ty| matches!(ty, SqlType::Numeric { .. } | SqlType::Uuid))
-                .count();
-            let expected_bool = source_types
-                .iter()
-                .filter(|ty| **ty == SqlType::Bool)
-                .count();
-            let expected_i32_names: Vec<_> = table
+            let expected_i32 = table
                 .columns
                 .iter()
                 .filter(|column| matches!(column.ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date))
-                .map(|column| column.name.clone())
-                .collect();
-            let expected_i64_names: Vec<_> = table
-                .columns
-                .iter()
-                .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
-                .map(|column| column.name.clone())
-                .collect();
-            let expected_b128_names: Vec<_> = table
-                .columns
-                .iter()
-                .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
-                .map(|column| column.name.clone())
-                .collect();
+                .count();
             if !identity.matches(open, pressured.contains(&open.gpu_id))
-                || identity.int4_columns.len() != expected_i32
-                || identity.int8_columns.len() != expected_i64
-                || identity.numeric_columns.len() != expected_b128
-                || identity.int4_columns != expected_i32_names
-                || identity.int8_columns != expected_i64_names
-                || identity.numeric_columns != expected_b128_names
-                || (!dense_rollover
-                    && (identity.bool_layouts.len() != expected_bool
-                        || !super::rollover::ResidentRolloverPlan::descriptor_bool_layouts_match(
-                            table,
-                            &source_types,
-                            identity.capacity,
-                            &identity.bool_layouts,
-                        )))
+                || !identity.matches_scalar_table_layout(table)
+                || (!dense_rollover && !identity.matches_fixed_table_layout(table))
                 || open.resident_device_int4_column_stats.len() != expected_i32
                 || (row_ids_present && identity.row_id_region.is_none() && !bootstrap_sentinel)
                 || (!row_ids_present && (identity.row_id_region.is_some() || bootstrap_sentinel))
@@ -690,308 +887,90 @@ impl Engine {
             {
                 return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
             }
-            (identity, open.gpu_id, bootstrap_sentinel)
+            (
+                identity,
+                open.gpu_id,
+                bootstrap_sentinel,
+                host_retention_prediction,
+            )
         };
         let k = source.row_count();
-        #[cfg(test)]
-        if matches!(
-            mode,
-            ResidentOpenShardAppendPreparationMode::IndexedInPlaceProof { .. }
-        ) && (dense_rollover
-            || bootstrap_sentinel
-            || identity
-                .row_count
-                .checked_add(k)
-                .is_none_or(|end| end > identity.capacity))
+        if indexed_in_place_proof
+            && (dense_rollover
+                || bootstrap_sentinel
+                || identity
+                    .row_count
+                    .checked_add(k)
+                    .is_none_or(|end| end > identity.capacity))
+        {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        if indexed_fixed_rollover_proof
+            && (dense_rollover
+                || bootstrap_sentinel
+                || table.indexes.is_empty()
+                || identity
+                    .row_count
+                    .checked_add(k)
+                    .is_none_or(|end| end <= identity.capacity))
         {
             return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
         }
         // NULL validity or varlen text has no capacity-strided OPEN-shard representation. It was
         // selected before descriptor geometry, so it cannot inherit an in-place arm from headroom.
-        let (branch, fixed_chunks, int4_min_max, bool_uploads, budget_allocation) =
-            if dense_rollover {
-                let payload = source
-                    .checked_dense_payload(table)
-                    .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let sidecar_bytes = u64::try_from(k)
-                    .ok()
-                    .and_then(|rows| rows.checked_mul(std::mem::size_of::<u64>() as u64))
-                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let row_id_bytes = if row_ids_present { sidecar_bytes } else { 0 };
-                let payload_bytes = payload
-                    .device_payload_len()
-                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let requested_bytes = payload_bytes
-                    .checked_add(sidecar_bytes)
-                    .and_then(|bytes| bytes.checked_add(row_id_bytes))
-                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let row_id_payload = row_ids.pre_wal_payload();
-                if row_ids_present != row_id_payload.is_some() {
-                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
-                }
-                let (new_shard_id, new_row_start) = checked_rollover_coordinates(
-                    identity.shard_id,
-                    identity.row_start,
-                    identity.row_count,
-                )
-                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let budget_allocation = self
-                    .read_state
-                    .residency
-                    .budget_allocation_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let still_matches = self
-                    .read_state
-                    .residency
-                    .shards
-                    .load()
-                    .get(source.table_name())
-                    .and_then(|shards| shards.last())
-                    .is_some_and(|open| identity.matches(open, pressured.contains(&open.gpu_id)));
-                let (resident_bytes, budget_scan_entries) =
-                    self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
-                let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
-                    Some(budget) => match budget.checked_sub(resident_bytes) {
-                        Some(remaining) => Some(remaining),
-                        None => {
-                            self.read_state
-                                .residency
-                                .rollover_budget_declines
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return Err(if bootstrap_sentinel {
-                                DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
-                            } else {
-                                DeviceInsertPlanPrepareError::UnsupportedShape
-                            });
-                        }
-                    },
-                    None => None,
-                };
-                if !still_matches
-                    || remaining_budget.is_some_and(|remaining| requested_bytes > remaining)
-                {
-                    self.read_state
-                        .residency
-                        .rollover_budget_declines
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Err(if bootstrap_sentinel {
-                        DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
-                    } else {
-                        DeviceInsertPlanPrepareError::UnsupportedShape
-                    });
-                }
-                let pending = super::rollover::PendingDenseResidentShard::reserve_pre_wal(
-                    self,
-                    gpu_id,
-                    payload,
-                    sidecar_bytes,
-                    row_id_payload,
-                )
+        let (
+            branch,
+            fixed_chunks,
+            fixed_chunk_offsets,
+            int4_min_max,
+            bool_uploads,
+            budget_allocation,
+        ) = if dense_rollover {
+            let payload = source
+                .checked_dense_payload(table)
                 .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                if remaining_budget.is_some_and(|remaining| pending.allocation_bytes > remaining) {
-                    self.read_state
-                        .residency
-                        .rollover_budget_declines
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Err(if bootstrap_sentinel {
-                        DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
-                    } else {
-                        DeviceInsertPlanPrepareError::UnsupportedShape
-                    });
-                }
-                (
-                    PreparedResidentAppendBranch::DenseRollover(PreparedDenseRollover {
-                        pending,
-                        new_shard_id,
-                        new_row_start,
-                        budget_scan_entries,
-                    }),
-                    None,
-                    Vec::new(),
-                    None,
-                    Some(budget_allocation),
-                )
-            } else if !bootstrap_sentinel
-                && identity
-                    .row_count
-                    .checked_add(k)
-                    .is_some_and(|end| end <= identity.capacity)
-            {
-                let chunks = source
-                    .checked_append_chunks(identity.capacity, identity.row_count)
-                    .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                #[cfg(test)]
-                let index_scratch_bytes = match mode {
-                    ResidentOpenShardAppendPreparationMode::LiveUnindexed => 0,
-                    ResidentOpenShardAppendPreparationMode::IndexedInPlaceProof {
-                        index_scratch_bytes,
-                    } => index_scratch_bytes,
-                };
-                #[cfg(not(test))]
-                let index_scratch_bytes = 0;
-                let reserve_created_by = identity.created_by_region.is_none();
-                // The proof mode always carries the budget guard, including when the append has
-                // an existing sidecar.  Its exact pooled index preparation footprint is charged
-                // alongside any append-sidecar reservation before the latter allocates.
-                let retain_budget_guard = reserve_created_by || !live_unindexed;
-                let (pending_created_by, budget_allocation) = if retain_budget_guard {
-                    let budget_allocation = self
-                        .read_state
-                        .residency
-                        .budget_allocation_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let still_matches = self
-                        .read_state
-                        .residency
-                        .shards
-                        .load()
-                        .get(source.table_name())
-                        .and_then(|shards| shards.last())
-                        .is_some_and(|open| {
-                            identity.matches(open, pressured.contains(&open.gpu_id))
-                        });
-                    let sidecar_bytes = if reserve_created_by {
-                        u64::try_from(identity.capacity)
-                            .ok()
-                            .and_then(|capacity| {
-                                capacity.checked_mul(std::mem::size_of::<u64>() as u64)
-                            })
-                            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?
-                    } else {
-                        0
-                    };
-                    let required_before_allocation = sidecar_bytes
-                        .checked_add(index_scratch_bytes)
-                        .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                    let (resident_bytes, _) =
-                        self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
-                    let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
-                        Some(budget) => match budget.checked_sub(resident_bytes) {
-                            Some(remaining) => Some(remaining),
-                            None => return Err(DeviceInsertPlanPrepareError::UnsupportedShape),
-                        },
-                        None => None,
-                    };
-                    if !still_matches
-                        || remaining_budget
-                            .is_some_and(|remaining| required_before_allocation > remaining)
-                    {
-                        return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
-                    }
-                    let pending_created_by = if reserve_created_by {
-                        // Reserve and allocate the capacity-sized created_by sidecar before WAL.
-                        // Device apply only installs this exact Arc and stamps its still-invisible slots.
-                        let pending = super::rollover::PendingInPlaceCreatedBy::reserve_pre_wal(
-                            self,
-                            gpu_id,
-                            identity.capacity,
-                        )
-                        .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                        let actual_required = pending
-                            .allocation_bytes
-                            .checked_add(index_scratch_bytes)
-                            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                        if pending.capacity_bytes != sidecar_bytes
-                            || pending.allocation_bytes < sidecar_bytes
-                            || remaining_budget.is_some_and(|remaining| actual_required > remaining)
-                        {
-                            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
-                        }
-                        Some(pending)
-                    } else {
-                        None
-                    };
-                    (pending_created_by, Some(budget_allocation))
-                } else {
-                    (None, None)
-                };
-                (
-                    PreparedResidentAppendBranch::InPlace(PreparedInPlaceAppend {
-                        pending_created_by,
-                    }),
-                    Some(chunks),
-                    source
-                        .int4_min_max()
-                        .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?,
-                    Some(
-                        build_bool_uploads(&source, table)
-                            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?,
-                    ),
-                    budget_allocation,
-                )
-            } else {
-                #[cfg(test)]
-                if matches!(
-                    mode,
-                    ResidentOpenShardAppendPreparationMode::IndexedInPlaceProof { .. }
-                ) {
-                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
-                }
-                // Rollover capacity is an allocation transaction even though this pre-WAL phase makes
-                // no allocation. Snapshot the exact budget under the same lock the publisher rechecks.
-                let budget_allocation = self
-                    .read_state
-                    .residency
-                    .budget_allocation_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let still_matches = self
-                    .read_state
-                    .residency
-                    .shards
-                    .load()
-                    .get(source.table_name())
-                    .and_then(|shards| shards.last())
-                    .is_some_and(|open| identity.matches(open, pressured.contains(&open.gpu_id)));
-                if !still_matches {
-                    return Err(if bootstrap_sentinel {
-                        DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
-                    } else {
-                        DeviceInsertPlanPrepareError::UnsupportedShape
-                    });
-                }
-                let (resident_bytes, budget_scan_entries) =
-                    self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
-                let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
-                    Some(budget) => match budget.checked_sub(resident_bytes) {
-                        Some(remaining) => Some(remaining),
-                        None => {
-                            self.read_state
-                                .residency
-                                .rollover_budget_declines
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return Err(if bootstrap_sentinel {
-                                DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
-                            } else {
-                                DeviceInsertPlanPrepareError::UnsupportedShape
-                            });
-                        }
-                    },
-                    None => None,
-                };
-                let desired = super::rollover::ResidentRolloverPlan::fixed_width_desired_capacity(
-                    k,
-                    Some(self.shard_size_target()),
-                )
-                .ok_or(if bootstrap_sentinel {
-                    DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
-                } else {
-                    DeviceInsertPlanPrepareError::UnsupportedShape
-                })?;
-                let types = source.column_types();
-                let rollover = match super::rollover::ResidentRolloverPlan::fixed_width_null_free(
-                    table,
-                    &types,
-                    k,
-                    desired,
-                    row_ids_present,
-                    false,
-                    remaining_budget,
-                ) {
-                    Ok(Some(plan)) => plan,
-                    Ok(None) => {
+            let sidecar_bytes = u64::try_from(k)
+                .ok()
+                .and_then(|rows| rows.checked_mul(std::mem::size_of::<u64>() as u64))
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let row_id_bytes = if row_ids_present { sidecar_bytes } else { 0 };
+            let payload_bytes = payload
+                .device_payload_len()
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let requested_bytes = payload_bytes
+                .checked_add(sidecar_bytes)
+                .and_then(|bytes| bytes.checked_add(row_id_bytes))
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let row_id_payload = row_ids.pre_wal_payload();
+            if row_ids_present != row_id_payload.is_some() {
+                return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+            }
+            let (new_shard_id, new_row_start) = checked_rollover_coordinates(
+                identity.shard_id,
+                identity.row_start,
+                identity.row_count,
+            )
+            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let budget_allocation = self
+                .read_state
+                .residency
+                .budget_allocation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let still_matches = self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(source.table_name())
+                .and_then(|shards| shards.last())
+                .is_some_and(|open| identity.matches(open, pressured.contains(&open.gpu_id)));
+            let (resident_bytes, budget_scan_entries) =
+                self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
+            let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
+                Some(budget) => match budget.checked_sub(resident_bytes) {
+                    Some(remaining) => Some(remaining),
+                    None => {
                         self.read_state
                             .residency
                             .rollover_budget_declines
@@ -1002,96 +981,254 @@ impl Engine {
                             DeviceInsertPlanPrepareError::UnsupportedShape
                         });
                     }
-                    Err(_) => {
+                },
+                None => None,
+            };
+            if !still_matches
+                || remaining_budget.is_some_and(|remaining| requested_bytes > remaining)
+            {
+                self.read_state
+                    .residency
+                    .rollover_budget_declines
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(if bootstrap_sentinel {
+                    DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
+                } else {
+                    DeviceInsertPlanPrepareError::UnsupportedShape
+                });
+            }
+            let pending = super::rollover::PendingDenseResidentShard::reserve_pre_wal(
+                self,
+                gpu_id,
+                payload,
+                sidecar_bytes,
+                row_id_payload,
+            )
+            .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            if remaining_budget.is_some_and(|remaining| pending.allocation_bytes > remaining) {
+                self.read_state
+                    .residency
+                    .rollover_budget_declines
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(if bootstrap_sentinel {
+                    DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
+                } else {
+                    DeviceInsertPlanPrepareError::UnsupportedShape
+                });
+            }
+            (
+                PreparedResidentAppendBranch::DenseRollover(PreparedDenseRollover {
+                    pending,
+                    new_shard_id,
+                    new_row_start,
+                    budget_scan_entries,
+                }),
+                None,
+                None,
+                Box::default(),
+                None,
+                Some(budget_allocation),
+            )
+        } else if !bootstrap_sentinel
+            && identity
+                .row_count
+                .checked_add(k)
+                .is_some_and(|end| end <= identity.capacity)
+        {
+            let chunks = source
+                .checked_append_chunks(identity.capacity, identity.row_count)
+                .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let index_scratch_bytes = match mode {
+                ResidentOpenShardAppendPreparationMode::LiveUnindexed => 0,
+                ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation {
+                    index_scratch_bytes,
+                } => index_scratch_bytes,
+                ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation {
+                    ..
+                } => {
+                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+                }
+            };
+            let reserve_created_by = identity.created_by_region.is_none();
+            // The proof mode always carries the budget guard, including when the append has
+            // an existing sidecar.  Its exact pooled index preparation footprint is charged
+            // alongside any append-sidecar reservation before the latter allocates.
+            let retain_budget_guard = reserve_created_by || !live_unindexed;
+            let (pending_created_by, budget_allocation) = if retain_budget_guard {
+                let budget_allocation = self
+                    .read_state
+                    .residency
+                    .budget_allocation_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let still_matches = self
+                    .read_state
+                    .residency
+                    .shards
+                    .load()
+                    .get(source.table_name())
+                    .and_then(|shards| shards.last())
+                    .is_some_and(|open| identity.matches(open, pressured.contains(&open.gpu_id)));
+                let sidecar_bytes = if reserve_created_by {
+                    u64::try_from(identity.capacity)
+                        .ok()
+                        .and_then(|capacity| {
+                            capacity.checked_mul(std::mem::size_of::<u64>() as u64)
+                        })
+                        .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?
+                } else {
+                    0
+                };
+                let required_before_allocation = sidecar_bytes
+                    .checked_add(index_scratch_bytes)
+                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+                let (resident_bytes, _) =
+                    self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
+                let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
+                    Some(budget) => match budget.checked_sub(resident_bytes) {
+                        Some(remaining) => Some(remaining),
+                        None => return Err(DeviceInsertPlanPrepareError::UnsupportedShape),
+                    },
+                    None => None,
+                };
+                if !still_matches
+                    || remaining_budget
+                        .is_some_and(|remaining| required_before_allocation > remaining)
+                {
+                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+                }
+                let pending_created_by = if reserve_created_by {
+                    // Reserve and allocate the capacity-sized created_by sidecar before WAL.
+                    // Device apply only installs this exact Arc and stamps its still-invisible slots.
+                    let pending = super::rollover::PendingInPlaceCreatedBy::reserve_pre_wal(
+                        self,
+                        gpu_id,
+                        identity.capacity,
+                    )
+                    .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
+                    let actual_required = pending
+                        .allocation_bytes
+                        .checked_add(index_scratch_bytes)
+                        .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+                    if pending.capacity_bytes != sidecar_bytes
+                        || pending.allocation_bytes < sidecar_bytes
+                        || remaining_budget.is_some_and(|remaining| actual_required > remaining)
+                    {
+                        return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+                    }
+                    Some(pending)
+                } else {
+                    None
+                };
+                (pending_created_by, Some(budget_allocation))
+            } else {
+                (None, None)
+            };
+            (
+                PreparedResidentAppendBranch::InPlace(PreparedInPlaceAppend { pending_created_by }),
+                Some(chunks.chunks),
+                Some(chunks.offsets),
+                source
+                    .int4_min_max()
+                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?,
+                Some(
+                    source
+                        .fixed_bool_uploads(table)
+                        .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?,
+                ),
+                budget_allocation,
+            )
+        } else {
+            if indexed_in_place_proof {
+                return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+            }
+            // Rollover capacity is an allocation transaction even though this pre-WAL phase makes
+            // no allocation. Snapshot the exact budget under the same lock the publisher rechecks.
+            let budget_allocation = self
+                .read_state
+                .residency
+                .budget_allocation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let still_matches = self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(source.table_name())
+                .and_then(|shards| shards.last())
+                .is_some_and(|open| identity.matches(open, pressured.contains(&open.gpu_id)));
+            if !still_matches {
+                return Err(if bootstrap_sentinel {
+                    DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
+                } else {
+                    DeviceInsertPlanPrepareError::UnsupportedShape
+                });
+            }
+            let (resident_bytes, budget_scan_entries) =
+                self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
+            let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
+                Some(budget) => match budget.checked_sub(resident_bytes) {
+                    Some(remaining) => Some(remaining),
+                    None => {
                         self.read_state
                             .residency
                             .rollover_budget_declines
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Err(if bootstrap_sentinel {
-                            DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
+                            DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
                         } else {
                             DeviceInsertPlanPrepareError::UnsupportedShape
                         });
                     }
-                };
-                let chunks = source
-                    .checked_append_chunks(rollover.capacity(), 0)
-                    .map_err(|_| {
-                        if bootstrap_sentinel {
-                            DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
+                },
+                None => None,
+            };
+            let (named_indexes_required, max_index_scratch_bytes) = match mode {
+                ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation {
+                    max_index_scratch_bytes,
+                } => (true, max_index_scratch_bytes),
+                ResidentOpenShardAppendPreparationMode::LiveUnindexed => (false, 0),
+                ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation { .. } => {
+                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+                }
+            };
+            let persistent_budget = match remaining_budget {
+                Some(remaining) => match remaining.checked_sub(max_index_scratch_bytes) {
+                    Some(persistent) => Some(persistent),
+                    None => {
+                        self.read_state
+                            .residency
+                            .rollover_budget_declines
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(if bootstrap_sentinel {
+                            DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
                         } else {
                             DeviceInsertPlanPrepareError::UnsupportedShape
-                        }
-                    })?;
-                let int4_min_max = source
-                    .int4_min_max()
-                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let expected_int4_stats = table
-                    .columns
-                    .iter()
-                    .filter(|column| {
-                        matches!(column.ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date)
-                    })
-                    .count();
-                if int4_min_max.len() != expected_int4_stats {
-                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
-                }
-                let int4_stats = table
-                    .columns
-                    .iter()
-                    .filter(|column| {
-                        matches!(column.ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date)
-                    })
-                    .zip(int4_min_max)
-                    .map(|(column, (min, max))| ResidentDeviceInt4ColumnStats {
-                        name: column.name.clone(),
-                        min,
-                        max,
-                    })
-                    .collect();
-                let bool_uploads = build_bool_uploads(&source, table)
-                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let bool_uploads = bool_uploads
-                    .into_iter()
-                    .zip(rollover.bool_layouts())
-                    .map(|(upload, layout)| {
-                        (upload.name == layout.name)
-                            .then_some((layout.bitmap_byte_offset, upload.values))
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-                let row_id_payload = row_ids.pre_wal_payload();
-                if row_ids_present != row_id_payload.is_some() {
-                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
-                }
-                let (new_shard_id, new_row_start) = checked_rollover_coordinates(
-                    identity.shard_id,
-                    identity.row_start,
-                    identity.row_count,
-                )
-                .ok_or(if bootstrap_sentinel {
-                    DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
-                } else {
-                    DeviceInsertPlanPrepareError::UnsupportedShape
-                })?;
-                let pending = super::rollover::PendingFixedResidentShard::reserve_pre_wal(
-                    self,
-                    gpu_id,
-                    &rollover,
-                    k,
-                    chunks,
-                    bool_uploads,
-                    int4_stats,
-                    row_id_payload,
-                )
-                .map_err(|_| {
-                    if bootstrap_sentinel {
-                        DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
-                    } else {
-                        DeviceInsertPlanPrepareError::UnsupportedShape
+                        });
                     }
-                })?;
-                if remaining_budget.is_some_and(|remaining| pending.allocation_bytes > remaining) {
+                },
+                None => None,
+            };
+            let desired = super::rollover::ResidentRolloverPlan::fixed_width_desired_capacity(
+                k,
+                Some(self.shard_size_target()),
+            )
+            .ok_or(if bootstrap_sentinel {
+                DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
+            } else {
+                DeviceInsertPlanPrepareError::UnsupportedShape
+            })?;
+            let rollover = match super::rollover::ResidentRolloverPlan::fixed_width_null_free_table(
+                table,
+                k,
+                desired,
+                row_ids_present,
+                named_indexes_required,
+                persistent_budget,
+            ) {
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
                     self.read_state
                         .residency
                         .rollover_budget_declines
@@ -1102,21 +1239,101 @@ impl Engine {
                         DeviceInsertPlanPrepareError::UnsupportedShape
                     });
                 }
-                (
-                    PreparedResidentAppendBranch::FixedRollover(PreparedFixedRollover {
-                        pending,
-                        capacity: rollover.capacity(),
-                        new_shard_id,
-                        new_row_start,
-                        capacity_fit_evaluations: rollover.capacity_scan_entries(),
-                        budget_scan_entries,
-                    }),
-                    None,
-                    Vec::new(),
-                    None,
-                    Some(budget_allocation),
-                )
+                Err(_) => {
+                    self.read_state
+                        .residency
+                        .rollover_budget_declines
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(if bootstrap_sentinel {
+                        DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
+                    } else {
+                        DeviceInsertPlanPrepareError::UnsupportedShape
+                    });
+                }
             };
+            let chunks = source
+                .checked_append_chunks(rollover.capacity(), 0)
+                .map_err(|_| {
+                    if bootstrap_sentinel {
+                        DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
+                    } else {
+                        DeviceInsertPlanPrepareError::UnsupportedShape
+                    }
+                })?;
+            let int4_stats = source
+                .fixed_int4_stats(table)
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let bool_uploads = source
+                .fixed_bool_uploads(table)
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let row_id_payload = row_ids.pre_wal_payload();
+            if row_ids_present != row_id_payload.is_some() {
+                return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+            }
+            let (new_shard_id, new_row_start) = checked_rollover_coordinates(
+                identity.shard_id,
+                identity.row_start,
+                identity.row_count,
+            )
+            .ok_or(if bootstrap_sentinel {
+                DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
+            } else {
+                DeviceInsertPlanPrepareError::UnsupportedShape
+            })?;
+            let pending = super::rollover::PendingFixedResidentShard::reserve_pre_wal(
+                self,
+                gpu_id,
+                &rollover,
+                k,
+                chunks,
+                bool_uploads,
+                int4_stats,
+                row_id_payload,
+            )
+            .map_err(|_| {
+                if bootstrap_sentinel {
+                    DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
+                } else {
+                    DeviceInsertPlanPrepareError::UnsupportedShape
+                }
+            })?;
+            let planned_index_allocation_bytes = rollover.named_index_bytes();
+            let actual_peak_bytes = pending
+                .allocation_bytes
+                .checked_add(planned_index_allocation_bytes)
+                .and_then(|bytes| bytes.checked_add(max_index_scratch_bytes))
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            if pending.allocation_bytes != rollover.allocation_bytes_before_indexes()
+                || remaining_budget.is_some_and(|remaining| actual_peak_bytes > remaining)
+            {
+                self.read_state
+                    .residency
+                    .rollover_budget_declines
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(if bootstrap_sentinel {
+                    DeviceInsertPlanPrepareError::RetryableBoundBootstrapResource
+                } else {
+                    DeviceInsertPlanPrepareError::UnsupportedShape
+                });
+            }
+            (
+                PreparedResidentAppendBranch::FixedRollover(PreparedFixedRollover {
+                    pending,
+                    capacity: rollover.capacity(),
+                    new_shard_id,
+                    new_row_start,
+                    capacity_fit_evaluations: rollover.capacity_scan_entries(),
+                    budget_scan_entries,
+                    planned_index_allocation_bytes,
+                    max_index_scratch_bytes,
+                }),
+                None,
+                None,
+                Box::default(),
+                None,
+                Some(budget_allocation),
+            )
+        };
         Ok(ResidentOpenShardAppendPlan {
             source,
             identity,
@@ -1125,8 +1342,10 @@ impl Engine {
             bootstrap_sentinel,
             branch,
             fixed_chunks,
+            fixed_chunk_offsets,
             int4_min_max,
             bool_uploads,
+            host_retention_prediction,
             budget_allocation,
             _device_apply: device_apply,
         })
@@ -1157,21 +1376,45 @@ impl Engine {
         .ok_or(DeviceInsertPlanApplyError::PublisherFailure)
     }
 
-    /// Thin cfg(test) adapter over the one resident append preparation core.  It never creates a
-    /// `DeviceInsertPlan`; the returned normal append plan is owned only by the inert proof wrapper.
-    #[cfg(test)]
-    pub(super) fn prepare_resident_open_shard_append_indexed_in_place_proof<'a>(
+    /// Internal reservation adapter over the one append compiler. It is intentionally not used
+    /// by live `DeviceInsertPlan` selection: the returned append reservation is owned only by
+    /// the private indexed physical-reservation owner until the future handoff is designed.
+    #[allow(dead_code)] // reached only by scalar-only inspection until live selection is designed
+    pub(super) fn prepare_resident_open_shard_append_indexed_in_place_reservation<'a>(
         &'a self,
         source: PreparedResidentAppendSource,
         row_ids: DeviceInsertRowIds,
         device_apply: MutexGuard<'a, ()>,
         index_scratch_bytes: u64,
+        _permit: IndexedPhysicalMaterializationPermit,
     ) -> Result<ResidentOpenShardAppendPlan<'a>, DeviceInsertPlanPrepareError> {
         self.prepare_resident_open_shard_append_core(
             source,
             row_ids,
-            ResidentOpenShardAppendPreparationMode::IndexedInPlaceProof {
+            ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation {
                 index_scratch_bytes,
+            },
+            Some(device_apply),
+        )
+    }
+
+    /// Internal fixed-rollover reservation adapter. It reserves the private payload/sidecars
+    /// plus the exact index and scratch envelope, without constructing a `DeviceInsertPlan` or
+    /// exposing WAL, apply, cache, or descriptor-publication authority.
+    #[allow(dead_code)] // reached only by scalar-only inspection until live selection is designed
+    pub(super) fn prepare_resident_open_shard_append_indexed_fixed_rollover_reservation<'a>(
+        &'a self,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        device_apply: MutexGuard<'a, ()>,
+        max_index_scratch_bytes: u64,
+        _permit: IndexedPhysicalMaterializationPermit,
+    ) -> Result<ResidentOpenShardAppendPlan<'a>, DeviceInsertPlanPrepareError> {
+        self.prepare_resident_open_shard_append_core(
+            source,
+            row_ids,
+            ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation {
+                max_index_scratch_bytes,
             },
             Some(device_apply),
         )
@@ -1206,11 +1449,10 @@ fn source_matches_table(source: &PreparedResidentAppendSource, table: &Relationa
             })
 }
 
-/// The cfg(test) proof can inspect an already-published indexed table while preserving the
+/// The private reservation can inspect an already-published indexed table while preserving the
 /// production predicate above verbatim.  It deliberately shares every non-index source/catalog
 /// witness with the live route, then lets the proof owner establish complete raw-index coverage.
-#[cfg(test)]
-fn source_matches_indexed_in_place_proof(
+pub(super) fn source_matches_indexed_in_place_reservation(
     source: &PreparedResidentAppendSource,
     table: &RelationalTable,
 ) -> bool {
@@ -1252,26 +1494,6 @@ fn is_live_resident_append_type(ty: SqlType) -> bool {
     )
 }
 
-fn build_bool_uploads(
-    source: &PreparedResidentAppendSource,
-    table: &RelationalTable,
-) -> Option<Vec<FixedWidthBoolUpload>> {
-    let staged = source.bool_uploads()?;
-    staged
-        .into_iter()
-        .map(|PreparedResidentBoolUpload { column_id, values }| {
-            table
-                .columns
-                .iter()
-                .find(|column| column.id == column_id && column.ty == SqlType::Bool)
-                .map(|column| FixedWidthBoolUpload {
-                    name: column.name.clone(),
-                    values,
-                })
-        })
-        .collect()
-}
-
 fn plan_matches_live_open(engine: &Engine, plan: &ResidentOpenShardAppendPlan) -> bool {
     let catalog = engine.catalog_snapshot();
     let Some(table) = catalog.relational_catalog.get(plan.source().table_name()) else {
@@ -1300,7 +1522,37 @@ fn plan_matches_live_open(engine: &Engine, plan: &ResidentOpenShardAppendPlan) -
 #[cfg(test)]
 mod ownership_tests {
     #[test]
-    fn indexed_proof_mode_reuses_the_single_append_preparation_core() {
+    fn live_device_plan_apply_requires_the_post_wal_typed_claim_permit() {
+        let source = include_str!("fixed_insert.rs")
+            .split("\n#[cfg(test)]\nmod ownership_tests")
+            .next()
+            .expect("implementation precedes tests");
+        assert!(source.contains("fn apply_after_typed_wal_claim"));
+        assert!(source.contains("TypedInsertPostWalApplyPermit"));
+        assert!(source.contains("permit.into_append_created_by()"));
+        assert!(
+            !source.contains("pub(crate) fn apply(\n"),
+            "DeviceInsertPlan must not expose an unclaimed apply entry"
+        );
+    }
+
+    #[test]
+    fn exact_row_id_box_is_slot_only_and_synthetic_or_consumed_forms_fail_closed() {
+        let row_ids = super::DeviceInsertRowIds::exact(vec![7_u64, 8].into());
+        let mut report = crate::engine_insert_plan::host_retention::HostRetentionReport::default();
+        row_ids.append_host_allocation_slot(&mut report).unwrap();
+        assert_eq!(report.retained_bytes(), 0);
+        assert_eq!(report.allocation_slots().unwrap(), 1);
+
+        let synthetic = super::DeviceInsertRowIds::synthetic_no_identity();
+        assert!(synthetic.append_host_allocation_slot(&mut report).is_err());
+        let mut consumed = super::DeviceInsertRowIds::exact(vec![9_u64].into());
+        assert!(consumed.take_exact().is_some());
+        assert!(consumed.append_host_allocation_slot(&mut report).is_err());
+    }
+
+    #[test]
+    fn indexed_reservation_mode_reuses_the_single_append_preparation_core() {
         let source = include_str!("fixed_insert.rs")
             .split("\n#[cfg(test)]\nmod ownership_tests")
             .next()
@@ -1315,10 +1567,10 @@ mod ownership_tests {
             })
             .expect("one append preparation core");
         assert!(core.contains("LiveUnindexed"));
-        assert!(core.contains("IndexedInPlaceProof"));
+        assert!(core.contains("IndexedInPlaceReservation"));
         assert!(core.contains("source_matches_table(&source, table)"));
-        assert!(core.contains("source_matches_indexed_in_place_proof(&source, table)"));
-        let proof_decline = core
+        assert!(core.contains("source_matches_indexed_in_place_reservation(&source, table)"));
+        let reservation_decline = core
             .find("&& (dense_rollover")
             .expect("proof mode rejects dense/bootstrap/headroom shapes");
         for later in [
@@ -1328,24 +1580,101 @@ mod ownership_tests {
             "budget_allocation_lock",
         ] {
             assert!(
-                proof_decline < core.find(later).expect("ordinary later preparation branch"),
-                "proof mode must decline before {later}"
+                reservation_decline < core.find(later).expect("ordinary later preparation branch"),
+                "reservation mode must decline before {later}"
             );
         }
         assert!(
-            ["dense_rollover", "bootstrap_sentinel", ".checked_add(k)", "end > identity.capacity"]
-                .into_iter()
-                .all(|decline| core[proof_decline..].contains(decline)),
-            "proof mode must explicitly decline every fixed/bootstrap/dense shape before allocation"
+            [
+                "dense_rollover",
+                "bootstrap_sentinel",
+                ".checked_add(k)",
+                "end > identity.capacity"
+            ]
+            .into_iter()
+            .all(|decline| core[reservation_decline..].contains(decline)),
+            "reservation mode must explicitly decline every fixed/bootstrap/dense shape before allocation"
         );
         let adapter = source
-            .split("fn prepare_resident_open_shard_append_indexed_in_place_proof")
+            .split("fn prepare_resident_open_shard_append_indexed_in_place_reservation")
             .nth(1)
             .and_then(|section| section.split("\n}\n\nfn source_matches_table").next())
             .expect("proof adapter");
         assert!(adapter.contains("prepare_resident_open_shard_append_core"));
         assert!(!adapter.contains("let catalog ="));
         assert!(!adapter.contains("reserve_pre_wal"));
+
+        let live_selector = source
+            .split("pub(crate) fn compile_typed_insert_device_plan")
+            .nth(1)
+            .and_then(|section| {
+                section
+                    .split("fn prepare_resident_open_shard_append")
+                    .next()
+            })
+            .expect("sole live device-plan selector");
+        assert!(live_selector.contains("ResidentOpenShardAppend"));
+        assert!(
+            !live_selector.contains("IndexedInPlaceReservation")
+                && !live_selector.contains("IndexedFixedRolloverReservation"),
+            "the live DeviceInsertPlan selector must not choose an indexed reservation"
+        );
+    }
+
+    #[test]
+    fn indexed_in_place_fused_owner_is_all_i32_only_and_has_no_publication_surface() {
+        let source = include_str!("fixed_insert/indexed_fused.rs");
+        let fused = source
+            .split("pub(in super::super) struct IndexedInPlaceFusedApplyInputs")
+            .nth(1)
+            .and_then(|section| {
+                section
+                    .split("pub(in super::super) fn prepare_inputs")
+                    .next()
+            })
+            .expect("private fused input and owner section");
+        for required in [
+            "prepare_i32_fused_apply",
+            "index: None",
+            "created_by_stamps",
+            "stamps_match_expected_commit",
+            "owner_array_backing_identity",
+            "staging_backing_identity",
+        ] {
+            assert!(
+                fused.contains(required),
+                "indexed fused owner must retain {required}"
+            );
+        }
+        for forbidden in [
+            "apply_before_header",
+            ".apply(",
+            "submit_resident",
+            ".publish(",
+            "shard_pk_device_index",
+        ] {
+            assert!(
+                !fused.contains(forbidden),
+                "indexed fused owner must not expose {forbidden}"
+            );
+        }
+        let inputs = source
+            .split("pub(in super::super) fn prepare_inputs")
+            .nth(1)
+            .and_then(|section| {
+                section
+                    .split("pub(in super::super) fn source_is_all_i32_fixed")
+                    .next()
+            })
+            .expect("sealed fused input derivation");
+        let compact_inputs: String = inputs
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(compact_inputs.contains("source_is_all_i32_fixed(&plan.source)"));
+        assert!(compact_inputs.contains("plan.identity.device_memory"));
+        assert!(compact_inputs.contains("plan.row_ids"));
+        assert!(compact_inputs.contains("expected_commit_seq"));
     }
     #[test]
     fn rollover_coordinates_are_checked_before_allocation() {
@@ -1484,9 +1813,9 @@ mod ownership_tests {
             .split("fn apply_resident_open_shard_append")
             .nth(1)
             .expect("sealed apply exists")
-            .split("#[cfg(test)]")
+            .split("\n    /// Internal reservation adapter")
             .next()
-            .expect("sealed apply precedes test-only convenience");
+            .expect("sealed apply precedes reservation adapters");
         assert!(
             !apply.contains("row_ids:"),
             "apply must consume only row IDs sealed into the opaque plan"

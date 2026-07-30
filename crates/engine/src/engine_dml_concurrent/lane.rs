@@ -1,3 +1,4 @@
+use super::durability_failure::execute_error_from_engine;
 use super::{Engine, EngineError, ExecuteError, LaneIntent, LaneOpKind};
 use gpu_db_replication::LogReplicator;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -151,11 +152,20 @@ impl Engine {
         let mut commit = self.commit_state();
         if let Err(error) = self.ensure_commit_path_available() {
             drop(commit);
-            let message = error.to_string();
-            for item in winners {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                    message.clone(),
-                ))));
+            match error {
+                EngineError::DurabilityFault(fault) => {
+                    for item in winners {
+                        item.set_outcome(Err(ExecuteError::IndeterminateDurability(fault)));
+                    }
+                }
+                error => {
+                    let message = error.to_string();
+                    for item in winners {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                            message.clone(),
+                        ))));
+                    }
+                }
             }
             return true;
         }
@@ -428,6 +438,7 @@ impl Engine {
             // even for a missing key; UPDATE replay is the one 0-row arm that returns no mutation.
             if item.op != LaneOpKind::Update || item.rows_affected != 0 {
                 write_set.tables.insert(item.table.to_string());
+                write_set.table_oids.push(item.table_oid);
             }
             commit.ledger.record(&write_set, commit_seq);
         }
@@ -579,6 +590,7 @@ impl Engine {
         }));
         match tail_result {
             Ok(Ok(())) => {
+                self.commit_state().ledger.mark_published_through(last_seq);
                 for item in &winners {
                     self.metrics.inc_commit();
                     item.set_outcome(Ok(item.resolved_rows_affected()));
@@ -746,7 +758,7 @@ impl Engine {
         mut intent: LaneIntent,
     ) {
         if let Err(error) = self.ensure_commit_path_available() {
-            intent.set_outcome(Err(ExecuteError::Engine(error)));
+            intent.set_outcome(Err(execute_error_from_engine(error)));
             return;
         }
         lanes
@@ -765,7 +777,7 @@ impl Engine {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Err(error) = self.ensure_commit_path_available() {
                 drop(hold);
-                intent.set_outcome(Err(ExecuteError::Engine(error)));
+                intent.set_outcome(Err(execute_error_from_engine(error)));
                 return;
             }
             hold.push(intent);
@@ -795,7 +807,7 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(error) = self.ensure_commit_path_available() {
             drop(queue);
-            intent.set_outcome(Err(ExecuteError::Engine(error)));
+            intent.set_outcome(Err(execute_error_from_engine(error)));
             return;
         }
         queue.push_back(intent);

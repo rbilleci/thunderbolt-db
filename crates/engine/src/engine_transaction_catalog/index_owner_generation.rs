@@ -94,10 +94,16 @@ impl Engine {
         // descriptor fields and every resource Arc then remain identical. The non-pruned table
         // high-water is the logical content-generation token recorded by every committed DML
         // shape, including those in-place stamps. Exclusive owner access makes this sample stable.
+        let table_oid = snapshot
+            .catalog
+            .relational_catalog
+            .get(&create.table)
+            .expect("existing CREATE UNIQUE target was checked above")
+            .oid;
         if self
             .commit_state()
             .ledger
-            .table_changed_after(&create.table, snapshot.boundary)
+            .table_changed_after(table_oid, snapshot.boundary)
         {
             return Err(ExecuteError::Serialization(format!(
                 "relation \"{}\" changed after CREATE UNIQUE snapshot boundary {}",

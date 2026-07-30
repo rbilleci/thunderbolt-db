@@ -30,6 +30,16 @@ pub(crate) struct RowWriteKey {
     pub(crate) row_key: String,
 }
 
+/// Stable identity of a logical row for the recent-commits ledger.  The legacy
+/// [`RowWriteKey`] remains an apply/WAL-materialization carrier while the old
+/// paths are retired, but the live SI ledger must never depend on formatted
+/// relation or row names after the canonical cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct StableRowWriteKey {
+    pub(crate) table_oid: u32,
+    pub(crate) row_id: u64,
+}
+
 /// A unique-index slot a write claims or releases: `(table, column, value)` for a column carrying
 /// a unique index. Two transactions writing the same unique slot conflict (first-committer-wins),
 /// so this is the second conflict dimension Stage 4 validates. Non-unique value-index appends are
@@ -77,7 +87,16 @@ pub(crate) struct WriteSet {
     /// into a heap without indexes), so the relation footprint must be carried independently for
     /// FK dependency history and publication auditing.
     pub(crate) tables: BTreeSet<String>,
+    /// Stable table identities for the live recent-commits ledger.  These are
+    /// deliberately a compact vector rather than a second name-indexed map:
+    /// a prepared ledger delta normalizes and owns the final boxed form before
+    /// the typed INSERT canonical cut.
+    pub(crate) table_oids: Vec<u32>,
     pub(crate) rows: Vec<RowWriteKey>,
+    /// Stable row identities corresponding to `rows` when a mutation has row
+    /// conflict points.  INSERTs deliberately have none: their allocator
+    /// range is fresh and not a first-committer-wins conflict dimension.
+    pub(crate) stable_rows: Vec<StableRowWriteKey>,
     pub(crate) unique_slots: Vec<UniqueIndexSlotKey>,
     /// E2.2(a) — the integer-keyed projection of the i32 unique slots (see [`IntUniqueSlotKey`]).
     /// The classic path fills this ALONGSIDE `unique_slots` (for i32 columns); the intent fast
@@ -86,11 +105,33 @@ pub(crate) struct WriteSet {
 }
 
 impl WriteSet {
+    pub(crate) fn add_table(&mut self, table: &RelationalTable) {
+        self.tables.insert(table.name.clone());
+        self.table_oids.push(table.oid);
+    }
+
+    pub(crate) fn add_row(&mut self, table: &RelationalTable, row_id: u64, row_key: String) {
+        self.rows.push(RowWriteKey {
+            table: table.name.clone(),
+            row_key,
+        });
+        self.stable_rows.push(StableRowWriteKey {
+            table_oid: table.oid,
+            row_id,
+        });
+    }
+
     pub(crate) fn extend_deduplicated(&mut self, other: &Self) {
         self.tables.extend(other.tables.iter().cloned());
+        self.table_oids.extend(other.table_oids.iter().copied());
+        self.table_oids.sort_unstable();
+        self.table_oids.dedup();
         self.rows.extend(other.rows.iter().cloned());
         self.rows.sort();
         self.rows.dedup();
+        self.stable_rows.extend(other.stable_rows.iter().copied());
+        self.stable_rows.sort_unstable();
+        self.stable_rows.dedup();
         self.unique_slots.extend(other.unique_slots.iter().cloned());
         self.unique_slots.sort();
         self.unique_slots.dedup();
@@ -401,19 +442,217 @@ impl WriteDelta {
     }
 }
 
-/// The recent row-identity ledger: every committed `(table, row-key)` carries the highest
-/// `commit_seq` that wrote it. Unique-slot history is device-authoritative in production; the two
-/// unique maps below exist only in `cfg(test)` as a host-neutral parity ledger. Row entries
-/// are pruned below the oldest active read snapshot, which is also the safe MVCC GC boundary.
-#[derive(Debug, Default)]
-pub(crate) struct RecentCommitsLedger {
-    pub(crate) rows: BTreeMap<RowWriteKey, Index>,
-    pub(crate) tables: BTreeMap<String, Index>,
+/// The normalized, stable ledger footprint of one write.  It deliberately owns
+/// its compact boxed keys: the typed INSERT path builds this before WAL, then
+/// transfers the exact allocation into the ledger's ordered epoch descriptor.
+#[derive(Debug)]
+pub(crate) struct PreparedLedgerDelta {
+    table_oids: Box<[u32]>,
+    rows: Box<[StableRowWriteKey]>,
     #[cfg(test)]
-    pub(crate) unique_slots: BTreeMap<UniqueIndexSlotKey, Index>,
+    /// Test-parity string slots are shared into both the map and epoch.
+    /// `Arc::clone` in the post-WAL claim only adjusts the refcount; cloning
+    /// the contained strings there would violate the allocation proof.
+    unique_slots: Box<[std::sync::Arc<UniqueIndexSlotKey>]>,
+    #[cfg(test)]
+    unique_slots_i32: Box<[IntUniqueSlotKey]>,
+}
+
+impl PreparedLedgerDelta {
+    pub(crate) fn from_write_set(write_set: &WriteSet) -> Result<Self, EngineError> {
+        if !write_set.tables.is_empty() && write_set.table_oids.is_empty() {
+            return Err(EngineError::ApplyFailed(
+                "write-set reached the live ledger without stable table OIDs".to_string(),
+            ));
+        }
+        if !write_set.rows.is_empty() && write_set.stable_rows.is_empty() {
+            return Err(EngineError::ApplyFailed(
+                "write-set reached the live ledger without stable row identities".to_string(),
+            ));
+        }
+        let mut table_oids = write_set.table_oids.clone();
+        table_oids.sort_unstable();
+        table_oids.dedup();
+        if table_oids.len() != write_set.tables.len() {
+            return Err(EngineError::ApplyFailed(format!(
+                "write-set stable table projection is incomplete: {} OIDs for {} relation names",
+                table_oids.len(),
+                write_set.tables.len()
+            )));
+        }
+        if table_oids.contains(&0) {
+            return Err(EngineError::ApplyFailed(
+                "write-set reached the live ledger with an invalid table OID".to_string(),
+            ));
+        }
+        let mut rows = write_set.stable_rows.clone();
+        rows.sort_unstable();
+        rows.dedup();
+        let mut legacy_rows = write_set.rows.clone();
+        legacy_rows.sort();
+        legacy_rows.dedup();
+        if rows.len() != legacy_rows.len() {
+            return Err(EngineError::ApplyFailed(format!(
+                "write-set stable row projection is incomplete: {} stable rows for {} legacy rows",
+                rows.len(),
+                legacy_rows.len()
+            )));
+        }
+        if rows.iter().any(|row| row.table_oid == 0) {
+            return Err(EngineError::ApplyFailed(
+                "write-set reached the live ledger with an invalid stable row identity".to_string(),
+            ));
+        }
+        Ok(Self {
+            table_oids: table_oids.into_boxed_slice(),
+            rows: rows.into_boxed_slice(),
+            #[cfg(test)]
+            unique_slots: {
+                let mut slots = write_set.unique_slots.clone();
+                slots.sort();
+                slots.dedup();
+                slots
+                    .into_iter()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            },
+            #[cfg(test)]
+            unique_slots_i32: {
+                let mut slots = write_set.unique_slots_i32.clone();
+                slots.sort_unstable();
+                slots.dedup();
+                slots.into_boxed_slice()
+            },
+        })
+    }
+}
+
+/// A pre-WAL capacity claim for one typed INSERT's stable ledger delta.  The
+/// only allocation here not already owned by `PreparedLedgerDelta` is the
+/// visibility cell; it is deliberately created before replication proposal.
+pub(crate) struct ReservedLedgerDelta {
+    delta: PreparedLedgerDelta,
+    visibility: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    owner_id: u64,
+    expected_commit_seq: Index,
+}
+
+/// Linear receipt carried from the post-WAL canonical claim through device
+/// apply to the publication tail.  Only reader-visible publication consumes
+/// it without a history lookup; a dropped receipt leaves its epoch pinned for
+/// recovery.
+#[must_use = "a claimed ledger receipt must be consumed after publication visibility"]
+pub(crate) struct LedgerClaimReceipt {
+    visibility: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    owner_id: u64,
+    commit_seq: Index,
+    drop_armed: bool,
+}
+
+impl Drop for LedgerClaimReceipt {
+    fn drop(&mut self) {
+        if self.drop_armed
+            && self.visibility.load(std::sync::atomic::Ordering::Acquire) != LEDGER_CLAIM_VISIBLE
+            && !std::thread::panicking()
+        {
+            panic!(
+                "commit-path invariant violation: claimed typed ledger receipt dropped before publication; restart recovery required"
+            );
+        }
+    }
+}
+
+impl LedgerClaimReceipt {
+    /// Tail failure has already wedged the engine and retained the pending
+    /// epoch for restart recovery.  Disarm only the receipt destructor so the
+    /// established fsync/publication error contract can return normally.
+    pub(crate) fn abandon_for_recovery(mut self) {
+        self.drop_armed = false;
+    }
+}
+
+const LEDGER_CLAIM_PENDING: u8 = 0;
+const LEDGER_CLAIM_VISIBLE: u8 = 1;
+
+/// Test-only authority for the canonical carrier's linearity unit tests.  It
+/// has no descriptor and therefore cannot exercise a production claim path.
+#[cfg(test)]
+pub(crate) fn issue_test_only_visible_ledger_claim_receipt() -> LedgerClaimReceipt {
+    LedgerClaimReceipt {
+        visibility: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LEDGER_CLAIM_VISIBLE)),
+        owner_id: 0,
+        commit_seq: 0,
+        drop_armed: true,
+    }
+}
+
+#[derive(Debug)]
+enum LedgerEpochState {
+    /// A live generic writer has reached canonical apply but is not yet
+    /// reader-visible.  Recovery deliberately uses this same state and its
+    /// normal publish path advances `mark_published_through` before service;
+    /// there is no bootstrap bypass that starts a mutable replay record visible.
+    AwaitingPublication,
+    Claimed(std::sync::Arc<std::sync::atomic::AtomicU8>),
+}
+
+#[derive(Debug)]
+struct LedgerEpochDescriptor {
+    commit_seq: Index,
+    table_oids: Box<[u32]>,
+    rows: Box<[StableRowWriteKey]>,
+    #[cfg(test)]
+    unique_slots: Box<[std::sync::Arc<UniqueIndexSlotKey>]>,
+    #[cfg(test)]
+    unique_slots_i32: Box<[IntUniqueSlotKey]>,
+    state: LedgerEpochState,
+}
+
+/// The recent stable-identity ledger.  Production history is keyed only by
+/// catalog OID and `(table_oid, row_id)`; formatted names stay in legacy
+/// mutation carriers and never reach this owner.  Epochs retain the exact key
+/// vectors until the active-snapshot boundary permits pruning.
+#[derive(Debug)]
+pub(crate) struct RecentCommitsLedger {
+    owner_id: u64,
+    published_through: Index,
+    rows: std::collections::HashMap<StableRowWriteKey, Index>,
+    tables: std::collections::HashMap<u32, Index>,
+    epochs: std::collections::VecDeque<LedgerEpochDescriptor>,
+    #[cfg(test)]
+    unique_slots: std::collections::HashMap<std::sync::Arc<UniqueIndexSlotKey>, Index>,
     /// Driverless parity twin for the allocation-free i32 slot projection.
     #[cfg(test)]
-    pub(crate) unique_slots_i32: std::collections::HashMap<IntUniqueSlotKey, Index>,
+    unique_slots_i32: std::collections::HashMap<IntUniqueSlotKey, Index>,
+}
+
+impl Default for RecentCommitsLedger {
+    fn default() -> Self {
+        static NEXT_OWNER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let owner_id = NEXT_OWNER_ID
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .expect("stable ledger owner-id space exhausted");
+        assert_ne!(
+            owner_id, 0,
+            "stable ledger owner IDs must never use the invalid zero value"
+        );
+        Self {
+            owner_id,
+            published_through: 0,
+            rows: std::collections::HashMap::new(),
+            tables: std::collections::HashMap::new(),
+            epochs: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            unique_slots: std::collections::HashMap::new(),
+            #[cfg(test)]
+            unique_slots_i32: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl RecentCommitsLedger {
@@ -429,22 +668,22 @@ impl RecentCommitsLedger {
 
     pub(crate) fn conflicts_rows(&self, write_set: &WriteSet, read_snapshot: Index) -> bool {
         write_set
-            .rows
+            .stable_rows
             .iter()
             .any(|key| self.rows.get(key).is_some_and(|&seq| seq > read_snapshot))
     }
 
-    pub(crate) fn table_changed_after(&self, table: &str, read_snapshot: Index) -> bool {
+    pub(crate) fn table_changed_after(&self, table_oid: u32, read_snapshot: Index) -> bool {
         self.tables
-            .get(table)
+            .get(&table_oid)
             .is_some_and(|&commit_seq| commit_seq > read_snapshot)
     }
 
     /// Stable logical identity of the currently-published table root. Catalog publication rekeys
     /// this high-water across rename and removes dropped identities, keeping it bounded by current
     /// catalog cardinality; typed reset WAL uses it as its replay-stable source-root descriptor.
-    pub(crate) fn table_root_index(&self, table: &str) -> Index {
-        self.tables.get(table).copied().unwrap_or(0)
+    pub(crate) fn table_root_index(&self, table_oid: u32) -> Index {
+        self.tables.get(&table_oid).copied().unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -460,63 +699,275 @@ impl RecentCommitsLedger {
         })
     }
 
-    /// Record committed row identities. Test builds additionally maintain the driverless unique
-    /// parity maps; production unique conflict history is read from resident version stamps.
-    pub(crate) fn record(&mut self, write_set: &WriteSet, commit_seq: Index) {
-        for table in &write_set.tables {
-            self.tables.insert(table.clone(), commit_seq);
-        }
-        for key in &write_set.rows {
-            self.rows.insert(key.clone(), commit_seq);
-        }
+    /// Reserve all mutable slots and an epoch descriptor before the typed
+    /// canonical cut.  The returned object owns both the normalized keys and
+    /// the prebuilt visibility cell, so the claim path below cannot allocate.
+    pub(crate) fn reserve_typed_delta(
+        &mut self,
+        delta: PreparedLedgerDelta,
+        expected_commit_seq: Index,
+    ) -> Result<ReservedLedgerDelta, EngineError> {
+        self.reserve_delta_capacity(&delta)?;
+        Ok(ReservedLedgerDelta {
+            delta,
+            visibility: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LEDGER_CLAIM_PENDING)),
+            owner_id: self.owner_id,
+            expected_commit_seq,
+        })
+    }
+
+    fn reserve_delta_capacity(&mut self, delta: &PreparedLedgerDelta) -> Result<(), EngineError> {
+        let absent_tables = delta
+            .table_oids
+            .iter()
+            .filter(|oid| !self.tables.contains_key(oid))
+            .count();
+        let absent_rows = delta
+            .rows
+            .iter()
+            .filter(|row| !self.rows.contains_key(row))
+            .count();
+        self.tables.try_reserve(absent_tables).map_err(|error| {
+            EngineError::ApplyFailed(format!(
+                "stable ledger could not reserve {absent_tables} table slots before WAL: {error}"
+            ))
+        })?;
+        self.rows.try_reserve(absent_rows).map_err(|error| {
+            EngineError::ApplyFailed(format!(
+                "stable ledger could not reserve {absent_rows} row slots before WAL: {error}"
+            ))
+        })?;
+        self.epochs.try_reserve(1).map_err(|error| {
+            EngineError::ApplyFailed(format!(
+                "stable ledger could not reserve an epoch descriptor before WAL: {error}"
+            ))
+        })?;
         #[cfg(test)]
         {
-            for key in &write_set.unique_slots {
-                self.unique_slots.insert(key.clone(), commit_seq);
-            }
-            for &key in &write_set.unique_slots_i32 {
-                self.unique_slots_i32.insert(key, commit_seq);
-            }
+            let absent_unique_slots = delta
+                .unique_slots
+                .iter()
+                .filter(|slot| !self.unique_slots.contains_key(slot.as_ref()))
+                .count();
+            let absent_unique_slots_i32 = delta
+                .unique_slots_i32
+                .iter()
+                .filter(|slot| !self.unique_slots_i32.contains_key(*slot))
+                .count();
+            self.unique_slots
+                .try_reserve(absent_unique_slots)
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "stable ledger could not reserve {absent_unique_slots} test unique slots before WAL: {error}"
+                    ))
+                })?;
+            self.unique_slots_i32
+                .try_reserve(absent_unique_slots_i32)
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "stable ledger could not reserve {absent_unique_slots_i32} test integer unique slots before WAL: {error}"
+                    ))
+                })?;
         }
+        Ok(())
+    }
+
+    /// Install a pre-reserved typed delta after WAL/status/timestamp.  No
+    /// allocation, re-encoding, name parsing, or alternate ledger path is
+    /// permitted here.
+    pub(crate) fn claim_typed_delta(
+        &mut self,
+        reserved: ReservedLedgerDelta,
+        commit_seq: Index,
+    ) -> LedgerClaimReceipt {
+        let ReservedLedgerDelta {
+            delta,
+            visibility,
+            owner_id,
+            expected_commit_seq,
+        } = reserved;
+        assert_eq!(
+            owner_id, self.owner_id,
+            "commit-path invariant violation: typed ledger reservation crossed engine ownership"
+        );
+        assert_eq!(
+            expected_commit_seq, commit_seq,
+            "commit-path invariant violation: typed ledger reservation commit sequence drifted"
+        );
+        for &table_oid in delta.table_oids.iter() {
+            self.tables.insert(table_oid, commit_seq);
+        }
+        for &row in delta.rows.iter() {
+            self.rows.insert(row, commit_seq);
+        }
+        #[cfg(test)]
+        for slot in delta.unique_slots.iter() {
+            self.unique_slots
+                .insert(std::sync::Arc::clone(slot), commit_seq);
+        }
+        #[cfg(test)]
+        for &slot in delta.unique_slots_i32.iter() {
+            self.unique_slots_i32.insert(slot, commit_seq);
+        }
+        self.epochs.push_back(LedgerEpochDescriptor {
+            commit_seq,
+            table_oids: delta.table_oids,
+            rows: delta.rows,
+            #[cfg(test)]
+            unique_slots: delta.unique_slots,
+            #[cfg(test)]
+            unique_slots_i32: delta.unique_slots_i32,
+            state: LedgerEpochState::Claimed(std::sync::Arc::clone(&visibility)),
+        });
+        LedgerClaimReceipt {
+            visibility,
+            owner_id,
+            commit_seq,
+            drop_armed: true,
+        }
+    }
+
+    /// Consume the receipt only after the typed commit is visible to the
+    /// publication coordinator.  The descriptor holds the same prebuilt cell,
+    /// so pruning only needs a constant-time load at the deque front and never
+    /// searches history.
+    pub(crate) fn mark_published_visible(
+        &mut self,
+        receipt: LedgerClaimReceipt,
+        publication_covered_seq: Index,
+    ) {
+        assert_eq!(
+            receipt.owner_id, self.owner_id,
+            "commit-path invariant violation: typed ledger receipt crossed engine ownership"
+        );
+        assert!(
+            receipt.commit_seq <= publication_covered_seq,
+            "commit-path invariant violation: typed ledger receipt became visible before publication coverage"
+        );
+        assert!(
+            self.published_through >= receipt.commit_seq,
+            "commit-path invariant violation: typed ledger receipt became visible before the ledger publication frontier"
+        );
+        receipt
+            .visibility
+            .compare_exchange(
+                LEDGER_CLAIM_PENDING,
+                LEDGER_CLAIM_VISIBLE,
+                std::sync::atomic::Ordering::Release,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .expect("commit-path invariant violation: typed ledger receipt was consumed twice");
+    }
+
+    /// Advance the monotonic visibility frontier for every generic live record
+    /// whose publication is now reader-visible.  This is a scalar high-water,
+    /// not an O(history) claim lookup; recovery/bootstrap can call it with the
+    /// recovered visible boundary before service begins.
+    pub(crate) fn mark_published_through(&mut self, publication_covered_seq: Index) {
+        self.published_through = self.published_through.max(publication_covered_seq);
+    }
+
+    /// Record a live generic/replay identity through the same stable-ID owner.
+    /// It stays `AwaitingPublication` until the ordinary publication path calls
+    /// [`Self::mark_published_through`]; replay does not have a visible-install
+    /// escape hatch. These routes retain their existing post-canonical
+    /// allocation debt; only typed INSERT is admitted with the pre-WAL
+    /// reservation proof above.
+    pub(crate) fn record(&mut self, write_set: &WriteSet, commit_seq: Index) {
+        let delta = PreparedLedgerDelta::from_write_set(write_set).unwrap_or_else(|error| {
+            panic!(
+                "commit-path invariant violation: generic/replay writer reached the stable ledger \
+                 without an OID identity: {error}"
+            )
+        });
+        self.reserve_delta_capacity(&delta).unwrap_or_else(|error| {
+            panic!(
+                "commit-path invariant violation: generic/replay ledger capacity reservation failed: {error}"
+            )
+        });
+        for &table_oid in delta.table_oids.iter() {
+            self.tables.insert(table_oid, commit_seq);
+        }
+        for &row in delta.rows.iter() {
+            self.rows.insert(row, commit_seq);
+        }
+        #[cfg(test)]
+        for slot in delta.unique_slots.iter() {
+            self.unique_slots
+                .insert(std::sync::Arc::clone(slot), commit_seq);
+        }
+        #[cfg(test)]
+        for &slot in delta.unique_slots_i32.iter() {
+            self.unique_slots_i32.insert(slot, commit_seq);
+        }
+        self.epochs.push_back(LedgerEpochDescriptor {
+            commit_seq,
+            table_oids: delta.table_oids,
+            rows: delta.rows,
+            #[cfg(test)]
+            unique_slots: delta.unique_slots,
+            #[cfg(test)]
+            unique_slots_i32: delta.unique_slots_i32,
+            state: LedgerEpochState::AwaitingPublication,
+        });
     }
 
     pub(crate) fn reconcile_table_roots(
         &mut self,
-        prior_identities: &BTreeMap<String, u32>,
+        _prior_identities: &BTreeMap<String, u32>,
         current_identities: &BTreeMap<String, u32>,
     ) {
-        let current_names_by_oid = current_identities
-            .iter()
-            .map(|(name, oid)| (*oid, name.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        let mut next = BTreeMap::new();
-        for (name, commit_seq) in std::mem::take(&mut self.tables) {
-            let destination = match prior_identities.get(&name) {
-                Some(oid) => current_names_by_oid.get(oid).copied(),
-                None => current_identities
-                    .contains_key(&name)
-                    .then_some(name.as_str()),
-            };
-            if let Some(destination) = destination {
-                next.entry(destination.to_string())
-                    .and_modify(|prior: &mut Index| *prior = (*prior).max(commit_seq))
-                    .or_insert(commit_seq);
-            }
-        }
-        self.tables = next;
+        let live_oids = current_identities
+            .values()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        self.tables.retain(|oid, _| live_oids.contains(oid));
     }
 
     /// Drop entries written at or before `boundary` (no active snapshot reads before it, so they can
     /// never win a future conflict). Keeps the ledger bounded by the active-snapshot window.
     pub(crate) fn prune_below(&mut self, boundary: Index) {
-        // `tables` is the durable logical root oracle for typed non-MVCC rewrites. Catalog
-        // publication bounds it by live stable identities; temporal pruning here would erase the
-        // source-root high-water of a still-live relation.
-        self.rows.retain(|_, &mut seq| seq > boundary);
-        #[cfg(test)]
-        {
-            self.unique_slots.retain(|_, &mut seq| seq > boundary);
-            self.unique_slots_i32.retain(|_, &mut seq| seq > boundary);
+        // Table roots are bounded by catalog identity reconciliation rather than
+        // time.  A claimed descriptor stays pinned until its publication
+        // receipt is consumed; a post-WAL apply panic therefore leaves the
+        // recovery wedge observable instead of silently pruning the claim.
+        while self.epochs.front().is_some_and(|epoch| {
+            epoch.commit_seq <= boundary
+                && match &epoch.state {
+                    LedgerEpochState::AwaitingPublication => {
+                        epoch.commit_seq <= self.published_through
+                    }
+                    LedgerEpochState::Claimed(visibility) => {
+                        visibility.load(std::sync::atomic::Ordering::Acquire)
+                            == LEDGER_CLAIM_VISIBLE
+                    }
+                }
+        }) {
+            let epoch = self
+                .epochs
+                .pop_front()
+                .expect("front was present when pruning stable ledger epoch");
+            for row in epoch.rows.iter() {
+                if self.rows.get(row) == Some(&epoch.commit_seq) {
+                    self.rows.remove(row);
+                }
+            }
+            #[cfg(test)]
+            for slot in epoch.unique_slots.iter() {
+                if self.unique_slots.get(slot.as_ref()) == Some(&epoch.commit_seq) {
+                    self.unique_slots.remove(slot.as_ref());
+                }
+            }
+            #[cfg(test)]
+            for &slot in epoch.unique_slots_i32.iter() {
+                if self.unique_slots_i32.get(&slot) == Some(&epoch.commit_seq) {
+                    self.unique_slots_i32.remove(&slot);
+                }
+            }
+            // `table_oids` are intentionally retained by the descriptor until
+            // this point as the exact claimed footprint, even though live roots
+            // themselves remain catalog-bounded high-water marks.
+            let _ = epoch.table_oids;
         }
     }
 

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CompoundI32I64ProbeShard, CudaCompoundFoldColumn, CudaDeviceMemoryChunk, CudaDeviceMemoryProof,
@@ -51,7 +51,10 @@ use gpu_db_storage::{
     Visibility as StorageVisibility,
 };
 use gpu_db_txn::{TxnError, TxnManager, TxnState};
-use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
+use gpu_db_types::{
+    CommitToken, DurabilityFault, DurabilityPoison, EngineError, Index, LogEntry, Role,
+    SnapshotMeta, Term, TxnId,
+};
 use gpu_db_wal::{
     append_wal_archive_segment_with_timestamps, apply_wal_archive_retention_from_txn,
     apply_wal_archive_retention_to_timestamp_micros, apply_wal_archive_retention_to_txn,
@@ -119,6 +122,7 @@ mod engine_durability;
 mod engine_insert_plan;
 mod engine_intent_lanes;
 mod insert_semantic_ir;
+mod typed_insert_aggregate;
 mod typed_insert_batch;
 pub use engine_dml_intent::{
     CoveredDeleteRoute, CoveredInsertRoute, CoveredUpdateRoute, IntentTicket, SynchronousCommit,
@@ -319,9 +323,26 @@ pub enum ExecuteError {
     /// to the caller. The engine is fail-stopped and restart recovery owns the outcome.
     #[error("indeterminate transaction outcome: {0}")]
     Indeterminate(String),
+    /// A concrete serial-WAL durability operation failed after the durable boundary was entered.
+    /// The fixed fault is retained so every affected client observes the same recovery-owned
+    /// outcome instead of a compatibility string.
+    #[error("indeterminate durability outcome: {0}")]
+    IndeterminateDurability(DurabilityFault),
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ExecuteError>() <= 48);
+
 impl ExecuteError {
+    /// Convert an engine failure observed after the WAL boundary without erasing a concrete
+    /// serial durability identity.  Compatibility failures keep the established engine wrapper.
+    pub(crate) fn from_post_wal_engine(error: EngineError) -> Self {
+        match error {
+            EngineError::DurabilityFault(fault) => Self::IndeterminateDurability(fault),
+            error => Self::Engine(error),
+        }
+    }
+
     pub fn is_unique_violation(&self) -> bool {
         matches!(self, Self::Engine(EngineError::UniqueViolation(_)))
     }
@@ -390,7 +411,12 @@ impl ExecuteError {
     }
 
     pub fn is_indeterminate(&self) -> bool {
-        matches!(self, ExecuteError::Indeterminate(_))
+        matches!(
+            self,
+            ExecuteError::Indeterminate(_)
+                | ExecuteError::IndeterminateDurability(_)
+                | ExecuteError::Engine(EngineError::DurabilityFault(_))
+        )
     }
 
     /// Whether this error is the resident-route "the table's GPU residency was invalidated out from
@@ -452,19 +478,9 @@ struct GroupFlushState {
     /// (low) value is safe: the waiter becomes a flusher and `flush_all` with nothing unflushed
     /// is a no-op that refreshes the mirror.
     durable_records: std::sync::atomic::AtomicUsize,
-    /// E1 step 2 — set once at construction when the WAL's durability backend supports MULTIPLE
-    /// concurrent group flushes in flight (the FUA fence pool). When true, `wait_group_durable`
-    /// takes the CONCURRENT path: it skips the single-flusher election (`flusher_active`) and lets
-    /// every committer run `begin_group_flush` + `job.commit()` at once — the WAL's ticket gate
-    /// keeps frames ordered and the fence pool pipelines durability. The serial backend leaves this
-    /// false and keeps electing one flusher (its `io_in_flight` slot admits at most one IO).
-    concurrent_durability: bool,
-    /// E1 step 2 — lock-free sticky mirror of `GroupFlushCoord::failed` for the concurrent path's
-    /// POLLING waiters (a committer whose records another thread already published spins on
-    /// `durable_records` with no per-commit wakeup). A flusher sets this before it wedges so a
-    /// polling waiter never spins forever behind a failed fence; the authoritative message stays in
-    /// `coord.failed`. Unused (always false) on the serial path.
-    wedged: std::sync::atomic::AtomicBool,
+    /// Fixed serial-WAL failure identity shared by the coordinator, queue drain, and late
+    /// committers. `DurabilityPoison` records the first concrete fault without allocating.
+    fixed_poison: DurabilityPoison,
 }
 
 impl Default for GroupFlushState {
@@ -473,8 +489,7 @@ impl Default for GroupFlushState {
             coord: Mutex::new(GroupFlushCoord::default()),
             cv: std::sync::Condvar::new(),
             durable_records: std::sync::atomic::AtomicUsize::new(0),
-            concurrent_durability: false,
-            wedged: std::sync::atomic::AtomicBool::new(false),
+            fixed_poison: DurabilityPoison::default(),
         }
     }
 }
@@ -487,7 +502,7 @@ struct GroupFlushCoord {
     /// Sticky wedge: a group fsync failed AFTER its members' deltas were applied (they can never
     /// be published, and nothing later may publish over them). See
     /// [`Engine::wait_group_durable`] for the failure-semantics rationale.
-    failed: Option<String>,
+    failed: Option<engine_dml_concurrent::CommitPathFailure>,
 }
 
 pub struct Engine {
@@ -959,7 +974,22 @@ impl DdlCatalogState {
 /// Every live strategy reports its exact durable-and-applied index to the sole contiguous
 /// publication coordinator, which alone advances `committed_seq`. Code holding `&mut Engine`
 /// reaches this state lock-free via `Mutex::get_mut`.
+static NEXT_COMMIT_STATE_CONTROL_PLANE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_commit_state_control_plane_owner_id() -> u64 {
+    let owner_id = NEXT_COMMIT_STATE_CONTROL_PLANE_OWNER_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    assert_ne!(
+        owner_id, 0,
+        "CommitState control-plane reservation owner identifiers exhausted"
+    );
+    owner_id
+}
+
 struct CommitState {
+    /// Stable process-local identity carried by a typed control-plane bundle. Commit-state
+    /// frontiers can match in two fresh engines, so sequence/length bindings alone are not an
+    /// owner proof.
+    control_plane_reservation_owner_id: u64,
     /// Durable ADR-014 lineage copied into every canonical WAL envelope. Recovery replaces the
     /// freshly generated value from the first validated canonical record before replay.
     canonical_identity: gpu_db_wal::CanonicalIdentity,
@@ -970,6 +1000,10 @@ struct CommitState {
     /// Non-pruned terminal claim index. The canonical WAL envelope is the durable authority; this
     /// map is its live/recovered lookup index for exact same-id retry resolution.
     transaction_status: HashMap<TxnId, DurableTransactionStatus>,
+    /// Mutation generation for move-only typed canonical status-slot reservations.  The typed
+    /// path binds its one reserved HashMap slot to this generation so an intervening legacy or
+    /// recovery status write cannot leave a stale credit usable.
+    transaction_status_reservation_generation: u64,
     /// Most recently applied entry and its exact relational row count. Recovery consumes this
     /// immediately to compare device/engine replay with the canonical terminal marker.
     last_applied_outcome: Option<(Index, u64)>,
@@ -989,6 +1023,10 @@ struct CommitState {
     /// sits on the wave sequencer's serial cut, where an unbounded BTreeMap's O(log n) insert was
     /// measured as a top per-item cost at millions of retained commits.
     wal_commit_timestamps_micros: HashMap<TxnId, u64>,
+    /// Mutation generation for the typed canonical timestamp-slot reservation.  This is distinct
+    /// from the monotonic timestamp value: it guards the actual HashMap owner and detects any
+    /// intervening map mutation before the typed credit is consumed.
+    wal_commit_timestamp_reservation_generation: u64,
     /// O(1) running max of every value ever put into `wal_commit_timestamps_micros`. Commit
     /// timestamps are assigned monotonically (`next_commit_timestamp_micros`), so this is exactly
     /// `wal_commit_timestamps_micros.values().max()` — tracked incrementally to keep the per-commit
@@ -1015,6 +1053,13 @@ struct DurableTransactionStatus {
     outcome: DurableTransactionOutcome,
 }
 
+/// Payload bytes retained by one transaction-status-index entry. The index owner defines this
+/// projection so pre-WAL planning never guesses the status layout or charges the canonical WAL
+/// status fragment a second time; the slot pool covers HashMap/allocator overhead.
+pub(crate) const fn durable_transaction_status_index_entry_bytes() -> usize {
+    std::mem::size_of::<(TxnId, DurableTransactionStatus)>()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurableTransactionOutcome {
     Committed {
@@ -1025,6 +1070,20 @@ enum DurableTransactionOutcome {
 }
 
 impl CommitState {
+    fn invalidate_transaction_status_reservations(&mut self) {
+        self.transaction_status_reservation_generation = self
+            .transaction_status_reservation_generation
+            .checked_add(1)
+            .expect("transaction-status reservation generation exhausted");
+    }
+
+    fn invalidate_commit_timestamp_reservations(&mut self) {
+        self.wal_commit_timestamp_reservation_generation = self
+            .wal_commit_timestamp_reservation_generation
+            .checked_add(1)
+            .expect("commit-timestamp reservation generation exhausted");
+    }
+
     fn resolve_transaction_retry(
         &self,
         txn_id: TxnId,
@@ -1066,6 +1125,7 @@ impl CommitState {
         match self.transaction_status.entry(txn_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(status);
+                self.invalidate_transaction_status_reservations();
                 Ok(())
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -1109,6 +1169,18 @@ impl CommitState {
         self.wal_commit_timestamps_micros
             .insert(txn_id, timestamp_micros);
         self.max_commit_timestamp_micros = self.max_commit_timestamp_micros.max(timestamp_micros);
+        self.invalidate_commit_timestamp_reservations();
+    }
+
+    /// Prune timestamp metadata whose records moved behind a durable checkpoint.
+    ///
+    /// Keep this mutation behind the same reservation-generation owner as insertion. A typed
+    /// canonical capacity token may otherwise survive an administrative checkpoint retain and
+    /// later consume a slot whose exact length/frontier proof is stale.
+    fn prune_checkpointed_commit_timestamps(&mut self, checkpointed_txn_ids: &BTreeSet<TxnId>) {
+        self.wal_commit_timestamps_micros
+            .retain(|txn_id, _| !checkpointed_txn_ids.contains(txn_id));
+        self.invalidate_commit_timestamp_reservations();
     }
 }
 
@@ -1273,6 +1345,19 @@ pub struct DurableWalArchiveRetentionWindowPlan {
 pub struct DurableWalArchiveMaintenancePlan {
     pub retention_window_plan: DurableWalArchiveRetentionWindowPlan,
     pub timeline_prune_plan: WalArchiveTimelinePrunePlan,
+}
+
+#[cfg(test)]
+mod durable_status_size_tests {
+    use super::*;
+
+    #[test]
+    fn durable_transaction_status_index_size_is_owned_by_its_value_layout() {
+        assert_eq!(
+            durable_transaction_status_index_entry_bytes(),
+            std::mem::size_of::<(TxnId, DurableTransactionStatus)>()
+        );
+    }
 }
 
 #[cfg(test)]

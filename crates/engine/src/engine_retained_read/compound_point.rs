@@ -18,6 +18,9 @@ pub struct RelationalCompoundI32I64PointReadTemplate {
     pub key_columns: [String; 2],
     projection_columns: Arc<Vec<RelationalColumn>>,
     pub(crate) table_generation: Arc<()>,
+    pub(crate) table_oid: u32,
+    pub(crate) table_point_slot: Arc<TablePointSlot>,
+    pub(crate) table_point_slot_identity: Arc<()>,
     pub(crate) route_key: CompoundPointRouteKey,
     pub(crate) projection_positions: Vec<usize>,
 }
@@ -182,7 +185,37 @@ impl Engine {
             ));
         }
 
-        let route_key = (table.name.clone(), key_id, projection_positions.clone());
+        let latest_catalog = self.read_state.latest_catalog();
+        let latest_table_is_current = latest_catalog
+            .relational_catalog
+            .get(table_name)
+            .is_some_and(|latest| latest.oid == table.oid);
+        if !latest_table_is_current {
+            return Err(compound_route_error(
+                "compound prepared route relation changed during preparation",
+            ));
+        }
+        let Some(table_point_slot) = self
+            .read_state
+            .residency
+            .ensure_table_point_slot(&self.read_state, &table)
+        else {
+            return Err(compound_route_error(
+                "compound prepared route observed a conflicting table identity",
+            ));
+        };
+        let table_point_slot_identity = Arc::clone(&table_point_slot.slot_identity);
+        if !self.read_state.residency.table_point_slot_is_current(
+            table_name,
+            table.oid,
+            &table_point_slot,
+            &table_point_slot_identity,
+        ) {
+            return Err(compound_route_error(
+                "compound prepared route relation changed during slot capture",
+            ));
+        }
+        let route_key = (key_id, projection_positions.clone());
         let template = RelationalCompoundI32I64PointReadTemplate {
             route_id: format!(
                 "compound_i32_i64_equality_projection:{}:{}:{}:{}",
@@ -197,17 +230,19 @@ impl Engine {
             key_columns: key_columns.map(str::to_string),
             projection_columns: Arc::new(projection_schema),
             table_generation: Arc::clone(&table_generation),
+            table_oid: table.oid,
+            table_point_slot: Arc::clone(&table_point_slot),
+            table_point_slot_identity: Arc::clone(&table_point_slot_identity),
             route_key: route_key.clone(),
             projection_positions: projection_positions.clone(),
         };
-        if self
-            .read_state
-            .residency
-            .compound_point_routes
+        if table_point_slot
+            .compound_route
             .load()
-            .get(&route_key)
+            .as_ref()
             .is_some_and(|route| {
-                Arc::ptr_eq(&route.table_generation, &table_generation)
+                route.route_key == route_key
+                    && Arc::ptr_eq(&route.table_generation, &table_generation)
                     && route.read_boundary <= read_boundary
             })
         {
@@ -306,14 +341,13 @@ impl Engine {
             .budget_allocation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self
-            .read_state
-            .residency
-            .compound_point_routes
+        if table_point_slot
+            .compound_route
             .load()
-            .get(&route_key)
+            .as_ref()
             .is_some_and(|route| {
-                Arc::ptr_eq(&route.table_generation, &table_generation)
+                route.route_key == route_key
+                    && Arc::ptr_eq(&route.table_generation, &table_generation)
                     && route.read_boundary <= read_boundary
             })
         {
@@ -356,9 +390,45 @@ impl Engine {
             .get(table_name)
             .and_then(|current| current.first())
             .is_some_and(|current| Arc::ptr_eq(&table_generation, &current.point_route_generation));
-        if !generation_is_current {
+        let slot_is_current = self.read_state.residency.table_point_slot_is_current(
+            table_name,
+            table.oid,
+            &table_point_slot,
+            &table_point_slot_identity,
+        );
+        let catalog_is_current = self
+            .read_state
+            .residency
+            .published_catalog_contains_exact_table_under_publish_lock(&self.read_state, &table);
+        if !generation_is_current || !slot_is_current || !catalog_is_current {
             return Err(compound_route_error(
                 "compound prepared route generation changed during preparation",
+            ));
+        }
+        if table_point_slot
+            .compound_route
+            .load()
+            .as_ref()
+            .is_some_and(|route| {
+                route.route_key == route_key
+                    && Arc::ptr_eq(&route.table_generation, &table_generation)
+                    && route.read_boundary <= read_boundary
+            })
+        {
+            return Ok(template);
+        }
+        if !self
+            .read_state
+            .residency
+            .reserve_table_point_route_under_publish_lock(
+                table_name,
+                table.oid,
+                &table_point_slot,
+                &table_point_slot_identity,
+            )
+        {
+            return Err(compound_route_error(
+                "compound prepared route table slot changed during publication",
             ));
         }
         let plan = Arc::new(CachedCompoundI32I64PointPlan {
@@ -370,28 +440,16 @@ impl Engine {
             ),
             plan,
         });
-        let current = self.read_state.residency.compound_point_routes.load();
-        let mut next = (**current).clone();
-        next.retain(|(cached_table, _, _), _| cached_table != table_name);
-        if next.len() >= MAX_CACHED_SHARDED_POINT_ROUTES {
-            if let Some(evicted) = next.keys().next().cloned() {
-                next.remove(&evicted);
-            }
-        }
-        next.insert(
-            route_key,
-            CachedCompoundI32I64PointRoute {
+        table_point_slot
+            .compound_route
+            .store(Some(Arc::new(CachedCompoundI32I64PointRoute {
+                route_key,
                 table_generation,
                 read_boundary,
                 gpu_id,
                 launch_resident,
                 plan,
-            },
-        );
-        self.read_state
-            .residency
-            .compound_point_routes
-            .store(Arc::new(next));
+            })));
         Ok(template)
     }
 
@@ -434,14 +492,25 @@ impl Engine {
                 "compound prepared route template is stale; reprepare against the current generation",
             ));
         }
+        if !self.read_state.residency.table_point_slot_is_current(
+            &template.table,
+            template.table_oid,
+            &template.table_point_slot,
+            &template.table_point_slot_identity,
+        ) {
+            return Err(compound_route_error(
+                "compound prepared route table identity is stale; reprepare against the current relation",
+            ));
+        }
         let (gpu_id, launch_resident, plan) = self
             .read_state
             .residency
-            .compound_point_routes
-            .load()
-            .get(&template.route_key)
+            .table_point_slot(&template.table, template.table_oid)
+            .filter(|slot| Arc::ptr_eq(slot, &template.table_point_slot))
+            .and_then(|slot| slot.compound_route.load_full())
             .and_then(|route| {
-                (Arc::ptr_eq(&route.table_generation, &template.table_generation)
+                (route.route_key == template.route_key
+                    && Arc::ptr_eq(&route.table_generation, &template.table_generation)
                     && route.read_boundary <= read_boundary)
                     .then(|| {
                         (

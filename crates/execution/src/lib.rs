@@ -36,10 +36,12 @@ pub use cuda_driver::CudaDriverRuntime;
 mod staged_filter;
 
 mod resident_memory;
+#[cfg(test)]
+pub(crate) use resident_memory::fail_next_prepared_u64_htod_publication;
 use resident_memory::CudaResidentReadSource;
 pub use resident_memory::{
     CudaDeviceMemoryChunk, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
-    CudaResidentDeviceMemoryReadView, RecompactFill, RecompactSegment,
+    CudaResidentDeviceMemoryReadView, PreparedU64HtoDPublication, RecompactFill, RecompactSegment,
 };
 mod resident_header;
 use resident_header::launch_cuda_resident_row_count;
@@ -49,16 +51,21 @@ mod resident_visible_digest;
 use resident_visible_digest::launch_cuda_resident_visible_digest;
 pub use resident_visible_digest::{CudaVisibleDigestColumn, CudaVisibleSourceDigest};
 mod resident_index_build;
+#[cfg(any(test, feature = "probe-timing"))]
+pub use resident_index_build::prepared_resident_typed_indexes_insert_counters;
 #[cfg(test)]
 pub(crate) use resident_index_build::{
     fail_next_prepared_resident_typed_indexes_insert_after_launch,
     fail_next_prepared_resident_typed_indexes_insert_after_leases,
-    prepared_resident_typed_indexes_insert_counters,
+    fail_next_resident_typed_index_build_after_launch,
+    fail_next_resident_typed_index_build_after_setup, resident_typed_index_build_counters,
 };
 pub use resident_index_build::{
     resident_index_allocated_bytes, resident_index_hash_bytes,
-    resident_typed_indexes_insert_preparation_bytes, CudaResidentIndexStatus,
-    CudaResidentTypedIndexInsert, PreparedResidentTypedIndexesInsert,
+    resident_typed_index_build_host_scratch_geometry, resident_typed_index_build_preparation_bytes,
+    resident_typed_indexes_insert_preparation_bytes, CudaHostScratchGeometry,
+    CudaResidentIndexStatus, CudaResidentTypedIndexInsert, PreparedResidentTypedIndexesInsert,
+    PreparedResidentTypedIndexesInsertHostRetention,
 };
 mod resident_sort;
 use resident_sort::{
@@ -140,6 +147,12 @@ pub use insert_resident_key_verdict::{
     CudaInsertResidentKeySidecar, CudaInsertResidentKeyVerdict,
     INSERT_RESIDENT_KEY_VERDICT_READBACK_BYTES,
 };
+mod insert_foreign_key_verdict;
+pub use insert_foreign_key_verdict::{
+    insert_foreign_key_verdict_scratch_bytes, CudaInsertForeignKeyParentShard,
+    CudaInsertForeignKeySelfProvider, CudaInsertForeignKeyVerdict,
+    INSERT_FOREIGN_KEY_VERDICT_READBACK_BYTES,
+};
 mod version_conflict;
 pub use version_conflict::CudaVersionConflictVerdict;
 mod resident_gather;
@@ -197,12 +210,17 @@ mod staged_hash_join;
 pub use staged_hash_join::HashJoinOutcome;
 mod write_locate;
 pub use write_locate::{
+    multi_shard_i32_write_locate_resource_geometry, CudaWriteLocateResourceGeometry,
     VisibleLocateResult, VisibleLocateShard, WriteLocateResult, WriteLocateShard,
 };
 mod write_apply;
 pub use write_apply::{
-    CudaCompoundFoldColumn, CudaWriteDestination, CudaWriteIndex, FusedApplyRequest,
+    i32_fused_apply_footprint_for_shape, CudaCompoundFoldColumn, CudaWriteDestination,
+    CudaWriteIndex, FusedApplyPreparation, FusedApplyPreparationFootprint, FusedApplyRequest,
+    PreparedI32FusedApply, PreparedI32FusedApplyHostRetention, PreparedI32FusedHeader,
 };
+#[cfg(any(test, feature = "probe-timing"))]
+pub use write_apply::{prepared_i32_fused_apply_counters, PreparedI32FusedApplyCounters};
 mod resident_sidecar;
 pub use resident_sidecar::{CudaSidecarSource, CudaTextOffsetSource};
 mod unique_coordinate;

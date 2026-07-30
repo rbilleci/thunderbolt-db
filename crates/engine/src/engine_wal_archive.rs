@@ -145,9 +145,7 @@ impl Engine {
         // to a timestamped archive BEFORE checkpointing (the archive manifest carries its own
         // timestamp metadata); `max_commit_timestamp_micros` keeps new commit timestamps strictly
         // monotonic regardless of pruning.
-        commit
-            .wal_commit_timestamps_micros
-            .retain(|txn_id, _| !checkpointed_txn_ids.contains(txn_id));
+        commit.prune_checkpointed_commit_timestamps(&checkpointed_txn_ids);
         // W1b: the replication log is the third per-commit unbounded structure — its applied
         // prefix is never read again (drain_committed_from yields only past-applied entries), so
         // the checkpoint boundary is its discard point too. No-op for Raft (its log serves

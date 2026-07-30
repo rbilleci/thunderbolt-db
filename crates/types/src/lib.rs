@@ -1,8 +1,168 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::num::NonZeroI32;
+use std::sync::OnceLock;
 
 pub type Term = u64;
 pub type Index = u64;
 pub type TxnId = u64;
+
+/// Durability implementation that observed a terminal post-handoff fault.
+///
+/// This remains a fixed value so the committed-write fail-stop path can publish its first fault
+/// without allocating a diagnostic string.  Backends that have not yet adopted the fixed-fault
+/// route keep their existing compatibility diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DurabilityBackend {
+    SerialWal,
+    FuaWal,
+}
+
+impl fmt::Display for DurabilityBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SerialWal => "serial-wal",
+            Self::FuaWal => "fua-wal",
+        })
+    }
+}
+
+/// Exact location in a backend's post-handoff durability state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DurabilityStage {
+    PositionalWrite,
+    PositionalWriteZero,
+    PositionalWriteOverflow,
+    PositionalWriteInvariant,
+    SyncData,
+    FrontierDrift,
+    Abandoned,
+    DescriptorPoison,
+    /// FUA exact-group admission could not retain an immutable physical scatter reservation
+    /// before the WAL claim crossed its rollback boundary.
+    FuaReservation,
+    /// The fixed FUA scatter source or its one-release publication failed after exact handoff.
+    FuaScatter,
+    /// FUA fence-pool work reported an immutable post-publication failure.
+    FuaFence,
+    /// The physical cadence controller could not preserve the sealed exact decision.
+    FuaController,
+    /// The exact FUA publish cursor or durable frontier diverged from the sealed group range.
+    FuaFrontier,
+    /// An exact FUA group was dropped between preclaim ownership and terminal settlement.
+    FuaAbandoned,
+    /// The permanently provisioned FUA descriptor/ledger was consumed inconsistently.
+    FuaDescriptor,
+}
+
+impl fmt::Display for DurabilityStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PositionalWrite => "positional-write",
+            Self::PositionalWriteZero => "positional-write-zero",
+            Self::PositionalWriteOverflow => "positional-write-overflow",
+            Self::PositionalWriteInvariant => "positional-write-invariant",
+            Self::SyncData => "sync-data",
+            Self::FrontierDrift => "frontier-drift",
+            Self::Abandoned => "abandoned",
+            Self::DescriptorPoison => "descriptor-poison",
+            Self::FuaReservation => "fua-reservation",
+            Self::FuaScatter => "fua-scatter",
+            Self::FuaFence => "fua-fence",
+            Self::FuaController => "fua-controller",
+            Self::FuaFrontier => "fua-frontier",
+            Self::FuaAbandoned => "fua-abandoned",
+            Self::FuaDescriptor => "fua-descriptor",
+        })
+    }
+}
+
+/// Allocation-free identity of a fail-stop durability fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurabilityFault {
+    pub backend: DurabilityBackend,
+    pub stage: DurabilityStage,
+    /// Platform error value captured at the failing syscall.
+    ///
+    /// A zero OS error is not a failure. Keeping the optional value niche-backed prevents this
+    /// fixed fault from enlarging the ubiquitous `EngineError`/`ExecuteError` success ABI.
+    raw_os_error: Option<NonZeroI32>,
+    pub segment_id: u64,
+    pub group_first_record: u64,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<DurabilityFault>() <= 24);
+
+impl DurabilityFault {
+    pub const fn new(
+        backend: DurabilityBackend,
+        stage: DurabilityStage,
+        raw_os_error: Option<i32>,
+        segment_id: u64,
+        group_first_record: u64,
+    ) -> Self {
+        let raw_os_error = match raw_os_error {
+            Some(error) => NonZeroI32::new(error),
+            None => None,
+        };
+        Self {
+            backend,
+            stage,
+            raw_os_error,
+            segment_id,
+            group_first_record,
+        }
+    }
+
+    pub const fn raw_os_error(self) -> Option<i32> {
+        match self.raw_os_error {
+            Some(error) => Some(error.get()),
+            None => None,
+        }
+    }
+}
+
+impl fmt::Display for DurabilityFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "backend={} stage={} raw_os_error={:?} segment_id={} group_first_record={}",
+            self.backend,
+            self.stage,
+            self.raw_os_error(),
+            self.segment_id,
+            self.group_first_record
+        )
+    }
+}
+
+/// First-wins fault publication for allocation-free, post-handoff fail-stop paths.
+#[derive(Debug, Default)]
+pub struct DurabilityPoison {
+    first: OnceLock<DurabilityFault>,
+}
+
+impl DurabilityPoison {
+    pub const fn new() -> Self {
+        Self {
+            first: OnceLock::new(),
+        }
+    }
+
+    /// Publish `fault` unless a concurrent path already won. Returns the immutable first fault.
+    pub fn install(&self, fault: DurabilityFault) -> DurabilityFault {
+        let _ = self.first.set(fault);
+        *self
+            .first
+            .get()
+            .expect("DurabilityPoison must contain the fault it just installed or observed")
+    }
+
+    pub fn snapshot(&self) -> Option<DurabilityFault> {
+        self.first.get().copied()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -84,6 +244,11 @@ pub enum EngineError {
     UndefinedOperator(String),
     #[error("durability failure: {0}")]
     Durability(String),
+    #[error("durability fault: {0}")]
+    DurabilityFault(DurabilityFault),
     #[error("pending mutation queue overloaded: pending={pending} cap={cap}")]
     MutationQueueOverloaded { pending: usize, cap: usize },
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<EngineError>() <= 32);

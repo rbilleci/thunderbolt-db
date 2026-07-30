@@ -240,23 +240,14 @@ fn compound_i32_i64_prepared_route_is_exact_resident_and_generation_safe() {
     let pressure_generation = std::sync::Arc::clone(
         &e.read_residency_shards()["accounts_read002"][0].point_route_generation,
     );
-    let pressure_route_count = e
-        .read_state
-        .residency
-        .compound_point_routes
-        .load()
-        .len();
+    let pressure_route_count = e.read_state.residency.compound_point_route_count();
     e.mark_gpu_memory_pressured(0);
     assert!(std::sync::Arc::ptr_eq(
         &pressure_generation,
         &e.read_residency_shards()["accounts_read002"][0].point_route_generation
     ));
     assert_eq!(
-        e.read_state
-            .residency
-            .compound_point_routes
-            .load()
-            .len(),
+        e.read_state.residency.compound_point_route_count(),
         pressure_route_count,
         "authoritative pressure leaves the cached route present for the execution-time gate"
     );
@@ -264,7 +255,10 @@ fn compound_i32_i64_prepared_route_is_exact_resident_and_generation_safe() {
         .execute_relational_compound_i32_i64_point_reads(&template, &params)
         .unwrap_err()
         .to_string();
-    assert!(pressure_error.contains("memory pressured"), "{pressure_error}");
+    assert!(
+        pressure_error.contains("memory pressured"),
+        "{pressure_error}"
+    );
     assert_eq!(e.sharded_point_gpu_probe_hits(), pressured_gpu_hits);
     assert_eq!(e.sharded_point_batch_hits(), pressured_batch_hits);
     e.clear_gpu_memory_pressured(0);
@@ -471,11 +465,7 @@ fn compound_route_concurrent_prepare_reuses_one_exact_budgeted_plan() {
     assert_eq!(first_template.route_id, second_template.route_id);
     assert!(e.relational_resident_bytes_for_gpu(0) <= base + estimated);
     assert_eq!(
-        e.read_state
-            .residency
-            .compound_point_routes
-            .load()
-            .len(),
+        e.read_state.residency.compound_point_route_count(),
         1,
         "both preparers converge on one retained allocation"
     );
@@ -545,10 +535,8 @@ fn compound_route_build_cannot_publish_after_generation_changes() {
     assert!(
         e.read_state
             .residency
-            .compound_point_routes
-            .load()
-            .keys()
-            .all(|(table, _, _)| table != "stale_build_read002"),
+            .compound_point_route_for_table("stale_build_read002")
+            .is_none(),
         "the losing builder published no stale route"
     );
     let current = e
@@ -572,6 +560,300 @@ fn compound_route_build_cannot_publish_after_generation_changes() {
         result[0].rows.clone().into_boxed(),
         vec![vec![SqlValue::Int8(-6_000_000_002)]]
     );
+}
+
+/// A catalog-only index change retains the table OID and its point-slot Arc.  A paused compound
+/// route builder must nevertheless reject its old full table shape at the final route fence; the
+/// fresh replacement index receives a new OID and can prepare normally afterward.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn compound_route_build_cannot_publish_across_same_oid_unique_index_replacement() {
+    let e = std::sync::Arc::new(Engine::new_local());
+    e.set_shard_residency_enabled(true);
+    e.set_shard_int8_section_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE compound_index_shape_race (tenant_id INT, account_id BIGINT, value BIGINT)",
+    )
+    .expect("fixture table");
+    e.execute_text(
+        2,
+        "CREATE UNIQUE INDEX compound_index_shape_race_old_key ON compound_index_shape_race (tenant_id, account_id)",
+    )
+    .expect("fixture compound unique index");
+    e.execute_text(
+        3,
+        "INSERT INTO compound_index_shape_race VALUES (1, 1001, 5000000001)",
+    )
+    .expect("fixture row and resident admission");
+    let before = e
+        .relational_catalog_table("compound_index_shape_race")
+        .expect("fixture table remains catalog-visible");
+    let old_index = before
+        .indexes
+        .iter()
+        .find(|index| index.name == "compound_index_shape_race_old_key")
+        .expect("fixture unique index remains catalog-visible");
+    assert!(old_index.unique);
+    assert_eq!(old_index.key_columns, ["tenant_id", "account_id"]);
+
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    e.set_sharded_point_route_pre_publish_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let builder_engine = std::sync::Arc::clone(&e);
+    let builder = std::thread::spawn(move || {
+        builder_engine.prepare_relational_compound_i32_i64_point_read_template(
+            "public",
+            "compound_index_shape_race",
+            ["tenant_id", "account_id"],
+            &["value"],
+        )
+    });
+    reached.wait();
+
+    e.execute_text(4, "DROP INDEX compound_index_shape_race_old_key")
+        .expect("same-table-OID unique-index drop races the paused builder");
+    let after_drop = e
+        .relational_catalog_table("compound_index_shape_race")
+        .expect("index drop keeps the table catalog-visible");
+    assert_eq!(after_drop.oid, before.oid, "DROP INDEX retains table OID");
+    assert!(
+        after_drop.indexes.is_empty(),
+        "the changed table shape no longer has the captured compound unique index"
+    );
+
+    resume.wait();
+    let stale_error = builder
+        .join()
+        .expect("paused builder thread")
+        .expect_err("a paused builder cannot publish through a same-OID catalog shape change")
+        .to_string();
+    assert!(
+        stale_error.contains("generation changed during preparation"),
+        "the exact final table-shape fence must reject the old builder: {stale_error}"
+    );
+    assert!(
+        e.read_state
+            .residency
+            .compound_point_route_for_table("compound_index_shape_race")
+            .is_none(),
+        "the stale builder published no route for the unchanged table OID"
+    );
+
+    e.execute_text(
+        5,
+        "CREATE UNIQUE INDEX compound_index_shape_race_new_key ON compound_index_shape_race (tenant_id, account_id)",
+    )
+    .expect("recreate the compound unique index under a new catalog OID");
+    let rebuilt = e
+        .relational_catalog_table("compound_index_shape_race")
+        .expect("rebuilt table remains catalog-visible");
+    assert_eq!(rebuilt.oid, before.oid);
+    let new_index = rebuilt
+        .indexes
+        .iter()
+        .find(|index| index.name == "compound_index_shape_race_new_key")
+        .expect("replacement index appears in the new table shape");
+    assert_ne!(
+        new_index.oid, old_index.oid,
+        "replacement index has a fresh OID"
+    );
+    e.publish_relational_resident_indexes("compound_index_shape_race")
+        .expect("publish the replacement named index over the resident table generation");
+
+    let fresh = e
+        .prepare_relational_compound_i32_i64_point_read_template(
+            "public",
+            "compound_index_shape_race",
+            ["tenant_id", "account_id"],
+            &["value"],
+        )
+        .expect("fresh current-shape compound route prepares");
+    let result = e
+        .execute_relational_compound_i32_i64_point_reads(
+            &fresh,
+            &[RelationalCompoundI32I64PointReadParam {
+                first: 1,
+                second: 1_001,
+            }],
+        )
+        .expect("fresh route executes after index replacement");
+    assert_eq!(
+        result[0].rows.clone().into_boxed(),
+        vec![vec![SqlValue::Int8(5_000_000_001)]]
+    );
+}
+
+/// A paused A builder must not survive `A -> B` followed by a new `A`. The original slot moves to
+/// B with its epoch, while the new A receives a distinct slot only when its fresh route binds.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn compound_route_rename_recreate_preserves_b_slot_and_fences_new_a() {
+    let e = std::sync::Arc::new(Engine::new_local());
+    e.set_shard_residency_enabled(true);
+    e.set_shard_int8_section_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE point_slot_compound_a (tenant_id INT, account_id BIGINT, value BIGINT, PRIMARY KEY (tenant_id, account_id))",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO point_slot_compound_a VALUES (1, 1001, 5000000001)",
+    )
+    .unwrap();
+    let original_table = e
+        .relational_catalog_table("point_slot_compound_a")
+        .unwrap();
+    let original_epoch = e
+        .read_state
+        .residency
+        .point_index_mutation_epoch_for_table(&e.read_state, &original_table)
+        .expect("A owns the original slot before the paused build");
+    let original_slot = e
+        .read_state
+        .residency
+        .table_point_slot("point_slot_compound_a", original_table.oid)
+        .expect("retain A's original slot through rename/recreate");
+    let original_identity = std::sync::Arc::clone(&original_slot.slot_identity);
+
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    e.set_sharded_point_route_pre_publish_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let builder_engine = std::sync::Arc::clone(&e);
+    let builder = std::thread::spawn(move || {
+        builder_engine.prepare_relational_compound_i32_i64_point_read_template(
+            "public",
+            "point_slot_compound_a",
+            ["tenant_id", "account_id"],
+            &["value"],
+        )
+    });
+    reached.wait();
+    e.execute_text(
+        3,
+        "ALTER TABLE point_slot_compound_a RENAME TO point_slot_compound_b",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "CREATE TABLE point_slot_compound_a (tenant_id INT, account_id BIGINT, value BIGINT, CONSTRAINT point_slot_compound_a_recreated_pkey PRIMARY KEY (tenant_id, account_id))",
+    )
+    .unwrap();
+    let renamed_table = e
+        .relational_catalog_table("point_slot_compound_b")
+        .unwrap();
+    let recreated_table = e
+        .relational_catalog_table("point_slot_compound_a")
+        .unwrap();
+    assert_eq!(renamed_table.oid, original_table.oid);
+    assert_ne!(recreated_table.oid, original_table.oid);
+    let renamed_slot = e
+        .read_state
+        .residency
+        .table_point_slot("point_slot_compound_b", renamed_table.oid)
+        .expect("rename moves the original slot before the paused builder resumes");
+    assert!(std::sync::Arc::ptr_eq(&original_slot, &renamed_slot));
+    assert!(std::sync::Arc::ptr_eq(&original_epoch, &renamed_slot.index_epoch));
+    assert!(std::sync::Arc::ptr_eq(
+        &original_identity,
+        &renamed_slot.slot_identity
+    ));
+
+    resume.wait();
+    let stale_error = builder
+        .join()
+        .expect("paused A builder joins")
+        .expect_err("the original A preparation cannot cross rename/recreate")
+        .to_string();
+    assert!(
+        stale_error.contains("generation changed during preparation"),
+        "old A must decline at the final route fence: {stale_error}"
+    );
+    assert!(
+        e.read_state
+            .residency
+            .compound_point_route_for_table("point_slot_compound_a")
+            .is_none(),
+        "old A did not cache through the replacement name"
+    );
+    assert!(original_slot.sharded_route.load().is_none());
+    assert!(original_slot.compound_route.load().is_none());
+
+    e.execute_text(
+        5,
+        "INSERT INTO point_slot_compound_b VALUES (2, 2002, 5000000002)",
+    )
+    .unwrap();
+    e.execute_text(
+        6,
+        "INSERT INTO point_slot_compound_a VALUES (3, 3003, 6000000003)",
+    )
+    .unwrap();
+    let fresh_b = e
+        .prepare_relational_compound_i32_i64_point_read_template(
+            "public",
+            "point_slot_compound_b",
+            ["tenant_id", "account_id"],
+            &["value"],
+        )
+        .expect("fresh B template binds");
+    let fresh_a = e
+        .prepare_relational_compound_i32_i64_point_read_template(
+            "public",
+            "point_slot_compound_a",
+            ["tenant_id", "account_id"],
+            &["value"],
+        )
+        .expect("fresh recreated A template binds");
+    let b_rows = e
+        .execute_relational_compound_i32_i64_point_reads(
+            &fresh_b,
+            &[RelationalCompoundI32I64PointReadParam {
+                first: 2,
+                second: 2_002,
+            }],
+        )
+        .expect("fresh B route executes");
+    let a_rows = e
+        .execute_relational_compound_i32_i64_point_reads(
+            &fresh_a,
+            &[RelationalCompoundI32I64PointReadParam {
+                first: 3,
+                second: 3_003,
+            }],
+        )
+        .expect("fresh recreated A route executes");
+    assert_eq!(
+        b_rows[0].rows.clone().into_boxed(),
+        vec![vec![SqlValue::Int8(5_000_000_002)]]
+    );
+    assert_eq!(
+        a_rows[0].rows.clone().into_boxed(),
+        vec![vec![SqlValue::Int8(6_000_000_003)]]
+    );
+    let recreated_slot = e
+        .read_state
+        .residency
+        .table_point_slot("point_slot_compound_a", recreated_table.oid)
+        .expect("fresh A binding installs the new slot");
+    assert!(!std::sync::Arc::ptr_eq(&original_slot, &recreated_slot));
+    assert!(!std::sync::Arc::ptr_eq(
+        &original_epoch,
+        &recreated_slot.index_epoch
+    ));
+    assert!(!std::sync::Arc::ptr_eq(
+        &original_identity,
+        &recreated_slot.slot_identity
+    ));
 }
 
 #[test]
@@ -598,24 +880,25 @@ fn retired_compound_plan_remains_charged_until_last_owner_drains() {
         &["value"],
     )
     .unwrap();
-    let pinned_routes = e.read_state.residency.compound_point_routes.load_full();
-    let old_plan_bytes = pinned_routes
-        .iter()
-        .find(|((table, _, _), _)| table == "retired_charge_read002")
-        .map(|(_, route)| route.plan.plan.allocated_bytes())
+    let pinned_route = e
+        .read_state
+        .residency
+        .compound_point_route_for_table("retired_charge_read002");
+    let old_plan_bytes = pinned_route
+        .as_ref()
+        .map(|route| route.plan.plan.allocated_bytes())
         .expect("pin the old compound plan through cache retirement");
     e.execute_text(
         3,
         "INSERT INTO retired_charge_read002 VALUES (2, 2002, -6000000002)",
     )
     .unwrap();
-    assert!(e
-        .read_state
-        .residency
-        .compound_point_routes
-        .load()
-        .keys()
-        .all(|(table, _, _)| table != "retired_charge_read002"));
+    assert!(
+        e.read_state
+            .residency
+            .compound_point_route_for_table("retired_charge_read002")
+            .is_none()
+    );
     assert_eq!(
         e.read_state
             .residency
@@ -650,14 +933,15 @@ fn retired_compound_plan_remains_charged_until_last_owner_drains() {
         budget_error.contains("residency budget exceeded"),
         "a pinned retired plan must consume the one-plan budget: {budget_error}"
     );
-    drop(pinned_routes);
-    assert!(e
-        .read_state
-        .residency
-        .live_compound_point_route_bytes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_empty());
+    drop(pinned_route);
+    assert!(
+        e.read_state
+            .residency
+            .live_compound_point_route_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    );
     let current_template = e
         .prepare_relational_compound_i32_i64_point_read_template(
             "public",

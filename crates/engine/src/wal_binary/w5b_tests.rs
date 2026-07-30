@@ -24,6 +24,15 @@ fn w5b_delete_by_key_round_trips_and_fails_loud() {
     assert!(decode_binary_record(&skewed).is_err());
 }
 
+#[test]
+fn w5b_decoded_delete_reencodes_the_exact_current_bytes() {
+    let payload = encode_binary_delete_by_key("public_accounts", "id", -73).unwrap();
+    let BinaryWalRecord::DeleteByKey(record) = decode_binary_record(&payload).unwrap() else {
+        panic!("decoded the wrong op");
+    };
+    assert_eq!(reencode_binary_delete_by_key(&record).unwrap(), payload);
+}
+
 /// U2 (W5b): the by-key UPDATE record round-trips (table + pk + new_row_id + new image)
 /// through the op-dispatch decoder; truncation/trailing bytes fail LOUDLY.
 #[test]
@@ -67,4 +76,17 @@ fn w5b_update_by_key_round_trips_and_fails_loud() {
         BinaryWalRecord::UpdateByKey(record) => assert_eq!(record.new_row_id, 7_000_001),
         _ => panic!("decoded the wrong op"),
     }
+}
+
+#[test]
+fn w5b_decoded_update_reencodes_the_exact_current_bytes() {
+    let values = [
+        SqlValue::Int4(42),
+        SqlValue::Text("current codec".to_string()),
+    ];
+    let payload = encode_binary_update_by_key("public_t", "id", 42, 7_000_001, &values).unwrap();
+    let BinaryWalRecord::UpdateByKey(record) = decode_binary_record(&payload).unwrap() else {
+        panic!("decoded the wrong op");
+    };
+    assert_eq!(reencode_binary_update_by_key(&record).unwrap(), payload);
 }

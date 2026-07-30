@@ -4,25 +4,33 @@
 //! status, ledger, or publication authority; [`super::canonical`] remains the sole serial-wave
 //! canonical chain.
 
-use super::canonical::WaveCanonicalOperation;
+use super::canonical::{ClaimedTypedInsertAuthority, WaveCanonicalOperation};
+#[cfg(test)]
+use super::control_plane::{fail_typed_control_plane_mutation_at, TypedControlPlaneMutationFault};
 #[cfg(test)]
 use super::CanonicalRequest;
 #[cfg(test)]
 use super::CommitWaveDone;
+#[cfg(test)]
+use super::EngineError;
 #[cfg(test)]
 use super::OfflockPreparedDml;
 use super::{CatalogSnapshot, CommitWaveItem, Engine, ExecuteError, Index};
 
 pub(super) struct TypedInsertPreWal<'a> {
     bound_plan: crate::engine_insert_plan::BoundDeviceInsertPlan<'a>,
+    reserved_ledger_delta: crate::write_path::ReservedLedgerDelta,
     request_digest: gpu_db_wal::CanonicalDigest,
+    txn_id: u64,
     row_count: u64,
 }
 
 pub(super) struct TypedInsertApply<'a> {
     plan: crate::engine_residency::DeviceInsertPlan<'a>,
     request_digest: gpu_db_wal::CanonicalDigest,
+    txn_id: u64,
     row_count: u64,
+    expected_commit_seq: Index,
 }
 
 // Keeping the sealed plan inline avoids a successful-route heap allocation between preflight and
@@ -48,20 +56,24 @@ impl<'a> TypedInsertPreWal<'a> {
     ) -> (WaveCanonicalOperation, TypedInsertApply<'a>) {
         let TypedInsertPreWal {
             bound_plan,
+            reserved_ledger_delta,
             request_digest,
+            txn_id,
             row_count,
         } = self;
-        let (plan, bound) = bound_plan.into_parts();
-        let proposal_payload = bound.proposal_payload();
+        let (plan, bound, expected_commit_seq) = bound_plan.into_parts();
         (
             WaveCanonicalOperation::TypedInsert {
-                proposal_payload,
                 bound,
+                expected_commit_seq,
+                reserved_ledger_delta,
             },
             TypedInsertApply {
                 plan,
                 request_digest,
+                txn_id,
                 row_count,
+                expected_commit_seq,
             },
         )
     }
@@ -83,12 +95,21 @@ impl TypedInsertApply<'_> {
         self.row_count
     }
 
+    pub(super) fn expected_commit_seq(&self) -> Index {
+        self.expected_commit_seq
+    }
+
     pub(super) fn apply(
         self,
         engine: &Engine,
-        commit_seq: Index,
-        proposed_range: crate::wal_binary::ProposedRowIdRange,
-    ) -> String {
+        authority: ClaimedTypedInsertAuthority,
+    ) -> TypedInsertApplied {
+        let claimed = authority.into_apply_authority(
+            self.expected_commit_seq,
+            self.txn_id,
+            self.request_digest,
+        );
+        let commit_seq = claimed.commit_seq;
         let table = self.plan.table_name().to_string();
         #[cfg(test)]
         if engine
@@ -100,10 +121,7 @@ impl TypedInsertApply<'_> {
             );
         }
         self.plan
-            .apply(
-                engine,
-                crate::engine_residency::AppendCreatedBy::InsertUniform(commit_seq),
-            )
+            .apply_after_typed_wal_claim(engine, claimed.residency_permit)
             .unwrap_or_else(|error| {
                 panic!(
                     "commit-path invariant violation: fixed INSERT device apply at commit_seq \
@@ -113,15 +131,27 @@ impl TypedInsertApply<'_> {
         engine
             .read_state
             .mvcc
-            .consume_proposed_row_id_range(proposed_range)
+            .consume_proposed_row_id_range(claimed.proposed_range)
             .unwrap_or_else(|error| {
                 panic!(
                     "commit-path invariant violation: fixed INSERT allocator consumption at \
                      commit_seq {commit_seq} drifted after device apply: {error}"
                 )
             });
-        table
+        TypedInsertApplied {
+            table,
+            commit_seq,
+            wal_position: claimed.wal_position,
+            ledger_receipt: claimed.ledger_receipt,
+        }
     }
+}
+
+pub(super) struct TypedInsertApplied {
+    pub(super) table: String,
+    pub(super) commit_seq: Index,
+    pub(super) wal_position: usize,
+    pub(super) ledger_receipt: crate::write_path::LedgerClaimReceipt,
 }
 
 impl Engine {
@@ -130,6 +160,7 @@ impl Engine {
     /// retains only typed source/template metadata through the canonical apply cut.
     pub(super) fn prepare_typed_insert_pre_wal<'a>(
         &'a self,
+        commit_proof: &mut std::sync::MutexGuard<'_, crate::CommitState>,
         item: &mut CommitWaveItem,
         wave_catalog: &CatalogSnapshot,
         wave_catalog_seq: Index,
@@ -141,6 +172,7 @@ impl Engine {
         if !self.binary_wal_records_enabled() {
             return TypedInsertPreflightResult::FullReprepare;
         }
+        let txn_id = item.txn_id;
         let Some(prepared) = item.offlock_prepared.take() else {
             return TypedInsertPreflightResult::FullReprepare;
         };
@@ -167,12 +199,34 @@ impl Engine {
             || self
                 .table_chunk_authoritative(prepared_plan.table_name())
                 .is_some();
-        match prepared_plan.bind_for_current_commit(self, row_id_proposal) {
-            Ok(bound_plan) => TypedInsertPreflightResult::Ready(TypedInsertPreWal {
-                bound_plan,
-                request_digest,
-                row_count: u64::from(row_count),
-            }),
+        match prepared_plan.bind_for_current_commit(self, commit_proof, row_id_proposal) {
+            Ok(bound_plan) => {
+                let expected_commit_seq = bound_plan.expected_commit_seq();
+                let prepared_ledger_delta = match crate::write_path::PreparedLedgerDelta::from_write_set(
+                    &item.write_set,
+                ) {
+                    Ok(delta) => delta,
+                    Err(error) => {
+                        return TypedInsertPreflightResult::PreWalFailure(ExecuteError::Engine(error));
+                    }
+                };
+                let reserved_ledger_delta = match commit_proof
+                    .ledger
+                    .reserve_typed_delta(prepared_ledger_delta, expected_commit_seq)
+                {
+                    Ok(reserved) => reserved,
+                    Err(error) => {
+                        return TypedInsertPreflightResult::PreWalFailure(ExecuteError::Engine(error));
+                    }
+                };
+                TypedInsertPreflightResult::Ready(TypedInsertPreWal {
+                    bound_plan,
+                    reserved_ledger_delta,
+                    request_digest,
+                    txn_id,
+                    row_count: u64::from(row_count),
+                })
+            }
             Err(crate::engine_insert_plan::BindDeviceInsertPlanError::Template {
                 bound_bootstrap: true,
             }) => TypedInsertPreflightResult::RetryableDecline,
@@ -403,7 +457,9 @@ mod tests {
             request,
             write_set: crate::write_path::WriteSet {
                 tables: std::collections::BTreeSet::from(["accounts".to_string()]),
+                table_oids: vec![prepared_catalog.relational_catalog["accounts"].oid],
                 rows: Vec::new(),
+                stable_rows: Vec::new(),
                 unique_slots: Vec::new(),
                 unique_slots_i32: Vec::new(),
             },
@@ -423,13 +479,16 @@ mod tests {
         let wal_before = engine.durable_wal_records().len();
         let row_id_before = engine.read_state.mvcc.current_row_id();
         let wave_catalog = engine.catalog_snapshot();
+        let mut commit = engine.commit_state();
         let result = engine.prepare_typed_insert_pre_wal(
+            &mut commit,
             &mut item,
             &wave_catalog,
             wave_catalog.commit_seq,
             row_id_before,
             false,
         );
+        drop(commit);
         assert!(matches!(result, TypedInsertPreflightResult::FullReprepare));
         assert!(item.offlock_prepared.is_none());
         assert_eq!(engine.durable_wal_records().len(), wal_before);
@@ -477,7 +536,9 @@ mod tests {
             request,
             write_set: crate::write_path::WriteSet {
                 tables: std::collections::BTreeSet::from(["checked_drift".to_string()]),
+                table_oids: vec![prepared_catalog.relational_catalog["checked_drift"].oid],
                 rows: Vec::new(),
+                stable_rows: Vec::new(),
                 unique_slots: Vec::new(),
                 unique_slots_i32: Vec::new(),
             },
@@ -500,13 +561,16 @@ mod tests {
             .value = SqlValue::Int4(2);
         let wal_before = engine.durable_wal_records().len();
         let row_id_before = engine.read_state.mvcc.current_row_id();
+        let mut commit = engine.commit_state();
         let result = engine.prepare_typed_insert_pre_wal(
+            &mut commit,
             &mut item,
             &drift,
             drift.commit_seq,
             row_id_before,
             false,
         );
+        drop(commit);
         assert!(matches!(result, TypedInsertPreflightResult::FullReprepare));
         assert!(item.offlock_prepared.is_none());
         assert_eq!(engine.durable_wal_records().len(), wal_before);
@@ -553,7 +617,9 @@ mod tests {
                 request,
                 write_set: crate::write_path::WriteSet {
                     tables: std::collections::BTreeSet::from(["domain_accounts".to_string()]),
+                    table_oids: vec![prepared_catalog.relational_catalog["domain_accounts"].oid],
                     rows: Vec::new(),
+                    stable_rows: Vec::new(),
                     unique_slots: Vec::new(),
                     unique_slots_i32: Vec::new(),
                 },
@@ -602,13 +668,16 @@ mod tests {
             }
             let wal_before = engine.durable_wal_records().len();
             let row_id_before = engine.read_state.mvcc.current_row_id();
+            let mut commit = engine.commit_state();
             let result = engine.prepare_typed_insert_pre_wal(
+                &mut commit,
                 &mut item,
                 &wave_catalog,
                 wave_catalog.commit_seq,
                 row_id_before,
                 false,
             );
+            drop(commit);
             assert!(
                 matches!(result, TypedInsertPreflightResult::FullReprepare),
                 "{sabotage}"
@@ -787,13 +856,18 @@ mod tests {
             .next()
             .expect("production fixed INSERT owner precedes its tests");
         let canonical = include_str!("canonical.rs");
+        let canonical_production = canonical
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production canonical owner precedes its tests");
+        let control_plane = include_str!("control_plane.rs");
         let wave = include_str!("wave.rs");
         assert_eq!(fixed.matches(".append_canonical(").count(), 0);
         assert_eq!(fixed.matches(".propose(").count(), 0);
         assert_eq!(fixed.matches("record_transaction_status").count(), 0);
         assert_eq!(fixed.matches("consume_proposed_row_id_range(").count(), 1);
-        assert_eq!(canonical.matches(".append_canonical(").count(), 1);
-        assert_eq!(canonical.matches(".propose(").count(), 1);
+        assert_eq!(canonical.matches(".append_canonical(").count(), 2);
+        assert_eq!(canonical.matches(".propose(").count(), 2);
         assert_eq!(
             canonical
                 .matches("record_transaction_status_digest_outcome(")
@@ -801,8 +875,104 @@ mod tests {
             1
         );
         assert_eq!(wave.matches("fn sequence_commit_wave_inner").count(), 1);
+        assert_eq!(fixed.matches("commit_state(").count(), 0);
         assert!(wave.contains("prepare_typed_insert_pre_wal"));
+        assert!(wave.contains("&mut commit,"));
+        assert!(wave.contains("fixed_apply.expected_commit_seq()"));
         assert!(wave.contains("append_canonical_wave_operation"));
+        assert!(fixed.contains("commit_proof: &mut std::sync::MutexGuard<'_, crate::CommitState>"));
+        assert!(fixed.contains("authority: ClaimedTypedInsertAuthority"));
+        assert!(fixed.contains("authority.into_apply_authority("));
+        assert!(fixed.contains("apply_after_typed_wal_claim"));
+        assert!(canonical.contains("struct ClaimedTypedInsertAuthority"));
+        assert!(canonical.contains("impl Drop for ClaimedTypedInsertAuthority"));
+        assert!(canonical.contains("WaveCanonicalCommit::TypedInsert"));
+        assert!(canonical.contains("expected_commit_seq: bound_expected_commit_seq"));
+        assert!(
+            canonical.contains("commit.repl.peek_next_index(),\n            expected_commit_seq")
+        );
+        assert!(canonical.contains("token.index, expected_commit_seq"));
+        assert!(canonical.contains("reserve_typed_canonical_control_plane"));
+        assert!(canonical.contains("Some((control_plane, ..)) => control_plane.propose"));
+        assert!(canonical.contains("control_plane.record_transaction_status"));
+        assert!(canonical.contains("control_plane.record_commit_timestamp"));
+        assert!(canonical.contains("control_plane.append_canonical(commit)"));
+        assert!(canonical.contains("rollback_inserted_status_after_pre_durable_failure"));
+        let exact_construction = canonical_production
+            .find("canonical_wal_record_with_commit_bound_insert")
+            .expect("typed exact record construction");
+        let exact_reservation = canonical_production
+            .find("reserve_typed_canonical_control_plane")
+            .expect("typed exact owner reservation");
+        let typed_proposal = canonical_production
+            .find("control_plane.propose(commit)")
+            .expect("typed replication proposal");
+        assert!(
+            exact_construction < exact_reservation && exact_reservation < typed_proposal,
+            "typed exact record construction/reservation must precede proposal"
+        );
+        assert_eq!(
+            canonical_production
+                .matches("rollback_tentative_wal_after_pre_durable_failure(commit)")
+                .count(),
+            3,
+            "every typed rollbackable post-proposal branch restores its exact tentative WAL tail"
+        );
+        assert_eq!(
+            canonical_production
+                .matches("claim_tentative_wal_after_final_rollbackable_step(commit)")
+                .count(),
+            1,
+            "the typed exact tail is claimed exactly once after the final timestamp step"
+        );
+        assert!(
+            canonical_production
+                .find("record_commit_timestamp(commit, timestamp_micros)")
+                .expect("typed timestamp mutation")
+                < canonical_production
+                    .find("claim_tentative_wal_after_final_rollbackable_step(commit)")
+                    .expect("typed exact claim"),
+            "the typed exact tail cannot become flushable before timestamp ownership is final"
+        );
+        assert_eq!(
+            canonical_production
+                .matches("commit.wal.append_canonical(record)")
+                .count(),
+            1,
+            "only the generic canonical compatibility path may append through ordinary WAL"
+        );
+        assert_eq!(
+            control_plane
+                .matches("commit.repl.propose_reserved(reservation, payload)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            control_plane
+                .matches(".append_typed_exact_tentative(reservation)")
+                .count(),
+            1
+        );
+        assert!(!control_plane.contains(".truncate("));
+        assert!(!control_plane.contains("append_canonical_reserved"));
+        assert_eq!(
+            control_plane
+                .matches("commit.transaction_status.entry(self.txn_id)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            control_plane
+                .matches(".wal_commit_timestamps_micros\n            .insert(self.txn_id, timestamp_micros)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            control_plane
+                .matches("commit.transaction_status.remove(&self.txn_id)")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1181,6 +1351,113 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn fixed_i32_typed_control_plane_late_failures_are_atomic_and_retryable() {
+        for fault in [
+            TypedControlPlaneMutationFault::BeforeCanonicalAppend,
+            TypedControlPlaneMutationFault::BeforeTransactionStatus,
+            TypedControlPlaneMutationFault::BeforeCommitTimestamp,
+        ] {
+            let mut engine = Engine::new_local();
+            engine.set_shard_residency_enabled(true);
+            engine.set_binary_wal_records_enabled(true);
+            engine
+                .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
+                .unwrap();
+            engine
+                .execute_dml_concurrent(2, "INSERT INTO accounts VALUES (0, 0)")
+                .unwrap();
+            let snapshot = engine
+                .populate_relational_residency_snapshot("accounts")
+                .unwrap();
+            assert!(snapshot.device_memory_proof.is_some());
+            engine.set_table_device_authoritative("accounts", true);
+
+            let wal_buffered_before = engine.wal_buffered_count();
+            let durable_wal_before = engine.durable_wal_records().len();
+            let row_id_before = engine.read_state.mvcc.current_row_id();
+            let (
+                repl_entries_before,
+                repl_next_before,
+                statuses_before,
+                timestamps_before,
+                ledger_before,
+            ) = {
+                let commit = engine.commit_state();
+                (
+                    commit.repl.retained_entry_count(),
+                    commit.repl.peek_next_index(),
+                    commit.transaction_status.len(),
+                    commit.wal_commit_timestamps_micros.len(),
+                    commit.ledger.len(),
+                )
+            };
+            let before = (
+                repl_entries_before,
+                repl_next_before,
+                statuses_before,
+                timestamps_before,
+                ledger_before,
+                wal_buffered_before,
+                durable_wal_before,
+                row_id_before,
+            );
+            fail_typed_control_plane_mutation_at(fault);
+            let error = engine
+                .execute_dml_concurrent(3, &fixed_insert_sql(2))
+                .expect_err("injected typed control-plane failure must be pre-durable");
+            assert!(matches!(
+                error,
+                ExecuteError::Engine(EngineError::Durability(_))
+            ));
+            let wal_buffered_after = engine.wal_buffered_count();
+            let durable_wal_after = engine.durable_wal_records().len();
+            let row_id_after = engine.read_state.mvcc.current_row_id();
+            let (
+                repl_entries_after,
+                repl_next_after,
+                statuses_after,
+                timestamps_after,
+                ledger_after,
+            ) = {
+                let commit = engine.commit_state();
+                (
+                    commit.repl.retained_entry_count(),
+                    commit.repl.peek_next_index(),
+                    commit.transaction_status.len(),
+                    commit.wal_commit_timestamps_micros.len(),
+                    commit.ledger.len(),
+                )
+            };
+            let after = (
+                repl_entries_after,
+                repl_next_after,
+                statuses_after,
+                timestamps_after,
+                ledger_after,
+                wal_buffered_after,
+                durable_wal_after,
+                row_id_after,
+            );
+            assert_eq!(after, before, "fault {fault:?} must restore every frontier");
+
+            engine
+                .execute_dml_concurrent(3, &fixed_insert_sql(2))
+                .expect("same-id retry succeeds after the pre-durable rollback");
+            let (statuses_committed, timestamps_committed) = {
+                let committed = engine.commit_state();
+                (
+                    committed.transaction_status.len(),
+                    committed.wal_commit_timestamps_micros.len(),
+                )
+            };
+            assert_eq!(statuses_committed, before.2 + 1);
+            assert_eq!(timestamps_committed, before.3 + 1);
+            assert_eq!(engine.durable_wal_records().len(), before.6 + 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn fixed_i32_authoritative_plan_decline_is_retryable_before_wal() {
         let mut engine = Engine::new_local();
         engine.set_shard_residency_enabled(true);
@@ -1244,7 +1521,9 @@ mod tests {
         .expect("exact int4 INSERT remains directly eligible");
         let write_set = crate::write_path::WriteSet {
             tables: std::collections::BTreeSet::from(["accounts".to_string()]),
+            table_oids: vec![catalog.relational_catalog["accounts"].oid],
             rows: Vec::new(),
+            stable_rows: Vec::new(),
             unique_slots: Vec::new(),
             unique_slots_i32: Vec::new(),
         };
@@ -1285,13 +1564,16 @@ mod tests {
             .device_authoritative_commits
             .load(std::sync::atomic::Ordering::Acquire);
 
+        let mut commit = engine.commit_state();
         let result = engine.prepare_typed_insert_pre_wal(
+            &mut commit,
             &mut item,
             &catalog,
             catalog.commit_seq,
             u64::MAX - 1,
             true,
         );
+        drop(commit);
         assert!(matches!(
             result,
             TypedInsertPreflightResult::PreWalFailure(crate::ExecuteError::Engine(_))

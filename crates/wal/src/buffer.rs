@@ -5,6 +5,25 @@
 
 use super::*;
 use crate::identity::{check_or_install_durable_identity, require_durable_identity};
+#[cfg(all(test, unix))]
+use gpu_db_types::DurabilityStage;
+use gpu_db_types::{DurabilityFault, DurabilityPoison};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(crate) mod group;
+mod typed_exact;
+pub use typed_exact::WalTypedExactAppendReservation;
+
+static NEXT_CANONICAL_APPEND_RESERVATION_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_canonical_append_reservation_owner_id() -> u64 {
+    let owner_id = NEXT_CANONICAL_APPEND_RESERVATION_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(
+        owner_id, 0,
+        "WAL canonical append reservation owner identifiers exhausted"
+    );
+    owner_id
+}
 
 /// The durable backing for a [`WalBuffer`]: an **append-only** segment writer whose mutable
 /// state sits behind its OWN small lock, separate from whatever outer lock guards the buffer
@@ -31,6 +50,9 @@ use crate::identity::{check_or_install_durable_identity, require_durable_identit
 struct WalDurableCore {
     segment_path: PathBuf,
     state: Mutex<WalDurableState>,
+    /// First fixed post-handoff exact fault. Once set, it is immutable and dominates every later
+    /// dynamic compatibility/admin poison diagnostic for this live backing.
+    fixed_poison: DurabilityPoison,
     /// Signals `io_in_flight` clearing (a group job completed or was abandoned), so an inline
     /// `flush_all` / prefix truncation waiting for the disk can proceed.
     cv: Condvar,
@@ -115,6 +137,7 @@ impl WalDurableCore {
                 poisoned: None,
                 stats: WalGroupCommitStats::default(),
             }),
+            fixed_poison: DurabilityPoison::new(),
             cv: Condvar::new(),
         }
     }
@@ -139,11 +162,22 @@ impl WalDurableCore {
     }
 
     fn poisoned_error(&self, reason: &str) -> EngineError {
+        if let Some(fault) = self.fixed_fault() {
+            return EngineError::DurabilityFault(fault);
+        }
         EngineError::Durability(format!(
             "WAL segment {} is poisoned by an earlier flush failure ({reason}); restart to \
              recover from the durable prefix",
             self.segment_path.display()
         ))
+    }
+
+    pub(super) fn install_fixed_fault(&self, fault: DurabilityFault) -> DurabilityFault {
+        self.fixed_poison.install(fault)
+    }
+
+    pub(super) fn fixed_fault(&self) -> Option<DurabilityFault> {
+        self.fixed_poison.snapshot()
     }
 
     /// Best-effort sidecar update; errors are reported but tolerable (the sidecar is a lower
@@ -222,6 +256,37 @@ impl WalDurableCore {
         Ok(())
     }
 
+    /// Establish a zero-filled positional-I/O extent before a typed record is proposed or before
+    /// a legacy compatibility group hands ownership off.  A returned serial job never creates,
+    /// reserves, or extends the file.
+    fn ensure_preallocated_through(
+        &self,
+        state: &mut WalDurableState,
+        write_end: u64,
+    ) -> Result<(), EngineError> {
+        if write_end <= state.prealloc_bytes {
+            return Ok(());
+        }
+        let new_prealloc = write_end
+            .max(
+                state
+                    .prealloc_bytes
+                    .saturating_add(wal_prealloc_chunk_bytes()),
+            )
+            .max(wal_prealloc_chunk_bytes());
+        let file = state.file.as_ref().ok_or_else(|| {
+            EngineError::Durability("WAL preallocation requires an open segment handle".to_string())
+        })?;
+        zero_fill_extend(file, state.prealloc_bytes, new_prealloc).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to extend WAL segment preallocation {}: {err}",
+                self.segment_path.display()
+            ))
+        })?;
+        state.prealloc_bytes = new_prealloc;
+        Ok(())
+    }
+
     /// Record a successful fsync of `group_size` records ending at `target_records`.
     fn note_group(state: &mut WalDurableState, group_size: usize, target_records: usize) {
         state.flushed_records = target_records;
@@ -260,11 +325,18 @@ impl Drop for WalDurableCore {
 
 /// The outcome of [`WalBuffer::begin_group_flush`]: either an IO job to run lock-free, or the
 /// news that nothing was unflushed (with the current durable watermark).
+// Keep jobs inline: `begin_group_flush` runs after logical claim, where boxing a job would create
+// a fallible post-WAL allocation and an alternate failure path.
+#[allow(clippy::large_enum_variant)]
 pub enum WalGroupFlushBegin {
     /// Unflushed records were snapshotted; run [`WalGroupFlushJob::commit`] to make them durable.
     Job(WalGroupFlushJob),
     /// Nothing to flush — every appended record is already durable up to `flushed_records`.
     Clean { flushed_records: usize },
+    /// Every bounded permanent descriptor is owned by an in-flight/forming group.  This is
+    /// explicit backpressure: callers wait or retry; a claimed exact record is never re-encoded,
+    /// copied into a fallback buffer, or failed for post-claim capacity.
+    Busy,
 }
 
 /// A snapshotted group flush whose expensive durability step — one `write_all` + fsync for the
@@ -279,11 +351,14 @@ pub struct WalGroupFlushJob {
     kind: Option<WalGroupFlushJobKind>,
 }
 
+// FUA handoff ownership is inline for the same post-claim no-allocation invariant.
+#[allow(clippy::large_enum_variant)]
 enum WalGroupFlushJobKind {
     /// The serial-fdatasync backend: one positional `write_all` + `fdatasync` on the live segment.
-    Serial(SerialFlushJob),
-    /// The FUA fence-pool backend (E1 step 1): publish the group's frame and wait for the
-    /// contiguous durable cut to cover it, allowing MULTIPLE groups durable in flight.
+    Serial(group::SerialFlushJob),
+    /// The FUA fence-pool backend: publish the presealed frame run and wait for its contiguous
+    /// durable cut. Fence-lane parallelism is physical implementation detail, not a second
+    /// logical durability lifecycle.
     #[cfg(unix)]
     Fua(fua::FuaFlushJob),
 }
@@ -315,85 +390,12 @@ impl Drop for WalGroupFlushJob {
     }
 }
 
-/// The serial-fdatasync group flush: the serialized unflushed tail plus the open segment handle.
-/// While it is outstanding the core's `io_in_flight` excludes every other writer of the file
-/// (inline flushes and admin ops wait on the condvar).
-struct SerialFlushJob {
-    core: Arc<WalDurableCore>,
-    file: Arc<File>,
-    /// W4a: the logical tail this group writes at (positional IO inside preallocated extents).
-    offset: u64,
-    /// W4a: the zero-filled frontier at snapshot time; the job extends it lock-free if needed
-    /// (`io_in_flight` already excludes every other writer of the file).
-    prealloc_end: u64,
-    bytes: Vec<u8>,
-    target_records: usize,
-    group_size: usize,
-}
-
-impl SerialFlushJob {
-    /// Perform the group's IO (one `write_all`, one `fdatasync`) then complete under the durable
-    /// core's own lock: advance the watermark + stats and wake waiters. On IO failure the backing
-    /// is POISONED fail-closed and waiters are still woken.
-    fn commit(self) -> Result<usize, EngineError> {
-        use std::os::unix::fs::FileExt;
-        // W4a: extend the zero-filled frontier lock-free if this group crosses it (rare — once
-        // per chunk; `io_in_flight` excludes every other writer), then write POSITIONALLY at
-        // the snapshotted logical tail so `sync_data` never pays size-change journaling.
-        let write_end = self.offset + self.bytes.len() as u64;
-        let mut new_prealloc_end = self.prealloc_end;
-        let io_result = if write_end > self.prealloc_end {
-            new_prealloc_end = write_end.max(self.prealloc_end + wal_prealloc_chunk_bytes());
-            zero_fill_extend(&self.file, self.prealloc_end, new_prealloc_end)
-        } else {
-            Ok(())
-        }
-        .and_then(|_| self.file.write_all_at(&self.bytes, self.offset))
-        .and_then(|_| self.file.sync_data());
-        let mut state = self.core.lock_state();
-        state.io_in_flight = false;
-        let outcome = match io_result {
-            Ok(()) => {
-                state.prealloc_bytes = state.prealloc_bytes.max(new_prealloc_end);
-                state.durable_bytes += self.bytes.len() as u64;
-                WalDurableCore::note_group(&mut state, self.group_size, self.target_records);
-                Ok(self.target_records)
-            }
-            Err(err) => {
-                // A partial positional write leaves garbage inside the preallocated region past
-                // `durable_bytes` (no size rewind — it would chop the preallocation, and after
-                // a failed fsync the page-cache state is unknowable anyway). Poison the backing:
-                // the group's records may back already-applied deltas, so nothing may ever
-                // append past this point until restart recovery truncates the torn tail.
-                state.poisoned = Some(format!("group flush failed ({err})"));
-                Err(EngineError::Durability(format!(
-                    "failed to flush WAL segment group {}: {err}",
-                    self.core.segment_path.display()
-                )))
-            }
-        };
-        drop(state);
-        self.core.cv.notify_all();
-        outcome
-    }
-
-    /// The flusher died between begin and commit: the file may hold a partial write. Fail closed
-    /// and wake anyone waiting for the IO to drain.
-    fn abandon(self) {
-        let mut state = self.core.lock_state();
-        state.io_in_flight = false;
-        state.poisoned = Some("group flush abandoned mid-IO".to_string());
-        drop(state);
-        self.core.cv.notify_all();
-    }
-}
-
 /// Per-buffer proof that the in-memory WAL history has one immutable canonical lineage.
 ///
 /// The public artifact writers deliberately validate their complete supplied slice. A live
 /// append-only buffer instead verifies only its newly appended suffix, installing the small
 /// durable sidecar only when it first binds and requiring it on every later durability handoff.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct DurableIdentityBinding {
     identity: Option<CanonicalIdentity>,
     verified_records: usize,
@@ -473,6 +475,9 @@ impl DurableIdentityBinding {
     ) -> Result<(), EngineError> {
         debug_assert!(target <= records.len());
         debug_assert!(self.verified_records <= target);
+        if self.verified_records == target {
+            return Ok(());
+        }
         let was_bound = self.identity.is_some();
         let mut identity = self.identity;
         for record in &records[self.verified_records..target] {
@@ -599,9 +604,30 @@ pub struct FuaDurabilityTelemetry {
     pub controller_sample_reconciliation: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WalBuffer {
     records: Vec<WalRecord>,
+    /// Sparse exact outer-byte authorities for only unflushed typed records. Recovered and
+    /// already-durable history allocates no parallel sidecar; entries retire at the frontier.
+    exact_typed_wire_records: Vec<typed_exact::ExactTypedWireRecord>,
+    /// At most one typed record can be tentative under the commit owner.  This O(1) frontier is
+    /// the group-flush gate; never scan the per-record wire sidecar on the 48M fixture path.
+    typed_exact_tentative_count: usize,
+    /// Compact non-truncatable boundary. Exact serialized Arcs retire at durability, but a
+    /// claimed typed record remains part of immutable history after that retirement.
+    highest_claimed_typed_exact_record: Option<usize>,
+    /// Last exact owner range handed to a formed scatter group.  Exact sidecars leave the live
+    /// tail at this monotonic cursor and can never be restored after handoff.
+    typed_exact_handoff_cursor: usize,
+    /// Two permanent scatter descriptors plus typed preproposal byte/record credits.
+    prepared_group_arena: group::WalPreparedGroupArena,
+    /// Changes whenever the logical record vector changes.  A typed canonical append reservation
+    /// captures this generation with the exact record frontier so an old Vec slot cannot be
+    /// replayed after truncation, recovery reinstatement, or an intervening append.
+    canonical_append_reservation_generation: u64,
+    /// Stable process-local identity, preventing an equal-length independent WAL buffer from
+    /// consuming this buffer's spare-capacity reservation.
+    canonical_append_reservation_owner_id: u64,
     /// Logical canonical catalog boundary, including records not yet flushed to durable media.
     /// It is independent of physical segment-prefix truncation because that operation preserves
     /// the complete logical record vector.
@@ -615,15 +641,37 @@ pub struct WalBuffer {
     flushed_memory: usize,
     fail_next_flush: bool,
     durable: Option<Arc<WalDurableCore>>,
-    /// E1 step 1: the optional FUA fence-pool durability backend (default OFF). When present it
-    /// REPLACES `durable`: `flush_all` / `begin_group_flush` publish frames into a pipelined
-    /// fence pool whose contiguous durable cut is the record watermark, so MULTIPLE groups can
-    /// be durable in flight at once (unlike the serial single-slot `durable` core). Gated behind
-    /// `#[cfg(unix)]` because the underlying `FuaFrameLog` is a unix `O_DIRECT|O_DSYNC` construct.
+    /// Optional FUA frame-log durability backend. It replaces `durable`; the fence pool may
+    /// overlap physical writes while the buffer preserves one logical lifecycle and watermark.
+    /// Gated behind `#[cfg(unix)]` because `FuaFrameLog` uses unix `O_DIRECT|O_DSYNC` operations.
     #[cfg(unix)]
     fua: Option<Arc<fua::FuaWalBackend>>,
     #[cfg(test)]
     canonical_catalog_tail_decodes_for_test: usize,
+}
+
+impl Default for WalBuffer {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            exact_typed_wire_records: Vec::new(),
+            typed_exact_tentative_count: 0,
+            highest_claimed_typed_exact_record: None,
+            typed_exact_handoff_cursor: 0,
+            prepared_group_arena: group::WalPreparedGroupArena::default(),
+            canonical_append_reservation_generation: 0,
+            canonical_append_reservation_owner_id: next_canonical_append_reservation_owner_id(),
+            canonical_catalog_tail: CanonicalCatalogTailCache::default(),
+            durable_identity_binding: DurableIdentityBinding::default(),
+            flushed_memory: 0,
+            fail_next_flush: false,
+            durable: None,
+            #[cfg(unix)]
+            fua: None,
+            #[cfg(test)]
+            canonical_catalog_tail_decodes_for_test: 0,
+        }
+    }
 }
 
 /// Which durability backend a durable [`WalBuffer`] uses. Default is the existing single-slot
@@ -636,7 +684,7 @@ pub enum WalDurability {
     SerialFdatasync,
     /// The FUA fence-pool backend: `lanes` concurrent FUA-write fence lanes over pre-written,
     /// epoch-stamped frame-log segments of `segment_bytes` data capacity each; the contiguous
-    /// durable cut advances the record watermark, allowing multiple groups durable in flight.
+    /// durable cut advances the one logical record watermark.
     FuaFencePool { lanes: usize, segment_bytes: usize },
 }
 
@@ -680,6 +728,13 @@ impl WalDurability {
 }
 
 impl WalBuffer {
+    fn invalidate_canonical_append_reservations(&mut self) {
+        self.canonical_append_reservation_generation = self
+            .canonical_append_reservation_generation
+            .checked_add(1)
+            .expect("WAL canonical append reservation generation exhausted");
+    }
+
     /// An in-memory WAL buffer with no durable backing (the default — `flush_all` only advances the
     /// in-memory durable watermark). Used by ephemeral engines and the bulk of the test suite.
     pub fn new() -> Self {
@@ -713,9 +768,8 @@ impl WalBuffer {
     }
 
     /// A WAL buffer backed by the FUA fence-pool durability backend (E1 step 1) — a FRESH durable
-    /// database. `flush_all` / `begin_group_flush` publish each group's encoded record run as ONE
-    /// frame into a pipelined fence pool; the contiguous durable cut is the record watermark, so
-    /// multiple groups can be durable in flight at once. Segment files are created next to
+    /// database. `flush_all` / `begin_group_flush` publish each group's encoded record run into
+    /// the FUA frame log; the contiguous durable cut is the one logical record watermark. Segment files are created next to
     /// `segment_path` (named `<segment_path>.fua.<segment_id>`); recovery reads them back with
     /// [`recover_fua_wal_records`]. `lanes` is the fence-pool depth (see
     /// [`WalDurability::DEFAULT_FUA_LANES`]); `segment_bytes` is the per-segment data capacity.
@@ -802,6 +856,7 @@ impl WalBuffer {
     ) -> Result<Self, EngineError> {
         debug_assert!(records.len() >= recovery.records.len());
         debug_assert!(records.ends_with(&recovery.records));
+        let record_count = records.len();
         let segment_base_records = records.len() - recovery.records.len();
         let core = WalDurableCore::fresh(segment_path);
         {
@@ -841,7 +896,14 @@ impl WalBuffer {
             state.flushed_records = records.len();
         }
         Ok(Self {
+            exact_typed_wire_records: Vec::new(),
+            typed_exact_tentative_count: 0,
+            highest_claimed_typed_exact_record: record_count.checked_sub(1),
+            typed_exact_handoff_cursor: record_count,
+            prepared_group_arena: group::WalPreparedGroupArena::default(),
             records,
+            canonical_append_reservation_generation: 0,
+            canonical_append_reservation_owner_id: next_canonical_append_reservation_owner_id(),
             canonical_catalog_tail: CanonicalCatalogTailCache::Dirty,
             durable_identity_binding,
             flushed_memory: 0,
@@ -913,7 +975,14 @@ impl WalBuffer {
         let recovered = records.len();
         let backend = fua::FuaWalBackend::reopen(segment_path, lanes, segment_bytes, recovered)?;
         Ok(Self {
+            exact_typed_wire_records: Vec::new(),
+            typed_exact_tentative_count: 0,
+            highest_claimed_typed_exact_record: recovered.checked_sub(1),
+            typed_exact_handoff_cursor: recovered,
+            prepared_group_arena: group::WalPreparedGroupArena::default(),
             records,
+            canonical_append_reservation_generation: 0,
+            canonical_append_reservation_owner_id: next_canonical_append_reservation_owner_id(),
             canonical_catalog_tail: CanonicalCatalogTailCache::Dirty,
             durable_identity_binding,
             flushed_memory: 0,
@@ -947,19 +1016,6 @@ impl WalBuffer {
         )
     }
 
-    /// FUA-backend PACING signal (E1 step 3): free fence lanes in the active segment's pool, or
-    /// `None` for any non-FUA backend. The engine's concurrent-durability wait uses this at the
-    /// engine seam — a committer begins its own group flush ONLY while a lane is free, so backlog
-    /// forms a LARGER next group behind the busy lanes instead of collapsing the pool to tiny
-    /// per-arrival frames (the population-share anti-convoy law, applied above the WAL).
-    pub fn fua_free_fence_slots(&self) -> Option<usize> {
-        #[cfg(unix)]
-        if let Some(fua) = self.fua.as_ref() {
-            return Some(fua.free_fence_slots());
-        }
-        None
-    }
-
     /// The durable segment path, if this buffer is backed by one. For the FUA backend this is the
     /// base path the per-segment files (`<path>.fua.<segment_id>`) sit beside.
     pub fn durable_segment_path(&self) -> Option<&Path> {
@@ -981,46 +1037,55 @@ impl WalBuffer {
         self.durable.is_some()
     }
 
-    /// Whether this buffer's durability backend supports MULTIPLE concurrent group flushes in
-    /// flight (E1 step 2). True only for the FUA fence-pool backend, where `begin_group_flush`
-    /// snapshots and advances the `published` cursor under the caller's outer lock (so frames stay
-    /// totally ordered) while the returned job's fence-pool durable-cut wait runs off-lock and
-    /// overlaps every other FUA job. The serial `write_all` + `fdatasync` backend requires the
-    /// caller to elect a SINGLE flusher (its `io_in_flight` slot admits at most one IO), so it
-    /// returns false — the engine keeps the flusher-election on that path and skips it on this one.
-    pub fn durability_is_concurrent(&self) -> bool {
+    /// Whether this buffer's durable backing is the FUA frame-log implementation.
+    ///
+    /// This is probe identity only. It does not grant callers a logical-concurrency exception:
+    /// typed exact FUA ownership serializes one presealed logical group through its lifecycle.
+    pub fn is_fua_durable(&self) -> bool {
         #[cfg(unix)]
-        if self.fua.is_some() {
-            return true;
+        {
+            self.fua.is_some()
         }
-        false
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Permanent physical FUA aggregates for the build-only engine probe. In-memory and serial
     /// WAL paths intentionally report all zeros.
     pub fn fua_durability_telemetry(&self) -> FuaDurabilityTelemetry {
         #[cfg(unix)]
-        if let Some(fua) = self.fua.as_ref() {
+        if let Some(fua) = self.fua.as_ref().cloned() {
             return fua.telemetry();
         }
         FuaDurabilityTelemetry::default()
     }
 
     pub fn append(&mut self, rec: WalRecord) {
+        self.prune_durable_typed_exact_wire_records();
         self.records.push(rec);
         self.canonical_catalog_tail = CanonicalCatalogTailCache::Dirty;
+        self.invalidate_canonical_append_reservations();
     }
 
     /// Append one sealed canonical envelope and advance the logical catalog boundary in the same
     /// mutation. The cache includes unflushed records because the next canonical proposal must
     /// chain from the logical append order, not only the durable prefix.
     pub fn append_canonical(&mut self, prepared: PreparedCanonicalWalRecord) {
-        let (record, tail) = prepared.into_parts();
+        self.prune_durable_typed_exact_wire_records();
+        assert!(
+            prepared.exact_authority().is_none(),
+            "commit-path invariant violation: exact typed canonical records must use the move-only tentative/claim lifecycle"
+        );
+        let (record, tail, exact) = prepared.into_parts();
+        debug_assert!(exact.is_none());
         self.records.push(record);
         self.canonical_catalog_tail = CanonicalCatalogTailCache::Known {
             record_count: self.records.len(),
             tail: Some(tail),
         };
+        self.invalidate_canonical_append_reservations();
     }
 
     /// Seed the buffer with records already known to be durable (e.g. recovered from a segment),
@@ -1039,7 +1104,12 @@ impl WalBuffer {
         );
         self.flushed_memory = records.len();
         self.records = records;
+        self.exact_typed_wire_records.clear();
+        self.typed_exact_tentative_count = 0;
+        self.highest_claimed_typed_exact_record = self.records.len().checked_sub(1);
+        self.typed_exact_handoff_cursor = self.records.len();
         self.canonical_catalog_tail = CanonicalCatalogTailCache::Dirty;
+        self.invalidate_canonical_append_reservations();
     }
 
     pub fn len(&self) -> usize {
@@ -1105,6 +1175,19 @@ impl WalBuffer {
         if len >= self.records.len() {
             return;
         }
+        if self
+            .highest_claimed_typed_exact_record
+            .is_some_and(|claimed| len <= claimed)
+        {
+            panic!(
+                "commit-path invariant violation: claimed typed exact WAL position is non-truncatable"
+            );
+        }
+        if self.has_typed_exact_wire_at_or_after(len) {
+            panic!(
+                "commit-path invariant violation: typed exact WAL positions are non-truncatable; use their move-only rollback before claim"
+            );
+        }
         // A rollback can discard already-verified records, but not the immutable lineage they
         // established. Clamping makes any surviving/new tail decode again before it can flush.
         self.durable_identity_binding.verified_records =
@@ -1134,6 +1217,7 @@ impl WalBuffer {
             } else {
                 CanonicalCatalogTailCache::Dirty
             };
+            self.invalidate_canonical_append_reservations();
             return;
         }
         match self.durable.as_ref() {
@@ -1187,6 +1271,7 @@ impl WalBuffer {
         } else {
             CanonicalCatalogTailCache::Dirty
         };
+        self.invalidate_canonical_append_reservations();
     }
 
     /// Make every appended record durable.
@@ -1205,105 +1290,78 @@ impl WalBuffer {
     /// leaves the on-disk tail state unknowable poisons the backing (fail-closed until restart
     /// recovery truncates the torn tail at [`recover_wal_segment`] time).
     pub fn flush_all(&mut self) -> Result<(), EngineError> {
+        self.prune_durable_typed_exact_wire_records();
+        self.require_no_unclaimed_typed_exact_tail()?;
         // FUA backend: the inline serial-path flush is just a group flush that also WAITS for the
         // durable cut. Delegating keeps one publish/wait path (and one `fail_next_flush`
         // consumption, handled by `begin_group_flush`).
         #[cfg(unix)]
         if self.fua.is_some() {
             let target = self.records.len();
+            let fua = Arc::clone(self.fua.as_ref().expect("checked FUA backend"));
+            let mut previous_durable = fua.durable_records();
+            let mut previous_published = fua.published_records();
+            loop {
+                if let Some(fault) = fua.exact_fault() {
+                    return Err(EngineError::DurabilityFault(fault));
+                }
+                match self.begin_group_flush()? {
+                    WalGroupFlushBegin::Clean { .. } => {}
+                    WalGroupFlushBegin::Job(job) => {
+                        job.commit()?;
+                    }
+                    WalGroupFlushBegin::Busy => {
+                        fua.wait_durable(fua.published_records())?;
+                    }
+                }
+                let durable = fua.durable_records();
+                if durable >= target {
+                    self.prune_durable_typed_exact_wire_records();
+                    return Ok(());
+                }
+                let published = fua.published_records();
+                if published == target {
+                    fua.wait_durable(target)?;
+                    self.prune_durable_typed_exact_wire_records();
+                    return Ok(());
+                }
+                if durable <= previous_durable && published <= previous_published {
+                    return Err(EngineError::Durability(
+                        "FUA WAL flush_all made no bounded prefix progress".to_string(),
+                    ));
+                }
+                previous_durable = durable;
+                previous_published = published;
+            }
+        }
+        let target = self.records.len();
+        loop {
             match self.begin_group_flush()? {
+                WalGroupFlushBegin::Clean { flushed_records } if flushed_records >= target => {
+                    self.prune_durable_typed_exact_wire_records();
+                    return Ok(());
+                }
                 WalGroupFlushBegin::Clean { .. } => {}
                 WalGroupFlushBegin::Job(job) => {
                     job.commit()?;
                 }
+                WalGroupFlushBegin::Busy => {
+                    // The serial core owns the in-flight descriptor/job and signals completion
+                    // without needing the buffer's outer lock.  Wait, then form the next prefix.
+                    if let Some(core) = self.durable.as_ref() {
+                        drop(core.lock_state_idle());
+                    } else {
+                        return Err(EngineError::Durability(
+                            "in-memory WAL group descriptor remained busy".to_string(),
+                        ));
+                    }
+                }
             }
-            // Ensure durability up to the full record count: a `Clean` return means nothing NEW to
-            // publish, but concurrently-published frames may not have reached the durable cut yet.
-            if let Some(fua) = self.fua.as_ref() {
-                fua.wait_durable(target)?;
-            }
-            return Ok(());
-        }
-        if let Some(path) = self.durable_segment_path().map(Path::to_path_buf) {
-            self.durable_identity_binding.verify_through(
-                &path,
-                &self.records,
-                self.records.len(),
-            )?;
-        }
-        if self.fail_next_flush {
-            self.fail_next_flush = false;
-            return Err(EngineError::Durability(
-                "simulated wal flush failure".to_string(),
-            ));
-        }
-        let target = self.records.len();
-        let Some(core) = self.durable.clone() else {
-            self.flushed_memory = target;
-            return Ok(());
-        };
-        // Inline (serialized-path) flush: wait out any in-flight group IO, then write + fsync
-        // while holding the core lock (the caller already holds the outer lock and expects a
-        // synchronous durable-or-error answer with clean rollback semantics).
-        let mut state = core.lock_state_idle();
-        if let Some(reason) = state.poisoned.clone() {
-            return Err(core.poisoned_error(&reason));
-        }
-        let group_size = target.saturating_sub(state.flushed_records);
-        if group_size == 0 {
-            return Ok(());
-        }
-        core.ensure_created(&mut state)?;
-        let mut tail = Vec::new();
-        for record in &self.records[state.flushed_records..target] {
-            encode_record_into(&mut tail, record)?;
-        }
-        let file = state.file.clone().expect("write handle present");
-        // W4a: keep the write inside zero-filled extents (extend by whole chunks, rare) and
-        // write POSITIONALLY at the logical tail — the file size never changes on the hot
-        // path, so `sync_data` skips the filesystem's size-change journaling.
-        let write_end = state.durable_bytes + tail.len() as u64;
-        if write_end > state.prealloc_bytes {
-            let new_prealloc = write_end
-                .max(state.prealloc_bytes + wal_prealloc_chunk_bytes())
-                .max(wal_prealloc_chunk_bytes());
-            if let Err(err) = zero_fill_extend(&file, state.prealloc_bytes, new_prealloc) {
-                state.poisoned = Some(format!("preallocation extend failed ({err})"));
-                return Err(EngineError::Durability(format!(
-                    "failed to extend WAL segment preallocation {}: {err}",
-                    core.segment_path.display()
-                )));
-            }
-            state.prealloc_bytes = new_prealloc;
-        }
-        {
-            use std::os::unix::fs::FileExt;
-            if let Err(err) = file.write_all_at(&tail, state.durable_bytes) {
-                // A partial positional write leaves garbage INSIDE the preallocated region past
-                // `durable_bytes`; the next successful write overwrites it and recovery's
-                // checksum walk truncates it — no size rewind needed (or wanted: it would chop
-                // the preallocation).
-                state.poisoned = Some(format!("append write failed ({err})"));
-                return Err(EngineError::Durability(format!(
-                    "failed to append WAL segment {}: {err}",
-                    core.segment_path.display()
-                )));
+            if self.flushed_count() >= target {
+                self.prune_durable_typed_exact_wire_records();
+                return Ok(());
             }
         }
-        if let Err(err) = file.sync_data() {
-            // After a failed fsync the page-cache state is unknowable (fsyncgate): the kernel may
-            // have marked dirty pages clean without persisting them, so neither a retry nor a
-            // rewind can be trusted. Fail closed; restart recovery truncates the torn tail.
-            state.poisoned = Some(format!("fsync failed ({err})"));
-            return Err(EngineError::Durability(format!(
-                "failed to fsync WAL segment {}: {err}",
-                core.segment_path.display()
-            )));
-        }
-        state.durable_bytes += tail.len() as u64;
-        // Watermark advances only after the fsync has succeeded.
-        WalDurableCore::note_group(&mut state, group_size, target);
-        Ok(())
     }
 
     /// Begin a GROUP flush (the concurrent commit path's designated-flusher protocol): snapshot
@@ -1317,18 +1375,12 @@ impl WalBuffer {
     ///
     /// The serial backend requires the caller to serialize group flushes (at most one outstanding
     /// job — the engine's flusher-election does this); the job's `io_in_flight` mark excludes the
-    /// INLINE [`WalBuffer::flush_all`] path in the meantime. The FUA backend has NO such single-slot
-    /// exclusion: it snapshots + advances its `published` cursor under this outer lock (so frames
-    /// stay totally ordered) and the returned job's fence-pool wait runs concurrently with any
-    /// other FUA job — multiple groups may be durable in flight at once.
+    /// INLINE [`WalBuffer::flush_all`] path in the meantime. The FUA backend has no serial-core
+    /// slot, but typed exact ownership still permits exactly one presealed logical group through
+    /// handoff and settlement at a time.
     pub fn begin_group_flush(&mut self) -> Result<WalGroupFlushBegin, EngineError> {
-        if let Some(path) = self.durable_segment_path().map(Path::to_path_buf) {
-            self.durable_identity_binding.verify_through(
-                &path,
-                &self.records,
-                self.records.len(),
-            )?;
-        }
+        self.prune_durable_typed_exact_wire_records();
+        self.require_no_unclaimed_typed_exact_tail()?;
         if self.fail_next_flush {
             self.fail_next_flush = false;
             return Err(EngineError::Durability(
@@ -1340,7 +1392,15 @@ impl WalBuffer {
         // exact serial-encoded record run), advance the `published` cursor under this outer lock
         // so frame order is total, and hand back a job that publishes + waits for the durable cut.
         #[cfg(unix)]
-        if let Some(fua) = self.fua.as_ref() {
+        if let Some(fua) = self.fua.as_ref().cloned() {
+            if let Some(fault) = fua.exact_fault() {
+                return Err(EngineError::DurabilityFault(fault));
+            }
+            self.durable_identity_binding.verify_through(
+                fua.base_path(),
+                &self.records,
+                self.records.len(),
+            )?;
             if let Some(reason) = fua.poison_reason() {
                 return Err(fua.poison_error(&reason));
             }
@@ -1351,67 +1411,173 @@ impl WalBuffer {
                     flushed_records: fua.durable_records(),
                 });
             }
+            if self
+                .exact_wire_for_group(
+                    published,
+                    self.records
+                        .get(published)
+                        .expect("nonempty FUA group has a logical head"),
+                )?
+                .is_some()
+            {
+                let prefix = self
+                    .select_prepared_group_prefix(published, None)?
+                    .expect("nonempty FUA exact head retains a group prefix");
+                let Some(group) = self.handoff_prepared_group(prefix)? else {
+                    return Ok(WalGroupFlushBegin::Busy);
+                };
+                let handoff = match fua.handoff_exact_group(&group) {
+                    Ok(handoff) => handoff,
+                    Err(error) => {
+                        if let EngineError::DurabilityFault(fault) = error {
+                            group.poison(fault);
+                            return Err(EngineError::DurabilityFault(fault));
+                        }
+                        return Err(error);
+                    }
+                };
+                return Ok(WalGroupFlushBegin::Job(WalGroupFlushJob {
+                    kind: Some(WalGroupFlushJobKind::Fua(fua::FuaFlushJob::new_exact(
+                        Arc::clone(&fua),
+                        handoff,
+                        group,
+                    ))),
+                }));
+            }
+            fua.reject_legacy_while_exact_active()?;
             let seq_count = u32::try_from(group_size).map_err(|_| {
                 EngineError::Durability(
                     "FUA WAL group exceeds u32 records; split the commit batch".to_string(),
                 )
             })?;
             let mut payload = Vec::new();
-            for record in &self.records[published..target] {
-                encode_record_into(&mut payload, record)?;
+            for index in published..target {
+                self.encode_fua_legacy_wire_record_into(&mut payload, index)?;
             }
             // Allocate the ticket and advance the published cursor together under this outer lock
             // so tickets and `first_seq` ranges are assigned in one total order.
             let ticket = fua.next_ticket();
             fua.set_published(target);
             return Ok(WalGroupFlushBegin::Job(WalGroupFlushJob {
-                kind: Some(WalGroupFlushJobKind::Fua(fua::FuaFlushJob::new(
-                    Arc::clone(fua),
-                    ticket,
-                    payload,
-                    published as u64,
-                    seq_count,
-                    target,
-                ))),
+                kind: Some(WalGroupFlushJobKind::Fua(
+                    fua::FuaFlushJob::new_legacy_compatibility(
+                        Arc::clone(&fua),
+                        ticket,
+                        payload,
+                        published as u64,
+                        seq_count,
+                        target,
+                    ),
+                )),
             }));
         }
-        let Some(core) = self.durable.as_ref() else {
-            self.flushed_memory = target;
+        let Some(core) = self.durable.clone() else {
+            let Some(prefix) = self.select_prepared_group_prefix(self.flushed_memory, None)? else {
+                return Ok(WalGroupFlushBegin::Clean {
+                    flushed_records: self.flushed_memory,
+                });
+            };
+            let Some(group) = self.handoff_prepared_group(prefix)? else {
+                return Ok(WalGroupFlushBegin::Busy);
+            };
+            self.flushed_memory = prefix.target_records;
+            group.finish_success();
             return Ok(WalGroupFlushBegin::Clean {
-                flushed_records: target,
+                flushed_records: self.flushed_memory,
             });
         };
         let mut state = core.lock_state();
-        debug_assert!(
-            !state.io_in_flight,
-            "at most one outstanding group flush job (the caller elects a single flusher)"
-        );
+        if let Some(fault) = core.fixed_fault() {
+            return Err(EngineError::DurabilityFault(fault));
+        }
+        if state.io_in_flight {
+            return Ok(WalGroupFlushBegin::Busy);
+        }
         if let Some(reason) = state.poisoned.clone() {
             return Err(core.poisoned_error(&reason));
         }
-        let group_size = target.saturating_sub(state.flushed_records);
-        if group_size == 0 {
+        let Some(natural_prefix) =
+            self.select_prepared_group_prefix(state.flushed_records, None)?
+        else {
             return Ok(WalGroupFlushBegin::Clean {
                 flushed_records: state.flushed_records,
             });
+        };
+        let mut prefix = natural_prefix;
+        if natural_prefix.exact_records != 0 {
+            let free = state
+                .prealloc_bytes
+                .checked_sub(state.durable_bytes)
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    EngineError::Durability(
+                        "serial WAL preallocation frontier is behind its durable tail".to_string(),
+                    )
+                })?;
+            prefix = self
+                .select_prepared_group_prefix(state.flushed_records, Some(free))?
+                .expect("nonempty serial WAL prefix remains nonempty after extent cap");
+            if prefix.exact_records != 0
+                && (state.file.is_none()
+                    || state
+                        .durable_bytes
+                        .checked_add(prefix.wire_bytes as u64)
+                        .is_none_or(|end| end > state.prealloc_bytes))
+            {
+                return Err(EngineError::Durability(
+                    "claimed typed exact WAL group escaped its pre-proposal serial extent"
+                        .to_string(),
+                ));
+            }
         }
-        core.ensure_created(&mut state)?;
-        let mut tail = Vec::new();
-        for record in &self.records[state.flushed_records..target] {
-            encode_record_into(&mut tail, record)?;
+        if self.exact_typed_wire_records.is_empty() {
+            self.durable_identity_binding.verify_through(
+                &core.segment_path,
+                &self.records,
+                prefix.target_records,
+            )?;
+        }
+        if prefix.exact_records == 0 && self.exact_typed_wire_records.is_empty() {
+            // Legacy-only compatibility groups retain the established create/preallocate route.
+            core.ensure_created(&mut state)?;
+            let write_end = state
+                .durable_bytes
+                .checked_add(prefix.wire_bytes as u64)
+                .ok_or_else(|| {
+                    EngineError::Durability("WAL group preallocation overflow".to_string())
+                })?;
+            core.ensure_preallocated_through(&mut state, write_end)?;
+        } else if prefix.exact_records == 0 {
+            // A legacy head may precede an admitted exact tail.  That reservation already
+            // created and sized the serial extent; mutating it here would make this a post-claim
+            // create/preallocation route.
+            let write_end = state
+                .durable_bytes
+                .checked_add(prefix.wire_bytes as u64)
+                .ok_or_else(|| {
+                    EngineError::Durability("WAL group extent validation overflow".to_string())
+                })?;
+            if state.file.is_none() || write_end > state.prealloc_bytes {
+                return Err(EngineError::Durability(
+                    "legacy prefix before a claimed typed exact WAL owner escaped its pre-proposal serial extent"
+                        .to_string(),
+                ));
+            }
         }
         let file = state.file.clone().expect("write handle present");
+        let Some(group) = self.handoff_prepared_group(prefix)? else {
+            return Ok(WalGroupFlushBegin::Busy);
+        };
         state.io_in_flight = true;
         Ok(WalGroupFlushBegin::Job(WalGroupFlushJob {
-            kind: Some(WalGroupFlushJobKind::Serial(SerialFlushJob {
-                core: Arc::clone(core),
+            kind: Some(WalGroupFlushJobKind::Serial(group::SerialFlushJob::new(
+                Arc::clone(&core),
                 file,
-                offset: state.durable_bytes,
-                prealloc_end: state.prealloc_bytes,
-                bytes: tail,
-                target_records: target,
-                group_size,
-            })),
+                state.durable_bytes,
+                prefix.target_records,
+                prefix.group_size(),
+                group,
+            ))),
         }))
     }
 
@@ -1455,6 +1621,9 @@ impl WalBuffer {
         // external checkpoint segment to trim against in step 1.
         #[cfg(unix)]
         if self.fua.is_some() {
+            if let Some(fault) = self.fua.as_ref().and_then(|backend| backend.exact_fault()) {
+                return Err(EngineError::DurabilityFault(fault));
+            }
             let _ = base;
             return Err(EngineError::Durability(
                 "prefix truncation is not supported by the FUA WAL backend in E1 step 1"
@@ -1468,6 +1637,9 @@ impl WalBuffer {
         })?;
         // Wait out any in-flight group IO: the rewrite below replaces the file wholesale.
         let mut state = core.lock_state_idle();
+        if let Some(fault) = core.fixed_fault() {
+            return Err(EngineError::DurabilityFault(fault));
+        }
         let flushed = state.flushed_records;
         if base > flushed {
             return Err(EngineError::Durability(format!(
@@ -1613,5 +1785,193 @@ impl WalBuffer {
     #[cfg(all(test, unix))]
     pub(crate) fn fua_published_records_for_test(&self) -> Option<usize> {
         self.fua.as_ref().map(|fua| fua.published_records())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_next_fua_exact_commit_for_test(
+        &self,
+        stage: DurabilityStage,
+        raw_os_error: Option<i32>,
+    ) {
+        self.fua
+            .as_ref()
+            .expect("FUA exact fault seam requires an FUA buffer")
+            .fail_next_exact_commit_for_test(stage, raw_os_error);
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    fn prepared_record(txn_id: TxnId) -> PreparedCanonicalWalRecord {
+        let identity = CanonicalIdentity {
+            database_id: [1; 16],
+            cluster_id: [2; 16],
+            timeline_id: [3; 16],
+            format_epoch: 1,
+        };
+        let request_digest = [4; 32];
+        let operation = CanonicalFragment {
+            kind: CanonicalFragmentKind::RowMutation,
+            body: vec![5],
+        };
+        let status = CanonicalFragment {
+            kind: CanonicalFragmentKind::TransactionClaimStatus,
+            body: vec![6],
+        };
+        let header = CanonicalPreApplyHeader {
+            identity,
+            leader_epoch: 1,
+            commit_seq: 1,
+            stable_transaction_id: txn_id,
+            request_digest,
+            isolation: CanonicalIsolation::ReadCommitted,
+            flags: u32::from(CanonicalFragmentKind::RowMutation as u16),
+            catalog_before_epoch: 0,
+            catalog_after_epoch: 0,
+            catalog_before_digest: [7; 32],
+            catalog_after_digest: [7; 32],
+            operation_count: 2,
+            table_block_count: 0,
+            allocator_high_water: 0,
+        };
+        let outcome = CanonicalOutcome {
+            kind: CanonicalOutcomeKind::CommitSuccess,
+            affected_rows: 1,
+            sqlstate: None,
+            constraint_id: 0,
+            target_digest: [8; 32],
+            returning_digest: [0; 32],
+        };
+        prepare_exact_canonical_wal_record(
+            txn_id,
+            CanonicalPhysicalRange {
+                log_epoch: 1,
+                lane_id: 0,
+                segment_id: 1,
+                first_frame_ordinal: 0,
+            },
+            header,
+            &[operation, status],
+            outcome,
+        )
+        .expect("prepare exact test canonical record")
+    }
+
+    #[test]
+    fn typed_exact_tentative_tail_is_unflushable_and_rolls_back_without_reencoding() {
+        let mut wal = WalBuffer::new();
+        let prepared = prepared_record(1);
+        let expected_payload = prepared.exact_packed_payload().unwrap().clone();
+        let expected_serialized = prepared
+            .exact_authority()
+            .unwrap()
+            .serialized_record()
+            .clone();
+        let mut reservation = wal
+            .reserve_typed_exact_append(prepared)
+            .expect("reserve exact owner before proposal");
+        let proposal = reservation.replication_payload().expect("proposal payload");
+        assert!(std::sync::Arc::ptr_eq(&proposal, &expected_payload));
+        wal.append_typed_exact_tentative(&mut reservation)
+            .expect("append tentative exact owner");
+        assert_eq!(wal.len(), 1);
+        let group_error = match wal.begin_group_flush() {
+            Ok(_) => panic!("tentative tail must not group flush"),
+            Err(error) => error,
+        };
+        assert!(group_error
+            .to_string()
+            .contains("cannot flush an unclaimed tentative typed exact WAL tail"));
+        assert!(
+            wal.flush_all().is_err(),
+            "tentative tail must not inline flush"
+        );
+        assert_eq!(
+            wal.typed_exact_wire_payload_ptr_for_test(0),
+            Some(expected_payload.as_ptr())
+        );
+        assert_eq!(
+            wal.typed_exact_serialized_bytes_for_test(0).as_deref(),
+            Some(expected_serialized.as_ref())
+        );
+        wal.rollback_typed_exact_append(&mut reservation)
+            .expect("rollback restores exact owner");
+        assert_eq!(wal.len(), 0);
+        assert!(wal.exact_typed_wire_records.is_empty());
+        assert!(wal.canonical_catalog_tail().unwrap().is_none());
+        let retried = reservation
+            .replication_payload()
+            .expect("same exact retry payload");
+        assert!(std::sync::Arc::ptr_eq(&proposal, &retried));
+    }
+
+    #[test]
+    fn typed_exact_reservation_rejects_state_owner_and_generic_append_bypass() {
+        let mut wal = WalBuffer::new();
+        let mut reservation = wal
+            .reserve_typed_exact_append(prepared_record(1))
+            .expect("reserve exact owner");
+        wal.append(WalRecord {
+            txn_id: 9,
+            payload: std::sync::Arc::from(&b"legacy"[..]),
+        });
+        let error = wal
+            .append_typed_exact_tentative(&mut reservation)
+            .expect_err("intervening append must reject the token");
+        assert!(error.to_string().contains("state drifted"));
+        assert_eq!(wal.len(), 1);
+
+        let mut first = WalBuffer::new();
+        let mut reservation = first
+            .reserve_typed_exact_append(prepared_record(1))
+            .expect("reserve first owner");
+        first
+            .append_typed_exact_tentative(&mut reservation)
+            .expect("tentative append on first owner");
+        let mut second = WalBuffer::new();
+        let error = second
+            .rollback_typed_exact_append(&mut reservation)
+            .expect_err("another WAL owner must reject this token");
+        assert!(error.to_string().contains("state drifted"));
+        assert_eq!(second.len(), 0);
+
+        let bypass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            WalBuffer::new().append_canonical(prepared_record(1));
+        }));
+        assert!(
+            bypass.is_err(),
+            "generic append must reject exact typed authority"
+        );
+    }
+
+    #[test]
+    fn claimed_typed_record_remains_nontruncatable_after_wire_arc_retires() {
+        let mut wal = WalBuffer::new();
+        let mut reservation = wal
+            .reserve_typed_exact_append(prepared_record(1))
+            .expect("reserve exact owner");
+        wal.append_typed_exact_tentative(&mut reservation)
+            .expect("append tentative exact owner");
+        wal.claim_typed_exact_append(reservation)
+            .expect("claim exact owner");
+        wal.flush_all().expect("in-memory durable claim");
+        assert!(
+            wal.exact_typed_wire_records.is_empty(),
+            "durability retires sparse wire Arc"
+        );
+        let truncate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wal.truncate(0)));
+        assert!(
+            truncate.is_err(),
+            "claimed history remains non-truncatable after pruning"
+        );
+
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: std::sync::Arc::from(&b"generic tail"[..]),
+        });
+        wal.truncate(1);
+        assert_eq!(wal.len(), 1, "a newer generic tail remains rollbackable");
     }
 }

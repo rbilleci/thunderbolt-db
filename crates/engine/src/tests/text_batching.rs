@@ -1144,7 +1144,7 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     assert_eq!(table.columns.len(), 1);
     assert_eq!(table.columns[0].name, "name");
     assert_eq!(
-        e.commit_state().ledger.table_root_index("transient_batch"),
+        e.test_table_root_index("transient_batch"),
         0,
         "a grouped drop/recreate must not attach the intermediate OID's root to its successor"
     );
@@ -1168,14 +1168,9 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     if let Err(failure) = e.commit_mutation_batch(&rename) {
         panic!("create/insert/rename batch failed: {}", failure.error);
     }
-    assert_eq!(
-        e.commit_state().ledger.table_root_index("transient_source"),
-        0
-    );
+    assert_eq!(e.test_table_root_index("transient_source"), 0);
     assert_ne!(
-        e.commit_state()
-            .ledger
-            .table_root_index("transient_destination"),
+        e.test_table_root_index("transient_destination"),
         0,
         "a grouped rename must carry the root by stable OID"
     );
@@ -1187,21 +1182,10 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
         .unwrap();
     assert_eq!(table.columns.len(), 1);
     assert_eq!(table.columns[0].name, "name");
+    assert_eq!(recovered.test_table_root_index("transient_batch"), 0);
     assert_eq!(
-        recovered
-            .commit_state()
-            .ledger
-            .table_root_index("transient_batch"),
-        0
-    );
-    assert_eq!(
-        recovered
-            .commit_state()
-            .ledger
-            .table_root_index("transient_destination"),
-        e.commit_state()
-            .ledger
-            .table_root_index("transient_destination"),
+        recovered.test_table_root_index("transient_destination"),
+        e.test_table_root_index("transient_destination"),
         "grouped live apply and record-at-a-time recovery must derive one root ledger"
     );
     let rows = recovered

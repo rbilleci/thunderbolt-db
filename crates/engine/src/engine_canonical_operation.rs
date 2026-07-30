@@ -6,9 +6,36 @@
 
 use super::*;
 
+// Codec-5 will consume this only once S3 is complete.  Keep the inert semantic reader compiled
+// and explicitly non-live without making it an engine-operation authority prematurely.
+#[allow(dead_code)]
+mod strict_non_insert;
+#[allow(unused_imports)]
+pub(crate) use strict_non_insert::{
+    decode_current_non_insert_canonical_operation, CurrentNonInsertCanonicalOperation,
+    CurrentNonInsertCanonicalOperationFacts, CurrentNonInsertExplicitSequenceFacts,
+    CurrentNonInsertSemanticClass,
+};
+
 pub(super) const ENGINE_OPERATION_MAGIC: &[u8; 8] = b"GPUDBOP1";
 pub(super) const ENGINE_OPERATION_CODEC_RESOLVED_BINARY: u8 = 2;
 pub(super) const ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2: u8 = 4;
+
+/// Exact fixed-width prefix carried by every canonical engine operation body.  Planning-only
+/// accounting uses this owner rather than duplicating the codec layout.
+const ENGINE_OPERATION_BODY_PREFIX_BYTES: usize =
+    ENGINE_OPERATION_MAGIC.len() + std::mem::size_of::<u8>() + 3 + std::mem::size_of::<u64>();
+
+pub(crate) fn canonical_operation_body_len(payload_len: usize) -> Result<usize, EngineError> {
+    let _ = u64::try_from(payload_len).map_err(|_| {
+        EngineError::Durability("canonical WAL operation length overflow".to_string())
+    })?;
+    ENGINE_OPERATION_BODY_PREFIX_BYTES
+        .checked_add(payload_len)
+        .ok_or_else(|| {
+            EngineError::Durability("canonical WAL operation length overflow".to_string())
+        })
+}
 
 enum AffectedRowsDefault {
     Known(u64),
@@ -191,12 +218,14 @@ fn encode_operation_body(codec: u8, payload: &[u8]) -> Result<Vec<u8>, EngineErr
     let len = u64::try_from(payload.len()).map_err(|_| {
         EngineError::Durability("canonical WAL operation length overflow".to_string())
     })?;
-    let mut body = Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + payload.len());
+    let expected_len = canonical_operation_body_len(payload.len())?;
+    let mut body = Vec::with_capacity(expected_len);
     body.extend_from_slice(ENGINE_OPERATION_MAGIC);
     body.push(codec);
     body.extend_from_slice(&[0; 3]);
     body.extend_from_slice(&len.to_le_bytes());
     body.extend_from_slice(payload);
+    debug_assert_eq!(body.len(), expected_len);
     Ok(body)
 }
 
@@ -386,6 +415,24 @@ fn decode_live_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, EngineEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_operation_body_length_helper_matches_real_encoder() {
+        for payload in [
+            Vec::new(),
+            vec![0xa5],
+            vec![0x5a; 4_096],
+            vec![0; 16 * 1024 * 1024 - 20],
+        ] {
+            let encoded = encode_operation_body(ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2, &payload)
+                .expect("test payload fits the operation codec");
+            assert_eq!(
+                canonical_operation_body_len(payload.len()).unwrap(),
+                encoded.len()
+            );
+        }
+        assert!(canonical_operation_body_len(usize::MAX).is_err());
+    }
 
     fn identity() -> gpu_db_wal::CanonicalIdentity {
         gpu_db_wal::CanonicalIdentity {

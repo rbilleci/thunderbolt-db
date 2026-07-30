@@ -56,6 +56,7 @@ pub enum SynchronousCommit {
 #[derive(Debug, Clone)]
 pub struct CoveredInsertRoute {
     table: String,
+    table_oid: u32,
     /// Shared table name for lean lane intents (cheap Arc clone per submit).
     table_arc: std::sync::Arc<str>,
     /// Catalog generation at prepare. Execute compares the LIVE generation:
@@ -115,6 +116,7 @@ impl CoveredInsertRoute {
 #[derive(Debug, Clone)]
 pub struct CoveredDeleteRoute {
     table: String,
+    table_oid: u32,
     table_arc: std::sync::Arc<str>,
     catalog_seq: Index,
     /// The pk's packed integer conflict-slot id (shared identity with the classic path).
@@ -150,6 +152,7 @@ impl CoveredDeleteRoute {
 #[derive(Debug, Clone)]
 pub struct CoveredUpdateRoute {
     table: String,
+    table_oid: u32,
     table_arc: std::sync::Arc<str>,
     catalog_seq: Index,
     /// The pk's packed integer conflict-slot id (shared identity with the classic path).
@@ -303,6 +306,7 @@ impl Engine {
         let binary_row_id_offset = (3 + 2 + table.name.len() + 4) as u32;
         Ok(CoveredInsertRoute {
             table: table.name.clone(),
+            table_oid: table.oid,
             catalog_seq: catalog.commit_seq,
             column_count: table.columns.len(),
             sql_prefix: format!("INSERT INTO {} VALUES (", table.name),
@@ -416,6 +420,7 @@ impl Engine {
             filter_idx: column_idx as u32,
             row_id_offset,
             table: std::sync::Arc::clone(&route.table_arc),
+            table_oid: route.table_oid,
             template,
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
@@ -602,6 +607,7 @@ impl Engine {
         let record_prefix = full[..full.len() - 4].to_vec();
         Ok(CoveredDeleteRoute {
             table: insert_route.table,
+            table_oid: insert_route.table_oid,
             table_arc: insert_route.table_arc,
             catalog_seq: insert_route.catalog_seq,
             pk_slot_id,
@@ -633,7 +639,7 @@ impl Engine {
         _mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
         self.ensure_commit_path_available()
-            .map_err(ExecuteError::Engine)?;
+            .map_err(ExecuteError::from_post_wal_engine)?;
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.repl_role() != Role::Leader {
@@ -737,6 +743,7 @@ impl Engine {
             filter_idx: route.pk_column_index as u32,
             row_id_offset: 0,
             table: std::sync::Arc::clone(&route.table_arc),
+            table_oid: route.table_oid,
             template: std::sync::Arc::from(record.as_slice()),
             values: Vec::new(),
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
@@ -793,6 +800,7 @@ impl Engine {
             .clone();
         Ok(CoveredUpdateRoute {
             table: insert_route.table,
+            table_oid: insert_route.table_oid,
             table_arc: insert_route.table_arc,
             catalog_seq: insert_route.catalog_seq,
             pk_slot_id,
@@ -831,7 +839,7 @@ impl Engine {
         _mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
         self.ensure_commit_path_available()
-            .map_err(ExecuteError::Engine)?;
+            .map_err(ExecuteError::from_post_wal_engine)?;
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.repl_role() != Role::Leader {
@@ -970,6 +978,7 @@ impl Engine {
             filter_idx: route.pk_column_index as u32,
             row_id_offset,
             table: std::sync::Arc::clone(&route.table_arc),
+            table_oid: route.table_oid,
             template: std::sync::Arc::from(record.as_slice()),
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
@@ -996,7 +1005,7 @@ impl Engine {
         if self.is_commit_path_poisoned() && !outcome.is_done() {
             ticket.outcome = None;
             ticket.release_snapshot();
-            return Some(Err(ExecuteError::Engine(
+            return Some(Err(ExecuteError::from_post_wal_engine(
                 self.commit_path_unavailable_error(),
             )));
         }
@@ -1060,7 +1069,7 @@ impl Engine {
         params: &[i32],
     ) -> Result<(), ExecuteError> {
         self.ensure_commit_path_available()
-            .map_err(ExecuteError::Engine)?;
+            .map_err(ExecuteError::from_post_wal_engine)?;
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if params.len() != route.column_count {
@@ -1111,12 +1120,13 @@ impl Engine {
         if !eligible {
             return IntentBuild::Fallback(logical_request.to_string());
         }
+        let table = table.expect("eligible covered INSERT retained its catalog table");
 
         let values: Vec<SqlValue> = params.iter().map(|&param| SqlValue::Int4(param)).collect();
         // E2.2(a): build the ALLOCATION-FREE integer conflict slots from the route's precomputed
         // (slot_id, column_index) list — no String format, no (table, column) clone.
         let mut write_set = WriteSet::default();
-        write_set.tables.insert(route.table.clone());
+        write_set.add_table(table);
         for &(slot_id, column_idx) in &route.unique_i32_slots {
             write_set
                 .unique_slots_i32
@@ -1127,10 +1137,7 @@ impl Engine {
         let delta = WriteDelta {
             write_set: write_set.clone(),
             read_snapshot,
-            catalog_dependencies: table
-                .cloned()
-                .map(|table| BTreeMap::from([(route.table.clone(), table)]))
-                .unwrap_or_default(),
+            catalog_dependencies: BTreeMap::from([(route.table.clone(), table.clone())]),
             foreign_key_dependencies: BTreeSet::new(),
             rows_consumed: 1,
             mutation: PreparedMutation::Insert {

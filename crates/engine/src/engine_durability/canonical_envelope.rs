@@ -43,7 +43,7 @@ impl Engine {
         )?;
         let sealed = SealedCanonicalOperation::from_bound_binary_insert(bound)?;
         let (operation, proposed_range) = sealed.into_operation_and_proposed_range();
-        let record = Self::canonical_wal_record_from_sealed_operation(
+        let record = Self::canonical_exact_wal_record_from_sealed_operation(
             commit.canonical_identity,
             catalog_epoch,
             catalog_digest,
@@ -75,6 +75,67 @@ impl Engine {
         outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
         outcome_rows: Option<u64>,
         isolation: gpu_db_wal::CanonicalIsolation,
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
+        Self::canonical_wal_record_from_sealed_operation_with_encoding(
+            identity,
+            catalog_epoch,
+            catalog_digest,
+            txn_id,
+            commit_seq,
+            lane_id,
+            operation,
+            request_digest,
+            outcome_kind,
+            outcome_rows,
+            isolation,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors the generic compatibility constructor above
+    fn canonical_exact_wal_record_from_sealed_operation(
+        identity: gpu_db_wal::CanonicalIdentity,
+        catalog_epoch: u64,
+        catalog_digest: gpu_db_wal::CanonicalDigest,
+        txn_id: TxnId,
+        commit_seq: Index,
+        lane_id: u32,
+        operation: SealedCanonicalOperation,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
+        outcome_rows: Option<u64>,
+        isolation: gpu_db_wal::CanonicalIsolation,
+    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
+        Self::canonical_wal_record_from_sealed_operation_with_encoding(
+            identity,
+            catalog_epoch,
+            catalog_digest,
+            txn_id,
+            commit_seq,
+            lane_id,
+            operation,
+            request_digest,
+            outcome_kind,
+            outcome_rows,
+            isolation,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // one canonical envelope derivation, two output modes
+    fn canonical_wal_record_from_sealed_operation_with_encoding(
+        identity: gpu_db_wal::CanonicalIdentity,
+        catalog_epoch: u64,
+        catalog_digest: gpu_db_wal::CanonicalDigest,
+        txn_id: TxnId,
+        commit_seq: Index,
+        lane_id: u32,
+        operation: SealedCanonicalOperation,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
+        outcome_rows: Option<u64>,
+        isolation: gpu_db_wal::CanonicalIsolation,
+        exact_typed: bool,
     ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
         if outcome_kind == gpu_db_wal::CanonicalOutcomeKind::AbortError {
             return Err(EngineError::Durability(
@@ -128,17 +189,20 @@ impl Engine {
             target_digest: operation_digest,
             returning_digest: [0; 32],
         };
-        let encoded = gpu_db_wal::encode_canonical_envelope(
-            gpu_db_wal::CanonicalPhysicalRange {
-                log_epoch: 1,
-                lane_id,
-                segment_id: commit_seq,
-                first_frame_ordinal: 0,
-            },
-            &header,
-            &[operation_fragment, status_fragment],
-            &outcome,
-        )?;
-        encoded.into_prepared_record(txn_id)
+        let physical = gpu_db_wal::CanonicalPhysicalRange {
+            log_epoch: 1,
+            lane_id,
+            segment_id: commit_seq,
+            first_frame_ordinal: 0,
+        };
+        let fragments = [operation_fragment, status_fragment];
+        if exact_typed {
+            gpu_db_wal::prepare_exact_canonical_wal_record(
+                txn_id, physical, header, &fragments, outcome,
+            )
+        } else {
+            gpu_db_wal::encode_canonical_envelope(physical, &header, &fragments, &outcome)?
+                .into_prepared_record(txn_id)
+        }
     }
 }

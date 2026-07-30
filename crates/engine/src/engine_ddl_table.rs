@@ -1628,6 +1628,14 @@ impl Engine {
 
         cat.relational_catalog
             .insert(rename.new_name.clone(), table.clone());
+        // The catalog identity survives rename. Move the one authoritative point-route/epoch
+        // slot rather than creating a name-keyed replacement; descriptor-shaped plans are retired
+        // inside the move and rebuild under the new catalog name.
+        self.read_state.residency.rename_table_point_slot(
+            &rename.old_name,
+            &rename.new_name,
+            table.oid,
+        );
         for candidate in cat.relational_catalog.values_mut() {
             for foreign_key in &mut candidate.foreign_keys {
                 if foreign_key.referenced_table == rename.old_name {
@@ -1703,6 +1711,11 @@ impl Engine {
             let Some(table) = cat.relational_catalog.remove(name) else {
                 continue;
             };
+            // Same-name recreation receives a new relation OID, so erase the old slot before any
+            // descriptor cleanup can make the name available again.
+            self.read_state
+                .residency
+                .remove_table_point_slot(name, table.oid);
             let prefix = relational_key_prefix(&table.name);
             let visibility = StorageVisibility {
                 read_txn_id: txn_id,

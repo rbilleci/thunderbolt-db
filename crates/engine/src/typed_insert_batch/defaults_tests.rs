@@ -183,3 +183,104 @@ fn sequence_default_is_deferred_only_when_requested_and_all_supplied_rows_are_ty
     );
     assert!(!engine.is_concurrent_dml_command(&requested));
 }
+
+#[test]
+fn resident_append_returning_defers_before_scalar_default_lowering() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE returning_default_gate (id int4, value int4 DEFAULT 1.5::numeric(10,1))",
+        )
+        .unwrap();
+    crate::column_default::reset_scalar_default_evaluation_count("value");
+    let command = parse_command(
+        "INSERT INTO returning_default_gate (id) VALUES (1), (2) RETURNING id, value",
+    )
+    .unwrap();
+    let catalog = engine.catalog_snapshot();
+
+    assert!(
+        try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq, None)
+            .unwrap()
+            .is_none(),
+        "the live resident-append adapter must defer RETURNING before default lowering"
+    );
+    assert_eq!(
+        crate::column_default::scalar_default_evaluation_count("value"),
+        0,
+        "the deferred live adapter must not evaluate a scalar default the legacy route owns"
+    );
+}
+
+#[test]
+fn resident_append_sequence_decline_precedes_scalar_default_lowering() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(1, "CREATE SEQUENCE sequence_gate_seq")
+        .unwrap();
+    engine
+        .execute_text(
+            2,
+            "CREATE TABLE sequence_scalar_gate (serial_value int4 DEFAULT nextval('sequence_gate_seq'::regclass), scalar_value int4 DEFAULT 1.5::numeric(10,1))",
+        )
+        .unwrap();
+    crate::column_default::reset_scalar_default_evaluation_count("scalar_value");
+    let command =
+        parse_command("INSERT INTO sequence_scalar_gate (serial_value) VALUES (DEFAULT)").unwrap();
+    let catalog = engine.catalog_snapshot();
+
+    assert!(
+        try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq, None)
+            .unwrap()
+            .is_none(),
+        "a requested sequence default has no resident-append effect owner"
+    );
+    assert_eq!(
+        crate::column_default::scalar_default_evaluation_count("scalar_value"),
+        0,
+        "the declined live adapter must not evaluate an unrelated scalar default"
+    );
+
+    let supplied_sequence =
+        parse_command("INSERT INTO sequence_scalar_gate (serial_value) VALUES (17)").unwrap();
+    assert!(
+        try_prepare_typed_insert_batch(
+            &supplied_sequence,
+            &catalog,
+            catalog.commit_seq,
+            None,
+        )
+        .unwrap()
+        .is_some(),
+        "a supplied sequence column must not over-decline solely because another scalar default is omitted"
+    );
+    assert_eq!(
+        crate::column_default::scalar_default_evaluation_count("scalar_value"),
+        1,
+        "the eligible typed route owns its one scalar broadcast evaluation"
+    );
+
+    crate::column_default::reset_scalar_default_evaluation_count("scalar_value");
+    engine.execute_text(3, "BEGIN").unwrap();
+    engine
+        .execute_text(
+            3,
+            "INSERT INTO sequence_scalar_gate (serial_value) VALUES (DEFAULT)",
+        )
+        .unwrap();
+    assert_eq!(
+        crate::column_default::scalar_default_evaluation_count("scalar_value"),
+        1,
+        "the serialized sequence owner must evaluate the scalar default once"
+    );
+    engine.execute_text(3, "COMMIT").unwrap();
+    let sequence = engine
+        .relational_catalog_sequence("sequence_gate_seq")
+        .unwrap();
+    assert_eq!(
+        (sequence.last_value, sequence.is_called),
+        (1, true),
+        "the one requested sequence default advances exactly once"
+    );
+}

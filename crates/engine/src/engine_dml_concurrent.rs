@@ -10,6 +10,8 @@ use crate::engine_mutation_admission::validate_transaction_characteristics;
 use crate::engine_transaction_reset::StableRetryOr;
 
 mod canonical;
+mod control_plane;
+mod durability_failure;
 mod fixed_insert;
 mod lane;
 mod lane_apply;
@@ -17,9 +19,15 @@ mod request;
 mod state;
 mod wave;
 
+#[cfg(test)]
+pub(crate) use canonical::issue_test_only_typed_insert_post_wal_apply_permit;
+pub(crate) use canonical::TypedInsertPostWalApplyPermit;
+pub(crate) use durability_failure::CommitPathFailure;
+
+use durability_failure::{execute_error_from_engine, TailCompletion};
 pub(crate) use state::{
-    new_pending_outcome, CanonicalRequest, CommitWaveItem, CommitWaveOutcome, CommitWaveState,
-    LaneIntent, LaneOpKind,
+    commit_wave_done_payload_bytes, new_pending_outcome, CanonicalRequest, CommitWaveItem,
+    CommitWaveOutcome, CommitWaveState, LaneIntent, LaneOpKind,
 };
 #[cfg(test)]
 use state::{wave_tail_failure_publish_hook, wave_tail_handoff_hook};
@@ -158,77 +166,6 @@ pub(crate) fn wave_host_phase_timing_enabled() -> bool {
 }
 
 impl Engine {
-    /// Central fail-stop drain. The sticky engine flag is stored before this method runs, so any
-    /// racing submit/pump observes the gate even if its item is between local pipeline stages.
-    pub(crate) fn fail_all_pending_commit_work(&self, reason: &str) {
-        let error = || {
-            ExecuteError::Engine(EngineError::Durability(format!(
-                "commit path is wedged pending restart recovery: {reason}"
-            )))
-        };
-
-        let stranded = {
-            let mut queue = self.lock_commit_wave_queue();
-            queue.wedged.get_or_insert_with(|| reason.to_string());
-            queue.sequencer_active = false;
-            queue.items.drain(..).collect::<Vec<_>>()
-        };
-        for item in stranded {
-            item.set_outcome(Err(error()));
-        }
-        let pending_tails = {
-            let mut tails = self
-                .commit_wave
-                .pending_tails
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tails.drain(..).collect::<Vec<_>>()
-        };
-        let pending_tail_count = pending_tails.len() as u64;
-        drop(pending_tails); // armed Drop fails every tail member
-        if pending_tail_count != 0 {
-            self.commit_wave
-                .tails_finished
-                .fetch_add(pending_tail_count, AtomicOrdering::Release);
-        }
-
-        if let Some(lanes) = &self.intent_lanes {
-            let mut intents = Vec::new();
-            for queue in &lanes.queues {
-                intents.extend(
-                    queue
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .drain(..),
-                );
-            }
-            intents.extend(
-                lanes
-                    .resize_hold
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .drain(..),
-            );
-            for request in lanes
-                .validate_queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .drain(..)
-            {
-                *request
-                    .slot
-                    .result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(None);
-                request.slot.done.store(true, AtomicOrdering::Release);
-            }
-            for item in intents {
-                item.set_outcome(Err(error()));
-            }
-        }
-        self.commit_wave.cv.notify_all();
-    }
-
     #[cfg(test)]
     pub(crate) fn set_wave_tail_handoff_hook(
         &self,
@@ -666,7 +603,7 @@ impl Engine {
             _ => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "execute_dml_concurrent received a non-DML command".to_string(),
-                )))
+                )));
             }
         }?;
         Ok(delta)
@@ -883,15 +820,13 @@ impl Engine {
         item: CommitWaveItem,
     ) -> Result<CommitWaveOutcome, ExecuteError> {
         self.ensure_commit_path_available()
-            .map_err(ExecuteError::Engine)?;
+            .map_err(execute_error_from_engine)?;
         let outcome = Arc::clone(&item.outcome);
         let mut queue = self.lock_commit_wave_queue();
         self.ensure_commit_path_available()
-            .map_err(ExecuteError::Engine)?;
-        if let Some(reason) = &queue.wedged {
-            return Err(ExecuteError::Engine(EngineError::Durability(format!(
-                "the concurrent commit path is wedged pending restart recovery: {reason}"
-            ))));
+            .map_err(execute_error_from_engine)?;
+        if let Some(failure) = &queue.wedged {
+            return Err(failure.outcome_error());
         }
         queue.items.push_back(item);
         Ok(outcome)
@@ -1089,11 +1024,20 @@ impl Engine {
                 queue.items.drain(..n).collect()
             };
             if let Err(error) = self.ensure_commit_path_available() {
-                let message = error.to_string();
-                for item in batch {
-                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                        message.clone(),
-                    ))));
+                match error {
+                    EngineError::DurabilityFault(fault) => {
+                        for item in batch {
+                            item.set_outcome(Err(ExecuteError::IndeterminateDurability(fault)));
+                        }
+                    }
+                    error => {
+                        let message = error.to_string();
+                        for item in batch {
+                            item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                                message.clone(),
+                            ))));
+                        }
+                    }
                 }
                 let mut queue = self.lock_commit_wave_queue();
                 queue.sequencer_active = false;
@@ -1247,80 +1191,9 @@ impl Engine {
             .any(|item| matches!(&item.cmd, Command::Insert(_)));
         #[cfg(not(feature = "probe-timing"))]
         let probe_has_insert = false;
-        // AUDIT d6d10f8e D (documented decision): on an fsync FAILURE the flusher arm panics on
-        // the CLAIMING thread — which may be a client whose OWN statement is already durably
-        // acked (it claimed a DIFFERENT wave's tail). That client observes a panic for a
-        // committed statement: the classic group-commit ack ambiguity, bounded to the fail-stop
-        // fsync-failure world where the whole path wedges anyway. Accepted: the pre-W2 shape
-        // had the same ambiguity on the sequencer's client thread, and any retry-after-restart
-        // discipline must already tolerate acked-but-uncertain outcomes.
-        // Unwind-safe completion accounting: the finished-counter bump + wakeups MUST fire even
-        // when the group-fsync-failure arm PANICS below (wait_group_durable's flusher arm panics
-        // holding the commit_mutex — the wedge-don't-serve-torn-state policy). Without it the
-        // next sequencer parks forever at the depth gate (handed > finished, empty slot). On any
-        // unclean exit the guard also WEDGES the queue and fails everything still queued —
-        // parity with `CommitWaveBatchGuard` for the durability half of the wave (the tail's own
-        // Drop fails its member outcomes).
-        struct TailCompletion<'a> {
-            engine: &'a Engine,
-            clean: bool,
-        }
-        impl Drop for TailCompletion<'_> {
-            fn drop(&mut self) {
-                let wedge = !self.clean;
-                if !self.clean {
-                    let mut queue = self.engine.lock_commit_wave_queue();
-                    let reason = queue.wedged.clone().unwrap_or_else(|| {
-                        "the commit-wave durability tail died before completing".to_string()
-                    });
-                    queue.wedged = Some(reason.clone());
-                    queue.sequencer_active = false;
-                    let stranded: Vec<CommitWaveItem> = queue.items.drain(..).collect();
-                    drop(queue);
-                    for item in &stranded {
-                        if !item.outcome.done.load(AtomicOrdering::Acquire) {
-                            item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                                format!(
-                                    "the concurrent commit path is wedged pending restart \
-                                     recovery: {reason}"
-                                ),
-                            ))));
-                        }
-                    }
-                }
-                if wedge {
-                    // Publish the sticky engine-wide fail-stop BEFORE the release-store that tells
-                    // barrier waiters this tail is finished. A COMMIT that observes the finished
-                    // counter through Acquire must therefore also observe the wedge before it can
-                    // claim identities or append WAL.
-                    self.engine.wedge_commit_path();
-                }
-                #[cfg(test)]
-                if wedge {
-                    let hook = wave_tail_failure_publish_hook()
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    if let Some((engine, reached, resume)) = hook {
-                        if engine == self.engine as *const Engine as usize {
-                            reached.wait();
-                            resume.wait();
-                        }
-                    }
-                }
-                self.engine
-                    .commit_wave
-                    .tails_finished
-                    .fetch_add(1, AtomicOrdering::Release);
-                let queue = self.engine.lock_commit_wave_queue();
-                self.engine.commit_wave.cv.notify_all();
-                drop(queue);
-            }
-        }
-        let mut completion = TailCompletion {
-            engine: self,
-            clean: false,
-        };
+        // `TailCompletion` owns the post-WAL failure boundary.  In particular, its fixed serial
+        // branch drains queues and tails before it publishes a waiter wakeup.
+        let mut completion = TailCompletion::new(self);
         #[cfg(feature = "probe-timing")]
         let probe_durability_started = probe_has_insert.then(Instant::now);
         let durability_result = self.wait_group_durable(tail.last_position, probe_has_insert);
@@ -1333,13 +1206,24 @@ impl Engine {
             // its sticky failure (and the flusher wedge-panicked if we were the flusher — in
             // that case this line is unreachable and the completion guard runs on unwind). Fail
             // the wave's outcomes and wedge the queue.
-            let mut queue = self.lock_commit_wave_queue();
-            queue.wedged.get_or_insert_with(|| err.to_string());
-            drop(queue);
+            if let EngineError::DurabilityFault(fault) = err {
+                let fault = self.fail_all_pending_commit_work_fixed(fault);
+                tail.set_fixed_durability_failure(fault);
+                completion.mark_fixed_failure(fault);
+            } else {
+                let mut queue = self.lock_commit_wave_queue();
+                queue
+                    .wedged
+                    .get_or_insert_with(|| CommitPathFailure::compatibility(err.to_string()));
+            }
             drop(tail); // armed: fails every still-unset member outcome with the wedge error
             return; // completion guard (clean=false) wedges idempotently + counts + notifies
         }
         if self.is_commit_path_poisoned() {
+            if let Some(fault) = self.group_flush.fixed_poison.snapshot() {
+                tail.set_fixed_durability_failure(fault);
+                completion.mark_fixed_failure(fault);
+            }
             drop(tail); // armed: fail outcomes; a wedged service publishes no later visibility
             return;
         }
@@ -1351,7 +1235,9 @@ impl Engine {
         {
             self.wedge_commit_path();
             let mut queue = self.lock_commit_wave_queue();
-            queue.wedged.get_or_insert_with(|| error.to_string());
+            queue
+                .wedged
+                .get_or_insert_with(|| CommitPathFailure::compatibility(error.to_string()));
             drop(queue);
             drop(tail);
             return;
@@ -1364,10 +1250,21 @@ impl Engine {
             if let Err(error) = self.wait_until_publication_covers(last_committed_seq) {
                 self.wedge_commit_path();
                 let mut queue = self.lock_commit_wave_queue();
-                queue.wedged.get_or_insert_with(|| error.to_string());
+                queue
+                    .wedged
+                    .get_or_insert_with(|| CommitPathFailure::compatibility(error.to_string()));
                 drop(queue);
                 drop(tail);
                 return;
+            }
+        }
+        if let Some(last_committed_seq) = last_committed_seq {
+            let mut commit = self.commit_state();
+            commit.ledger.mark_published_through(last_committed_seq);
+            for receipt in std::mem::take(&mut tail.typed_ledger_receipts) {
+                commit
+                    .ledger
+                    .mark_published_visible(receipt, last_committed_seq);
             }
         }
         for (position, _seq, rows) in &tail.committed {
@@ -1388,7 +1285,7 @@ impl Engine {
             );
         }
         tail.armed = false;
-        completion.clean = true;
+        completion.mark_clean();
     }
 
     fn wait_until_publication_covers(&self, commit_seq: Index) -> Result<(), EngineError> {
@@ -1405,7 +1302,7 @@ impl Engine {
             }
             let queue = self.lock_commit_wave_queue();
             if let Some(error) = &queue.wedged {
-                return Err(EngineError::Durability(error.clone()));
+                return Err(error.engine_error());
             }
             if self.committed_seq() >= commit_seq {
                 return Ok(());
@@ -1459,14 +1356,11 @@ impl Engine {
     fn wait_group_durable(
         &self,
         wal_position: usize,
-        probe_insert: bool,
+        _probe_insert: bool,
     ) -> Result<(), EngineError> {
-        // E1 step 2 — FUA fence-pool backend: no single-flusher election. Every committer whose
-        // record isn't yet covered runs its own `begin_group_flush` + `job.commit()` concurrently;
-        // the WAL's ticket gate keeps frames ordered and the fence pool pipelines durability.
-        if self.group_flush.concurrent_durability {
-            return self.wait_group_durable_concurrent(wal_position, probe_insert);
-        }
+        // The engine owns exactly one logical durability group for every WAL backend. Exact FUA
+        // owns physical frame/fence execution beneath this coordinator; it does not create a
+        // second engine-side scheduler or alternate failure path.
         loop {
             if self
                 .group_flush
@@ -1481,11 +1375,8 @@ impl Engine {
                 .coord
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(msg) = &coord.failed {
-                return Err(EngineError::Durability(format!(
-                    "group-commit durability failed; the commit path is wedged pending restart \
-                     recovery: {msg}"
-                )));
+            if let Some(failure) = &coord.failed {
+                return Err(failure.engine_error());
             }
             // Re-check under the coordination lock (a flusher may have finished in between).
             if self
@@ -1514,7 +1405,7 @@ impl Engine {
             // validate/append/apply (and queue into the NEXT group) while this group's disk IO is
             // in flight. Completion takes only the WAL core's own lock, never the commit_mutex.
             #[cfg(feature = "probe-timing")]
-            let probe_begin_started = probe_insert.then(Instant::now);
+            let probe_begin_started = _probe_insert.then(Instant::now);
             let begun = {
                 let mut commit = self.commit_state();
                 commit.wal.begin_group_flush()
@@ -1531,7 +1422,7 @@ impl Engine {
                 }
                 Ok(gpu_db_wal::WalGroupFlushBegin::Job(job)) => {
                     #[cfg(feature = "probe-timing")]
-                    let probe_job_started = probe_insert.then(Instant::now);
+                    let probe_job_started = _probe_insert.then(Instant::now);
                     let result = job.commit();
                     #[cfg(feature = "probe-timing")]
                     if let Some(started) = probe_job_started {
@@ -1541,8 +1432,17 @@ impl Engine {
                     }
                     result
                 }
+                Ok(gpu_db_wal::WalGroupFlushBegin::Busy) => Ok(self
+                    .group_flush
+                    .durable_records
+                    .load(AtomicOrdering::Acquire)),
                 Err(err) => Err(err),
             };
+            #[cfg(test)]
+            let flush_result = durability_failure::inject_fixed_group_completion_failure_for_test(
+                self,
+                flush_result,
+            );
             let mut coord = self
                 .group_flush
                 .coord
@@ -1559,8 +1459,28 @@ impl Engine {
                     // now covers it (or a concurrent truncate shrank nothing below it — see the
                     // rollback paths, which only ever drop UNFLUSHED records they own).
                 }
+                Err(EngineError::DurabilityFault(fault)) => {
+                    let fault = self.group_flush.fixed_poison.install(fault);
+                    let selected = match coord
+                        .failed
+                        .as_ref()
+                        .and_then(CommitPathFailure::fixed_fault)
+                    {
+                        Some(existing) => existing,
+                        None => {
+                            coord.failed = Some(CommitPathFailure::Fixed(fault));
+                            fault
+                        }
+                    };
+                    // Publish the engine-wide admission gate before waking a group waiter.  A
+                    // waiter that observes this completion must not claim new work while the
+                    // owning tail is still draining already-applied members.
+                    self.commit_path_wedged.store(true, AtomicOrdering::Release);
+                    self.group_flush.cv.notify_all();
+                    return Err(EngineError::DurabilityFault(selected));
+                }
                 Err(err) => {
-                    coord.failed = Some(err.to_string());
+                    coord.failed = Some(CommitPathFailure::compatibility(err.to_string()));
                     self.group_flush.cv.notify_all();
                     drop(coord);
                     // Wedge-don't-serve-torn-state: poison the commit_mutex so the façade refuses
@@ -1573,182 +1493,6 @@ impl Engine {
                 }
             }
         }
-    }
-
-    /// E1 step 2 — the CONCURRENT-durability variant of [`Engine::wait_group_durable`], taken when
-    /// the WAL's FUA fence-pool backend is active (`concurrent_durability`). There is NO
-    /// single-flusher election: every committer whose record isn't yet covered snapshots + publishes
-    /// its own group frame under a BRIEF commit_mutex hold (the WAL's ticket gate assigns frame
-    /// order there) and then waits for the fence pool's contiguous durable cut OFF-LOCK, so MANY
-    /// groups are durable in flight at once. A committer whose tail another thread already published
-    /// (so `begin_group_flush` reports `Clean`) does NOT re-snapshot in a tight loop — it POLLS the
-    /// shared `durable_records` mirror (spin-then-yield, no per-commit wakeup) until the owning
-    /// thread's fence completes and advances it. Visibility still gates on the durable frontier
-    /// exactly as the serial path; a fence/publish/roll failure wedges fail-closed identically.
-    fn wait_group_durable_concurrent(
-        &self,
-        wal_position: usize,
-        _probe_insert: bool,
-    ) -> Result<(), EngineError> {
-        loop {
-            if self
-                .group_flush
-                .durable_records
-                .load(AtomicOrdering::Acquire)
-                >= wal_position
-            {
-                return Ok(());
-            }
-            if self.group_flush.wedged.load(AtomicOrdering::Acquire) {
-                return Err(self.group_flush_wedged_error());
-            }
-            // FENCE-POOL PACING (E1 step 3 — the engine-seam anti-convoy law): snapshot + publish
-            // our unflushed tail under a BRIEF commit_mutex hold (frame order is assigned there),
-            // but ONLY if the fence pool has a free lane. While every lane is busy we do NOT begin
-            // — a fresh begin here would frame the FEW records accumulated since the last publish
-            // (the E1.2 negative: 61-record serial-election groups collapse to ~28), doubling the
-            // durable-op count and starving the pool. Instead we release the lock and POLL the
-            // durable mirror: whoever begins when a lane frees sweeps the WHOLE accumulated tail
-            // (ours included) into ONE larger frame. This recreates serial-election batching but
-            // with up to `lanes` groups pipelined instead of one. `fua_free_fence_slots` is `None`
-            // on the serial backend (never reached here) → treat as "a lane is free".
-            #[cfg(feature = "probe-timing")]
-            let probe_begin_started = _probe_insert.then(Instant::now);
-            let begun = {
-                let mut commit = self.commit_state();
-                if commit.wal.fua_free_fence_slots().unwrap_or(1) == 0 {
-                    None // all lanes busy → accumulate + poll (do not ship a tiny frame)
-                } else {
-                    Some(commit.wal.begin_group_flush())
-                }
-            };
-            #[cfg(feature = "probe-timing")]
-            if let Some(started) = probe_begin_started {
-                self.record_insert_probe_durability_begin_group_flush_nanos(
-                    started.elapsed().as_nanos() as u64,
-                );
-            }
-            match begun {
-                None => {
-                    // Pacing back-off: another begin will cover us once a lane frees. Poll the
-                    // durable mirror off-lock; on budget-elapse re-loop to re-check the pacing gate.
-                    if self.poll_concurrent_durable_mirror(wal_position)? {
-                        return Ok(());
-                    }
-                }
-                Some(Ok(gpu_db_wal::WalGroupFlushBegin::Clean { flushed_records })) => {
-                    // Another committer already published our tail and owns the in-flight frame that
-                    // covers us; it will advance `durable_records` when its fence completes. Refresh
-                    // the mirror with the snapshot's durable cut, then POLL (no wakeup) until either
-                    // the frontier covers us or the owner wedges.
-                    self.group_flush
-                        .durable_records
-                        .fetch_max(flushed_records, AtomicOrdering::AcqRel);
-                    if self.poll_concurrent_durable_mirror(wal_position)? {
-                        return Ok(());
-                    }
-                }
-                Some(Ok(gpu_db_wal::WalGroupFlushBegin::Job(job))) => {
-                    #[cfg(feature = "probe-timing")]
-                    let probe_job_started = _probe_insert.then(Instant::now);
-                    let result = job.commit();
-                    #[cfg(feature = "probe-timing")]
-                    if let Some(started) = probe_job_started {
-                        self.record_insert_probe_durability_job_wait_nanos(
-                            started.elapsed().as_nanos() as u64,
-                        );
-                    }
-                    match result {
-                        Ok(flushed_records) => {
-                            self.group_flush
-                                .durable_records
-                                .fetch_max(flushed_records, AtomicOrdering::AcqRel);
-                            // Loop: our own record was appended before this frame was published, so the
-                            // frontier now covers it.
-                        }
-                        Err(err) => return Err(self.wedge_group_flush(err)),
-                    }
-                }
-                Some(Err(err)) => return Err(self.wedge_group_flush(err)),
-            }
-        }
-    }
-
-    /// Spin-then-yield poll of the concurrent durable mirror (no per-commit wakeup), bounded by a
-    /// yield budget. Returns `Ok(true)` when the frontier covers `wal_position`, `Ok(false)` when
-    /// the budget elapses (the caller re-loops to re-check the pacing gate / a freed fence lane —
-    /// this also surfaces a poisoned backend that died mid-flight without setting `wedged`, far
-    /// beyond one fence latency), and `Err` when the path is wedged. Pure spin at low contention
-    /// keeps the ack near one fence latency; the yield fallback avoids burning a core when the pool
-    /// is genuinely backed up.
-    fn poll_concurrent_durable_mirror(&self, wal_position: usize) -> Result<bool, EngineError> {
-        const SPIN_BEFORE_YIELD: u32 = 256;
-        const POLL_YIELD_BUDGET: u32 = 1 << 16;
-        let mut spins: u32 = 0;
-        let mut yields: u32 = 0;
-        loop {
-            if self
-                .group_flush
-                .durable_records
-                .load(AtomicOrdering::Acquire)
-                >= wal_position
-            {
-                return Ok(true);
-            }
-            if self.group_flush.wedged.load(AtomicOrdering::Acquire) {
-                return Err(self.group_flush_wedged_error());
-            }
-            if spins < SPIN_BEFORE_YIELD {
-                spins += 1;
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-                yields += 1;
-                if yields >= POLL_YIELD_BUDGET {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-
-    /// E1 step 2 — wedge the concurrent group-flush path fail-closed after a fence/publish/roll
-    /// failure whose group's member deltas were already applied (they can never be published, and
-    /// nothing later may publish over them). Records the sticky failure under the coordination lock,
-    /// flips the lock-free `wedged` mirror so POLLING waiters bail, and PANICS while holding the
-    /// commit_mutex — poisoning it so the façade refuses further service (restart recovery replays
-    /// the durable WAL prefix; the un-fsynced records were never acknowledged nor visible). This is
-    /// the same wedge-don't-serve-torn-state policy the serial path's flusher applies.
-    fn wedge_group_flush(&self, err: EngineError) -> EngineError {
-        {
-            let mut coord = self
-                .group_flush
-                .coord
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if coord.failed.is_none() {
-                coord.failed = Some(err.to_string());
-            }
-        }
-        self.group_flush.wedged.store(true, AtomicOrdering::Release);
-        let _commit = self.commit_state();
-        panic!(
-            "group-commit FUA durability failed after member deltas were applied: {err} — \
-             wedging the commit path; restart recovery replays the durable WAL prefix"
-        );
-    }
-
-    /// The sticky-failure error a concurrent waiter returns once the path is wedged.
-    fn group_flush_wedged_error(&self) -> EngineError {
-        let coord = self
-            .group_flush
-            .coord
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let msg = coord.failed.clone().unwrap_or_else(|| "wedged".to_string());
-        EngineError::Durability(format!(
-            "group-commit durability failed; the commit path is wedged pending restart \
-             recovery: {msg}"
-        ))
     }
 
     pub fn execute_text(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
@@ -1848,9 +1592,9 @@ impl Engine {
         expected_catalog_version: Option<Index>,
     ) -> Result<(), ExecuteError> {
         if self.is_commit_path_poisoned() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "commit path is wedged; restart recovery required".to_string(),
-            )));
+            return Err(execute_error_from_engine(
+                self.commit_path_unavailable_error(),
+            ));
         }
         if command_has_returning(&cmd) {
             return Err(discarded_returning_error());
@@ -2092,7 +1836,7 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
                 self.ensure_commit_path_available()
-                    .map_err(ExecuteError::Engine)?;
+                    .map_err(execute_error_from_engine)?;
                 if snapshot.transaction_delta_is_empty() {
                     self.finish_transaction_context(txn_id, true, chain)?;
                 } else {
@@ -2111,7 +1855,7 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
                 self.ensure_commit_path_available()
-                    .map_err(ExecuteError::Engine)?;
+                    .map_err(execute_error_from_engine)?;
                 self.finish_transaction_context(txn_id, false, chain)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -2138,7 +1882,7 @@ impl Engine {
 
     pub fn execute_read_text(&mut self, text: &str) -> Result<Option<String>, ExecuteError> {
         self.ensure_commit_path_available()
-            .map_err(ExecuteError::Engine)?;
+            .map_err(execute_error_from_engine)?;
         let cmd = parse_command(text)?;
 
         match cmd {

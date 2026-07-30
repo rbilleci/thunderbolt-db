@@ -67,9 +67,21 @@ mod admission;
 mod append_source;
 /// Typed INSERT device-plan compilation and physical residency adaptation.
 mod fixed_insert;
-/// Test-only inert indexed-append preparation ownership.
-#[cfg(test)]
+/// In-place physical reservation ingredients for the unreachable indexed handoff.
 pub(crate) mod index_delta;
+/// Zero-CUDA generation/cache preview consumed by the indexed in-place reservation.
+mod index_delta_preview;
+#[cfg(test)]
+mod index_delta_preview_tests;
+/// Fixed-rollover physical reservation ingredients for the unreachable indexed handoff.
+pub(crate) mod index_rollover;
+/// One sealed forecast-to-materialization boundary for indexed physical preparation.
+mod indexed_forecast;
+/// Private physical resources for the still-unreachable indexed INSERT handoff.
+///
+/// This compiles with production so its move-only lifetime and abandonment behavior cannot
+/// silently diverge.  It is not a live strategy selector, WAL carrier, or publisher.
+mod indexed_reservation;
 /// Vacuum, serialized rehydration, and device-gather ownership.
 mod maintenance;
 /// Resident append, rollover, sparse-version stamping, and fused-apply ownership.
@@ -78,6 +90,11 @@ mod mutation;
 mod payload;
 /// Residency feature policy, elision eligibility, and telemetry ownership.
 mod policy;
+/// Prepared, branch-neutral indexed table publication capability.  Its constructors remain
+/// test-only until WRITE-001 opens the one live `DeviceInsertPlan` handoff.
+mod prepared_table_index_manifest;
+#[cfg(test)]
+pub(crate) use prepared_table_index_manifest::allocation_test_support::assert_no_thread_allocations;
 /// Fit-aware fixed-width rollover planning and private device construction ownership.
 mod rollover;
 /// Residency warmup, route planning, and status ownership.
@@ -91,11 +108,11 @@ pub(crate) use fixed_insert::{
 };
 pub(crate) use payload::{
     build_relational_device_payload, build_relational_device_payload_with_capacity,
-    checked_fixed_width_append_geometry, compound_index_row_fingerprint, compound_key_fingerprint,
-    compound_key_type_supported, compound_unique_slot_id, compute_open_shard_int4_append_chunks,
-    i32_section_needle, index_all_key_columns_foldable, index_is_compound,
-    index_key_column_positions, index_probe_key_id, index_uses_fingerprint, key_column_width_words,
-    parse_relational_row_id, probe_key_id_positions, sql_value_as_int4, sql_value_from_i32_section,
+    compound_index_row_fingerprint, compound_key_fingerprint, compound_key_type_supported,
+    compound_unique_slot_id, compute_open_shard_int4_append_chunks, i32_section_needle,
+    index_all_key_columns_foldable, index_is_compound, index_key_column_positions,
+    index_probe_key_id, index_uses_fingerprint, key_column_width_words, parse_relational_row_id,
+    probe_key_id_positions, sql_value_as_int4, sql_value_from_i32_section,
     sql_value_from_i64_section, sql_value_key_words, AppendCreatedBy, UnifiedResidentSnapshotParts,
     COMPOUND_KEY_ID_FLAG, CREATED_BY_VISIBLE_FILL_BYTE, DELETED_BY_LIVE_FILL_BYTE,
     ROW_ID_UNSTAMPED_FILL_BYTE,
@@ -658,12 +675,7 @@ impl Engine {
         let route_descriptors = self
             .read_state
             .residency
-            .sharded_point_routes
-            .load()
-            .iter()
-            .filter(|((name, _, _), route)| name.as_str() != table && route.gpu_id == gpu_id)
-            .map(|(_, route)| route.plan.descriptor_allocated_bytes())
-            .sum::<u64>();
+            .sharded_point_route_descriptor_bytes_for_gpu_excluding(gpu_id, table);
         // Compound directories are free only after every retired/in-flight plan owner drains, so
         // none of their live charge is treated as immediately reclaimable by table replacement.
         let live_compound_routes = self.live_compound_point_route_bytes_for_gpu(gpu_id);
@@ -773,12 +785,7 @@ impl Engine {
         let route_descriptor_bytes = self
             .read_state
             .residency
-            .sharded_point_routes
-            .load()
-            .iter()
-            .filter(|((name, _, _), route)| name == table && route.gpu_id == gpu_id)
-            .map(|(_, route)| route.plan.descriptor_allocated_bytes())
-            .sum::<u64>();
+            .sharded_point_route_descriptor_bytes_for_table_gpu(table, gpu_id);
         let compound_route_bytes = self.live_compound_point_route_bytes_for_table(gpu_id, table);
         (
             snapshot_bytes

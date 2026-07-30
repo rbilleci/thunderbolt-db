@@ -3,6 +3,9 @@
 This is a stable design contract, not a task list or a second work ledger. `PLAN.md` owns WRITE-001's ordering,
 open work, and acceptance; `STATUS.md` records only accepted facts. This contract refines the write boundaries in
 `ARCHITECTURE.md` §§6–8 and ADR-014/015 without creating a second sequencing, WAL, recovery, or publication owner.
+The frozen codec-5 S4/image boundary and the PLAN-gated requirements for later S7/S8/replay
+contracts are recorded in
+[`write-001-codec5-semantics-v2.md`](write-001-codec5-semantics-v2.md).
 
 ## Decision
 

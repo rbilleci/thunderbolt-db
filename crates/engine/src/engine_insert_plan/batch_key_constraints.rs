@@ -4,9 +4,12 @@
 //! indexes.  It owns the exact-key primitive's descriptor construction, but not the common
 //! source, allocation scope, CHECK scheduling, or cross-class diagnostic precedence.
 
+use super::host_retention::{HostRetentionGeometry, HostRetentionReport};
+use super::resident_constraint_generation::{self, ResidentConstraintColumnBinding};
 use super::{CatalogSnapshot, EngineError, Index};
 use crate::relational_model::{RelationalColumn, RelationalIndex, RelationalTable};
 use crate::typed_insert_batch::{TypedInsertBatch, TypedInsertConstraintDeviceSource};
+use crate::ExecuteError;
 use gpu_db_execution::{insert_batch_key_verdict_scratch_bytes, CudaCompoundFoldColumn};
 
 pub(super) struct CompiledBatchKeyConstraints {
@@ -257,9 +260,45 @@ pub(super) fn seal_after_success(
 }
 
 impl BatchKeyConstraintProof {
-    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
     pub(crate) fn indexes(&self) -> &[IndexBinding] {
         &self.indexes
+    }
+
+    /// Current retained host backing for the sealed raw-index witness. It has no generation pin:
+    /// string/catalog contents are data backings, while the current generation owner lives in
+    /// the separate validation seal.
+    pub(crate) fn append_host_retention(
+        &self,
+        report: &mut HostRetentionReport,
+    ) -> Result<(), EngineError> {
+        report.retain_string(&self.target_schema)?;
+        report.retain_string(&self.target_name)?;
+        report.retain_boxed_slice(&self.indexes)?;
+        for index in self.indexes.iter() {
+            index.append_host_retention(report)?;
+        }
+        Ok(())
+    }
+
+    /// Scalar pre-lease geometry for the sealed raw-index witness. Its strings and boxes are
+    /// private copies made by the proof compiler, so they cannot alias another preview owner.
+    pub(crate) fn host_retention_geometry(&self) -> Result<HostRetentionGeometry, EngineError> {
+        let mut geometry = HostRetentionGeometry::default();
+        append_string_geometry(
+            &mut geometry,
+            &self.target_schema,
+            "key proof target schema",
+        )?;
+        append_string_geometry(&mut geometry, &self.target_name, "key proof target name")?;
+        geometry.checked_add_backing_elements::<IndexBinding>(
+            self.indexes.len(),
+            "key proof index box",
+        )?;
+        for index in self.indexes.iter() {
+            index.append_host_retention_geometry(&mut geometry)?;
+        }
+        Ok(geometry)
     }
 
     pub(super) fn matches_current_catalog(&self, catalog: &CatalogSnapshot) -> bool {
@@ -270,7 +309,7 @@ impl BatchKeyConstraintProof {
     /// catalog contents at a newer commit sequence.  Its target binding stays exact; only the
     /// unrelated monotonic catalog sequence is permitted to advance.  Production keeps the
     /// sequence-exact [`Self::matches_current_catalog`] witness.
-    #[cfg(test)]
+    #[allow(dead_code)] // current-generation reservation witness, not a live eligibility lift
     pub(super) fn matches_current_target_binding(&self, catalog: &CatalogSnapshot) -> bool {
         catalog.commit_seq >= self.catalog_seq && self.matches_catalog_binding(catalog)
     }
@@ -297,19 +336,116 @@ impl BatchKeyConstraintProof {
 }
 
 impl IndexBinding {
-    #[cfg(test)]
+    /// Visit the already sealed catalog members without materializing a second binding box.
+    ///
+    /// Fixed-rollover index preparation uses this after its all-resource permit. Keeping the
+    /// callback borrowed makes the permit-time host high-water a function of the final CUDA
+    /// descriptor vector only, rather than an otherwise redundant box of cloned names.
+    pub(crate) fn try_for_each_resolved_catalog_column(
+        &self,
+        table: &RelationalTable,
+        mut visit: impl FnMut(usize, &RelationalColumn) -> Result<(), ExecuteError>,
+    ) -> Result<(), ExecuteError> {
+        for binding in self.resolved_columns.iter() {
+            let (position, column) = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, column)| binding.matches(column))
+                .ok_or_else(|| {
+                    ExecuteError::Serialization(
+                        "resident key binding lost its catalog column".to_string(),
+                    )
+                })?;
+            visit(position, column)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_host_retention(
+        &self,
+        report: &mut HostRetentionReport,
+    ) -> Result<(), EngineError> {
+        report.retain_string(&self.name)?;
+        report.retain_string(&self.table)?;
+        report.retain_string(&self.column)?;
+        report.retain_boxed_slice(&self.key_columns)?;
+        for column in self.key_columns.iter() {
+            report.retain_string(column)?;
+        }
+        report.retain_boxed_slice(&self.resolved_columns)?;
+        for column in self.resolved_columns.iter() {
+            column.append_host_retention(report)?;
+        }
+        Ok(())
+    }
+
+    fn append_host_retention_geometry(
+        &self,
+        geometry: &mut HostRetentionGeometry,
+    ) -> Result<(), EngineError> {
+        append_string_geometry(geometry, &self.name, "key proof index name")?;
+        append_string_geometry(geometry, &self.table, "key proof index table")?;
+        append_string_geometry(geometry, &self.column, "key proof index column")?;
+        geometry.checked_add_backing_elements::<String>(
+            self.key_columns.len(),
+            "key proof index key-column box",
+        )?;
+        for column in self.key_columns.iter() {
+            append_string_geometry(geometry, column, "key proof index key-column name")?;
+        }
+        geometry.checked_add_backing_elements::<KeyColumnBinding>(
+            self.resolved_columns.len(),
+            "key proof resolved-column box",
+        )?;
+        for column in self.resolved_columns.iter() {
+            append_string_geometry(geometry, &column.name, "key proof resolved-column name")?;
+        }
+        Ok(())
+    }
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
     pub(crate) fn raw_ordinal(&self) -> usize {
         self.raw_ordinal
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
     pub(super) fn is_unique_or_primary(&self) -> bool {
         self.unique || self.primary_key
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
     pub(super) fn key_columns(&self) -> &[KeyColumnBinding] {
         &self.resolved_columns
+    }
+
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
+    pub(crate) fn key_column_count(&self) -> usize {
+        self.resolved_columns.len()
+    }
+
+    /// Adapt this already-sealed UNIQUE/index witness to the neutral resident constraint column
+    /// seam. The generic binding remains impossible to fabricate from names or types alone:
+    /// each source member must still match the current catalog column exactly.
+    pub(crate) fn resident_constraint_columns(
+        &self,
+        table: &RelationalTable,
+    ) -> Result<Box<[ResidentConstraintColumnBinding]>, ExecuteError> {
+        let columns = self
+            .resolved_columns
+            .iter()
+            .map(|binding| {
+                table
+                    .columns
+                    .iter()
+                    .find(|column| binding.matches(column))
+                    .ok_or_else(|| {
+                        ExecuteError::Serialization(
+                            "resident key binding lost its catalog column".to_string(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        resident_constraint_generation::bind_catalog_columns(table, columns)
     }
 
     fn matches(&self, ordinal: usize, table: &RelationalTable, live: &RelationalIndex) -> bool {
@@ -337,8 +473,27 @@ impl IndexBinding {
     }
 }
 
+fn append_string_geometry(
+    geometry: &mut HostRetentionGeometry,
+    value: &String,
+    domain: &'static str,
+) -> Result<(), EngineError> {
+    if value.capacity() == 0 {
+        return Ok(());
+    }
+    let bytes = u64::try_from(value.capacity())
+        .map_err(|_| EngineError::Durability("key proof string capacity overflows".to_string()))?;
+    geometry.checked_add_backing_bytes_slots(bytes, 1, domain)
+}
+
 impl KeyColumnBinding {
-    #[cfg(test)]
+    fn append_host_retention(&self, report: &mut HostRetentionReport) -> Result<(), EngineError> {
+        report.retain_string(&self.name)
+    }
+}
+
+impl KeyColumnBinding {
+    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
     pub(super) fn ty(&self) -> crate::SqlType {
         self.ty
     }

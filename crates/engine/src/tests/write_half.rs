@@ -1,5 +1,20 @@
 use super::*;
 
+fn stable_write_set(table_oid: u32, row_id: u64) -> WriteSet {
+    let table = format!("stable_{table_oid}");
+    let mut write_set = WriteSet::default();
+    write_set.tables.insert(table.clone());
+    write_set.table_oids.push(table_oid);
+    write_set.rows.push(RowWriteKey {
+        table: table.clone(),
+        row_key: format!("rel/{table}/{row_id:020}"),
+    });
+    write_set
+        .stable_rows
+        .push(StableRowWriteKey { table_oid, row_id });
+    write_set
+}
+
 #[test]
 fn recent_commits_ledger_conflict_record_and_prune() {
     // Unit-level proof of the SI conflict-detection + GC-boundary logic the concurrent commit
@@ -8,6 +23,10 @@ fn recent_commits_ledger_conflict_record_and_prune() {
     let row = |id: u64| RowWriteKey {
         table: "t".to_string(),
         row_key: format!("rel/t/{id:020}"),
+    };
+    let stable_row = |id| StableRowWriteKey {
+        table_oid: 41,
+        row_id: id,
     };
     let slot = |v: &str| UniqueIndexSlotKey {
         table: "t".to_string(),
@@ -18,6 +37,7 @@ fn recent_commits_ledger_conflict_record_and_prune() {
     // Txn at read_snapshot 5 commits at seq 6, writing row 1 and unique slot "a".
     let mut ws = WriteSet::default();
     ws.rows.push(row(1));
+    ws.stable_rows.push(stable_row(1));
     ws.unique_slots.push(slot("a"));
     assert!(
         !ledger.conflicts(&ws, 5),
@@ -29,6 +49,7 @@ fn recent_commits_ledger_conflict_record_and_prune() {
     // A txn that snapshotted at 5 and writes the SAME row conflicts (row written at 6 > 5).
     let mut overlap = WriteSet::default();
     overlap.rows.push(row(1));
+    overlap.stable_rows.push(stable_row(1));
     assert!(
         ledger.conflicts(&overlap, 5),
         "row written after the snapshot must conflict (first-committer-wins)"
@@ -46,12 +67,14 @@ fn recent_commits_ledger_conflict_record_and_prune() {
     // A disjoint write (different row + slot) never conflicts.
     let mut disjoint = WriteSet::default();
     disjoint.rows.push(row(2));
+    disjoint.stable_rows.push(stable_row(2));
     disjoint.unique_slots.push(slot("b"));
     assert!(!ledger.conflicts(&disjoint, 0));
 
     // Pruning below the oldest active snapshot drops entries no active txn can still win against.
     ledger.record(&disjoint, 10); // now seqs 6 and 10 are recorded
     assert_eq!(ledger.len(), 4);
+    ledger.mark_published_through(10);
     ledger.prune_below(6); // oldest active snapshot is 7 → prune <= 6
     assert_eq!(
         ledger.len(),
@@ -71,15 +94,21 @@ fn recent_commits_ledger_conflict_record_and_prune() {
 #[test]
 fn table_root_and_rewrite_fence_lifecycle_is_catalog_and_epoch_bounded() {
     let mut ledger = RecentCommitsLedger::default();
-    ledger.tables.insert("before".to_string(), 7);
-    ledger.tables.insert("dropped".to_string(), 8);
+    let mut before = WriteSet::default();
+    before.tables.insert("before".to_string());
+    before.table_oids.push(41);
+    ledger.record(&before, 7);
+    let mut dropped = WriteSet::default();
+    dropped.tables.insert("dropped".to_string());
+    dropped.table_oids.push(42);
+    ledger.record(&dropped, 8);
     let prior = BTreeMap::from([("before".to_string(), 41), ("dropped".to_string(), 42)]);
     let current = BTreeMap::from([("after".to_string(), 41), ("dropped".to_string(), 99)]);
     ledger.reconcile_table_roots(&prior, &current);
-    assert_eq!(ledger.table_root_index("after"), 7);
-    assert_eq!(ledger.table_root_index("before"), 0);
+    assert_eq!(ledger.table_root_index(41), 7);
+    assert_eq!(ledger.table_root_index(42), 0);
     assert_eq!(
-        ledger.table_root_index("dropped"),
+        ledger.table_root_index(99),
         0,
         "drop/recreate under one name must not inherit the old OID's root"
     );
@@ -145,9 +174,229 @@ fn recent_commits_ledger_integer_slot_conflict_and_cross_path() {
     assert!(ledger.conflicts(&classic, 7));
 
     // Prune drops the integer slots too (bounded by the active-snapshot window).
+    ledger.mark_published_through(8);
     ledger.prune_below(8);
     assert_eq!(ledger.len(), 0, "all slots at/below the floor pruned");
     assert!(!ledger.conflicts(&same_pk, 0));
+}
+
+#[test]
+fn typed_ledger_claim_is_prepared_before_wal_and_pinned_until_publication() {
+    let mut ledger = RecentCommitsLedger::default();
+    let mut write_set = WriteSet::default();
+    write_set.tables.insert("typed_t".to_string());
+    write_set.table_oids.push(71);
+    write_set.rows.push(RowWriteKey {
+        table: "typed_t".to_string(),
+        row_key: "rel/typed_t/00000000000000000009".to_string(),
+    });
+    write_set.stable_rows.push(StableRowWriteKey {
+        table_oid: 71,
+        row_id: 9,
+    });
+    write_set.unique_slots.push(UniqueIndexSlotKey {
+        table: "typed_t".to_string(),
+        column: "id".to_string(),
+        value: "9".to_string(),
+    });
+    write_set
+        .unique_slots_i32
+        .push((pack_unique_slot_id(71, 1), 9));
+
+    let prepared = PreparedLedgerDelta::from_write_set(&write_set).unwrap();
+    let reserved = ledger.reserve_typed_delta(prepared, 12).unwrap();
+    assert_eq!(
+        ledger.table_root_index(71),
+        0,
+        "reservation has no live effect"
+    );
+
+    let receipt = ledger.claim_typed_delta(reserved, 12);
+    assert_eq!(ledger.table_root_index(71), 12);
+    assert!(ledger.conflicts(&write_set, 11));
+    ledger.prune_below(12);
+    assert!(
+        ledger.conflicts(&write_set, 11),
+        "a post-WAL typed claim remains pinned until publication coverage consumes its receipt"
+    );
+
+    ledger.mark_published_through(12);
+    ledger.mark_published_visible(receipt, 12);
+    ledger.prune_below(12);
+    assert!(!ledger.conflicts(&write_set, 11));
+    assert_eq!(
+        ledger.table_root_index(71),
+        12,
+        "roots are catalog-bounded high-water"
+    );
+}
+
+#[test]
+fn prepared_ledger_delta_rejects_partial_stable_identity_projection() {
+    let mut missing_table_oid = WriteSet::default();
+    missing_table_oid
+        .tables
+        .insert("missing_table_oid".to_string());
+    assert!(
+        PreparedLedgerDelta::from_write_set(&missing_table_oid).is_err(),
+        "a legacy relation name cannot enter the live ledger without its stable OID"
+    );
+
+    let mut missing_row_identity = WriteSet::default();
+    missing_row_identity
+        .tables
+        .insert("missing_row_identity".to_string());
+    missing_row_identity.table_oids.push(97);
+    missing_row_identity.rows.push(RowWriteKey {
+        table: "missing_row_identity".to_string(),
+        row_key: "rel/missing_row_identity/00000000000000000001".to_string(),
+    });
+    assert!(
+        PreparedLedgerDelta::from_write_set(&missing_row_identity).is_err(),
+        "a legacy row key cannot enter the live ledger without its stable (OID,row_id) identity"
+    );
+}
+
+#[test]
+fn typed_ledger_reservation_rejects_sequence_drift_and_cross_owner_without_mutation() {
+    let write_set = stable_write_set(93, 7);
+
+    let mut sequence_ledger = RecentCommitsLedger::default();
+    let reservation = sequence_ledger
+        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 31)
+        .unwrap();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sequence_ledger.claim_typed_delta(reservation, 32)
+        }))
+        .is_err(),
+        "a post-WAL claim must fail closed if its expected sequence drifted"
+    );
+    assert_eq!(sequence_ledger.table_root_index(93), 0);
+    assert!(!sequence_ledger.conflicts(&write_set, 0));
+
+    let mut reservation_owner = RecentCommitsLedger::default();
+    let mut other_owner = RecentCommitsLedger::default();
+    let reservation = reservation_owner
+        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 33)
+        .unwrap();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            other_owner.claim_typed_delta(reservation, 33)
+        }))
+        .is_err(),
+        "a reservation must never cross stable-ledger ownership"
+    );
+    assert_eq!(reservation_owner.table_root_index(93), 0);
+    assert_eq!(other_owner.table_root_index(93), 0);
+    assert!(!reservation_owner.conflicts(&write_set, 0));
+    assert!(!other_owner.conflicts(&write_set, 0));
+}
+
+#[test]
+fn generic_ledger_epoch_waits_for_the_publication_frontier_before_pruning() {
+    let write_set = stable_write_set(94, 8);
+    let mut ledger = RecentCommitsLedger::default();
+    ledger.record(&write_set, 41);
+    ledger.prune_below(41);
+    assert!(
+        ledger.conflicts(&write_set, 0),
+        "generic/replay records remain conflict-visible until publication advances"
+    );
+
+    ledger.mark_published_through(41);
+    ledger.prune_below(41);
+    assert!(!ledger.conflicts(&write_set, 0));
+}
+
+#[test]
+fn typed_ledger_orphan_panics_and_explicit_abandon_keeps_the_epoch_pinned() {
+    let write_set = stable_write_set(95, 9);
+
+    let mut orphaned = RecentCommitsLedger::default();
+    let receipt = orphaned
+        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 51)
+        .map(|reservation| orphaned.claim_typed_delta(reservation, 51))
+        .unwrap();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(receipt))).is_err(),
+        "an unconsumed post-WAL receipt must turn into a recovery-visible invariant failure"
+    );
+    orphaned.prune_below(51);
+    assert!(orphaned.conflicts(&write_set, 0));
+
+    let mut abandoned = RecentCommitsLedger::default();
+    let receipt = abandoned
+        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 52)
+        .map(|reservation| abandoned.claim_typed_delta(reservation, 52))
+        .unwrap();
+    receipt.abandon_for_recovery();
+    abandoned.prune_below(52);
+    assert!(
+        abandoned.conflicts(&write_set, 0),
+        "the explicit error-path abandon suppresses only the destructor; the epoch remains pinned"
+    );
+}
+
+#[test]
+fn every_live_ledger_record_family_has_a_publication_frontier() {
+    let canonical = include_str!("../engine_dml_concurrent/canonical.rs");
+    let sharded_wave = include_str!("../engine_dml_concurrent/wave.rs");
+    let lane = include_str!("../engine_dml_concurrent/lane.rs");
+    let serial = include_str!("../engine_commit.rs");
+    let shared_tail = include_str!("../engine_dml_concurrent.rs");
+
+    assert_eq!(
+        canonical
+            .matches("commit.ledger.record(write_set, expected_commit_seq);")
+            .count(),
+        1,
+        "the generic canonical wave record must use the shared publication tail"
+    );
+    assert_eq!(
+        sharded_wave
+            .matches("commit.ledger.record(&batch[position].write_set, commit_seq);")
+            .count(),
+        1,
+        "the sharded covered-INSERT record must use the shared publication tail"
+    );
+    assert_eq!(
+        lane.matches("commit.ledger.record(&write_set, commit_seq);")
+            .count(),
+        1,
+        "the intent-lane record owns one direct publication tail"
+    );
+    assert_eq!(
+        serial.matches("commit.ledger.record(").count(),
+        2,
+        "the two serial/recovery record families must stay enumerated"
+    );
+    assert_eq!(
+        shared_tail
+            .matches("commit.ledger.mark_published_through(last_committed_seq);")
+            .count(),
+        1,
+        "canonical and sharded waves advance their shared generic frontier before receipt release"
+    );
+    assert_eq!(
+        shared_tail
+            .matches(".mark_published_visible(receipt, last_committed_seq);")
+            .count(),
+        1,
+        "typed claims become pruneable only at the same shared publication tail"
+    );
+    assert_eq!(
+        lane.matches(".mark_published_through(last_seq);").count(),
+        1,
+        "the intent lane advances its own successful publication tail"
+    );
+    assert_eq!(
+        serial
+            .matches("commit.ledger.mark_published_through(")
+            .count(),
+        2,
+        "every serial/recovery record family has a matching publication frontier"
+    );
 }
 
 #[test]
@@ -457,7 +706,10 @@ fn concurrent_commits_share_group_fsyncs_and_recover_durably() {
     const COMMITS_PER_WRITER: usize = 25;
 
     let path = test_wal_path("group-commit-concurrent");
-    let e = Engine::with_durable_wal_segment(&path);
+    let mut e = Engine::with_durable_wal_segment(&path);
+    // This fixture owns the classic group-flusher accounting contract. The lane lifecycle has
+    // separate coverage, so detach it before construction of the concurrent wave workload.
+    e.intent_lanes = None;
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
 
     let engine = std::sync::Arc::new(e);
@@ -530,19 +782,23 @@ fn concurrent_commits_share_group_fsyncs_and_recover_durably() {
 
 #[test]
 fn group_fsync_failure_wedges_the_concurrent_commit_path_without_exposing_the_delta() {
-    // D3b failure semantics: the group fsync runs AFTER the committer's delta is applied, so a
-    // flush failure cannot roll back into a clean per-statement abort — instead the flusher
-    // panics (poisoning the commit_mutex, the engine's wedge-don't-serve-torn-state policy) and
-    // the sticky group failure makes later concurrent commits error out. Crucially the failed
-    // commit's delta must NEVER become visible (committed_seq was not published), and a restart
-    // recovers exactly the durable prefix (the un-fsynced record was never acknowledged).
+    // D3b failure semantics for the retained generic UPDATE/DELETE compatibility branch: group
+    // fsync runs AFTER the committer's delta is applied, so a flush failure cannot roll back into
+    // a clean per-statement abort — the flusher panics (poisoning the commit_mutex) and later
+    // concurrent commits fail closed. Typed INSERT owns a distinct pre-WAL exact-admission path;
+    // this fixture intentionally proves the still-live generic coordinator behavior instead.
     let path = test_wal_path("group-commit-wedge");
     let mut e = Engine::with_durable_wal_segment(&path);
+    // Keep this failure fixture on the classic group coordinator. The default lane tail catches
+    // its panic and returns an error, which would no longer exercise the stated flusher premise.
+    e.intent_lanes = None;
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (id, v) VALUES (7, 0)")
+        .unwrap();
     e.simulate_next_wal_flush_failure();
 
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        e.execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (7, 70)")
+        e.execute_dml_concurrent(3, "UPDATE t SET v = 70 WHERE id = 7")
     }));
     assert!(
         panicked.is_err(),
@@ -556,7 +812,7 @@ fn group_fsync_failure_wedges_the_concurrent_commit_path_without_exposing_the_de
     // The engine-wide fail-stop refuses reads after the applied-but-unpublished delta wedges the
     // commit path. Visibility is proved from the durable prefix after restart below; serving a
     // live snapshot here would risk exposing torn state.
-    let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
+    let Command::Select(select) = parse_command("SELECT id, v FROM t").unwrap() else {
         panic!("expected SELECT plan");
     };
     assert!(
@@ -568,23 +824,20 @@ fn group_fsync_failure_wedges_the_concurrent_commit_path_without_exposing_the_de
     );
 
     // The sticky group failure turns later concurrent commits into errors, not panics.
-    let later = e.execute_dml_concurrent(3, "INSERT INTO t (id, v) VALUES (8, 80)");
+    let later = e.execute_dml_concurrent(4, "UPDATE t SET v = 80 WHERE id = 7");
     assert!(
         matches!(later, Err(ExecuteError::Engine(EngineError::Durability(_)))),
         "later concurrent commits fail closed while wedged, got {later:?}"
     );
 
-    // Restart-replay recovers exactly the durable prefix: the CREATE, neither INSERT.
+    // Restart-replay recovers the durable CREATE + baseline INSERT, but not the failed UPDATE.
     drop(e);
     let recovered = Engine::open_durable_wal_segment(&path).unwrap();
-    assert_eq!(recovered.wal_flushed_count(), 1);
-    assert!(
-        recovered
-            .execute_relational_select(&select)
-            .unwrap()
-            .rows
-            .is_empty(),
-        "un-fsynced commits are absent after restart recovery"
+    assert_eq!(recovered.wal_flushed_count(), 2);
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(7), SqlValue::Int4(0)]],
+        "the un-fsynced UPDATE is absent after restart recovery"
     );
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(&path);

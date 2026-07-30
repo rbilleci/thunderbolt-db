@@ -15,6 +15,17 @@ impl InsertStatementOrdinal {
     /// Existing one-statement ingress has one stable statement position. Transaction-overlay
     /// preparation will supply its actual operation ordinal when it adopts this boundary.
     pub(crate) const FIRST: Self = Self(0);
+
+    /// Transactional semantic preparation carries the exact operation position rather than
+    /// reclassifying every statement as the legacy one-statement ingress.
+    #[allow(dead_code)] // Adopted by the next production-compiled effect-plan handoff.
+    pub(crate) const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn as_u32(self) -> u32 {
+        self.0
+    }
 }
 
 #[cfg(test)]
@@ -63,6 +74,10 @@ pub(crate) struct ResolvedInsertSemantics<'a> {
     pub(crate) table: &'a RelationalTable,
     pub(crate) statement_ordinal: InsertStatementOrdinal,
     pub(crate) row_count: u32,
+    /// The SQL-order RETURNING names remain attached to this exact INSERT carrier until the
+    /// later semantic phase binds them. A continuation cannot pair another statement's output
+    /// list with these resolved input cells.
+    pub(crate) returning: &'a [String],
     pub(crate) columns: Box<[ResolvedInsertColumn<'a>]>,
 }
 
@@ -140,6 +155,7 @@ impl<'a> ResolvedInsertSemantics<'a> {
             table,
             statement_ordinal,
             row_count,
+            returning: &insert.returning,
             columns: columns.into(),
         })
     }

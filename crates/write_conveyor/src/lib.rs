@@ -14,6 +14,9 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{error::Error, fmt};
 
+#[cfg(test)]
+mod test_alloc;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriteIntent {
@@ -1433,9 +1436,11 @@ pub use fua_controller::{
 #[cfg(unix)]
 pub use fua_frame_log::{
     frame_log_capacity_bytes, fua_frame_padded_bytes, invalidate_frame_log_suffix,
-    recover_frame_log_by_scan, FrameBatchHandle, FrameGroupMetadata, FrameHandle, FuaFrameLog,
-    FuaFrameLogAppender, FuaFrameLogConfig, FuaFrameLogFencePool, FuaFrameLogTelemetry,
-    RecoveredFrame, FUA_IN_FLIGHT_DEPTH_BUCKETS,
+    recover_frame_log_by_scan, FrameBatchHandle, FrameGroupMetadata, FrameHandle, FuaFrameFault,
+    FuaFrameFaultStage, FuaFrameLog, FuaFrameLogAppender, FuaFrameLogConfig, FuaFrameLogFencePool,
+    FuaFrameLogFixedFencePool, FuaFrameLogTelemetry, FuaFramePoison, FuaScatterPlan,
+    FuaScatterReservation, FuaScatterSource, RecoveredFrame, FUA_FIXED_FENCE_POOL_MAX_LANES,
+    FUA_FRAME_FAULT_NO_FRAME, FUA_IN_FLIGHT_DEPTH_BUCKETS, FUA_SCATTER_MAX_FRAGMENTS,
 };
 #[cfg(unix)]
 mod wal_segment;

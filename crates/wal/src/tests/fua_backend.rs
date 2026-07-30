@@ -231,6 +231,7 @@ fn fua_watermark_is_monotonic_under_concurrent_in_flight_jobs() {
                     std::thread::spawn(move || job.commit().expect("commit")),
                 ));
             }
+            WalGroupFlushBegin::Busy => panic!("FUA does not use the serial scatter arena"),
         }
     }
 
@@ -337,6 +338,10 @@ fn fua_segment_roll_recovers_across_segments() {
 fn fua_config_and_unsupported_ops_error() {
     let base = fua_test_base("config");
     assert!(WalBuffer::with_fua_durable_segment(&base, 8, 0).is_err());
+    assert!(
+        WalBuffer::with_fua_durable_segment(&base, 33, 1 << 20).is_err(),
+        "fixed FUA successor ownership is bounded to the fixed-pool lane limit"
+    );
 
     let mut wal = WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("create");
     wal.append(rec(1, b"x"));

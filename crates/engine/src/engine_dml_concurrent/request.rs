@@ -121,9 +121,9 @@ impl Engine {
         self.legacy_lane_history_write_guard()
             .map_err(ExecuteError::Engine)?;
         if self.is_commit_path_poisoned() {
-            return Err(ExecuteError::Engine(EngineError::Durability(
-                "commit path is wedged; restart recovery required".to_string(),
-            )));
+            return Err(super::durability_failure::execute_error_from_engine(
+                self.commit_path_unavailable_error(),
+            ));
         }
         if self.transaction_snapshot_handle(txn_id).is_some() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -141,7 +141,7 @@ impl Engine {
             _ => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "concurrent DML admission received a non-DML command".to_string(),
-                )))
+                )));
             }
         };
         // Stable transaction identity resolves before fresh table access or state-sensitive

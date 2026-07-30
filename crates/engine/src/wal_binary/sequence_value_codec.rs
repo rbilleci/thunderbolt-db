@@ -14,7 +14,10 @@ const SEQUENCE_VALUE_NEXTVAL: u8 = 1;
 const SEQUENCE_VALUE_DEFAULT: u8 = 2;
 const SEQUENCE_VALUE_SETVAL: u8 = 3;
 const SEQUENCE_GUARD_SHARED_STABLE_OID: u8 = 1;
-const ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES: usize = 86;
+/// Exact durable width of one sequence-value reference in an opcode-21 transaction wrapper.
+///
+/// The wrapper owns framing and slice ordering; this subcodec owns precisely one reference.
+pub(crate) const ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES: usize = 86;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinarySequenceValueOperation {
@@ -284,7 +287,7 @@ pub(crate) fn encode_sequence_referenced_transaction(
         || base[0] != WAL_BINARY_TAG
         || base[1] != WAL_BINARY_VERSION
         || base[2] == OP_SEQUENCE_REFERENCED_TRANSACTION
-        || !valid_sequence_value_references(references)
+        || !valid_sequence_value_reference_closure(references)
         || base.len() > u64::MAX as usize
         || references.len() > u32::MAX as usize
     {
@@ -306,18 +309,10 @@ pub(crate) fn encode_sequence_referenced_transaction(
     out.extend_from_slice(base);
     out.extend_from_slice(&(references.len() as u32).to_le_bytes());
     for reference in references {
-        out.extend_from_slice(&reference.transition_txn_id.to_le_bytes());
-        out.extend_from_slice(&reference.parent_txn_id.to_le_bytes());
-        out.extend_from_slice(&reference.statement_ordinal.to_le_bytes());
-        out.extend_from_slice(&reference.expression_ordinal.to_le_bytes());
-        out.extend_from_slice(&reference.sequence_oid.to_le_bytes());
-        out.extend_from_slice(&reference.returned_value.to_le_bytes());
-        out.extend_from_slice(&reference.input_digest);
-        out.extend_from_slice(&reference.table_oid.to_le_bytes());
-        out.extend_from_slice(&reference.column_id.to_le_bytes());
-        out.extend_from_slice(&reference.row_id.to_le_bytes());
-        out.push(u8::from(reference.final_value_overwritten));
-        out.push(u8::from(reference.default_expression));
+        let mut encoded = [0; ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
+        encode_sequence_value_reference_into_exact(reference, &mut encoded)
+            .expect("validated sequence-reference closure encodes every member");
+        out.extend_from_slice(&encoded);
     }
     Some(out)
 }
@@ -343,24 +338,12 @@ pub(crate) fn decode_sequence_referenced_transaction(
         .try_reserve_exact(reference_count)
         .map_err(|_| decoder.fail("reference allocation exceeds capacity"))?;
     for _ in 0..reference_count {
-        references.push(BinarySequenceValueReference {
-            transition_txn_id: decoder.u64()?,
-            parent_txn_id: decoder.u64()?,
-            statement_ordinal: decoder.u32()?,
-            expression_ordinal: decoder.u32()?,
-            sequence_oid: decoder.u32()?,
-            returned_value: decoder.i64()?,
-            input_digest: decoder.digest()?,
-            table_oid: decoder.u32()?,
-            column_id: decoder.u32()?,
-            staging_row_ordinal: 0,
-            row_id: decoder.u64()?,
-            final_value_overwritten: decoder.boolean()?,
-            default_expression: decoder.boolean()?,
-        });
+        references.push(decode_sequence_value_reference_exact(
+            decoder.take(ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES)?,
+        )?);
     }
     decoder.finish()?;
-    if !valid_sequence_value_references(&references) {
+    if !valid_sequence_value_reference_closure(&references) {
         return Err(decoder.fail("noncanonical sequence transition references"));
     }
     let BinaryWalRecord::Transaction(mut transaction) = decode_binary_record(&base)? else {
@@ -426,7 +409,95 @@ pub(crate) fn validate_sequence_envelope_transaction_id(
     Ok(())
 }
 
-fn valid_sequence_value_references(references: &[BinarySequenceValueReference]) -> bool {
+/// Encode one sequence-value reference into its exact opcode-21 subcodec layout.
+///
+/// This is allocation-free and deliberately does not own ordering or duplicate checks across a
+/// transaction; use [`valid_sequence_value_reference_closure`] for that enclosing invariant.
+pub(crate) fn encode_sequence_value_reference_into_exact(
+    reference: &BinarySequenceValueReference,
+    out: &mut [u8; ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES],
+) -> Result<(), EngineError> {
+    if !valid_sequence_value_reference(reference) {
+        return Err(EngineError::Durability(
+            "noncanonical standalone sequence-value reference".to_string(),
+        ));
+    }
+    out[0..8].copy_from_slice(&reference.transition_txn_id.to_le_bytes());
+    out[8..16].copy_from_slice(&reference.parent_txn_id.to_le_bytes());
+    out[16..20].copy_from_slice(&reference.statement_ordinal.to_le_bytes());
+    out[20..24].copy_from_slice(&reference.expression_ordinal.to_le_bytes());
+    out[24..28].copy_from_slice(&reference.sequence_oid.to_le_bytes());
+    out[28..36].copy_from_slice(&reference.returned_value.to_le_bytes());
+    out[36..68].copy_from_slice(&reference.input_digest);
+    out[68..72].copy_from_slice(&reference.table_oid.to_le_bytes());
+    out[72..76].copy_from_slice(&reference.column_id.to_le_bytes());
+    out[76..84].copy_from_slice(&reference.row_id.to_le_bytes());
+    out[84] = u8::from(reference.final_value_overwritten);
+    out[85] = u8::from(reference.default_expression);
+    Ok(())
+}
+
+/// Decode one sequence-value reference only when `bytes` is the exact standalone width.
+///
+/// The decoder rejects truncation, surplus, invalid booleans, and every noncanonical scalar
+/// binding before a caller can place the value into a transaction closure.
+pub(crate) fn decode_sequence_value_reference_exact(
+    bytes: &[u8],
+) -> Result<BinarySequenceValueReference, EngineError> {
+    if bytes.len() != ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES {
+        return Err(EngineError::Durability(format!(
+            "malformed binary sequence record: sequence-value reference length {} does not match exact width {ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES}",
+            bytes.len()
+        )));
+    }
+    let mut decoder = SequenceDecoder::new(bytes);
+    let reference = BinarySequenceValueReference {
+        transition_txn_id: decoder.u64()?,
+        parent_txn_id: decoder.u64()?,
+        statement_ordinal: decoder.u32()?,
+        expression_ordinal: decoder.u32()?,
+        sequence_oid: decoder.u32()?,
+        returned_value: decoder.i64()?,
+        input_digest: decoder.digest()?,
+        table_oid: decoder.u32()?,
+        column_id: decoder.u32()?,
+        staging_row_ordinal: 0,
+        row_id: decoder.u64()?,
+        final_value_overwritten: decoder.boolean()?,
+        default_expression: decoder.boolean()?,
+    };
+    decoder.finish()?;
+    if !valid_sequence_value_reference(&reference) {
+        return Err(decoder.fail("noncanonical sequence transition reference"));
+    }
+    Ok(reference)
+}
+
+fn valid_sequence_value_reference(reference: &BinarySequenceValueReference) -> bool {
+    reference.transition_txn_id != 0
+        && reference.parent_txn_id != 0
+        && reference.sequence_oid != 0
+        && reference.input_digest != [0; 32]
+        && reference.staging_row_ordinal == 0
+        && if reference.default_expression {
+            reference.table_oid != 0 && reference.column_id != 0 && reference.row_id != 0
+        } else {
+            reference.table_oid == 0
+                && reference.column_id == 0
+                && reference.row_id == 0
+                && !reference.final_value_overwritten
+        }
+}
+
+/// Validate the reference slice as one transaction-owned sequence closure.
+///
+/// Transition and statement order are monotonic; an expression identity is unique per parent
+/// transaction/statement; and one materialized default may bind each table/row/column at most
+/// once.  Different expression ordinals on the same row remain distinct when they bind distinct
+/// columns, so a multi-default INSERT row is representable without admitting duplicate bindings.
+pub(crate) fn valid_sequence_value_reference_closure(
+    references: &[BinarySequenceValueReference],
+) -> bool {
     if references.is_empty() {
         return false;
     }
@@ -435,30 +506,18 @@ fn valid_sequence_value_references(references: &[BinarySequenceValueReference]) 
     let mut expressions = BTreeSet::new();
     let mut default_bindings = BTreeSet::new();
     for reference in references {
-        if reference.transition_txn_id == 0
-            || reference.parent_txn_id == 0
-            || reference.sequence_oid == 0
-            || reference.input_digest == [0; 32]
-            || reference.staging_row_ordinal != 0
+        if !valid_sequence_value_reference(reference)
             || !expressions.insert((
                 reference.parent_txn_id,
                 reference.statement_ordinal,
                 reference.expression_ordinal,
             ))
             || (reference.default_expression
-                && (reference.table_oid == 0
-                    || reference.column_id == 0
-                    || reference.row_id == 0
-                    || !default_bindings.insert((
-                        reference.table_oid,
-                        reference.row_id,
-                        reference.column_id,
-                    ))))
-            || (!reference.default_expression
-                && (reference.table_oid != 0
-                    || reference.column_id != 0
-                    || reference.row_id != 0
-                    || reference.final_value_overwritten))
+                && !default_bindings.insert((
+                    reference.table_oid,
+                    reference.row_id,
+                    reference.column_id,
+                )))
             || prior_transition_id.is_some_and(|prior| prior >= reference.transition_txn_id)
             || prior_statement_ordinal.is_some_and(|prior| prior > reference.statement_ordinal)
         {

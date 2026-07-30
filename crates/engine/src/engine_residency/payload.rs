@@ -844,7 +844,7 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                         _ => {
                             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                                 "open-shard int4 append encountered a non-i32 value".to_string(),
-                            )))
+                            )));
                         }
                     };
                     bytes.extend_from_slice(&value.to_le_bytes());
@@ -864,7 +864,7 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                         _ => {
                             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                                 "open-shard i64 append encountered a non-i64 value".to_string(),
-                            )))
+                            )));
                         }
                     };
                     bytes.extend_from_slice(&value.to_le_bytes());
@@ -891,7 +891,7 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                                 "open-shard b128 append encountered a non-numeric/uuid value"
                                     .to_string(),
-                            )))
+                            )));
                         }
                     }
                 }

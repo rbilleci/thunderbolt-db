@@ -496,7 +496,7 @@ impl Engine {
                 return false;
             };
             // Append at the shard-local `row_count`, not its global `row_start`.
-            let mut chunks = match source.append_chunks(&column_types, capacity, row_count) {
+            let chunks = match source.append_chunks(&column_types, capacity, row_count) {
                 Ok(chunks) => chunks,
                 Err(_) => return false,
             };
@@ -542,19 +542,17 @@ impl Engine {
                         .then(std::time::Instant::now);
                 // Per-COLUMN offsets only: the encoder's FINAL chunk is the device
                 // row-count header (offset 0), which the fused submit publishes after fencing the kernel.
-                let chunk_offsets: Vec<u64> = chunks
-                    .iter()
-                    .take(column_count)
-                    .map(|chunk| chunk.byte_offset)
-                    .collect();
+                let Some(chunk_offsets) = chunks.first_offsets(column_count) else {
+                    return false;
+                };
                 let outcome = column_values.as_ref().and_then(|column_values| {
-                    let column_value_slices = column_values.slices();
                     self.try_fused_apply_in_place(
                         table,
+                        &catalog_table,
                         shard_id,
                         &shard_device_memory,
-                        &chunk_offsets,
-                        &column_value_slices,
+                        chunk_offsets.as_slice(),
+                        column_values,
                         row_count,
                         capacity,
                         gpu_id,
@@ -585,8 +583,8 @@ impl Engine {
                 // Keep the count header private until values, BoolBits, and identity sidecars
                 // are complete.  The sealed encoder always emits it last, but bool uses a
                 // separate bitmap operator and therefore must run before this final publish.
-                let header = match chunks.pop() {
-                    Some(header) if header.byte_offset == 0 => header,
+                let (header, chunks) = match chunks.split_final_header() {
+                    Some((header, payload)) if header.byte_offset == 0 => (header, payload),
                     _ => return false,
                 };
                 // `deleted_by` needs no write on append — the headroom was pre-filled with the live sentinel at
@@ -595,7 +593,7 @@ impl Engine {
                 let append_started =
                     crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                         .then(std::time::Instant::now);
-                let append_result = shard_device_memory.append_owned_chunks(chunks);
+                let append_result = chunks.append_to(&shard_device_memory);
                 if let Some(started) = append_started {
                     crate::engine_dml_concurrent::WAVE_DEVICE_STATS[1].fetch_add(
                         started.elapsed().as_nanos() as u64,
@@ -640,10 +638,14 @@ impl Engine {
                         let Some(uploads) = plan.take_bool_uploads(&shard_bool_layouts) else {
                             return false;
                         };
-                        for (layout, (offset, values)) in shard_bool_layouts.iter().zip(uploads) {
-                            if offset != layout.bitmap_byte_offset
+                        for (layout, upload) in shard_bool_layouts.iter().zip(uploads) {
+                            if upload.name.as_ref() != layout.name
                                 || shard_device_memory
-                                    .set_bool_bitmap_range(offset, row_count as u32, &values)
+                                    .set_bool_bitmap_range(
+                                        layout.bitmap_byte_offset,
+                                        row_count as u32,
+                                        &upload.values,
+                                    )
                                     .is_err()
                             {
                                 return false;
@@ -785,7 +787,7 @@ impl Engine {
                             for (stat, (lo, hi)) in open
                                 .resident_device_int4_column_stats
                                 .iter_mut()
-                                .zip(new_min_max.iter())
+                                .zip(new_min_max.as_slice().iter())
                             {
                                 stat.min = stat.min.min(*lo);
                                 stat.max = stat.max.max(*hi);
@@ -986,8 +988,8 @@ impl Engine {
                 pending.device_memory,
                 Some(pending.created_by_region),
                 pending.row_id_region,
-                pending.int4_stats,
-                pending.bool_layouts,
+                Vec::from(pending.int4_stats),
+                Vec::from(pending.bool_layouts),
                 Vec::new(),
                 Vec::new(),
                 pending.allocation_bytes,
@@ -1662,10 +1664,11 @@ impl Engine {
     pub(super) fn try_fused_apply_in_place(
         &self,
         table: &str,
+        table_relation: &RelationalTable,
         shard_id: u32,
         shard_device_memory: &Arc<CudaResidentDeviceMemory>,
         chunk_offsets: &[u64],
-        column_values: &[&[i32]],
+        column_values: &super::append_source::ResidentAppendI32Columns<'_>,
         row_count: usize,
         capacity: usize,
         gpu_id: u16,
@@ -1677,7 +1680,7 @@ impl Engine {
         let k = stamps.len();
         if k == 0
             || chunk_offsets.len() != column_values.len()
-            || column_values.iter().any(|col| col.len() != k)
+            || !column_values.all_i32_len(k)
             || row_count.saturating_add(k) > capacity
         {
             return None;
@@ -1807,11 +1810,7 @@ impl Engine {
             }
         }
         // Flatten col-major values + owned per-column destinations.
-        let values: Vec<i32> = column_values
-            .iter()
-            .flat_map(|column| column.iter())
-            .copied()
-            .collect();
+        let values = column_values.flatten_i32()?;
         let columns: Vec<gpu_db_execution::CudaWriteDestination> = chunk_offsets
             .iter()
             .map(|&byte_offset| gpu_db_execution::CudaWriteDestination {
@@ -1836,9 +1835,21 @@ impl Engine {
                 byte_offset: 0,
             },
         };
-        let _index_mutation = index_col
-            .is_some()
-            .then(|| self.read_state.residency.begin_point_index_mutation(table));
+        let _index_mutation = if index_col.is_some() {
+            let Some(guard) = self
+                .read_state
+                .residency
+                .begin_point_index_mutation_for_table(&self.read_state, table_relation)
+            else {
+                self.read_state
+                    .residency
+                    .purge_shard_pk_index_for_table(table);
+                return Some(false);
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let apply_result = shard_device_memory.submit_i32_fused_apply_status(&request);
         #[cfg(test)]
         if matches!(&apply_result, Ok(status) if !status.declined) {

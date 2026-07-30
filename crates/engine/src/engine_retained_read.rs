@@ -24,7 +24,7 @@ pub use index_publication::{
 
 /// Prepared routes are latency hints, not another residency tier. One shape per table and this
 /// per-family ceiling bound every generation-owned plan retained by the engine.
-const MAX_CACHED_SHARDED_POINT_ROUTES: usize = 64;
+pub(crate) const MAX_CACHED_SHARDED_POINT_ROUTES: usize = 64;
 
 #[cfg(test)]
 type RetainedCompletionPostHook = (
@@ -87,9 +87,11 @@ impl Engine {
             )));
         }
         self.ensure_commit_path_available()
-            .map_err(ExecuteError::Engine)?;
+            .map_err(ExecuteError::from_post_wal_engine)?;
         if origin_wedge.load(AtomicOrdering::Acquire) {
-            return Err(ExecuteError::Engine(self.commit_path_unavailable_error()));
+            return Err(ExecuteError::from_post_wal_engine(
+                self.commit_path_unavailable_error(),
+            ));
         }
         Ok(())
     }

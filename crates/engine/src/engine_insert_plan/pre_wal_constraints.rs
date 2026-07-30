@@ -9,6 +9,9 @@ use crate::relational_model::RelationalTable;
 use crate::typed_insert_batch::TypedInsertBatch;
 use gpu_db_execution::CudaAllocationScope;
 
+// Preserve the existing INSERT-plan facade for the test-only resident proof seam.
+pub(super) use super::constraint_arbitration::ConstraintCandidate;
+
 /// Move-only composite catalog witness carried by the prepared INSERT plan.
 pub(super) struct PreWalConstraintProof {
     checks: row_local_constraints::RowLocalConstraintProof,
@@ -23,45 +26,22 @@ pub(super) struct PreWalConstraintPreparation {
     pub(super) candidate: Option<ConstraintCandidate>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ConstraintPhase {
-    PrimaryKeyNull = 0,
-    Check = 1,
-    Duplicate = 2,
-}
-
-#[cfg_attr(test, derive(Clone))]
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum ConstraintOrdinal {
-    Attnum(i16),
-    Check(String, usize),
-    Index(usize),
-}
-
-#[cfg_attr(test, derive(Clone))]
-enum ConstraintDiagnostic {
-    NotNull { table: String, column: String },
-    Check { table: String, name: String },
-    Unique { name: String },
-}
-
-/// A bounded terminal from a device operation.  Candidate order is exactly `(row, phase,
-/// ordinal)`: CHECK ordinal is relcache lexical `(name, raw catalog ordinal)`, PRIMARY KEY NULL
-/// uses attnum, and duplicate uses the raw index vector ordinal.
-#[cfg_attr(test, derive(Clone))]
-pub(super) struct ConstraintCandidate {
-    row: u32,
-    phase: ConstraintPhase,
-    ordinal: ConstraintOrdinal,
-    diagnostic: ConstraintDiagnostic,
-}
-
 impl PreWalConstraintProof {
     pub(super) fn matches_current_catalog(&self, catalog: &CatalogSnapshot) -> bool {
         self.checks.matches_current_catalog(catalog) && self.keys.matches_current_catalog(catalog)
     }
 
-    #[cfg(test)]
+    /// Current-generation proof seams may observe an unrelated committed DML generation after
+    /// their local CUDA pass. Keep the target/check/index witness exact while allowing only a
+    /// monotonic catalog sequence advance; live callers retain the sequence-exact
+    /// [`Self::matches_current_catalog`] gate.
+    #[allow(dead_code)] // FK-only current-generation test seam, not live eligibility
+    pub(super) fn matches_current_target_binding(&self, catalog: &CatalogSnapshot) -> bool {
+        self.checks.matches_current_target_binding(catalog)
+            && self.keys.matches_current_target_binding(catalog)
+    }
+
+    #[allow(dead_code)] // current-generation reservation input, not a live handoff
     pub(super) fn batch_key_proof(&self) -> &batch_key_constraints::BatchKeyConstraintProof {
         &self.keys
     }
@@ -70,7 +50,7 @@ impl PreWalConstraintProof {
     /// revalidated against the held current catalog.  The cfg(test) resident seam receives the
     /// one sealed raw-index proof; it must not clone or reconstruct a second authority from the
     /// catalog.
-    #[cfg(test)]
+    #[allow(dead_code)] // current-generation reservation input, not a live handoff
     pub(super) fn into_batch_key_proof_after_current_catalog(
         self,
         catalog: &CatalogSnapshot,
@@ -111,8 +91,28 @@ pub(super) fn prepare_before_queue(
     batch: &TypedInsertBatch,
     catalog: &CatalogSnapshot,
 ) -> Result<PreWalConstraintPreparation, EngineError> {
+    prepare_before_queue_inner(engine, batch, catalog, true)
+}
+
+/// Test-only local CHECK/PK/duplicate preparation for the inert FK proof. The live wrapper
+/// above remains the sole production entry and continues to reject FK-bearing tables.
+#[cfg(test)]
+pub(super) fn prepare_before_queue_foreign_key_proof(
+    engine: &Engine,
+    batch: &TypedInsertBatch,
+    catalog: &CatalogSnapshot,
+) -> Result<PreWalConstraintPreparation, EngineError> {
+    prepare_before_queue_inner(engine, batch, catalog, false)
+}
+
+fn prepare_before_queue_inner(
+    engine: &Engine,
+    batch: &TypedInsertBatch,
+    catalog: &CatalogSnapshot,
+    reject_foreign_keys: bool,
+) -> Result<PreWalConstraintPreparation, EngineError> {
     let table = bound_table(batch, catalog)?;
-    if !table.foreign_keys.is_empty() {
+    if reject_foreign_keys && !table.foreign_keys.is_empty() {
         return Err(EngineError::ApplyFailed(format!(
             "device pre-WAL proof is unavailable for relation \"{}\" with foreign keys",
             table.name
@@ -154,38 +154,29 @@ pub(super) fn prepare_before_queue(
 
         for candidate in row_local_constraints::evaluate(engine, batch, table, &source, &checks)? {
             let constraint = &table.check_constraints[candidate.check_ordinal];
-            candidates.push(ConstraintCandidate {
-                row: candidate.row,
-                phase: ConstraintPhase::Check,
-                ordinal: ConstraintOrdinal::Check(constraint.name.clone(), candidate.check_ordinal),
-                diagnostic: ConstraintDiagnostic::Check {
-                    table: table.name.clone(),
-                    name: constraint.name.clone(),
-                },
-            });
+            candidates.push(ConstraintCandidate::check(
+                candidate.row,
+                table.name.clone(),
+                constraint.name.clone(),
+                candidate.check_ordinal,
+            ));
         }
         for candidate in batch_key_constraints::evaluate(batch, &source, &keys)? {
             match candidate {
                 batch_key_constraints::BatchKeyCandidate::PrimaryKeyNull { row, column } => {
-                    candidates.push(ConstraintCandidate {
+                    candidates.push(ConstraintCandidate::primary_key_null(
                         row,
-                        phase: ConstraintPhase::PrimaryKeyNull,
-                        ordinal: ConstraintOrdinal::Attnum(column.attnum),
-                        diagnostic: ConstraintDiagnostic::NotNull {
-                            table: table.name.clone(),
-                            column: column.name,
-                        },
-                    })
+                        table.name.clone(),
+                        column.name,
+                        column.attnum,
+                    ))
                 }
                 batch_key_constraints::BatchKeyCandidate::Duplicate { row, index_ordinal } => {
-                    candidates.push(ConstraintCandidate {
+                    candidates.push(ConstraintCandidate::unique(
                         row,
-                        phase: ConstraintPhase::Duplicate,
-                        ordinal: ConstraintOrdinal::Index(index_ordinal),
-                        diagnostic: ConstraintDiagnostic::Unique {
-                            name: keys.index(index_ordinal).name.clone(),
-                        },
-                    });
+                        index_ordinal,
+                        keys.index(index_ordinal).name.clone(),
+                    ));
                 }
             }
         }
@@ -200,57 +191,8 @@ pub(super) fn prepare_before_queue(
             checks: row_local_constraints::seal_after_success(batch, table, &checks)?,
             keys: batch_key_constraints::seal_after_success(batch, &keys),
         },
-        candidate: candidates.into_iter().min_by(|left, right| {
-            (left.row, left.phase, &left.ordinal).cmp(&(right.row, right.phase, &right.ordinal))
-        }),
+        candidate: ConstraintCandidate::merge(candidates),
     })
-}
-
-impl ConstraintCandidate {
-    #[cfg(test)]
-    pub(super) fn unique(row: u32, index_ordinal: usize, name: String) -> Self {
-        Self {
-            row,
-            phase: ConstraintPhase::Duplicate,
-            ordinal: ConstraintOrdinal::Index(index_ordinal),
-            diagnostic: ConstraintDiagnostic::Unique { name },
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn choose(left: Option<Self>, right: Option<Self>) -> Option<Self> {
-        match (left, right) {
-            (Some(left), Some(right)) => Some(
-                [left, right]
-                    .into_iter()
-                    .min_by(|left, right| {
-                        (left.row, left.phase, &left.ordinal).cmp(&(
-                            right.row,
-                            right.phase,
-                            &right.ordinal,
-                        ))
-                    })
-                    .expect("two candidates have a minimum"),
-            ),
-            (left, right) => left.or(right),
-        }
-    }
-
-    pub(super) fn into_error(self) -> EngineError {
-        match self.diagnostic {
-            ConstraintDiagnostic::NotNull { table, column } => {
-                EngineError::NotNullViolation(format!(
-                    "null value in column \"{column}\" of relation \"{table}\" violates not-null constraint"
-                ))
-            }
-            ConstraintDiagnostic::Check { table, name } => EngineError::CheckViolation(format!(
-                "new row for relation \"{table}\" violates check constraint \"{name}\""
-            )),
-            ConstraintDiagnostic::Unique { name } => EngineError::UniqueViolation(format!(
-                "duplicate key value violates unique constraint \"{name}\""
-            )),
-        }
-    }
 }
 
 pub(super) fn bound_table<'a>(
@@ -279,7 +221,7 @@ pub(super) fn bound_table<'a>(
 /// payload at a newer commit sequence, so this permits only monotonic sequence advance while
 /// preserving the target OID and schema digest exactly. Production pre-WAL binding remains
 /// sequence-exact through [`bound_table`].
-#[cfg(test)]
+#[allow(dead_code)] // current-generation reservation witness, not live pre-WAL binding
 pub(super) fn bound_table_current_generation<'a>(
     batch: &TypedInsertBatch,
     catalog: &'a CatalogSnapshot,
@@ -394,8 +336,11 @@ mod tests {
     fn proof_only_indexed_seam_does_not_widen_the_live_typed_route() {
         let engine = crate::Engine::new_local_test_engine();
         engine
+            .execute_text(1, "CREATE TABLE proof_only_parent (id int4 PRIMARY KEY)")
+            .unwrap();
+        engine
             .execute_text(
-                1,
+                2,
                 "CREATE TABLE proof_only_gate (id int4 PRIMARY KEY, code int4 UNIQUE)",
             )
             .unwrap();
@@ -420,18 +365,13 @@ mod tests {
             .is_some()
         );
 
-        let mut foreign_key_catalog = (*catalog).clone();
-        foreign_key_catalog
-            .relational_catalog
-            .get_mut("proof_only_gate")
-            .unwrap()
-            .foreign_keys
-            .push(crate::relational_model::RelationalForeignKey {
-                name: "proof_only_gate_fk".to_string(),
-                column: "code".to_string(),
-                referenced_table: "parent".to_string(),
-                referenced_column: "id".to_string(),
-            });
+        engine
+            .execute_text(
+                3,
+                "ALTER TABLE ONLY proof_only_gate ADD CONSTRAINT proof_only_gate_fk FOREIGN KEY (code) REFERENCES proof_only_parent(id)",
+            )
+            .unwrap();
+        let foreign_key_catalog = engine.catalog_snapshot();
         assert!(
             crate::typed_insert_batch::try_prepare_typed_insert_batch_proof_only(
                 &command,

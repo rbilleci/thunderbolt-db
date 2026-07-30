@@ -6,6 +6,9 @@
 
 use super::*;
 
+mod point_slots;
+pub(crate) use point_slots::TablePointSlot;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BacklogBlocker {
     Wal,
@@ -376,6 +379,37 @@ impl ReadState {
         self.catalog_history.load().latest()
     }
 
+    /// Publish one immutable catalog generation. Ordinary DML republishes an identical table
+    /// catalog and stays on the original lock-free catalog-history store path. A table-catalog
+    /// change instead shares the point-route linearization domain: DDL can retire or move a slot
+    /// before this catalog is visible, while an old reader can still try to ensure that stale
+    /// name/OID. Reconciling the directory and storing the new catalog while holding one lock
+    /// makes that stale installation either precede this retirement or observe the new catalog
+    /// and decline; it cannot survive into the replacement catalog generation.
+    pub(crate) fn publish_catalog_generation_with_point_slot_fence(
+        &self,
+        generation: Arc<CatalogSnapshot>,
+        prune_below: Index,
+    ) {
+        let history = self.catalog_history.load();
+        let prior = history.latest();
+        if prior.relational_catalog == generation.relational_catalog {
+            self.catalog_history
+                .store(Arc::new(history.pushed(generation, prune_below)));
+            return;
+        }
+
+        let _point_route_publish = self
+            .residency
+            .sharded_point_route_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.residency
+            .reconcile_table_point_slots_under_publish_lock(&prior, &generation);
+        self.catalog_history
+            .store(Arc::new(history.pushed(generation, prune_below)));
+    }
+
     pub(crate) fn publish_table_rewrite_fences(
         &self,
         table_oids: impl IntoIterator<Item = u32>,
@@ -597,9 +631,128 @@ pub(crate) struct PointIndexMutationGuard {
     epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
+pub(crate) const POINT_INDEX_MUTATION_POISON: u64 = u64::MAX;
+
+/// Exact, preselected point-index epoch transition. `start` is intentionally one CAS: no
+/// residency map lookup, spin loop, allocation, or scheduler yield can intervene.
+#[must_use]
+#[allow(dead_code)] // WRITE-001 consumes this only after the live carrier is opened.
+pub(crate) struct PreparedPointIndexMutationGuard {
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    expected_even: u64,
+    post_wal_armed: bool,
+    armed: bool,
+}
+
+#[allow(dead_code)]
+impl PreparedPointIndexMutationGuard {
+    pub(crate) fn new(epoch: Arc<std::sync::atomic::AtomicU64>, expected_even: u64) -> Self {
+        Self {
+            epoch,
+            expected_even,
+            post_wal_armed: false,
+            armed: false,
+        }
+    }
+
+    /// Cross the durable cut before attempting the exact seqlock transition. From this point an
+    /// inability to own the expected epoch is terminal: retaining an apparently healthy even
+    /// epoch would let a later route bind an index generation whose durable mutation did not
+    /// complete.
+    pub(crate) fn arm_post_wal(&mut self) {
+        self.post_wal_armed = true;
+    }
+
+    fn poison_terminal_failure(&self) {
+        if self.post_wal_armed {
+            self.epoch.store(
+                POINT_INDEX_MUTATION_POISON,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
+    pub(crate) fn start(&mut self) -> Result<(), ()> {
+        let Some(writing) = self.expected_even.checked_add(1) else {
+            self.poison_terminal_failure();
+            return Err(());
+        };
+        // Reject the terminal-adjacent value too: its apparent +2 successor is the reserved
+        // poison sentinel, never a successful even publication.
+        if self.expected_even.checked_add(2).is_none() {
+            self.poison_terminal_failure();
+            return Err(());
+        }
+        if self.expected_even & 1 != 0 || self.expected_even == POINT_INDEX_MUTATION_POISON {
+            self.poison_terminal_failure();
+            return Err(());
+        }
+        if self
+            .epoch
+            .compare_exchange(
+                self.expected_even,
+                writing,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.poison_terminal_failure();
+            return Err(());
+        }
+        self.armed = true;
+        Ok(())
+    }
+    pub(crate) fn complete(mut self) -> Result<(), ()> {
+        if !self.armed {
+            return Err(());
+        }
+        self.epoch.store(
+            self.expected_even.checked_add(2).ok_or(())?,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.armed = false;
+        self.post_wal_armed = false;
+        Ok(())
+    }
+
+    /// Finish only after a successful [`Self::start`].  The caller's owned guard is the proof
+    /// that both preconditions below already held; keeping this infallible prevents a terminal
+    /// publisher from surfacing a recoverable error after it has stored successor authorities.
+    pub(crate) fn complete_started(mut self) {
+        assert!(
+            self.armed,
+            "prepared point-index mutation completed without a successful start"
+        );
+        let published_even = self
+            .expected_even
+            .checked_add(2)
+            .expect("prepared point-index mutation start proved its final epoch fits");
+        self.epoch
+            .store(published_even, std::sync::atomic::Ordering::Release);
+        self.armed = false;
+        self.post_wal_armed = false;
+    }
+}
+impl Drop for PreparedPointIndexMutationGuard {
+    fn drop(&mut self) {
+        if self.armed || self.post_wal_armed {
+            self.epoch.store(
+                POINT_INDEX_MUTATION_POISON,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct TransactionNamedIndexLifecycle {
     publication_active: bool,
+    /// Monotone release-build ownership token.  The guard returned by admission carries this
+    /// exact value, so a stale/drop-reused guard cannot enter or finish a later publication.
+    generation: u64,
+    /// The sole pre-final ownership set.  Entering terminal publication moves this exact tree
+    /// root into `final_publication_tables`; no duplicate table-name tree is prebuilt or cloned.
     protected_tables: BTreeSet<String>,
     deferred_purges: BTreeSet<String>,
     final_publication_tables: BTreeSet<String>,
@@ -644,18 +797,26 @@ impl Drop for TransactionNamedIndexPublicationOwnerGuard {
 /// the final guard releases and performs those purges only after device publication finishes.
 pub(crate) struct TransactionNamedIndexPublicationGuard<'a> {
     residency: &'a ResidencyReadState,
+    lifecycle_generation: u64,
     final_publication_entered: bool,
     finished: bool,
 }
 
-impl TransactionNamedIndexPublicationGuard<'_> {
+impl<'a> TransactionNamedIndexPublicationGuard<'a> {
+    #[allow(dead_code)]
+    pub(crate) fn into_terminal(self) -> TerminalNamedIndexPublicationGuard<'a> {
+        TerminalNamedIndexPublicationGuard {
+            inner: Some(self),
+            post_wal_armed: false,
+        }
+    }
     /// Enter canonical apply's final-publication phase. A purge deferred before this point is
     /// superseded by the pending publication. Every external purge from this point through guard
     /// completion is conservatively replayed afterward, even when it overlaps an intermediate
     /// rebuild; canonical owner's own retirements use the explicit during-transaction bypass.
     pub(crate) fn enter_final_publication(&mut self) {
         self.residency
-            .enter_transaction_named_index_final_publication();
+            .enter_transaction_named_index_final_publication(self.lifecycle_generation);
         self.final_publication_entered = true;
     }
 
@@ -663,13 +824,63 @@ impl TransactionNamedIndexPublicationGuard<'_> {
     /// phase are superseded; final-phase purges retire the published generation. Dropping without
     /// completion applies every request to clean up an aborted preflight or failed apply.
     pub(crate) fn complete(mut self) {
-        debug_assert!(
+        assert!(
             self.final_publication_entered,
             "successful transaction index publication must enter its final phase"
         );
         self.residency
-            .finish_transaction_named_index_publication(true);
+            .finish_transaction_named_index_publication(self.lifecycle_generation, true);
         self.finished = true;
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct TerminalNamedIndexPublicationGuard<'a> {
+    inner: Option<TransactionNamedIndexPublicationGuard<'a>>,
+    post_wal_armed: bool,
+}
+#[allow(dead_code)]
+impl TerminalNamedIndexPublicationGuard<'_> {
+    pub(crate) fn arm_post_wal(&mut self) {
+        self.post_wal_armed = true;
+    }
+    pub(crate) fn enter_final_publication(&mut self) {
+        self.inner
+            .as_mut()
+            .expect("terminal lifecycle guard consumed")
+            .enter_final_publication();
+    }
+    pub(crate) fn complete_success(mut self) {
+        assert!(self.post_wal_armed, "terminal success requires WAL arm");
+        self.inner
+            .take()
+            .expect("terminal lifecycle guard consumed")
+            .complete();
+    }
+    pub(crate) fn complete_poisoned(mut self) {
+        let mut guard = self
+            .inner
+            .take()
+            .expect("terminal lifecycle guard consumed");
+        guard
+            .residency
+            .finish_transaction_named_index_publication_poisoned(guard.lifecycle_generation);
+        guard.finished = true;
+    }
+}
+
+impl Drop for TerminalNamedIndexPublicationGuard<'_> {
+    fn drop(&mut self) {
+        let Some(mut guard) = self.inner.take() else {
+            return;
+        };
+        if self.post_wal_armed {
+            guard
+                .residency
+                .finish_transaction_named_index_publication_poisoned(guard.lifecycle_generation);
+            guard.finished = true;
+        }
+        // An unarmed guard drops its inner owner normally, retaining pre-WAL abort cleanup.
     }
 }
 
@@ -677,7 +888,7 @@ impl Drop for TransactionNamedIndexPublicationGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.residency
-                .finish_transaction_named_index_publication(false);
+                .finish_transaction_named_index_publication(self.lifecycle_generation, false);
         }
     }
 }
@@ -763,22 +974,17 @@ pub(crate) struct ResidencyReadState {
     #[cfg(test)]
     pub(crate) named_index_publication_post_publish_hook:
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
-    /// Generation-owned, GPU-resident multi-shard point route keyed by table/filter/projection shape.
-    /// Exact Arc publication identity makes a route reusable without re-enumerating every shard per batch;
-    /// a new publication misses and replaces it while in-flight readers keep the old plan pinned.
-    pub(crate) sharded_point_routes: ArcSwap<ShardedPointRouteMap>,
-    /// Per-table seqlock for in-place device-index mutation versus retained singleton plans. The
-    /// map is touched only on route preparation or mutation; cache-hit reads retain the entry Arc.
-    pub(crate) point_index_mutation_epochs:
-        Mutex<BTreeMap<String, Arc<std::sync::atomic::AtomicU64>>>,
-    /// READ-002's compound generation routes are isolated from the established int4 latency cache so
-    /// adding a route family cannot change the production cache-hit plan type or branch shape.
-    pub(crate) compound_point_routes: ArcSwap<CompoundPointRouteMap>,
+    /// Sole point-route/epoch authority. The outer directory is copied only for table-identity
+    /// lifecycle changes; every stable table slot owns its independently replaceable route plans
+    /// and mutation epoch. A DROP/recreate receives a fresh OID/slot/epoch, while rename moves the
+    /// same slot Arc to its new name.
+    pub(crate) table_point_slots: ArcSwap<BTreeMap<String, Arc<TablePointSlot>>>,
     /// Dedicated compound-route bytes remain charged until the last plan owner drains, including
     /// readers and old ArcSwap map guards that outlive cache retirement. Current-map accounting alone
     /// would otherwise admit a replacement while the retired table-scale directory is still live.
     pub(crate) live_compound_point_route_bytes: Arc<Mutex<BTreeMap<(u16, String), u64>>>,
-    /// Serializes rare route-cache COW publications and retirement purges; cache-hit reads stay lock-free.
+    /// Serializes rare point-slot publication and retirement. Cache-hit reads only load the outer
+    /// directory and their table's ArcSwapOption, so they remain lock-free.
     pub(crate) sharded_point_route_publish_lock: Mutex<()>,
     /// Linearizes destructive named/shard-index cache retirement with the pre-WAL-to-apply interval
     /// of a composite transaction. It is a short state latch, not a lock held across WAL: active
@@ -1060,10 +1266,15 @@ impl ResidencyReadState {
             .transaction_named_index_lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(
+        assert!(
             !lifecycle.publication_active,
             "the serialized commit authority permits one named-index publication"
         );
+        lifecycle.generation = lifecycle
+            .generation
+            .checked_add(1)
+            .expect("named-index publication lifecycle generation exhausted");
+        let lifecycle_generation = lifecycle.generation;
         lifecycle.publication_active = true;
         lifecycle.protected_tables = protected_tables;
         lifecycle.deferred_purges.clear();
@@ -1072,18 +1283,22 @@ impl ResidencyReadState {
         drop(lifecycle);
         TransactionNamedIndexPublicationGuard {
             residency: self,
+            lifecycle_generation,
             final_publication_entered: false,
             finished: false,
         }
     }
 
-    fn enter_transaction_named_index_final_publication(&self) {
+    fn enter_transaction_named_index_final_publication(&self, lifecycle_generation: u64) {
         let mut lifecycle = self
             .transaction_named_index_lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(lifecycle.publication_active);
-        lifecycle.final_publication_tables = lifecycle.protected_tables.clone();
+        assert!(
+            lifecycle.publication_active && lifecycle.generation == lifecycle_generation,
+            "stale named-index lifecycle guard cannot enter final publication"
+        );
+        lifecycle.final_publication_tables = std::mem::take(&mut lifecycle.protected_tables);
         // Canonical apply is one atomic publication. Requests recorded before its final phase are
         // ordered before that publication. Once apply begins, external pressure/retirement must be
         // replayed after success so no request that observed a newly allocated generation is lost.
@@ -1115,12 +1330,19 @@ impl ResidencyReadState {
         }
     }
 
-    fn finish_transaction_named_index_publication(&self, publication_succeeded: bool) {
+    fn finish_transaction_named_index_publication(
+        &self,
+        lifecycle_generation: u64,
+        publication_succeeded: bool,
+    ) {
         let mut lifecycle = self
             .transaction_named_index_lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(lifecycle.publication_active);
+        assert!(
+            lifecycle.publication_active && lifecycle.generation == lifecycle_generation,
+            "stale named-index lifecycle guard cannot finish publication"
+        );
         lifecycle.publication_active = false;
         lifecycle.protected_tables.clear();
         let deferred = std::mem::take(&mut lifecycle.deferred_purges);
@@ -1143,41 +1365,30 @@ impl ResidencyReadState {
         }
     }
 
-    pub(crate) fn point_index_mutation_epoch(
-        &self,
-        table: &str,
-    ) -> Arc<std::sync::atomic::AtomicU64> {
-        Arc::clone(
-            self.point_index_mutation_epochs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry(table.to_string())
-                .or_default(),
-        )
+    #[allow(dead_code)]
+    fn finish_transaction_named_index_publication_poisoned(&self, lifecycle_generation: u64) {
+        let mut lifecycle = self
+            .transaction_named_index_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            lifecycle.publication_active && lifecycle.generation == lifecycle_generation,
+            "stale named-index lifecycle guard cannot poison publication"
+        );
+        lifecycle.publication_active = false;
+        lifecycle.protected_tables.clear();
+        lifecycle.deferred_purges.clear();
+        lifecycle.final_publication_tables.clear();
+        lifecycle.post_publication_deferred_purges.clear();
     }
 
-    pub(crate) fn begin_point_index_mutation(&self, table: &str) -> PointIndexMutationGuard {
-        let epoch = self.point_index_mutation_epoch(table);
-        loop {
-            let current = epoch.load(std::sync::atomic::Ordering::Acquire);
-            if current & 1 == 0 {
-                let writing = current
-                    .checked_add(1)
-                    .expect("point-index mutation epoch exhausted");
-                if epoch
-                    .compare_exchange_weak(
-                        current,
-                        writing,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    return PointIndexMutationGuard { epoch };
-                }
-            }
-            std::thread::yield_now();
-        }
+    #[allow(dead_code)]
+    pub(crate) fn prepare_exact_point_index_mutation(
+        &self,
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+        expected_even: u64,
+    ) -> PreparedPointIndexMutationGuard {
+        PreparedPointIndexMutationGuard::new(epoch, expected_even)
     }
 
     #[cfg(test)]
@@ -1200,7 +1411,9 @@ impl ResidencyReadState {
             .transaction_named_index_lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if lifecycle.publication_active && lifecycle.protected_tables.contains(table) {
+        let table_is_protected = lifecycle.protected_tables.contains(table)
+            || lifecycle.final_publication_tables.contains(table);
+        if lifecycle.publication_active && table_is_protected {
             let canonical_owner =
                 TRANSACTION_NAMED_INDEX_PUBLICATION_OWNER_ACTIVE.with(std::cell::Cell::get);
             if canonical_owner {
@@ -1229,8 +1442,10 @@ impl ResidencyReadState {
             .transaction_named_index_lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(
-            !lifecycle.publication_active || lifecycle.protected_tables.contains(table),
+        assert!(
+            !lifecycle.publication_active
+                || lifecycle.protected_tables.contains(table)
+                || lifecycle.final_publication_tables.contains(table),
             "an active transaction index publisher may retire only its protected tables"
         );
         drop(lifecycle);
@@ -1249,8 +1464,10 @@ impl ResidencyReadState {
             .transaction_named_index_lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(
-            !lifecycle.publication_active || lifecycle.protected_tables.contains(table),
+        assert!(
+            !lifecycle.publication_active
+                || lifecycle.protected_tables.contains(table)
+                || lifecycle.final_publication_tables.contains(table),
             "an active transaction index publisher may retain only its protected tables"
         );
         drop(lifecycle);
@@ -1261,28 +1478,7 @@ impl ResidencyReadState {
             .sharded_point_route_publish_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        {
-            let current = self.sharded_point_routes.load();
-            if current
-                .keys()
-                .any(|(cached_table, _, _)| cached_table == table)
-            {
-                let mut next = (**current).clone();
-                next.retain(|(cached_table, _, _), _| cached_table != table);
-                self.sharded_point_routes.store(Arc::new(next));
-            }
-        }
-        {
-            let current = self.compound_point_routes.load();
-            if current
-                .keys()
-                .any(|(cached_table, _, _)| cached_table == table)
-            {
-                let mut next = (**current).clone();
-                next.retain(|(cached_table, _, _), _| cached_table != table);
-                self.compound_point_routes.store(Arc::new(next));
-            }
-        }
+        self.purge_table_point_routes_under_publish_lock(table);
         self.shard_pk_device_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1300,28 +1496,7 @@ impl ResidencyReadState {
             .sharded_point_route_publish_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        {
-            let current = self.sharded_point_routes.load();
-            if current
-                .keys()
-                .any(|(cached_table, _, _)| cached_table == table)
-            {
-                let mut next = (**current).clone();
-                next.retain(|(cached_table, _, _), _| cached_table != table);
-                self.sharded_point_routes.store(Arc::new(next));
-            }
-        }
-        {
-            let current = self.compound_point_routes.load();
-            if current
-                .keys()
-                .any(|(cached_table, _, _)| cached_table == table)
-            {
-                let mut next = (**current).clone();
-                next.retain(|(cached_table, _, _), _| cached_table != table);
-                self.compound_point_routes.store(Arc::new(next));
-            }
-        }
+        self.purge_table_point_routes_under_publish_lock(table);
         self.shard_pk_device_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1338,34 +1513,13 @@ impl ResidencyReadState {
 
     /// Retire cached prepared routes for the named tables. An already-submitted reader retains its
     /// own plan Arc through completion, but the global cache stops pinning the generation before return.
-    fn purge_sharded_point_routes_for_tables<'a>(&self, tables: impl IntoIterator<Item = &'a str>) {
-        let tables = tables
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        if tables.is_empty() {
-            return;
-        }
+    fn purge_table_point_routes_for_tables<'a>(&self, tables: impl IntoIterator<Item = &'a str>) {
         let _publish = self
             .sharded_point_route_publish_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let current = self.sharded_point_routes.load();
-        if current
-            .keys()
-            .any(|(cached_table, _, _)| tables.contains(cached_table.as_str()))
-        {
-            let mut next = (**current).clone();
-            next.retain(|(cached_table, _, _), _| !tables.contains(cached_table.as_str()));
-            self.sharded_point_routes.store(Arc::new(next));
-        }
-        let current = self.compound_point_routes.load();
-        if current
-            .keys()
-            .any(|(cached_table, _, _)| tables.contains(cached_table.as_str()))
-        {
-            let mut next = (**current).clone();
-            next.retain(|(cached_table, _, _), _| !tables.contains(cached_table.as_str()));
-            self.compound_point_routes.store(Arc::new(next));
+        for table in tables {
+            self.purge_table_point_routes_under_publish_lock(table);
         }
     }
 
@@ -1437,7 +1591,7 @@ impl ResidencyReadState {
             // The invalidated publication is a new table generation even though its payload Arc is retained
             // for already-captured readers. Rotate before purging while descriptor publication stays locked,
             // so a G0 preparer cannot pass its route-lock recheck and republish after retirement.
-            self.purge_sharded_point_routes_for_tables(std::iter::once(table));
+            self.purge_table_point_routes_for_tables(std::iter::once(table));
         }
     }
 
@@ -1515,7 +1669,7 @@ impl ResidencyReadState {
         // Store-before-purge is deliberate. New readers immediately see a new table token; old readers
         // fail their under-lock global-token recheck. Retaining descriptor_publish_lock through this purge
         // closes the prior purge-before-publication re-insertion window.
-        self.purge_sharded_point_routes_for_tables(changed_tables.iter().map(String::as_str));
+        self.purge_table_point_routes_for_tables(changed_tables.iter().map(String::as_str));
         result
     }
 
@@ -1557,7 +1711,7 @@ impl ResidencyReadState {
             std::sync::atomic::Ordering::Relaxed,
         );
         self.shards.store(Arc::new(next));
-        self.purge_sharded_point_routes_for_tables(std::iter::once(table));
+        self.purge_table_point_routes_for_tables(std::iter::once(table));
         result
     }
 }
@@ -1645,5 +1799,186 @@ impl RouteTelemetry {
 
     pub(crate) fn remove_table(&self, table: &str) {
         self.route_decisions().remove(table);
+    }
+}
+
+#[cfg(test)]
+mod prepared_point_index_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn prepared_epoch_is_one_exact_cas_and_rejects_drift() {
+        let epoch = Arc::new(AtomicU64::new(8));
+        let mut guard = PreparedPointIndexMutationGuard::new(Arc::clone(&epoch), 6);
+        assert!(guard.start().is_err());
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
+    }
+
+    #[test]
+    fn post_wal_exact_cas_drift_poison_wedges_the_epoch() {
+        let epoch = Arc::new(AtomicU64::new(8));
+        let mut guard = PreparedPointIndexMutationGuard::new(Arc::clone(&epoch), 6);
+        guard.arm_post_wal();
+        assert!(guard.start().is_err(), "the exact CAS must reject drift");
+        assert_eq!(
+            epoch.load(Ordering::Acquire),
+            POINT_INDEX_MUTATION_POISON,
+            "a durable mutation may not leave an apparently healthy even epoch after CAS failure"
+        );
+    }
+
+    #[test]
+    fn post_wal_arm_without_start_poison_wedges_on_drop() {
+        let epoch = Arc::new(AtomicU64::new(6));
+        let mut guard = PreparedPointIndexMutationGuard::new(Arc::clone(&epoch), 6);
+        guard.arm_post_wal();
+        drop(guard);
+        assert_eq!(epoch.load(Ordering::Acquire), POINT_INDEX_MUTATION_POISON);
+    }
+
+    #[test]
+    fn prepared_epoch_refuses_terminal_adjacent_even_value() {
+        let epoch = Arc::new(AtomicU64::new(u64::MAX - 1));
+        let mut guard = PreparedPointIndexMutationGuard::new(Arc::clone(&epoch), u64::MAX - 1);
+        assert!(guard.start().is_err());
+        assert_eq!(epoch.load(Ordering::Acquire), u64::MAX - 1);
+    }
+
+    #[test]
+    fn prepared_epoch_completes_to_exact_even_successor() {
+        let epoch = Arc::new(AtomicU64::new(6));
+        let mut guard = PreparedPointIndexMutationGuard::new(Arc::clone(&epoch), 6);
+        guard.start().unwrap();
+        assert_eq!(epoch.load(Ordering::Acquire), 7);
+        guard.complete().unwrap();
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
+    }
+
+    #[test]
+    fn abandoned_prepared_epoch_remains_terminally_poisoned() {
+        let epoch = Arc::new(AtomicU64::new(12));
+        let mut guard = PreparedPointIndexMutationGuard::new(Arc::clone(&epoch), 12);
+        guard.start().unwrap();
+        drop(guard);
+        assert_eq!(epoch.load(Ordering::Acquire), POINT_INDEX_MUTATION_POISON);
+    }
+
+    #[test]
+    fn prepared_start_has_no_lookup_or_spin_path() {
+        let source = include_str!("engine_state.rs");
+        let start = source
+            .split("pub(crate) fn start(&mut self)")
+            .nth(1)
+            .and_then(|section| section.split("pub(crate) fn complete").next())
+            .unwrap();
+        for forbidden in [
+            "point_index_mutation_epoch",
+            "loop",
+            "yield_now",
+            "BTree",
+            "Mutex",
+        ] {
+            assert!(
+                !start.contains(forbidden),
+                "prepared start must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_lifecycle_pre_wal_abort_and_armed_drop_choose_distinct_cleanup() {
+        let residency = ResidencyReadState::default();
+        let protected = BTreeSet::from(["epoch_guard_table".to_string()]);
+        let first_generation;
+        {
+            let guard = residency
+                .begin_transaction_named_index_publication(protected.clone())
+                .into_terminal();
+            let lifecycle = residency.transaction_named_index_lifecycle.lock().unwrap();
+            assert!(lifecycle.publication_active);
+            assert_eq!(
+                guard
+                    .inner
+                    .as_ref()
+                    .expect("fresh terminal lifecycle owns its inner guard")
+                    .lifecycle_generation,
+                lifecycle.generation,
+                "the terminal guard carries the exact active lifecycle generation"
+            );
+            first_generation = lifecycle.generation;
+        }
+        assert!(
+            !residency
+                .transaction_named_index_lifecycle
+                .lock()
+                .unwrap()
+                .publication_active
+        );
+        {
+            let mut guard = residency
+                .begin_transaction_named_index_publication(protected)
+                .into_terminal();
+            assert_eq!(
+                guard
+                    .inner
+                    .as_ref()
+                    .expect("fresh terminal lifecycle owns its inner guard")
+                    .lifecycle_generation,
+                first_generation + 1,
+                "a later terminal owner receives a distinct monotone generation"
+            );
+            guard.enter_final_publication();
+            guard.arm_post_wal();
+            let mut lifecycle = residency.transaction_named_index_lifecycle.lock().unwrap();
+            lifecycle.deferred_purges.insert("pre".to_string());
+            lifecycle
+                .post_publication_deferred_purges
+                .insert("post".to_string());
+        }
+        let lifecycle = residency.transaction_named_index_lifecycle.lock().unwrap();
+        assert!(!lifecycle.publication_active);
+        assert!(lifecycle.deferred_purges.is_empty());
+        assert!(lifecycle.post_publication_deferred_purges.is_empty());
+    }
+
+    #[test]
+    fn terminal_lifecycle_moves_the_sole_protected_set_and_defers_final_phase_purges() {
+        let residency = ResidencyReadState::default();
+        let mut guard = residency.begin_transaction_named_index_publication(BTreeSet::from([
+            "sole_protected_set".to_string(),
+        ]));
+        {
+            let lifecycle = residency.transaction_named_index_lifecycle.lock().unwrap();
+            assert!(lifecycle.protected_tables.contains("sole_protected_set"));
+            assert!(lifecycle.final_publication_tables.is_empty());
+        }
+
+        guard.enter_final_publication();
+        {
+            let lifecycle = residency.transaction_named_index_lifecycle.lock().unwrap();
+            assert!(lifecycle.protected_tables.is_empty());
+            assert!(lifecycle
+                .final_publication_tables
+                .contains("sole_protected_set"));
+        }
+        // External retirement observes the final-phase half of the same ownership union, so it
+        // must defer instead of racing the terminal publisher after the move.
+        residency.purge_shard_pk_index_for_table("sole_protected_set");
+        {
+            let lifecycle = residency.transaction_named_index_lifecycle.lock().unwrap();
+            assert!(lifecycle.deferred_purges.contains("sole_protected_set"));
+            assert!(
+                lifecycle
+                    .post_publication_deferred_purges
+                    .contains("sole_protected_set"),
+                "a purge observed after the terminal cut is replayed after success"
+            );
+        }
+        guard.complete();
+        let lifecycle = residency.transaction_named_index_lifecycle.lock().unwrap();
+        assert!(!lifecycle.publication_active);
+        assert!(lifecycle.protected_tables.is_empty());
+        assert!(lifecycle.final_publication_tables.is_empty());
     }
 }

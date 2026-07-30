@@ -31,6 +31,12 @@ pub(crate) struct CommitPublicationCoordinator {
     tails_finished: std::sync::atomic::AtomicU64,
 }
 
+/// Payload bytes of one publication-join entry. The slot pool, not this scalar, bounds BTree
+/// node and allocator overhead; no per-transaction atomic publication-root object exists yet.
+pub(crate) const fn commit_publication_join_entry_payload_bytes() -> usize {
+    std::mem::size_of::<Index>()
+}
+
 #[derive(Debug)]
 struct CommitPublicationState {
     /// First commit index not yet publication-covered. Commit indices begin at one; the reader
@@ -247,6 +253,14 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn publication_join_entry_payload_size_is_owned_by_its_index_value() {
+        assert_eq!(
+            commit_publication_join_entry_payload_bytes(),
+            std::mem::size_of::<Index>()
+        );
+    }
 
     fn release_simulated_wave_tail(engine: &Engine) {
         engine

@@ -7,7 +7,15 @@
 //! leaves no public descriptor or side-map owner behind.
 
 use super::*;
-use crate::typed_insert_batch::PreparedResidentDensePayload;
+use crate::engine_insert_plan::host_retention::{HostRetentionGeometry, HostRetentionReport};
+use crate::typed_insert_batch::{
+    PreparedResidentDensePayload, PreparedResidentFixedBoolUpload, PreparedResidentFixedChunkOwners,
+};
+
+mod prepared_fixed_publication;
+use prepared_fixed_publication::fixed_rollover_host_materialization_scratch;
+#[allow(unused_imports)] // sibling-private handoff for the immediate live-caller migration
+pub(super) use prepared_fixed_publication::PreparedFixedResidentShardPublication;
 
 /// Sealed allocation geometry for one fixed-width, NULL-free rollover.
 ///
@@ -23,6 +31,75 @@ pub(super) struct ResidentRolloverPlan {
     named_index_bytes: u64,
     bool_layouts: Vec<ResidentDeviceBoolColumnLayout>,
     capacity_scan_entries: u64,
+}
+
+/// Allocation-free capacity-search result for typed fixed rollover.  The selected geometry is
+/// materialized into catalog-named BOOL descriptors exactly once, after fit selection.
+struct FixedWidthTableGeometry {
+    capacity: usize,
+    payload_bytes: u64,
+    bool_bitmap_base: u64,
+    bool_bitmap_bytes: u64,
+    bool_count: usize,
+    created_by_bytes: u64,
+    row_id_bytes: u64,
+    named_index_bytes: u64,
+}
+
+/// Borrowed, allocation-free fixed-rollover geometry used before a private payload exists.
+///
+/// Unlike `ResidentRolloverPlan`, this deliberately retains no materialized BOOL descriptor
+/// names.  The append compiler reconstructs those names only after the indexed physical permit
+/// has crossed the capacity boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FixedRolloverGeometryForecast {
+    capacity: usize,
+    payload_bytes: u64,
+    created_by_bytes: u64,
+    row_id_bytes: u64,
+    named_index_bytes: u64,
+    capacity_scan_entries: u64,
+}
+
+impl FixedRolloverGeometryForecast {
+    pub(super) fn capacity(self) -> usize {
+        self.capacity
+    }
+
+    pub(super) fn payload_bytes(self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub(super) fn created_by_bytes(self) -> u64 {
+        self.created_by_bytes
+    }
+
+    pub(super) fn row_id_bytes(self) -> u64 {
+        self.row_id_bytes
+    }
+
+    pub(super) fn named_index_bytes(self) -> u64 {
+        self.named_index_bytes
+    }
+
+    pub(super) fn allocation_bytes_before_indexes(self) -> Option<u64> {
+        self.payload_bytes
+            .checked_add(self.created_by_bytes)?
+            .checked_add(self.row_id_bytes)
+    }
+
+    pub(super) fn capacity_scan_entries(self) -> u64 {
+        self.capacity_scan_entries
+    }
+}
+
+impl FixedWidthTableGeometry {
+    fn total_allocation_bytes(&self) -> Option<u64> {
+        self.payload_bytes
+            .checked_add(self.created_by_bytes)?
+            .checked_add(self.row_id_bytes)?
+            .checked_add(self.named_index_bytes)
+    }
 }
 
 impl ResidentRolloverPlan {
@@ -103,6 +180,116 @@ impl ResidentRolloverPlan {
         Ok(Some(selected))
     }
 
+    /// Typed resident sources have already been checked against this catalog table.  Keep the
+    /// rollover planner borrowed from that point onward so it does not allocate a temporary
+    /// `Vec<SqlType>` merely to rediscover table-owned type tags.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fixed_width_null_free_table(
+        table: &RelationalTable,
+        rows: usize,
+        desired_capacity: usize,
+        row_ids_present: bool,
+        named_indexes_required: bool,
+        remaining_budget: Option<u64>,
+    ) -> Result<Option<Self>, ExecuteError> {
+        let Some(forecast) = Self::fixed_width_null_free_table_forecast(
+            table,
+            rows,
+            desired_capacity,
+            row_ids_present,
+            named_indexes_required,
+            remaining_budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let geometry = fixed_width_table_geometry(
+            table,
+            rows,
+            forecast.capacity,
+            row_ids_present,
+            named_indexes_required,
+        )?;
+        let mut plan = Self::from_fixed_width_table_geometry(table, geometry)?;
+        plan.capacity_scan_entries = forecast.capacity_scan_entries;
+        Ok(Some(plan))
+    }
+
+    /// Allocation-free capacity selection for an indexed physical forecast.  This is the exact
+    /// same search the materializing plan uses, but it refuses to materialize the descriptor
+    /// `Vec` before the permit has admitted the private generation.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fixed_width_null_free_table_forecast(
+        table: &RelationalTable,
+        rows: usize,
+        desired_capacity: usize,
+        row_ids_present: bool,
+        named_indexes_required: bool,
+        remaining_budget: Option<u64>,
+    ) -> Result<Option<FixedRolloverGeometryForecast>, ExecuteError> {
+        if rows == 0 || desired_capacity < rows || !is_fixed_width_table(table) {
+            return Ok(None);
+        }
+        if desired_capacity > (1_usize << 31) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident rollover capacity is implausibly large".to_string(),
+            )));
+        }
+        let make_geometry = |capacity| {
+            fixed_width_table_geometry(
+                table,
+                rows,
+                capacity,
+                row_ids_present,
+                named_indexes_required,
+            )
+        };
+        let Some(remaining_budget) = remaining_budget else {
+            let geometry = make_geometry(desired_capacity)?;
+            return Ok(Some(FixedRolloverGeometryForecast {
+                capacity: geometry.capacity,
+                payload_bytes: geometry.payload_bytes,
+                created_by_bytes: geometry.created_by_bytes,
+                row_id_bytes: geometry.row_id_bytes,
+                named_index_bytes: geometry.named_index_bytes,
+                capacity_scan_entries: 1,
+            }));
+        };
+        let minimum = make_geometry(rows)?;
+        if minimum
+            .total_allocation_bytes()
+            .is_none_or(|bytes| bytes > remaining_budget)
+        {
+            return Ok(None);
+        }
+        let mut low = rows;
+        let mut high = desired_capacity;
+        let mut selected = minimum;
+        let mut scans = 1_u64;
+        while low <= high {
+            let midpoint = low + (high - low) / 2;
+            let candidate = make_geometry(midpoint)?;
+            scans = scans.saturating_add(1);
+            if candidate
+                .total_allocation_bytes()
+                .is_some_and(|bytes| bytes <= remaining_budget)
+            {
+                selected = candidate;
+                low = midpoint.saturating_add(1);
+            } else {
+                high = midpoint.saturating_sub(1);
+            }
+        }
+        Ok(Some(FixedRolloverGeometryForecast {
+            capacity: selected.capacity,
+            payload_bytes: selected.payload_bytes,
+            created_by_bytes: selected.created_by_bytes,
+            row_id_bytes: selected.row_id_bytes,
+            named_index_bytes: selected.named_index_bytes,
+            capacity_scan_entries: scans,
+        }))
+    }
+
     fn at_capacity(
         table: &RelationalTable,
         column_types: &[SqlType],
@@ -132,7 +319,7 @@ impl ResidentRolloverPlan {
         } else {
             0
         };
-        Ok(Self {
+        let plan = Self {
             capacity,
             payload_bytes,
             created_by_bytes,
@@ -140,7 +327,35 @@ impl ResidentRolloverPlan {
             named_index_bytes,
             bool_layouts,
             capacity_scan_entries: 0,
-        })
+        };
+        plan.checked_total_allocation_bytes().ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident rollover total allocation overflowed".to_string(),
+            ))
+        })?;
+        Ok(plan)
+    }
+
+    fn from_fixed_width_table_geometry(
+        table: &RelationalTable,
+        geometry: FixedWidthTableGeometry,
+    ) -> Result<Self, ExecuteError> {
+        let bool_layouts = materialize_fixed_width_bool_layouts(table, &geometry)?;
+        let plan = Self {
+            capacity: geometry.capacity,
+            payload_bytes: geometry.payload_bytes,
+            created_by_bytes: geometry.created_by_bytes,
+            row_id_bytes: geometry.row_id_bytes,
+            named_index_bytes: geometry.named_index_bytes,
+            bool_layouts,
+            capacity_scan_entries: 0,
+        };
+        plan.checked_total_allocation_bytes().ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident rollover total allocation overflowed".to_string(),
+            ))
+        })?;
+        Ok(plan)
     }
 
     pub(super) fn capacity(&self) -> usize {
@@ -148,34 +363,121 @@ impl ResidentRolloverPlan {
     }
 
     pub(super) fn total_allocation_bytes(&self) -> u64 {
+        self.checked_total_allocation_bytes()
+            .expect("resident rollover construction validates its total allocation")
+    }
+
+    fn checked_total_allocation_bytes(&self) -> Option<u64> {
         self.payload_bytes
-            .saturating_add(self.created_by_bytes)
-            .saturating_add(self.row_id_bytes)
-            .saturating_add(self.named_index_bytes)
+            .checked_add(self.created_by_bytes)?
+            .checked_add(self.row_id_bytes)?
+            .checked_add(self.named_index_bytes)
     }
 
     pub(super) fn allocation_bytes_before_indexes(&self) -> u64 {
         self.payload_bytes
-            .saturating_add(self.created_by_bytes)
-            .saturating_add(self.row_id_bytes)
+            .checked_add(self.created_by_bytes)
+            .and_then(|bytes| bytes.checked_add(self.row_id_bytes))
+            .expect("resident rollover construction validates its allocation components")
+    }
+
+    pub(super) fn named_index_bytes(&self) -> u64 {
+        self.named_index_bytes
     }
 
     pub(super) fn capacity_scan_entries(&self) -> u64 {
         self.capacity_scan_entries
     }
 
+    #[cfg(test)]
     pub(super) fn bool_layouts(&self) -> &[ResidentDeviceBoolColumnLayout] {
         &self.bool_layouts
     }
 
+    #[allow(dead_code)] // legacy rollover tests keep the published-layout variant; plan sizing uses the borrowed form.
     pub(super) fn descriptor_bool_layouts_match(
         table: &RelationalTable,
         column_types: &[SqlType],
         capacity: usize,
         actual: &[ResidentDeviceBoolColumnLayout],
     ) -> bool {
-        fixed_width_payload_layout(table, column_types, capacity)
-            .is_ok_and(|(_, expected)| expected == actual)
+        Self::descriptor_bool_layout_pairs_match(
+            table,
+            column_types,
+            capacity,
+            actual
+                .iter()
+                .map(|layout| (layout.name.as_str(), layout.bitmap_byte_offset)),
+        )
+    }
+
+    /// Compare descriptor geometry without recreating catalog-owned `String` metadata.  The
+    /// boxed append identity uses this form during pure retention prediction/validation.
+    #[allow(dead_code)] // retained for the published-layout compatibility helper above.
+    pub(super) fn descriptor_bool_layout_pairs_match<'a>(
+        table: &RelationalTable,
+        column_types: &[SqlType],
+        capacity: usize,
+        actual: impl Iterator<Item = (&'a str, u64)>,
+    ) -> bool {
+        if table.columns.len() != column_types.len() || !is_fixed_width(column_types) {
+            return false;
+        }
+        let mut bytes = std::mem::size_of::<u64>() as u64;
+        let capacity = match u64::try_from(capacity) {
+            Ok(capacity) => capacity,
+            Err(_) => return false,
+        };
+        for width in [4_u64, 8, 16] {
+            let count = column_types
+                .iter()
+                .filter(|ty| match width {
+                    4 => matches!(ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date),
+                    8 => matches!(ty, SqlType::Int8 | SqlType::Timestamp),
+                    16 => matches!(ty, SqlType::Numeric { .. } | SqlType::Uuid),
+                    _ => false,
+                })
+                .count();
+            let count = match u64::try_from(count) {
+                Ok(count) => count,
+                Err(_) => return false,
+            };
+            let section = match count
+                .checked_mul(capacity)
+                .and_then(|bytes| bytes.checked_mul(width))
+            {
+                Some(section) => section,
+                None => return false,
+            };
+            bytes = match bytes.checked_add(section) {
+                Some(bytes) => bytes,
+                None => return false,
+            };
+        }
+        let bool_bytes = match capacity
+            .div_ceil(32)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+        {
+            Some(bytes) => bytes,
+            None => return false,
+        };
+        let mut actual = actual;
+        for (column, ty) in table.columns.iter().zip(column_types) {
+            if !matches!(ty, SqlType::Bool) {
+                continue;
+            }
+            let Some((name, offset)) = actual.next() else {
+                return false;
+            };
+            if name != column.name || offset != bytes {
+                return false;
+            }
+            bytes = match bytes.checked_add(bool_bytes) {
+                Some(bytes) => bytes,
+                None => return false,
+            };
+        }
+        actual.next().is_none()
     }
 }
 
@@ -199,8 +501,11 @@ pub(super) struct PendingFixedResidentShard {
     pub(super) device_memory: Arc<CudaResidentDeviceMemory>,
     pub(super) created_by_region: Arc<CudaResidentDeviceMemory>,
     pub(super) row_id_region: Option<Arc<CudaResidentDeviceMemory>>,
-    pub(super) bool_layouts: Vec<ResidentDeviceBoolColumnLayout>,
-    pub(super) int4_stats: Vec<ResidentDeviceInt4ColumnStats>,
+    // These metadata arrays survive pre-WAL reservation.  They must not preserve the allocator
+    // capacity of catalog `String`/`Vec` inputs, because the reservation predictor owns exact
+    // host geometry before this private generation is materialized.
+    pub(super) bool_layouts: Box<[ResidentDeviceBoolColumnLayout]>,
+    pub(super) int4_stats: Box<[ResidentDeviceInt4ColumnStats]>,
     pub(super) payload_bytes: u64,
     pub(super) created_by_bytes: u64,
     pub(super) row_id_bytes: u64,
@@ -212,6 +517,9 @@ pub(super) struct PendingFixedResidentShard {
     /// Pre-WAL immutable payload/BoolBits/row-ID H2D plus post-WAL stamps and final header.
     pub(super) live_h2d_bytes: u64,
     pub(super) persistent_allocation_count: u64,
+    /// Concrete reserve-local host owner peak minus the retained descriptor owners below. The
+    /// append plan combines this disjoint scratch with its identity/source report.
+    pub(super) host_materialization_scratch: HostRetentionGeometry,
 }
 
 /// A capacity-sized created-by sidecar allocated before WAL for a typed in-place append whose
@@ -373,9 +681,9 @@ impl PendingFixedResidentShard {
         gpu_id: u16,
         plan: &ResidentRolloverPlan,
         rows: usize,
-        mut chunks: Vec<CudaOwnedDeviceMemoryChunk>,
-        bool_uploads: Vec<(u64, Box<[u8]>)>,
-        int4_stats: Vec<ResidentDeviceInt4ColumnStats>,
+        chunks: PreparedResidentFixedChunkOwners,
+        bool_uploads: Box<[PreparedResidentFixedBoolUpload]>,
+        int4_stats: Box<[ResidentDeviceInt4ColumnStats]>,
         row_id_payload: Option<Vec<u8>>,
     ) -> Result<Self, ExecuteError> {
         if rows == 0
@@ -384,14 +692,33 @@ impl PendingFixedResidentShard {
             || bool_uploads
                 .iter()
                 .zip(&plan.bool_layouts)
-                .any(|((offset, values), layout)| {
-                    *offset != layout.bitmap_byte_offset || values.len() != rows
+                .any(|(upload, layout)| {
+                    upload.name.as_ref() != layout.name || upload.values.len() != rows
                 })
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "sealed fixed-width rollover lost its private payload geometry".to_string(),
             )));
         }
+        let mut retained_bool_layouts =
+            Vec::<ResidentDeviceBoolColumnLayout>::with_capacity(plan.bool_layouts.len());
+        let mut host_materialization_peak = HostRetentionReport::default();
+        chunks.append_host_retention(&mut host_materialization_peak)?;
+        host_materialization_peak.retain_boxed_slice(&bool_uploads)?;
+        for upload in bool_uploads.iter() {
+            upload.append_host_retention(&mut host_materialization_peak)?;
+        }
+        host_materialization_peak.retain_boxed_slice(&int4_stats)?;
+        for stat in int4_stats.iter() {
+            host_materialization_peak.retain_string(&stat.name)?;
+        }
+        if let Some(payload) = row_id_payload.as_ref() {
+            host_materialization_peak.retain_vec(payload)?;
+        }
+        // Its backing is allocated before the first upload is consumed and becomes the final
+        // exact bool-layout box without reallocation.
+        host_materialization_peak.retain_vec(&retained_bool_layouts)?;
+        let immutable_materialization_peak = host_materialization_peak.geometry()?;
         let final_count_header = u64::try_from(rows)
             .map_err(|_| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
@@ -399,10 +726,12 @@ impl PendingFixedResidentShard {
                 ))
             })?
             .to_le_bytes();
+        let PreparedResidentFixedChunkOwners { chunks, offsets: _ } = chunks;
+        let mut chunks = Vec::from(chunks);
         let header = chunks
             .pop()
             .filter(|chunk| {
-                chunk.byte_offset == 0 && chunk.bytes.as_slice() == final_count_header.as_slice()
+                chunk.byte_offset == 0 && chunk.bytes.as_ref() == final_count_header.as_slice()
             })
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
@@ -414,8 +743,8 @@ impl PendingFixedResidentShard {
                 .ok()
                 .and_then(|chunk_bytes| bytes.checked_add(chunk_bytes))
         });
-        let bool_h2d = bool_uploads.iter().try_fold(0_u64, |bytes, (_, values)| {
-            u64::try_from(values.len())
+        let bool_h2d = bool_uploads.iter().try_fold(0_u64, |bytes, upload| {
+            u64::try_from(upload.values.len())
                 .ok()
                 .and_then(|value_bytes| bytes.checked_add(value_bytes))
         });
@@ -448,6 +777,8 @@ impl PendingFixedResidentShard {
                 "sealed fixed-width rollover row-id geometry drifted".to_string(),
             )));
         }
+        #[cfg(test)]
+        FIXED_ROLLOVER_RESERVATIONS.with(|count| count.set(count.get() + 1));
         let runtime = engine.cuda_driver_probe_runtime();
         let device_memory = Arc::new(
             runtime
@@ -492,12 +823,19 @@ impl PendingFixedResidentShard {
             )));
         }
         device_memory
-            .append_owned_chunks(chunks)
+            .append_owned_chunks(chunks.into_iter().map(|chunk| CudaOwnedDeviceMemoryChunk {
+                byte_offset: chunk.byte_offset,
+                bytes: chunk.bytes.into_vec(),
+            }))
             .map_err(device_write_error("sealed fixed-width payload preupload"))?;
-        for (offset, values) in bool_uploads {
+        for (upload, layout) in IntoIterator::into_iter(bool_uploads).zip(&plan.bool_layouts) {
             device_memory
-                .set_bool_bitmap_range(offset, 0, &values)
+                .set_bool_bitmap_range(layout.bitmap_byte_offset, 0, &upload.values)
                 .map_err(device_write_error("sealed fixed-width bool preupload"))?;
+            retained_bool_layouts.push(ResidentDeviceBoolColumnLayout {
+                name: String::from(upload.name),
+                bitmap_byte_offset: layout.bitmap_byte_offset,
+            });
         }
         if let (Some(region), Some(payload)) = (&row_id_region, row_id_payload) {
             region
@@ -541,11 +879,27 @@ impl PendingFixedResidentShard {
                     "sealed fixed-width sidecar fill accounting overflowed".to_string(),
                 ))
             })?;
+        let bool_layouts = retained_bool_layouts.into_boxed_slice();
+        let mut retained_host = HostRetentionReport::default();
+        retained_host.retain_boxed_slice(&bool_layouts)?;
+        for layout in bool_layouts.iter() {
+            retained_host.retain_string(&layout.name)?;
+        }
+        retained_host.retain_boxed_slice(&int4_stats)?;
+        for stat in int4_stats.iter() {
+            retained_host.retain_string(&stat.name)?;
+        }
+        let retained_host = retained_host.geometry()?;
+        let host_materialization_scratch = fixed_rollover_host_materialization_scratch(
+            immutable_materialization_peak,
+            retained_host,
+            created_by_stamp_bytes_u64,
+        )?;
         Ok(Self {
             device_memory,
             created_by_region,
             row_id_region,
-            bool_layouts: plan.bool_layouts.clone(),
+            bool_layouts,
             int4_stats,
             payload_bytes: plan.payload_bytes,
             created_by_bytes: plan.created_by_bytes,
@@ -556,11 +910,16 @@ impl PendingFixedResidentShard {
             sidecar_fill_bytes,
             live_h2d_bytes,
             persistent_allocation_count: 2 + u64::from(plan.row_id_bytes != 0),
+            host_materialization_scratch,
         })
     }
 
-    /// Finish the only mutable portion after WAL: exact created-by stamps, then the sealed count
-    /// header. The generation remains private until mutation publishes its descriptor.
+    /// Temporary compatibility bridge for the unconverted live fixed-rollover caller.
+    ///
+    /// The immediate caller-migration slice must replace this allocation-bearing finalizer with
+    /// `prepare_uniform_commit_pre_wal` plus
+    /// [`PreparedFixedResidentShardPublication::publish_post_wal`] and then delete this method.
+    /// The generation remains private until mutation publishes its descriptor.
     pub(super) fn finish_post_wal(self, stamps: &[Index]) -> Result<Self, ExecuteError> {
         if stamps.is_empty()
             || std::mem::size_of_val(stamps) != self.created_by_stamp_bytes
@@ -592,6 +951,17 @@ impl PendingFixedResidentShard {
             ))?;
         Ok(self)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FIXED_ROLLOVER_RESERVATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn fixed_rollover_reservation_count() -> u64 {
+    FIXED_ROLLOVER_RESERVATIONS.with(std::cell::Cell::get)
 }
 
 impl PendingInPlaceCreatedBy {
@@ -851,6 +1221,23 @@ fn is_fixed_width(column_types: &[SqlType]) -> bool {
         })
 }
 
+fn is_fixed_width_table(table: &RelationalTable) -> bool {
+    !table.columns.is_empty()
+        && table.columns.iter().all(|column| {
+            matches!(
+                column.ty,
+                SqlType::Int2
+                    | SqlType::Int4
+                    | SqlType::Date
+                    | SqlType::Int8
+                    | SqlType::Timestamp
+                    | SqlType::Numeric { .. }
+                    | SqlType::Uuid
+                    | SqlType::Bool
+            )
+        })
+}
+
 fn fixed_width_payload_layout(
     table: &RelationalTable,
     column_types: &[SqlType],
@@ -907,6 +1294,135 @@ fn fixed_width_payload_layout(
         }
     }
     Ok((bytes, bool_layouts))
+}
+
+fn fixed_width_table_geometry(
+    table: &RelationalTable,
+    rows: usize,
+    capacity: usize,
+    row_ids_present: bool,
+    named_indexes_required: bool,
+) -> Result<FixedWidthTableGeometry, ExecuteError> {
+    let mut bytes = std::mem::size_of::<u64>() as u64;
+    for width in [4_u64, 8, 16] {
+        let count = table
+            .columns
+            .iter()
+            .filter(|column| match width {
+                4 => matches!(column.ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date),
+                8 => matches!(column.ty, SqlType::Int8 | SqlType::Timestamp),
+                16 => matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid),
+                _ => false,
+            })
+            .count() as u64;
+        bytes = bytes
+            .checked_add(
+                count
+                    .checked_mul(capacity as u64)
+                    .and_then(|bytes| bytes.checked_mul(width))
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "fixed-width resident payload allocation overflowed".to_string(),
+                        ))
+                    })?,
+            )
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "fixed-width resident payload allocation overflowed".to_string(),
+                ))
+            })?;
+    }
+    let bool_bytes = u64::try_from(capacity.div_ceil(32))
+        .ok()
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u32>() as u64))
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "fixed-width bool bitmap allocation overflowed".to_string(),
+            ))
+        })?;
+    let bool_bitmap_base = bytes;
+    let bool_count = table
+        .columns
+        .iter()
+        .filter(|column| column.ty == SqlType::Bool)
+        .count();
+    bytes = bytes
+        .checked_add(
+            u64::try_from(bool_count)
+                .ok()
+                .and_then(|count| count.checked_mul(bool_bytes))
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "fixed-width bool bitmap allocation overflowed".to_string(),
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "fixed-width bool bitmap allocation overflowed".to_string(),
+            ))
+        })?;
+    let created_by_bytes = u64::try_from(capacity)
+        .ok()
+        .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<u64>() as u64))
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident rollover created-by allocation overflowed".to_string(),
+            ))
+        })?;
+    let row_id_bytes = if row_ids_present { created_by_bytes } else { 0 };
+    let named_index_bytes = if named_indexes_required {
+        estimated_named_index_bytes_for_shard(table, rows, capacity).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" has unsupported mandatory index allocation geometry",
+                table.name
+            )))
+        })?
+    } else {
+        0
+    };
+    Ok(FixedWidthTableGeometry {
+        capacity,
+        payload_bytes: bytes,
+        bool_bitmap_base,
+        bool_bitmap_bytes: bool_bytes,
+        bool_count,
+        created_by_bytes,
+        row_id_bytes,
+        named_index_bytes,
+    })
+}
+
+fn materialize_fixed_width_bool_layouts(
+    table: &RelationalTable,
+    geometry: &FixedWidthTableGeometry,
+) -> Result<Vec<ResidentDeviceBoolColumnLayout>, ExecuteError> {
+    let mut layouts = Vec::with_capacity(geometry.bool_count);
+    let mut bitmap_byte_offset = geometry.bool_bitmap_base;
+    for column in table
+        .columns
+        .iter()
+        .filter(|column| column.ty == SqlType::Bool)
+    {
+        layouts.push(ResidentDeviceBoolColumnLayout {
+            name: column.name.clone(),
+            bitmap_byte_offset,
+        });
+        bitmap_byte_offset = bitmap_byte_offset
+            .checked_add(geometry.bool_bitmap_bytes)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "fixed-width bool bitmap allocation overflowed".to_string(),
+                ))
+            })?;
+    }
+    (layouts.len() == geometry.bool_count && bitmap_byte_offset == geometry.payload_bytes)
+        .then_some(layouts)
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "fixed-width bool descriptor geometry drifted".to_string(),
+            ))
+        })
 }
 
 fn int4_stats(
@@ -1021,6 +1537,51 @@ mod tests {
         .unwrap();
         assert_eq!(dense.capacity(), 3);
         assert!(dense.capacity_scan_entries() > 1);
+    }
+
+    #[test]
+    fn borrowed_table_fixed_width_planner_matches_legacy_layout_and_fit() {
+        let engine = Engine::new_local_test_engine();
+        engine
+            .execute_text(1, "CREATE TABLE mixed (a int4, b int8, flag bool)")
+            .unwrap();
+        let table = engine.relational_catalog_table("mixed").unwrap();
+        let types = table
+            .columns
+            .iter()
+            .map(|column| column.ty)
+            .collect::<Vec<_>>();
+        let legacy =
+            ResidentRolloverPlan::fixed_width_null_free(&table, &types, 3, 64, true, false, None)
+                .unwrap()
+                .unwrap();
+        let borrowed =
+            ResidentRolloverPlan::fixed_width_null_free_table(&table, 3, 64, true, false, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(borrowed.capacity(), legacy.capacity());
+        assert_eq!(
+            borrowed.total_allocation_bytes(),
+            legacy.total_allocation_bytes()
+        );
+        assert_eq!(borrowed.bool_layouts(), legacy.bool_layouts());
+
+        let minimum =
+            ResidentRolloverPlan::fixed_width_null_free_table(&table, 3, 3, true, false, None)
+                .unwrap()
+                .unwrap();
+        let fitted = ResidentRolloverPlan::fixed_width_null_free_table(
+            &table,
+            3,
+            64,
+            true,
+            false,
+            Some(minimum.total_allocation_bytes()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fitted.capacity(), 3);
+        assert!(fitted.capacity_scan_entries() > 1);
     }
 
     #[test]

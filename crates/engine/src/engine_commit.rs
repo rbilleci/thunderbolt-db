@@ -1137,6 +1137,7 @@ impl Engine {
         };
         let visible = self.publish_ready_indices(to_apply.iter().map(|entry| entry.index))?;
         self.require_publication_coverage(visible, publish_index)?;
+        commit.ledger.mark_published_through(publish_index);
         // STRATA read-cache policy remains independently configurable. R3-004 establishes mandatory
         // device write generations in DML preflight; this post-publish refresh is only the broader
         // read-residency policy for unhandled DDL/global invalidation.
@@ -1423,6 +1424,7 @@ impl Engine {
         }
         let visible = self.publish_ready_indices(to_apply.iter().map(|entry| entry.index))?;
         self.require_publication_coverage(visible, token.index)?;
+        commit.ledger.mark_published_through(token.index);
         {
             let precise_scope = Self::residency_invalidation_scope(&to_apply);
             let tables = if self.auto_admit_on_commit_enabled() {
@@ -1776,7 +1778,8 @@ impl Engine {
                 let entity_id = entity_ids[0];
                 let row_key = relational_row_key(&record.table, entity_id);
                 let mut write_set = WriteSet::default();
-                write_set.tables.insert(record.table.clone());
+                write_set.add_table(&table);
+                write_set.add_row(&table, entity_id, row_key.clone());
                 write_set.add_unique_slots(&table, &new_values);
                 let delta = WriteDelta {
                     write_set: write_set.clone(),
@@ -1823,7 +1826,7 @@ impl Engine {
             .clone();
         let commit_seq = entry.index;
         let mut write_set = WriteSet::default();
-        write_set.tables.insert(record.table.clone());
+        write_set.add_table(&table);
         let mut inserted_rows = Vec::with_capacity(record.rows.len());
         let mut rows = Vec::with_capacity(record.rows.len());
         let mut row_ids = Vec::with_capacity(record.rows.len());

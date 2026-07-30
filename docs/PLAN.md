@@ -43,10 +43,30 @@ starts at WRITE-001:
    Iterate focused gates (and quick card when the read path may move), freeze, obtain independent audit, then run one
    applicable canonical full card; no repair reuses an invalidated candidate or card. The accepted 2026-07-28
    checkpoint covers composite device pre-WAL row/key/current-resident proof plus the inert indexed in-place
-   append/index-delta owner. The next checkpoint extends that inert proof to fixed rollover: prebuild the private
-   payload and every index generation before WAL, account exact persistent bytes plus maximum concurrent scratch,
-   and prove zero-build launched-error drain. It remains test-only and production-ineligible until accepted; only a
-   later checkpoint may promote the proven pieces beneath the sole live `DeviceInsertPlan`.
+   append/index-delta owner. The accepted fixed-rollover checkpoint privately prebuilds the payload and every
+   physical index generation before WAL, accounts exact persistent bytes plus maximum concurrent build/probe
+   scratch, independently GPU-locates every directory against its intended raw/fingerprinted key, and proves
+   zero-based full-build launched-error drain. The accepted inert effect/canonical-v1 checkpoint binds sequence and
+   `RETURNING` evidence to one pre-effect typed-statement digest and defines one strict typed logical record without
+   a WAL opcode, replay, apply, physical, or publication consumer. The accepted codec-5 S1--S6 checkpoint adds exact
+   chunk/status/outer envelopes, allocation-free structural traversal, strict typed/non-INSERT source decoding, and
+   one incomplete move-only source draft through row dispositions, sequence effects, and statement outcomes. It
+   deliberately stops before final overlay and retained-response ownership. The accepted inert shared-image
+   checkpoint preserves v1 bytes while defining one strict typed-vector grammar and one
+   `GPUDBTYPEDIMAGE2` owner for catalog-ordered final-table vectors and projection-ordered retained responses,
+   including exact bytes/allocation-slot accounting and hostile pre-allocation rejection. These pieces remain
+   production-ineligible.
+
+   The next semantics-v2 S4 + S7 checkpoint begins by freezing and independently auditing one internally complete
+   exact S7 wire contract under
+   [`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md). Only after that design gate
+   may the same checkpoint implement S4/S7: make row identity table-local, bind every disposition to its final
+   table and surviving transition, encode and strictly decode the complete final overlay, and consume the shared
+   typed image for final table state. Reconcile the existing misnamed provisional S1--S6 scaffold in that slice:
+   make semantics-version dispatch explicit, preserve semantics-v1 bytes, and leave exactly one normative S4
+   authority. Keep the new form unreachable from live WAL/recovery/apply. S8, the final destructive replay IR,
+   durable sequence validation, GPU replay compilation, and the complete pre-WAL capacity lease remain later
+   WRITE-001 checkpoints; none may add another WAL, operation, publication, or eligibility authority.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as

@@ -1,22 +1,26 @@
-//! Test-only current-generation UNIQUE/PRIMARY KEY proof for typed INSERT.
+//! Current-generation UNIQUE/PRIMARY KEY validation ingredients for typed INSERT.
 //!
 //! This module owns no WAL, row identities, apply, or publication.  It proves one deliberately
 //! narrow autocommit shape under the residency mutation gate so the future live handoff has an
 //! exact GPU-resident semantic reference rather than a host duplicate check.
 
-use std::collections::BTreeSet;
+#![allow(dead_code)] // reservation inputs compile before live indexed eligibility is opened
+
 use std::sync::Arc;
 use std::sync::MutexGuard;
 
-use super::batch_key_constraints::{BatchKeyConstraintProof, IndexBinding, KeyColumnBinding};
+use super::batch_key_constraints::BatchKeyConstraintProof;
+use super::host_retention::{HostRetentionGeometry, HostRetentionReport};
 use super::pre_wal_constraints::{self, ConstraintCandidate};
+use super::resident_constraint_generation;
 use crate::relational_model::RelationalTable;
-use crate::typed_insert_batch::{TypedInsertBatch, TypedInsertConstraintDeviceSource};
-use crate::{Engine, EngineError, ExecuteError, Index, RelationalResidentShard, SqlType};
+use crate::typed_insert_batch::TypedInsertBatch;
+#[cfg(test)]
+use crate::EngineError;
+use crate::{Engine, ExecuteError, Index, RelationalResidentShard};
 use gpu_db_execution::{
-    insert_resident_key_verdict_scratch_bytes, CudaAllocationScope, CudaCompoundFoldColumn,
-    CudaInsertResidentKeyShard, CudaInsertResidentKeySidecar,
-    INSERT_RESIDENT_KEY_VERDICT_READBACK_BYTES,
+    insert_resident_key_verdict_scratch_bytes, CudaAllocationScope, CudaInsertResidentKeyShard,
+    CudaInsertResidentKeySidecar, INSERT_RESIDENT_KEY_VERDICT_READBACK_BYTES,
 };
 
 /// Move-only context for the proof-only current-generation pass.  The sole sealed raw-index
@@ -45,6 +49,31 @@ struct ResidentKeyShardResourceEvidence {
 }
 
 impl ResidentKeyValidationSeal {
+    /// Retained host backing for the validation seal. Its point-route generation is a per-GPU
+    /// generation pin, never a generic host owner or host-generation pin.
+    pub(crate) fn append_host_retention(
+        &self,
+        report: &mut HostRetentionReport,
+    ) -> Result<(), crate::EngineError> {
+        report.retain_string(&self.table_name)?;
+        report.retain_boxed_slice(&self.shards)?;
+        Ok(())
+    }
+
+    /// Allocation-free pre-lease geometry. The string and sealed shard box are independent
+    /// owners; the generation Arc remains a device-generation pin rather than host storage.
+    pub(crate) fn host_retention_geometry(
+        &self,
+    ) -> Result<HostRetentionGeometry, crate::EngineError> {
+        let mut geometry = HostRetentionGeometry::default();
+        append_string_geometry(&mut geometry, &self.table_name, "resident key table name")?;
+        geometry.checked_add_backing_elements::<ResidentKeyShardResourceEvidence>(
+            self.shards.len(),
+            "resident key shard evidence",
+        )?;
+        Ok(geometry)
+    }
+
     pub(crate) fn matches_in_place_append(
         &self,
         table: &RelationalTable,
@@ -68,6 +97,16 @@ impl ResidentKeyValidationSeal {
             })
     }
 
+    pub(crate) fn matches_fixed_rollover_predecessor(
+        &self,
+        table: &RelationalTable,
+        catalog_seq: Index,
+        shard: &RelationalResidentShard,
+        predecessor_boundary: Index,
+    ) -> bool {
+        self.matches_in_place_append(table, catalog_seq, shard, predecessor_boundary)
+    }
+
     pub(crate) fn original_read_snapshot(&self) -> Index {
         self.original_read_snapshot
     }
@@ -75,6 +114,20 @@ impl ResidentKeyValidationSeal {
     pub(crate) fn predecessor_boundary(&self) -> Index {
         self.predecessor_boundary
     }
+}
+
+fn append_string_geometry(
+    geometry: &mut HostRetentionGeometry,
+    value: &String,
+    domain: &'static str,
+) -> Result<(), crate::EngineError> {
+    if value.capacity() == 0 {
+        return Ok(());
+    }
+    let bytes = u64::try_from(value.capacity()).map_err(|_| {
+        crate::EngineError::Durability("resident key string capacity overflows".to_string())
+    })?;
+    geometry.checked_add_backing_bytes_slots(bytes, 1, domain)
 }
 
 pub(super) fn compile(engine: &Engine) -> ResidentKeyConstraintProof {
@@ -148,21 +201,17 @@ pub(super) fn validate_current_generation(
     }
 
     // Pin the exact immutable map while the mutation gate excludes every descriptor/sidecar
-    // publisher.  Never reload this map inside the shard/index loops.
-    let shard_map = engine.read_state.residency.shards.load_full();
-    let shards = shard_map.get(&table.name).ok_or_else(|| {
-        decline("resident INSERT key proof found no hot shard generation for its table")
-    })?;
-    let runtime = engine.router.runtime().snapshot();
+    // publisher. Never reload this generation inside the shard/index loops.
     let expected_gpu = engine.planner.default_gpu_id();
-    let history_floor_requires_retry = validate_shard_generation(
+    let pinned_generation = resident_constraint_generation::pin_hot_shard_generation(
         engine,
         table,
-        shards,
         original_read_snapshot,
         expected_gpu,
-        &runtime,
+        _held_mutation_gate,
     )?;
+    let shards = pinned_generation.shards();
+    let history_floor_requires_retry = pinned_generation.history_floor_requires_retry();
 
     let scratch = max_scratch_bytes(engine, batch, table, shards, keys)?;
     let source_bytes = batch
@@ -198,14 +247,17 @@ pub(super) fn validate_current_generation(
         .iter()
         .filter(|index| index.is_unique_or_primary())
     {
-        let incoming_columns = incoming_columns(&source, index).map_err(ExecuteError::Engine)?;
+        let columns = index.resident_constraint_columns(table)?;
+        let incoming_columns = resident_constraint_generation::incoming_columns(&source, &columns)
+            .map_err(ExecuteError::Engine)?;
         for shard in shards {
             if shard.row_count == 0 {
                 // The generation validator above makes this a history-floor decision; the CUDA
                 // primitive's zero-readback fast return is never itself used as history evidence.
                 continue;
             }
-            let resident_columns = resident_columns(engine, table, shard, index)?;
+            let resident_columns =
+                resident_constraint_generation::resident_columns(engine, table, shard, &columns)?;
             let payload = shard
                 .device_memory
                 .as_deref()
@@ -318,88 +370,6 @@ pub(super) fn validate_current_generation(
     })
 }
 
-fn validate_shard_generation(
-    engine: &Engine,
-    table: &RelationalTable,
-    shards: &[RelationalResidentShard],
-    original_read_snapshot: Index,
-    expected_gpu: u16,
-    runtime: &gpu_db_execution::GpuRuntimeSnapshot,
-) -> Result<bool, ExecuteError> {
-    if shards.is_empty() {
-        return Err(decline(
-            "resident INSERT key proof has an empty shard generation",
-        ));
-    }
-    let mut shard_ids = BTreeSet::new();
-    let mut generation = None::<Arc<()>>;
-    let mut history_floor_requires_retry = false;
-    for shard in shards {
-        let pressured = runtime.memory_pressured_gpu_ids.contains(&shard.gpu_id);
-        if shard.schema != table.schema
-            || shard.table != table.name
-            || shard.gpu_id != expected_gpu
-            || !shard.is_valid(pressured)
-            || shard.capacity < shard.row_count
-            || !shard_ids.insert(shard.shard_id)
-        {
-            return Err(decline(
-                "resident INSERT key proof found a pressured, stale, or incomplete shard generation",
-            ));
-        }
-        history_floor_requires_retry |= shard.history_floor_index > original_read_snapshot;
-        let payload = shard.device_memory.as_ref().ok_or_else(|| {
-            decline("resident INSERT key proof found a shard without a device payload")
-        })?;
-        let proof = payload.metadata();
-        if proof.gpu_id != expected_gpu
-            || !proof.retained
-            || proof.copied_bytes > proof.allocated_bytes
-            || shard.device_memory_proof.as_ref() != Some(proof)
-            || !engine.shard_write_locate_cell_live(&table.name, shard.shard_id, payload)
-        {
-            return Err(decline(
-                "resident INSERT key proof found an invalid payload ownership witness",
-            ));
-        }
-        let sidecar_bytes = u64::try_from(shard.capacity)
-            .ok()
-            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<u64>() as u64))
-            .ok_or_else(|| decline("resident INSERT key sidecar extent overflows"))?;
-        let valid_sidecar = |memory: &Arc<gpu_db_execution::CudaResidentDeviceMemory>| {
-            let proof = memory.metadata();
-            proof.gpu_id == expected_gpu
-                && proof.retained
-                && proof.copied_bytes >= sidecar_bytes
-                && proof.copied_bytes <= proof.allocated_bytes
-        };
-        if shard
-            .deleted_by_region
-            .as_ref()
-            .is_some_and(|memory| !valid_sidecar(memory))
-            || shard
-                .created_by_region
-                .as_ref()
-                .is_some_and(|memory| !valid_sidecar(memory))
-            || (shard.max_created_by > 0 && shard.created_by_region.is_none())
-        {
-            return Err(decline(
-                "resident INSERT key proof found incomplete version sidecars",
-            ));
-        }
-        if let Some(current) = generation.as_ref() {
-            if !Arc::ptr_eq(current, &shard.point_route_generation) {
-                return Err(decline(
-                    "resident INSERT key proof found a torn table generation",
-                ));
-            }
-        } else {
-            generation = Some(Arc::clone(&shard.point_route_generation));
-        }
-    }
-    Ok(history_floor_requires_retry)
-}
-
 fn max_scratch_bytes(
     engine: &Engine,
     batch: &TypedInsertBatch,
@@ -415,163 +385,20 @@ fn max_scratch_bytes(
         .iter()
         .filter(|index| index.is_unique_or_primary())
     {
-        let incoming = descriptor_count_for_batch(batch, index).map_err(ExecuteError::Engine)?;
+        let columns = index.resident_constraint_columns(table)?;
+        let incoming = resident_constraint_generation::descriptor_count_for_batch(batch, &columns)
+            .map_err(ExecuteError::Engine)?;
         for shard in shards.iter().filter(|shard| shard.row_count != 0) {
             let snapshot = engine.resident_snapshot_for_shard(shard, table);
-            let resident = descriptor_count_for_resident(table, &snapshot, index)?;
+            let resident = resident_constraint_generation::descriptor_count_for_resident(
+                table, &snapshot, &columns,
+            )?;
             let bytes = insert_resident_key_verdict_scratch_bytes(rows, incoming, resident)
                 .ok_or_else(|| decline("resident INSERT key scratch extent overflows"))?;
             maximum = maximum.max(bytes);
         }
     }
     Ok(maximum)
-}
-
-pub(crate) fn descriptor_count_for_batch(
-    batch: &TypedInsertBatch,
-    index: &IndexBinding,
-) -> Result<usize, EngineError> {
-    let mut validity = BTreeSet::new();
-    for column in index.key_columns() {
-        if batch.row_local_constraint_column_has_validity_bitmap(column.id)? {
-            validity.insert((column.attnum, column.id));
-        }
-    }
-    index
-        .key_columns()
-        .len()
-        .checked_add(validity.len())
-        .ok_or_else(|| {
-            EngineError::ApplyFailed("resident key descriptor count overflows".to_string())
-        })
-}
-
-fn descriptor_count_for_resident(
-    table: &RelationalTable,
-    snapshot: &crate::RelationalResidencySnapshot,
-    index: &IndexBinding,
-) -> Result<usize, ExecuteError> {
-    let mut validity = BTreeSet::new();
-    for column in index.key_columns() {
-        let column_idx = table_column_index(table, column)?;
-        if crate::resident_device_null_column_offset(snapshot, table, column_idx)
-            .map_err(|error| decline(format!("resident key layout declined: {error}")))?
-            .is_some()
-        {
-            validity.insert((column.attnum, column.id));
-        }
-    }
-    index
-        .key_columns()
-        .len()
-        .checked_add(validity.len())
-        .ok_or_else(|| decline("resident key descriptor count overflows"))
-}
-
-pub(crate) fn incoming_columns(
-    source: &TypedInsertConstraintDeviceSource,
-    index: &IndexBinding,
-) -> Result<Vec<CudaCompoundFoldColumn>, EngineError> {
-    let mut descriptors = Vec::with_capacity(index.key_columns().len() * 2);
-    let mut validity = BTreeSet::new();
-    for column in index.key_columns() {
-        let (data, valid) = source.key_column_layout(column.id, &column.name)?;
-        descriptors.push(data);
-        if let Some(offset) = valid {
-            validity.insert((column.attnum, column.id, offset));
-        }
-    }
-    descriptors.extend(
-        validity.into_iter().map(
-            |(_, _, bitmap_byte_offset)| CudaCompoundFoldColumn::Validity { bitmap_byte_offset },
-        ),
-    );
-    Ok(descriptors)
-}
-
-pub(crate) fn resident_columns(
-    engine: &Engine,
-    table: &RelationalTable,
-    shard: &RelationalResidentShard,
-    index: &IndexBinding,
-) -> Result<Vec<CudaCompoundFoldColumn>, ExecuteError> {
-    let snapshot = engine.resident_snapshot_for_shard(shard, table);
-    let mut descriptors = Vec::with_capacity(index.key_columns().len() * 2);
-    let mut validity = BTreeSet::new();
-    for column in index.key_columns() {
-        let column_idx = table_column_index(table, column)?;
-        let data = match column.ty() {
-            SqlType::Int2 | SqlType::Int4 | SqlType::Date => CudaCompoundFoldColumn::Fixed {
-                byte_offset: crate::resident_device_int4_column_offset(
-                    &snapshot, table, column_idx,
-                )
-                .map_err(|error| decline(format!("resident int4 key layout declined: {error}")))?,
-                width_words: 1,
-            },
-            SqlType::Int8 | SqlType::Timestamp => CudaCompoundFoldColumn::Fixed {
-                byte_offset: crate::resident_device_int8_column_offset(
-                    &snapshot, table, column_idx,
-                )
-                .map_err(|error| decline(format!("resident int8 key layout declined: {error}")))?,
-                width_words: 2,
-            },
-            SqlType::Numeric { .. } | SqlType::Uuid => CudaCompoundFoldColumn::Fixed {
-                byte_offset: crate::resident_device_numeric_column_offset(
-                    &snapshot, table, column_idx,
-                )
-                .map_err(|error| decline(format!("resident wide key layout declined: {error}")))?,
-                width_words: 4,
-            },
-            SqlType::Bool => CudaCompoundFoldColumn::Bool {
-                bitmap_byte_offset: crate::resident_device_bool_column_offset(
-                    &snapshot, table, column_idx,
-                )
-                .map_err(|error| decline(format!("resident bool key layout declined: {error}")))?,
-            },
-            SqlType::Text => {
-                let layout =
-                    crate::resident_device_text_column_layout(&snapshot, table, column_idx)
-                        .map_err(|error| {
-                            decline(format!("resident text key layout declined: {error}"))
-                        })?;
-                CudaCompoundFoldColumn::Text {
-                    offsets_byte_offset: layout.offsets_byte_offset,
-                    bytes_byte_offset: layout.bytes_byte_offset,
-                    bytes_len: layout.bytes_len,
-                }
-            }
-        };
-        descriptors.push(data);
-        if let Some(offset) = crate::resident_device_null_column_offset(
-            &snapshot, table, column_idx,
-        )
-        .map_err(|error| decline(format!("resident key validity layout declined: {error}")))?
-        {
-            validity.insert((column.attnum, column.id, offset));
-        }
-    }
-    descriptors.extend(
-        validity.into_iter().map(
-            |(_, _, bitmap_byte_offset)| CudaCompoundFoldColumn::Validity { bitmap_byte_offset },
-        ),
-    );
-    Ok(descriptors)
-}
-
-fn table_column_index(
-    table: &RelationalTable,
-    binding: &KeyColumnBinding,
-) -> Result<usize, ExecuteError> {
-    table
-        .columns
-        .iter()
-        .position(|column| {
-            column.id == binding.id
-                && column.attnum == binding.attnum
-                && column.name == binding.name
-                && column.ty == binding.ty()
-        })
-        .ok_or_else(|| decline("resident key binding lost its catalog column"))
 }
 
 fn decline(message: impl Into<String>) -> ExecuteError {
@@ -591,7 +418,7 @@ mod tests {
         let inner = source
             .split("pub(super) fn validate_current_generation")
             .nth(1)
-            .and_then(|section| section.split("\nfn validate_shard_generation").next())
+            .and_then(|section| section.split("\nfn max_scratch_bytes").next())
             .expect("current-generation validator");
         assert!(inner.contains("predecessor_boundary: Index"));
         assert!(inner.contains("_held_mutation_gate: &MutexGuard"));
@@ -599,6 +426,7 @@ mod tests {
         assert!(!inner.contains("engine.committed_seq()"));
         assert!(!inner.contains("mutation_gate\n        .lock"));
         assert!(inner.contains("ResidentKeyValidationSeal"));
+        assert!(inner.contains("resident_constraint_generation::pin_hot_shard_generation"));
     }
 
     fn proof_only_plan(engine: &Engine, sql: &str) -> super::super::PreparedDeviceInsertPlan {

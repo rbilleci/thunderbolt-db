@@ -12,15 +12,20 @@ fn validate_index_fold_columns(
 ) -> Result<(), CudaRuntimeProbeError> {
     let mut data_columns = 0usize;
     let mut saw_validity = false;
-    let mut validity_offsets = Vec::new();
-    for column in columns {
+    for (ordinal, column) in columns.iter().enumerate() {
         match column {
             CudaCompoundFoldColumn::Validity { bitmap_byte_offset } => {
                 saw_validity = true;
-                if validity_offsets.contains(bitmap_byte_offset) {
+                if columns[..ordinal].iter().any(|prior| {
+                    matches!(
+                        prior,
+                        CudaCompoundFoldColumn::Validity {
+                            bitmap_byte_offset: prior_offset
+                        } if prior_offset == bitmap_byte_offset
+                    )
+                }) {
                     return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
                 }
-                validity_offsets.push(*bitmap_byte_offset);
             }
             _ if saw_validity => {
                 // The raw-key fast path relies on the first descriptor being data. Keeping every
@@ -30,7 +35,7 @@ fn validate_index_fold_columns(
             _ => data_columns += 1,
         }
     }
-    if data_columns == 0 || validity_offsets.len() > data_columns {
+    if data_columns == 0 || columns.len() - data_columns > data_columns {
         return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
     }
     Ok(())
@@ -333,6 +338,38 @@ DONE:
     ret;
 }
 "#;
+
+/// Exact call-local host backing that overlaps one synchronous typed-index build. This excludes
+/// borrowed source/index owners and pooled device leases; it includes every heap owner constructed
+/// by the execution primitive itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaHostScratchGeometry {
+    pub bytes: u64,
+    pub allocation_slots: u64,
+}
+
+/// Allocation-free prediction for the four descriptor vectors plus the NUL-terminated PTX owner
+/// used by one [`CudaResidentDeviceMemory::submit_resident_typed_index_build_status`] call.
+pub fn resident_typed_index_build_host_scratch_geometry(
+    column_count: usize,
+) -> Option<CudaHostScratchGeometry> {
+    if column_count == 0 || u32::try_from(column_count).is_err() {
+        return None;
+    }
+    let descriptor_bytes = column_count
+        .checked_mul(
+            std::mem::size_of::<u64>()
+                .checked_add(std::mem::size_of::<u32>())?
+                .checked_add(std::mem::size_of::<u64>())?
+                .checked_add(std::mem::size_of::<u64>())?,
+        )
+        .and_then(|bytes| u64::try_from(bytes).ok())?;
+    let ptx_bytes = u64::try_from(RESIDENT_INDEX_BUILD_PTX.len().checked_add(1)?).ok()?;
+    Some(CudaHostScratchGeometry {
+        bytes: descriptor_bytes.checked_add(ptx_bytes)?,
+        allocation_slots: 5,
+    })
+}
 
 /// One existing resident index maintained by the multi-index tail-insert kernel.
 #[derive(Debug, Clone)]
@@ -648,8 +685,28 @@ struct NullStreamDrain {
 impl Drop for NullStreamDrain {
     fn drop(&mut self) {
         if self.armed {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "probe-timing"))]
             PREPARED_MULTI_INDEX_DRAINS.with(|drains| drains.set(drains.get() + 1));
+            let _ = self.primary.set_current();
+            unsafe {
+                let _ = (self.primary.cu_stream_synchronize)(std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// Full index builds use the same default stream and pooled-lease discipline as prepared append,
+/// but keep independent test instrumentation so the accepted append proof remains unchanged.
+struct TypedIndexBuildNullStreamDrain {
+    primary: Arc<crate::GpuPrimaryContext>,
+    armed: bool,
+}
+
+impl Drop for TypedIndexBuildNullStreamDrain {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(test)]
+            RESIDENT_TYPED_INDEX_BUILD_DRAINS.with(|drains| drains.set(drains.get() + 1));
             let _ = self.primary.set_current();
             unsafe {
                 let _ = (self.primary.cu_stream_synchronize)(std::ptr::null_mut());
@@ -676,30 +733,78 @@ pub fn resident_typed_indexes_insert_preparation_bytes(
         .checked_add(u64::try_from(verdict_pool).ok()?)
 }
 
-#[cfg(test)]
+/// Exact pooled scratch for one full typed resident-index build: four separately bucketed column
+/// descriptor arrays (`u64`, `u32`, `u64`, `u64`) plus the separately bucketed four-byte verdict.
+/// A full build requires at least one descriptor column, so zero is refused rather than modeled as
+/// a zero-work launch.
+pub fn resident_typed_index_build_preparation_bytes(descriptor_column_count: usize) -> Option<u64> {
+    if descriptor_column_count == 0 {
+        return None;
+    }
+    let descriptor_buckets = [
+        descriptor_column_count.checked_mul(std::mem::size_of::<u64>())?,
+        descriptor_column_count.checked_mul(std::mem::size_of::<u32>())?,
+        descriptor_column_count.checked_mul(std::mem::size_of::<u64>())?,
+        descriptor_column_count.checked_mul(std::mem::size_of::<u64>())?,
+    ];
+    descriptor_buckets
+        .into_iter()
+        .try_fold(0_u64, |total, bytes| {
+            total.checked_add(
+                u64::try_from(crate::cuda_context::checked_output_buffer_bucket(bytes)?).ok()?,
+            )
+        })?
+        .checked_add(
+            u64::try_from(crate::cuda_context::checked_output_buffer_bucket(
+                std::mem::size_of::<u32>(),
+            )?)
+            .ok()?,
+        )
+}
+
+#[cfg(any(test, feature = "probe-timing"))]
 thread_local! {
     static PREPARED_MULTI_INDEX_PREPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PREPARED_MULTI_INDEX_SUBMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PREPARED_MULTI_INDEX_DRAINS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FAIL_PREPARED_MULTI_INDEX_AFTER_LEASES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_PREPARED_MULTI_INDEX_AFTER_LAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RESIDENT_TYPED_INDEX_BUILD_LAUNCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static RESIDENT_TYPED_INDEX_BUILD_DRAINS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FAIL_RESIDENT_TYPED_INDEX_BUILD_AFTER_SETUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_RESIDENT_TYPED_INDEX_BUILD_AFTER_LAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "probe-timing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreparedResidentTypedIndexesInsertCounters {
+pub struct PreparedResidentTypedIndexesInsertCounters {
     pub prepares: u64,
     pub submits: u64,
     pub drains: u64,
 }
 
-#[cfg(test)]
-pub(crate) fn prepared_resident_typed_indexes_insert_counters(
+#[cfg(any(test, feature = "probe-timing"))]
+pub fn prepared_resident_typed_indexes_insert_counters(
 ) -> PreparedResidentTypedIndexesInsertCounters {
     PreparedResidentTypedIndexesInsertCounters {
         prepares: PREPARED_MULTI_INDEX_PREPARES.with(std::cell::Cell::get),
         submits: PREPARED_MULTI_INDEX_SUBMITS.with(std::cell::Cell::get),
         drains: PREPARED_MULTI_INDEX_DRAINS.with(std::cell::Cell::get),
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidentTypedIndexBuildCounters {
+    pub launches: u64,
+    pub drains: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn resident_typed_index_build_counters() -> ResidentTypedIndexBuildCounters {
+    ResidentTypedIndexBuildCounters {
+        launches: RESIDENT_TYPED_INDEX_BUILD_LAUNCHES.with(std::cell::Cell::get),
+        drains: RESIDENT_TYPED_INDEX_BUILD_DRAINS.with(std::cell::Cell::get),
     }
 }
 
@@ -721,6 +826,30 @@ pub(crate) fn fail_next_prepared_resident_typed_indexes_insert_after_launch() {
 #[cfg(test)]
 fn take_fail_after_prepared_multi_index_launch() -> bool {
     FAIL_PREPARED_MULTI_INDEX_AFTER_LAUNCH.with(|fail| fail.replace(false))
+}
+
+/// Inject a return after all typed-index-build descriptor setup has been queued. This isolates
+/// the lease/drain gap before the build kernel is launched.
+#[cfg(test)]
+pub(crate) fn fail_next_resident_typed_index_build_after_setup() {
+    FAIL_RESIDENT_TYPED_INDEX_BUILD_AFTER_SETUP.with(|fail| fail.set(true));
+}
+
+/// Inject a return after a typed-index-build launch has been accepted and before terminal D2H.
+/// Callers must not retry that destination; the test proves only draining and pool reuse.
+#[cfg(test)]
+pub(crate) fn fail_next_resident_typed_index_build_after_launch() {
+    FAIL_RESIDENT_TYPED_INDEX_BUILD_AFTER_LAUNCH.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn take_fail_after_resident_typed_index_build_setup() -> bool {
+    FAIL_RESIDENT_TYPED_INDEX_BUILD_AFTER_SETUP.with(|fail| fail.replace(false))
+}
+
+#[cfg(test)]
+fn take_fail_after_resident_typed_index_build_launch() -> bool {
+    FAIL_RESIDENT_TYPED_INDEX_BUILD_AFTER_LAUNCH.with(|fail| fail.replace(false))
 }
 
 /// Move-only launch ownership for one fused resident-index tail insert.
@@ -751,6 +880,16 @@ pub struct PreparedResidentTypedIndexesInsert {
     cu_launch_kernel: CuLaunchKernel,
 }
 
+/// Host backing retained privately by one prepared multi-index launch token.
+///
+/// The contained `Arc<CudaResidentDeviceAllocation>` values are GPU allocation pins, not host
+/// plan payload. Only their enclosing boxed pointer array is statement-retired host storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreparedResidentTypedIndexesInsertHostRetention {
+    pub owner_array_backing_identity: Option<usize>,
+    pub owner_array_backing_bytes: u64,
+}
+
 // SAFETY: exclusive allocations/leases and `primary` pin the module function; submit/drop rebind
 // that context before CUDA use. The single-consumption token is intentionally not `Sync`.
 unsafe impl Send for PreparedResidentTypedIndexesInsert {}
@@ -763,11 +902,36 @@ impl PreparedResidentTypedIndexesInsert {
             .saturating_add(u64::try_from(self.decline_guard.capacity).unwrap_or(u64::MAX))
     }
 
+    /// Checked host owner-array geometry for pre-WAL retention accounting. The launch keeps no
+    /// host descriptor image: descriptor/decline leases are already GPU-pool accounting.
+    pub fn host_retention_report(
+        &self,
+    ) -> Result<PreparedResidentTypedIndexesInsertHostRetention, CudaRuntimeProbeError> {
+        let elements = self._index_owners.len();
+        let element_size =
+            std::mem::size_of::<Arc<crate::resident_memory::CudaResidentDeviceAllocation>>();
+        if elements == 0 || element_size == 0 {
+            return Ok(PreparedResidentTypedIndexesInsertHostRetention::default());
+        }
+        let bytes = u64::try_from(elements)
+            .ok()
+            .and_then(|elements| {
+                u64::try_from(element_size)
+                    .ok()
+                    .and_then(|element_size| elements.checked_mul(element_size))
+            })
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(elements))?;
+        Ok(PreparedResidentTypedIndexesInsertHostRetention {
+            owner_array_backing_identity: Some(self._index_owners.as_ptr() as usize),
+            owner_array_backing_bytes: bytes,
+        })
+    }
+
     /// Consume the sealed launch exactly once.  All allocation and module-cache work happened
     /// during preparation; this performs only the kernel launch and its bounded four-byte D2H
     /// status fence.
     pub fn submit(mut self) -> Result<CudaResidentIndexStatus, CudaRuntimeProbeError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "probe-timing"))]
         PREPARED_MULTI_INDEX_SUBMITS.with(|submits| submits.set(submits.get() + 1));
         self.primary.set_current()?;
         let mut stream_drain = self
@@ -877,6 +1041,36 @@ impl CudaResidentDeviceMemory {
             gc_boundary,
             dup_tolerant,
         )
+        .map(|(status, _host_scratch)| status)
+    }
+
+    /// Status-bearing build plus an observation of every call-local host backing while those
+    /// owners were simultaneously live. The indexed rollover reservation uses this scalar-only
+    /// result to compare its allocation-free forecast with the execution primitive's actual
+    /// vector capacities; no host pointer or mutation capability escapes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_resident_typed_index_build_status_observed(
+        &self,
+        index: &CudaResidentDeviceMemory,
+        table_mask: u32,
+        hash_shift: u32,
+        columns: &[CudaCompoundFoldColumn],
+        row_count: usize,
+        deleted_by: Option<&CudaResidentDeviceMemory>,
+        gc_boundary: u64,
+        dup_tolerant: bool,
+    ) -> Result<(CudaResidentIndexStatus, CudaHostScratchGeometry), CudaRuntimeProbeError> {
+        self.submit_resident_typed_index_range(
+            index,
+            table_mask,
+            hash_shift,
+            columns,
+            0,
+            row_count,
+            deleted_by,
+            gc_boundary,
+            dup_tolerant,
+        )
     }
 
     /// Insert the appended resident row range into an existing index without host key folding or
@@ -929,6 +1123,7 @@ impl CudaResidentDeviceMemory {
             0,
             dup_tolerant,
         )
+        .map(|(status, _host_scratch)| status)
     }
 
     /// Maintain all supplied named indexes for one appended resident row range in a single GPU
@@ -1185,7 +1380,7 @@ impl CudaResidentDeviceMemory {
             )
         })?;
         check_cuda(unsafe { cu_memset_d8(decline_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "probe-timing"))]
         PREPARED_MULTI_INDEX_PREPARES.with(|prepares| prepares.set(prepares.get() + 1));
         Ok(PreparedResidentTypedIndexesInsert {
             primary,
@@ -1220,7 +1415,7 @@ impl CudaResidentDeviceMemory {
         deleted_by: Option<&CudaResidentDeviceMemory>,
         gc_boundary: u64,
         dup_tolerant: bool,
-    ) -> Result<CudaResidentIndexStatus, CudaRuntimeProbeError> {
+    ) -> Result<(CudaResidentIndexStatus, CudaHostScratchGeometry), CudaRuntimeProbeError> {
         type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
         type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
         type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
@@ -1366,15 +1561,15 @@ impl CudaResidentDeviceMemory {
             }
         }
 
+        let exact_preparation_bytes =
+            resident_typed_index_build_preparation_bytes(columns.len())
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        // Refuse all five separately bucketed leases as one unit before any lease is acquired.
+        // This gives rollover preparation an exact fail-closed peak rather than a partial-build
+        // allocation failure after descriptor ownership has escaped its caller.
+        crate::CudaAllocationScope::ensure_available(exact_preparation_bytes)?;
         let primary = self.primary_arc();
         primary.set_current()?;
-        let offsets_guard = primary.lease_device_buffer_owned(std::mem::size_of_val(&*offsets))?;
-        let widths_guard = primary.lease_device_buffer_owned(std::mem::size_of_val(&*widths))?;
-        let blob_offsets_guard =
-            primary.lease_device_buffer_owned(std::mem::size_of_val(&*blob_offsets))?;
-        let blob_lens_guard =
-            primary.lease_device_buffer_owned(std::mem::size_of_val(&*blob_lens))?;
-        let decline_guard = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
         let cu_memset_d8 = unsafe {
             *primary
                 .lib()
@@ -1402,6 +1597,26 @@ impl CudaResidentDeviceMemory {
                 .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
                 .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
         };
+        // Module resolution can fail and may JIT; resolve it before acquiring the descriptor
+        // leases and before the first default-stream operation, so every later error has one
+        // armed drain owner.
+        let mut ptx = Vec::with_capacity(RESIDENT_INDEX_BUILD_PTX.len() + 1);
+        ptx.extend_from_slice(RESIDENT_INDEX_BUILD_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_resident_typed_index_build", &ptx)?;
+        let offsets_guard = primary.lease_device_buffer_owned(std::mem::size_of_val(&*offsets))?;
+        let widths_guard = primary.lease_device_buffer_owned(std::mem::size_of_val(&*widths))?;
+        let blob_offsets_guard =
+            primary.lease_device_buffer_owned(std::mem::size_of_val(&*blob_offsets))?;
+        let blob_lens_guard =
+            primary.lease_device_buffer_owned(std::mem::size_of_val(&*blob_lens))?;
+        let decline_guard = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
+        // Field/local declaration order is load-bearing: this guard drops before every pooled
+        // lease below on each HtoD, memset, launch, injected, or terminal-D2H error path.
+        let mut stream_drain = TypedIndexBuildNullStreamDrain {
+            primary: Arc::clone(&primary),
+            armed: true,
+        };
         for (guard, ptr, bytes) in [
             (
                 &offsets_guard,
@@ -1427,11 +1642,10 @@ impl CudaResidentDeviceMemory {
             check_cuda(unsafe { cu_memcpy_htod(guard.ptr, ptr, bytes) })?;
         }
         check_cuda(unsafe { cu_memset_d8(decline_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
-
-        let mut ptx = Vec::with_capacity(RESIDENT_INDEX_BUILD_PTX.len() + 1);
-        ptx.extend_from_slice(RESIDENT_INDEX_BUILD_PTX);
-        ptx.push(0);
-        let function = primary.cached_function(c"gpu_db_resident_typed_index_build", &ptx)?;
+        #[cfg(test)]
+        if take_fail_after_resident_typed_index_build_setup() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-1));
+        }
         let mut base_arg = self.device_ptr();
         let mut offsets_arg = offsets_guard.ptr;
         let mut widths_arg = widths_guard.ptr;
@@ -1485,6 +1699,12 @@ impl CudaResidentDeviceMemory {
                 std::ptr::null_mut(),
             )
         })?;
+        #[cfg(test)]
+        RESIDENT_TYPED_INDEX_BUILD_LAUNCHES.with(|launches| launches.set(launches.get() + 1));
+        #[cfg(test)]
+        if take_fail_after_resident_typed_index_build_launch() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-1));
+        }
         // Blocking null-stream DtoH is the completion fence for the build and descriptor leases.
         let mut decline = 0_u32;
         check_cuda(unsafe {
@@ -1494,6 +1714,71 @@ impl CudaResidentDeviceMemory {
                 std::mem::size_of::<u32>(),
             )
         })?;
-        Ok(CudaResidentIndexStatus::from_bits(decline))
+        stream_drain.armed = false;
+        let observed_host_scratch =
+            observed_index_build_host_scratch(&offsets, &widths, &blob_offsets, &blob_lens, &ptx)?;
+        let expected_host_scratch = resident_typed_index_build_host_scratch_geometry(columns.len())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(columns.len()))?;
+        if observed_host_scratch != expected_host_scratch {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
+        }
+        Ok((
+            CudaResidentIndexStatus::from_bits(decline),
+            observed_host_scratch,
+        ))
+    }
+}
+
+fn observed_index_build_host_scratch(
+    offsets: &Vec<u64>,
+    widths: &Vec<u32>,
+    blob_offsets: &Vec<u64>,
+    blob_lens: &Vec<u64>,
+    ptx: &Vec<u8>,
+) -> Result<CudaHostScratchGeometry, CudaRuntimeProbeError> {
+    let bytes = [
+        offsets.capacity().checked_mul(std::mem::size_of::<u64>()),
+        widths.capacity().checked_mul(std::mem::size_of::<u32>()),
+        blob_offsets
+            .capacity()
+            .checked_mul(std::mem::size_of::<u64>()),
+        blob_lens.capacity().checked_mul(std::mem::size_of::<u64>()),
+        Some(ptx.capacity()),
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, bytes| {
+        let bytes = bytes.ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        total
+            .checked_add(
+                u64::try_from(bytes)
+                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(bytes))?,
+            )
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))
+    })?;
+    Ok(CudaHostScratchGeometry {
+        bytes,
+        allocation_slots: 5,
+    })
+}
+
+#[cfg(test)]
+mod host_scratch_tests {
+    use super::*;
+
+    #[test]
+    fn index_build_host_scratch_counts_four_descriptors_and_ptx_owner() {
+        let one = resident_typed_index_build_host_scratch_geometry(1).unwrap();
+        assert_eq!(
+            one.bytes,
+            (std::mem::size_of::<u64>()
+                + std::mem::size_of::<u32>()
+                + std::mem::size_of::<u64>()
+                + std::mem::size_of::<u64>()
+                + RESIDENT_INDEX_BUILD_PTX.len()
+                + 1) as u64
+        );
+        assert_eq!(one.allocation_slots, 5);
+        assert!(one.bytes > 7_500, "PTX backing must be non-vacuous");
+        assert!(resident_typed_index_build_host_scratch_geometry(0).is_none());
     }
 }

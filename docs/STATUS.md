@@ -63,6 +63,153 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   unchanged p50. The card emitted exact canonical completion, removed its isolated target, and outer capture was
   0/0. Independent post-card audit returned **FINAL ACCEPT** with no finding.
 
+## WRITE-001 indexed fixed-rollover checkpoint accepted — 2026-07-28
+
+- The accepted checkpoint extends only the inert test boundary above. Before any WAL or live operation exists, it
+  constructs one complete private fixed-rollover payload generation plus every affected physical index generation,
+  reconciling five raw catalog aliases to four distinct resident directories. All four directories are allocated
+  before the first build, each full zero-based build uses descriptors derived from the private successor payload,
+  and every destination is then independently GPU-located with its sealed raw key or canonical order-sensitive
+  compound fingerprint. Each intended row slot must be present before only scalar probe evidence survives. No
+  row-count header, live operation, WAL record, publication, eligibility bit, or canonical generation changes.
+- Preflight accounts exact persistent payload, MVCC sidecars, and physical-index bytes plus the maximum concurrent
+  scratch of the sequential builds and independent GPU probes. It subtracts that maximum before capacity search,
+  requires named-index space, rejects one byte below the exact peak before the first runtime payload allocation, and
+  proves the exact minimum can produce a one-row successor. The private owner drops index directories before the
+  successor payload and lifecycle guard. First, middle, and last completed-build failure injection leaves the public
+  fingerprint unchanged and permits an immediate complete retry.
+- Full resident-index build preparation now has one exact five-bucket scratch calculator and one all-or-nothing
+  allocation check. Module resolution precedes pooled leases; an armed default-stream drain outlives every queued
+  descriptor/setup/build operation and drops before those leases on setup, launch, injected post-launch, or terminal
+  readback failure. Exact-budget reuse plus a smoke launch and index lookup prove that zero-based launched-error
+  cleanup is non-vacuous. Write-locate now exposes its exact pooled-scratch and bounded-readback geometry; swapped
+  raw directories and reversed compound descriptors both complete all four builds but fail the independent lookup,
+  leave the full public fingerprint unchanged, and permit an immediate clean retry.
+- Focused CUDA tests pass **7/7 engine** and **4/4 execution**, plus the exact write-locate geometry test; ordinary
+  serial suites pass **797/651 engine** and **63/97 execution** (passed/ignored). Workspace all-target/all-feature
+  check, strict engine/execution Clippy,
+  targeted formatting, diff checks, exact source-size review, NULL differential, allocation/drift/atomicity/resource
+  sabotage, and production-ineligibility source guards are clean. The preserved HAZARD artifact is
+  `target/write001-index-rollover-hazard-repair1-20260728`: three serial plus two simultaneous cohorts each pass the
+  same **7 engine + 4 execution** tests, with no CUDA 700/716/717, illegal-address, misaligned-address, or
+  launch-failure signature.
+- The preserved quick A+B screen for repaired runtime tree `25f032d2f0deb643dfcef306b481726e62677609`
+  completed non-canonically. Out-of-L2 raw results were **1,435.3 GB/s** roofline, **1,448.6 GB/s** scalar compare
+  count, **1,465.1 GB/s** constant-mask output, and **1,673.9 M-elem/s** grouped. The three production point-read
+  observations were **271,687,753 / 272,272,973 / 272,742,673 lookups/s**; all pass the floor, with a
+  **272,272,973** median at p50 **114–115us**. Its log is
+  `target/write001-index-rollover-quick-25f032d2-20260728.log`, SHA-256
+  `623d742c393d92f135f1d7026490038e3690896fad07c59da8de93fdd8bb08e9` (**39,212 bytes**).
+- The first pre-card audit correctly rejected frozen tree `1ea88cfe28bc1d66dd5aebb239d4bdac4ec03226`
+  because build/status counts did not prove the contents of all four engine-owned directories. The repaired runtime
+  and sabotage evidence above closed that finding. Independent pre-card re-audit returned **ACCEPT** with no
+  Critical, Major, or Minor finding for HEAD `845999f8e728a0fd23a67eb42a17f397851fb84c`, staged runtime tree
+  `66222cc3bf4ef3493c2128250fa31b4a837a3a7a`, cached-diff SHA-256
+  `e3f89bc4e473c9a145be48a0cc4b690d27b87cd12337eb09548fb78c8bdbf7fd`, and **15 staged paths** without
+  unstaged or untracked source.
+- The one canonical full card for that exact runtime tree is
+  `target/write001-index-rollover-full-66222cc3-20260728.log`, SHA-256
+  `4f2127ddf2e82bacf840c5c466d8377827f7639fb956bea3e631ace42a6ef664` (**48,723 bytes**). Its raw/point/AWS-LC
+  artifacts are `cf761a5c3afab3d4f03d1420a25b35e2dcf614b9d409554a597ad83a839e0bf3`,
+  `07b1de8ebcc2efe2aff5f2437ab40da8239370e38c73e2d427cc2a0a53f579b9`, and
+  `58fe42dd388c1f8eb4003f978e9c8728e1db3feedd48bfdca92698d07e993b61`.
+- Section A measured **1,433.3 GB/s** out-of-L2 roofline, **1,462.0 GB/s** constant-mask output, and
+  **1,674.2 M-elem/s** grouped execution. Section B measured **273,333,866 / 272,526,473 / 263,766,400**
+  lookups/s; all three passed the floor, with a **272,526,473** median and p50 **112–114us**. Section C built
+  48M rows in **463.1s** and measured **246,077,163 lookups/s** at p50/p99/p99.9/max
+  **130/150/156/156us**. Against the preceding accepted checkpoint, the raw and grouped metrics are stable,
+  Section B improves by 2.15%, and Section C changes by -4.37% with p50 +1us; no material regression is evident.
+  The card exited 0, emitted exact
+  `report_card_execution_status=complete mode=full sections=A,B,C canonical=true`, and removed its isolated target.
+  Subsequent ledger edits are documentation-only and retain applicability of this runtime seal; independent
+  post-card audit returned **FINAL ACCEPT** with no Critical, Major, or Minor finding.
+
+## WRITE-001 inert typed-effect and canonical-codec checkpoint accepted — 2026-07-29
+
+- The production-compiled but test-only `PreparedInsertEffectPlan` now parents both autocommit and explicit
+  sequence evidence with the immutable pre-effect typed-statement digest captured during semantic preparation,
+  rather than the legacy SQL/JSON command digest. Stable-OID classification, exact admitted-catalog currentness,
+  explicit snapshot identity, sequence ownership and predecessor chains, and ordered typed `RETURNING` geometry are
+  sealed under the established locks. Complete validation precedes the first typed-vector write, and the terminal
+  drops the sealed batch internally. No live operation, WAL/status append, sequence mutation, device launch,
+  physical row identity, apply, recovery, result buffer, or publication authority was added.
+- The private canonical v1 codec owns one little-endian logical form: a fixed **100-byte** header, exactly **eight**
+  ordered length-delimited sections, and an inclusive **16 MiB** record ceiling. Its statement digest covers
+  catalog-ordered typed input/provenance, NULL/default distinction, target/dependency/domain identity, raw-order
+  indexes and FK supporting-index closure, ordered `RETURNING`, and sequence requests while excluding prepared
+  catalog sequence, transaction parent, receipts, returned outcomes, and private mutable state. Encoder and decoder
+  share whole-section sequence/vector and global catalog identity validators.
+- The strict decoder bounds allocations by remaining bytes, rejects noncanonical tags, lengths, order, bitmap
+  tails, UTF-8 row offsets, temporal carriers, OID/name/type/attnum collisions, sequence geometry/mode/ownership,
+  and fabricated self/external FK index copies, recomputes both logical digests, and byte-compares a canonical
+  model re-encoding. The decoded carrier is private, non-cloneable, and has no conversion to a typed batch,
+  operation, replay, or apply plan. V1 sequence class-name closure intentionally reflects the current `public`
+  namespace; a future multi-schema sequence representation requires an explicit format-version decision.
+- The live resident-append adapter now stops at the shared move-only pre-semantic IR when `RETURNING`, a requested
+  sequence default, or an unsupported constraint requires the compatibility route. Expected catalog/generation,
+  target/arity/parameter binding, and table/column ownership still precede that decline. Scalar defaults therefore
+  execute exactly once; legacy `RETURNING` validation reuses the same typed binder after supplied coercion and
+  before default evaluation. A supplied sequence column remains typed-eligible, while absent FK parents fail
+  closed in direct semantic preparation.
+- Focused evidence passes canonical codec **27/27**, the full typed-batch cohort **67 passed / 11 GPU-required
+  ignored**, pre-WAL effects **42/42**, and the serial all-feature engine library sweep **893 passed / 661
+  GPU-marked ignored**. Workspace all-target/all-feature check and strict Clippy, scoped
+  rustfmt, cached/working whitespace checks, no-live-consumer guards, and source-size review are clean; the largest
+  new production leaf is the **1,484-line** decoder. Independent architecture review returned **ACCEPT** with no
+  unresolved blocker. GPU NULL differential, HAZARD, quick card, full card, recovery, and read-performance gates
+  are inapplicable to this inert pre-WAL/pre-device slice.
+
+## WRITE-001 codec-5 S1--S6 source checkpoint accepted — 2026-07-29
+
+- The private codec-5 aggregate now owns an exact allocation-free layout for one through four ordered mutation
+  chunks followed by one fixed `GPUDBSTATUS2` fragment. Exact fallible body reservation, root-closed chunk/status
+  encoding and decoding, and exact borrowed outer canonical-envelope buffers share the same measured geometry.
+  Boundary, count, flag, root, truncation, trailing-byte, and short/surplus-buffer sabotage fails closed. The
+  physical aggregate remains format/semantics v1 and has no live writer, WAL opcode, recovery, apply, device,
+  result, or publication consumer.
+- Its private executable-semantics draft traverses S1 and S4 across chunk boundaries without assembling either
+  section, then materializes exactly one move-only typed S2 or strict non-INSERT S3 source per statement, compact S4
+  dispositions, ordered S5 published/private sequence evidence, and S6 statement outcomes. Raw S2/S3 bodies exist
+  only in one bounded source scratch and are discarded after strict decode. Family/statement/source ordinals,
+  overlay chains, row/digest parents, sequence predecessor and overwrite facts, outcome/retention closure, exact
+  lengths, swaps, duplicates, omissions, and trailing bytes are hostile-tested. The owner intentionally stops
+  before S7 final-overlay and S8 retained-response authority and exposes no replay conversion.
+- Independent repair audit accepted HEAD `845999f8e728a0fd23a67eb42a17f397851fb84c`, exact staged tree
+  `a17b68e4a994a3339c5e4b56ce8bd620b7edabab`, cached-diff SHA-256
+  `a3291bcfdcaec6af0ee4585797e8a1ac5fb9d8a5ee22623a404e2c0bd1efa159`, and **172 staged paths** with no
+  Critical, Major, or Minor finding. Focused exact-export tests, all-target/all-feature engine check, strict Clippy,
+  formatting, whitespace, source-boundary, and inertness gates passed. GPU/HAZARD and report-card evidence are
+  inapplicable because the checkpoint cannot launch, mutate, persist, replay, publish, or affect the read path.
+
+## WRITE-001 inert shared typed-image checkpoint accepted — 2026-07-30
+
+- One private `GPUDBTYPEDIMAGE2` owner now serves future catalog-ordered final-table images and
+  projection-ordered retained responses without becoming a second INSERT carrier. Its exact 112-byte header,
+  96-byte descriptors, role values, identity/derived sentinels, type/domain metadata, layout/vector digest
+  preimages, validity forms, and value shapes cover all nine supported SQL storage types, supplied NULL
+  placeholders, empty text, and canonical zero-row fixed/bool/text vectors. The v1 canonical record delegates to
+  the same typed-vector grammar, and its accepted bytes remain unchanged.
+- Encoding measurement accounts the exact persistent image and decoded owners plus maximum concurrent descriptor
+  scratch and allocation slots. The populated nine-type fixture is exactly **1,377 encoded bytes**, **1,511
+  decoded-owned bytes**, **864 bytes / one slot** maximum encode and decode scratch, **one encoded slot**, and
+  **23 decoded persistent slots**. Decode validates header/directory/name/vector geometry, scalar domains, NULL
+  placeholders, and digests from borrowed bytes before fallible exact reservations; an internally consistent
+  hostile maximum-column/short-body form proves exactly **zero** descriptor or value reservation attempts.
+- The decoded owner is move-only and exposes only borrowed typed facts: no raw bytes, clone, reencoder, extraction,
+  live WAL/recovery/apply/device/result/publication consumer, or eligibility authority exists. The normative
+  boundary freezes only the S4 numeric form and implemented shared image. S7/S8/replay remain non-wire
+  requirements. The historically named `executable_semantics_v2` S1--S6 source is explicitly provisional
+  semantics-1 debt using a global row range and both-absent canceled/suppressed references; PLAN requires an exact
+  S7 freeze/audit, version-specific reconciliation, and one normative S4 authority before implementation.
+- Independent re-audit accepted HEAD `845999f8e728a0fd23a67eb42a17f397851fb84c`, exact staged tree
+  `bd313d349e5258af33d4f9ac9f9662736b10dfa4`, cached-diff SHA-256
+  `676b6bcb04864f2a36f0ce0e5a056cb6876af1a924c0c2b5d5cb0c23733968aa`, and **177 staged paths** with no
+  Critical, Major, or Minor finding. Fresh exact-export gates pass image **7/7**, canonical v1 **32/32**,
+  aggregate **48/48**, typed batch **82 passed / 11 GPU-required ignored**, all-target/all-feature engine check,
+  strict Clippy, formatting, and diff checks. The applicable full serial engine sweep passes **1,090 / 669 / 0**
+  (passed/ignored/failed). GPU NULL differential, HAZARD, recovery/retry, quick card, and full card are
+  inapplicable because the accepted slice is an unreachable host codec and documentation boundary.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted

@@ -1719,6 +1719,9 @@ impl Engine {
             write_set
                 .tables
                 .extend(reset.dependency_identities.keys().cloned());
+            write_set
+                .table_oids
+                .extend(reset.dependency_identities.values().copied());
             applied.push(AppliedRowMutation::TableReset { reset, write_set });
         }
 
@@ -1735,7 +1738,7 @@ impl Engine {
             match mutation {
                 DecodedTransactionMutation::Insert { row_id, row, .. } => {
                     let mut write_set = WriteSet::default();
-                    write_set.tables.insert(table_name.clone());
+                    write_set.add_table(&table);
                     write_set.add_unique_slots(&table, &row);
                     applied.push(AppliedRowMutation::Insert {
                         table: table_name,
@@ -1752,11 +1755,8 @@ impl Engine {
                 } => {
                     let row_key = relational_row_key(&table_name, row_id);
                     let mut write_set = WriteSet::default();
-                    write_set.tables.insert(table_name.clone());
-                    write_set.rows.push(RowWriteKey {
-                        table: table_name.clone(),
-                        row_key: row_key.clone(),
-                    });
+                    write_set.add_table(&table);
+                    write_set.add_row(&table, row_id, row_key.clone());
                     write_set.add_unique_slots(&table, &old_row);
                     write_set.add_unique_slots(&table, &new_row);
                     let mut deduplicated = WriteSet::default();
@@ -1775,11 +1775,8 @@ impl Engine {
                 } => {
                     let row_key = relational_row_key(&table_name, row_id);
                     let mut write_set = WriteSet::default();
-                    write_set.tables.insert(table_name.clone());
-                    write_set.rows.push(RowWriteKey {
-                        table: table_name.clone(),
-                        row_key: row_key.clone(),
-                    });
+                    write_set.add_table(&table);
+                    write_set.add_row(&table, row_id, row_key.clone());
                     write_set.add_unique_slots(&table, &old_row);
                     applied.push(AppliedRowMutation::Delete {
                         table: table_name,

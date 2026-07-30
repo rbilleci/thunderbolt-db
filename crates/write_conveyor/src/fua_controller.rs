@@ -4,14 +4,18 @@
 //! controller mutex from `select` through successful frame publication and `record_published`.
 //! In particular, a token is not observable until the corresponding physical group is visible.
 
-use std::collections::BTreeMap;
-
 /// Physical frame count selected for a sustained FUA group.
 pub const FUA_CONTROLLER_QD16_FRAGMENTS: usize = 16;
 /// Number of eligible QD16 groups between sparse QD1 probes.
 pub const FUA_CONTROLLER_SUSTAINED_GROUPS: u16 = 512;
 /// A QD1 probe at or below this latency begins or continues verification.
 pub const FUA_CONTROLLER_FAST_NANOS: u64 = 900_000;
+
+/// The controller holds one fixed identity slot for every direct QD1 sample that can still
+/// settle.  This is deliberately an implementation bound rather than a caller-tunable queue:
+/// `select` must choose the sustained physical layout before frame visibility when no slot is
+/// free, and `record_published` must never grow an authority after visibility.
+const FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS: usize = 4096;
 
 /// Persistent physical-backend controller phase.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -198,14 +202,134 @@ pub struct FuaPhysicalController {
     current_generation_ordinal_floor: u64,
     next_publication_ordinal: u64,
     ordinal_exhausted: bool,
-    outstanding: BTreeMap<u64, OutstandingSample>,
+    outstanding: OutstandingSamples,
+    current_generation_nonfast_pending: usize,
+    current_generation_fast_pending: usize,
     telemetry: FuaControllerTelemetry,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct OutstandingSample {
+    publication_ordinal: u64,
     generation: u64,
     kind: FuaControllerSampleKind,
+}
+
+/// Preallocated, bounded authority for QD1 sample identities.  The fixed free-slot stack makes
+/// post-visibility insertion O(1); a bounded linear identity lookup is used only when a later
+/// completion settles its publication ordinal.  The free-slot count is the previsibility capacity
+/// authority.
+#[derive(Debug)]
+struct OutstandingSamples {
+    slots: Box<[OutstandingSampleSlot; FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS]>,
+    free_indices: Box<[u16; FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS]>,
+    free_len: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutstandingSampleSlot {
+    occupied: bool,
+    sample: OutstandingSample,
+}
+
+const EMPTY_OUTSTANDING_SAMPLE: OutstandingSample = OutstandingSample {
+    publication_ordinal: 0,
+    generation: 0,
+    kind: FuaControllerSampleKind::Sparse,
+};
+
+const EMPTY_OUTSTANDING_SAMPLE_SLOT: OutstandingSampleSlot = OutstandingSampleSlot {
+    occupied: false,
+    sample: EMPTY_OUTSTANDING_SAMPLE,
+};
+
+impl OutstandingSamples {
+    fn new() -> Self {
+        let mut free_indices = Box::new([0; FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS]);
+        for (index, free_index) in free_indices.iter_mut().enumerate() {
+            *free_index = index as u16;
+        }
+        Self {
+            slots: Box::new(
+                [EMPTY_OUTSTANDING_SAMPLE_SLOT; FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS],
+            ),
+            free_indices,
+            free_len: FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS,
+            len: 0,
+        }
+    }
+
+    fn has_free_slot(&self) -> bool {
+        self.free_len != 0
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The caller has already made the capacity decision through `has_free_slot` while holding
+    /// the controller mutex.  Do not turn a violation of that previsibility contract into a
+    /// post-visibility fallback: no frame can be made visible from a `Qd1Sample` decision unless
+    /// this fixed authority was available at selection time.
+    fn insert_selected(&mut self, sample: OutstandingSample) {
+        let free_index = self
+            .free_len
+            .checked_sub(1)
+            .expect("select must reserve fixed QD1 identity capacity before publication");
+        self.free_len = free_index;
+        let slot_index = usize::from(self.free_indices[free_index]);
+        let slot = self
+            .slots
+            .get_mut(slot_index)
+            .expect("fixed QD1 free slot index must remain in range");
+        debug_assert!(!slot.occupied);
+        slot.occupied = true;
+        slot.sample = sample;
+        self.len += 1;
+        debug_assert_eq!(
+            self.len + self.free_len,
+            FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS
+        );
+    }
+
+    fn index_of(&self, publication_ordinal: u64) -> Option<usize> {
+        self.slots.iter().position(|slot| {
+            slot.occupied && slot.sample.publication_ordinal == publication_ordinal
+        })
+    }
+
+    fn sample_at(&self, index: usize) -> OutstandingSample {
+        let slot = self
+            .slots
+            .get(index)
+            .expect("outstanding identity index must remain in the fixed arena");
+        debug_assert!(slot.occupied);
+        slot.sample
+    }
+
+    fn remove_at(&mut self, index: usize) -> OutstandingSample {
+        let slot = self
+            .slots
+            .get_mut(index)
+            .expect("outstanding identity index must remain in the fixed arena");
+        debug_assert!(slot.occupied);
+        let sample = slot.sample;
+        slot.occupied = false;
+        self.len -= 1;
+        debug_assert!(self.free_len < FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS);
+        self.free_indices[self.free_len] = index as u16;
+        self.free_len += 1;
+        debug_assert_eq!(
+            self.len + self.free_len,
+            FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS
+        );
+        sample
+    }
 }
 
 impl Default for FuaPhysicalController {
@@ -219,7 +343,9 @@ impl Default for FuaPhysicalController {
             current_generation_ordinal_floor: 0,
             next_publication_ordinal: 0,
             ordinal_exhausted: false,
-            outstanding: BTreeMap::new(),
+            outstanding: OutstandingSamples::new(),
+            current_generation_nonfast_pending: 0,
+            current_generation_fast_pending: 0,
             telemetry: FuaControllerTelemetry::default(),
         };
         controller.refresh_snapshot();
@@ -242,7 +368,7 @@ impl FuaPhysicalController {
             FuaControllerPhase::SustainedSlow if self.has_nonfast_outstanding() => {
                 FuaControllerDecision::PendingProbeCover { fragments }
             }
-            FuaControllerPhase::SustainedSlow if self.no_more_sample_identities() => {
+            FuaControllerPhase::SustainedSlow if !self.can_select_qd1_sample() => {
                 FuaControllerDecision::SustainedEpoch { fragments }
             }
             FuaControllerPhase::SustainedSlow => FuaControllerDecision::Qd1Sample {
@@ -251,13 +377,13 @@ impl FuaPhysicalController {
             FuaControllerPhase::Verify if self.has_nonfast_outstanding() => {
                 FuaControllerDecision::PendingProbeCover { fragments }
             }
-            FuaControllerPhase::Verify if self.no_more_sample_identities() => {
+            FuaControllerPhase::Verify if !self.can_select_qd1_sample() => {
                 FuaControllerDecision::SustainedEpoch { fragments }
             }
             FuaControllerPhase::Verify => FuaControllerDecision::Qd1Sample {
                 kind: FuaControllerSampleKind::Verify,
             },
-            FuaControllerPhase::Fast if self.no_more_sample_identities() => {
+            FuaControllerPhase::Fast if !self.can_select_qd1_sample() => {
                 FuaControllerDecision::SustainedEpoch { fragments }
             }
             FuaControllerPhase::Fast => FuaControllerDecision::Qd1Sample {
@@ -268,6 +394,8 @@ impl FuaPhysicalController {
 
     /// Commit a selected decision after the corresponding physical frames are atomically visible.
     /// The ordinal is allocated here, never at `select`, so failed staging cannot create a token.
+    /// A `Qd1Sample` must be the decision returned by `select` while this controller mutex stayed
+    /// held: that previsibility check is the fixed identity-capacity permit for this call.
     pub fn record_published(
         &mut self,
         decision: FuaControllerDecision,
@@ -320,14 +448,12 @@ impl FuaPhysicalController {
                 } else {
                     self.next_publication_ordinal += 1;
                 }
-                let previous = self.outstanding.insert(
+                self.outstanding.insert_selected(OutstandingSample {
                     publication_ordinal,
-                    OutstandingSample {
-                        generation: self.generation,
-                        kind,
-                    },
-                );
-                debug_assert!(previous.is_none());
+                    generation: self.generation,
+                    kind,
+                });
+                self.record_current_generation_sample(kind);
                 Some(FuaControllerSampleToken {
                     generation: self.generation,
                     publication_ordinal,
@@ -437,19 +563,21 @@ impl FuaPhysicalController {
         token: FuaControllerSampleToken,
         settlement: Settlement,
     ) -> Option<FuaControllerSampleKind> {
-        let Some(issued) = self.outstanding.get(&token.publication_ordinal).copied() else {
+        let Some(index) = self.outstanding.index_of(token.publication_ordinal) else {
             self.telemetry.protocol_faults = self.telemetry.protocol_faults.saturating_add(1);
             self.restart_sustained();
             self.refresh_snapshot();
             return None;
         };
+        let issued = self.outstanding.sample_at(index);
         if issued.generation != token.generation || issued.kind != token.kind {
             self.telemetry.protocol_faults = self.telemetry.protocol_faults.saturating_add(1);
             self.restart_sustained();
             self.refresh_snapshot();
             return None;
         }
-        self.outstanding.remove(&token.publication_ordinal);
+        self.outstanding.remove_at(index);
+        self.remove_current_generation_sample(issued);
         if token.generation != self.generation
             || token.publication_ordinal < self.current_generation_ordinal_floor
             || self.generation_exhausted
@@ -512,18 +640,60 @@ impl FuaPhysicalController {
             self.verify_fast_streak = 0;
             self.sustained_qd16_remaining = FUA_CONTROLLER_SUSTAINED_GROUPS;
             self.current_generation_ordinal_floor = self.next_publication_ordinal;
+            self.current_generation_nonfast_pending = 0;
+            self.current_generation_fast_pending = 0;
             self.telemetry.generation_exhausted = 1;
             self.telemetry.protocol_faults = self.telemetry.protocol_faults.saturating_add(1);
         } else {
             self.generation += 1;
             self.current_generation_ordinal_floor = 0;
+            self.current_generation_nonfast_pending = 0;
+            self.current_generation_fast_pending = 0;
         }
     }
 
     fn has_nonfast_outstanding(&self) -> bool {
-        self.outstanding.values().any(|sample| {
-            sample.generation == self.generation && sample.kind != FuaControllerSampleKind::Fast
-        })
+        self.current_generation_nonfast_pending != 0
+    }
+
+    fn record_current_generation_sample(&mut self, kind: FuaControllerSampleKind) {
+        match kind {
+            FuaControllerSampleKind::Fast => {
+                self.current_generation_fast_pending = self
+                    .current_generation_fast_pending
+                    .checked_add(1)
+                    .expect("fixed Fast identity count must not exceed arena capacity");
+            }
+            FuaControllerSampleKind::Sparse | FuaControllerSampleKind::Verify => {
+                self.current_generation_nonfast_pending = self
+                    .current_generation_nonfast_pending
+                    .checked_add(1)
+                    .expect("fixed serial identity count must not exceed arena capacity");
+            }
+        }
+    }
+
+    fn remove_current_generation_sample(&mut self, sample: OutstandingSample) {
+        if sample.generation != self.generation
+            || sample.publication_ordinal < self.current_generation_ordinal_floor
+            || self.generation_exhausted
+        {
+            return;
+        }
+        match sample.kind {
+            FuaControllerSampleKind::Fast => {
+                self.current_generation_fast_pending = self
+                    .current_generation_fast_pending
+                    .checked_sub(1)
+                    .expect("current Fast sample count must match fixed identity arena");
+            }
+            FuaControllerSampleKind::Sparse | FuaControllerSampleKind::Verify => {
+                self.current_generation_nonfast_pending = self
+                    .current_generation_nonfast_pending
+                    .checked_sub(1)
+                    .expect("current serial sample count must match fixed identity arena");
+            }
+        }
     }
 
     fn kind_is_current(&self, kind: FuaControllerSampleKind) -> bool {
@@ -539,6 +709,10 @@ impl FuaPhysicalController {
 
     fn no_more_sample_identities(&self) -> bool {
         self.generation_exhausted || self.ordinal_exhausted
+    }
+
+    fn can_select_qd1_sample(&self) -> bool {
+        !self.no_more_sample_identities() && self.outstanding.has_free_slot()
     }
 
     fn increment_reason(&mut self, reason: FuaControllerReason) {
@@ -563,20 +737,9 @@ impl FuaPhysicalController {
         self.telemetry.generation_exhausted = u64::from(self.generation_exhausted);
         self.telemetry.ordinal_exhausted = u64::from(self.ordinal_exhausted);
         self.telemetry.pending_qd1_samples = self.outstanding.len() as u64;
-        self.telemetry.current_generation_serial_pending_samples = self
-            .outstanding
-            .values()
-            .filter(|sample| {
-                sample.generation == self.generation && sample.kind != FuaControllerSampleKind::Fast
-            })
-            .count() as u64;
-        self.telemetry.fast_in_flight = self
-            .outstanding
-            .values()
-            .filter(|sample| {
-                sample.generation == self.generation && sample.kind == FuaControllerSampleKind::Fast
-            })
-            .count() as u64;
+        self.telemetry.current_generation_serial_pending_samples =
+            self.current_generation_nonfast_pending as u64;
+        self.telemetry.fast_in_flight = self.current_generation_fast_pending as u64;
         self.telemetry.fast_in_flight_max = self
             .telemetry
             .fast_in_flight_max
@@ -635,6 +798,12 @@ mod tests {
         let mut controller = FuaPhysicalController::default();
         let sparse = reach_sparse(&mut controller);
         assert_eq!(
+            controller
+                .telemetry()
+                .current_generation_serial_pending_samples,
+            1
+        );
+        assert_eq!(
             controller.select(eligible()),
             FuaControllerDecision::PendingProbeCover { fragments: 16 }
         );
@@ -643,6 +812,12 @@ mod tests {
         assert_eq!(telemetry.sustained_qd16_remaining, 0);
         assert_eq!(telemetry.pending_probe_cover_actions, 1);
         controller.observe_qd1_sample(sparse, FUA_CONTROLLER_FAST_NANOS);
+        assert_eq!(
+            controller
+                .telemetry()
+                .current_generation_serial_pending_samples,
+            0
+        );
         assert!(controller.action_reconciliation_ok());
         assert!(controller.sample_reconciliation_ok());
         assert!(controller.is_quiescent());
@@ -664,11 +839,12 @@ mod tests {
     }
 
     #[test]
-    fn fast_pipeline_tracks_in_flight_and_slow_result_restarts_all() {
+    fn fixed_authority_keeps_current_and_stale_identities() {
         let mut controller = FuaPhysicalController::default();
         reach_fast(&mut controller);
         let first = publish(&mut controller).expect("fast token");
         let second = publish(&mut controller).expect("fast token");
+        assert_eq!(controller.outstanding.len(), 2);
         assert_eq!(controller.telemetry().fast_in_flight, 2);
         controller.observe_qd1_sample(first, FUA_CONTROLLER_FAST_NANOS + 1);
         assert_eq!(
@@ -678,8 +854,88 @@ mod tests {
         assert_eq!(controller.telemetry().pending_qd1_samples, 1);
         controller.observe_qd1_sample(second, FUA_CONTROLLER_FAST_NANOS);
         assert_eq!(controller.telemetry().stale_qd1_samples, 1);
+        assert_eq!(controller.outstanding.len(), 0);
         assert!(controller.sample_reconciliation_ok());
         assert!(controller.is_quiescent());
+    }
+
+    #[test]
+    fn full_fixed_authority_selects_sustained_before_visibility_and_reconciles() {
+        let mut controller = FuaPhysicalController::default();
+        reach_fast(&mut controller);
+        let fast_probes_before = controller.telemetry().fast_probes;
+        let mut tokens = Vec::with_capacity(FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS);
+        for _ in 0..FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS {
+            assert_eq!(
+                controller.select(eligible()),
+                FuaControllerDecision::Qd1Sample {
+                    kind: FuaControllerSampleKind::Fast
+                }
+            );
+            tokens.push(publish(&mut controller).expect("fixed identity slot"));
+        }
+        assert_eq!(
+            controller.outstanding.len(),
+            FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS
+        );
+        assert_eq!(
+            controller.select(eligible()),
+            FuaControllerDecision::SustainedEpoch { fragments: 16 },
+            "capacity must choose a safe fragmented layout before any additional frame is visible"
+        );
+        assert!(publish(&mut controller).is_none());
+        assert_eq!(controller.telemetry().protocol_fallback_actions, 0);
+        assert!(controller.action_reconciliation_ok());
+
+        for token in tokens {
+            controller.observe_qd1_sample(token, FUA_CONTROLLER_FAST_NANOS);
+        }
+        assert_eq!(
+            controller.telemetry().fast_probes,
+            fast_probes_before + FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS as u64
+        );
+        assert_eq!(
+            controller.telemetry().fast_in_flight_max,
+            FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS as u64
+        );
+        assert!(controller.sample_reconciliation_ok());
+        assert!(controller.is_quiescent());
+    }
+
+    #[test]
+    fn fixed_authority_record_and_settlement_do_not_allocate_or_grow() {
+        let mut controller = FuaPhysicalController::default();
+        reach_fast(&mut controller);
+        let mut tokens = Vec::with_capacity(FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS);
+
+        crate::test_alloc::assert_no_allocations(|| {
+            for _ in 0..FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS {
+                let decision = controller.select(eligible());
+                let token = controller
+                    .record_published(decision)
+                    .expect("fast decision has preselected fixed identity capacity");
+                tokens.push(token);
+            }
+            for token in tokens.drain(..) {
+                controller.observe_qd1_sample(token, FUA_CONTROLLER_FAST_NANOS);
+            }
+        });
+
+        assert_eq!(controller.outstanding.len(), 0);
+        assert!(controller.action_reconciliation_ok());
+        assert!(controller.sample_reconciliation_ok());
+        assert!(controller.is_quiescent());
+    }
+
+    #[test]
+    fn fixed_authority_source_has_no_dynamic_identity_map() {
+        let source = include_str!("fua_controller.rs");
+        assert!(source.contains("FUA_CONTROLLER_OUTSTANDING_SAMPLE_SLOTS: usize = 4096"));
+        let dynamic_map = concat!("BTree", "Map");
+        assert!(
+            !source.contains(dynamic_map),
+            "QD1 identity authority must remain fixed-capacity after publication"
+        );
     }
 
     #[test]
@@ -850,6 +1106,25 @@ mod tests {
                 FuaControllerDecision::SustainedEpoch { .. }
             ));
         }
+        assert!(controller.is_quiescent());
+    }
+
+    #[test]
+    fn exhausted_generation_settles_prior_same_generation_identity_as_stale() {
+        let mut controller = FuaPhysicalController {
+            phase: FuaControllerPhase::Fast,
+            generation: u64::MAX,
+            ..Default::default()
+        };
+        let first = publish(&mut controller).expect("first Fast token");
+        let stale = publish(&mut controller).expect("second Fast token");
+        controller.observe_qd1_sample(first, FUA_CONTROLLER_FAST_NANOS + 1);
+        assert_eq!(controller.telemetry().generation_exhausted, 1);
+        assert_eq!(controller.telemetry().fast_in_flight, 0);
+
+        controller.observe_qd1_sample(stale, FUA_CONTROLLER_FAST_NANOS);
+        assert_eq!(controller.telemetry().stale_qd1_samples, 1);
+        assert!(controller.sample_reconciliation_ok());
         assert!(controller.is_quiescent());
     }
 }

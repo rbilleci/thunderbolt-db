@@ -1375,11 +1375,21 @@ impl Engine {
         record: &BinaryTransactionRecord,
         ledger: &RecentCommitsLedger,
     ) -> Result<(), ExecuteError> {
+        let catalog = snapshot.transaction_catalog();
         for delta in deltas {
             for table in &delta.foreign_key_dependencies {
                 let conflict_boundary =
                     self.transaction_table_conflict_boundary(snapshot, table, delta.read_snapshot)?;
-                if ledger.table_changed_after(table, conflict_boundary) {
+                let table_oid = catalog
+                    .relational_catalog
+                    .get(table)
+                    .ok_or_else(|| {
+                        ExecuteError::Serialization(format!(
+                            "foreign-key dependency relation \"{table}\" left the transaction catalog"
+                        ))
+                    })?
+                    .oid;
+                if ledger.table_changed_after(table_oid, conflict_boundary) {
                     return Err(ExecuteError::Serialization(format!(
                         "foreign-key dependency relation \"{table}\" changed after transaction conflict boundary {conflict_boundary}"
                     )));
@@ -1387,7 +1397,6 @@ impl Engine {
             }
         }
         type IdentityRows = BTreeMap<String, Vec<(u64, Vec<SqlValue>)>>;
-        let catalog = snapshot.transaction_catalog();
         let mut final_rows = IdentityRows::new();
         let mut removed_rows = IdentityRows::new();
         let mut mutated_ids = BTreeMap::<String, BTreeSet<u64>>::new();

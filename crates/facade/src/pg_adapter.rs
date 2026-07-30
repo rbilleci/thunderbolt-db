@@ -211,9 +211,9 @@ fn parse_pg_non_decimal_numeric(
         if byte == b'_' {
             // PostgreSQL's non-decimal reader permits one separator immediately after the
             // base prefix, but every underscore must lead to a valid base digit.
-            if !digits
+            if digits
                 .get(index + 1)
-                .is_some_and(|next| ascii_digit_value(*next, radix).is_some())
+                .is_none_or(|next| ascii_digit_value(*next, radix).is_none())
             {
                 return Err(NumericCodecFailure::Invalid);
             }

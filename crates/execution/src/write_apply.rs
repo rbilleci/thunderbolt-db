@@ -1,6 +1,20 @@
 use crate::{check_cuda, CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError};
 use std::{ffi::c_void, sync::Arc};
 
+mod prepared_fused;
+#[cfg(test)]
+pub(crate) use prepared_fused::{
+    fail_next_prepared_i32_fused_apply_after_launch,
+    fail_next_prepared_i32_fused_apply_after_status,
+    fail_next_prepared_i32_fused_apply_before_header,
+};
+pub use prepared_fused::{
+    i32_fused_apply_footprint_for_shape, FusedApplyPreparation, FusedApplyPreparationFootprint,
+    PreparedI32FusedApply, PreparedI32FusedApplyHostRetention, PreparedI32FusedHeader,
+};
+#[cfg(any(test, feature = "probe-timing"))]
+pub use prepared_fused::{prepared_i32_fused_apply_counters, PreparedI32FusedApplyCounters};
+
 #[derive(Debug, Clone)]
 pub struct CudaWriteDestination {
     pub memory: Arc<CudaResidentDeviceMemory>,
@@ -146,11 +160,17 @@ type CuStreamSync = unsafe extern "C" fn(*mut c_void) -> i32;
 struct DefaultStreamDrain {
     sync: CuStreamSync,
     armed: bool,
+    #[cfg(any(test, feature = "probe-timing"))]
+    drain_counter: Option<fn()>,
 }
 
 impl Drop for DefaultStreamDrain {
     fn drop(&mut self) {
         if self.armed {
+            #[cfg(any(test, feature = "probe-timing"))]
+            if let Some(counter) = self.drain_counter {
+                counter();
+            }
             unsafe { (self.sync)(std::ptr::null_mut()) };
         }
     }
@@ -881,6 +901,8 @@ impl CudaResidentDeviceMemory {
         let mut stream_drain = DefaultStreamDrain {
             sync: cu_stream_sync,
             armed: true,
+            #[cfg(any(test, feature = "probe-timing"))]
+            drain_counter: None,
         };
         check_cuda(unsafe {
             cu_launch_kernel(
@@ -1044,6 +1066,8 @@ impl CudaResidentDeviceMemory {
         let mut stream_drain = DefaultStreamDrain {
             sync: cu_stream_sync,
             armed: true,
+            #[cfg(any(test, feature = "probe-timing"))]
+            drain_counter: None,
         };
         check_cuda(unsafe {
             cu_launch_kernel(
@@ -1336,6 +1360,8 @@ impl CudaResidentDeviceMemory {
         let mut stream_drain = DefaultStreamDrain {
             sync: cu_stream_sync,
             armed: true,
+            #[cfg(any(test, feature = "probe-timing"))]
+            drain_counter: None,
         };
         check_cuda(unsafe {
             cu_launch_kernel(

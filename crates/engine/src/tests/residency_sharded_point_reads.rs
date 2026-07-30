@@ -244,11 +244,11 @@ fn sharded_point_batch_matches_single_flight_route() {
     for i in 0..needles.len() {
         assert_eq!(cached.needle_range(i), proj.needle_range(i));
     }
-    let compat_select = match parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap()
-    {
-        Command::Select(select) => select,
-        other => panic!("expected SELECT, got {other:?}"),
-    };
+    let compat_select =
+        match parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap() {
+            Command::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
     let compat_template = e
         .prepare_relational_retained_read_template(&compat_select)
         .unwrap();
@@ -267,11 +267,8 @@ fn sharded_point_batch_matches_single_flight_route() {
     // remain reusable; comparing the outer database-global shard-map Arc would miss here and restore O(shards).
     e.execute_text(10_000, "CREATE TABLE route_other (id INT, value INT)")
         .unwrap();
-    e.execute_text(
-        10_001,
-        "INSERT INTO route_other (id, value) VALUES (1, 10)",
-    )
-    .unwrap();
+    e.execute_text(10_001, "INSERT INTO route_other (id, value) VALUES (1, 10)")
+        .unwrap();
     let unrelated_hb = e.sharded_point_route_cache_hits();
     e.gather_sharded_int4_point_lookups_batched(
         e.committed_seq(),
@@ -340,13 +337,12 @@ fn sharded_point_batch_matches_single_flight_route() {
         .expect("projection-churn GPU route completed")
         .expect("projection-churn shape served");
         assert_eq!(
-            e.read_state
-                .residency
-                .sharded_point_routes
-                .load()
-                .keys()
-                .filter(|(name, _, _)| name == "accounts")
-                .count(),
+            usize::from(
+                e.read_state
+                    .residency
+                    .sharded_point_route_for_table("accounts")
+                    .is_some()
+            ),
             1,
             "one deterministic prepared shape per table"
         );
@@ -354,26 +350,13 @@ fn sharded_point_batch_matches_single_flight_route() {
     let route_bytes = e
         .read_state
         .residency
-        .sharded_point_routes
-        .load()
-        .values()
-        .filter(|route| route.gpu_id == 0)
-        .map(|route| route.plan.descriptor_allocated_bytes())
-        .sum::<u64>();
-    assert!(route_bytes > 0, "prepared descriptor allocation is non-vacuous");
+        .sharded_point_route_descriptor_bytes_for_gpu(0);
+    assert!(
+        route_bytes > 0,
+        "prepared descriptor allocation is non-vacuous"
+    );
     let with_route = e.relational_resident_bytes_for_gpu(0);
-    {
-        let _publish = e
-            .read_state
-            .residency
-            .sharded_point_route_publish_lock
-            .lock()
-            .unwrap();
-        e.read_state
-            .residency
-            .sharded_point_routes
-            .store(std::sync::Arc::new(Default::default()));
-    }
+    e.read_state.residency.clear_sharded_point_routes_for_test();
     let without_route = e.relational_resident_bytes_for_gpu(0);
     assert_eq!(
         with_route.saturating_sub(without_route),
@@ -391,7 +374,7 @@ fn sharded_point_batch_matches_single_flight_route() {
     .expect("no-headroom GPU route completed")
     .expect("no-headroom route still serves transiently");
     assert!(
-        e.read_state.residency.sharded_point_routes.load().is_empty(),
+        e.read_state.residency.sharded_point_route_count() == 0,
         "prepared descriptor is not retained beyond the hard residency budget"
     );
 
@@ -602,8 +585,8 @@ fn sharded_point_batch_declines_on_null_bearing() {
     );
 }
 
-/// PERF-001 audit regressions: a route prepared against G0 cannot republish after G1 wins, and injected
-/// CUDA failures remain typed errors rather than ordinary declines that a caller could retry elsewhere.
+/// PERF-001 audit regressions: a route prepared against G0 cannot republish *or submit* after G1 wins, and
+/// injected CUDA failures remain typed errors rather than ordinary declines that a caller could retry elsewhere.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn sharded_point_route_publication_and_cuda_failures_fail_closed() {
@@ -625,8 +608,7 @@ fn sharded_point_route_publication_and_cuda_failures_fail_closed() {
     }
     let table = e.relational_catalog_table("route_race").unwrap();
     let id = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
-    let balance =
-        crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
+    let balance = crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
     let old_generation = std::sync::Arc::clone(
         &e.read_state.residency.shards.load()["route_race"][0].point_route_generation,
     );
@@ -662,19 +644,19 @@ fn sharded_point_route_publication_and_cuda_failures_fail_closed() {
         "same-table publication rotates the O(1) generation token"
     );
     resume.wait();
-    let old_read = reader
-        .join()
-        .expect("reader thread")
-        .expect("old prepared GPU read completed")
-        .expect("old prepared GPU read remained semantically eligible");
-    assert_eq!(old_read.values, vec![5, 50]);
+    assert!(
+        reader
+            .join()
+            .expect("reader thread")
+            .expect("old prepared GPU read completed")
+            .is_none(),
+        "a plan whose G0 authority retired before pre-publish must decline before submission"
+    );
     assert!(
         e.read_state
             .residency
-            .sharded_point_routes
-            .load()
-            .keys()
-            .all(|(table, _, _)| table != "route_race"),
+            .sharded_point_route_for_table("route_race")
+            .is_none(),
         "G0 reader must not republish its retired plan after G1 publication"
     );
 
@@ -689,8 +671,11 @@ fn sharded_point_route_publication_and_cuda_failures_fail_closed() {
     )
     .expect("current route completed")
     .expect("current route served");
-    for (phase, projection) in [(1_u8, vec![id]), (2, vec![id, balance]), (3, vec![id, balance])]
-    {
+    for (phase, projection) in [
+        (1_u8, vec![id]),
+        (2, vec![id, balance]),
+        (3, vec![id, balance]),
+    ] {
         let served_before = e.sharded_point_batch_hits();
         e.force_next_sharded_point_cuda_failure(phase);
         let err = e
@@ -711,17 +696,20 @@ fn sharded_point_route_publication_and_cuda_failures_fail_closed() {
     }
 }
 
-/// An index builder paused after CUDA construction cannot republish a retired table generation after DROP's
-/// route/index purge. The completed allocation may serve only the already-captured attempt transiently; it must
-/// never re-enter the durable index map and pin the dropped payload outside residency accounting.
+/// An index builder paused after CUDA construction cannot republish or submit a retired table generation after
+/// DROP's route/index purge. It must never re-enter the durable index map and pin the dropped payload outside
+/// residency accounting.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn sharded_point_index_build_cannot_republish_after_drop() {
     let e = std::sync::Arc::new(Engine::new_local());
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.execute_text(1, "CREATE TABLE dropped_build (id INT PRIMARY KEY, value INT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE dropped_build (id INT PRIMARY KEY, value INT)",
+    )
+    .unwrap();
     e.execute_text(
         2,
         "INSERT INTO dropped_build (id, value) VALUES (1, 10), (2, 20)",
@@ -779,16 +767,132 @@ fn sharded_point_index_build_cannot_republish_after_drop() {
     );
 }
 
+/// The point-route builder owns a pre-publication GPU plan while DDL can remove the old slot and
+/// recreate its name with a new OID. The stale builder must decline before submission and can
+/// never cache through the replacement table's slot or epoch.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn sharded_point_route_drop_recreate_cannot_cross_the_catalog_slot_fence() {
+    let e = std::sync::Arc::new(Engine::new_local());
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE point_slot_drop_race (id INT PRIMARY KEY, value INT)",
+    )
+    .unwrap();
+    e.execute_text(2, "INSERT INTO point_slot_drop_race VALUES (1, 10)")
+        .unwrap();
+    let old_table = e.relational_catalog_table("point_slot_drop_race").unwrap();
+    let id = crate::rel_exec_helpers::relational_column_index(&old_table, "id").unwrap();
+    let value = crate::rel_exec_helpers::relational_column_index(&old_table, "value").unwrap();
+    let old_epoch = e
+        .read_state
+        .residency
+        .point_index_mutation_epoch_for_table(&e.read_state, &old_table)
+        .expect("the old table owns its slot before the paused build");
+    let old_slot = e
+        .read_state
+        .residency
+        .table_point_slot("point_slot_drop_race", old_table.oid)
+        .expect("retain the old table slot through DROP/recreate");
+    let old_identity = std::sync::Arc::clone(&old_slot.slot_identity);
+
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    e.set_sharded_point_route_pre_publish_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let builder_engine = std::sync::Arc::clone(&e);
+    let builder_table = old_table.clone();
+    let builder = std::thread::spawn(move || {
+        builder_engine.gather_sharded_int4_point_lookups_batched(
+            builder_engine.committed_seq(),
+            &builder_table,
+            id,
+            &[id, value],
+            &[1],
+        )
+    });
+    reached.wait();
+    e.execute_text(3, "DROP TABLE point_slot_drop_race").unwrap();
+    e.execute_text(
+        4,
+        "CREATE TABLE point_slot_drop_race (id INT PRIMARY KEY, value INT)",
+    )
+    .unwrap();
+    let replacement_table = e.relational_catalog_table("point_slot_drop_race").unwrap();
+    assert_ne!(replacement_table.oid, old_table.oid);
+    assert!(
+        e.read_state
+            .residency
+            .table_point_slot("point_slot_drop_race", old_table.oid)
+            .is_none(),
+        "the dropped OID is no longer reachable under the recreated name"
+    );
+    resume.wait();
+    assert!(
+        builder
+            .join()
+            .expect("paused old builder joins")
+            .expect("stale builder completed")
+            .is_none(),
+        "the dropped builder declines before submitting its captured plan"
+    );
+    assert!(
+        e.read_state
+            .residency
+            .sharded_point_route_for_table("point_slot_drop_race")
+            .is_none(),
+        "the old builder cannot cache its route through the recreated catalog entry"
+    );
+    assert!(old_slot.sharded_route.load().is_none());
+    assert!(old_slot.compound_route.load().is_none());
+
+    e.execute_text(5, "INSERT INTO point_slot_drop_race VALUES (2, 20)")
+        .unwrap();
+    let replacement_id =
+        crate::rel_exec_helpers::relational_column_index(&replacement_table, "id").unwrap();
+    let replacement_value =
+        crate::rel_exec_helpers::relational_column_index(&replacement_table, "value").unwrap();
+    let fresh = e
+        .gather_sharded_int4_point_lookups_batched(
+            e.committed_seq(),
+            &replacement_table,
+            replacement_id,
+            &[replacement_id, replacement_value],
+            &[2],
+        )
+        .expect("fresh recreated-table GPU route completes")
+        .expect("fresh recreated-table GPU route is eligible");
+    assert_eq!(fresh.values, vec![2, 20]);
+    let replacement_slot = e
+        .read_state
+        .residency
+        .table_point_slot("point_slot_drop_race", replacement_table.oid)
+        .expect("fresh binding installs only the replacement slot");
+    assert!(!std::sync::Arc::ptr_eq(&old_slot, &replacement_slot));
+    assert!(!std::sync::Arc::ptr_eq(&old_epoch, &replacement_slot.index_epoch));
+    assert!(!std::sync::Arc::ptr_eq(
+        &old_identity,
+        &replacement_slot.slot_identity
+    ));
+}
+
 /// Direct descriptor invalidation is itself a table-generation publication. A reader paused after preparing
-/// G0 cannot republish that route after the invalidated G1 descriptor wins.
+/// G0 cannot republish or submit that route after the invalidated G1 descriptor wins.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn sharded_point_route_invalidation_rotates_generation_before_purge() {
     let e = std::sync::Arc::new(Engine::new_local());
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.execute_text(1, "CREATE TABLE invalidation_race (id INT PRIMARY KEY, value INT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE invalidation_race (id INT PRIMARY KEY, value INT)",
+    )
+    .unwrap();
     e.execute_text(
         2,
         "INSERT INTO invalidation_race (id, value) VALUES (1, 10), (2, 20)",
@@ -798,8 +902,7 @@ fn sharded_point_route_invalidation_rotates_generation_before_purge() {
     let id = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
     let value = crate::rel_exec_helpers::relational_column_index(&table, "value").unwrap();
     let old_generation = std::sync::Arc::clone(
-        &e.read_state.residency.shards.load()["invalidation_race"][0]
-            .point_route_generation,
+        &e.read_state.residency.shards.load()["invalidation_race"][0].point_route_generation,
     );
 
     let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -825,24 +928,162 @@ fn sharded_point_route_invalidation_rotates_generation_before_purge() {
         e.committed_seq().saturating_add(1),
     );
     let invalid_generation = std::sync::Arc::clone(
-        &e.read_state.residency.shards.load()["invalidation_race"][0]
-            .point_route_generation,
+        &e.read_state.residency.shards.load()["invalidation_race"][0].point_route_generation,
     );
     assert!(!std::sync::Arc::ptr_eq(
         &old_generation,
         &invalid_generation
     ));
     resume.wait();
-    let old = reader.join().unwrap().unwrap().unwrap();
-    assert_eq!(old.values, vec![1, 10], "already-captured G0 remains valid");
+    assert!(
+        reader.join().unwrap().unwrap().is_none(),
+        "a plan whose descriptor generation was invalidated before pre-publish declines before submission"
+    );
     assert!(
         e.read_state
             .residency
-            .sharded_point_routes
-            .load()
-            .keys()
-            .all(|(table, _, _)| table != "invalidation_race"),
+            .sharded_point_route_for_table("invalidation_race")
+            .is_none(),
         "G0 cannot republish over the invalidated G1 token"
+    );
+}
+
+/// A same-OID DDL publication clears the previous route but keeps the relation name and column positions
+/// plausible. A stale caller must therefore fail the complete-shape fence before GPU construction, and it
+/// must not fast-hit the current route that a newer boundary later installs. The Arc retained before the cut
+/// remains independently executable: this distinguishes safe pre-cut ownership from post-cut cache reuse.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn sharded_point_same_oid_ddl_fences_stale_boundary_before_build_or_launch() {
+    let e = Engine::new_local();
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE same_oid_point_fence (id INT PRIMARY KEY, value INT)",
+    )
+    .unwrap();
+    e.execute_text(2, "INSERT INTO same_oid_point_fence VALUES (1, 10)")
+        .unwrap();
+    let old_boundary = e.committed_seq();
+    let old_table = e.relational_catalog_table("same_oid_point_fence").unwrap();
+    let id = crate::rel_exec_helpers::relational_column_index(&old_table, "id").unwrap();
+    let value = crate::rel_exec_helpers::relational_column_index(&old_table, "value").unwrap();
+
+    e.gather_sharded_int4_point_lookups_batched(
+        old_boundary,
+        &old_table,
+        id,
+        &[id, value],
+        &[1],
+    )
+    .expect("pre-cut route completed")
+    .expect("pre-cut route served");
+    let pre_cut_route = e
+        .read_state
+        .residency
+        .sharded_point_route_for_table("same_oid_point_fence")
+        .expect("retain the warmed pre-cut route Arc");
+
+    e.execute_text(
+        3,
+        "CREATE INDEX same_oid_point_fence_value ON same_oid_point_fence (value)",
+    )
+    .unwrap();
+    let current_table = e.relational_catalog_table("same_oid_point_fence").unwrap();
+    assert_eq!(current_table.oid, old_table.oid, "CREATE INDEX preserves table OID");
+    assert!(
+        e.read_state
+            .residency
+            .sharded_point_route_for_table("same_oid_point_fence")
+            .is_none(),
+        "same-OID catalog-shape publication clears the old slot route"
+    );
+
+    // The stale descriptor has the same name/OID and its slot was just cleared. Phase 1 is consumed only by
+    // a GPU construction attempt, so the following current caller proves this stale call declined before it
+    // built or launched anything.
+    e.force_next_sharded_point_cuda_failure(1);
+    assert!(
+        e.gather_sharded_int4_point_lookups_batched(
+            old_boundary,
+            &old_table,
+            id,
+            &[id, value],
+            &[1],
+        )
+        .expect("stale same-OID call completed")
+        .is_none(),
+        "a cleared slot plus stale same-OID table fails before route build"
+    );
+    let current_boundary = e.committed_seq();
+    let injected = e
+        .gather_sharded_int4_point_lookups_batched(
+            current_boundary,
+            &current_table,
+            id,
+            &[id, value],
+            &[1],
+        )
+        .expect_err("the stale call must leave phase-1 failure for the current builder");
+    assert!(
+        injected
+            .to_string()
+            .contains("GPU prepared shard point-route construction"),
+        "phase 1 proves the current call, not the stale call, reached construction"
+    );
+
+    // A retained G0 Arc owns all of its device resources and may finish after the cut. It is not a cache hit
+    // through the G1 table slot, and therefore cannot make a post-DDL caller observe stale catalog shape.
+    let (pre_cut_cols, _) = pre_cut_route
+        .launch_resident
+        .submit_prepared_multi_shard_i32_index_probe_dense(&pre_cut_route.plan, &[1], old_boundary)
+        .expect("retained pre-cut plan submits independently")
+        .complete_detached_columnar_compact()
+        .expect("retained pre-cut plan completes independently");
+    assert_eq!(pre_cut_cols.status(), &[1]);
+
+    let current = e
+        .gather_sharded_int4_point_lookups_batched(
+            current_boundary,
+            &current_table,
+            id,
+            &[id, value],
+            &[1],
+        )
+        .expect("current same-OID route completed")
+        .expect("current same-OID route served");
+    assert_eq!(current.values, vec![1, 10]);
+    e.gather_sharded_int4_point_lookups_batched(
+        current_boundary,
+        &current_table,
+        id,
+        &[id, value],
+        &[1],
+    )
+    .expect("current retained route completed")
+    .expect("current retained route served");
+    let cache_hits_before_stale = e.sharded_point_route_cache_hits();
+
+    // G1 has now rebuilt the same route key and generation for the same OID. The `latest_catalog` boundary
+    // guard forces this old S caller through `ensure_table_point_slot`, whose full relation comparison rejects
+    // the old index shape; it cannot fast-hit G1's route.
+    assert!(
+        e.gather_sharded_int4_point_lookups_batched(
+            old_boundary,
+            &old_table,
+            id,
+            &[id, value],
+            &[1],
+        )
+        .expect("old-boundary call against G1 route completed")
+        .is_none(),
+        "old boundary cannot fast-hit a current same-key route after same-OID DDL"
+    );
+    assert_eq!(
+        e.sharded_point_route_cache_hits(),
+        cache_hits_before_stale,
+        "stale boundary did not consume the current cached route"
     );
 }
 
@@ -908,8 +1149,11 @@ fn sharded_point_route_publication_waits_for_budget_transaction() {
     let e = std::sync::Arc::new(Engine::new_local());
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.execute_text(1, "CREATE TABLE route_budget (id INT PRIMARY KEY, value INT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE route_budget (id INT PRIMARY KEY, value INT)",
+    )
+    .unwrap();
     e.execute_text(2, "INSERT INTO route_budget (id, value) VALUES (1, 10)")
         .unwrap();
     let table = e.relational_catalog_table("route_budget").unwrap();
@@ -947,7 +1191,7 @@ fn sharded_point_route_publication_waits_for_budget_transaction() {
             .is_err(),
         "route publication must wait behind the active budget transaction"
     );
-    assert!(e.read_state.residency.sharded_point_routes.load().is_empty());
+    assert_eq!(e.read_state.residency.sharded_point_route_count(), 0);
     drop(budget);
     assert_eq!(
         done_rx
@@ -958,7 +1202,7 @@ fn sharded_point_route_publication_waits_for_budget_transaction() {
             .values,
         vec![1, 10]
     );
-    assert_eq!(e.read_state.residency.sharded_point_routes.load().len(), 1);
+    assert_eq!(e.read_state.residency.sharded_point_route_count(), 1);
 }
 
 /// SUB-SLICE 8 v3 (O(1) routing) — the BINARY-SEARCH route at DEPTH across many ascending-disjoint shards.
@@ -1139,10 +1383,8 @@ fn sharded_point_batch_deleted_by_gate() {
         assert!(
             t.read_state
                 .residency
-                .sharded_point_routes
-                .load()
-                .keys()
-                .all(|(cached_table, _, _)| cached_table != "accounts"),
+                .sharded_point_route_for_table("accounts")
+                .is_none(),
             "index replacement retires the route before removing its accounted index owner"
         );
         assert!(
@@ -1152,8 +1394,8 @@ fn sharded_point_batch_deleted_by_gate() {
         resume.wait();
         reader.join().expect("old-boundary reader thread")
     })
-        .expect("old-boundary GPU route completed")
-        .expect("old-boundary deleted-row probe served");
+    .expect("old-boundary GPU route completed")
+    .expect("old-boundary deleted-row probe served");
     assert_eq!(
         old_deleted.values,
         vec![130, 1_300],
@@ -1162,8 +1404,8 @@ fn sharded_point_batch_deleted_by_gate() {
 
     // A losing preparer can pin an index between ensure() and route publication. Rebuild a narrow current
     // index, clear only its route, pause a current-boundary two-column plan, then let an older one-column shape
-    // replace the index and publish. The paused plan remains safe for its own read but must fail the under-lock
-    // index-identity check and leave the older, accounted route in the global cache.
+    // replace the index and publish. The paused plan must fail the under-lock index-identity check, decline
+    // before submission, and leave the older, accounted route in the global cache.
     t.read_state
         .residency
         .purge_shard_pk_index_for_table("accounts");
@@ -1176,18 +1418,7 @@ fn sharded_point_batch_deleted_by_gate() {
     )
     .expect("rebuild current-boundary route")
     .expect("current-boundary route served");
-    {
-        let _publish = t
-            .read_state
-            .residency
-            .sharded_point_route_publish_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        t.read_state
-            .residency
-            .sharded_point_routes
-            .store(std::sync::Arc::new(Default::default()));
-    }
+    t.read_state.residency.clear_sharded_point_routes_for_test();
     let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
     let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
     t.set_sharded_point_route_pre_publish_hook(
@@ -1217,22 +1448,20 @@ fn sharded_point_batch_deleted_by_gate() {
             .expect("older competing route served");
         assert_eq!(older_shape.values, vec![130]);
         resume.wait();
-        let current_result = current_reader
-            .join()
-            .expect("current-boundary reader thread")
-            .expect("current-boundary losing plan completed")
-            .expect("current-boundary losing plan served transiently");
-        assert_eq!(current_result.needle_range(0).1, 0);
+        assert!(
+            current_reader
+                .join()
+                .expect("current-boundary reader thread")
+                .expect("current-boundary losing plan completed")
+                .is_none(),
+            "a losing plan must not submit after its prepared index was replaced"
+        );
     });
     assert!(
         t.read_state
             .residency
-            .sharded_point_routes
-            .load()
-            .keys()
-            .any(|(cached_table, _, projection)| {
-                cached_table == "accounts" && projection.as_slice() == [id_col]
-            }),
+            .sharded_point_route_for_table("accounts")
+            .is_some_and(|route| route.route_key.1.as_slice() == [id_col]),
         "the losing newer-boundary plan cannot replace the accounted older route"
     );
 
@@ -1314,5 +1543,57 @@ fn sharded_point_batch_deleted_by_gate() {
     assert!(
         t.sharded_point_gpu_probe_hits() >= gpu_before_birth_checks + 2,
         "both snapshot-bound checks fired the fully-GPU dense probe"
+    );
+}
+
+/// CPU-visible ownership guard for the latency fast path. The ignored GPU race covers runtime behavior; this
+/// guard keeps the critical source ordering explicit when that hardware gate is unavailable.
+#[test]
+fn sharded_point_cached_route_fast_path_keeps_shape_and_submission_fences() {
+    let source = include_str!("../engine_retained_read/shard_point_lookup.rs");
+    let function = &source[source
+        .find("fn gather_sharded_int4_point_lookups_batched_gpu(")
+        .expect("sharded point helper exists")..];
+    let fast_path = function
+        .find("let fast_cached_route")
+        .expect("exact cached-route fast path exists");
+    let full_shape_fence = function
+        .find("ensure_table_point_slot(&self.read_state, table)")
+        .expect("all non-fast paths use complete table equality");
+    let prepare = function
+        .find("let prepared_route")
+        .expect("GPU plan preparation exists");
+    assert!(
+        fast_path < full_shape_fence && full_shape_fence < prepare,
+        "the fast path is distinct, and every miss reaches full-shape ensure before GPU preparation"
+    );
+    let fast_source = &function[fast_path..full_shape_fence];
+    for required in [
+        "latest_catalog.commit_seq == read_boundary",
+        "table_point_slot(&table.name, table.oid)",
+        "table_point_slot_is_current",
+        "entry.route_key == route_key",
+        "Arc::ptr_eq(&entry.table_generation, &table_generation)",
+        "entry.read_boundary <= read_boundary",
+        "memory_pressured_gpu_ids",
+    ] {
+        assert!(
+            fast_source.contains(required),
+            "fast cached route retains required proof: {required}"
+        );
+    }
+    let final_currentness = function
+        .find("if !(generation_is_current")
+        .expect("final under-lock currentness gate exists");
+    let submit = function
+        .find("submit_prepared_multi_shard_i32_index_probe_dense")
+        .expect("GPU submission exists");
+    let final_source = &function[final_currentness..submit];
+    assert!(
+        final_source.contains("slot_is_current")
+            && final_source.contains("catalog_is_current")
+            && final_source.contains("indexes_are_current")
+            && final_source.contains("return Ok(None);"),
+        "any final authority drift declines before the prepared plan can submit"
     );
 }

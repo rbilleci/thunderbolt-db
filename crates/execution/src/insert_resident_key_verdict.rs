@@ -125,7 +125,7 @@ fn invalid_input(value: u64) -> CudaRuntimeProbeError {
     CudaRuntimeProbeError::InvalidInputLength(usize::try_from(value).unwrap_or(usize::MAX))
 }
 
-fn data_count(columns: &[CudaCompoundFoldColumn]) -> Result<u32, CudaRuntimeProbeError> {
+pub(crate) fn data_count(columns: &[CudaCompoundFoldColumn]) -> Result<u32, CudaRuntimeProbeError> {
     u32::try_from(
         columns
             .iter()
@@ -135,7 +135,7 @@ fn data_count(columns: &[CudaCompoundFoldColumn]) -> Result<u32, CudaRuntimeProb
     .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(columns.len()))
 }
 
-fn same_key_data_layout(
+pub(crate) fn same_key_data_layout(
     incoming: &[CudaCompoundFoldColumn],
     resident: &[CudaCompoundFoldColumn],
 ) -> Result<(), CudaRuntimeProbeError> {
@@ -171,7 +171,7 @@ fn same_key_data_layout(
     Ok(())
 }
 
-fn sidecar_ptr(
+pub(crate) fn sidecar_ptr(
     primary: &Arc<super::GpuPrimaryContext>,
     sidecar: Option<CudaInsertResidentKeySidecar<'_>>,
     row_count: u32,
