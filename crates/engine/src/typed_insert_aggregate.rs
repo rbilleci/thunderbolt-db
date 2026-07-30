@@ -16,10 +16,18 @@ mod envelope;
 #[path = "typed_insert_aggregate/status.rs"]
 mod status;
 // The physical codec-5 aggregate is still format/semantics v1.  This private, unreachable
-// contract gives the eventual replay owner one allocation-free v2 semantic traversal without
-// claiming that the incomplete section set is live or replayable yet.
-#[path = "typed_insert_aggregate/executable_semantics_v2.rs"]
-mod executable_semantics_v2;
+// scaffold gives the eventual replay owner one allocation-free *v1* source traversal without
+// claiming that the incomplete section set is live or replayable yet.  It is intentionally not
+// the table-local semantics-v2 authority.
+#[path = "typed_insert_aggregate/semantics_v1_scaffold.rs"]
+mod semantics_v1_scaffold;
+
+// Semantics two is a production-compiled but unreachable normative decoder checkpoint.  It is
+// not linked into the live codec-5 decoder, WAL, recovery, apply, or publication path until the
+// remaining WRITE-001 ownership gates promote it as one whole slice.  Its reencoder/fixtures are
+// separately test-only.
+#[path = "typed_insert_aggregate/semantics_v2.rs"]
+mod semantics_v2;
 
 #[allow(unused_imports)] // Terminal pre-WAL adoption consumes this complete inert API next.
 pub(crate) use codec::{
@@ -47,7 +55,10 @@ mod envelope_tests;
 
 pub(crate) const ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE: u8 = 5;
 pub(crate) const AGGREGATE_FORMAT_VERSION: u16 = 1;
-pub(crate) const AGGREGATE_SEMANTICS_VERSION: u16 = 1;
+/// The only semantics emitted by the current codec-5 writer.
+pub(crate) const AGGREGATE_SEMANTICS_V1: u16 = 1;
+/// Reserved for the inert, reader-only S4/S7 checkpoint.  No production writer can emit it.
+pub(crate) const AGGREGATE_SEMANTICS_V2: u16 = 2;
 pub(crate) const AGGREGATE_SECTION_COUNT: usize = 8;
 pub(crate) const AGGREGATE_HEADER_BYTES: u64 = 96;
 pub(crate) const AGGREGATE_SECTION_HEADER_BYTES: u64 = 16;

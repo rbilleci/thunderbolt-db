@@ -21,6 +21,42 @@ fn reject_with(bytes: &[u8], expected: &str) {
     );
 }
 
+/// Forces every scanner request through individual source-byte reads.  The raw measure must not
+/// rely on contiguous record slices or reserve any decoded owner while validating hostile wire.
+struct BytewiseCanonicalSource<'a>(&'a [u8]);
+
+impl CanonicalTypedInsertReadAt for BytewiseCanonicalSource<'_> {
+    fn len(&self) -> u64 {
+        u64::try_from(self.0.len()).expect("fixture source length fits u64")
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), EngineError> {
+        let start = usize::try_from(offset).map_err(|_| codec_error("fixture offset overflows"))?;
+        let end = start
+            .checked_add(out.len())
+            .ok_or_else(|| codec_error("fixture source range overflows"))?;
+        let source = self
+            .0
+            .get(start..end)
+            .ok_or_else(|| codec_error("fixture source is truncated"))?;
+        for (destination, source) in out.iter_mut().zip(source) {
+            *destination = *source;
+        }
+        Ok(())
+    }
+}
+
+fn raw_reject_without_reservation(bytes: &[u8]) {
+    let (result, stats) = decode::observe_stats_for_test(|| {
+        measure_decoded_canonical_typed_insert_from_source(&BytewiseCanonicalSource(bytes))
+    });
+    assert!(result.is_err(), "hostile S2 source unexpectedly measured");
+    assert_eq!(
+        stats.attempts, 0,
+        "raw S2 source validation allocated/reserved before rejection"
+    );
+}
+
 fn single_column_batch(
     txn_id: TxnId,
     table: &str,
@@ -512,6 +548,63 @@ fn canonical_codec_rejects_bitmap_tails_text_offsets_and_input_state_tags() {
 }
 
 #[test]
+fn canonical_source_measure_rejects_hostile_wire_before_any_owner_reservation() {
+    let bytes = baseline();
+    let target = section_offsets(&bytes)[0] + 8;
+    let mut invalid_identifier = bytes.clone();
+    invalid_identifier[target + 4] = 0xff;
+    raw_reject_without_reservation(&invalid_identifier);
+
+    let multibyte = encode(&single_column_batch(
+        95,
+        "codec_raw_text_boundary",
+        "text",
+        vec![
+            crate::SqlValue::Text("é".to_string()),
+            crate::SqlValue::Text("x".to_string()),
+        ],
+    ))
+    .expect("multibyte source fixture encodes");
+    let (values, _) = first_column_value_and_state_offsets(&multibyte);
+    let offsets = values + 1 + 4 + 4 + 4;
+    let mut split_codepoint = multibyte;
+    split_codepoint[offsets + 8..offsets + 16].copy_from_slice(&1_u64.to_le_bytes());
+    raw_reject_without_reservation(&split_codepoint);
+
+    let null_then_text = encode(&single_column_batch(
+        96,
+        "codec_raw_placeholder",
+        "text",
+        vec![
+            crate::SqlValue::Null,
+            crate::SqlValue::Text("x".to_string()),
+        ],
+    ))
+    .expect("nullable text source fixture encodes");
+    let (values, _) = first_column_value_and_state_offsets(&null_then_text);
+    let offsets = values + 1 + 4 + 4 + 4;
+    let mut nonzero_null_placeholder = null_then_text;
+    nonzero_null_placeholder[offsets + 8..offsets + 16].copy_from_slice(&1_u64.to_le_bytes());
+    raw_reject_without_reservation(&nonzero_null_placeholder);
+
+    let private = encode(&super::sequence_tests::private_chain_batch())
+        .expect("private sequence source fixture encodes");
+    let (result, stats) = decode::observe_stats_for_test(|| {
+        measure_decoded_canonical_typed_insert_published_only_from_source(&BytewiseCanonicalSource(
+            &private,
+        ))
+    });
+    assert!(
+        result.is_err(),
+        "published-only raw profile accepted private S2 evidence"
+    );
+    assert_eq!(
+        stats.attempts, 0,
+        "published-only source profile must reject private S2 before reservation"
+    );
+}
+
+#[test]
 fn canonical_codec_rejects_order_and_mirrored_digest_forgeries() {
     let bytes = baseline();
     let columns = section_offsets(&bytes)[1] + 8;
@@ -649,6 +742,19 @@ fn canonical_codec_rejects_true_rehashed_global_identity_and_value_domain_forger
         reject(&forged);
     }
 
+    for kind in [
+        decode::RehashedForgery::IndexOidTargetRelationCollision,
+        decode::RehashedForgery::IndexOidDependencyRelationCollision,
+        decode::RehashedForgery::IndexOidDomainCollision,
+        decode::RehashedForgery::SupportingIndexOidDomainCollision,
+        decode::RehashedForgery::SupportingIndexClassNameCollision,
+        decode::RehashedForgery::DomainOidNameCollision,
+    ] {
+        let forged = decode::rehashed_forgery_for_test(&closure, kind)
+            .expect("global registry forgery rehashes");
+        reject(&forged);
+    }
+
     let serial = encode(&super::tests::serial_batch(41)).expect("serial fixture encodes");
     let forged = decode::rehashed_forgery_for_test(
         &serial,
@@ -656,6 +762,35 @@ fn canonical_codec_rejects_true_rehashed_global_identity_and_value_domain_forger
     )
     .expect("sequence class-name forgery rehashes");
     reject_with(&forged, "qualified class-name identity drifted");
+
+    let serial_index =
+        encode(&super::tests::serial_index_batch()).expect("serial/index fixture encodes");
+    for kind in [
+        decode::RehashedForgery::IndexOidSequenceCollision,
+        decode::RehashedForgery::IndexSequenceClassNameCollision,
+    ] {
+        let forged = decode::rehashed_forgery_for_test(&serial_index, kind)
+            .expect("index/sequence registry forgery rehashes");
+        reject(&forged);
+    }
+
+    let external_parent_domain = encode(&super::tests::external_parent_domain_batch())
+        .expect("one-FK external-domain fixture encodes");
+    let forged = decode::rehashed_forgery_for_test(
+        &external_parent_domain,
+        decode::RehashedForgery::UnindexedTargetExternalColumnIdCollision,
+    )
+    .expect("unindexed target/external column-id forgery rehashes");
+    reject_with(&forged, "global catalog column identity drifted");
+
+    let external_shared = encode(&super::tests::external_shared_supporting_index_batch())
+        .expect("shared external fixture encodes");
+    let forged = decode::rehashed_forgery_for_test(
+        &external_shared,
+        decode::RehashedForgery::TargetAttnumOrder,
+    )
+    .expect("target attnum-order forgery rehashes");
+    reject(&forged);
 
     let date = encode(&single_column_batch(
         92,
@@ -684,6 +819,25 @@ fn canonical_codec_rejects_true_rehashed_global_identity_and_value_domain_forger
             .expect("temporal carrier forgery rehashes");
         reject(&forged);
     }
+}
+
+#[test]
+fn canonical_codec_rejects_two_external_supporting_indexes_with_one_class_name() {
+    let fixture = encode(&super::tests::distinct_external_supporting_indexes_batch())
+        .expect("distinct supporting-index fixture encodes");
+    let forged = decode::rehashed_forgery_for_test(
+        &fixture,
+        decode::RehashedForgery::SupportingIndexPairClassNameCollision,
+    )
+    .expect("supporting-index pair class-name forgery rehashes");
+    reject_with(&forged, "qualified class-name identity drifted");
+}
+
+#[test]
+fn canonical_codec_accepts_an_external_unnamed_domain_identity() {
+    let bytes = encode(&super::tests::external_parent_domain_batch())
+        .expect("external unnamed-domain fixture encodes");
+    decode(&bytes).expect("external parent domain identity must round-trip");
 }
 
 #[test]

@@ -240,9 +240,9 @@ pub(super) enum PrivatePredecessor {
 
 #[derive(Clone, Copy)]
 pub(super) struct PrivateChain {
-    state: (i64, bool),
-    owner: PrivateOwner,
-    outcome: gpu_db_wal::CanonicalDigest,
+    pub(super) state: (i64, bool),
+    pub(super) owner: PrivateOwner,
+    pub(super) outcome: gpu_db_wal::CanonicalDigest,
 }
 
 pub(super) struct PrivateEffectEvidence {
@@ -358,6 +358,20 @@ pub(super) fn validate_private_effect(
     evidence: PrivateEffectEvidence,
     chains: &mut BTreeMap<u32, PrivateChain>,
 ) -> Result<(), EngineError> {
+    let prior = chains.get(&view.request.sequence_oid).copied();
+    let next = validate_private_effect_state(view, parent, absolute, descriptor, evidence, prior)?;
+    chains.insert(view.request.sequence_oid, next);
+    Ok(())
+}
+
+pub(super) fn validate_private_effect_state(
+    view: CanonicalSequenceEffectView<'_>,
+    parent: CanonicalSequenceParentView,
+    absolute: u32,
+    descriptor: gpu_db_wal::CanonicalDigest,
+    evidence: PrivateEffectEvidence,
+    previous: Option<PrivateChain>,
+) -> Result<PrivateChain, EngineError> {
     let expected = if evidence.prior_is_called {
         evidence.prior_last_value.checked_add(1)
     } else {
@@ -377,7 +391,7 @@ pub(super) fn validate_private_effect(
     {
         return Err(codec_error("private sequence evidence is inconsistent"));
     }
-    if let Some(previous) = chains.get(&view.request.sequence_oid) {
+    if let Some(previous) = previous {
         if (evidence.prior_last_value, evidence.prior_is_called) != previous.state
             || evidence.owner != previous.owner
             || !matches!(evidence.predecessor, PrivatePredecessor::Outcome(digest) if digest == previous.outcome)
@@ -409,15 +423,11 @@ pub(super) fn validate_private_effect(
     if child != evidence.child_digest || outcome != evidence.outcome_digest {
         return Err(codec_error("private sequence digest witness drifted"));
     }
-    chains.insert(
-        view.request.sequence_oid,
-        PrivateChain {
-            state: (evidence.next_last_value, evidence.next_is_called),
-            owner: evidence.owner,
-            outcome,
-        },
-    );
-    Ok(())
+    Ok(PrivateChain {
+        state: (evidence.next_last_value, evidence.next_is_called),
+        owner: evidence.owner,
+        outcome,
+    })
 }
 
 fn private_owner_compatible(origin: u8, owner: PrivateOwner) -> bool {

@@ -295,6 +295,16 @@ pub(crate) fn decode_typed_insert_aggregate_bodies<'a>(
     outer_flags: u32,
     bodies: &[&'a [u8]],
 ) -> Result<DecodedTypedInsertAggregate<'a>, EngineError> {
+    decode_aggregate_framing(outer_flags, bodies)?.into_semantics_v1()
+}
+
+/// Decode only the canonical chunk/status/header/section framing.  Semantic dispatch happens
+/// after this shared physical proof and before either version's scalar rules.  The type is kept
+/// inside the aggregate codec so semantics-v2 cannot receive an alternate raw-stream carrier.
+pub(super) fn decode_aggregate_framing<'a>(
+    outer_flags: u32,
+    bodies: &[&'a [u8]],
+) -> Result<DecodedAggregateFraming<'a>, EngineError> {
     if !(2..=AGGREGATE_MAX_CHUNKS + 1).contains(&bodies.len()) {
         return Err(error("fragment body count is outside codec-5 bounds"));
     }
@@ -383,40 +393,12 @@ pub(crate) fn decode_typed_insert_aggregate_bodies<'a>(
     if decoded_header.section_region_bytes != section_region_bytes {
         return Err(error("aggregate header section-region length drifted"));
     }
-    let measure = TypedInsertAggregateMeasure {
-        flags: decoded_header.flags,
+    Ok(DecodedAggregateFraming {
         outer_flags,
-        stable_transaction_id: decoded_header.stable_transaction_id,
-        statement_count: decoded_header.statement_count,
-        insert_statement_count: decoded_header.insert_statement_count,
-        original_inserted_row_count: decoded_header.original_inserted_row_count,
-        final_row_transition_count: decoded_header.final_row_transition_count,
-        allocator_before: decoded_header.allocator_before,
-        allocator_high_water: decoded_header.allocator_high_water,
-        table_block_count: decoded_header.table_block_count,
-        sections: std::array::from_fn(|index| AggregateSectionMeasure {
-            entry_count: sections[index].entry_count,
-            payload_bytes: sections[index].payload_bytes,
-        }),
-    };
-    let layout = measure
-        .measure()
-        .map_err(|layout| error(&format!("decoded layout is invalid: {layout}")))?;
-    if layout.stream_bytes != stream_offset
-        || layout.chunk_count as usize != chunk_count
-        || layout
-            .live_chunks()
-            .iter()
-            .zip(payloads.iter().flatten())
-            .any(|(chunk, payload)| chunk.payload_bytes as usize != payload.len())
-        || status.txn_id != measure.stable_transaction_id
-        || status.statement_count != measure.statement_count
-        || status.response_artifact_count != sections[7].entry_count
-    {
-        return Err(error("decoded chunk/layout/status geometry drifted"));
-    }
-    Ok(DecodedTypedInsertAggregate {
-        layout,
+        header: decoded_header,
+        header_bytes: header,
+        chunk_count,
+        stream_bytes: stream_offset,
         aggregate_root: root,
         section_roots,
         status,
@@ -433,13 +415,148 @@ pub(crate) struct DecodedAggregateSection {
     pub(crate) payload_bytes: u64,
 }
 
-pub(crate) struct DecodedTypedInsertAggregate<'a> {
-    layout: TypedInsertAggregateLayout,
+/// Shared, allocation-free physical aggregate proof.  It owns no version-specific scalar
+/// interpretation: semantics-v1 consumes it through `into_semantics_v1`, while the inert S4/S7
+/// owner receives the same chunk/status/section evidence through crate-private access.
+pub(super) struct DecodedAggregateFraming<'a> {
+    outer_flags: u32,
+    header: DecodedHeader,
+    header_bytes: [u8; AGGREGATE_HEADER_BYTES as usize],
+    chunk_count: usize,
+    stream_bytes: u64,
     aggregate_root: gpu_db_wal::CanonicalDigest,
     section_roots: [gpu_db_wal::CanonicalDigest; AGGREGATE_SECTION_COUNT],
     status: TypedInsertStatusV2,
     sections: [DecodedAggregateSection; AGGREGATE_SECTION_COUNT],
     payloads: [Option<&'a [u8]>; AGGREGATE_MAX_CHUNKS],
+}
+
+impl<'a> DecodedAggregateFraming<'a> {
+    fn into_semantics_v1(self) -> Result<DecodedTypedInsertAggregate<'a>, EngineError> {
+        // Dispatch precedes every v1 scalar/layout rule. Semantics two is routed only through
+        // the inert S4/S7 owner; v1 must never reinterpret its zero allocator sentinels.
+        if self.header.semantics_version != AGGREGATE_SEMANTICS_V1 {
+            return Err(error(
+                "semantics-v2 aggregate requires the inert S4/S7 decoder",
+            ));
+        }
+        let measure = TypedInsertAggregateMeasure {
+            flags: self.header.flags,
+            outer_flags: self.outer_flags,
+            stable_transaction_id: self.header.stable_transaction_id,
+            statement_count: self.header.statement_count,
+            insert_statement_count: self.header.insert_statement_count,
+            original_inserted_row_count: self.header.original_inserted_row_count,
+            final_row_transition_count: self.header.final_row_transition_count,
+            allocator_before: self.header.allocator_before,
+            allocator_high_water: self.header.allocator_high_water,
+            table_block_count: self.header.table_block_count,
+            sections: std::array::from_fn(|index| AggregateSectionMeasure {
+                entry_count: self.sections[index].entry_count,
+                payload_bytes: self.sections[index].payload_bytes,
+            }),
+        };
+        let layout = measure
+            .measure()
+            .map_err(|layout| error(&format!("decoded layout is invalid: {layout}")))?;
+        if layout.stream_bytes != self.stream_bytes
+            || layout.chunk_count as usize != self.chunk_count
+            || layout
+                .live_chunks()
+                .iter()
+                .zip(self.payloads.iter().flatten())
+                .any(|(chunk, payload)| chunk.payload_bytes as usize != payload.len())
+            || self.status.txn_id != measure.stable_transaction_id
+            || self.status.statement_count != measure.statement_count
+            || self.status.response_artifact_count != self.sections[7].entry_count
+        {
+            return Err(error("decoded chunk/layout/status geometry drifted"));
+        }
+        Ok(DecodedTypedInsertAggregate {
+            layout,
+            framing: self,
+        })
+    }
+
+    pub(super) fn semantics_version(&self) -> u16 {
+        self.header.semantics_version
+    }
+
+    pub(super) fn outer_flags(&self) -> u32 {
+        self.outer_flags
+    }
+
+    pub(super) fn status(&self) -> &TypedInsertStatusV2 {
+        &self.status
+    }
+
+    pub(super) fn sections(&self) -> &[DecodedAggregateSection; AGGREGATE_SECTION_COUNT] {
+        &self.sections
+    }
+
+    pub(super) fn header_bytes(&self) -> &[u8; AGGREGATE_HEADER_BYTES as usize] {
+        &self.header_bytes
+    }
+
+    pub(super) fn header_scalars(&self) -> DecodedAggregateHeaderScalars {
+        DecodedAggregateHeaderScalars {
+            flags: self.header.flags,
+            stable_transaction_id: self.header.stable_transaction_id,
+            statement_count: self.header.statement_count,
+            insert_statement_count: self.header.insert_statement_count,
+            original_inserted_row_count: self.header.original_inserted_row_count,
+            final_row_transition_count: self.header.final_row_transition_count,
+            allocator_before: self.header.allocator_before,
+            allocator_high_water: self.header.allocator_high_water,
+            table_block_count: self.header.table_block_count,
+        }
+    }
+
+    pub(super) fn aggregate_root(&self) -> gpu_db_wal::CanonicalDigest {
+        self.aggregate_root
+    }
+
+    pub(super) fn section_roots(&self) -> &[gpu_db_wal::CanonicalDigest; AGGREGATE_SECTION_COUNT] {
+        &self.section_roots
+    }
+
+    pub(super) fn with_section_reader<T>(
+        &self,
+        section: usize,
+        visitor: impl FnOnce(&mut DecodedAggregateSectionReader<'_>) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let section = self
+            .sections
+            .get(section)
+            .ok_or_else(|| error("section ordinal is out of range"))?;
+        let mut reader = DecodedAggregateSectionReader::new(
+            self.payloads,
+            self.chunk_count,
+            section.payload_offset,
+            section.payload_bytes,
+        )?;
+        let value = visitor(&mut reader)?;
+        reader.finish()?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DecodedAggregateHeaderScalars {
+    pub(super) flags: u32,
+    pub(super) stable_transaction_id: u64,
+    pub(super) statement_count: u32,
+    pub(super) insert_statement_count: u32,
+    pub(super) original_inserted_row_count: u64,
+    pub(super) final_row_transition_count: u64,
+    pub(super) allocator_before: u64,
+    pub(super) allocator_high_water: u64,
+    pub(super) table_block_count: u32,
+}
+
+pub(crate) struct DecodedTypedInsertAggregate<'a> {
+    layout: TypedInsertAggregateLayout,
+    framing: DecodedAggregateFraming<'a>,
 }
 
 impl DecodedTypedInsertAggregate<'_> {
@@ -448,19 +565,19 @@ impl DecodedTypedInsertAggregate<'_> {
     }
 
     pub(crate) fn aggregate_root(&self) -> gpu_db_wal::CanonicalDigest {
-        self.aggregate_root
+        self.framing.aggregate_root
     }
 
     pub(crate) fn section_roots(&self) -> &[gpu_db_wal::CanonicalDigest; AGGREGATE_SECTION_COUNT] {
-        &self.section_roots
+        &self.framing.section_roots
     }
 
     pub(crate) fn status(&self) -> &TypedInsertStatusV2 {
-        &self.status
+        &self.framing.status
     }
 
     pub(crate) fn sections(&self) -> &[DecodedAggregateSection; AGGREGATE_SECTION_COUNT] {
-        &self.sections
+        &self.framing.sections
     }
 
     pub(crate) fn copy_section_payload(
@@ -469,6 +586,7 @@ impl DecodedTypedInsertAggregate<'_> {
         out: &mut [u8],
     ) -> Result<(), EngineError> {
         let section = self
+            .framing
             .sections
             .get(section)
             .ok_or_else(|| error("section ordinal is out of range"))?;
@@ -476,8 +594,8 @@ impl DecodedTypedInsertAggregate<'_> {
             return Err(error("section output length is not exact"));
         }
         copy_payload_range(
-            &self.payloads,
-            self.layout.chunk_count as usize,
+            &self.framing.payloads,
+            self.framing.chunk_count,
             section.payload_offset,
             out,
         )
@@ -492,19 +610,7 @@ impl DecodedTypedInsertAggregate<'_> {
         section: usize,
         visitor: impl FnOnce(&mut DecodedAggregateSectionReader<'_>) -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
-        let section = self
-            .sections
-            .get(section)
-            .ok_or_else(|| error("section ordinal is out of range"))?;
-        let mut reader = DecodedAggregateSectionReader::new(
-            self.payloads,
-            self.layout.chunk_count as usize,
-            section.payload_offset,
-            section.payload_bytes,
-        )?;
-        let value = visitor(&mut reader)?;
-        reader.finish()?;
-        Ok(value)
+        self.framing.with_section_reader(section, visitor)
     }
 }
 
@@ -666,7 +772,7 @@ fn encoded_headers(
     let mut writer = FixedWriter::new(&mut header);
     writer.bytes(AGGREGATE_STREAM_MAGIC)?;
     writer.u16(AGGREGATE_FORMAT_VERSION)?;
-    writer.u16(AGGREGATE_SEMANTICS_VERSION)?;
+    writer.u16(AGGREGATE_SEMANTICS_V1)?;
     writer.u16(AGGREGATE_FORMAT_VERSION)?;
     writer.u16(AGGREGATE_FORMAT_VERSION)?;
     writer.u32(view.flags)?;
@@ -854,6 +960,7 @@ fn decode_chunk_header(body: &[u8]) -> Result<DecodedChunkHeader, EngineError> {
 }
 
 struct DecodedHeader {
+    semantics_version: u16,
     flags: u32,
     section_region_bytes: u64,
     stable_transaction_id: u64,
@@ -873,8 +980,10 @@ fn decode_header(
     if &bytes[0..16] != AGGREGATE_STREAM_MAGIC
         || u16::from_le_bytes(bytes[16..18].try_into().expect("fixed field"))
             != AGGREGATE_FORMAT_VERSION
-        || u16::from_le_bytes(bytes[18..20].try_into().expect("fixed field"))
-            != AGGREGATE_SEMANTICS_VERSION
+        || !matches!(
+            u16::from_le_bytes(bytes[18..20].try_into().expect("fixed field")),
+            AGGREGATE_SEMANTICS_V1 | AGGREGATE_SEMANTICS_V2
+        )
         || u16::from_le_bytes(bytes[20..22].try_into().expect("fixed field"))
             != AGGREGATE_FORMAT_VERSION
         || u16::from_le_bytes(bytes[22..24].try_into().expect("fixed field"))
@@ -889,6 +998,7 @@ fn decode_header(
         ));
     }
     Ok(DecodedHeader {
+        semantics_version: u16::from_le_bytes(bytes[18..20].try_into().expect("fixed field")),
         flags: u32::from_le_bytes(bytes[24..28].try_into().expect("fixed field")),
         section_region_bytes: u64::from_le_bytes(bytes[32..40].try_into().expect("fixed field")),
         stable_transaction_id: u64::from_le_bytes(bytes[40..48].try_into().expect("fixed field")),

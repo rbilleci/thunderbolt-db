@@ -154,6 +154,34 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Deliberately exposes every byte as a separate source segment.  Thus every fixed image
+/// header/descriptor/vector field crosses a `read_at` boundary instead of accidentally relying
+/// on the slice adapter's contiguous reads.
+struct BytewiseImageSource<'a> {
+    bytes: &'a [u8],
+}
+
+impl TypedImageReadAt for BytewiseImageSource<'_> {
+    fn len(&self) -> u64 {
+        u64::try_from(self.bytes.len()).expect("test slice length fits u64")
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), EngineError> {
+        let start = usize::try_from(offset).map_err(|_| image_error("test offset"))?;
+        let end = start
+            .checked_add(out.len())
+            .ok_or_else(|| image_error("test range overflow"))?;
+        let range = self
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| image_error("test range truncated"))?;
+        for (destination, source) in out.iter_mut().zip(range) {
+            *destination = *source;
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn typed_image_round_trips_all_physical_shapes_with_stable_layout_and_vector_digests() {
     let fixture = Fixture::new();
@@ -552,8 +580,160 @@ fn typed_image_rejects_zero_row_noncanonical_bool_and_text_payloads() {
 }
 
 #[test]
+fn typed_image_raw_measure_reserves_every_owner_and_drains_on_failure() {
+    let bytes = response_bytes();
+    let measure = measure_decoded_typed_image(&bytes).expect("raw image pass succeeds");
+    assert_eq!(measure.persistent_bytes(), 1_511);
+    assert_eq!(measure.persistent_allocation_slots(), 23);
+    assert_eq!(
+        measure.maximum_scratch_bytes(),
+        9 * u64::try_from(std::mem::size_of::<ImageDescriptor>()).unwrap()
+    );
+    assert_eq!(measure.maximum_scratch_allocation_slots(), 1);
+
+    let (_, stats) = observe_decode_reservation_stats_for_test(|| {
+        decode_typed_image_after_measure(&bytes, measure).expect("measured decode succeeds")
+    });
+    assert_eq!(stats.persistent_bytes, measure.persistent_bytes());
+    assert_eq!(
+        stats.persistent_slots,
+        measure.persistent_allocation_slots()
+    );
+    assert_eq!(stats.scratch_bytes, measure.maximum_scratch_bytes());
+    assert_eq!(
+        stats.scratch_slots,
+        measure.maximum_scratch_allocation_slots()
+    );
+    let owners = stats.attempts;
+
+    for owner in 1..=owners {
+        let failed = fail_decode_reservation_for_test(owner, None, None, || {
+            decode_typed_image_after_measure(&bytes, measure)
+        });
+        assert!(failed.is_err(), "owner {owner} must fail closed");
+        assert!(
+            decode_typed_image_after_measure(&bytes, measure).is_ok(),
+            "owner {owner} failure must drain before immediate retry"
+        );
+    }
+
+    let below_persistent = measure.persistent_bytes().checked_sub(1).unwrap();
+    let persistent_refusal =
+        fail_decode_reservation_for_test(owners + 1, Some(below_persistent), None, || {
+            decode_typed_image_after_measure(&bytes, measure)
+        });
+    assert!(persistent_refusal.is_err());
+    assert!(decode_typed_image_after_measure(&bytes, measure).is_ok());
+
+    let below_scratch = measure.maximum_scratch_bytes().checked_sub(1).unwrap();
+    let scratch_refusal =
+        fail_decode_reservation_for_test(owners + 1, None, Some(below_scratch), || {
+            decode_typed_image_after_measure(&bytes, measure)
+        });
+    assert!(scratch_refusal.is_err());
+    assert!(decode_typed_image_after_measure(&bytes, measure).is_ok());
+}
+
+#[test]
+fn typed_image_read_at_raw_pass_crosses_every_fixed_boundary_without_reservation() {
+    let bytes = response_bytes();
+    let source = BytewiseImageSource { bytes: &bytes };
+    let (measure, owners) =
+        observe_decode_reservations_for_test(|| measure_decoded_typed_image_from_source(&source));
+    let measure = measure.expect("bytewise source raw pass succeeds");
+    assert_eq!(owners, 0, "raw source pass may not reserve decoded owners");
+    assert_eq!(measure.image_bytes(), u64::try_from(bytes.len()).unwrap());
+    assert_eq!(measure, measure_decoded_typed_image(&bytes).unwrap());
+
+    let mut copied = Vec::new();
+    copied
+        .try_reserve_exact(bytes.len())
+        .expect("test exact image copy reservation");
+    copied.resize(bytes.len(), 0);
+    copy_typed_image_after_measure(&source, measure, &mut copied).expect("copy after raw pass");
+    assert_eq!(copied, bytes);
+
+    let name_start = TYPED_IMAGE_HEADER_BYTES as usize + 9 * TYPED_IMAGE_DESCRIPTOR_BYTES as usize;
+    let mut invalid_utf8 = bytes.clone();
+    invalid_utf8[name_start] = 0xff;
+    let (invalid_utf8, owners) = observe_decode_reservations_for_test(|| {
+        measure_decoded_typed_image_from_source(&BytewiseImageSource {
+            bytes: &invalid_utf8,
+        })
+    });
+    assert!(invalid_utf8.is_err());
+    assert_eq!(owners, 0, "UTF-8 sabotage must fail before any reservation");
+
+    let mut nonzero_placeholder = bytes.clone();
+    write_u32(&mut nonzero_placeholder, vector_offset(&bytes, 0) + 22, 1);
+    let (nonzero_placeholder, owners) = observe_decode_reservations_for_test(|| {
+        measure_decoded_typed_image_from_source(&BytewiseImageSource {
+            bytes: &nonzero_placeholder,
+        })
+    });
+    assert!(nonzero_placeholder.is_err());
+    assert_eq!(
+        owners, 0,
+        "placeholder sabotage must fail before any reservation"
+    );
+
+    let mut forged_digest = bytes.clone();
+    let first_descriptor_digest = TYPED_IMAGE_HEADER_BYTES as usize + 64;
+    forged_digest[first_descriptor_digest] ^= 1;
+    let (forged_digest, owners) = observe_decode_reservations_for_test(|| {
+        measure_decoded_typed_image_from_source(&BytewiseImageSource {
+            bytes: &forged_digest,
+        })
+    });
+    assert!(forged_digest.is_err());
+    assert_eq!(
+        owners, 0,
+        "digest sabotage must fail before any reservation"
+    );
+}
+
+#[test]
+fn typed_image_source_measure_rejects_valid_same_length_content_drift() {
+    let original = response_bytes();
+    let measure =
+        measure_decoded_typed_image_from_source(&BytewiseImageSource { bytes: &original })
+            .expect("original image source measures");
+
+    let mut changed_fixture = Fixture::new();
+    changed_fixture.int4 = TypedInsertColumnValues::I32(vec![44, 45, 47].into());
+    let changed_columns = changed_fixture.response_columns();
+    let changed = encode_typed_image(&TypedImageView {
+        role: TypedImageRole::RetainedResponse,
+        rows: 3,
+        columns: &changed_columns,
+    })
+    .expect("changed image remains independently canonical");
+    assert_eq!(
+        changed.len(),
+        original.len(),
+        "content-drift fixture preserves raw geometry"
+    );
+    assert!(
+        measure_decoded_typed_image_from_source(&BytewiseImageSource { bytes: &changed }).is_ok(),
+        "changed source must remain a valid image rather than malformed sabotage"
+    );
+
+    let mut destination = vec![0; original.len()];
+    assert!(
+        copy_typed_image_after_measure(
+            &BytewiseImageSource { bytes: &changed },
+            measure,
+            &mut destination,
+        )
+        .is_err(),
+        "a raw measure must bind the exact source content, not only its geometry"
+    );
+}
+
+#[test]
 fn typed_image_source_guards_keep_one_inert_shared_vector_authority() {
     let source = include_str!("typed_image_codec.rs");
+    let source_reader = include_str!("typed_image_codec/read_at.rs");
     let value_contract = include_str!("typed_image_codec_value_contract.rs");
     let encoder = include_str!("canonical_codec.rs");
     let decoder = include_str!("canonical_codec_decode.rs");
@@ -568,6 +748,10 @@ fn typed_image_source_guards_keep_one_inert_shared_vector_authority() {
     assert!(!source.contains("fn reencode"));
     assert!(!source.contains("fn into_inner"));
     assert!(source.contains("typed_image_codec_value_contract"));
+    assert!(source.contains("decode_reservation"));
+    assert!(source.contains("measure_decoded_typed_image_from_source"));
+    assert!(source_reader.contains("trait TypedImageReadAt"));
+    assert!(!source_reader.contains("Vec<"));
     assert!(!value_contract.contains("Vec::with_capacity"));
     assert!(!value_contract.contains("vec!["));
     assert!(!value_contract.contains("append_typed_values"));

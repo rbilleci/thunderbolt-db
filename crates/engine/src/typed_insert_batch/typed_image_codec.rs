@@ -13,47 +13,29 @@ use super::typed_image_codec_value_contract::{
 use super::*;
 use sha2::{Digest, Sha256};
 
+#[path = "typed_image_codec/decode_reservation.rs"]
+mod decode_reservation;
+#[path = "typed_image_codec/read_at.rs"]
+mod read_at;
 #[cfg(test)]
 #[path = "typed_image_codec_tests.rs"]
 mod tests;
-
-// Thread-local test-only proof that pass one rejects before decoded-owner reservation.
+pub(crate) use decode_reservation::TypedImageDecodeMeasure;
 #[cfg(test)]
-thread_local! {
-    static DECODE_RESERVATION_OBSERVATION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn note_decode_reservation() {
-    DECODE_RESERVATION_OBSERVATION.with(|observation| {
-        if let Some(attempts) = observation.get() {
-            observation.set(Some(
-                attempts
-                    .checked_add(1)
-                    .expect("test decode reservation counter overflow"),
-            ));
-        }
-    });
-}
-
-#[cfg(test)]
-pub(super) fn observe_decode_reservations_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
-    DECODE_RESERVATION_OBSERVATION.with(|observation| {
-        assert!(
-            observation.replace(Some(0)).is_none(),
-            "test decode reservation observation cannot nest"
-        );
-        let result = operation();
-        let attempts = observation
-            .replace(None)
-            .expect("test decode reservation observation remains armed");
-        (result, attempts)
-    })
-}
+use decode_reservation::{
+    fail_decode_reservation_for_test, observe_decode_reservation_stats_for_test,
+    observe_decode_reservations_for_test,
+};
+use decode_reservation::{
+    into_exact_boxed_slice, into_exact_boxed_str, reserve_decode_exact, reserve_decode_string,
+};
+pub(crate) use read_at::TypedImageReadAt;
 
 pub(crate) const TYPED_IMAGE_HEADER_BYTES: u64 = 112;
 pub(crate) const TYPED_IMAGE_DESCRIPTOR_BYTES: u64 = 96;
 pub(crate) const TYPED_IMAGE_LAYOUT_DIGEST_DOMAIN: &[u8] = b"gpu-db/write001/image-layout/v2";
+pub(crate) const TYPED_IMAGE_CONTENT_FINGERPRINT_DOMAIN: &[u8] =
+    b"gpu-db/write001/image-content-fingerprint/v2";
 pub(crate) const TYPED_VECTOR_DIGEST_DOMAIN: &[u8] = b"gpu-db/write001/typed-vector/v2";
 
 const IMAGE_MAGIC: [u8; 16] = *b"GPUDBTYPEDIMAGE2";
@@ -546,103 +528,54 @@ pub(crate) fn encode_typed_image(view: &TypedImageView<'_>) -> Result<Vec<u8>, E
     Ok(out)
 }
 
-/// Strict v2 decoder.  It does all fixed/header/directory/offset/minimum validation before any
-/// count-to-`usize` conversion that is used for allocation, then allocates each final owner
-/// vector exactly once with fallible reservations.
+/// Allocation-free raw-pass sizing for a strict typed-image decode.  The named child owns the
+/// reservation/injection mechanics; this facade keeps the grammar authority local.
+#[allow(dead_code)] // Consumed by the inert semantics-v2 S7 owner, never a live result path.
+pub(crate) fn measure_decoded_typed_image(
+    bytes: &[u8],
+) -> Result<TypedImageDecodeMeasure, EngineError> {
+    read_at::measure_decoded_typed_image_from_source(&read_at::SliceImageSource::new(bytes))
+}
+
+/// Allocation-free raw-pass sizing through a borrowed random-access image source.  This is the
+/// sole strict image grammar: the contiguous-byte entry point above is only its slice adapter.
+/// In particular, callers with chunked records must complete this pass before reserving or
+/// copying a full image body.
+#[allow(dead_code)] // Consumed by the inert semantics-v2 S7 owner, never a live result path.
+pub(crate) fn measure_decoded_typed_image_from_source<S: TypedImageReadAt + ?Sized>(
+    source: &S,
+) -> Result<TypedImageDecodeMeasure, EngineError> {
+    read_at::measure_decoded_typed_image_from_source(source)
+}
+
+/// Copy an image only after a successful source-backed raw pass.  The caller owns the exact
+/// reservation (and any aggregate scratch accounting); this helper neither grows nor allocates.
+#[allow(dead_code)] // Narrow S7 recovery helper.
+pub(crate) fn copy_typed_image_after_measure<S: TypedImageReadAt + ?Sized>(
+    source: &S,
+    measure: TypedImageDecodeMeasure,
+    destination: &mut [u8],
+) -> Result<(), EngineError> {
+    read_at::copy_typed_image_after_measure(source, measure, destination)
+}
+
+/// Strict v2 decoder.  It first completes [`measure_decoded_typed_image`], then makes only the
+/// measured, exact fallible reservations.  Any failure drops the complete partial graph before
+/// this function returns, so the same bytes may be retried immediately.
 #[allow(dead_code)] // Future inert codec-5 S7/S8 reader.
 pub(crate) fn decode_typed_image(bytes: &[u8]) -> Result<DecodedTypedImage, EngineError> {
-    let header = parse_header(bytes)?;
-    let total = checked_total_len(header.columns, header.name_bytes, header.vector_bytes)?;
-    if total != bytes.len() as u64 {
-        return Err(image_error("image length is not exact"));
-    }
-    let columns = usize::try_from(header.columns)
-        .map_err(|_| image_error("image column count exceeds addressability"))?;
-    let descriptors_start = usize::try_from(TYPED_IMAGE_HEADER_BYTES)
-        .map_err(|_| image_error("header addressability"))?;
-    let descriptors_len = usize::try_from(header.descriptor_bytes)
-        .map_err(|_| image_error("descriptor bytes exceed addressability"))?;
-    let descriptor_region = bytes
-        .get(
-            descriptors_start
-                ..descriptors_start
-                    .checked_add(descriptors_len)
-                    .ok_or_else(|| image_error("descriptor boundary overflow"))?,
-        )
-        .ok_or_else(|| image_error("descriptor region is truncated"))?;
-    let name_start = descriptors_start
-        .checked_add(descriptors_len)
-        .ok_or_else(|| image_error("name boundary overflow"))?;
-    let names_len = usize::try_from(header.name_bytes)
-        .map_err(|_| image_error("name bytes exceed addressability"))?;
-    let vector_start = name_start
-        .checked_add(names_len)
-        .ok_or_else(|| image_error("vector boundary overflow"))?;
-    let descriptors = parse_descriptors(&ImageDecodeLayout {
-        region: descriptor_region,
-        role: header.role,
-        rows: header.rows,
-        columns,
-        name_start,
-        name_len: names_len,
-        vector_start,
-        vector_len: header.vector_bytes,
-        layout_digest: header.layout_digest,
-        image: bytes,
-    })?;
-    let mut owned = Vec::new();
-    #[cfg(test)]
-    note_decode_reservation();
-    owned
-        .try_reserve_exact(columns)
-        .map_err(|_| image_error("decoded column reservation failed"))?;
-    for descriptor in descriptors {
-        let name = descriptor_name(bytes, &descriptor)?;
-        let vector = vector_bytes(bytes, &descriptor)?;
-        let (validity, validity_len) = decode_typed_validity(vector, header.rows)?;
-        let (values, value_len) = decode_typed_values(
-            vector
-                .get(validity_len..)
-                .ok_or_else(|| image_error("vector value boundary is truncated"))?,
-            descriptor.ty,
-            header.rows,
-        )?;
-        if validity_len
-            .checked_add(value_len)
-            .and_then(|length| (length == vector.len()).then_some(length))
-            .is_none()
-        {
-            return Err(image_error("vector length has trailing bytes"));
-        }
-        let digest = typed_vector_digest(&validity, &values, descriptor.ty, header.rows)?;
-        if digest != descriptor.vector_digest {
-            return Err(image_error("vector digest drifted"));
-        }
-        validate_invalid_placeholders(&validity, &values, header.rows)?;
-        owned.push(DecodedTypedImageColumn {
-            catalog_column_ordinal: descriptor.catalog_column_ordinal,
-            stable_column_id: descriptor.stable_column_id,
-            table_ref: descriptor.table_ref,
-            attnum: descriptor.attnum,
-            ty: descriptor.ty,
-            type_oid: descriptor.type_oid,
-            type_size: descriptor.type_size,
-            result_format: descriptor.result_format,
-            name,
-            validity,
-            values,
-            vector_digest: descriptor.vector_digest,
-        });
-    }
-    Ok(DecodedTypedImage {
-        facts: DecodedTypedImageFacts {
-            role: header.role,
-            rows: header.rows,
-            columns: header.columns,
-            layout_digest: header.layout_digest,
-        },
-        columns: owned.into_boxed_slice(),
-    })
+    let measure = measure_decoded_typed_image(bytes)?;
+    decode_typed_image_after_measure(bytes, measure)
+}
+
+/// Decode after a caller has completed the allocation-free pass.  The opaque measure is checked
+/// again against the bytes so a stale measure cannot authorize a different raw image.
+#[allow(dead_code)] // Future inert codec-5 S7 reader supplies the raw-pass measure.
+pub(crate) fn decode_typed_image_after_measure(
+    bytes: &[u8],
+    measure: TypedImageDecodeMeasure,
+) -> Result<DecodedTypedImage, EngineError> {
+    decode_reservation::decode_typed_image_after_measure(bytes, measure)
 }
 
 pub(super) fn decode_typed_validity(
@@ -662,17 +595,25 @@ pub(super) fn decode_typed_validity(
                 .get(5..used)
                 .ok_or_else(|| image_error("bitmap is truncated before allocation"))?;
             let mut words = Vec::new();
-            #[cfg(test)]
-            note_decode_reservation();
-            words
-                .try_reserve_exact(expected)
-                .map_err(|_| image_error("validity bitmap reservation failed"))?;
+            reserve_decode_exact(
+                &mut words,
+                expected,
+                sized_owner_bytes::<u32>(expected)?,
+                0,
+                "decoded validity bitmap",
+            )?;
             for chunk in raw.chunks_exact(4) {
                 words.push(u32::from_le_bytes(
                     chunk.try_into().expect("exact bitmap word"),
                 ));
             }
-            Ok((TypedInsertColumnValidity::Bitmap(words.into()), used))
+            Ok((
+                TypedInsertColumnValidity::Bitmap(into_exact_boxed_slice(
+                    words,
+                    "decoded validity bitmap",
+                )?),
+                used,
+            ))
         }
         _ => Err(image_error("validity form tag is unknown")),
     }
@@ -701,56 +642,64 @@ pub(super) fn decode_typed_values(
             exact_fixed_payload(payload, rows_usize, 4, "i32")?;
             validate_i32_body(body, ty)?;
             let mut values = Vec::new();
-            #[cfg(test)]
-            note_decode_reservation();
-            values
-                .try_reserve_exact(rows_usize)
-                .map_err(|_| image_error("i32 reservation failed"))?;
+            reserve_decode_exact(
+                &mut values,
+                rows_usize,
+                sized_owner_bytes::<i32>(rows_usize)?,
+                0,
+                "decoded i32 values",
+            )?;
             for chunk in body.chunks_exact(4) {
                 values.push(i32::from_le_bytes(chunk.try_into().expect("exact i32")));
             }
-            TypedInsertColumnValues::I32(values.into())
+            TypedInsertColumnValues::I32(into_exact_boxed_slice(values, "decoded i32 values")?)
         }
         (2, SqlType::Int8 | SqlType::Timestamp) => {
             exact_fixed_payload(payload, rows_usize, 8, "i64")?;
             validate_i64_body(body, ty)?;
             let mut values = Vec::new();
-            #[cfg(test)]
-            note_decode_reservation();
-            values
-                .try_reserve_exact(rows_usize)
-                .map_err(|_| image_error("i64 reservation failed"))?;
+            reserve_decode_exact(
+                &mut values,
+                rows_usize,
+                sized_owner_bytes::<i64>(rows_usize)?,
+                0,
+                "decoded i64 values",
+            )?;
             for chunk in body.chunks_exact(8) {
                 values.push(i64::from_le_bytes(chunk.try_into().expect("exact i64")));
             }
-            TypedInsertColumnValues::I64(values.into())
+            TypedInsertColumnValues::I64(into_exact_boxed_slice(values, "decoded i64 values")?)
         }
         (3, ty @ SqlType::Numeric { .. }) => {
             exact_fixed_payload(payload, rows_usize, 16, "numeric")?;
             validate_i128_body(body, ty)?;
             let mut values = Vec::new();
-            #[cfg(test)]
-            note_decode_reservation();
-            values
-                .try_reserve_exact(rows_usize)
-                .map_err(|_| image_error("numeric reservation failed"))?;
+            reserve_decode_exact(
+                &mut values,
+                rows_usize,
+                sized_owner_bytes::<i128>(rows_usize)?,
+                0,
+                "decoded numeric values",
+            )?;
             for chunk in body.chunks_exact(16) {
                 values.push(i128::from_le_bytes(chunk.try_into().expect("exact i128")));
             }
-            TypedInsertColumnValues::I128(values.into())
+            TypedInsertColumnValues::I128(into_exact_boxed_slice(values, "decoded numeric values")?)
         }
         (4, SqlType::Uuid) => {
             exact_fixed_payload(payload, rows_usize, 16, "uuid")?;
             let mut values = Vec::new();
-            #[cfg(test)]
-            note_decode_reservation();
-            values
-                .try_reserve_exact(rows_usize)
-                .map_err(|_| image_error("uuid reservation failed"))?;
+            reserve_decode_exact(
+                &mut values,
+                rows_usize,
+                sized_owner_bytes::<[u8; 16]>(rows_usize)?,
+                0,
+                "decoded UUID values",
+            )?;
             for chunk in body.chunks_exact(16) {
                 values.push(chunk.try_into().expect("exact UUID"));
             }
-            TypedInsertColumnValues::Bytes16(values.into())
+            TypedInsertColumnValues::Bytes16(into_exact_boxed_slice(values, "decoded UUID values")?)
         }
         (5, SqlType::Bool) => {
             let expected_words = bitmap_words(rows_usize)?;
@@ -775,17 +724,19 @@ pub(super) fn decode_typed_values(
                 return Err(image_error("bool bitmap tail is noncanonical"));
             }
             let mut words = Vec::new();
-            #[cfg(test)]
-            note_decode_reservation();
-            words
-                .try_reserve_exact(expected_words)
-                .map_err(|_| image_error("bool bitmap reservation failed"))?;
+            reserve_decode_exact(
+                &mut words,
+                expected_words,
+                sized_owner_bytes::<u32>(expected_words)?,
+                0,
+                "decoded bool bitmap",
+            )?;
             for chunk in raw.chunks_exact(4) {
                 words.push(u32::from_le_bytes(
                     chunk.try_into().expect("exact bool word"),
                 ));
             }
-            TypedInsertColumnValues::BoolBits(words.into())
+            TypedInsertColumnValues::BoolBits(into_exact_boxed_slice(words, "decoded bool bitmap")?)
         }
         (6, SqlType::Text) => decode_text_values(body, payload, rows_usize)?,
         _ => return Err(image_error("vector shape tag does not match SQL type")),
@@ -924,112 +875,14 @@ fn measure_typed_values(bytes: &[u8], ty: SqlType, rows: u32) -> Result<usize, E
     Ok(total)
 }
 
-/// Verify NULL placeholders directly from borrowed wire bytes during decode pass one.  This keeps
-/// a forged nonzero NULL cell from causing any vector-owner allocation before rejection.
-fn validate_raw_vector_placeholders(
-    vector: &[u8],
-    validity_len: usize,
-    ty: SqlType,
-    rows: u32,
-) -> Result<(), EngineError> {
-    if vector.first() == Some(&0) {
-        return Ok(());
-    }
-    let rows = usize::try_from(rows).map_err(|_| image_error("row count addressability"))?;
-    let validity = vector
-        .get(5..validity_len)
-        .ok_or_else(|| image_error("validity bitmap is truncated"))?;
-    let values = vector
-        .get(validity_len..)
-        .ok_or_else(|| image_error("values are truncated"))?;
-    let shape = *values
-        .first()
-        .ok_or_else(|| image_error("value shape is truncated"))?;
-    let payload = values
-        .get(9..)
-        .ok_or_else(|| image_error("value payload is truncated"))?;
-    for row in 0..rows {
-        let word_start = (row / 32)
-            .checked_mul(4)
-            .ok_or_else(|| image_error("validity word offset overflow"))?;
-        let word = read_u32(validity, word_start)?;
-        if word & (1_u32 << (row % 32)) != 0 {
-            continue;
-        }
-        let zero = match (shape, ty) {
-            (1, SqlType::Int2 | SqlType::Int4 | SqlType::Date) => {
-                payload.get(
-                    row.checked_mul(4)
-                        .ok_or_else(|| image_error("i32 placeholder offset overflow"))?
-                        ..row
-                            .checked_add(1)
-                            .and_then(|next| next.checked_mul(4))
-                            .ok_or_else(|| image_error("i32 placeholder end overflow"))?,
-                ) == Some([0; 4].as_slice())
-            }
-            (2, SqlType::Int8 | SqlType::Timestamp) => {
-                payload.get(
-                    row.checked_mul(8)
-                        .ok_or_else(|| image_error("i64 placeholder offset overflow"))?
-                        ..row
-                            .checked_add(1)
-                            .and_then(|next| next.checked_mul(8))
-                            .ok_or_else(|| image_error("i64 placeholder end overflow"))?,
-                ) == Some([0; 8].as_slice())
-            }
-            (3, SqlType::Numeric { .. }) => {
-                payload.get(
-                    row.checked_mul(16)
-                        .ok_or_else(|| image_error("numeric placeholder offset overflow"))?
-                        ..row
-                            .checked_add(1)
-                            .and_then(|next| next.checked_mul(16))
-                            .ok_or_else(|| image_error("numeric placeholder end overflow"))?,
-                ) == Some([0; 16].as_slice())
-            }
-            (4, SqlType::Uuid) => {
-                payload.get(
-                    row.checked_mul(16)
-                        .ok_or_else(|| image_error("UUID placeholder offset overflow"))?
-                        ..row
-                            .checked_add(1)
-                            .and_then(|next| next.checked_mul(16))
-                            .ok_or_else(|| image_error("UUID placeholder end overflow"))?,
-                ) == Some([0; 16].as_slice())
-            }
-            (5, SqlType::Bool) => {
-                let words = payload
-                    .get(4..)
-                    .ok_or_else(|| image_error("bool placeholder bitmap is truncated"))?;
-                let value_word = read_u32(words, word_start)?;
-                value_word & (1_u32 << (row % 32)) == 0
-            }
-            (6, SqlType::Text) => {
-                let offsets = payload
-                    .get(4..)
-                    .ok_or_else(|| image_error("text placeholders are truncated"))?;
-                let start = row
-                    .checked_mul(8)
-                    .ok_or_else(|| image_error("text placeholder offset overflow"))?;
-                read_u64(offsets, start)?
-                    == read_u64(
-                        offsets,
-                        row.checked_add(1)
-                            .and_then(|next| next.checked_mul(8))
-                            .ok_or_else(|| image_error("text placeholder end overflow"))?,
-                    )?
-            }
-            _ => {
-                return Err(image_error(
-                    "placeholder value shape does not match SQL type",
-                ))
-            }
-        };
-        if !zero {
-            return Err(image_error("invalid typed value placeholder is nonzero"));
-        }
-    }
-    Ok(())
+pub(super) fn sized_owner_bytes<T>(count: usize) -> Result<u64, EngineError> {
+    u64::try_from(count)
+        .map_err(|_| image_error("decoded owner count addressability"))?
+        .checked_mul(
+            u64::try_from(std::mem::size_of::<T>())
+                .map_err(|_| image_error("decoded owner element size addressability"))?,
+        )
+        .ok_or_else(|| image_error("decoded owner bytes overflow"))
 }
 
 fn append_typed_vector<S: TypedVectorSink>(
@@ -1064,18 +917,6 @@ fn typed_vector_digest(
     digest.bytes(&sql_type_bytes(ty)?);
     digest.bytes(&rows.to_le_bytes());
     append_typed_vector(&mut digest, validity, values, ty, rows)?;
-    Ok(digest.finish())
-}
-
-fn typed_vector_digest_bytes(
-    ty: SqlType,
-    rows: u32,
-    body: &[u8],
-) -> Result<gpu_db_wal::CanonicalDigest, EngineError> {
-    let mut digest = DomainDigest::new(TYPED_VECTOR_DIGEST_DOMAIN);
-    digest.bytes(&sql_type_bytes(ty)?);
-    digest.bytes(&rows.to_le_bytes());
-    digest.bytes(body);
     Ok(digest.finish())
 }
 
@@ -1293,6 +1134,7 @@ fn parse_header(bytes: &[u8]) -> Result<ImageHeader, EngineError> {
     })
 }
 
+#[derive(Clone, Copy)]
 struct ImageHeader {
     role: TypedImageRole,
     rows: u32,
@@ -1328,7 +1170,56 @@ struct ImageDecodeLayout<'a> {
     image: &'a [u8],
 }
 
-fn parse_descriptors(layout: &ImageDecodeLayout<'_>) -> Result<Vec<ImageDescriptor>, EngineError> {
+fn decoded_image_layout(bytes: &[u8]) -> Result<(ImageHeader, ImageDecodeLayout<'_>), EngineError> {
+    let header = parse_header(bytes)?;
+    let total = checked_total_len(header.columns, header.name_bytes, header.vector_bytes)?;
+    if total != bytes.len() as u64 {
+        return Err(image_error("image length is not exact"));
+    }
+    let columns = usize::try_from(header.columns)
+        .map_err(|_| image_error("image column count exceeds addressability"))?;
+    let descriptors_start = usize::try_from(TYPED_IMAGE_HEADER_BYTES)
+        .map_err(|_| image_error("header addressability"))?;
+    let descriptors_len = usize::try_from(header.descriptor_bytes)
+        .map_err(|_| image_error("descriptor bytes exceed addressability"))?;
+    let descriptor_end = descriptors_start
+        .checked_add(descriptors_len)
+        .ok_or_else(|| image_error("descriptor boundary overflow"))?;
+    let descriptor_region = bytes
+        .get(descriptors_start..descriptor_end)
+        .ok_or_else(|| image_error("descriptor region is truncated"))?;
+    let name_start = descriptor_end;
+    let name_len = usize::try_from(header.name_bytes)
+        .map_err(|_| image_error("name bytes exceed addressability"))?;
+    let vector_start = name_start
+        .checked_add(name_len)
+        .ok_or_else(|| image_error("vector boundary overflow"))?;
+    if vector_start > bytes.len() {
+        return Err(image_error("name region is truncated"));
+    }
+    Ok((
+        header,
+        ImageDecodeLayout {
+            region: descriptor_region,
+            role: header.role,
+            rows: header.rows,
+            columns,
+            name_start,
+            name_len,
+            vector_start,
+            vector_len: header.vector_bytes,
+            layout_digest: header.layout_digest,
+            image: bytes,
+        },
+    ))
+}
+
+/// The raw pass has already verified directory geometry and every nested body.  This second pass
+/// reserves exactly the measured transient descriptor directory and materializes its fixed
+/// entries for the owned decode; it performs no attacker-sized implicit reservation.
+fn parse_descriptors_after_measure(
+    layout: &ImageDecodeLayout<'_>,
+) -> Result<Vec<ImageDescriptor>, EngineError> {
     if layout.region.len()
         != layout
             .columns
@@ -1337,114 +1228,18 @@ fn parse_descriptors(layout: &ImageDecodeLayout<'_>) -> Result<Vec<ImageDescript
     {
         return Err(image_error("descriptor region is not exact"));
     }
-    validate_descriptor_directory(layout)?;
     let mut result = Vec::new();
-    #[cfg(test)]
-    note_decode_reservation();
-    result
-        .try_reserve_exact(layout.columns)
-        .map_err(|_| image_error("descriptor reservation failed"))?;
+    reserve_decode_exact(
+        &mut result,
+        layout.columns,
+        0,
+        sized_owner_bytes::<ImageDescriptor>(layout.columns)?,
+        "decoded descriptor scratch",
+    )?;
     for ordinal in 0..layout.columns {
         result.push(raw_descriptor(layout.region, ordinal)?);
     }
     Ok(result)
-}
-
-/// Decode pass one: validate every raw descriptor, name and vector with borrowed bytes before
-/// reserving the descriptor directory or any decoded typed value owner.
-fn validate_descriptor_directory(layout_input: &ImageDecodeLayout<'_>) -> Result<(), EngineError> {
-    let mut layout = DomainDigest::new(TYPED_IMAGE_LAYOUT_DIGEST_DOMAIN);
-    layout.bytes(&layout_input.rows.to_le_bytes());
-    layout.bytes(
-        &u32::try_from(layout_input.columns)
-            .map_err(|_| image_error("descriptor count exceeds u32"))?
-            .to_le_bytes(),
-    );
-    layout.bytes(
-        &u64::from(layout_input.rows)
-            .checked_mul(
-                u64::try_from(layout_input.columns)
-                    .map_err(|_| image_error("descriptor count addressability"))?,
-            )
-            .ok_or_else(|| image_error("image cell count overflows"))?
-            .to_le_bytes(),
-    );
-    let mut expected_name = u64::try_from(layout_input.name_start)
-        .map_err(|_| image_error("name offset addressability"))?;
-    let mut expected_vector = u64::try_from(layout_input.vector_start)
-        .map_err(|_| image_error("vector offset addressability"))?;
-    for ordinal in 0..layout_input.columns {
-        let descriptor = raw_descriptor(layout_input.region, ordinal)?;
-        validate_decoded_descriptor(layout_input.role, &descriptor)?;
-        append_normalized_descriptor(&mut layout, &descriptor)?;
-        if descriptor.name_len == 0 {
-            if descriptor.name_offset != 0 {
-                return Err(image_error("empty descriptor name has an offset"));
-            }
-        } else if descriptor.name_offset != expected_name {
-            return Err(image_error("descriptor names have a gap or overlap"));
-        }
-        expected_name = expected_name
-            .checked_add(descriptor.name_len)
-            .ok_or_else(|| image_error("name range overflow"))?;
-        if descriptor.vector_offset != expected_vector {
-            return Err(image_error("descriptor vectors have a gap or overlap"));
-        }
-        expected_vector = expected_vector
-            .checked_add(descriptor.vector_len)
-            .ok_or_else(|| image_error("vector range overflow"))?;
-    }
-    let expected_name_end = u64::try_from(
-        layout_input
-            .name_start
-            .checked_add(layout_input.name_len)
-            .ok_or_else(|| image_error("name end overflow"))?,
-    )
-    .map_err(|_| image_error("name end addressability"))?;
-    if expected_name != expected_name_end {
-        return Err(image_error("descriptor names do not fill the name region"));
-    }
-    let expected_vector_end = u64::try_from(layout_input.vector_start)
-        .map_err(|_| image_error("vector start addressability"))?
-        .checked_add(layout_input.vector_len)
-        .ok_or_else(|| image_error("vector end overflow"))?;
-    if expected_vector != expected_vector_end {
-        return Err(image_error(
-            "descriptor vectors do not fill the vector region",
-        ));
-    }
-    if layout_input.role == TypedImageRole::RetainedResponse {
-        for ordinal in 0..layout_input.columns {
-            let descriptor = raw_descriptor(layout_input.region, ordinal)?;
-            layout.bytes(descriptor_name_bytes(layout_input.image, &descriptor)?);
-        }
-    }
-    for ordinal in 0..layout_input.columns {
-        let descriptor = raw_descriptor(layout_input.region, ordinal)?;
-        let _ = descriptor_name_bytes(layout_input.image, &descriptor)?;
-        let vector = vector_bytes(layout_input.image, &descriptor)?;
-        let valid_len = measure_typed_validity(vector, layout_input.rows)?;
-        let value_len = measure_typed_values(
-            vector
-                .get(valid_len..)
-                .ok_or_else(|| image_error("vector value is truncated"))?,
-            descriptor.ty,
-            layout_input.rows,
-        )?;
-        if valid_len.checked_add(value_len) != Some(vector.len()) {
-            return Err(image_error("descriptor vector has trailing bytes"));
-        }
-        validate_raw_vector_placeholders(vector, valid_len, descriptor.ty, layout_input.rows)?;
-        if typed_vector_digest_bytes(descriptor.ty, layout_input.rows, vector)?
-            != descriptor.vector_digest
-        {
-            return Err(image_error("vector digest drifted"));
-        }
-    }
-    if layout.finish() != layout_input.layout_digest {
-        return Err(image_error("image layout digest drifted"));
-    }
-    Ok(())
 }
 
 fn raw_descriptor(region: &[u8], ordinal: usize) -> Result<ImageDescriptor, EngineError> {
@@ -1454,6 +1249,15 @@ fn raw_descriptor(region: &[u8], ordinal: usize) -> Result<ImageDescriptor, Engi
     let raw = region
         .get(base..base + TYPED_IMAGE_DESCRIPTOR_BYTES as usize)
         .ok_or_else(|| image_error("descriptor is truncated"))?;
+    parse_descriptor_entry(raw, ordinal)
+}
+
+/// Parse one fixed descriptor entry after its caller has isolated the exact 96-byte range.  Both
+/// the contiguous adapter and the chunked `read_at` grammar use this one entry authority.
+fn parse_descriptor_entry(raw: &[u8], ordinal: usize) -> Result<ImageDescriptor, EngineError> {
+    if raw.len() != TYPED_IMAGE_DESCRIPTOR_BYTES as usize {
+        return Err(image_error("descriptor is not exact"));
+    }
     let expected =
         u32::try_from(ordinal).map_err(|_| image_error("descriptor ordinal overflow"))?;
     if read_u32(raw, 0)? != expected || read_u16(raw, 18)? != 0 {
@@ -1579,13 +1383,14 @@ fn descriptor_name(bytes: &[u8], descriptor: &ImageDescriptor) -> Result<Box<str
     }
     let name = std::str::from_utf8(raw).map_err(|_| image_error("name is not UTF-8"))?;
     let mut owned = String::new();
-    #[cfg(test)]
-    note_decode_reservation();
-    owned
-        .try_reserve_exact(name.len())
-        .map_err(|_| image_error("name reservation failed"))?;
+    reserve_decode_string(
+        &mut owned,
+        name.len(),
+        u64::try_from(name.len()).map_err(|_| image_error("name allocation addressability"))?,
+        "decoded name",
+    )?;
     owned.push_str(name);
-    Ok(owned.into_boxed_str())
+    into_exact_boxed_str(owned, "decoded name")
 }
 
 fn descriptor_name_bytes<'a>(
@@ -1665,26 +1470,31 @@ fn decode_text_values(
         .ok_or_else(|| image_error("text bytes are truncated before allocation"))?;
     validate_text_raw(offsets_raw, text, rows)?;
     let mut offsets = Vec::new();
-    #[cfg(test)]
-    note_decode_reservation();
-    offsets
-        .try_reserve_exact(offset_count)
-        .map_err(|_| image_error("text offsets reservation failed"))?;
+    reserve_decode_exact(
+        &mut offsets,
+        offset_count,
+        sized_owner_bytes::<u64>(offset_count)?,
+        0,
+        "decoded text offsets",
+    )?;
     for chunk in offsets_raw.chunks_exact(8) {
         offsets.push(u64::from_le_bytes(
             chunk.try_into().expect("exact text offset"),
         ));
     }
     let mut owned_bytes = Vec::new();
-    #[cfg(test)]
-    note_decode_reservation();
-    owned_bytes
-        .try_reserve_exact(text.len())
-        .map_err(|_| image_error("text bytes reservation failed"))?;
+    reserve_decode_exact(
+        &mut owned_bytes,
+        text.len(),
+        u64::try_from(text.len())
+            .map_err(|_| image_error("text byte allocation addressability"))?,
+        0,
+        "decoded text bytes",
+    )?;
     owned_bytes.extend_from_slice(text);
     Ok(TypedInsertColumnValues::Text {
-        offsets: offsets.into(),
-        bytes: owned_bytes.into(),
+        offsets: into_exact_boxed_slice(offsets, "decoded text offsets")?,
+        bytes: into_exact_boxed_slice(owned_bytes, "decoded text bytes")?,
     })
 }
 

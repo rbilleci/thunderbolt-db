@@ -1,7 +1,7 @@
-//! Private provisional S1/S4 scaffold for the future codec-5 replay owner.
+//! Private provisional semantics-v1 S1/S4 scaffold for the future codec-5 replay owner.
 //!
-//! The historical module/function names contain `v2`, but this is not the normative semantics-v2
-//! S4 reader. Codec-5's physical aggregate header remains semantics v1, the provisional S4 uses
+//! This is not the normative semantics-v2 S4 reader. Codec-5's physical aggregate header remains
+//! semantics v1, and the provisional S4 uses
 //! that form's global allocator range and both-sentinel canceled/suppressed references, and every
 //! owner here is deliberately unreachable from the live writer, recovery, and apply paths. The
 //! PLAN-owned S4/S7 checkpoint must version, replace, or rename this scaffold after freezing the
@@ -18,7 +18,7 @@
 use super::codec::{DecodedAggregateSectionReader, DecodedTypedInsertAggregate};
 use crate::EngineError;
 
-#[path = "executable_semantics_v2/source_materialization.rs"]
+#[path = "semantics_v1_scaffold/source_materialization.rs"]
 mod source_materialization;
 
 const STATEMENT_DIRECTORY_SECTION: usize = 0;
@@ -37,7 +37,7 @@ const DISPOSITION_SUPPRESSED_AT_STATEMENT: u8 = 3;
 /// Stack-only facts established by the S1/S4 traversal.  This carries no replay, mutation, or
 /// publication capability; a later owner must still complete S2/S7 and the remaining sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExecutableSemanticsV2Summary {
+struct SemanticsV1ScaffoldSummary {
     statement_count: u32,
     typed_insert_count: u32,
     canonical_operation_count: u32,
@@ -56,11 +56,11 @@ enum StatementFamily {
 ///
 /// This traversal is allocation-free.  It keeps one current S1 entry while consuming exactly its
 /// S4 source-row range, which proves directory/source ordering without ever assembling a section
-/// or building a statement map. Its historical Rust name is not a semantics-v2 eligibility or
-/// dispatch claim. It is private until the final replay transaction owns the full S1--S8 closure.
-fn validate_executable_semantics_v2(
+/// or building a statement map. It is a semantics-v1-only scaffold and is private until the
+/// final replay transaction owns the full S1--S8 closure.
+fn validate_semantics_v1_scaffold(
     decoded: &DecodedTypedInsertAggregate<'_>,
-) -> Result<ExecutableSemanticsV2Summary, EngineError> {
+) -> Result<SemanticsV1ScaffoldSummary, EngineError> {
     let measure = &decoded.layout().measure;
     let sections = decoded.sections();
     let directory_section = sections
@@ -222,7 +222,7 @@ fn validate_executable_semantics_v2(
                     "S4 surviving rows exceed aggregate final transition count",
                 ));
             }
-            Ok(ExecutableSemanticsV2Summary {
+            Ok(SemanticsV1ScaffoldSummary {
                 statement_count: measure.statement_count,
                 typed_insert_count,
                 canonical_operation_count,
@@ -242,12 +242,12 @@ fn validate_payload_length(
 ) -> Result<(), EngineError> {
     let expected_bytes = u64::from(expected_count)
         .checked_mul(entry_bytes)
-        .ok_or_else(|| violation("executable-semantics-v2 payload size overflows"))?;
+        .ok_or_else(|| violation("semantics-v1 scaffold payload size overflows"))?;
     if reader.remaining() != expected_bytes {
         return Err(violation(match section {
             "S1" => "S1 payload length is not exact for its outer entry count",
             "S4" => "S4 payload length is not exact for its outer entry count",
-            _ => "executable-semantics-v2 payload length is not exact",
+            _ => "semantics-v1 scaffold payload length is not exact",
         }));
     }
     Ok(())
@@ -379,7 +379,7 @@ fn validate_row_disposition(
 
 fn violation(message: &str) -> EngineError {
     EngineError::Durability(format!(
-        "typed INSERT aggregate executable semantics v2: {message}"
+        "typed INSERT aggregate semantics-v1 scaffold: {message}"
     ))
 }
 
@@ -580,7 +580,7 @@ mod tests {
 
     fn validate(
         payloads: &[Vec<u8>; AGGREGATE_SECTION_COUNT],
-    ) -> Result<ExecutableSemanticsV2Summary, EngineError> {
+    ) -> Result<SemanticsV1ScaffoldSummary, EngineError> {
         let encoded = encode(payloads);
         let bodies: Vec<Vec<u8>> = encoded.fragment_bodies().map(<[u8]>::to_vec).collect();
         let refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
@@ -588,11 +588,11 @@ mod tests {
             OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
             &refs,
         )?;
-        validate_executable_semantics_v2(&decoded)
+        validate_semantics_v1_scaffold(&decoded)
     }
 
     fn assert_rejected(payloads: &[Vec<u8>; AGGREGATE_SECTION_COUNT], needle: &str) {
-        let error = validate(payloads).expect_err("sabotaged v2 semantics must reject");
+        let error = validate(payloads).expect_err("sabotaged v1 scaffold must reject");
         assert!(
             error.to_string().contains(needle),
             "expected {needle:?}, got {error}"
@@ -601,10 +601,10 @@ mod tests {
 
     #[test]
     fn golden_mixed_families_and_all_row_dispositions_close_without_owned_replay_state() {
-        let summary = validate(&valid_payloads()).expect("valid v2 semantic closure");
+        let summary = validate(&valid_payloads()).expect("valid v1 scaffold closure");
         assert_eq!(
             summary,
-            ExecutableSemanticsV2Summary {
+            SemanticsV1ScaffoldSummary {
                 statement_count: 3,
                 typed_insert_count: 2,
                 canonical_operation_count: 1,
@@ -770,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_validation_crosses_a_chunk_boundary_without_assembling_s1_or_s4() {
+    fn v1_scaffold_validation_crosses_a_chunk_boundary_without_assembling_s1_or_s4() {
         let mut payloads = valid_payloads();
         let base = view(&payloads).measure().unwrap();
         let target = AGGREGATE_CHUNK_PAYLOAD_BYTES - 12;
@@ -784,9 +784,9 @@ mod tests {
 
     #[test]
     fn validator_source_uses_the_bounded_reader_and_no_owned_replay_collection() {
-        let source = include_str!("executable_semantics_v2.rs");
+        let source = include_str!("semantics_v1_scaffold.rs");
         let validator = source
-            .split("fn validate_executable_semantics_v2")
+            .split("fn validate_semantics_v1_scaffold")
             .nth(1)
             .expect("validator exists")
             .split("fn validate_payload_length")

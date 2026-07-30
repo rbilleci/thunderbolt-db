@@ -22,10 +22,21 @@ pub(in super::super) enum RehashedForgery {
     SequencePrivateOwnerFuture,
     SequenceClassNameCollision,
     IndexClassNameCollision,
+    SupportingIndexClassNameCollision,
+    SupportingIndexPairClassNameCollision,
+    IndexSequenceClassNameCollision,
     IndexOidOutOfRange,
+    IndexOidTargetRelationCollision,
+    IndexOidDependencyRelationCollision,
+    IndexOidDomainCollision,
+    SupportingIndexOidDomainCollision,
+    IndexOidSequenceCollision,
     ExternalColumnIdCollision,
+    UnindexedTargetExternalColumnIdCollision,
     ExternalColumnHugeOrdinal,
     ForeignKeyTypeOidRelationCollision,
+    DomainOidNameCollision,
+    TargetAttnumOrder,
     DateCarrierUnderflow,
     DateCarrierOverflow,
     TimestampCarrierUnderflow,
@@ -86,7 +97,7 @@ pub(in super::super) fn rehashed_forgery_for_test(
                 .get_mut(1)
                 .ok_or_else(|| codec_error("external supporting-index fixture needs two FKs"))?;
             foreign_key.supporting_index.name =
-                format!("{}_forged", foreign_key.supporting_index.name).into();
+                format!("{}_forged", foreign_key.supporting_index.name);
         }
         RehashedForgery::SequenceDuplicateLocal => {
             let first = model
@@ -224,7 +235,49 @@ pub(in super::super) fn rehashed_forgery_for_test(
                 .indexes
                 .first_mut()
                 .ok_or_else(|| codec_error("index fixture has no target index"))?;
-            index.name = model.target.name.clone().into();
+            index.name = model.target.name.clone();
+        }
+        RehashedForgery::SupportingIndexClassNameCollision => {
+            let name = model
+                .indexes
+                .first()
+                .ok_or_else(|| codec_error("index fixture has no target index"))?
+                .name
+                .clone();
+            let foreign_key = model
+                .foreign_keys
+                .first_mut()
+                .ok_or_else(|| codec_error("foreign-key fixture has no FK"))?;
+            foreign_key.supporting_index.name = name;
+        }
+        RehashedForgery::SupportingIndexPairClassNameCollision => {
+            let name = model
+                .foreign_keys
+                .first()
+                .ok_or_else(|| codec_error("foreign-key fixture has no first FK"))?
+                .supporting_index
+                .name
+                .clone();
+            let foreign_key = model
+                .foreign_keys
+                .get_mut(1)
+                .ok_or_else(|| codec_error("foreign-key fixture needs two FKs"))?;
+            foreign_key.supporting_index.name = name;
+        }
+        RehashedForgery::IndexSequenceClassNameCollision => {
+            let name = model
+                .effects
+                .effects
+                .first()
+                .ok_or_else(|| codec_error("sequence fixture needs one effect"))?
+                .request
+                .effective_name
+                .clone();
+            let index = model
+                .indexes
+                .first_mut()
+                .ok_or_else(|| codec_error("index fixture has no target index"))?;
+            index.name = name;
         }
         RehashedForgery::IndexOidOutOfRange => {
             let index = model
@@ -232,6 +285,63 @@ pub(in super::super) fn rehashed_forgery_for_test(
                 .first_mut()
                 .ok_or_else(|| codec_error("index fixture has no target index"))?;
             index.oid = i32::MAX as u32 + 1;
+        }
+        RehashedForgery::IndexOidTargetRelationCollision => {
+            let index = model
+                .indexes
+                .first_mut()
+                .ok_or_else(|| codec_error("index fixture has no target index"))?;
+            index.oid = model.target.oid;
+        }
+        RehashedForgery::IndexOidDependencyRelationCollision => {
+            let oid = model
+                .dependencies
+                .get(1)
+                .ok_or_else(|| codec_error("index fixture needs an external dependency"))?
+                .oid;
+            let index = model
+                .indexes
+                .first_mut()
+                .ok_or_else(|| codec_error("index fixture has no target index"))?;
+            index.oid = oid;
+        }
+        RehashedForgery::IndexOidDomainCollision => {
+            let oid = model
+                .domains
+                .first()
+                .ok_or_else(|| codec_error("index fixture needs a domain"))?
+                .oid;
+            let index = model
+                .indexes
+                .first_mut()
+                .ok_or_else(|| codec_error("index fixture has no target index"))?;
+            index.oid = oid;
+        }
+        RehashedForgery::SupportingIndexOidDomainCollision => {
+            let oid = model
+                .domains
+                .first()
+                .ok_or_else(|| codec_error("foreign-key fixture needs a domain"))?
+                .oid;
+            let foreign_key = model
+                .foreign_keys
+                .first_mut()
+                .ok_or_else(|| codec_error("foreign-key fixture has no FK"))?;
+            foreign_key.supporting_index.oid = oid;
+        }
+        RehashedForgery::IndexOidSequenceCollision => {
+            let oid = model
+                .effects
+                .effects
+                .first()
+                .ok_or_else(|| codec_error("sequence fixture needs one effect"))?
+                .request
+                .sequence_oid;
+            let index = model
+                .indexes
+                .first_mut()
+                .ok_or_else(|| codec_error("index fixture has no target index"))?;
+            index.oid = oid;
         }
         RehashedForgery::ExternalColumnIdCollision => {
             let child_id = model
@@ -246,6 +356,19 @@ pub(in super::super) fn rehashed_forgery_for_test(
                 .ok_or_else(|| codec_error("foreign-key fixture has no FK"))?;
             foreign_key.parent_column.column_id = child_id;
             foreign_key.supporting_index.key_columns[0].column_id = child_id;
+        }
+        RehashedForgery::UnindexedTargetExternalColumnIdCollision => {
+            let column_id = model
+                .columns
+                .first()
+                .ok_or_else(|| codec_error("fixture has no target column"))?
+                .column_id;
+            let foreign_key = model
+                .foreign_keys
+                .first_mut()
+                .ok_or_else(|| codec_error("foreign-key fixture has no FK"))?;
+            foreign_key.parent_column.column_id = column_id;
+            foreign_key.supporting_index.key_columns[0].column_id = column_id;
         }
         RehashedForgery::ExternalColumnHugeOrdinal => {
             let foreign_key = model
@@ -262,6 +385,25 @@ pub(in super::super) fn rehashed_forgery_for_test(
                 .ok_or_else(|| codec_error("foreign-key fixture has no FK"))?;
             foreign_key.parent_column.type_oid = model.target.oid;
             foreign_key.supporting_index.key_columns[0].type_oid = model.target.oid;
+        }
+        RehashedForgery::DomainOidNameCollision => {
+            let domain = model
+                .domains
+                .first()
+                .ok_or_else(|| codec_error("domain fixture has no domain"))?;
+            model.domains.push(DecodedDomain {
+                schema: domain.schema.clone(),
+                name: format!("{}_forged", domain.name),
+                oid: domain.oid,
+                base_type: domain.base_type,
+            });
+        }
+        RehashedForgery::TargetAttnumOrder => {
+            let column = model
+                .columns
+                .first_mut()
+                .ok_or_else(|| codec_error("fixture has no target column"))?;
+            column.attnum = 3;
         }
         RehashedForgery::DateCarrierUnderflow => {
             let column = model
@@ -494,6 +636,11 @@ fn refresh_sequence_witnesses(model: &mut DecodedModel) -> Result<(), EngineErro
                     owner,
                     predecessor,
                     input_digest,
+                    chain: PrivateChain {
+                        state: (next_last_value, next_is_called),
+                        owner,
+                        outcome,
+                    },
                 };
                 private_outcomes.insert(effect.request.sequence_oid, outcome);
             }

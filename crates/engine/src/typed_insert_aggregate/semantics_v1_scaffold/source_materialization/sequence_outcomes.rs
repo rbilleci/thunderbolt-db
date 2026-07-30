@@ -1,4 +1,4 @@
-//! Inert S5 sequence-closure and S6 statement-outcome source materialization.
+//! Inert semantics-v1 S5 sequence-closure and S6 statement-outcome source materialization.
 //!
 //! S5 is read straight from the chunk-bounded aggregate reader into a compact owner. Published
 //! references use only one fixed 86-byte stack buffer; private effects retain no raw body because
@@ -243,7 +243,7 @@ fn read_s5_entry(
             }
             let reference = crate::decode_sequence_value_reference_exact(&bytes).map_err(|error| {
                 EngineError::Durability(format!(
-                    "typed INSERT aggregate executable semantics v2: S5 published reference strict decode: {error}"
+                    "typed INSERT aggregate semantics-v1 scaffold: S5 published reference strict decode: {error}"
                 ))
             })?;
             S5Body::Published(reference)
@@ -565,7 +565,7 @@ fn read_s6_entry(reader: &mut DecodedAggregateSectionReader<'_>) -> Result<S6Ent
     reader.copy_exact(&mut outcome_bytes)?;
     let outcome = gpu_db_wal::decode_canonical_outcome_exact(&outcome_bytes).map_err(|error| {
         EngineError::Durability(format!(
-            "typed INSERT aggregate executable semantics v2: S6 outcome strict decode: {error}"
+            "typed INSERT aggregate semantics-v1 scaffold: S6 outcome strict decode: {error}"
         ))
     })?;
     Ok(S6Entry {
