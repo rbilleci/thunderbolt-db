@@ -89,6 +89,14 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
   consumer. Independent re-audit accepted exact tree `bd313d349e5258af33d4f9ac9f9662736b10dfa4` and diff
   `676b6bcb04864f2a36f0ce0e5a056cb6876af1a924c0c2b5d5cb0c23733968aa` across 177 staged paths with no
   finding; GPU/HAZARD/recovery/card gates are inapplicable to the inert host codec.
+- The exact typed-INSERT-only semantics-v2 S7 contract is now frozen at
+  [`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md), SHA-256
+  `b673127af53148fb26a5e26e32ad00bacb3206aadea0440a155d1a8d05624453`. Independent architecture audit
+  returned **ACCEPT** after closing logical `RETURNING`/retry formats, the full-success/final-abort matrix,
+  constraint error identity, dependency/index owner and generation equality, ADR-014 lease authority, exact
+  catalog/allocator/generation witnesses, final index roots, an acyclic generation graph, recovery witness phasing,
+  terminal guard keys, synthesized NOT NULL identities, and the resolution/S1 request-digest echo. This checkpoint
+  changes design only and remains inert.
 - Regenerable benchmark/build state was reduced from about **143 GB to 4.9 GB**. The runner now recreates the
   source-relative temporary directory required by clean quick and exported-full builds.
 - **PRODUCT-001 completed and received final independent acceptance on 2026-07-26.** The superseded listener,
@@ -115,16 +123,19 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. Resume with the PLAN-owned semantics-v2 S4 + S7 checkpoint. Before
-implementation, freeze and independently audit the exact S7 wire required by
-[`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md), then make row identity
-table-local, bind every disposition to its final table/transition, and encode plus strictly decode the complete
-final overlay using the shared typed image. The current `executable_semantics_v2` name is provisional debt: its
-physical aggregate is semantics 1, its S4 validator uses one global row cursor, and canceled/suppressed rows retain
-both absent references. Make dispatch version-specific, preserve semantics-v1 bytes, and leave exactly one
-normative S4 authority. Keep the new form unreachable from live WAL/recovery/apply. S8, final replay ownership,
-durable sequence validation, GPU replay compilation, and the complete pre-WAL capacity lease remain later
-WRITE-001 checkpoints; do not add another live operation, WAL, publication, or eligibility authority.
+**WRITE-001** is the sole active **NOW** task. The S7 design gate is complete; resume with its inert normative S4/S7
+implementation. Dispatch semantics before validation, preserve every semantics-v1 byte and test, replace the
+provisional global-row S4 validator with the sole table-local semantics-v2 authority, encode/decode the complete
+final overlay through the shared typed image, and implement the quarantined → catalog/lease-validated generation
+pending → generation-witness-validated test states. Pin the required success/abort golden vectors, independent
+catalog/lease/generation witnesses, coherent rehashed-root sabotage, exact persistent plus maximum scratch
+accounting, allocation-failure drain, and decode/re-encode equality. Keep the entire form unreachable from live
+WAL/recovery/apply/publication. S8, final replay ownership, live durable-sequence validation, GPU replay compilation,
+and the complete live pre-WAL capacity lease remain later WRITE-001 checkpoints; do not add another live operation,
+WAL, publication, or eligibility authority.
+
+The local worktree intentionally retains user-owned unstaged changes in `AGENTS.md`, `docs/CODE_SIZE.md`, and the
+source-size-policy hunks of `docs/PLAN.md`; do not stage, revert, or overwrite them.
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read
 floor, and INSERT-001's sealed qualification, differential, HAZARD, and canonical-card evidence in `STATUS.md`.

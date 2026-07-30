@@ -57,16 +57,20 @@ starts at WRITE-001:
    including exact bytes/allocation-slot accounting and hostile pre-allocation rejection. These pieces remain
    production-ineligible.
 
-   The next semantics-v2 S4 + S7 checkpoint begins by freezing and independently auditing one internally complete
-   exact S7 wire contract under
-   [`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md). Only after that design gate
-   may the same checkpoint implement S4/S7: make row identity table-local, bind every disposition to its final
-   table and surviving transition, encode and strictly decode the complete final overlay, and consume the shared
-   typed image for final table state. Reconcile the existing misnamed provisional S1--S6 scaffold in that slice:
-   make semantics-version dispatch explicit, preserve semantics-v1 bytes, and leave exactly one normative S4
-   authority. Keep the new form unreachable from live WAL/recovery/apply. S8, the final destructive replay IR,
-   durable sequence validation, GPU replay compilation, and the complete pre-WAL capacity lease remain later
-   WRITE-001 checkpoints; none may add another WAL, operation, publication, or eligibility authority.
+   The exact semantics-v2 S7 wire contract is frozen and independently architecture-accepted at
+   [`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md), file SHA-256
+   `b673127af53148fb26a5e26e32ad00bacb3206aadea0440a155d1a8d05624453`. It permanently admits only typed
+   INSERT, defines exact table-local S4 binding, final-neutral generation inputs followed by final-bound S7
+   digests, logical `RETURNING`/retry identity, full-success or final-statement-abort outcomes, catalog/dependency/
+   index/constraint closure, ADR-014 lease witnesses, and catalog/allocator/generation witness phases. The next
+   checkpoint may now implement the inert normative S4/S7 reader and test-only reencoder: make row identity
+   table-local, bind every disposition to its final table and surviving transition, encode and strictly decode the
+   complete final overlay, consume the shared typed image, and implement the checked witness-state transitions.
+   Reconcile the existing misnamed provisional S1--S6 scaffold in that slice: dispatch by semantics version before
+   validation, preserve semantics-v1 bytes, and leave exactly one normative S4 authority. Keep the new form
+   unreachable from live WAL/recovery/apply/publication. S8, the final destructive replay IR, live durable-sequence
+   validation, GPU replay compilation, and the complete live pre-WAL capacity lease remain later WRITE-001
+   checkpoints; none may add another WAL, operation, publication, or eligibility authority.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as

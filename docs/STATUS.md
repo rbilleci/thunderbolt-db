@@ -210,6 +210,31 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   (passed/ignored/failed). GPU NULL differential, HAZARD, recovery/retry, quick card, and full card are
   inapplicable because the accepted slice is an unreachable host codec and documentation boundary.
 
+## WRITE-001 exact semantics-v2 S7 design freeze accepted — 2026-07-30
+
+- The typed-INSERT-only semantics-v2 S7 contract is now byte-exact in
+  [`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md), SHA-256
+  `b673127af53148fb26a5e26e32ad00bacb3206aadea0440a155d1a8d05624453`. Its 640-byte header and all
+  14 fixed directories are closed; the expanded 384-byte index descriptor carries base/final index generations
+  and roots, and every fixed layout sums without a gap or stale 288-byte form.
+- Logical `RETURNING` now binds S2 values, exact S4 result-row selection, ordered projections, duplicates, and
+  text/binary formats into S6 and aggregate retry identity. Plain nonempty INSERT admits only full success or one
+  final typed abort: earlier rows are applied-then-canceled, failing-statement rows are suppressed, no no-op or
+  partial success exists, and NOT NULL/domain, UNIQUE/primary-key, FK, and CHECK errors have exact source and stable
+  constraint identities.
+- Dependency tokens have exact S2/catalog sources, owner/index/generation/name equalities, and a reference-neutral
+  runtime guard key. S7 allocator ranges are only transaction cross-checks beneath the authoritative durable
+  ADR-014 `AllocatorLease`. Mandatory catalog, allocator, and generation witnesses bind the outer database/catalog/
+  transaction identity; final-neutral row/index/effect inputs feed the sole generation builder before final-bound
+  codec digests, so coherent opaque-root substitution rejects without a digest cycle.
+- The independent read-only architecture re-audit returned **ACCEPT** on the exact file hash above after rejecting
+  and driving repairs for result identity, outcome closure, dependency sources, allocator authority, opaque-root
+  evidence, final index state, digest-cycle, recovery witness phasing, terminal guard keys, synthesized domain
+  NOT NULL identity, and the resolution/S1 request-digest echo. This is a design-only inert checkpoint: no source,
+  live writer, WAL/recovery/apply/publication,
+  device, residency, or read path changed, so correctness suites, GPU/HAZARD, recovery, quick card, and full card
+  are not applicable. WRITE-001 remains active; normative S4/S7 implementation is the next PLAN checkpoint.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted
