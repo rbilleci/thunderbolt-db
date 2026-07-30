@@ -4,9 +4,9 @@
 //! This leaf consumes no WAL envelope, creates no replay transaction, and has no recovery,
 //! apply, plan, or publication caller.  It first reuses the allocation-free S1/S4 validation
 //! traversal, then reads the four direct sections again to retain exactly one joined source per
-//! statement and one compact disposition per original INSERT row. Its parent module's historical
-//! `v2` name is not normative semantics-v2 dispatch; the accepted physical aggregate remains
-//! semantics 1. Raw S2/S3 bytes exist only in one bounded scratch owner while their strict current
+//! statement and one compact disposition per original INSERT row. Its parent is not normative
+//! semantics-v2 dispatch; the accepted physical aggregate remains semantics 1. Raw S2/S3 bytes
+//! exist only in one bounded scratch owner while their strict current
 //! codec is decoded.
 
 use super::super::TypedInsertAggregateMeasure;
@@ -123,7 +123,7 @@ enum StatementSemanticClass {
 pub(super) fn materialize_source_draft(
     decoded: &DecodedTypedInsertAggregate<'_>,
 ) -> Result<TypedInsertAggregateSourceDraft, EngineError> {
-    let summary = validate_executable_semantics_v2(decoded)?;
+    let summary = validate_semantics_v1_scaffold(decoded)?;
     let statement_capacity = usize::try_from(summary.statement_count)
         .map_err(|_| violation("S1 statement count exceeds host address space"))?;
     let disposition_capacity = usize::try_from(summary.original_row_count)

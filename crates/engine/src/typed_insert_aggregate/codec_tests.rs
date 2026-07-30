@@ -57,6 +57,26 @@ fn body_refs(bodies: &[Vec<u8>]) -> Vec<&[u8]> {
     bodies.iter().map(Vec::as_slice).collect()
 }
 
+const SEMANTICS_V1_EXACT_BODY_GOLDEN_HEX: [&str; 2] = [
+    "47505544424f50310501030024010000000000000000000001000000000000000000000024010000000000008c5b99aa6fbe9f3ec46bc18070691d913bf7c9d2e67df18470f2af3c4216b2aa475055444254584e414747310000000001000100010001000100000008000000a400000000000000290000000000000001000000010000000100000000000000010000000000000063000000000000006400000000000000010000000000000001000000010000000100000000000000310200000001000000020000000000000032320300000000000000030000000000000033333304000000010000000400000000000000343434340500000000000000050000000000000035353535350600000001000000060000000000000036363636363607000000010000000700000000000000373737373737370800000000000000080000000000000038383838383838388c5b99aa6fbe9f3ec46bc18070691d913bf7c9d2e67df18470f2af3c4216b2aa",
+    "47505544425354415455533201010101010101010101010101010101020202020202020202020202020202022900000000000000030303030303030303030303030303030303030303030303030303030303030301010000000000000000000000000000010000000000000003a3a1ab320d7eccc1be21b1d6fa322a63a88dfdc5bd09b4a3665dc5a31bdb6900000000000000000000000000000000000000000000000000000000000000008c5b99aa6fbe9f3ec46bc18070691d913bf7c9d2e67df18470f2af3c4216b2aa",
+];
+
+fn decode_fixture_hex(encoded: &str) -> Vec<u8> {
+    assert!(
+        encoded.len().is_multiple_of(2),
+        "fixture hex is byte-aligned"
+    );
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).expect("fixture hex is ASCII");
+            u8::from_str_radix(digits, 16).expect("fixture hex digit")
+        })
+        .collect()
+}
+
 fn payloads_for_chunk_count(chunks: usize) -> [Vec<u8>; AGGREGATE_SECTION_COUNT] {
     assert!((1..=AGGREGATE_MAX_CHUNKS).contains(&chunks));
     let mut payloads: [Vec<u8>; AGGREGATE_SECTION_COUNT] = std::array::from_fn(|index| {
@@ -81,6 +101,33 @@ fn payloads_for_chunk_count(chunks: usize) -> [Vec<u8>; AGGREGATE_SECTION_COUNT]
         chunks
     );
     payloads
+}
+
+#[test]
+fn semantics_v1_complete_fragment_bodies_match_the_literal_wire_golden() {
+    let payloads: [Vec<u8>; AGGREGATE_SECTION_COUNT] =
+        std::array::from_fn(|index| vec![0x31 + index as u8; index + 1]);
+    let actual = encoded_copies(&encode_fixture(&payloads));
+    let expected: Vec<Vec<u8>> = SEMANTICS_V1_EXACT_BODY_GOLDEN_HEX
+        .iter()
+        .map(|encoded| decode_fixture_hex(encoded))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "semantics-v1 chunk/status bytes drifted from their literal golden"
+    );
+    let expected_refs = body_refs(&expected);
+    let decoded = decode_typed_insert_aggregate_bodies(
+        OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
+        &expected_refs,
+    )
+    .expect("literal semantics-v1 golden remains strictly decodable");
+    let expected_view = view(&payloads);
+    let expected_layout = expected_view.measure().expect("golden fixture layout");
+    let expected_roots = typed_insert_aggregate_status_roots(&expected_view, &expected_layout)
+        .expect("golden fixture roots");
+    assert_eq!(decoded.layout().measure, expected_layout.measure);
+    assert_eq!(decoded.status(), &status(expected_roots));
 }
 
 #[test]

@@ -18,17 +18,17 @@ clearly identified before it is excluded.
 
 | File class | Preferred envelope | Required analysis | Critical outlier |
 |---|---:|---:|---:|
-| Production source | 300–1,500 lines | Over 2,000 lines | Over 5,000 lines |
-| Tests, examples, benchmarks, and tools | 300–2,000 lines | Over 3,000 lines | Over 5,000 lines |
+| Production source | 450–2,250 lines | Over 3,000 lines | Over 7,500 lines |
+| Tests, examples, benchmarks, and tools | 450–3,000 lines | Over 4,500 lines | Over 7,500 lines |
 | Generated or archived source | No numeric target | Confirm provenance and non-ownership | Manual edits or mixed generated/handwritten content |
 
-Files under 500 lines are usually easy to load in one context. Files between 500 and the preferred ceiling are
+Files under 750 lines are usually easy to load in one context. Files between 750 and the preferred ceiling are
 not presumptively too large when they own one coherent concept. Crossing a required-analysis threshold means the
 file is outside the guideline until it is decomposed or entered in the exception registry. Every critical outlier
 must have a `PLAN.md` task until that disposition is complete.
 
-New files should remain within the preferred envelope. Do not create a production file over 2,000 lines or a
-test/tool file over 3,000 lines without an accepted exception. A change that pushes an existing file across a
+New files should remain within the preferred envelope. Do not create a production file over 3,000 lines or a
+test/tool file over 4,500 lines without an accepted exception. A change that pushes an existing file across a
 threshold, or grows an already-outlying file materially, must include decomposition or update its PLAN-owned
 disposition.
 
@@ -46,7 +46,7 @@ For every file outside the envelope:
 4. **Choose a disposition.** Decompose along ownership boundaries; retain a cohesive file through a documented
    exception; identify reproducible generated material; or archive/delete code that is no longer live.
 5. **Design the destination first.** Name the proposed modules and their responsibilities, public surface, test
-   placement, dependency direction, and validation gates. Target modules normally remain below 1,500 lines and
+   placement, dependency direction, and validation gates. Target modules normally remain below 2,250 lines and
    must not simply move the same ambiguity into another oversized file.
 
 Good boundaries include protocol phases, storage layers, operator families, data types, transaction phases,
@@ -84,18 +84,13 @@ artifact, a stable declarative table, or a tightly coupled kernel corpus whose c
 cannot be separated safely. “It is old,” “splitting is inconvenient,” and “the tests pass” are not sufficient.
 
 Add accepted exceptions to the table below. An exception records a current architecture fact, not future work;
-any proposed remediation belongs in `PLAN.md`. Re-review an exception when the file grows by 20%, gains a new
+any proposed remediation belongs in `PLAN.md`. Re-review an exception when the file grows by 30%, gains a new
 responsibility, changes its public boundary, or reaches the stated trigger.
 
-There is currently one accepted exception:
-
-| File | Policy count | Architecture fact and re-review trigger |
-|---|---:|---|
-| `crates/sql/src/lib.rs` | 2,004 production lines (2,031 physical less 27 comment-only) | Stable SQL crate facade re-exported wholesale by `gpu_db_protocol` and consumed directly by engine, facade, planner, and server code. It retains catalog/control DDL dispatch and identifier/quote/clause utilities for the remaining coupled parser family; 123 Rust files reference `gpu_db_sql`. INSERT-001 added only the private `lexical.rs` leaf declaration and its stable re-export. WRITE-001 retained typed `InsertCell`/provenance behavior in `ast.rs`. CHECK-001 moved the cohesive `ParseError` diagnostics into the bounded 33-line private `parse_error.rs` leaf while preserving the root re-export, so typed-literal diagnostics did not grow the root. Splitting the remaining facade during behavior work would violate the behavior/structure separation rule. Re-review on any further net production growth, a new root-owned SQL family, a public-boundary change, or a count of 2,100 lines, whichever comes first. |
-
-Under the comment-excluded count, `crates/engine/src/engine_expr.rs` has 1,926 counted lines (2,403 physical lines
-less 477 comment-only lines), so its former exception is no longer needed. Its completed historical disposition
-remains in `PLAN.md` and `STATUS.md`.
+There are currently no accepted exceptions. The former `crates/sql/src/lib.rs` exception became unnecessary when
+the size limits increased by 50% on 2026-07-29; its completed historical disposition remains in `PLAN.md` and
+`STATUS.md`. Under the comment-excluded count, `crates/engine/src/engine_expr.rs` likewise remains within the
+preferred production envelope without an exception.
 
 ## Candidate inventory command
 

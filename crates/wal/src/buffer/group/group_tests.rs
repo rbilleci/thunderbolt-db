@@ -237,6 +237,29 @@ fn claim_exact(wal: &mut WalBuffer, txn_id: TxnId) -> Arc<[u8]> {
     serialized
 }
 
+#[cfg(unix)]
+fn claim_fua_exact_after_preproposal_readiness(wal: &mut WalBuffer, txn_id: TxnId) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match wal.reserve_typed_exact_append(exact_record(txn_id)) {
+            Ok(mut reservation) => {
+                wal.append_typed_exact_tentative(&mut reservation)
+                    .expect("tentative exact append after prepared rollover");
+                wal.claim_typed_exact_append(reservation)
+                    .expect("claim exact append after prepared rollover");
+                return;
+            }
+            Err(EngineError::ProposalFailed(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(EngineError::ProposalFailed(_)) => {
+                panic!("FUA successor did not become ready before bounded test admission");
+            }
+            Err(error) => panic!("exact FUA preproposal rollover admission failed: {error}"),
+        }
+    }
+}
+
 fn serial_group_exact_ptr(job: &super::super::WalGroupFlushJob) -> Option<*const u8> {
     match job.kind.as_ref().expect("fresh group job") {
         super::super::WalGroupFlushJobKind::Serial(job) => {
@@ -927,10 +950,12 @@ fn fixed_poison_is_visible_before_wake_and_first_fault_wins_under_race() {
         right_poison.install(right)
     });
     race.wait();
+    let left_published = left_worker.join().expect("left fault");
+    let right_published = right_worker.join().expect("right fault");
     let published = first.snapshot().expect("one racing fault wins");
     assert!(published == left || published == right);
-    assert_eq!(left_worker.join().expect("left fault"), published);
-    assert_eq!(right_worker.join().expect("right fault"), published);
+    assert_eq!(left_published, published);
+    assert_eq!(right_published, published);
     assert_eq!(
         first.install(exact_fault_for(DurabilityStage::FrontierDrift, None)),
         published,
@@ -1164,7 +1189,7 @@ fn exact_fua_full_forming_group_seals_and_readmits_the_next_record() {
     let mut wal = WalBuffer::with_fua_durable_segment(&path, 8, 1 << 20).expect("FUA WAL");
     let total = MAX_WAL_GROUP_RECORDS + 1;
     for txn_id in 1..=total as TxnId {
-        claim_exact(&mut wal, txn_id);
+        claim_fua_exact_after_preproposal_readiness(&mut wal, txn_id);
     }
     let sealed = wal.flushed_count();
     assert!(
@@ -1188,32 +1213,10 @@ fn exact_fua_full_forming_group_seals_and_readmits_the_next_record() {
 #[cfg(unix)]
 #[test]
 fn exact_fua_rolls_only_after_the_successor_is_prepared_before_claim() {
-    fn claim_after_preproposal_successor_readiness(wal: &mut WalBuffer, txn_id: TxnId) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match wal.reserve_typed_exact_append(exact_record(txn_id)) {
-                Ok(mut reservation) => {
-                    wal.append_typed_exact_tentative(&mut reservation)
-                        .expect("tentative exact append after prepared rollover");
-                    wal.claim_typed_exact_append(reservation)
-                        .expect("claim exact append after prepared rollover");
-                    return;
-                }
-                Err(EngineError::ProposalFailed(_)) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(EngineError::ProposalFailed(_)) => {
-                    panic!("FUA successor did not become ready before bounded test admission");
-                }
-                Err(error) => panic!("exact FUA preproposal rollover admission failed: {error}"),
-            }
-        }
-    }
-
     let path = fua_test_path("exact-roll");
     let mut wal = WalBuffer::with_fua_durable_segment(&path, 8, 16 * 1024).expect("FUA WAL");
     for txn_id in 1..=8 {
-        claim_after_preproposal_successor_readiness(&mut wal, txn_id);
+        claim_fua_exact_after_preproposal_readiness(&mut wal, txn_id);
         wal.flush_all()
             .expect("flush exact record through prepared roll");
     }

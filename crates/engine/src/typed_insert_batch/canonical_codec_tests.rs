@@ -1,5 +1,28 @@
 use super::*;
 
+struct BytewiseCanonicalSource<'a>(&'a [u8]);
+
+impl CanonicalTypedInsertReadAt for BytewiseCanonicalSource<'_> {
+    fn len(&self) -> u64 {
+        u64::try_from(self.0.len()).expect("fixture source length fits u64")
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), EngineError> {
+        let start = usize::try_from(offset).map_err(|_| codec_error("fixture offset overflows"))?;
+        let end = start
+            .checked_add(out.len())
+            .ok_or_else(|| codec_error("fixture source range overflows"))?;
+        let source = self
+            .0
+            .get(start..end)
+            .ok_or_else(|| codec_error("fixture source is truncated"))?;
+        for (destination, source) in out.iter_mut().zip(source) {
+            *destination = *source;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn prepared_batch() -> TypedInsertBatch {
     let engine = crate::Engine::new_local();
     engine
@@ -47,6 +70,206 @@ fn canonical_codec_encoded_len_runs_the_exact_encoder_traversal_without_material
             encoded.len()
         );
     }
+}
+
+#[test]
+fn canonical_decoder_uses_fallible_exact_vector_reservations_and_retries_cleanly() {
+    let bytes = encode(&prepared_batch()).expect("canonical record encodes");
+    let (_, stats) = decode::observe_stats_for_test(|| decode(&bytes).expect("record decodes"));
+    let owners = stats.attempts;
+    assert!(owners != 0, "decoded fixture must retain owned vectors");
+    assert!(
+        stats.persistent_bytes != 0,
+        "decoded fixture must reserve retained owner bytes"
+    );
+    assert!(
+        stats.scratch_bytes != 0,
+        "canonical reencode scratch must be reserved/injected"
+    );
+    for owner in 1..=owners {
+        let failed = decode::fail_at_for_test(owner, || decode(&bytes));
+        assert!(failed.is_err(), "decoded owner {owner} must fail closed");
+        assert!(
+            decode(&bytes).is_ok(),
+            "decoded owner {owner} must drain for retry"
+        );
+    }
+}
+
+#[test]
+fn canonical_source_measure_binds_bytewise_copy_before_model_decode() {
+    let bytes = encode(&prepared_batch()).expect("canonical source fixture encodes");
+    let source = BytewiseCanonicalSource(&bytes);
+    let (measure, stats) = decode::observe_stats_for_test(|| {
+        measure_decoded_canonical_typed_insert_from_source(&source)
+            .expect("bytewise source raw pass succeeds")
+    });
+    assert_eq!(
+        stats.attempts, 0,
+        "successful raw S2 measure must not reserve decoded owners"
+    );
+    assert_eq!(
+        measure.record_bytes(),
+        u64::try_from(bytes.len()).expect("fixture fits u64")
+    );
+    assert!(measure.persistent_bytes() != 0);
+    assert_eq!(
+        measure
+            .maximum_with_record_copy_bytes()
+            .expect("fixture scratch peak fits u64"),
+        u64::try_from(bytes.len())
+            .expect("fixture fits u64")
+            .checked_mul(2)
+            .expect("fixture peak fits u64"),
+        "the raw copy and final exact reencode are concurrently live"
+    );
+    assert_eq!(
+        measure
+            .maximum_with_record_copy_allocation_slots()
+            .expect("fixture scratch slots fit u64"),
+        2,
+        "the raw copy and final exact reencode are two concurrent allocations"
+    );
+
+    let mut copy = vec![0_u8; bytes.len()];
+    copy_decoded_canonical_typed_insert_after_measure(&source, measure, &mut copy)
+        .expect("copy remeasures and preserves bytewise source evidence");
+    let (decoded, observed) = decode::observe_stats_for_test(|| {
+        decode_decoded_canonical_typed_insert_after_measure(&copy, measure)
+            .expect("opaque measure authorizes only its copied bytes")
+    });
+    assert_eq!(decoded.facts().row_count, 2);
+    assert_eq!(
+        observed.persistent_bytes,
+        measure.persistent_bytes(),
+        "S2 raw measure must equal all retained decoder owners"
+    );
+    assert_eq!(
+        observed.persistent_slots,
+        measure.persistent_allocation_slots(),
+        "S2 raw measure must equal every retained allocation slot"
+    );
+    assert_eq!(
+        observed.scratch_bytes,
+        measure.maximum_scratch_bytes(),
+        "S2 raw measure must equal peak reencode scratch"
+    );
+    assert_eq!(
+        observed.scratch_slots,
+        measure.maximum_scratch_allocation_slots(),
+        "S2 raw measure must equal peak scratch allocation slots"
+    );
+    assert_eq!(
+        observed.attempts,
+        measure
+            .persistent_allocation_slots()
+            .checked_add(measure.maximum_scratch_allocation_slots())
+            .expect("fixture reservation attempts fit u64"),
+        "every measured persistent/scratch allocation slot must have one exact attempt; \
+         persistent slots observed={} measured={}, scratch slots observed={} measured={}",
+        observed.persistent_slots,
+        measure.persistent_allocation_slots(),
+        observed.scratch_slots,
+        measure.maximum_scratch_allocation_slots(),
+    );
+    for owner in 1..=observed.attempts {
+        let rejected = decode::fail_at_for_test(owner, || {
+            decode_decoded_canonical_typed_insert_after_measure(&copy, measure)
+        });
+        assert!(rejected.is_err(), "S2 owner {owner} must reject cleanly");
+        assert!(
+            decode_decoded_canonical_typed_insert_after_measure(&copy, measure).is_ok(),
+            "S2 owner {owner} failure must drain for a retry"
+        );
+    }
+    let last_owner = observed
+        .attempts
+        .checked_add(1)
+        .expect("fixture owner count fits injection domain");
+    for (persistent_bytes, persistent_slots, scratch_bytes, scratch_slots) in [
+        (Some(measure.persistent_bytes() - 1), None, None, None),
+        (
+            None,
+            Some(measure.persistent_allocation_slots() - 1),
+            None,
+            None,
+        ),
+        (None, None, Some(measure.maximum_scratch_bytes() - 1), None),
+        (
+            None,
+            None,
+            None,
+            Some(measure.maximum_scratch_allocation_slots() - 1),
+        ),
+    ] {
+        let rejected = decode::fail_with_limits_for_test(
+            last_owner,
+            persistent_bytes,
+            persistent_slots,
+            scratch_bytes,
+            scratch_slots,
+            || decode_decoded_canonical_typed_insert_after_measure(&copy, measure),
+        );
+        assert!(rejected.is_err(), "one-unit-below S2 budget must refuse");
+        assert!(
+            decode_decoded_canonical_typed_insert_after_measure(&copy, measure).is_ok(),
+            "one-unit-below S2 refusal must drain for retry"
+        );
+    }
+
+    let mut stale = copy.clone();
+    stale[0] ^= 1;
+    let stale_source = BytewiseCanonicalSource(&stale);
+    let mut stale_destination = vec![0_u8; stale.len()];
+    assert!(
+        copy_decoded_canonical_typed_insert_after_measure(
+            &stale_source,
+            measure,
+            &mut stale_destination,
+        )
+        .is_err(),
+        "same-length source drift must fail before copy"
+    );
+    assert!(
+        decode_decoded_canonical_typed_insert_after_measure(&stale, measure).is_err(),
+        "same-length source drift must fail before model-owner allocation"
+    );
+
+    let first_serial = encode(&serial_batch(41)).expect("first same-length serial fixture encodes");
+    let second_serial =
+        encode(&serial_batch(42)).expect("second same-length serial fixture encodes");
+    assert_eq!(
+        first_serial.len(),
+        second_serial.len(),
+        "serial values must give a same-length content-drift fixture"
+    );
+    let first_measure =
+        measure_decoded_canonical_typed_insert_from_source(&BytewiseCanonicalSource(&first_serial))
+            .expect("first serial source measures");
+    let second_source = BytewiseCanonicalSource(&second_serial);
+    let mut same_length_destination = vec![0_u8; second_serial.len()];
+    assert!(
+        copy_decoded_canonical_typed_insert_after_measure(
+            &second_source,
+            first_measure,
+            &mut same_length_destination,
+        )
+        .is_err(),
+        "the source fingerprint must refuse a distinct valid same-length S2 record"
+    );
+}
+
+#[test]
+fn canonical_decoder_source_guard_has_no_arc_or_implicit_byte_owner() {
+    let decoder = include_str!("canonical_codec_decode.rs");
+    let reservation = include_str!("canonical_codec_decode_reservation.rs");
+    assert!(!decoder.contains("Arc::from"));
+    assert!(!decoder.contains("String::from_utf8"));
+    assert!(!decoder.contains(".to_vec()"));
+    assert!(!decoder.contains("Vec::with_capacity"));
+    assert!(decoder.contains("reserve_string"));
+    assert!(reservation.contains("reserve_reencode_scratch"));
+    assert!(reservation.contains("values.len() != values.capacity()"));
 }
 
 pub(super) fn serial_batch(value: i64) -> TypedInsertBatch {
@@ -102,6 +325,93 @@ pub(super) fn serial_batch_values(values: &[i64]) -> TypedInsertBatch {
             false,
         )
         .expect("serial fixture seals")
+}
+
+pub(super) fn serial_index_batch() -> TypedInsertBatch {
+    let engine = crate::Engine::new_local();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE codec_serial_index (id serial PRIMARY KEY, payload int4)",
+        )
+        .expect("serial/index codec fixture table creates");
+    let crate::Command::Insert(insert) =
+        crate::parse_command("INSERT INTO codec_serial_index (id, payload) VALUES (DEFAULT, 7)")
+            .expect("serial/index codec fixture INSERT parses")
+    else {
+        panic!("fixture must parse as INSERT");
+    };
+    let catalog = engine.catalog_snapshot();
+    let prepared = prepare_typed_insert_semantics(&insert, &catalog, catalog.commit_seq, None)
+        .expect("serial/index fixture semantic preparation succeeds")
+        .expect("serial/index fixture prepares");
+    let typed_statement_digest = prepared.typed_statement_digest();
+    let parent = sequence_defaults::effects::SequenceDefaultParentContext::for_test(
+        72,
+        true,
+        typed_statement_digest,
+        InsertStatementOrdinal::FIRST,
+        0,
+    );
+    let bindings = prepared
+        .sequence_requests()
+        .iter()
+        .cloned()
+        .map(|request| {
+            sequence_defaults::SequenceDefaultBinding::published(request, parent.clone(), 1)
+        })
+        .collect();
+    prepared
+        .seal(
+            sequence_defaults::SequenceDefaultBindings::from_bindings(parent, bindings),
+            false,
+            false,
+        )
+        .expect("serial/index fixture seals")
+}
+
+pub(super) fn external_parent_domain_batch() -> TypedInsertBatch {
+    let engine = crate::Engine::new_local();
+    engine
+        .execute_text(1, "CREATE DOMAIN codec_external_amount AS int4")
+        .expect("external domain fixture creates");
+    engine
+        .execute_text(
+            2,
+            "CREATE TABLE codec_external_parent (id codec_external_amount PRIMARY KEY)",
+        )
+        .expect("external domain parent fixture creates");
+    engine
+        .execute_text(
+            3,
+            "CREATE TABLE codec_external_child (id int4, parent_id int4)",
+        )
+        .expect("external domain child fixture creates");
+    engine
+        .execute_text(
+            4,
+            "ALTER TABLE ONLY codec_external_child ADD CONSTRAINT codec_external_child_parent_fkey FOREIGN KEY (parent_id) REFERENCES codec_external_parent(id)",
+        )
+        .expect("external domain foreign key fixture creates");
+    let insert = crate::Insert {
+        table: "codec_external_child".to_string(),
+        columns: Vec::new(),
+        rows: crate::Insert::programmatic_rows(vec![vec![
+            crate::SqlValue::Int4(7),
+            crate::SqlValue::Int4(11),
+        ]]),
+        returning: Vec::new(),
+    };
+    let catalog = engine.catalog_snapshot();
+    prepare_typed_insert_semantics(&insert, &catalog, catalog.commit_seq, None)
+        .expect("external domain fixture semantic preparation succeeds")
+        .expect("external domain fixture prepares")
+        .seal(
+            sequence_defaults::SequenceDefaultBindings::empty(),
+            false,
+            false,
+        )
+        .expect("external domain fixture seals")
 }
 
 pub(super) fn catalog_closure_batch() -> TypedInsertBatch {
@@ -198,6 +508,56 @@ pub(super) fn external_shared_supporting_index_batch() -> TypedInsertBatch {
             false,
         )
         .expect("shared-support fixture seals")
+}
+
+pub(super) fn distinct_external_supporting_indexes_batch() -> TypedInsertBatch {
+    let engine = crate::Engine::new_local();
+    for (txn_id, sql) in [
+        (
+            1,
+            "CREATE TABLE codec_left_parent (id int4 PRIMARY KEY)",
+        ),
+        (
+            2,
+            "CREATE TABLE codec_right_parent (id int4 PRIMARY KEY)",
+        ),
+        (
+            3,
+            "CREATE TABLE codec_two_parent_child (id int4, left_id int4, right_id int4)",
+        ),
+        (
+            4,
+            "ALTER TABLE ONLY codec_two_parent_child ADD CONSTRAINT codec_two_parent_child_left_fkey FOREIGN KEY (left_id) REFERENCES codec_left_parent(id)",
+        ),
+        (
+            5,
+            "ALTER TABLE ONLY codec_two_parent_child ADD CONSTRAINT codec_two_parent_child_right_fkey FOREIGN KEY (right_id) REFERENCES codec_right_parent(id)",
+        ),
+    ] {
+        engine
+            .execute_text(txn_id, sql)
+            .expect("distinct-supporting-index fixture catalog setup succeeds");
+    }
+    let insert = crate::Insert {
+        table: "codec_two_parent_child".to_string(),
+        columns: Vec::new(),
+        rows: crate::Insert::programmatic_rows(vec![vec![
+            crate::SqlValue::Int4(7),
+            crate::SqlValue::Int4(11),
+            crate::SqlValue::Int4(13),
+        ]]),
+        returning: Vec::new(),
+    };
+    let catalog = engine.catalog_snapshot();
+    prepare_typed_insert_semantics(&insert, &catalog, catalog.commit_seq, None)
+        .expect("distinct-supporting-index semantic preparation succeeds")
+        .expect("distinct-supporting-index fixture prepares")
+        .seal(
+            sequence_defaults::SequenceDefaultBindings::empty(),
+            false,
+            false,
+        )
+        .expect("distinct-supporting-index fixture seals")
 }
 
 pub(super) fn self_referencing_catalog_closure_batch() -> TypedInsertBatch {

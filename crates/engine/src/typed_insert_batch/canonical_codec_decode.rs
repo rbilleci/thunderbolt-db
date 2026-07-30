@@ -2,31 +2,46 @@
 
 use super::sequence::{
     append_private_owner, append_private_predecessor, private_child_digest, private_outcome_digest,
-    sequence_input_digest, validate_private_effect, validate_sequence_parent,
-    validate_sequence_request, PrivateEffectEvidence, PrivateOwner, PrivatePredecessor,
+    sequence_input_digest, validate_private_effect_state, validate_sequence_parent,
+    validate_sequence_request, PrivateChain, PrivateEffectEvidence, PrivateOwner,
+    PrivatePredecessor,
 };
 use super::*;
 use crate::typed_insert_batch::sequence_defaults::effects::{
     CanonicalSequenceEffectKindView, CanonicalSequenceEffectView, CanonicalSequenceParentView,
     CanonicalSequenceRequestView,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 #[path = "canonical_codec_decode_forge.rs"]
 mod forge;
+#[path = "canonical_codec_decode/read_at.rs"]
+#[allow(dead_code)] // Inert S7 recovery contract; exercised directly by codec tests.
+mod read_at;
 #[path = "canonical_codec_decode_reencode.rs"]
 mod reencode;
+#[path = "canonical_codec_decode_reservation.rs"]
+mod reservation;
 #[path = "canonical_codec_decode_sequence.rs"]
 mod sequence_section;
 #[path = "canonical_codec_decode_views.rs"]
 mod views;
 #[cfg(test)]
 pub(super) use forge::{rehashed_forgery_for_test, RehashedForgery};
+pub(crate) use read_at::CanonicalTypedInsertReadAt;
+#[cfg(test)]
+pub(crate) use reservation::note_typed_vector_owner_for_test;
+pub(crate) use reservation::CanonicalTypedInsertDecodeMeasure;
+#[cfg(test)]
+pub(super) use reservation::{fail_at_for_test, fail_with_limits_for_test, observe_stats_for_test};
+use reservation::{into_exact_boxed_slice, require_exact_vec, reserve_exact, reserve_string};
 pub(crate) use views::{
-    DecodedReturningLayoutFacts, DecodedSequenceEffectFacts, DecodedSequenceEffectKindFacts,
-    DecodedSequenceParentFacts, DecodedSequenceRequestFacts, DecodedTypedInsertRecordFacts,
-    DecodedTypedInsertTargetFacts,
+    DecodedCatalogBindingFacts, DecodedCatalogColumnFacts, DecodedDependencyFacts,
+    DecodedDomainFacts, DecodedForeignKeyFacts, DecodedIndexFacts, DecodedReturningLayoutFacts,
+    DecodedReturningProjectionFacts, DecodedSequenceBindingFacts, DecodedSequenceEffectFacts,
+    DecodedSequenceEffectKindFacts, DecodedSequenceParentFacts, DecodedSequenceRequestFacts,
+    DecodedTypedInsertRecordFacts, DecodedTypedInsertTargetFacts,
+    DecodedTypedInsertTargetIdentityFacts, DecodedTypedValueFacts,
 };
 
 fn parse_valid_model(bytes: &[u8]) -> Result<DecodedModel, EngineError> {
@@ -41,7 +56,7 @@ fn parse_valid_model(bytes: &[u8]) -> Result<DecodedModel, EngineError> {
     reader.take(HEADER_LEN)?;
     let recorded_statement_digest = prefix.typed_statement_digest;
     let recorded_returning_digest = prefix.returning_digest;
-    let mut sections = Vec::with_capacity(SECTION_COUNT as usize);
+    let mut section_bytes: [&[u8]; SECTION_COUNT as usize] = [&[]; SECTION_COUNT as usize];
     for expected in 1..=SECTION_COUNT {
         let tag = reader.u16()?;
         if tag != expected || reader.u16()? != 0 {
@@ -49,7 +64,7 @@ fn parse_valid_model(bytes: &[u8]) -> Result<DecodedModel, EngineError> {
         }
         let len =
             usize::try_from(reader.u32()?).map_err(|_| codec_error("section length overflows"))?;
-        sections.push(reader.subreader(len)?);
+        section_bytes[usize::from(expected - 1)] = reader.take(len)?;
     }
     if !reader.done() {
         return Err(codec_error(
@@ -57,6 +72,7 @@ fn parse_valid_model(bytes: &[u8]) -> Result<DecodedModel, EngineError> {
         ));
     }
 
+    let mut sections = section_bytes.map(Reader::new);
     let target = read_target(&mut sections[0])?;
     let columns = read_columns(&mut sections[1], target.rows)?;
     let dependencies = read_dependencies(&mut sections[2])?;
@@ -145,6 +161,59 @@ struct DecodedColumn {
     values: TypedInsertColumnValues,
 }
 
+/// Decoder-private catalog owners deliberately retain exact `String`/`Vec` storage rather than
+/// converting untrusted text to the batch builder's shared `Arc` graph.  The decoded record is
+/// inert; reencoding and S7 use borrowed views only.
+struct DecodedDependency {
+    schema: String,
+    name: String,
+    oid: u32,
+    schema_digest: gpu_db_wal::CanonicalDigest,
+}
+
+struct DecodedDomain {
+    schema: String,
+    name: String,
+    oid: u32,
+    base_type: SqlType,
+}
+
+struct DecodedCatalogColumn {
+    dependency_ordinal: u32,
+    catalog_column_ordinal: u32,
+    column_id: u32,
+    attnum: i16,
+    name: String,
+    ty: SqlType,
+    type_oid: u32,
+    type_size: i16,
+}
+
+struct DecodedIndex {
+    owner_dependency_ordinal: u32,
+    raw_ordinal: u32,
+    oid: u32,
+    name: String,
+    table_name: String,
+    first_column_name: String,
+    key_columns: Vec<DecodedCatalogColumn>,
+    unique: bool,
+    primary_key: bool,
+    unique_constraint: bool,
+}
+
+struct DecodedForeignKey {
+    raw_ordinal: u32,
+    name: String,
+    child_column_name: String,
+    referenced_table_name: String,
+    referenced_column_name: String,
+    child_column: DecodedCatalogColumn,
+    parent_dependency_ordinal: u32,
+    parent_column: DecodedCatalogColumn,
+    supporting_index: DecodedIndex,
+}
+
 struct DecodedProjection {
     catalog_column_ordinal: u32,
     column_id: u32,
@@ -205,6 +274,7 @@ enum DecodedEffectKind {
         owner: PrivateOwner,
         predecessor: PrivatePredecessor,
         input_digest: gpu_db_wal::CanonicalDigest,
+        chain: PrivateChain,
     },
 }
 
@@ -222,10 +292,10 @@ struct DecodedEffects {
 pub(super) struct DecodedModel {
     target: Target,
     columns: Vec<DecodedColumn>,
-    dependencies: Vec<TypedInsertDependencyBinding>,
-    domains: Vec<TypedInsertDomainBinding>,
-    indexes: Vec<TypedInsertCanonicalIndexBinding>,
-    foreign_keys: Vec<TypedInsertCanonicalForeignKeyBinding>,
+    dependencies: Vec<DecodedDependency>,
+    domains: Vec<DecodedDomain>,
+    indexes: Vec<DecodedIndex>,
+    foreign_keys: Vec<DecodedForeignKey>,
     returning: DecodedReturning,
     effects: DecodedEffects,
     typed_statement_digest: gpu_db_wal::CanonicalDigest,
@@ -246,8 +316,76 @@ pub(super) fn decode(bytes: &[u8]) -> Result<DecodedTypedInsertRecord, EngineErr
     Ok(DecodedTypedInsertRecord { model })
 }
 
+#[allow(dead_code)]
+pub(crate) fn measure_decoded_canonical_typed_insert_from_source<
+    S: CanonicalTypedInsertReadAt + ?Sized,
+>(
+    source: &S,
+) -> Result<CanonicalTypedInsertDecodeMeasure, EngineError> {
+    read_at::measure_from_source(source)
+}
+
+#[allow(dead_code)]
+pub(crate) fn measure_decoded_canonical_typed_insert_published_only_from_source<
+    S: CanonicalTypedInsertReadAt + ?Sized,
+>(
+    source: &S,
+) -> Result<CanonicalTypedInsertDecodeMeasure, EngineError> {
+    read_at::measure_published_only_from_source(source)
+}
+
+#[allow(dead_code)]
+pub(crate) fn copy_decoded_canonical_typed_insert_after_measure<
+    S: CanonicalTypedInsertReadAt + ?Sized,
+>(
+    source: &S,
+    measure: CanonicalTypedInsertDecodeMeasure,
+    destination: &mut [u8],
+) -> Result<(), EngineError> {
+    read_at::copy_after_measure(source, measure, destination)
+}
+
+#[allow(dead_code)]
+pub(crate) fn copy_decoded_canonical_typed_insert_published_only_after_measure<
+    S: CanonicalTypedInsertReadAt + ?Sized,
+>(
+    source: &S,
+    measure: CanonicalTypedInsertDecodeMeasure,
+    destination: &mut [u8],
+) -> Result<(), EngineError> {
+    read_at::copy_published_only_after_measure(source, measure, destination)
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_decoded_canonical_typed_insert_after_measure(
+    bytes: &[u8],
+    measure: CanonicalTypedInsertDecodeMeasure,
+) -> Result<DecodedTypedInsertRecord, EngineError> {
+    read_at::decode_after_measure(bytes, measure)
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_decoded_canonical_typed_insert_published_only_after_measure(
+    bytes: &[u8],
+    measure: CanonicalTypedInsertDecodeMeasure,
+) -> Result<DecodedTypedInsertRecord, EngineError> {
+    read_at::decode_published_only_after_measure(bytes, measure)
+}
+
 pub(super) fn record_facts(model: &DecodedModel) -> DecodedTypedInsertRecordFacts {
     views::record_facts(model)
+}
+
+pub(super) fn target_identity(model: &DecodedModel) -> DecodedTypedInsertTargetIdentityFacts<'_> {
+    views::target_identity(model)
+}
+
+pub(super) fn column_value_at(
+    model: &DecodedModel,
+    catalog_column_ordinal: u32,
+    row_ordinal: u32,
+) -> Result<(bool, DecodedTypedValueFacts<'_>), EngineError> {
+    views::column_value_at(model, catalog_column_ordinal, row_ordinal)
 }
 
 pub(super) fn sequence_parent_facts(model: &DecodedModel) -> Option<DecodedSequenceParentFacts> {
@@ -258,6 +396,62 @@ pub(super) fn sequence_effect_facts(
     model: &DecodedModel,
 ) -> impl ExactSizeIterator<Item = DecodedSequenceEffectFacts> + '_ {
     views::sequence_effect_facts(model)
+}
+
+pub(super) fn catalog_columns(
+    model: &DecodedModel,
+) -> impl ExactSizeIterator<Item = DecodedCatalogColumnFacts<'_>> {
+    views::catalog_columns(model)
+}
+
+pub(super) fn dependencies(
+    model: &DecodedModel,
+) -> impl ExactSizeIterator<Item = DecodedDependencyFacts<'_>> {
+    views::dependencies(model)
+}
+
+pub(super) fn domains(
+    model: &DecodedModel,
+) -> impl ExactSizeIterator<Item = DecodedDomainFacts<'_>> {
+    views::domains(model)
+}
+
+pub(super) fn indexes(
+    model: &DecodedModel,
+) -> impl ExactSizeIterator<Item = DecodedIndexFacts<'_>> {
+    views::indexes(model)
+}
+
+pub(super) fn index_key_columns(
+    model: &DecodedModel,
+    index_ordinal: u32,
+) -> Result<impl ExactSizeIterator<Item = DecodedCatalogBindingFacts<'_>>, EngineError> {
+    views::index_key_columns(model, index_ordinal)
+}
+
+pub(super) fn foreign_keys(
+    model: &DecodedModel,
+) -> impl ExactSizeIterator<Item = DecodedForeignKeyFacts<'_>> {
+    views::foreign_keys(model)
+}
+
+pub(super) fn foreign_key_supporting_index_keys(
+    model: &DecodedModel,
+    foreign_key_ordinal: u32,
+) -> Result<impl ExactSizeIterator<Item = DecodedCatalogBindingFacts<'_>>, EngineError> {
+    views::foreign_key_supporting_index_keys(model, foreign_key_ordinal)
+}
+
+pub(super) fn sequence_bindings(
+    model: &DecodedModel,
+) -> impl ExactSizeIterator<Item = DecodedSequenceBindingFacts<'_>> {
+    views::sequence_bindings(model)
+}
+
+pub(super) fn returning_projections(
+    model: &DecodedModel,
+) -> impl ExactSizeIterator<Item = DecodedReturningProjectionFacts<'_>> {
+    views::returning_projections(model)
 }
 
 #[cfg(test)]
@@ -283,7 +477,8 @@ fn read_target(reader: &mut Reader<'_>) -> Result<Target, EngineError> {
 
 fn read_columns(reader: &mut Reader<'_>, rows: u32) -> Result<Vec<DecodedColumn>, EngineError> {
     let count = reader.count_bounded("column", 38)?;
-    let mut columns = Vec::with_capacity(count);
+    let mut columns = Vec::new();
+    reserve_exact(&mut columns, count, "decoded column directory")?;
     for expected in 0..count {
         let ordinal = reader.u32()?;
         if ordinal != expected as u32 {
@@ -311,8 +506,11 @@ fn read_columns(reader: &mut Reader<'_>, rows: u32) -> Result<Vec<DecodedColumn>
                 "column row count cannot fit its remaining state bytes",
             ));
         }
-        let mut states = Vec::with_capacity(rows as usize);
-        let mut provenance = Vec::with_capacity(rows as usize);
+        let row_count = usize::try_from(rows).map_err(|_| codec_error("row count overflows"))?;
+        let mut states = Vec::new();
+        reserve_exact(&mut states, row_count, "decoded input-state vector")?;
+        let mut provenance = Vec::new();
+        reserve_exact(&mut provenance, row_count, "decoded provenance vector")?;
         for _ in 0..rows {
             states.push(reader.input_state()?);
             provenance.push(reader.input_provenance()?);
@@ -331,80 +529,89 @@ fn read_columns(reader: &mut Reader<'_>, rows: u32) -> Result<Vec<DecodedColumn>
             validity,
             presence,
             defaults,
-            states: states.into(),
-            provenance: provenance.into(),
+            states: into_exact_boxed_slice(states)?,
+            provenance: into_exact_boxed_slice(provenance)?,
             values,
         });
     }
+    require_exact_vec(&columns)?;
     Ok(columns)
 }
 
-fn read_dependencies(
-    reader: &mut Reader<'_>,
-) -> Result<Vec<TypedInsertDependencyBinding>, EngineError> {
+fn read_dependencies(reader: &mut Reader<'_>) -> Result<Vec<DecodedDependency>, EngineError> {
     let count = reader.count_bounded("dependency", 51)?;
-    let mut dependencies = Vec::with_capacity(count);
+    let mut dependencies = Vec::new();
+    reserve_exact(&mut dependencies, count, "decoded dependency directory")?;
     for ordinal in 0..count {
         if reader.u32()? != ordinal as u32 || reader.u8()? != if ordinal == 0 { 1 } else { 2 } {
             return Err(codec_error("dependency ordinal or role is noncanonical"));
         }
-        dependencies.push(TypedInsertDependencyBinding {
-            schema: Arc::from(reader.identifier()?),
-            name: Arc::from(reader.identifier()?),
+        dependencies.push(DecodedDependency {
+            schema: reader.identifier()?,
+            name: reader.identifier()?,
             oid: reader.u32()?,
             schema_digest: reader.digest()?,
         });
     }
+    require_exact_vec(&dependencies)?;
     Ok(dependencies)
 }
 
-fn read_domains(reader: &mut Reader<'_>) -> Result<Vec<TypedInsertDomainBinding>, EngineError> {
+fn read_domains(reader: &mut Reader<'_>) -> Result<Vec<DecodedDomain>, EngineError> {
     let count = reader.count_bounded("domain", 18)?;
-    let mut domains = Vec::with_capacity(count);
+    let mut domains = Vec::new();
+    reserve_exact(&mut domains, count, "decoded domain directory")?;
     for ordinal in 0..count {
         if reader.u32()? != ordinal as u32 {
             return Err(codec_error("domain ordinal is noncanonical"));
         }
-        domains.push(TypedInsertDomainBinding {
-            schema: Arc::from(reader.identifier()?),
-            name: Arc::from(reader.identifier()?),
+        domains.push(DecodedDomain {
+            schema: reader.identifier()?,
+            name: reader.identifier()?,
             oid: reader.u32()?,
             base_type: reader.sql_type()?,
         });
     }
+    require_exact_vec(&domains)?;
     Ok(domains)
 }
 
-fn read_indexes(
-    reader: &mut Reader<'_>,
-) -> Result<Vec<TypedInsertCanonicalIndexBinding>, EngineError> {
+fn read_indexes(reader: &mut Reader<'_>) -> Result<Vec<DecodedIndex>, EngineError> {
     let count = reader.count_bounded("index", 36)?;
-    (0..count).map(|_| read_index(reader)).collect()
+    let mut indexes = Vec::new();
+    reserve_exact(&mut indexes, count, "decoded index directory")?;
+    for _ in 0..count {
+        indexes.push(read_index(reader)?);
+    }
+    require_exact_vec(&indexes)?;
+    Ok(indexes)
 }
 
-fn read_index(reader: &mut Reader<'_>) -> Result<TypedInsertCanonicalIndexBinding, EngineError> {
+fn read_index(reader: &mut Reader<'_>) -> Result<DecodedIndex, EngineError> {
     let owner_dependency_ordinal = reader.u32()?;
     let raw_ordinal = reader.u32()?;
     let oid = reader.u32()?;
-    let name = Arc::from(reader.identifier()?);
-    let table_name = Arc::from(reader.identifier()?);
-    let first_column_name = Arc::from(reader.identifier()?);
+    let name = reader.identifier()?;
+    let table_name = reader.identifier()?;
+    let first_column_name = reader.identifier()?;
     let unique = reader.bool()?;
     let primary_key = reader.bool()?;
     let unique_constraint = reader.bool()?;
     let count = reader.count_bounded("index key", 25)?;
-    let mut key_columns = Vec::with_capacity(count);
+    let mut key_columns = Vec::new();
+    reserve_exact(&mut key_columns, count, "decoded index key directory")?;
     for _ in 0..count {
         key_columns.push(read_catalog_column_binding(reader)?);
     }
-    Ok(TypedInsertCanonicalIndexBinding {
+    require_exact_vec(&key_columns)?;
+    Ok(DecodedIndex {
         owner_dependency_ordinal,
         raw_ordinal,
         oid,
         name,
         table_name,
         first_column_name,
-        key_columns: key_columns.into(),
+        key_columns,
         unique,
         primary_key,
         unique_constraint,
@@ -413,37 +620,37 @@ fn read_index(reader: &mut Reader<'_>) -> Result<TypedInsertCanonicalIndexBindin
 
 fn read_catalog_column_binding(
     reader: &mut Reader<'_>,
-) -> Result<TypedInsertCanonicalColumnBinding, EngineError> {
-    Ok(TypedInsertCanonicalColumnBinding {
+) -> Result<DecodedCatalogColumn, EngineError> {
+    Ok(DecodedCatalogColumn {
         dependency_ordinal: reader.u32()?,
         catalog_column_ordinal: reader.u32()?,
         column_id: reader.u32()?,
         attnum: reader.i16()?,
-        name: Arc::from(reader.identifier()?),
+        name: reader.identifier()?,
         ty: reader.sql_type()?,
         type_oid: reader.u32()?,
         type_size: reader.i16()?,
     })
 }
 
-fn read_foreign_keys(
-    reader: &mut Reader<'_>,
-) -> Result<Vec<TypedInsertCanonicalForeignKeyBinding>, EngineError> {
+fn read_foreign_keys(reader: &mut Reader<'_>) -> Result<Vec<DecodedForeignKey>, EngineError> {
     let count = reader.count_bounded("foreign-key", 64)?;
-    let mut foreign_keys = Vec::with_capacity(count);
+    let mut foreign_keys = Vec::new();
+    reserve_exact(&mut foreign_keys, count, "decoded foreign-key directory")?;
     for _ in 0..count {
-        foreign_keys.push(TypedInsertCanonicalForeignKeyBinding {
+        foreign_keys.push(DecodedForeignKey {
             raw_ordinal: reader.u32()?,
-            name: Arc::from(reader.identifier()?),
-            child_column_name: Arc::from(reader.identifier()?),
-            referenced_table_name: Arc::from(reader.identifier()?),
-            referenced_column_name: Arc::from(reader.identifier()?),
+            name: reader.identifier()?,
+            child_column_name: reader.identifier()?,
+            referenced_table_name: reader.identifier()?,
+            referenced_column_name: reader.identifier()?,
             child_column: read_catalog_column_binding(reader)?,
             parent_dependency_ordinal: reader.u32()?,
             parent_column: read_catalog_column_binding(reader)?,
             supporting_index: read_index(reader)?,
         });
     }
+    require_exact_vec(&foreign_keys)?;
     Ok(foreign_keys)
 }
 
@@ -463,7 +670,14 @@ fn read_returning(reader: &mut Reader<'_>) -> Result<DecodedReturning, EngineErr
             "RETURNING projection count cannot fit remaining bytes",
         ));
     }
-    let mut projections = Vec::with_capacity(columns as usize);
+    let projection_count =
+        usize::try_from(columns).map_err(|_| codec_error("projection count overflows"))?;
+    let mut projections = Vec::new();
+    reserve_exact(
+        &mut projections,
+        projection_count,
+        "decoded RETURNING projection directory",
+    )?;
     for _ in 0..columns {
         projections.push(DecodedProjection {
             catalog_column_ordinal: reader.u32()?,
@@ -475,6 +689,7 @@ fn read_returning(reader: &mut Reader<'_>) -> Result<DecodedReturning, EngineErr
             type_size: reader.i16()?,
         });
     }
+    require_exact_vec(&projections)?;
     Ok(DecodedReturning {
         rows,
         columns,
@@ -504,10 +719,8 @@ fn read_sequence_effects(
             target.statement_ordinal,
         )?;
     }
-    let mut effects = Vec::with_capacity(count);
-    let mut published_ids = BTreeSet::new();
-    let mut private_chains = BTreeMap::new();
-    let mut target_cells = BTreeSet::new();
+    let mut effects: Vec<DecodedEffect> = Vec::new();
+    reserve_exact(&mut effects, count, "decoded sequence-effect directory")?;
     let mut previous_key = None;
     for expected in 0..count {
         let ordinal = reader.u32()?;
@@ -538,7 +751,10 @@ fn read_sequence_effects(
                 .ok_or_else(|| codec_error("sequence expression ordinal overflow"))?
             || request.descriptor_digest
                 != crate::sequence_descriptor_digest(request.sequence_oid, &request.effective_name)
-            || !target_cells.insert((request.row_ordinal, request.catalog_column_ordinal))
+            || effects.iter().any(|prior| {
+                prior.request.row_ordinal == request.row_ordinal
+                    && prior.request.catalog_column_ordinal == request.catalog_column_ordinal
+            })
         {
             return Err(codec_error(
                 "sequence request descriptor/order/target drifted",
@@ -550,7 +766,9 @@ fn read_sequence_effects(
                 let input_digest = reader.digest()?;
                 let returned_value = reader.i64()?;
                 if transition_txn_id == 0
-                    || !published_ids.insert(transition_txn_id)
+                    || effects.iter().any(|prior| {
+                        matches!(prior.kind, DecodedEffectKind::Published { transition_txn_id: prior_id, .. } if prior_id == transition_txn_id)
+                    })
                     || returned_value != request.value
                     || input_digest
                         != sequence_input_digest(
@@ -593,7 +811,15 @@ fn read_sequence_effects(
                     request.value,
                     (next_last_value, next_is_called),
                 )?;
-                validate_private_effect(
+                let previous = effects.iter().rev().find_map(|prior| {
+                    (prior.request.sequence_oid == request.sequence_oid)
+                        .then_some(match prior.kind {
+                            DecodedEffectKind::Private { chain, .. } => Some(chain),
+                            DecodedEffectKind::Published { .. } => None,
+                        })
+                        .flatten()
+                });
+                let chain = validate_private_effect_state(
                     CanonicalSequenceEffectView {
                         request: request_view,
                         value: request.value,
@@ -639,7 +865,7 @@ fn read_sequence_effects(
                         child_digest: child,
                         outcome_digest: outcome,
                     },
-                    &mut private_chains,
+                    previous,
                 )?;
                 DecodedEffectKind::Private {
                     prior_last_value,
@@ -650,6 +876,7 @@ fn read_sequence_effects(
                     owner,
                     predecessor,
                     input_digest,
+                    chain,
                 }
             }
             _ => return Err(codec_error("sequence effect tag is unknown")),
@@ -661,6 +888,7 @@ fn read_sequence_effects(
     if let Some(parent_value) = parent {
         sequence_section::validate_decoded_sequence_section(parent_value, &effects)?;
     }
+    require_exact_vec(&effects)?;
     Ok(DecodedEffects { parent, effects })
 }
 
@@ -766,10 +994,10 @@ impl DecodedRequest {
 fn validate_decoded_metadata(
     target: &Target,
     columns: &[DecodedColumn],
-    dependencies: &[TypedInsertDependencyBinding],
-    domains: &[TypedInsertDomainBinding],
-    indexes: &[TypedInsertCanonicalIndexBinding],
-    foreign_keys: &[TypedInsertCanonicalForeignKeyBinding],
+    dependencies: &[DecodedDependency],
+    domains: &[DecodedDomain],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
     returning: &DecodedReturning,
     effects: &DecodedEffects,
 ) -> Result<(), EngineError> {
@@ -783,13 +1011,15 @@ fn validate_decoded_metadata(
     {
         return Err(codec_error("target dependency zero drifted"));
     }
-    let mut dep_ids = BTreeSet::new();
     for dependency in dependencies {
         if dependency.schema.is_empty()
             || dependency.name.is_empty()
             || dependency.oid == 0
             || zero_digest(dependency.schema_digest)
-            || !dep_ids.insert(dependency.oid)
+            || dependencies
+                .iter()
+                .take_while(|prior| !std::ptr::eq(*prior, dependency))
+                .any(|prior| prior.oid == dependency.oid)
         {
             return Err(codec_error("dependency identity is invalid"));
         }
@@ -814,46 +1044,849 @@ fn validate_decoded_metadata(
     }
     validate_target_catalog_references(columns, indexes, foreign_keys)?;
     validate_dependency_closure_order(dependencies, foreign_keys)?;
-    super::validation::validate_catalog_closure(dependencies, indexes, foreign_keys)?;
-    let target_columns = columns
-        .iter()
-        .map(|column| super::validation::GlobalTargetColumnIdentity {
-            name: &column.name,
-            column_id: column.column_id,
-            attnum: column.attnum,
-            ty: column.ty,
-            type_oid: column.type_oid,
-            type_size: column.type_size,
-        })
-        .collect::<Vec<_>>();
-    let sequences = effects
-        .effects
-        .iter()
-        .map(|effect| super::validation::GlobalSequenceDescriptor {
-            oid: effect.request.sequence_oid,
-            effective_name: &effect.request.effective_name,
-        })
-        .collect::<Vec<_>>();
-    super::validation::validate_global_identity_registry(
-        super::validation::GlobalTargetIdentity {
-            schema: &target.schema,
-            name: &target.name,
-            oid: target.oid,
-            schema_digest: target.schema_digest,
-        },
-        &target_columns,
+    validate_decoded_catalog_closure(dependencies, indexes, foreign_keys)?;
+    validate_decoded_global_identity_registry(
+        target,
+        columns,
         dependencies,
         domains,
         indexes,
         foreign_keys,
-        &sequences,
+        effects,
     )
+}
+
+/// Decoder counterpart to the producer's catalog closure registry.  The model has already
+/// reserved each retained directory, so these checks deliberately rescan it instead of creating
+/// attacker-sized maps/sets.  Every duplicate key below must repeat its complete identity.
+fn validate_decoded_catalog_closure(
+    dependencies: &[DecodedDependency],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+) -> Result<(), EngineError> {
+    for (ordinal, index) in indexes.iter().enumerate() {
+        if index.owner_dependency_ordinal != 0
+            || index.raw_ordinal != ordinal as u32
+            || indexes[..ordinal]
+                .iter()
+                .any(|prior| prior.oid == index.oid || prior.name == index.name)
+        {
+            return Err(codec_error("target index order or identity drifted"));
+        }
+        validate_decoded_index(index, dependencies)?;
+        for prior in &indexes[..ordinal] {
+            validate_same_primary_index(prior, index)?;
+            validate_decoded_catalog_column_sets(&prior.key_columns, &index.key_columns)?;
+        }
+    }
+    for (ordinal, foreign_key) in foreign_keys.iter().enumerate() {
+        if foreign_key.raw_ordinal != ordinal as u32
+            || foreign_keys[..ordinal]
+                .iter()
+                .any(|prior| prior.name == foreign_key.name)
+            || foreign_key.child_column.dependency_ordinal != 0
+            || foreign_key.parent_column.dependency_ordinal != foreign_key.parent_dependency_ordinal
+        {
+            return Err(codec_error(
+                "foreign-key order or dependency identity drifted",
+            ));
+        }
+        validate_decoded_catalog_column(&foreign_key.child_column, dependencies)?;
+        validate_decoded_catalog_column(&foreign_key.parent_column, dependencies)?;
+        if foreign_key.child_column.name != foreign_key.child_column_name
+            || foreign_key.parent_column.name != foreign_key.referenced_column_name
+            || dependencies
+                .get(foreign_key.parent_dependency_ordinal as usize)
+                .map(|dependency| dependency.name.as_str())
+                != Some(foreign_key.referenced_table_name.as_str())
+            || foreign_key.child_column.ty != foreign_key.parent_column.ty
+        {
+            return Err(codec_error("foreign-key column/type binding drifted"));
+        }
+        validate_decoded_index(&foreign_key.supporting_index, dependencies)?;
+        if foreign_key.supporting_index.owner_dependency_ordinal
+            != foreign_key.parent_dependency_ordinal
+            || !foreign_key.supporting_index.unique
+            || !(foreign_key.supporting_index.primary_key
+                || foreign_key.supporting_index.unique_constraint)
+            || foreign_key.supporting_index.key_columns.len() != 1
+            || !same_decoded_catalog_column(
+                &foreign_key.supporting_index.key_columns[0],
+                &foreign_key.parent_column,
+            )
+        {
+            return Err(codec_error("foreign-key supporting unique index drifted"));
+        }
+        for index in indexes {
+            validate_same_primary_index(index, &foreign_key.supporting_index)?;
+            validate_decoded_catalog_column_sets(
+                &index.key_columns,
+                &foreign_key.supporting_index.key_columns,
+            )?;
+            if index.oid == foreign_key.supporting_index.oid
+                && !same_decoded_index(index, &foreign_key.supporting_index)
+            {
+                return Err(codec_error("catalog index OID identity drifted"));
+            }
+        }
+        for prior in &foreign_keys[..ordinal] {
+            validate_same_primary_index(&prior.supporting_index, &foreign_key.supporting_index)?;
+            validate_decoded_catalog_column_pair(&prior.child_column, &foreign_key.child_column)?;
+            validate_decoded_catalog_column_pair(&prior.parent_column, &foreign_key.parent_column)?;
+            validate_decoded_catalog_column_sets(
+                &prior.supporting_index.key_columns,
+                &foreign_key.supporting_index.key_columns,
+            )?;
+            if prior.supporting_index.oid == foreign_key.supporting_index.oid
+                && !same_decoded_index(&prior.supporting_index, &foreign_key.supporting_index)
+            {
+                return Err(codec_error("catalog index OID identity drifted"));
+            }
+            if foreign_key.parent_dependency_ordinal != 0
+                && prior.parent_dependency_ordinal == foreign_key.parent_dependency_ordinal
+                && (prior.supporting_index.raw_ordinal == foreign_key.supporting_index.raw_ordinal
+                    || prior.supporting_index.name == foreign_key.supporting_index.name)
+                && !same_decoded_index(&prior.supporting_index, &foreign_key.supporting_index)
+            {
+                return Err(codec_error(
+                    "external foreign-key supporting-index copy drifted",
+                ));
+            }
+        }
+        if foreign_key.parent_dependency_ordinal == 0 {
+            let self_index = indexes
+                .get(foreign_key.supporting_index.raw_ordinal as usize)
+                .filter(|index| same_decoded_index(index, &foreign_key.supporting_index));
+            if self_index.is_none() {
+                return Err(codec_error(
+                    "self-referencing foreign-key supporting index drifted",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_decoded_index(
+    index: &DecodedIndex,
+    dependencies: &[DecodedDependency],
+) -> Result<(), EngineError> {
+    let owner = dependencies
+        .get(index.owner_dependency_ordinal as usize)
+        .ok_or_else(|| codec_error("index owner dependency absent"))?;
+    if !valid_decoded_oid(index.oid)
+        || index.name.is_empty()
+        || index.table_name != owner.name
+        || index.first_column_name.is_empty()
+        || !(1..=32).contains(&index.key_columns.len())
+        || index.key_columns[0].name != index.first_column_name
+        || ((index.primary_key || index.unique_constraint) && !index.unique)
+        || (index.primary_key && index.unique_constraint)
+    {
+        return Err(codec_error("index metadata is invalid"));
+    }
+    for (ordinal, column) in index.key_columns.iter().enumerate() {
+        if column.dependency_ordinal != index.owner_dependency_ordinal
+            || index.key_columns[..ordinal]
+                .iter()
+                .any(|prior| prior.column_id == column.column_id)
+        {
+            return Err(codec_error("index repeats a key-column identity"));
+        }
+        validate_decoded_catalog_column(column, dependencies)?;
+    }
+    Ok(())
+}
+
+fn validate_decoded_catalog_column(
+    column: &DecodedCatalogColumn,
+    dependencies: &[DecodedDependency],
+) -> Result<(), EngineError> {
+    if column.column_id == 0
+        || column.name.is_empty()
+        || column.type_oid == 0
+        || column.type_size != column.ty.type_size()
+        || dependencies
+            .get(column.dependency_ordinal as usize)
+            .is_none()
+    {
+        return Err(codec_error("resolved catalog column identity is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_decoded_catalog_column_sets(
+    left: &[DecodedCatalogColumn],
+    right: &[DecodedCatalogColumn],
+) -> Result<(), EngineError> {
+    for column in left {
+        for candidate in right {
+            validate_decoded_catalog_column_pair(column, candidate)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_decoded_catalog_column_pair(
+    left: &DecodedCatalogColumn,
+    right: &DecodedCatalogColumn,
+) -> Result<(), EngineError> {
+    let conflicts = left.column_id == right.column_id
+        || (left.dependency_ordinal == right.dependency_ordinal
+            && (left.catalog_column_ordinal == right.catalog_column_ordinal
+                || left.attnum == right.attnum
+                || left.name == right.name));
+    if conflicts && !same_decoded_catalog_column(left, right) {
+        return Err(codec_error("catalog column identity drifted"));
+    }
+    Ok(())
+}
+
+fn same_decoded_catalog_column(left: &DecodedCatalogColumn, right: &DecodedCatalogColumn) -> bool {
+    left.dependency_ordinal == right.dependency_ordinal
+        && left.catalog_column_ordinal == right.catalog_column_ordinal
+        && left.column_id == right.column_id
+        && left.attnum == right.attnum
+        && left.name == right.name
+        && left.ty == right.ty
+        && left.type_oid == right.type_oid
+        && left.type_size == right.type_size
+}
+
+fn same_decoded_index(left: &DecodedIndex, right: &DecodedIndex) -> bool {
+    left.owner_dependency_ordinal == right.owner_dependency_ordinal
+        && left.raw_ordinal == right.raw_ordinal
+        && left.oid == right.oid
+        && left.name == right.name
+        && left.table_name == right.table_name
+        && left.first_column_name == right.first_column_name
+        && left.unique == right.unique
+        && left.primary_key == right.primary_key
+        && left.unique_constraint == right.unique_constraint
+        && left.key_columns.len() == right.key_columns.len()
+        && left
+            .key_columns
+            .iter()
+            .zip(&right.key_columns)
+            .all(|(left, right)| same_decoded_catalog_column(left, right))
+}
+
+fn validate_same_primary_index(
+    left: &DecodedIndex,
+    right: &DecodedIndex,
+) -> Result<(), EngineError> {
+    if left.primary_key
+        && right.primary_key
+        && left.owner_dependency_ordinal == right.owner_dependency_ordinal
+        && !same_decoded_index(left, right)
+    {
+        return Err(codec_error("relation has conflicting primary-key indexes"));
+    }
+    Ok(())
+}
+
+/// Allocation-free equivalent of the producer's global catalog namespace registry. The producer
+/// owns BTreeMap-backed identities; this inert recovery boundary must not retain attacker keys,
+/// so it rescans every completed registry dimension and compares each pair exactly.
+#[allow(clippy::too_many_arguments)]
+fn validate_decoded_global_identity_registry(
+    target: &Target,
+    columns: &[DecodedColumn],
+    dependencies: &[DecodedDependency],
+    domains: &[DecodedDomain],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+    effects: &DecodedEffects,
+) -> Result<(), EngineError> {
+    if !valid_decoded_oid(target.oid)
+        || target.schema.is_empty()
+        || target.name.is_empty()
+        || zero_digest(target.schema_digest)
+    {
+        return Err(codec_error("relation identity is invalid"));
+    }
+    for dependency in dependencies {
+        if !valid_decoded_oid(dependency.oid)
+            || dependency.schema.is_empty()
+            || dependency.name.is_empty()
+            || zero_digest(dependency.schema_digest)
+        {
+            return Err(codec_error("relation identity is invalid"));
+        }
+    }
+    for domain in domains {
+        if !valid_decoded_oid(domain.oid) || domain.schema.is_empty() || domain.name.is_empty() {
+            return Err(codec_error("domain identity is invalid"));
+        }
+    }
+    let mut prior_attnum = None;
+    for (ordinal, column) in columns.iter().enumerate() {
+        if column.name.is_empty()
+            || column.column_id == 0
+            || column.attnum <= 0
+            || u32::try_from(ordinal)
+                .ok()
+                .is_none_or(|ordinal| ordinal >= column.attnum as u32)
+            || column.type_oid == 0
+            || column.type_size != column.ty.type_size()
+            || prior_attnum.is_some_and(|prior| prior >= column.attnum)
+        {
+            return Err(codec_error("target catalog column identity is invalid"));
+        }
+        prior_attnum = Some(column.attnum);
+    }
+    for effect in &effects.effects {
+        if !valid_decoded_oid(effect.request.sequence_oid)
+            || effect.request.effective_name.is_empty()
+        {
+            return Err(codec_error("sequence descriptor identity is invalid"));
+        }
+    }
+    validate_decoded_domain_names(domains)?;
+    validate_decoded_global_object_registry(
+        target,
+        columns,
+        dependencies,
+        domains,
+        indexes,
+        foreign_keys,
+        effects,
+    )?;
+    validate_decoded_global_column_registry(target, columns, dependencies, indexes, foreign_keys)?;
+    validate_decoded_sequence_effective_names(effects)?;
+    validate_decoded_class_names(target, dependencies, indexes, foreign_keys, effects)
+}
+
+#[derive(Clone, Copy)]
+enum DecodedGlobalObject<'a> {
+    Relation {
+        oid: u32,
+        schema: &'a str,
+        name: &'a str,
+        schema_digest: gpu_db_wal::CanonicalDigest,
+    },
+    Domain {
+        oid: u32,
+        base_type: SqlType,
+        named: Option<(&'a str, &'a str)>,
+    },
+    Index(&'a DecodedIndex),
+    Sequence {
+        oid: u32,
+        effective_name: &'a str,
+    },
+}
+
+struct DecodedGlobalObjectSources<'a> {
+    target: &'a Target,
+    columns: &'a [DecodedColumn],
+    dependencies: &'a [DecodedDependency],
+    domains: &'a [DecodedDomain],
+    indexes: &'a [DecodedIndex],
+    foreign_keys: &'a [DecodedForeignKey],
+    effects: &'a DecodedEffects,
+}
+
+impl DecodedGlobalObject<'_> {
+    fn oid(self) -> u32 {
+        match self {
+            Self::Relation { oid, .. } | Self::Domain { oid, .. } | Self::Sequence { oid, .. } => {
+                oid
+            }
+            Self::Index(index) => index.oid,
+        }
+    }
+}
+
+fn validate_decoded_global_object_registry(
+    target: &Target,
+    columns: &[DecodedColumn],
+    dependencies: &[DecodedDependency],
+    domains: &[DecodedDomain],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+    effects: &DecodedEffects,
+) -> Result<(), EngineError> {
+    let sources = DecodedGlobalObjectSources {
+        target,
+        columns,
+        dependencies,
+        domains,
+        indexes,
+        foreign_keys,
+        effects,
+    };
+    let mut ordinal = 0_usize;
+    visit_decoded_global_objects(&sources, |candidate| {
+        let candidate_ordinal = ordinal;
+        let mut prior_ordinal = 0_usize;
+        visit_decoded_global_objects(&sources, |prior| {
+            if prior_ordinal < candidate_ordinal
+                && prior.oid() == candidate.oid()
+                && !same_decoded_global_object(prior, candidate)
+            {
+                return Err(codec_error("global catalog OID identity drifted"));
+            }
+            prior_ordinal += 1;
+            Ok(())
+        })?;
+        ordinal += 1;
+        Ok(())
+    })
+}
+
+fn visit_decoded_global_objects(
+    sources: &DecodedGlobalObjectSources<'_>,
+    mut visit: impl FnMut(DecodedGlobalObject<'_>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    visit(DecodedGlobalObject::Relation {
+        oid: sources.target.oid,
+        schema: &sources.target.schema,
+        name: &sources.target.name,
+        schema_digest: sources.target.schema_digest,
+    })?;
+    for dependency in sources.dependencies {
+        visit(DecodedGlobalObject::Relation {
+            oid: dependency.oid,
+            schema: &dependency.schema,
+            name: &dependency.name,
+            schema_digest: dependency.schema_digest,
+        })?;
+    }
+    for domain in sources.domains {
+        visit(DecodedGlobalObject::Domain {
+            oid: domain.oid,
+            base_type: domain.base_type,
+            named: Some((&domain.schema, &domain.name)),
+        })?;
+    }
+    for column in sources.columns {
+        visit_decoded_implicit_domain(column.ty, column.type_oid, &mut visit)?;
+    }
+    for index in sources.indexes {
+        for column in &index.key_columns {
+            visit_decoded_implicit_domain(column.ty, column.type_oid, &mut visit)?;
+        }
+        visit(DecodedGlobalObject::Index(index))?;
+    }
+    for foreign_key in sources.foreign_keys {
+        visit_decoded_implicit_domain(
+            foreign_key.child_column.ty,
+            foreign_key.child_column.type_oid,
+            &mut visit,
+        )?;
+        visit_decoded_implicit_domain(
+            foreign_key.parent_column.ty,
+            foreign_key.parent_column.type_oid,
+            &mut visit,
+        )?;
+        for column in &foreign_key.supporting_index.key_columns {
+            visit_decoded_implicit_domain(column.ty, column.type_oid, &mut visit)?;
+        }
+        visit(DecodedGlobalObject::Index(&foreign_key.supporting_index))?;
+    }
+    for effect in &sources.effects.effects {
+        visit(DecodedGlobalObject::Sequence {
+            oid: effect.request.sequence_oid,
+            effective_name: &effect.request.effective_name,
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_decoded_domain_names(domains: &[DecodedDomain]) -> Result<(), EngineError> {
+    for (ordinal, domain) in domains.iter().enumerate() {
+        if domains[..ordinal].iter().any(|prior| {
+            prior.schema == domain.schema && prior.name == domain.name && prior.oid != domain.oid
+        }) {
+            return Err(codec_error("domain qualified-name identity drifted"));
+        }
+    }
+    Ok(())
+}
+
+fn visit_decoded_implicit_domain(
+    ty: SqlType,
+    type_oid: u32,
+    visit: &mut impl FnMut(DecodedGlobalObject<'_>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    if type_oid != ty.postgres_oid()
+        && !gpu_db_sql::SUPPORTED_SQL_TYPES
+            .iter()
+            .any(|builtin| type_oid == builtin.postgres_oid())
+    {
+        visit(DecodedGlobalObject::Domain {
+            oid: type_oid,
+            base_type: ty,
+            named: None,
+        })?;
+    }
+    Ok(())
+}
+
+fn same_decoded_global_object(
+    left: DecodedGlobalObject<'_>,
+    right: DecodedGlobalObject<'_>,
+) -> bool {
+    match (left, right) {
+        (
+            DecodedGlobalObject::Relation {
+                schema: left_schema,
+                name: left_name,
+                schema_digest: left_digest,
+                ..
+            },
+            DecodedGlobalObject::Relation {
+                schema: right_schema,
+                name: right_name,
+                schema_digest: right_digest,
+                ..
+            },
+        ) => left_schema == right_schema && left_name == right_name && left_digest == right_digest,
+        (
+            DecodedGlobalObject::Domain {
+                base_type: left_type,
+                named: left_name,
+                ..
+            },
+            DecodedGlobalObject::Domain {
+                base_type: right_type,
+                named: right_name,
+                ..
+            },
+        ) => {
+            left_type == right_type
+                && match (left_name, right_name) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => true,
+                }
+        }
+        (DecodedGlobalObject::Index(left), DecodedGlobalObject::Index(right)) => {
+            same_decoded_index(left, right)
+        }
+        (
+            DecodedGlobalObject::Sequence {
+                effective_name: left_name,
+                ..
+            },
+            DecodedGlobalObject::Sequence {
+                effective_name: right_name,
+                ..
+            },
+        ) => left_name == right_name,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DecodedGlobalColumnIdentity<'a> {
+    relation_oid: u32,
+    catalog_column_ordinal: u32,
+    column_id: u32,
+    attnum: i16,
+    name: &'a str,
+    ty: SqlType,
+    type_oid: u32,
+    type_size: i16,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_decoded_global_column_registry(
+    target: &Target,
+    columns: &[DecodedColumn],
+    dependencies: &[DecodedDependency],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+) -> Result<(), EngineError> {
+    for (ordinal, column) in columns.iter().enumerate() {
+        validate_decoded_column_type(column.ty, column.type_oid)?;
+        let catalog_column_ordinal =
+            u32::try_from(ordinal).map_err(|_| codec_error("target column ordinal overflows"))?;
+        let candidate = decoded_target_column_identity(target, catalog_column_ordinal, column);
+        for (prior_ordinal, prior) in columns[..ordinal].iter().enumerate() {
+            let prior_ordinal = u32::try_from(prior_ordinal)
+                .map_err(|_| codec_error("target column ordinal overflows"))?;
+            validate_decoded_global_column_pair(
+                decoded_target_column_identity(target, prior_ordinal, prior),
+                candidate,
+            )?;
+        }
+        visit_decoded_catalog_columns(indexes, foreign_keys, |catalog_column| {
+            validate_decoded_global_column_pair(
+                candidate,
+                decoded_catalog_column_identity(catalog_column, dependencies, target, columns)?,
+            )
+        })?;
+    }
+    let mut ordinal = 0_usize;
+    visit_decoded_catalog_columns(indexes, foreign_keys, |catalog_column| {
+        let candidate =
+            decoded_catalog_column_identity(catalog_column, dependencies, target, columns)?;
+        let candidate_ordinal = ordinal;
+        let mut prior_ordinal = 0_usize;
+        visit_decoded_catalog_columns(indexes, foreign_keys, |prior| {
+            if prior_ordinal < candidate_ordinal {
+                validate_decoded_global_column_pair(
+                    decoded_catalog_column_identity(prior, dependencies, target, columns)?,
+                    candidate,
+                )?;
+            }
+            prior_ordinal += 1;
+            Ok(())
+        })?;
+        ordinal += 1;
+        Ok(())
+    })
+}
+
+fn visit_decoded_catalog_columns(
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+    mut visit: impl FnMut(&DecodedCatalogColumn) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    for index in indexes {
+        for column in &index.key_columns {
+            visit(column)?;
+        }
+    }
+    for foreign_key in foreign_keys {
+        visit(&foreign_key.child_column)?;
+        visit(&foreign_key.parent_column)?;
+        for column in &foreign_key.supporting_index.key_columns {
+            visit(column)?;
+        }
+    }
+    Ok(())
+}
+
+fn decoded_target_column_identity<'a>(
+    target: &'a Target,
+    ordinal: u32,
+    column: &'a DecodedColumn,
+) -> DecodedGlobalColumnIdentity<'a> {
+    DecodedGlobalColumnIdentity {
+        relation_oid: target.oid,
+        catalog_column_ordinal: ordinal,
+        column_id: column.column_id,
+        attnum: column.attnum,
+        name: &column.name,
+        ty: column.ty,
+        type_oid: column.type_oid,
+        type_size: column.type_size,
+    }
+}
+
+fn decoded_catalog_column_identity<'a>(
+    column: &'a DecodedCatalogColumn,
+    dependencies: &'a [DecodedDependency],
+    target: &'a Target,
+    columns: &'a [DecodedColumn],
+) -> Result<DecodedGlobalColumnIdentity<'a>, EngineError> {
+    let relation_oid = dependencies
+        .get(column.dependency_ordinal as usize)
+        .map(|dependency| dependency.oid)
+        .ok_or_else(|| codec_error("catalog column dependency is absent"))?;
+    validate_decoded_column_type(column.ty, column.type_oid)?;
+    if column.column_id == 0
+        || column.attnum <= 0
+        || column.catalog_column_ordinal >= column.attnum as u32
+        || column.name.is_empty()
+        || column.type_size != column.ty.type_size()
+    {
+        return Err(codec_error("catalog column identity is invalid"));
+    }
+    let candidate = DecodedGlobalColumnIdentity {
+        relation_oid,
+        catalog_column_ordinal: column.catalog_column_ordinal,
+        column_id: column.column_id,
+        attnum: column.attnum,
+        name: &column.name,
+        ty: column.ty,
+        type_oid: column.type_oid,
+        type_size: column.type_size,
+    };
+    if relation_oid == target.oid {
+        let target_column = columns
+            .get(column.catalog_column_ordinal as usize)
+            .ok_or_else(|| codec_error("target catalog column identity is invalid"))?;
+        let expected =
+            decoded_target_column_identity(target, column.catalog_column_ordinal, target_column);
+        if !same_decoded_global_column_identity(candidate, expected) {
+            return Err(codec_error("global catalog column identity drifted"));
+        }
+    }
+    Ok(candidate)
+}
+
+fn validate_decoded_global_column_pair(
+    left: DecodedGlobalColumnIdentity<'_>,
+    right: DecodedGlobalColumnIdentity<'_>,
+) -> Result<(), EngineError> {
+    let conflicts = left.column_id == right.column_id
+        || (left.relation_oid == right.relation_oid
+            && (left.catalog_column_ordinal == right.catalog_column_ordinal
+                || left.attnum == right.attnum
+                || left.name == right.name));
+    if conflicts && !same_decoded_global_column_identity(left, right) {
+        return Err(codec_error("global catalog column identity drifted"));
+    }
+    Ok(())
+}
+
+fn same_decoded_global_column_identity(
+    left: DecodedGlobalColumnIdentity<'_>,
+    right: DecodedGlobalColumnIdentity<'_>,
+) -> bool {
+    left.relation_oid == right.relation_oid
+        && left.catalog_column_ordinal == right.catalog_column_ordinal
+        && left.column_id == right.column_id
+        && left.attnum == right.attnum
+        && left.name == right.name
+        && left.ty == right.ty
+        && left.type_oid == right.type_oid
+        && left.type_size == right.type_size
+}
+
+fn validate_decoded_column_type(ty: SqlType, type_oid: u32) -> Result<(), EngineError> {
+    if type_oid == ty.postgres_oid() {
+        return Ok(());
+    }
+    if gpu_db_sql::SUPPORTED_SQL_TYPES
+        .iter()
+        .any(|builtin| type_oid == builtin.postgres_oid())
+    {
+        return Err(codec_error("builtin type OID has the wrong SQL type"));
+    }
+    if !valid_decoded_oid(type_oid) {
+        return Err(codec_error("domain type OID is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_decoded_sequence_effective_names(effects: &DecodedEffects) -> Result<(), EngineError> {
+    for (ordinal, effect) in effects.effects.iter().enumerate() {
+        for prior in &effects.effects[..ordinal] {
+            if prior.request.effective_name == effect.request.effective_name
+                && prior.request.sequence_oid != effect.request.sequence_oid
+            {
+                return Err(codec_error("sequence effective-name identity drifted"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct DecodedClassIdentity<'a> {
+    schema: &'a str,
+    name: &'a str,
+    oid: u32,
+}
+
+fn validate_decoded_class_names(
+    target: &Target,
+    dependencies: &[DecodedDependency],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+    effects: &DecodedEffects,
+) -> Result<(), EngineError> {
+    let mut ordinal = 0_usize;
+    visit_decoded_class_identities(
+        target,
+        dependencies,
+        indexes,
+        foreign_keys,
+        effects,
+        |candidate| {
+            let candidate_ordinal = ordinal;
+            let mut prior_ordinal = 0_usize;
+            visit_decoded_class_identities(
+                target,
+                dependencies,
+                indexes,
+                foreign_keys,
+                effects,
+                |prior| {
+                    if prior_ordinal < candidate_ordinal
+                        && prior.schema == candidate.schema
+                        && prior.name == candidate.name
+                        && prior.oid != candidate.oid
+                    {
+                        return Err(codec_error("qualified class-name identity drifted"));
+                    }
+                    prior_ordinal += 1;
+                    Ok(())
+                },
+            )?;
+            ordinal += 1;
+            Ok(())
+        },
+    )
+}
+
+fn visit_decoded_class_identities(
+    target: &Target,
+    dependencies: &[DecodedDependency],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+    effects: &DecodedEffects,
+    mut visit: impl FnMut(DecodedClassIdentity<'_>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    visit(DecodedClassIdentity {
+        schema: &target.schema,
+        name: &target.name,
+        oid: target.oid,
+    })?;
+    for dependency in dependencies {
+        visit(DecodedClassIdentity {
+            schema: &dependency.schema,
+            name: &dependency.name,
+            oid: dependency.oid,
+        })?;
+    }
+    for index in indexes {
+        visit_decoded_index_class_identity(index, dependencies, &mut visit)?;
+    }
+    for foreign_key in foreign_keys {
+        visit_decoded_index_class_identity(
+            &foreign_key.supporting_index,
+            dependencies,
+            &mut visit,
+        )?;
+    }
+    for effect in &effects.effects {
+        visit(DecodedClassIdentity {
+            schema: "public",
+            name: &effect.request.effective_name,
+            oid: effect.request.sequence_oid,
+        })?;
+    }
+    Ok(())
+}
+
+fn visit_decoded_index_class_identity(
+    index: &DecodedIndex,
+    dependencies: &[DecodedDependency],
+    visit: &mut impl FnMut(DecodedClassIdentity<'_>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let owner = dependencies
+        .get(index.owner_dependency_ordinal as usize)
+        .ok_or_else(|| codec_error("index owner dependency absent"))?;
+    visit(DecodedClassIdentity {
+        schema: &owner.schema,
+        name: &index.name,
+        oid: index.oid,
+    })
+}
+
+fn valid_decoded_oid(oid: u32) -> bool {
+    (1..=i32::MAX as u32).contains(&oid)
 }
 
 fn validate_target_catalog_references(
     columns: &[DecodedColumn],
-    indexes: &[TypedInsertCanonicalIndexBinding],
-    foreign_keys: &[TypedInsertCanonicalForeignKeyBinding],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
 ) -> Result<(), EngineError> {
     for index in indexes {
         if index.owner_dependency_ordinal != 0 {
@@ -866,7 +1899,7 @@ fn validate_target_catalog_references(
             if key.dependency_ordinal != 0
                 || key.column_id != column.column_id
                 || key.attnum != column.attnum
-                || key.name.as_ref() != column.name
+                || key.name != column.name
                 || key.ty != column.ty
                 || key.type_oid != column.type_oid
                 || key.type_size != column.type_size
@@ -882,7 +1915,7 @@ fn validate_target_catalog_references(
         if foreign_key.child_column.dependency_ordinal != 0
             || foreign_key.child_column.column_id != column.column_id
             || foreign_key.child_column.attnum != column.attnum
-            || foreign_key.child_column.name.as_ref() != column.name
+            || foreign_key.child_column.name != column.name
             || foreign_key.child_column.ty != column.ty
             || foreign_key.child_column.type_oid != column.type_oid
             || foreign_key.child_column.type_size != column.type_size
@@ -896,36 +1929,42 @@ fn validate_target_catalog_references(
 }
 
 fn validate_dependency_closure_order(
-    dependencies: &[TypedInsertDependencyBinding],
-    foreign_keys: &[TypedInsertCanonicalForeignKeyBinding],
+    dependencies: &[DecodedDependency],
+    foreign_keys: &[DecodedForeignKey],
 ) -> Result<(), EngineError> {
-    let mut by_oid = BTreeMap::from([(dependencies[0].oid, 0_u32)]);
     let mut next = 1_u32;
     for foreign_key in foreign_keys {
         let dependency = dependencies
             .get(foreign_key.parent_dependency_ordinal as usize)
             .ok_or_else(|| codec_error("foreign-key parent dependency is absent"))?;
-        if dependency.name.as_ref() != foreign_key.referenced_table_name.as_ref() {
+        if dependency.name != foreign_key.referenced_table_name {
             return Err(codec_error("foreign-key parent dependency name drifted"));
         }
-        match by_oid.get(&dependency.oid) {
-            Some(ordinal) if *ordinal == foreign_key.parent_dependency_ordinal => {}
-            Some(_) => {
+        if foreign_key.parent_dependency_ordinal == 0 {
+            continue;
+        }
+        let prior = foreign_keys
+            .iter()
+            .take_while(|prior| !std::ptr::eq(*prior, foreign_key))
+            .find(|prior| {
+                dependencies
+                    .get(prior.parent_dependency_ordinal as usize)
+                    .is_some_and(|candidate| candidate.oid == dependency.oid)
+            });
+        if let Some(prior) = prior {
+            if prior.parent_dependency_ordinal != foreign_key.parent_dependency_ordinal {
                 return Err(codec_error(
                     "foreign-key parent has ambiguous dependency ordinal",
-                ))
+                ));
             }
-            None if foreign_key.parent_dependency_ordinal == next => {
-                by_oid.insert(dependency.oid, next);
-                next = next
-                    .checked_add(1)
-                    .ok_or_else(|| codec_error("dependency ordinal overflows"))?;
-            }
-            None => {
-                return Err(codec_error(
-                    "FK parent dependency is not first-occurrence ordered",
-                ))
-            }
+        } else if foreign_key.parent_dependency_ordinal == next {
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| codec_error("dependency ordinal overflows"))?;
+        } else {
+            return Err(codec_error(
+                "FK parent dependency is not first-occurrence ordered",
+            ));
         }
     }
     if dependencies.len() != next as usize {
@@ -936,24 +1975,29 @@ fn validate_dependency_closure_order(
 
 fn validate_decoded_columns(
     columns: &[DecodedColumn],
-    domains: &[TypedInsertDomainBinding],
+    domains: &[DecodedDomain],
     rows: u32,
 ) -> Result<(), EngineError> {
-    let mut ids = BTreeSet::new();
-    let mut source = BTreeSet::new();
-    let mut first_domain = Vec::new();
+    let mut next_domain_ordinal = 0_u32;
     for (expected, column) in columns.iter().enumerate() {
         if column.ordinal != expected as u32
             || column.name.is_empty()
             || column.column_id == 0
             || column.type_oid == 0
             || column.type_size != column.ty.type_size()
-            || !ids.insert(column.column_id)
+            || columns
+                .iter()
+                .take(expected)
+                .any(|prior| prior.column_id == column.column_id)
         {
             return Err(codec_error("decoded column identity is invalid"));
         }
         if let Some(source_ordinal) = column.source_ordinal {
-            if !source.insert(source_ordinal) {
+            if columns
+                .iter()
+                .take(expected)
+                .any(|prior| prior.source_ordinal == Some(source_ordinal))
+            {
                 return Err(codec_error("decoded source ordinal is duplicated"));
             }
         }
@@ -964,41 +2008,50 @@ fn validate_decoded_columns(
             if column.type_oid != domain.oid || column.ty != domain.base_type {
                 return Err(codec_error("decoded domain binding drifted"));
             }
-            if !first_domain
+            if !columns[..expected]
                 .iter()
-                .any(|prior: &&TypedInsertDomainBinding| prior.oid == domain.oid)
+                .any(|prior| prior.domain_ordinal == Some(ordinal))
             {
-                first_domain.push(domain);
+                if ordinal != next_domain_ordinal {
+                    return Err(codec_error(
+                        "decoded domains are not first-occurrence ordered",
+                    ));
+                }
+                next_domain_ordinal = next_domain_ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| codec_error("decoded domain ordinal overflows"))?;
             }
         } else if column.type_oid != column.ty.postgres_oid() {
             return Err(codec_error("decoded base type OID drifted"));
         }
         validate_decoded_column_vectors(column, rows)?;
     }
-    if source
+    let source_count = columns
         .iter()
-        .copied()
-        .enumerate()
-        .any(|(expected, actual)| u32::try_from(expected).ok() != Some(actual))
-    {
+        .filter(|column| column.source_ordinal.is_some())
+        .count();
+    if (0..source_count).any(|expected| {
+        columns
+            .iter()
+            .filter(|column| column.source_ordinal == u32::try_from(expected).ok())
+            .count()
+            != 1
+    }) {
         return Err(codec_error("decoded source ordinals are not contiguous"));
     }
-    if first_domain.len() != domains.len()
-        || !first_domain
-            .iter()
-            .zip(domains)
-            .all(|(left, right)| left.oid == right.oid && left.name == right.name)
-    {
+    if usize::try_from(next_domain_ordinal).ok() != Some(domains.len()) {
         return Err(codec_error(
             "decoded domains are not first-occurrence ordered",
         ));
     }
-    let mut domain_ids = BTreeSet::new();
-    for domain in domains {
+    for (ordinal, domain) in domains.iter().enumerate() {
         if domain.schema.is_empty()
             || domain.name.is_empty()
             || domain.oid == 0
-            || !domain_ids.insert(domain.oid)
+            || domains
+                .iter()
+                .take(ordinal)
+                .any(|prior| prior.oid == domain.oid)
         {
             return Err(codec_error("decoded domain identity is invalid"));
         }
@@ -1071,7 +2124,17 @@ fn decoded_placeholder_zero(values: &TypedInsertColumnValues, row: usize) -> boo
 fn decoded_returning_digest(
     returning: &DecodedReturning,
 ) -> Result<gpu_db_wal::CanonicalDigest, EngineError> {
-    let mut body = Writer::new(MAX_RECORD_BYTES);
+    let mut counting = Writer::counting(MAX_RECORD_BYTES);
+    append_decoded_returning_digest_body(&mut counting, returning)?;
+    let mut body = Writer::hashing_request_body(MAX_RECORD_BYTES, counting.len())?;
+    append_decoded_returning_digest_body(&mut body, returning)?;
+    body.finish_request_digest()
+}
+
+fn append_decoded_returning_digest_body(
+    body: &mut Writer,
+    returning: &DecodedReturning,
+) -> Result<(), EngineError> {
     body.bytes(b"GPUDBTYPEDINSERTRETURNING1")?;
     body.u16(FORMAT_VERSION)?;
     body.u16(SEMANTICS_VERSION)?;
@@ -1084,7 +2147,7 @@ fn decoded_returning_digest(
     )?)?;
     for projection in &returning.projections {
         append_projection(
-            &mut body,
+            body,
             projection.catalog_column_ordinal,
             projection.column_id,
             projection.attnum,
@@ -1094,31 +2157,59 @@ fn decoded_returning_digest(
             projection.type_size,
         )?;
     }
-    Ok(gpu_db_wal::canonical_request_digest(&body.finish()))
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn decoded_statement_digest(
     target: &Target,
     columns: &[DecodedColumn],
-    dependencies: &[TypedInsertDependencyBinding],
-    domains: &[TypedInsertDomainBinding],
-    indexes: &[TypedInsertCanonicalIndexBinding],
-    foreign_keys: &[TypedInsertCanonicalForeignKeyBinding],
+    dependencies: &[DecodedDependency],
+    domains: &[DecodedDomain],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
     returning_digest: gpu_db_wal::CanonicalDigest,
     effects: &DecodedEffects,
 ) -> Result<gpu_db_wal::CanonicalDigest, EngineError> {
-    let sequence_cells = effects
-        .effects
-        .iter()
-        .map(|effect| {
-            (
-                effect.request.catalog_column_ordinal,
-                effect.request.row_ordinal,
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let mut body = Writer::new(MAX_RECORD_BYTES);
+    let mut counting = Writer::counting(MAX_RECORD_BYTES);
+    append_decoded_statement_digest_body(
+        &mut counting,
+        target,
+        columns,
+        dependencies,
+        domains,
+        indexes,
+        foreign_keys,
+        returning_digest,
+        effects,
+    )?;
+    let mut body = Writer::hashing_request_body(MAX_RECORD_BYTES, counting.len())?;
+    append_decoded_statement_digest_body(
+        &mut body,
+        target,
+        columns,
+        dependencies,
+        domains,
+        indexes,
+        foreign_keys,
+        returning_digest,
+        effects,
+    )?;
+    body.finish_request_digest()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_decoded_statement_digest_body(
+    body: &mut Writer,
+    target: &Target,
+    columns: &[DecodedColumn],
+    dependencies: &[DecodedDependency],
+    domains: &[DecodedDomain],
+    indexes: &[DecodedIndex],
+    foreign_keys: &[DecodedForeignKey],
+    returning_digest: gpu_db_wal::CanonicalDigest,
+    effects: &DecodedEffects,
+) -> Result<(), EngineError> {
     body.bytes(b"GPUDBTYPEDINSERTSTATEMENT1")?;
     body.u16(FORMAT_VERSION)?;
     body.u16(SEMANTICS_VERSION)?;
@@ -1128,11 +2219,11 @@ fn decoded_statement_digest(
     body.digest(&target.schema_digest)?;
     body.u32(target.statement_ordinal.as_u32())?;
     body.u32(target.rows)?;
-    reencode::append_decoded_intent_columns(&mut body, columns, target.rows, &sequence_cells)?;
-    append_dependencies(&mut body, dependencies)?;
-    append_domains(&mut body, domains)?;
-    append_indexes(&mut body, indexes)?;
-    append_foreign_keys(&mut body, foreign_keys)?;
+    reencode::append_decoded_intent_columns(body, columns, target.rows, &effects.effects)?;
+    reencode::append_decoded_dependencies(body, dependencies)?;
+    reencode::append_decoded_domains(body, domains)?;
+    reencode::append_decoded_indexes(body, indexes)?;
+    reencode::append_decoded_foreign_keys(body, foreign_keys)?;
     body.digest(&returning_digest)?;
     body.u32(checked_u32(
         effects.effects.len(),
@@ -1141,7 +2232,7 @@ fn decoded_statement_digest(
     for effect in &effects.effects {
         let request = &effect.request;
         append_sequence_request(
-            &mut body,
+            body,
             request.target_table_oid,
             request.row_ordinal,
             request.catalog_column_ordinal,
@@ -1153,7 +2244,7 @@ fn decoded_statement_digest(
             request.expression_ordinal,
         )?;
     }
-    Ok(gpu_db_wal::canonical_request_digest(&body.finish()))
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1216,9 +2307,6 @@ impl<'a> Reader<'a> {
     fn digest(&mut self) -> Result<gpu_db_wal::CanonicalDigest, EngineError> {
         self.exact()
     }
-    fn subreader(&mut self, count: usize) -> Result<Reader<'a>, EngineError> {
-        Ok(Reader::new(self.take(count)?))
-    }
     fn count_bounded(
         &mut self,
         kind: &str,
@@ -1233,20 +2321,27 @@ impl<'a> Reader<'a> {
             Ok(count)
         }
     }
-    fn blob(&mut self) -> Result<Vec<u8>, EngineError> {
+    fn identifier(&mut self) -> Result<String, EngineError> {
         let count =
             usize::try_from(self.u32()?).map_err(|_| codec_error("blob length overflows"))?;
         if count > self.remaining() || count > MAX_RECORD_BYTES {
             return Err(codec_error("blob length is outside section bounds"));
         }
-        Ok(self.take(count)?.to_vec())
-    }
-    fn identifier(&mut self) -> Result<String, EngineError> {
-        let bytes = self.blob()?;
+        let bytes = self.take(count)?;
         if bytes.is_empty() || bytes.len() > MAX_IDENTIFIER_BYTES || bytes.contains(&0) {
             return Err(codec_error("identifier encoding is noncanonical"));
         }
-        String::from_utf8(bytes).map_err(|_| codec_error("identifier is not UTF-8"))
+        let text =
+            std::str::from_utf8(bytes).map_err(|_| codec_error("identifier is not UTF-8"))?;
+        let mut owned = String::new();
+        reserve_string(&mut owned, text.len(), "decoded identifier")?;
+        owned.push_str(text);
+        if owned.len() != owned.capacity() {
+            return Err(codec_error(
+                "decoded identifier capacity is not exact before retention",
+            ));
+        }
+        Ok(owned)
     }
     fn option_u32(&mut self) -> Result<Option<u32>, EngineError> {
         match self.u8()? {
@@ -1305,14 +2400,15 @@ impl<'a> Reader<'a> {
         if count != expected {
             return Err(codec_error("bitmap word count is not exact"));
         }
-        let mut words = Vec::with_capacity(count);
+        let mut words = Vec::new();
+        reserve_exact(&mut words, count, "decoded bitmap owner")?;
         for _ in 0..count {
             words.push(self.u32()?);
         }
         if !bitmap_shape_is_exact(&words, rows as usize) {
             return Err(codec_error("bitmap tail bits are noncanonical"));
         }
-        Ok(words.into())
+        into_exact_boxed_slice(words)
     }
     fn validity(&mut self, rows: u32) -> Result<TypedInsertColumnValidity, EngineError> {
         let (validity, consumed) = super::super::typed_image_codec::decode_typed_validity(

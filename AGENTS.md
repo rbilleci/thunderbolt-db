@@ -87,9 +87,9 @@ fallback, bootstrap step, or product-scope exception.
 
 ## Source File Size and Module Boundaries
 
-Follow `docs/CODE_SIZE.md`. Production source over 2,000 lines and test/example/tool source over 3,000 lines
-requires an audited disposition; any file over 5,000 lines must remain owned by a PLAN task until it is split or
-accepted in the exception registry. New modules should normally remain below 1,500 lines.
+Follow `docs/CODE_SIZE.md`. Production source over 3,000 lines and test/example/tool source over 4,500 lines
+requires an audited disposition; any file over 7,500 lines must remain owned by a PLAN task until it is split or
+accepted in the exception registry. New modules should normally remain below 2,250 lines.
 
 Split by invariant and ownership, not by line range. Preserve stable facades, move the closest tests, update
 module/import/re-export/build/test/doc references in the same slice, and verify old paths and symbols are gone.

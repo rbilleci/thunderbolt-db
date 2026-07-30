@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::typed_insert_batch::sequence_defaults::effects::CanonicalSequenceParentView;
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[path = "canonical_codec_decode.rs"]
@@ -46,9 +47,23 @@ const SECTION_RETURNING: u16 = 7;
 const SECTION_SEQUENCE_EFFECTS: u16 = 8;
 
 pub(crate) use decode::{
-    DecodedReturningLayoutFacts, DecodedSequenceEffectFacts, DecodedSequenceEffectKindFacts,
+    CanonicalTypedInsertDecodeMeasure, CanonicalTypedInsertReadAt, DecodedCatalogBindingFacts,
+    DecodedCatalogColumnFacts, DecodedDependencyFacts, DecodedDomainFacts, DecodedForeignKeyFacts,
+    DecodedIndexFacts, DecodedReturningLayoutFacts, DecodedReturningProjectionFacts,
+    DecodedSequenceBindingFacts, DecodedSequenceEffectFacts, DecodedSequenceEffectKindFacts,
     DecodedSequenceParentFacts, DecodedSequenceRequestFacts, DecodedTypedInsertRecordFacts,
-    DecodedTypedInsertTargetFacts,
+    DecodedTypedInsertTargetFacts, DecodedTypedInsertTargetIdentityFacts, DecodedTypedValueFacts,
+};
+
+#[cfg(test)]
+pub(crate) use decode::note_typed_vector_owner_for_test;
+pub(crate) use decode::{
+    copy_decoded_canonical_typed_insert_after_measure,
+    copy_decoded_canonical_typed_insert_published_only_after_measure,
+    decode_decoded_canonical_typed_insert_after_measure,
+    decode_decoded_canonical_typed_insert_published_only_after_measure,
+    measure_decoded_canonical_typed_insert_from_source,
+    measure_decoded_canonical_typed_insert_published_only_from_source,
 };
 
 /// Crate-private, non-cloneable decoded evidence. It intentionally owns the validated parsed
@@ -126,6 +141,18 @@ impl DecodedTypedInsertRecord {
         self.facts().typed_statement_digest
     }
 
+    pub(crate) fn target_identity(&self) -> DecodedTypedInsertTargetIdentityFacts<'_> {
+        decode::target_identity(&self.model)
+    }
+
+    pub(crate) fn column_value_at(
+        &self,
+        catalog_column_ordinal: u32,
+        row_ordinal: u32,
+    ) -> Result<(bool, DecodedTypedValueFacts<'_>), EngineError> {
+        decode::column_value_at(&self.model, catalog_column_ordinal, row_ordinal)
+    }
+
     /// RETURNING-layout identity from the retained model.
     pub(crate) fn returning_digest(&self) -> gpu_db_wal::CanonicalDigest {
         self.facts().returning.digest
@@ -143,6 +170,54 @@ impl DecodedTypedInsertRecord {
         &self,
     ) -> impl ExactSizeIterator<Item = DecodedSequenceEffectFacts> + '_ {
         decode::sequence_effect_facts(&self.model)
+    }
+
+    pub(crate) fn catalog_columns(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DecodedCatalogColumnFacts<'_>> {
+        decode::catalog_columns(&self.model)
+    }
+
+    pub(crate) fn dependencies(&self) -> impl ExactSizeIterator<Item = DecodedDependencyFacts<'_>> {
+        decode::dependencies(&self.model)
+    }
+
+    pub(crate) fn domains(&self) -> impl ExactSizeIterator<Item = DecodedDomainFacts<'_>> {
+        decode::domains(&self.model)
+    }
+
+    pub(crate) fn indexes(&self) -> impl ExactSizeIterator<Item = DecodedIndexFacts<'_>> {
+        decode::indexes(&self.model)
+    }
+
+    pub(crate) fn index_key_columns(
+        &self,
+        index_ordinal: u32,
+    ) -> Result<impl ExactSizeIterator<Item = DecodedCatalogBindingFacts<'_>>, EngineError> {
+        decode::index_key_columns(&self.model, index_ordinal)
+    }
+
+    pub(crate) fn foreign_keys(&self) -> impl ExactSizeIterator<Item = DecodedForeignKeyFacts<'_>> {
+        decode::foreign_keys(&self.model)
+    }
+
+    pub(crate) fn foreign_key_supporting_index_keys(
+        &self,
+        foreign_key_ordinal: u32,
+    ) -> Result<impl ExactSizeIterator<Item = DecodedCatalogBindingFacts<'_>>, EngineError> {
+        decode::foreign_key_supporting_index_keys(&self.model, foreign_key_ordinal)
+    }
+
+    pub(crate) fn sequence_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DecodedSequenceBindingFacts<'_>> {
+        decode::sequence_bindings(&self.model)
+    }
+
+    pub(crate) fn returning_projections(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DecodedReturningProjectionFacts<'_>> {
+        decode::returning_projections(&self.model)
     }
 }
 
@@ -1301,6 +1376,7 @@ struct Writer {
     len: usize,
     limit: usize,
     materialize: bool,
+    digest: Option<sha2::Sha256>,
 }
 impl Writer {
     fn new(limit: usize) -> Self {
@@ -1309,6 +1385,7 @@ impl Writer {
             len: 0,
             limit,
             materialize: true,
+            digest: None,
         }
     }
     fn counting(limit: usize) -> Self {
@@ -1317,7 +1394,56 @@ impl Writer {
             len: 0,
             limit,
             materialize: false,
+            digest: None,
         }
+    }
+    fn exact(limit: usize, len: usize) -> Result<Self, EngineError> {
+        if len > limit {
+            return Err(codec_error(
+                "record exceeds the 16 MiB one-fragment ceiling",
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| codec_error("canonical record exact reservation failed"))?;
+        Ok(Self {
+            bytes,
+            len: 0,
+            limit,
+            materialize: true,
+            digest: None,
+        })
+    }
+    /// Stream one ADR014 request body after a counting pass has established its exact length.
+    /// The digest primitive length-prefixes its request argument, so this hasher can be seeded
+    /// without materializing the otherwise transient body.
+    fn hashing_request_body(limit: usize, body_len: usize) -> Result<Self, EngineError> {
+        if body_len > limit {
+            return Err(codec_error(
+                "record exceeds the 16 MiB one-fragment ceiling",
+            ));
+        }
+        let domain = b"gpu-db/adr014/request/v1";
+        let mut digest = sha2::Sha256::new();
+        digest.update(
+            u64::try_from(domain.len())
+                .map_err(|_| codec_error("digest domain length overflows"))?
+                .to_le_bytes(),
+        );
+        digest.update(domain);
+        digest.update(
+            u64::try_from(body_len)
+                .map_err(|_| codec_error("digest body length overflows"))?
+                .to_le_bytes(),
+        );
+        Ok(Self {
+            bytes: Vec::new(),
+            len: 0,
+            limit,
+            materialize: false,
+            digest: Some(digest),
+        })
     }
     fn len(&self) -> usize {
         self.len
@@ -1329,6 +1455,17 @@ impl Writer {
         );
         debug_assert_eq!(self.bytes.len(), self.len);
         self.bytes
+    }
+    fn finish_request_digest(self) -> Result<gpu_db_wal::CanonicalDigest, EngineError> {
+        if self.materialize {
+            return Err(codec_error(
+                "materialized writer cannot finish as a streamed digest",
+            ));
+        }
+        let digest = self
+            .digest
+            .ok_or_else(|| codec_error("counting writer has no streamed digest"))?;
+        Ok(digest.finalize().into())
     }
     fn reserve(&mut self, count: usize) -> Result<(), EngineError> {
         let len = self
@@ -1342,12 +1479,17 @@ impl Writer {
         }
         self.len = len;
         if self.materialize {
-            self.bytes.reserve(count);
+            self.bytes
+                .try_reserve(count)
+                .map_err(|_| codec_error("canonical record reservation failed"))?;
         }
         Ok(())
     }
     fn bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
         self.reserve(bytes.len())?;
+        if let Some(digest) = &mut self.digest {
+            digest.update(bytes);
+        }
         if self.materialize {
             self.bytes.extend_from_slice(bytes);
         }

@@ -63,14 +63,32 @@ starts at WRITE-001:
    INSERT, defines exact table-local S4 binding, final-neutral generation inputs followed by final-bound S7
    digests, logical `RETURNING`/retry identity, full-success or final-statement-abort outcomes, catalog/dependency/
    index/constraint closure, ADR-014 lease witnesses, and catalog/allocator/generation witness phases. The next
-   checkpoint may now implement the inert normative S4/S7 reader and test-only reencoder: make row identity
-   table-local, bind every disposition to its final table and surviving transition, encode and strictly decode the
-   complete final overlay, consume the shared typed image, and implement the checked witness-state transitions.
-   Reconcile the existing misnamed provisional S1--S6 scaffold in that slice: dispatch by semantics version before
-   validation, preserve semantics-v1 bytes, and leave exactly one normative S4 authority. Keep the new form
-   unreachable from live WAL/recovery/apply/publication. S8, the final destructive replay IR, live durable-sequence
-   validation, GPU replay compilation, and the complete live pre-WAL capacity lease remain later WRITE-001
-   checkpoints; none may add another WAL, operation, publication, or eligibility authority.
+   accepted **Q0 structural quarantine/reservation prerequisite** now dispatches semantics before v1 validation,
+   keeps the sole writer hardwired to v1, renames the provisional v1 scaffold, preserves the exact v1 golden, runs
+   allocation-free S7 pass zero, reserves exact persistent plus maximum scratch ownership, and strictly fills
+   source-backed S2/images into an inert move-only quarantine owner. It deliberately does not claim the normative
+   S4/S7 checkpoint: complete semantic roots, external witness activation, the fully validated reencoder, and two
+   of the three required goldens remain absent.
+
+   The next independently reviewable checkpoint is **Q1 codec-closed quarantine**. Consume the structural owner
+   into a new move-only codec-closed quarantine state only after allocation-free closure of every S1--S7 fact
+   derivable without external witnesses. Recompute final-row and logical-`RETURNING` digests; statement
+   disposition/sequence/dependency/projection and overlay roots; S4-survivor/transition bijection; S2/final-image
+   cell equality; exact index/unique/FK effect inventories and composite NULL participation; reference-neutral
+   dependency guard keys; table transition/index-effect roots and manifests; and the root descriptor after those
+   manifests. Correct `ForeignKeyGuard` token identity to the supporting parent-index identity rather than the FK
+   constraint identity. Move catalog/allocator advancement off raw quarantine so only the codec-closed owner can
+   invoke it. Pin all three frozen minimal-abort, explicit multi-statement-abort, and successful interleaved
+   two-table golden shapes as checked-in bytes with independently expected Q1 roots, plus coherently rehashed
+   sabotage that reaches each new semantic boundary. Q1 has no reencoder, generation builder, or live caller.
+
+   **Q2 witness closure** follows Q1: independently validate the pinned catalog and durable allocator leases,
+   consume that owner through a sealed/drained generation builder and independent generation witness, reject
+   coherent opaque-root and generation-input substitutions, and expose test-only byte reencoding exclusively from
+   the fully witness-validated state for all three goldens. Keep Q1/Q2 unreachable from live
+   WAL/recovery/apply/publication. S8, the final destructive replay IR, live durable-sequence validation, GPU replay
+   compilation, and the complete live pre-WAL capacity lease remain later WRITE-001 checkpoints; none may add
+   another WAL, operation, publication, or eligibility authority.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as
@@ -148,12 +166,12 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 
 ## STRUCT-001 — oversized-file remediation method
 
-The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline had **30 files outside
-its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
-or tools over 3,000 lines. Every baseline outlier plus one subsequently crossed test threshold has a completed
-audited disposition. The standalone **STRUCT-001** queue is **zero actionable files**; under the
-comment-excluded count in `CODE_SIZE.md`, `engine_expr.rs` no longer requires an exception, while the SQL crate
-root has the one accepted bounded-facade exception recorded by the standard. PRODUCT-001 completed the four
+The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). Under the former thresholds, the corrected 2026-07-12
+baseline had **30 files outside its analysis envelopes**: 18 production files over 2,000 lines, eight test files
+over 3,000 lines, and four examples or tools over 3,000 lines. Every baseline outlier plus one subsequently crossed
+test threshold has a completed audited disposition. The standalone **STRUCT-001** queue is **zero actionable
+files**. After the 2026-07-29 50% limit increase, neither `engine_expr.rs` nor the SQL crate root requires an
+exception, and the standard's exception registry is empty. PRODUCT-001 completed the four
 reopened engine dispositions: `engine_dml_concurrent.rs`, `engine_commit.rs`, and
 `engine_mutation_admission.rs` are below the
 2,000-line comment-excluded threshold, while `engine_transaction_catalog.rs` is a 594-line physical root with its
@@ -175,8 +193,8 @@ that file's disposition cell in the inventory below:
 
 Execute one behavior-preserving ownership extraction at a time. Keep semantic rewrites separate, update every
 code/build/test/doc reference in the same slice, search for old paths and symbols, and do not create numbered
-shards, catch-all modules, cycles, or a compensating `pub(crate)` sprawl. Target new modules below 1,500 lines.
-Critical outliers over 5,000 lines receive priority; a pure structural move uses targeted correctness gates,
+shards, catch-all modules, cycles, or a compensating `pub(crate)` sprawl. Target new modules below 2,250 lines.
+Critical outliers over 7,500 lines receive priority; a pure structural move uses targeted correctness gates,
 while any runtime/kernel/residency/result-path change also uses the full applicable `AGENTS.md` gates.
 
 ### Ordered inventory
@@ -204,7 +222,7 @@ module map; work may run independently across crates but GPU validation remains 
 |---:|---|---|
 | 1,783 | `crates/engine/src/engine_streaming_exec.rs` | **DISPOSITION COMPLETE — bounded streaming facade/control-plane owner below the 2,000-line production analysis threshold.** STRUCT-001HW–IH isolated every separable join, SELECT-fold, scalar, cold-lifecycle, DML/class, and chunk-key owner into bounded private leaves. IH moved exact key-index/Bloom/candidate/structural-uniqueness behavior into the rustfmt-clean 1,164-line `streaming_chunk_keys.rs`, preserving six public telemetry and five crate APIs, adding exactly seven sibling bridges, and keeping nine helpers private. All 80 focused GPU executions, both 505/487 modes, the complete 992 suite, all static/source/cleanup gates, and an independent 16-control audit passed. The root now cohesively owns shared cold/key/staging contracts and telemetry, durable checkpoint codec/orchestration, sanctioned final readback/reverse decode, and the scheduler helper; no exception is required. Multi-GPU remains separately deferred. |
 | 1,872 | `crates/wal/src/lib.rs` | **DISPOSITION COMPLETE — bounded mixed root below the 2,000-line production threshold; no exception.** STRUCT-001II–IN isolated coherent test, buffer/group-flush, timeline/registry/prune, object-backup, and checkpoint owners; IL hardened timeline delimiters. IN moved exact checkpoint/control/lane ownership into the 371-line `checkpoint.rs` behind three type/nine function re-exports with no bridge. Both 85-test modes, 40 engine recovery tests, five GPU cold-checkpoint controls, static gates, fresh inventory, and independent audit passed. The root cohesively retains shared record/archive/recovery/commit contracts; strict/tolerant segment+tail persistence; archive manifest/recovery/retention; and shared path/validation/codec helpers used by multiple leaves. Further splitting now causes bridge/helper churn. Re-audit at 2,000 lines, a second new family, bridge/cycle/public-boundary pressure, or descendant threshold crossing. All WAL descendants are within mandatory envelopes. |
-| 2,004 counted | `crates/sql/src/lib.rs` | **DISPOSITION COMPLETE — accepted bounded-facade exception registered in `CODE_SIZE.md`.** The root remains the stable SQL crate facade re-exported wholesale by protocol and directly consumed across engine/facade/planner/server. STRUCT-001IO–IV already isolated COPY, decimal, ACL, SELECT, scalar, command/control, AST, and relation/schema/table/index/DML owners. INSERT-001 placed its allocation-free compatibility-prefix scanner in `lexical.rs`; WRITE-001 retained typed `InsertCell`/provenance behavior in `ast.rs`; CHECK-001 moved the cohesive public `ParseError` diagnostics to the bounded 33-line private `parse_error.rs` leaf while retaining the root re-export. The root is now exactly 2,031 physical/2,004 counted lines and carries no new parser responsibility. The exception reopens on any net growth, new root SQL family, public-boundary change, or 2,100 counted lines. |
+| 2,004 counted | `crates/sql/src/lib.rs` | **DISPOSITION COMPLETE — cohesive SQL facade within the current preferred envelope; former exception retired.** The root remains the stable SQL crate facade re-exported wholesale by protocol and directly consumed across engine/facade/planner/server. STRUCT-001IO–IV already isolated COPY, decimal, ACL, SELECT, scalar, command/control, AST, and relation/schema/table/index/DML owners. INSERT-001 placed its allocation-free compatibility-prefix scanner in `lexical.rs`; WRITE-001 retained typed `InsertCell`/provenance behavior in `ast.rs`; CHECK-001 moved the cohesive public `ParseError` diagnostics to the bounded 33-line private `parse_error.rs` leaf while retaining the root re-export. The root is now exactly 2,031 physical/2,004 counted lines and carries no new parser responsibility. The 2026-07-29 50% limit increase retired its `CODE_SIZE.md` exception; reanalyze on a new root-owned SQL family, public-boundary change, or crossing the current preferred envelope. |
 
 **Wave 3 — production review outliers (2,001–5,000 lines).** Analyze after Waves 1–2 establish the relevant
 facades, unless one is a safe leaf extraction that directly reduces an earlier wave.
@@ -223,7 +241,7 @@ facades, unless one is a safe leaf extraction that directly reduces an earlier w
 | 1,996 | `crates/engine/src/engine_dml_prepare.rs` | **DISPOSITION COMPLETE — bounded DML prepare/resolve/materialize/constraint runtime owner below 2,000 lines; no exception.** STRUCT-001JN moved the exact 228-line state-free prelude into the rustfmt-clean 232-line private `engine_dml_prepare/contracts.rs` child. Its two aliases, two functions, validation enum/proof, four stable crate-private facade paths, and all typed canonicalization/DNF/decline semantics are exact apart from one scope-equivalent helper visibility token. The later R3-003 transaction-only rebind guard lives with the bounded transaction-delta owner, preserving this file's established invariant and envelope. Ten host controls, 100 focused actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, and independent audit passed. |
 | 1,972 | `crates/engine/src/rel_exec_helpers.rs` | **DISPOSITION COMPLETE — bounded relational helper root below 2,000 lines; no exception.** STRUCT-001JO moved the exact four-function row codec into the rustfmt-clean 176-line private `rel_exec_helpers/row_codec.rs` child. Full normalized reconstruction is byte-identical; all prefixes, NULL/text escaping, numeric scale, typed parsing/errors, four stable crate-private facade paths, 72 live invocation sites, and dependency direction are unchanged. Ten host codec/WAL/recovery controls, 40 focused actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, and independent audit passed. |
 
-**Wave 4 — test-suite outliers (over 3,000 lines).** Split by behavioral seam and fixture ownership after, or
+**Wave 4 — historical test-suite outliers (over the former 3,000-line threshold).** Split by behavioral seam and fixture ownership after, or
 alongside, the production module they cover; do not fragment tests merely to reduce a count.
 
 | Lines | File | Disposition / evidence |
@@ -238,7 +256,7 @@ alongside, the production module they cover; do not fragment tests merely to red
 | 2,347 | `crates/engine/src/tests/mvcc_query.rs` | **DISPOSITION COMPLETE — bounded MVCC-query test facade below 3,000 lines; no exception.** STRUCT-001KY isolated the exact 24-test/24-ignore initial actual-CUDA historical lookup, composition, ordering, filtering, visibility, provenance, and source-relative driver matrix in the rustfmt-clean 1,164-line private `cuda_driver_routes.rs` child. Payload/full reconstruction hashes match; 72 local plus 72 independent-audit actual-CUDA executions passed with simultaneous GPU processes and zero CUDA 700/716/719. Both 505/487 modes, the complete 992 suite, workspace check, strict Clippy, rustdoc, static/source/cleanup gates, fresh five-file inventory, and independent audit pass. The bounded parent retained capability/fallback/backend-parity seams at that structural checkpoint; RETIRE-001 later deleted those seams while preserving native set-composition, provenance, and benchmark-report owners. |
 | 2,876 | `crates/execution/src/tests/cuda_paths.rs` | **DISPOSITION COMPLETE — bounded CUDA-path test corpus below 3,000 lines; no exception.** STRUCT-001KZ normalized the exact final 164-line resident-generation publish/pinned-reader/GPU-read/post-drain reclamation soundness test into the rustfmt-clean 168-line private sibling `tests/cuda_generation_lifetime.rs`. Re-indenting nonblank child payload lines by four spaces and restoring the removed separator reconstructs the old 3,041-line include fragment byte-for-byte. Three local plus three independent-audit actual-GPU executions passed with simultaneous processes and zero CUDA 700/716/719. The execution library's 56/77 ordinary and 133/133 include-ignored suites, workspace check, strict Clippy, private rustdoc, static/source/cleanup gates, fresh four-file inventory, and independent audit pass. The unchanged bounded include fragment retains all other CUDA operator/runtime tests. |
 
-**Wave 5 — example and tool outliers (over 3,000 lines).** Determine whether each is a cohesive executable,
+**Wave 5 — historical example and tool outliers (over the former 3,000-line threshold).** Determine whether each is a cohesive executable,
 handwritten tool, reproducible generated artifact, or obsolete evidence before choosing modules or an exception.
 
 | Lines | File | Disposition / evidence |
@@ -249,8 +267,8 @@ handwritten tool, reproducible generated artifact, or obsolete evidence before c
 | deleted | `scripts/run_p8_ch_benchmark_residency_probe.sh` and `scripts/lib/p8_ch_benchmark_protocol_boundary.sh` | **DISPOSITION COMPLETE — accepted deletion.** The historical `order_line` harness launched superseded protocol surfaces and direct-engine benchmark-only writes. It is neither a canonical workload nor an admissible compatibility shortcut. |
 
 STRUCT-001 closes only when every row has an audited disposition; every accepted retention appears in the
-`CODE_SIZE.md` exception registry; no non-excepted production file exceeds 2,000 lines and no non-excepted
-test/example/tool exceeds 3,000; all references resolve; targeted gates pass after every extraction; and a fresh
+`CODE_SIZE.md` exception registry; no non-excepted production file exceeds 3,000 lines and no non-excepted
+test/example/tool exceeds 4,500; all references resolve; targeted gates pass after every extraction; and a fresh
 inventory finds no unowned outlier. Line-count drift is expected, so the fresh inventory—not this snapshot—is
 the final acceptance source.
 

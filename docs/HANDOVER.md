@@ -97,6 +97,16 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
   catalog/allocator/generation witnesses, final index roots, an acyclic generation graph, recovery witness phasing,
   terminal guard keys, synthesized NOT NULL identities, and the resolution/S1 request-digest echo. This checkpoint
   changes design only and remains inert.
+- The accepted Q0 structural quarantine/reservation prerequisite dispatches semantics before v1 validation,
+  preserves the sole v1 writer and literal v1 golden, performs allocation-free semantics-v2 S7 pass zero, reserves
+  exact persistent plus maximum scratch ownership, and strictly fills source-backed S2/images into a private
+  move-only quarantine owner. The initial audit rejected incomplete canonical-v1 global registries; repaired
+  cross-kind OID, class-name, column-ID, external-domain, and `attnum` coverage plus an unmasked coherently rehashed
+  matrix received final **ACCEPT**. Exact staged tree
+  `166a1a1aba92e5854836d63a6946d2777ef61ba5`, diff
+  `896c2aa60d8dc7d5d182996f1b6e444b70b2635d530506fb76f93628506648f4`, 41 source paths; focused suites and the
+  **1,103 passed / 667 GPU-required ignored / 0 failed** serial engine sweep are clean. Q0 has no constructible
+  fully validated state, reencoder, or live consumer and is not the complete normative S4/S7 checkpoint.
 - Regenerable benchmark/build state was reduced from about **143 GB to 4.9 GB**. The runner now recreates the
   source-relative temporary directory required by clean quick and exported-full builds.
 - **PRODUCT-001 completed and received final independent acceptance on 2026-07-26.** The superseded listener,
@@ -123,16 +133,20 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. The S7 design gate is complete; resume with its inert normative S4/S7
-implementation. Dispatch semantics before validation, preserve every semantics-v1 byte and test, replace the
-provisional global-row S4 validator with the sole table-local semantics-v2 authority, encode/decode the complete
-final overlay through the shared typed image, and implement the quarantined → catalog/lease-validated generation
-pending → generation-witness-validated test states. Pin the required success/abort golden vectors, independent
-catalog/lease/generation witnesses, coherent rehashed-root sabotage, exact persistent plus maximum scratch
-accounting, allocation-failure drain, and decode/re-encode equality. Keep the entire form unreachable from live
-WAL/recovery/apply/publication. S8, final replay ownership, live durable-sequence validation, GPU replay compilation,
-and the complete live pre-WAL capacity lease remain later WRITE-001 checkpoints; do not add another live operation,
-WAL, publication, or eligibility authority.
+**WRITE-001** is the sole active **NOW** task. Resume with **Q1 codec-closed quarantine**, not witness activation.
+Consume Q0's structurally filled owner into a new move-only codec-closed state only after closing every
+codec-computable S1--S7 fact: final-row and logical-`RETURNING` digests; statement disposition/sequence/dependency/
+projection and overlay roots; S4-survivor/transition bijection; S2/final-image cells; index/unique/FK effects and
+composite NULL participation; dependency guard keys; table transition/index-effect roots, manifests, and the
+manifest-bound root descriptor. Correct `ForeignKeyGuard` token identity to the supporting parent index. Move
+catalog/allocator advancement so raw quarantine cannot invoke it. Pin all three frozen golden shapes and coherent
+inner-root sabotage, but give Q1 no reencoder, generation builder, or live caller.
+
+After independent Q1 acceptance, Q2 owns pinned catalog/durable-allocator validation, the sealed/drained generation
+builder and independent witness, opaque-root/generation-input sabotage, and test-only byte equality from the fully
+validated state. Keep both phases unreachable from live WAL/recovery/apply/publication. S8, final replay ownership,
+live durable-sequence validation, GPU replay compilation, and the complete live pre-WAL capacity lease remain later
+WRITE-001 checkpoints; do not add another live operation, WAL, publication, or eligibility authority.
 
 The local worktree intentionally retains user-owned unstaged changes in `AGENTS.md`, `docs/CODE_SIZE.md`, and the
 source-size-policy hunks of `docs/PLAN.md`; do not stage, revert, or overwrite them.

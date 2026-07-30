@@ -22,10 +22,26 @@ mod typed_image_codec;
 mod typed_image_codec_value_contract;
 #[allow(unused_imports)] // Narrow future codec-5 S2/S5 read views; no live replay caller yet.
 pub(crate) use canonical_codec::{
-    CanonicalTypedInsertRecordPrefix, DecodedReturningLayoutFacts, DecodedSequenceEffectFacts,
-    DecodedSequenceEffectKindFacts, DecodedSequenceParentFacts, DecodedSequenceRequestFacts,
-    DecodedTypedInsertRecord, DecodedTypedInsertRecordFacts, DecodedTypedInsertTargetFacts,
+    copy_decoded_canonical_typed_insert_after_measure,
+    copy_decoded_canonical_typed_insert_published_only_after_measure,
+    decode_decoded_canonical_typed_insert_after_measure,
+    decode_decoded_canonical_typed_insert_published_only_after_measure,
+    measure_decoded_canonical_typed_insert_from_source,
+    measure_decoded_canonical_typed_insert_published_only_from_source,
+    CanonicalTypedInsertDecodeMeasure, CanonicalTypedInsertReadAt,
+    CanonicalTypedInsertRecordPrefix, DecodedCatalogBindingFacts, DecodedCatalogColumnFacts,
+    DecodedDependencyFacts, DecodedDomainFacts, DecodedForeignKeyFacts, DecodedIndexFacts,
+    DecodedReturningLayoutFacts, DecodedReturningProjectionFacts, DecodedSequenceBindingFacts,
+    DecodedSequenceEffectFacts, DecodedSequenceEffectKindFacts, DecodedSequenceParentFacts,
+    DecodedSequenceRequestFacts, DecodedTypedInsertRecord, DecodedTypedInsertRecordFacts,
+    DecodedTypedInsertTargetFacts, DecodedTypedInsertTargetIdentityFacts, DecodedTypedValueFacts,
     CANONICAL_TYPED_INSERT_RECORD_HEADER_BYTES,
+};
+#[allow(unused_imports)] // Production-compiled inert codec-5 S7 reader; no live caller exists.
+pub(crate) use typed_image_codec::{
+    copy_typed_image_after_measure, decode_typed_image, decode_typed_image_after_measure,
+    measure_decoded_typed_image, measure_decoded_typed_image_from_source, DecodedTypedImage,
+    TypedImageDecodeMeasure, TypedImageReadAt, TypedImageRole,
 };
 mod constraint_source;
 mod defaults;
@@ -216,7 +232,7 @@ enum TypedInsertInputProvenance {
 
 /// Device-ready value vectors. An invalid entry always retains its zero placeholder; validity is
 /// the only authority for whether that placeholder denotes SQL NULL.
-enum TypedInsertColumnValues {
+pub(crate) enum TypedInsertColumnValues {
     /// `int2`, `int4`, and `date` share their existing i32 storage domain.
     I32(Box<[i32]>),
     /// `int8` and `timestamp` share their existing i64 storage domain.
@@ -237,7 +253,7 @@ enum TypedInsertColumnValues {
 
 /// SQL validity: bit `row % 32` in word `row / 32` is one for a non-NULL input. Bitmap tails are
 /// always zero, including the final word of a 33-row vector.
-enum TypedInsertColumnValidity {
+pub(crate) enum TypedInsertColumnValidity {
     AllValid,
     Bitmap(Box<[u32]>),
 }

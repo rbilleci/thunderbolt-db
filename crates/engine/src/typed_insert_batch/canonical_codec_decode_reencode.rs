@@ -16,7 +16,19 @@ fn reencode_decoded_with(
     model: &DecodedModel,
     unchecked_values: bool,
 ) -> Result<Vec<u8>, EngineError> {
-    let mut record = Writer::new(MAX_RECORD_BYTES);
+    let mut counting = Writer::counting(MAX_RECORD_BYTES);
+    append_reencoded(model, unchecked_values, &mut counting)?;
+    super::reservation::reserve_reencode_scratch(counting.len())?;
+    let mut record = Writer::exact(MAX_RECORD_BYTES, counting.len())?;
+    append_reencoded(model, unchecked_values, &mut record)?;
+    Ok(record.finish())
+}
+
+fn append_reencoded(
+    model: &DecodedModel,
+    unchecked_values: bool,
+    record: &mut Writer,
+) -> Result<(), EngineError> {
     record.bytes(&MAGIC)?;
     record.u16(FORMAT_VERSION)?;
     record.u16(SEMANTICS_VERSION)?;
@@ -28,7 +40,7 @@ fn reencode_decoded_with(
     record.u32(0)?;
     record.digest(&model.typed_statement_digest)?;
     record.digest(&model.returning_digest)?;
-    append_section(&mut record, SECTION_TARGET, |out| {
+    append_section(record, SECTION_TARGET, |out| {
         out.identifier(&model.target.schema)?;
         out.identifier(&model.target.name)?;
         out.u32(model.target.oid)?;
@@ -37,25 +49,25 @@ fn reencode_decoded_with(
         out.u32(model.target.rows)?;
         out.u32(model.target.column_count)
     })?;
-    append_section(&mut record, SECTION_COLUMNS, |out| {
+    append_section(record, SECTION_COLUMNS, |out| {
         encode_decoded_columns(out, &model.columns, model.target.rows, unchecked_values)
     })?;
-    append_section(&mut record, SECTION_DEPENDENCIES, |out| {
-        append_dependencies(out, &model.dependencies)
+    append_section(record, SECTION_DEPENDENCIES, |out| {
+        append_decoded_dependencies(out, &model.dependencies)
     })?;
-    append_section(&mut record, SECTION_DOMAINS, |out| {
-        append_domains(out, &model.domains)
+    append_section(record, SECTION_DOMAINS, |out| {
+        append_decoded_domains(out, &model.domains)
     })?;
-    append_section(&mut record, SECTION_INDEXES, |out| {
-        append_indexes(out, &model.indexes)
+    append_section(record, SECTION_INDEXES, |out| {
+        append_decoded_indexes(out, &model.indexes)
     })?;
-    append_section(&mut record, SECTION_FOREIGN_KEYS, |out| {
-        append_foreign_keys(out, &model.foreign_keys)
+    append_section(record, SECTION_FOREIGN_KEYS, |out| {
+        append_decoded_foreign_keys(out, &model.foreign_keys)
     })?;
-    append_section(&mut record, SECTION_RETURNING, |out| {
+    append_section(record, SECTION_RETURNING, |out| {
         encode_decoded_returning(out, &model.returning)
     })?;
-    append_section(&mut record, SECTION_SEQUENCE_EFFECTS, |out| {
+    append_section(record, SECTION_SEQUENCE_EFFECTS, |out| {
         encode_decoded_effects(out, &model.effects)
     })?;
     let body_len = record
@@ -63,7 +75,7 @@ fn reencode_decoded_with(
         .checked_sub(HEADER_LEN)
         .ok_or_else(|| codec_error("decoded record header length underflow"))?;
     record.patch_u32(32, checked_u32(body_len, "decoded record body length")?);
-    Ok(record.finish())
+    Ok(())
 }
 
 fn encode_decoded_columns(
@@ -213,6 +225,7 @@ fn encode_decoded_effects(out: &mut Writer, effects: &DecodedEffects) -> Result<
                 owner,
                 predecessor,
                 input_digest,
+                ..
             } => {
                 out.u8(2)?;
                 out.i64(prior_last_value)?;
@@ -229,11 +242,103 @@ fn encode_decoded_effects(out: &mut Writer, effects: &DecodedEffects) -> Result<
     Ok(())
 }
 
+pub(super) fn append_decoded_dependencies(
+    out: &mut Writer,
+    dependencies: &[DecodedDependency],
+) -> Result<(), EngineError> {
+    out.u32(checked_u32(dependencies.len(), "dependency count")?)?;
+    for (ordinal, dependency) in dependencies.iter().enumerate() {
+        out.u32(checked_u32(ordinal, "dependency ordinal")?)?;
+        out.u8(if ordinal == 0 { 1 } else { 2 })?;
+        out.identifier(&dependency.schema)?;
+        out.identifier(&dependency.name)?;
+        out.u32(dependency.oid)?;
+        out.digest(&dependency.schema_digest)?;
+    }
+    Ok(())
+}
+
+pub(super) fn append_decoded_domains(
+    out: &mut Writer,
+    domains: &[DecodedDomain],
+) -> Result<(), EngineError> {
+    out.u32(checked_u32(domains.len(), "domain count")?)?;
+    for (ordinal, domain) in domains.iter().enumerate() {
+        out.u32(checked_u32(ordinal, "domain ordinal")?)?;
+        out.identifier(&domain.schema)?;
+        out.identifier(&domain.name)?;
+        out.u32(domain.oid)?;
+        append_sql_type(out, domain.base_type)?;
+    }
+    Ok(())
+}
+
+pub(super) fn append_decoded_indexes(
+    out: &mut Writer,
+    indexes: &[DecodedIndex],
+) -> Result<(), EngineError> {
+    out.u32(checked_u32(indexes.len(), "index count")?)?;
+    for index in indexes {
+        append_decoded_index(out, index)?;
+    }
+    Ok(())
+}
+
+fn append_decoded_index(out: &mut Writer, index: &DecodedIndex) -> Result<(), EngineError> {
+    out.u32(index.owner_dependency_ordinal)?;
+    out.u32(index.raw_ordinal)?;
+    out.u32(index.oid)?;
+    out.identifier(&index.name)?;
+    out.identifier(&index.table_name)?;
+    out.identifier(&index.first_column_name)?;
+    out.bool(index.unique)?;
+    out.bool(index.primary_key)?;
+    out.bool(index.unique_constraint)?;
+    out.u32(checked_u32(index.key_columns.len(), "index key count")?)?;
+    for column in &index.key_columns {
+        append_decoded_catalog_column(out, column)?;
+    }
+    Ok(())
+}
+
+pub(super) fn append_decoded_foreign_keys(
+    out: &mut Writer,
+    foreign_keys: &[DecodedForeignKey],
+) -> Result<(), EngineError> {
+    out.u32(checked_u32(foreign_keys.len(), "foreign-key count")?)?;
+    for foreign_key in foreign_keys {
+        out.u32(foreign_key.raw_ordinal)?;
+        out.identifier(&foreign_key.name)?;
+        out.identifier(&foreign_key.child_column_name)?;
+        out.identifier(&foreign_key.referenced_table_name)?;
+        out.identifier(&foreign_key.referenced_column_name)?;
+        append_decoded_catalog_column(out, &foreign_key.child_column)?;
+        out.u32(foreign_key.parent_dependency_ordinal)?;
+        append_decoded_catalog_column(out, &foreign_key.parent_column)?;
+        append_decoded_index(out, &foreign_key.supporting_index)?;
+    }
+    Ok(())
+}
+
+fn append_decoded_catalog_column(
+    out: &mut Writer,
+    column: &DecodedCatalogColumn,
+) -> Result<(), EngineError> {
+    out.u32(column.dependency_ordinal)?;
+    out.u32(column.catalog_column_ordinal)?;
+    out.u32(column.column_id)?;
+    out.i16(column.attnum)?;
+    out.identifier(&column.name)?;
+    append_sql_type(out, column.ty)?;
+    out.u32(column.type_oid)?;
+    out.i16(column.type_size)
+}
+
 pub(super) fn append_decoded_intent_columns(
     out: &mut Writer,
     columns: &[DecodedColumn],
     rows: u32,
-    sequence_cells: &BTreeSet<(u32, u32)>,
+    effects: &[DecodedEffect],
 ) -> Result<(), EngineError> {
     out.u32(checked_u32(columns.len(), "decoded intent column count")?)?;
     for column in columns {
@@ -251,7 +356,10 @@ pub(super) fn append_decoded_intent_columns(
             let state = column.states[row];
             append_input_state(out, state)?;
             append_input_provenance(out, column.provenance[row])?;
-            let sequence = sequence_cells.contains(&(column.ordinal, row as u32));
+            let sequence = effects.iter().any(|effect| {
+                effect.request.catalog_column_ordinal == column.ordinal
+                    && effect.request.row_ordinal == row as u32
+            });
             match state {
                 TypedInsertInputState::Provided => {
                     out.u8(2)?;

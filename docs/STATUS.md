@@ -235,6 +235,39 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   device, residency, or read path changed, so correctness suites, GPU/HAZARD, recovery, quick card, and full card
   are not applicable. WRITE-001 remains active; normative S4/S7 implementation is the next PLAN checkpoint.
 
+## WRITE-001 inert semantics-v2 quarantine prerequisite accepted — 2026-07-30
+
+- Aggregate semantic-version dispatch now occurs before semantics-v1 scalar validation. The only writer remains
+  hardwired to semantics v1, the historical source owner is explicitly named `semantics_v1_scaffold`, and a
+  literal full-body golden locks every accepted v1 fragment byte. Canonical-v1 and shared-image decoding now
+  measure borrowed sources, reserve every persistent owner and maximum concurrent scratch exactly, revalidate the
+  measured source before copying, and drain failed reservations so the same input can retry.
+- The private semantics-v2 path performs allocation-free pass zero over the original codec-5 chunks, validates the
+  exact fixed S7 header and all 14 directory geometries, measures nested S2 and typed-image sources without
+  retaining raw bodies, and fills one move-only `QuarantinedSemanticsV2` owner only after all exact reservations
+  succeed. Source fingerprints reject same-length content drift; injected copy/allocation failures drain cleanly.
+  The first pinned minimal final-abort vector binds the actual fixed S2 target, schema, and logical `RETURNING`
+  layout, and coherent dependency-token-root sabotage rejects after source proof.
+- Catalog/allocator and sealed generation-validation owners are production-compiled scaffolds, but this checkpoint
+  deliberately provides no sealed generation-builder implementation, no constructible fully witness-validated
+  state, no test reencoder, and no WAL/recovery/apply/device/result/publication caller. Complete final-row,
+  table-transition, overlay, index-effect/manifest, logical-`RETURNING`, and generation-root closure plus the other
+  two normative goldens remain with the next WRITE-001 checkpoint; this prerequisite is not the complete S4/S7
+  implementation.
+- The first independent audit rejected a hand-written canonical-v1 decoder registry that missed cross-kind object
+  OIDs, complete class-name pairs, unindexed target/external global column IDs, compatible unnamed external
+  domains, and strict target `attnum` order. The repaired allocation-free all-pairs authority and coherently
+  rehashed matrix close every finding. A re-audit then rejected a masked column-ID sabotage; the final one-FK,
+  no-target-index case reaches the intended global-column diagnostic. Final independent re-audit returned
+  **ACCEPT** on exact staged tree `166a1a1aba92e5854836d63a6946d2777ef61ba5`, cached-diff SHA-256
+  `896c2aa60d8dc7d5d182996f1b6e444b70b2635d530506fb76f93628506648f4`, and **41 staged source paths**.
+- Exact-candidate gates pass semantics v2 **9/9**, typed image **10/10**, canonical v1 **38/38**, aggregate
+  **58/58**, and the full serial engine library **1,103 passed / 667 GPU-required ignored / 0 failed**, plus strict
+  Clippy for library and tests, scoped rustfmt, cached-diff checks, frozen-design hash, source ownership, and
+  inertness guards. GPU NULL differential, HAZARD, recovery, quick card, and full card are inapplicable because the
+  accepted slice is host-only, cannot construct an executable witness state, and cannot reach a device or live
+  mutation path.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted
