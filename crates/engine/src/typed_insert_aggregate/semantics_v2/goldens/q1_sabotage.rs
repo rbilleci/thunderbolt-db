@@ -313,6 +313,86 @@ fn rehash_published_sequence_token(s5: &[u8], s7: &mut [u8], dependency_ref: usi
     s7[token + 192..token + 224].copy_from_slice(&digest);
 }
 
+fn rehash_constraint_token(s7: &mut [u8], dependency_ref: usize) {
+    let dependencies = directory(s7, 3);
+    let tables = directory(s7, 0);
+    let token = dependencies + dependency_ref * 224;
+    assert!(
+        matches!(s7[token + 4], 9..=11),
+        "Q2 hostile token is a static catalog guard"
+    );
+    let table_ref = u32_at(s7, token + 20) as usize;
+    let table = tables + table_ref * 384;
+    let identity = exact(
+        b"gpu-db/write001/s7-constraint-object/v2",
+        &[
+            &s7[token + 4..token + 5],
+            &s7[token + 8..token + 16],
+            &s7[token + 16..token + 20],
+            &s7[table + 8..table + 16],
+            &s7[token + 48..token + 56],
+            &s7[token + 24..token + 32],
+            &s7[token + 64..token + 96],
+            &s7[token + 96..token + 128],
+            &s7[token + 128..token + 160],
+        ],
+    );
+    s7[token + 160..token + 192].copy_from_slice(&identity);
+    let digest = exact(
+        b"gpu-db/write001/s7-dependency-token/v2",
+        &[&s7[token..token + 192], &[0; 32], &[0; 32], &[0; 32]],
+    );
+    s7[token + 192..token + 224].copy_from_slice(&digest);
+}
+
+/// A coherent Q1-valid substitution which swaps the two table-local static NOT NULL guard
+/// tokens. The pinned catalog remains unchanged and must reject this at Q2 guard closure.
+pub(super) fn q2_owner_swapped_guard_fixture() -> q1_vectors::Q1Fixture {
+    let base = q1_vectors::successful_a_b_a_fixture();
+    let mut sections = base.sections.clone();
+    let s7 = &mut sections[6];
+    let dependencies = directory(s7, 3);
+    let uses = directory(s7, 4);
+    let parent = dependencies + 14 * 224;
+    let child = dependencies + 15 * 224;
+    assert_eq!(s7[parent + 4], 9, "Q2 parent guard is NOT NULL");
+    assert_eq!(s7[child + 4], 9, "Q2 child guard is NOT NULL");
+    assert_eq!(u32_at(s7, parent + 20), 0, "Q2 parent guard target");
+    assert_eq!(u32_at(s7, child + 20), 1, "Q2 child guard target");
+
+    s7[parent + 20..parent + 24].copy_from_slice(&1_u32.to_le_bytes());
+    s7[child + 20..child + 24].copy_from_slice(&0_u32.to_le_bytes());
+    let parent_name: [u8; 32] = s7[parent + 128..parent + 160]
+        .try_into()
+        .expect("Q2 parent guard name");
+    let child_name: [u8; 32] = s7[child + 128..child + 160]
+        .try_into()
+        .expect("Q2 child guard name");
+    s7[parent + 128..parent + 160].copy_from_slice(&child_name);
+    s7[child + 128..child + 160].copy_from_slice(&parent_name);
+    rehash_constraint_token(s7, 14);
+    rehash_constraint_token(s7, 15);
+
+    for ordinal in 0..u32_at(s7, 56) as usize {
+        let usage = uses + ordinal * 32;
+        if u16::from_le_bytes(
+            s7[usage + 8..usage + 10]
+                .try_into()
+                .expect("Q2 guard use role"),
+        ) == 9
+        {
+            let dependency_ref = u32_at(s7, usage + 4);
+            if dependency_ref == 14 {
+                s7[usage + 4..usage + 8].copy_from_slice(&15_u32.to_le_bytes());
+            } else if dependency_ref == 15 {
+                s7[usage + 4..usage + 8].copy_from_slice(&14_u32.to_le_bytes());
+            }
+        }
+    }
+    rehash_overlay_chain(&mut sections);
+    reframed(&base, sections)
+}
+
 fn s5_offset(s5: &[u8], ordinal: usize) -> usize {
     let mut offset = 0;
     for _ in 0..ordinal {

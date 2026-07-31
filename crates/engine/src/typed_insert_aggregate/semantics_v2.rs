@@ -132,6 +132,19 @@ fn close_canonical_semantics_v2_for_test<'a>(
     Ok(())
 }
 
+/// Test-only catalog-guard continuation.  It consumes the actual codec-closed owner through the
+/// one guard-validation leaf and returns no retained state or generation-pending capability.
+#[cfg(test)]
+fn validate_canonical_semantics_v2_guards_for_test<'a>(
+    outer: &gpu_db_wal::CanonicalPreApplyHeader,
+    outcome: &gpu_db_wal::CanonicalOutcome,
+    fragments: &[gpu_db_wal::CanonicalFragmentRef<'a>],
+    catalog: &retained::SemanticsV2CatalogWitness<'_>,
+) -> Result<(), EngineError> {
+    fill_canonical_semantics_v2_for_test(outer, outcome, fragments)?
+        .validate_guards_after_codec_for_test(catalog)
+}
+
 #[cfg(test)]
 fn fail_retained_source_copy_at_for_test<T>(attempt: u64, operation: impl FnOnce() -> T) -> T {
     retained::fail_source_copy_at_for_test(attempt, operation)

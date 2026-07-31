@@ -2,10 +2,17 @@
 
 use super::super::{
     graph::{ReservedSemanticsV2Graph, RetainedDependencyToken, RetainedTable},
-    SemanticsV2BoundIdentity, SemanticsV2CatalogForeignKeyWitness, SemanticsV2CatalogGuardWitness,
-    SemanticsV2CatalogTableWitness, SemanticsV2CatalogWitness,
+    SemanticsV2BoundIdentity, SemanticsV2CatalogDomainWitness, SemanticsV2CatalogForeignKeyWitness,
+    SemanticsV2CatalogGuardWitness, SemanticsV2CatalogTableWitness, SemanticsV2CatalogWitness,
 };
 use crate::typed_insert_batch::DecodedForeignKeyFacts;
+
+const ABSENT_U32: u32 = u32::MAX;
+const TERMINAL_ERROR_FLAG: u16 = 2;
+
+#[cfg(test)]
+#[path = "guards_tests.rs"]
+mod guards_tests;
 
 pub(super) fn validate_guard_order(
     rows: &[SemanticsV2CatalogGuardWitness<'_>],
@@ -24,7 +31,9 @@ pub(super) fn validate_guard_order(
         )?;
         if row.synthesized_not_null {
             super::require(
-                row.display_oid == 0
+                row.display_oid <= 0x7fff_ffff
+                    && row.schema.is_empty()
+                    && row.name.is_empty()
                     && matches!(
                         row.kind,
                         super::NOT_NULL_GUARD | super::DOMAIN_CONSTRAINT_GUARD
@@ -108,7 +117,9 @@ pub(super) fn validate_guard_closure(
             "S7 guard dependency does not select exactly one pinned catalog guard",
         )?;
     }
-    validate_guard_nested_membership(catalog)
+    validate_guard_nested_membership(catalog)?;
+    validate_statement_guard_bijections(identity, graph, catalog)?;
+    validate_terminal_catalog_identity(identity, graph, catalog)
 }
 
 fn guard_matches_dependency(
@@ -261,6 +272,518 @@ fn validate_guard_nested_membership(
         )?;
     }
     Ok(())
+}
+
+/// Build the expected static guard inventory directly from one resolved target table and its S2
+/// record, then close it bijectively against roles 9--11 in that resolution's bounded use range.
+/// No map or temporary inventory is materialized: every expected guard is checked in place and
+/// the aggregate actual-use count proves there are no extras.
+fn validate_statement_guard_bijections(
+    identity: SemanticsV2BoundIdentity,
+    graph: &ReservedSemanticsV2Graph,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+) -> Result<(), crate::EngineError> {
+    for resolution in &graph.resolutions {
+        let (retained, target) = target_for_resolution(graph, catalog, resolution)?;
+        let record = graph
+            .records
+            .get(usize::try_from(resolution.record_ref).map_err(|_| {
+                super::validation_error("guard resolution record reference is unaddressable")
+            })?)
+            .ok_or_else(|| super::validation_error("guard resolution record is absent"))?;
+        let uses = resolution_uses(graph, resolution)?;
+        super::require(
+            uses.iter()
+                .all(|usage| usage.statement_ordinal == resolution.statement_ordinal),
+            "guard resolution use range crosses a statement boundary",
+        )?;
+
+        let mut expected_count = 0_usize;
+        for guard in target.not_null_guards {
+            validate_table_not_null_expected(target, record, guard)?;
+            require_exact_expected_guard_use(identity, graph, resolution, uses, guard)?;
+            expected_count = expected_count.checked_add(1).ok_or_else(|| {
+                super::validation_error("expected NOT NULL guard count overflows")
+            })?;
+        }
+        for (raw_ordinal, guard) in target.check_guards.iter().enumerate() {
+            validate_table_check_expected(target, guard, raw_ordinal)?;
+            require_exact_expected_guard_use(identity, graph, resolution, uses, guard)?;
+            expected_count = expected_count
+                .checked_add(1)
+                .ok_or_else(|| super::validation_error("expected CHECK guard count overflows"))?;
+        }
+        for (domain_ordinal, domain) in catalog.domains.iter().enumerate() {
+            let Some(_source) = bound_domain_source(record, target, domain)? else {
+                continue;
+            };
+            for (raw_ordinal, guard) in domain.constraints.iter().enumerate() {
+                validate_domain_guard_expected(domain, guard, domain_ordinal, raw_ordinal)?;
+                require_exact_expected_guard_use(identity, graph, resolution, uses, guard)?;
+                expected_count = expected_count.checked_add(1).ok_or_else(|| {
+                    super::validation_error("expected domain guard count overflows")
+                })?;
+            }
+        }
+
+        let actual_count = uses
+            .iter()
+            .filter(|usage| matches!(usage.role, 9..=11))
+            .count();
+        super::require(
+            actual_count == expected_count,
+            "statement guard uses have an extra, missing, or cross-owner entry",
+        )?;
+        let _ = retained;
+    }
+    Ok(())
+}
+
+fn target_for_resolution<'a, 'b>(
+    graph: &'a ReservedSemanticsV2Graph,
+    catalog: &'b SemanticsV2CatalogWitness<'b>,
+    resolution: &super::super::graph::RetainedStatementResolution,
+) -> Result<(&'a RetainedTable, &'b SemanticsV2CatalogTableWitness<'b>), crate::EngineError> {
+    let mut retained_rows = graph
+        .tables
+        .iter()
+        .filter(|table| table.table_ref == resolution.table_ref);
+    let retained = retained_rows
+        .next()
+        .ok_or_else(|| super::validation_error("guard resolution target table is absent"))?;
+    super::require(
+        retained_rows.next().is_none(),
+        "guard resolution target table reference is ambiguous",
+    )?;
+    let mut catalog_rows = catalog.tables.iter().filter(|table| {
+        table.stable_table_id == retained.stable_table_id
+            && table.display_oid == retained.display_oid
+    });
+    let target = catalog_rows.next().ok_or_else(|| {
+        super::validation_error("guard resolution target catalog table is absent")
+    })?;
+    super::require(
+        catalog_rows.next().is_none(),
+        "guard resolution target catalog table is ambiguous",
+    )?;
+    Ok((retained, target))
+}
+
+fn resolution_uses<'a>(
+    graph: &'a ReservedSemanticsV2Graph,
+    resolution: &super::super::graph::RetainedStatementResolution,
+) -> Result<&'a [super::super::graph::RetainedStatementDependencyUse], crate::EngineError> {
+    let start = usize::try_from(resolution.dependency_use_start)
+        .map_err(|_| super::validation_error("guard use range start is unaddressable"))?;
+    let count = usize::try_from(resolution.dependency_use_count)
+        .map_err(|_| super::validation_error("guard use range count is unaddressable"))?;
+    let end = start
+        .checked_add(count)
+        .ok_or_else(|| super::validation_error("guard use range overflows"))?;
+    graph
+        .dependency_uses
+        .get(start..end)
+        .ok_or_else(|| super::validation_error("guard use range exceeds retained graph"))
+}
+
+fn validate_table_not_null_expected(
+    target: &SemanticsV2CatalogTableWitness<'_>,
+    record: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+    guard: &SemanticsV2CatalogGuardWitness<'_>,
+) -> Result<(), crate::EngineError> {
+    let source = record
+        .catalog_columns()
+        .find(|column| column.catalog_column_ordinal == guard.owner_catalog_column_ordinal)
+        .ok_or_else(|| super::validation_error("NOT NULL guard has no S2 target column"))?;
+    let column = target
+        .catalog_columns
+        .iter()
+        .find(|column| column.catalog_column_ordinal == guard.owner_catalog_column_ordinal)
+        .ok_or_else(|| super::validation_error("NOT NULL guard owner column is not pinned"))?;
+    super::require(
+        guard.kind == super::NOT_NULL_GUARD
+            && guard.owner_kind == 1
+            && guard.owner_stable_id == target.stable_table_id
+            && guard.owner_display_oid == target.display_oid
+            && guard.source_ordinal == guard.owner_catalog_column_ordinal
+            && guard.raw_constraint_ordinal == 0
+            && guard.domain_ordinal == ABSENT_U32
+            && guard.synthesized_not_null
+            && guard.shape_digest == column.column_shape_digest
+            && guard.program_or_descriptor_root == column.column_root
+            && super::catalog_column_matches_source(column, source),
+        "NOT NULL guard does not exactly bind its target owner and S2 column",
+    )
+}
+
+fn validate_table_check_expected(
+    target: &SemanticsV2CatalogTableWitness<'_>,
+    guard: &SemanticsV2CatalogGuardWitness<'_>,
+    raw_ordinal: usize,
+) -> Result<(), crate::EngineError> {
+    let raw_ordinal = u32::try_from(raw_ordinal)
+        .map_err(|_| super::validation_error("CHECK guard ordinal exceeds canonical domain"))?;
+    super::require(
+        guard.kind == super::CHECK_GUARD
+            && guard.owner_kind == 1
+            && guard.owner_stable_id == target.stable_table_id
+            && guard.owner_display_oid == target.display_oid
+            && !guard.synthesized_not_null
+            && guard.owner_catalog_column_ordinal == ABSENT_U32
+            && guard.domain_ordinal == ABSENT_U32
+            && guard.raw_constraint_ordinal == raw_ordinal
+            && guard.source_ordinal == raw_ordinal,
+        "CHECK guard does not exactly bind its target owner and raw ordinal",
+    )
+}
+
+fn bound_domain_source<'a>(
+    record: &'a crate::typed_insert_batch::DecodedTypedInsertRecord,
+    target: &SemanticsV2CatalogTableWitness<'_>,
+    domain: &SemanticsV2CatalogDomainWitness<'_>,
+) -> Result<Option<crate::typed_insert_batch::DecodedDomainFacts<'a>>, crate::EngineError> {
+    let mut matches = record.domains().filter(|source| {
+        source.oid == domain.display_oid
+            && source.schema == domain.schema
+            && source.name == domain.name
+            && super::storage_bytes(source.base_type) == domain.storage
+            && source.base_type.postgres_oid() == domain.declared_type_oid
+            && source.base_type.type_size() == domain.signed_type_size
+    });
+    let Some(source) = matches.next() else {
+        return Ok(None);
+    };
+    super::require(
+        matches.next().is_none()
+            && record.catalog_columns().any(|column| {
+                column.domain_ordinal == Some(source.ordinal)
+                    && target.catalog_columns.iter().any(|catalog_column| {
+                        super::catalog_column_matches_source(catalog_column, column)
+                    })
+            }),
+        "pinned domain is ambiguous or not bound by an exact target S2/catalog column",
+    )?;
+    Ok(Some(source))
+}
+
+fn validate_domain_guard_expected(
+    domain: &SemanticsV2CatalogDomainWitness<'_>,
+    guard: &SemanticsV2CatalogGuardWitness<'_>,
+    domain_ordinal: usize,
+    raw_ordinal: usize,
+) -> Result<(), crate::EngineError> {
+    let domain_ordinal = u32::try_from(domain_ordinal)
+        .map_err(|_| super::validation_error("catalog domain ordinal exceeds canonical domain"))?;
+    let raw_ordinal = u32::try_from(raw_ordinal)
+        .map_err(|_| super::validation_error("domain guard ordinal exceeds canonical domain"))?;
+    super::require(
+        guard.kind == super::DOMAIN_CONSTRAINT_GUARD
+            && guard.owner_kind == 2
+            && guard.owner_stable_id == domain.stable_domain_id
+            && guard.owner_display_oid == domain.display_oid
+            && guard.owner_catalog_column_ordinal == ABSENT_U32
+            && guard.domain_ordinal == domain_ordinal
+            && guard.raw_constraint_ordinal == raw_ordinal
+            && guard.source_ordinal == raw_ordinal,
+        "domain guard does not exactly bind its pinned domain and raw ordinal",
+    )
+}
+
+fn require_exact_expected_guard_use(
+    identity: SemanticsV2BoundIdentity,
+    graph: &ReservedSemanticsV2Graph,
+    resolution: &super::super::graph::RetainedStatementResolution,
+    uses: &[super::super::graph::RetainedStatementDependencyUse],
+    guard: &SemanticsV2CatalogGuardWitness<'_>,
+) -> Result<(), crate::EngineError> {
+    let mut count = 0_u32;
+    for usage in uses.iter().filter(|usage| {
+        usage.role == u16::from(guard.kind) && usage.source_ordinal == guard.source_ordinal
+    }) {
+        let token = graph
+            .dependencies
+            .get(usize::try_from(usage.dependency_ref).map_err(|_| {
+                super::validation_error("guard use dependency reference is unaddressable")
+            })?)
+            .ok_or_else(|| super::validation_error("guard use dependency is absent"))?;
+        if guard_matches_dependency(identity, guard, token)
+            && token.target_table_ref == resolution.table_ref
+        {
+            super::require(
+                if token.flags & TERMINAL_ERROR_FLAG != 0 {
+                    resolution.terminal_dependency_ref == token.dependency_ref
+                        && resolution.terminal_source_ordinal == guard.source_ordinal
+                } else {
+                    resolution.terminal_dependency_ref != token.dependency_ref
+                },
+                "terminal guard use does not replace its exact ordinary guard use",
+            )?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| super::validation_error("expected guard-use count overflows"))?;
+        }
+    }
+    super::require(
+        count == 1,
+        "expected catalog guard does not have exactly one statement use",
+    )
+}
+
+fn validate_terminal_catalog_identity(
+    identity: SemanticsV2BoundIdentity,
+    graph: &ReservedSemanticsV2Graph,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+) -> Result<(), crate::EngineError> {
+    for resolution in &graph.resolutions {
+        let outcome = graph
+            .outcomes
+            .get(usize::try_from(resolution.outcome_ref).map_err(|_| {
+                super::validation_error("terminal resolution outcome reference is unaddressable")
+            })?)
+            .ok_or_else(|| super::validation_error("terminal resolution outcome is absent"))?;
+        if outcome.outcome.kind != gpu_db_wal::CanonicalOutcomeKind::AbortError {
+            continue;
+        }
+        let (_, target) = target_for_resolution(graph, catalog, resolution)?;
+        let record = graph
+            .records
+            .get(usize::try_from(resolution.record_ref).map_err(|_| {
+                super::validation_error("terminal resolution record reference is unaddressable")
+            })?)
+            .ok_or_else(|| super::validation_error("terminal resolution record is absent"))?;
+        let token = graph
+            .dependencies
+            .get(
+                usize::try_from(resolution.terminal_dependency_ref).map_err(|_| {
+                    super::validation_error("terminal dependency reference is unaddressable")
+                })?,
+            )
+            .ok_or_else(|| super::validation_error("terminal dependency is absent"))?;
+        let uses = resolution_uses(graph, resolution)?;
+        super::require(
+            token.flags & TERMINAL_ERROR_FLAG != 0
+                && terminal_use_count(uses, resolution, token) == 1
+                && token.target_table_ref == resolution.table_ref,
+            "terminal token does not have one exact terminal statement use",
+        )?;
+        match token.kind {
+            super::NOT_NULL_GUARD | super::CHECK_GUARD | super::DOMAIN_CONSTRAINT_GUARD => {
+                validate_terminal_catalog_guard(identity, catalog, token, outcome)?;
+            }
+            super::UNIQUE_KEY_GUARD => {
+                validate_terminal_unique(
+                    graph, record, target, catalog, token, resolution, outcome,
+                )?;
+            }
+            super::FOREIGN_KEY_GUARD => {
+                validate_terminal_foreign_key(
+                    graph, record, target, catalog, token, resolution, outcome,
+                )?;
+            }
+            _ => {
+                return Err(super::validation_error(
+                    "terminal token kind is not a catalog guard",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn terminal_use_count(
+    uses: &[super::super::graph::RetainedStatementDependencyUse],
+    resolution: &super::super::graph::RetainedStatementResolution,
+    token: &RetainedDependencyToken,
+) -> usize {
+    uses.iter()
+        .filter(|usage| {
+            usage.dependency_ref == token.dependency_ref
+                && usage.role == u16::from(token.kind)
+                && usage.source_ordinal == resolution.terminal_source_ordinal
+        })
+        .count()
+}
+
+fn validate_terminal_catalog_guard(
+    identity: SemanticsV2BoundIdentity,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+    token: &RetainedDependencyToken,
+    outcome: &super::super::graph::RetainedStatementOutcome,
+) -> Result<(), crate::EngineError> {
+    let mut guards = catalog
+        .guards
+        .iter()
+        .filter(|guard| guard_matches_dependency(identity, guard, token));
+    let guard = guards
+        .next()
+        .ok_or_else(|| super::validation_error("terminal token has no pinned catalog guard"))?;
+    super::require(
+        guards.next().is_none(),
+        "terminal token selects an ambiguous pinned catalog guard",
+    )?;
+    let expected_sqlstate = match guard.kind {
+        super::NOT_NULL_GUARD => *b"23502",
+        super::CHECK_GUARD => *b"23514",
+        super::DOMAIN_CONSTRAINT_GUARD if guard.synthesized_not_null => *b"23502",
+        super::DOMAIN_CONSTRAINT_GUARD => *b"23514",
+        _ => {
+            return Err(super::validation_error(
+                "terminal catalog guard kind is invalid",
+            ))
+        }
+    };
+    super::require(
+        outcome.outcome.sqlstate == Some(expected_sqlstate)
+            && outcome.outcome.constraint_id == guard.stable_guard_id,
+        "terminal catalog guard SQLSTATE or stable constraint identity is invalid",
+    )
+}
+
+fn validate_terminal_unique(
+    graph: &ReservedSemanticsV2Graph,
+    record: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+    target: &SemanticsV2CatalogTableWitness<'_>,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+    token: &RetainedDependencyToken,
+    resolution: &super::super::graph::RetainedStatementResolution,
+    outcome: &super::super::graph::RetainedStatementOutcome,
+) -> Result<(), crate::EngineError> {
+    let source = record
+        .indexes()
+        .find(|index| index.raw_ordinal == resolution.terminal_source_ordinal)
+        .ok_or_else(|| super::validation_error("terminal unique source index is absent"))?;
+    let descriptor = graph
+        .indexes
+        .get(usize::try_from(token.descriptor_ref).map_err(|_| {
+            super::validation_error("terminal unique descriptor reference is unaddressable")
+        })?)
+        .ok_or_else(|| super::validation_error("terminal unique descriptor is absent"))?;
+    let mut matches = catalog.indexes.iter().filter(|index| {
+        index.stable_index_id == descriptor.stable_index_id
+            && index.display_oid == descriptor.display_oid
+            && index.owner_stable_table_id == target.stable_table_id
+            && index.owner_display_oid == target.display_oid
+            && index.raw_catalog_ordinal == source.raw_ordinal
+            && super::catalog_index_matches_s2(index, source)
+    });
+    let index = matches.next().ok_or_else(|| {
+        super::validation_error("terminal unique index is absent from pinned catalog")
+    })?;
+    super::require(
+        matches.next().is_none()
+            && descriptor.raw_catalog_ordinal == source.raw_ordinal
+            && descriptor.owner_stable_table_id == target.stable_table_id
+            && descriptor.owner_display_oid == target.display_oid
+            && token_matches_pinned_index(token, descriptor, index)?
+            && index_constraint_matches_descriptor(index, descriptor)?
+            && outcome.outcome.sqlstate == Some(*b"23505")
+            && outcome.outcome.constraint_id == terminal_unique_constraint_id(index),
+        "terminal unique source, descriptor, or stable constraint identity is invalid",
+    )
+}
+
+fn validate_terminal_foreign_key(
+    graph: &ReservedSemanticsV2Graph,
+    record: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+    target: &SemanticsV2CatalogTableWitness<'_>,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+    token: &RetainedDependencyToken,
+    resolution: &super::super::graph::RetainedStatementResolution,
+    outcome: &super::super::graph::RetainedStatementOutcome,
+) -> Result<(), crate::EngineError> {
+    let source = record
+        .foreign_keys()
+        .find(|foreign_key| foreign_key.raw_ordinal == resolution.terminal_source_ordinal)
+        .ok_or_else(|| super::validation_error("terminal foreign-key source is absent"))?;
+    let mut matches = target.foreign_keys.iter().filter(|foreign_key| {
+        foreign_key.raw_foreign_key_ordinal == source.raw_ordinal
+            && foreign_key.schema == target.schema
+            && foreign_key.name == source.name
+    });
+    let foreign_key = matches.next().ok_or_else(|| {
+        super::validation_error("terminal foreign key is absent from target catalog")
+    })?;
+    let descriptor = graph
+        .indexes
+        .get(usize::try_from(token.descriptor_ref).map_err(|_| {
+            super::validation_error("terminal foreign-key descriptor reference is unaddressable")
+        })?)
+        .ok_or_else(|| super::validation_error("terminal foreign-key descriptor is absent"))?;
+    let mut supporting_indexes = catalog.indexes.iter().filter(|index| {
+        index.stable_index_id == foreign_key.supporting_stable_index_id
+            && index.owner_stable_table_id == foreign_key.parent_stable_table_id
+            && index.owner_display_oid == foreign_key.parent_display_oid
+            && super::catalog_index_matches_s2(index, source.supporting_index)
+    });
+    let supporting_index = supporting_indexes.next().ok_or_else(|| {
+        super::validation_error(
+            "terminal foreign-key supporting index is absent from pinned catalog",
+        )
+    })?;
+    super::require(
+        supporting_indexes.next().is_none()
+            && token_matches_pinned_index(token, descriptor, supporting_index)?
+            && matches.next().is_none()
+            && descriptor.raw_catalog_ordinal == source.supporting_index.raw_ordinal
+            && descriptor.owner_stable_table_id == foreign_key.parent_stable_table_id
+            && descriptor.owner_display_oid == foreign_key.parent_display_oid
+            && outcome.outcome.sqlstate == Some(*b"23503")
+            && outcome.outcome.constraint_id == foreign_key.stable_constraint_id,
+        "terminal foreign key source, supporting index, or stable constraint identity is invalid",
+    )
+}
+
+fn token_matches_pinned_index(
+    token: &RetainedDependencyToken,
+    descriptor: &super::super::graph::RetainedIndexDescriptor,
+    index: &super::super::SemanticsV2CatalogIndexWitness<'_>,
+) -> Result<bool, crate::EngineError> {
+    Ok(token.descriptor_ref == descriptor.index_ref
+        && token.stable_object_id == index.stable_index_id
+        && token.display_oid == index.display_oid
+        && token.catalog_epoch == index.catalog_epoch
+        && token.base_generation == index.base_generation
+        && token.schema_digest == index.schema_digest
+        && token.base_root == index.base_root
+        && token.name_digest == super::qualified_name_digest(index.schema, index.name)?
+        && descriptor.stable_index_id == index.stable_index_id
+        && descriptor.display_oid == index.display_oid
+        && descriptor.catalog_epoch == index.catalog_epoch
+        && descriptor.base_index_generation == index.base_generation
+        && descriptor.owner_schema_digest == index.schema_digest
+        && descriptor.owner_name_digest
+            == super::qualified_name_digest(index.owner_schema, index.owner_name)?
+        && descriptor.base_index_root == index.base_root
+        && descriptor.index_name_digest == super::qualified_name_digest(index.schema, index.name)?)
+}
+
+fn index_constraint_matches_descriptor(
+    index: &super::super::SemanticsV2CatalogIndexWitness<'_>,
+    descriptor: &super::super::graph::RetainedIndexDescriptor,
+) -> Result<bool, crate::EngineError> {
+    if index.index_flags & 0b110 != 0 {
+        Ok(
+            descriptor.stable_constraint_id == index.constraint_stable_id
+                && descriptor.constraint_display_oid == index.constraint_display_oid
+                && descriptor.constraint_name_digest
+                    == super::qualified_name_digest(
+                        index.constraint_schema,
+                        index.constraint_name,
+                    )?,
+        )
+    } else {
+        Ok(descriptor.stable_constraint_id == u64::MAX
+            && descriptor.constraint_display_oid == 0
+            && descriptor.constraint_name_digest == [0; 32])
+    }
+}
+
+fn terminal_unique_constraint_id(index: &super::super::SemanticsV2CatalogIndexWitness<'_>) -> u64 {
+    if index.index_flags & 0b110 != 0 {
+        index.constraint_stable_id
+    } else {
+        index.stable_index_id
+    }
 }
 
 pub(super) fn validate_target_foreign_keys(

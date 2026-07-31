@@ -12,11 +12,13 @@
 mod q1_sabotage;
 #[path = "goldens/q1_vectors.rs"]
 mod q1_vectors;
+#[path = "goldens/q2_guard_sabotage.rs"]
+mod q2_guard_sabotage;
 
 use super::{
     close_canonical_semantics_v2_for_test, fail_retained_source_copy_at_for_test,
     fill_canonical_semantics_v2_for_test, measure_canonical_semantics_v2,
-    validate_dependency_token_digest_for_test,
+    validate_canonical_semantics_v2_guards_for_test, validate_dependency_token_digest_for_test,
 };
 use crate::typed_insert_aggregate::{
     encode_status_v2, TypedInsertStatusV2, AGGREGATE_CHUNK_FLAG_FIRST, AGGREGATE_CHUNK_FLAG_LAST,

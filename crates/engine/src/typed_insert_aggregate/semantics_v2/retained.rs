@@ -282,6 +282,17 @@ impl QuarantinedSemanticsV2 {
     pub(super) fn close_codec_for_test(self) -> Result<CodecClosedSemanticsV2, crate::EngineError> {
         self.close_codec()
     }
+
+    /// Test-only guard continuation.  It takes the sole existing codec-close bridge before the
+    /// catalog leaf, keeping the facade from gaining a second close transition spelling.
+    #[cfg(test)]
+    pub(super) fn validate_guards_after_codec_for_test(
+        self,
+        catalog: &SemanticsV2CatalogWitness<'_>,
+    ) -> Result<(), crate::EngineError> {
+        self.close_codec_for_test()?
+            .validate_guards_for_test(catalog)
+    }
 }
 
 impl CodecClosedSemanticsV2 {
@@ -313,6 +324,21 @@ impl CodecClosedSemanticsV2 {
         witness: SemanticsV2CatalogAllocatorWitness<'a>,
     ) -> Result<GenerationPendingSemanticsV2<'a>, crate::EngineError> {
         self.validate_catalog_and_allocator(witness)
+    }
+
+    /// Consume a codec-closed graph through only the catalog-guard witness leaf.  This is a
+    /// test seam for hostile evidence; it neither exposes retained state nor constructs a
+    /// generation-pending owner.
+    #[cfg(test)]
+    pub(super) fn validate_guards_for_test(
+        self,
+        catalog: &SemanticsV2CatalogWitness<'_>,
+    ) -> Result<(), crate::EngineError> {
+        catalog_validation::validate_guards_for_test(
+            self.graph.identity,
+            &self.graph.graph,
+            catalog,
+        )
     }
 }
 

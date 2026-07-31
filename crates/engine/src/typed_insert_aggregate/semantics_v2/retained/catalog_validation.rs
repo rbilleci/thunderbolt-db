@@ -59,6 +59,17 @@ pub(super) fn validate(
     validate_sequence_closure(identity, graph, &witness.catalog)
 }
 
+/// Test-only terminal leaf for hostile catalog-guard evidence.  It consumes the codec-closed
+/// graph without exposing it or permitting the generation-pending transition.
+#[cfg(test)]
+pub(super) fn validate_guards_for_test(
+    identity: SemanticsV2BoundIdentity,
+    graph: &ReservedSemanticsV2Graph,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+) -> Result<(), crate::EngineError> {
+    guards::validate_guard_closure(identity, graph, catalog)
+}
+
 pub(super) fn validate_durable_allocator_index_identity(
     identity: SemanticsV2BoundIdentity,
     proof: &SemanticsV2DurableAllocatorIndexProof<'_>,
