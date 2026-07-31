@@ -131,6 +131,49 @@ pub(crate) fn encode_canonical_typed_insert_record_for_test(
     canonical_codec::encode(batch)
 }
 
+/// Test-only canonical S2 reencoder for an already validated, move-only decoded record.
+///
+/// This deliberately accepts the retained decoder owner rather than a raw byte slice or a
+/// prepared batch.  It is only available to the inert semantics-v2 golden evidence and cannot
+/// become a production write carrier.
+#[cfg(test)]
+pub(crate) fn reencode_decoded_canonical_typed_insert_record_for_test(
+    record: &DecodedTypedInsertRecord,
+) -> Vec<u8> {
+    record.reencode()
+}
+
+/// Test-only byte reconstruction for an already decoded final-table image.  Keeping the view
+/// adaptation here prevents aggregate evidence from reaching into the typed-image codec's
+/// encoder input structs.
+#[cfg(test)]
+pub(crate) fn reencode_decoded_typed_image_for_test(
+    image: &DecodedTypedImage,
+) -> Result<Vec<u8>, EngineError> {
+    let facts = image.facts();
+    let columns: Vec<_> = image
+        .columns()
+        .map(|column| TypedImageColumnView {
+            catalog_column_ordinal: column.catalog_column_ordinal,
+            stable_column_id: column.stable_column_id,
+            table_ref: column.table_ref,
+            attnum: column.attnum,
+            ty: column.ty,
+            type_oid: column.type_oid,
+            type_size: column.type_size,
+            result_format: column.result_format,
+            name: column.name,
+            validity: column.validity,
+            values: column.values,
+        })
+        .collect();
+    encode_typed_image(&TypedImageView {
+        role: facts.role,
+        rows: facts.rows,
+        columns: &columns,
+    })
+}
+
 /// Test-only bridge to the canonical private sequence-chain fixture. The aggregate S5 tests use
 /// this exact existing codec fixture rather than inventing a second private-effect encoder.
 #[cfg(test)]

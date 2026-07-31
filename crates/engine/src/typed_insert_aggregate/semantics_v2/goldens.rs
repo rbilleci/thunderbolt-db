@@ -14,6 +14,10 @@ mod q1_sabotage;
 mod q1_vectors;
 #[path = "goldens/q2_guard_sabotage.rs"]
 mod q2_guard_sabotage;
+#[path = "goldens/q2_reencode.rs"]
+mod q2_reencode;
+#[path = "goldens/q2_witnesses.rs"]
+mod q2_witnesses;
 
 use super::{
     close_canonical_semantics_v2_for_test, fail_retained_source_copy_at_for_test,

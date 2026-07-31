@@ -16,6 +16,9 @@ mod fill;
 mod generation_validation;
 #[path = "retained/graph.rs"]
 mod graph;
+#[cfg(test)]
+#[path = "retained/reencode.rs"]
+mod reencode;
 #[path = "retained/reservation.rs"]
 mod reservation;
 
@@ -47,6 +50,36 @@ pub(super) struct SemanticsV2BoundIdentity {
 pub(super) struct SemanticsV2CatalogAllocatorWitness<'a> {
     pub(super) catalog: SemanticsV2CatalogWitness<'a>,
     allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'a>,
+}
+
+/// Literal test-fixture input for the closure-scoped durable allocator adapter below.  Keeping
+/// this wrapper at the retained boundary lets sibling golden fixtures provide only exact table
+/// intervals, while the authenticated index, active pin, selected records, and proof remain
+/// wholly inside `catalog_validation`.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) struct AllocatorLeaseSpecForTest {
+    pub(super) stable_allocator_id: u64,
+    pub(super) lease_start: u64,
+    pub(super) lease_end: u64,
+}
+
+/// Closed independent generation evidence cases accepted by the retained Q2 fixture facade.
+/// This is intentionally distinct from the private builder's enum so sibling golden tests never
+/// receive a builder, candidate, work owner, or module path.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Q2GoldenCase {
+    MinimalAbort,
+    ExplicitAbort,
+    SuccessfulInterleaved,
+}
+
+/// Closed hostile-output variants for the Q2 independent generation facade.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Q2GoldenSabotage {
+    FinalRoot,
 }
 
 #[allow(dead_code)]
@@ -229,6 +262,17 @@ pub(super) struct FullyWitnessValidatedSemanticsV2<C> {
     generation: generation_validation::OwnedGenerationResult<C>,
 }
 
+#[cfg(test)]
+impl<C> FullyWitnessValidatedSemanticsV2<C> {
+    /// Rebuild the canonical S1--S7 payloads only from a fully witness-validated owner.
+    ///
+    /// This is a private golden-evidence seam: it has no raw aggregate input, graph getter,
+    /// generation-result extractor, production compilation, or live write/recovery route.
+    pub(super) fn reencode_s1_s7_for_test(&self) -> Result<[Vec<u8>; 7], crate::EngineError> {
+        reencode::reencode_s1_s7_for_test(self)
+    }
+}
+
 struct CatalogAndAllocatorValidated<'a> {
     catalog: SemanticsV2CatalogWitness<'a>,
     allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'a>,
@@ -335,6 +379,105 @@ impl CodecClosedSemanticsV2 {
             &self.graph.graph,
             catalog,
         )
+    }
+}
+
+/// Consume an actual codec-closed owner through the one catalog/allocator transition while the
+/// test fixture's durable proof is still scoped to this call.  The callback receives only the
+/// resulting pending typestate; it cannot retain or construct a proof, inspect the graph, or
+/// spell another codec-close transition.
+#[cfg(test)]
+pub(super) fn with_catalog_allocator_pending_for_test<T>(
+    closed: CodecClosedSemanticsV2,
+    catalog: SemanticsV2CatalogWitness<'_>,
+    leases: &[AllocatorLeaseSpecForTest],
+    operation: impl FnOnce(GenerationPendingSemanticsV2<'_>) -> Result<T, crate::EngineError>,
+) -> Result<T, crate::EngineError> {
+    let identity = closed.graph.identity;
+    let authority_leases: Vec<_> = leases
+        .iter()
+        .map(|lease| catalog_validation::AllocatorLeaseSpecForTest {
+            stable_allocator_id: lease.stable_allocator_id,
+            lease_start: lease.lease_start,
+            lease_end: lease.lease_end,
+        })
+        .collect();
+    catalog_validation::with_allocator_proof_for_test(
+        identity,
+        &authority_leases,
+        |allocator_index| {
+            operation(closed.validate_catalog_and_allocator_for_test(
+                SemanticsV2CatalogAllocatorWitness {
+                    catalog,
+                    allocator_index,
+                },
+            )?)
+        },
+    )
+}
+
+/// Complete the Q2 test-only catalog, allocator, generation, and logical-reencoding chain.
+/// The fixture contributes only a real codec-closed owner, pinned catalog facts, exact allocator
+/// intervals, and a closed case tag.  The private builder/candidate/work types and the final
+/// validated owner never cross this retained facade.
+#[cfg(test)]
+pub(super) fn reencode_q2_golden_from_closed_for_test(
+    closed: CodecClosedSemanticsV2,
+    catalog: SemanticsV2CatalogWitness<'_>,
+    leases: &[AllocatorLeaseSpecForTest],
+    case: Q2GoldenCase,
+) -> Result<([Vec<u8>; 7], gpu_db_wal::CanonicalDigest), crate::EngineError> {
+    with_catalog_allocator_pending_for_test(closed, catalog, leases, |pending| {
+        generation_validation::golden_builder::validate_and_reencode_case(
+            pending,
+            golden_builder_case(case),
+        )
+    })
+}
+
+/// Drive the same closed Q2 fixture chain with an independently configured hostile generation
+/// output.  It returns no owner or reconstructed bytes, so a failed builder validation cannot
+/// become a side channel around the fully validated typestate.
+#[cfg(test)]
+pub(super) fn validate_q2_golden_sabotage_from_closed_for_test(
+    closed: CodecClosedSemanticsV2,
+    catalog: SemanticsV2CatalogWitness<'_>,
+    leases: &[AllocatorLeaseSpecForTest],
+    case: Q2GoldenCase,
+    sabotage: Q2GoldenSabotage,
+) -> Result<(), crate::EngineError> {
+    with_catalog_allocator_pending_for_test(closed, catalog, leases, |pending| {
+        generation_validation::golden_builder::validate_case_sabotage_result(
+            pending,
+            golden_builder_case(case),
+            golden_builder_sabotage(sabotage),
+        )
+    })
+}
+
+#[cfg(test)]
+fn golden_builder_case(case: Q2GoldenCase) -> generation_validation::golden_builder::GoldenCase {
+    match case {
+        Q2GoldenCase::MinimalAbort => {
+            generation_validation::golden_builder::GoldenCase::MinimalAbort
+        }
+        Q2GoldenCase::ExplicitAbort => {
+            generation_validation::golden_builder::GoldenCase::ExplicitAbort
+        }
+        Q2GoldenCase::SuccessfulInterleaved => {
+            generation_validation::golden_builder::GoldenCase::SuccessfulInterleaved
+        }
+    }
+}
+
+#[cfg(test)]
+fn golden_builder_sabotage(
+    sabotage: Q2GoldenSabotage,
+) -> generation_validation::golden_builder::GoldenBuilderSabotage {
+    match sabotage {
+        Q2GoldenSabotage::FinalRoot => {
+            generation_validation::golden_builder::GoldenBuilderSabotage::FinalRoot
+        }
     }
 }
 

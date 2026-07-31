@@ -41,7 +41,7 @@ fn rehash_table_roots(s7: &mut [u8]) {
     let table_at = directory(s7, 0);
     let transition_at = directory(s7, 7);
     let effect_at = directory(s7, 8);
-    for table_ref in 0..2 {
+    for table_ref in 0..u32_at(s7, 40) as usize {
         let table = table_at + table_ref * 384;
         let table_id = u64_at(s7, table + 8);
         let transitions = (u32_at(s7, table + 88)..u32_at(s7, table + 88) + u32_at(s7, table + 92))
@@ -81,7 +81,7 @@ fn rehash_table_manifests(s7: &mut [u8]) {
     let transition_at = directory(s7, 7);
     let effect_at = directory(s7, 8);
     let image_descriptor_at = directory(s7, 11);
-    for table_ref in 0..2 {
+    for table_ref in 0..u32_at(s7, 40) as usize {
         let table = table_at + table_ref * 384;
         let target = u32_at(s7, table + 20) as usize;
         let disposition_start = u32_at(s7, table + 80) as usize;
@@ -132,7 +132,7 @@ fn rehash_root_descriptor(s7: &mut [u8]) {
     hash.update(&s7[30..32]);
     hash.update(&s7[328..536]);
     hash.update(&s7[40..44]);
-    for table_ref in 0..2 {
+    for table_ref in 0..u32_at(s7, 40) as usize {
         let table = table_at + table_ref * 384;
         hash.update(&s7[table..table + 4]);
         hash.update(&s7[table + 8..table + 16]);
@@ -185,6 +185,39 @@ fn reframed(
     sections: [Vec<u8>; AGGREGATE_SECTION_COUNT],
 ) -> q1_vectors::Q1Fixture {
     reframed_with_request(base, sections, base.outer.request_digest)
+}
+
+fn reframed_explicit_abort(
+    base: &q1_vectors::Q1Fixture,
+    mut sections: [Vec<u8>; AGGREGATE_SECTION_COUNT],
+) -> q1_vectors::Q1Fixture {
+    let (root, payload, manifest, overlay) = {
+        let s7 = &mut sections[6];
+        let payload = rehash_payload(s7);
+        let table_at = directory(s7, 0);
+        (
+            s7[536..568].try_into().expect("Q1 root descriptor"),
+            payload,
+            s7[table_at + 352..table_at + 384]
+                .try_into()
+                .expect("Q1 explicit manifest"),
+            s7[504..536].try_into().expect("Q1 overlay"),
+        )
+    };
+    q1_vectors::finish_fixture(
+        sections,
+        base.outer.request_digest,
+        1,
+        2,
+        0,
+        2,
+        [2, 2, 0, 2, 1, 2, 1, 0],
+        base.outcome.clone(),
+        root,
+        payload,
+        manifest,
+        overlay,
+    )
 }
 
 fn reframed_with_request(
@@ -391,6 +424,114 @@ pub(super) fn q2_owner_swapped_guard_fixture() -> q1_vectors::Q1Fixture {
     }
     rehash_overlay_chain(&mut sections);
     reframed(&base, sections)
+}
+
+/// A coherent wire-level root substitution.  Every affected S7 digest is repaired so codec
+/// closure accepts it; Q2's unchanged independent builder must still reject the substituted
+/// final roots against its fixed output authority.
+pub(super) fn q2_repaired_root_substitution_fixture() -> q1_vectors::Q1Fixture {
+    let base = q1_vectors::successful_a_b_a_fixture();
+    let mut sections = base.sections.clone();
+    let s7 = &mut sections[6];
+    let parent = directory(s7, 0);
+    s7[parent + 192] ^= 0x5a;
+    s7[440] ^= 0xa5;
+    rehash_table_manifests(s7);
+    rehash_root_descriptor(s7);
+    reframed(&base, sections)
+}
+
+/// Recreates the pre-repair shape where the first statement has no ordinary NOT NULL witness
+/// for `required`. The dependency and its use are physically absent, leaving only the terminal
+/// guard for the aborting statement. Wire framing and every affected root are rebuilt so codec
+/// closure accepts the exact old shape; only the pinned Q2 catalog guard bijection may reject the
+/// missing `required` witness.
+pub(super) fn q2_explicit_missing_first_ordinary_guard_fixture() -> q1_vectors::Q1Fixture {
+    let base = q1_vectors::explicit_abort_fixture();
+    let mut sections = base.sections.clone();
+    {
+        let s7 = &mut sections[6];
+        let uses = directory(s7, 4);
+        let dependencies = directory(s7, 3);
+        assert_eq!(u32_at(s7, 52), 4, "Q2 repaired dependency count");
+        assert_eq!(u32_at(s7, 56), 5, "Q2 repaired use count");
+        assert_eq!(
+            uses,
+            dependencies + 4 * 224,
+            "Q2 repaired dependency extent"
+        );
+        assert_eq!(u32_at(s7, uses + 32), 0, "Q2 first guard statement");
+        assert_eq!(u32_at(s7, uses + 32 + 4), 2, "Q2 ordinary guard reference");
+        assert_eq!(
+            u16::from_le_bytes(
+                s7[uses + 32 + 8..uses + 32 + 10]
+                    .try_into()
+                    .expect("Q2 ordinary guard role"),
+            ),
+            9,
+            "Q2 ordinary guard role"
+        );
+
+        // Remove dependency #2 and its statement-zero use. The terminal guard becomes #2 and
+        // the sections after the dependency/use arenas move left by their exact record widths.
+        let terminal_token = dependencies + 3 * 224;
+        let use_after_ordinary = uses + 2 * 32;
+        let after_uses = uses + 5 * 32;
+        let mut old_shape = Vec::with_capacity(s7.len() - 224 - 32);
+        old_shape.extend_from_slice(&s7[..dependencies + 2 * 224]);
+        old_shape.extend_from_slice(&s7[terminal_token..terminal_token + 224]);
+        old_shape.extend_from_slice(&s7[uses..uses + 32]);
+        old_shape.extend_from_slice(&s7[use_after_ordinary..after_uses]);
+        old_shape.extend_from_slice(&s7[after_uses..]);
+        *s7 = old_shape;
+
+        write_u32(s7, 52, 3);
+        write_u32(s7, 56, 4);
+        let regions = [
+            (640_u64, 384_u64),
+            (1_024, 64),
+            (1_088, 640),
+            (1_728, 672),
+            (2_400, 128),
+            (2_528, 0),
+            (2_528, 0),
+            (2_528, 0),
+            (2_528, 0),
+            (2_528, 0),
+            (2_528, 128),
+            (2_656, 160),
+            (2_816, 0),
+            (2_816, u64_at(s7, 96)),
+        ];
+        for (ordinal, (offset, len)) in regions.iter().enumerate() {
+            write_u64(s7, 104 + ordinal * 16, *offset);
+            write_u64(s7, 112 + ordinal * 16, *len);
+        }
+
+        let resolutions = directory(s7, 2);
+        let old_uses = directory(s7, 4);
+        write_u32(s7, resolutions + 40, 0);
+        write_u32(s7, resolutions + 44, 1);
+        write_u32(s7, resolutions + 320 + 40, 1);
+        write_u32(s7, resolutions + 320 + 44, 3);
+        write_u32(s7, resolutions + 320 + 84, 2);
+
+        let terminal = dependencies + 2 * 224;
+        let terminal_use = old_uses + 3 * 32;
+        assert_eq!(u32_at(s7, terminal), 3, "Q2 terminal guard old reference");
+        assert_eq!(
+            u32_at(s7, terminal_use + 4),
+            3,
+            "Q2 terminal use old reference"
+        );
+        write_u32(s7, terminal, 2);
+        write_u32(s7, terminal_use + 4, 2);
+        rehash_constraint_token(s7, 2);
+        let s7_len = s7.len() as u64;
+        write_u64(s7, 32, s7_len);
+    }
+    rehash_overlay_chain(&mut sections);
+    reframed_explicit_abort(&base, sections)
 }
 
 fn s5_offset(s5: &[u8], ordinal: usize) -> usize {

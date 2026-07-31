@@ -132,6 +132,18 @@ fn close_canonical_semantics_v2_for_test<'a>(
     Ok(())
 }
 
+/// Test-only handoff of an actual strict-filled, codec-closed owner to the retained Q2 golden
+/// facade.  The returned typestate has no public graph accessor or builder method; only the
+/// retained facade can consume it with a pinned catalog and allocator lease proof.
+#[cfg(test)]
+fn codec_closed_canonical_semantics_v2_for_test<'a>(
+    outer: &gpu_db_wal::CanonicalPreApplyHeader,
+    outcome: &gpu_db_wal::CanonicalOutcome,
+    fragments: &[gpu_db_wal::CanonicalFragmentRef<'a>],
+) -> Result<retained::CodecClosedSemanticsV2, EngineError> {
+    fill_canonical_semantics_v2_for_test(outer, outcome, fragments)?.close_codec_for_test()
+}
+
 /// Test-only catalog-guard continuation.  It consumes the actual codec-closed owner through the
 /// one guard-validation leaf and returns no retained state or generation-pending capability.
 #[cfg(test)]

@@ -1337,6 +1337,10 @@ mod boundary_tests {
     fn source_boundary_forbids_borrowed_witnesses_and_live_builder_paths() {
         let retained = include_str!("../retained.rs");
         let generation = include_str!("generation_validation.rs");
+        let golden_builder = include_str!("generation_validation/golden_builder.rs");
+        let reencode = include_str!("reencode.rs");
+        let q2_witnesses = include_str!("../goldens/q2_witnesses.rs");
+        let q2_reencode = include_str!("../goldens/q2_reencode.rs");
         let typed_batch = include_str!("../../../typed_insert_batch.rs");
         assert!(generation.contains("struct LaunchedAttempt"));
         assert!(generation.contains("fn drain_once(&mut self) -> DrainOutcome"));
@@ -1355,12 +1359,158 @@ mod boundary_tests {
         assert!(!generation.contains(&witness_getter));
         assert!(!retained.contains("FullyWitnessValidatedSemanticsV2<'"));
         assert!(!retained.contains("generation_witness_for_test"));
-        assert!(!retained.contains("fn reencode_"));
+        assert!(
+            retained.contains("#[cfg(test)]\n#[path = \"retained/reencode.rs\"]\nmod reencode;")
+        );
+        assert!(generation.contains(
+            "#[cfg(test)]\n#[path = \"generation_validation/golden_builder.rs\"]\npub(super) mod golden_builder;"
+        ));
+        assert!(retained.contains("pub(super) fn reencode_s1_s7_for_test(&self)"));
+        assert!(reencode.contains("owner: &FullyWitnessValidatedSemanticsV2<C>"));
+        assert!(!reencode.contains("GenerationPendingSemanticsV2"));
+        assert!(!reencode.contains("QuarantinedSemanticsV2"));
+        assert!(!reencode.contains("CodecClosedSemanticsV2"));
+        assert!(golden_builder.contains("enum GoldenCase"));
+        assert!(golden_builder.contains("fn try_reserve_candidate"));
+        assert!(golden_builder.contains("fn launch("));
+        assert!(!golden_builder.contains("Q1Fixture"));
+        assert!(!golden_builder.contains("ReservedSemanticsV2Graph"));
         assert!(typed_batch
             .contains("#[cfg(test)]\npub(crate) use typed_image_codec::{encode_typed_image"));
+
+        // The two test-only typed reencoders have exactly one definition and exactly one call
+        // from the retained logical reencoder.  No second generic byte bridge may appear.
+        for bridge in [
+            "reencode_decoded_canonical_typed_insert_record_for_test",
+            "reencode_decoded_typed_image_for_test",
+        ] {
+            assert_eq!(
+                typed_batch
+                    .matches(&format!("#[cfg(test)]\npub(crate) fn {bridge}("))
+                    .count(),
+                1,
+                "{bridge} has one cfg(test) bridge definition"
+            );
+            assert_eq!(
+                reencode.matches(&format!("{bridge}(")).count(),
+                1,
+                "{bridge} has one retained reencoder call"
+            );
+        }
+
+        let without_line_comments = |source: &str| {
+            source
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let golden_builder_code = without_line_comments(golden_builder);
+        let q2_witness_code = without_line_comments(q2_witnesses);
+        for forbidden in [
+            "Q1",
+            "q1_vectors",
+            "DecodedTyped",
+            "decode_canonical",
+            "MINIMAL_ABORT_SECTION",
+            "SECTION_HEX",
+            "q1_sabotage",
+            "frozen:",
+            "sections:",
+        ] {
+            assert!(
+                !q2_witness_code.contains(forbidden),
+                "Q2 catalog/lease witnesses must not receive {forbidden} input"
+            );
+        }
+        assert!(
+            golden_builder_code.contains("pub(super) fn new(case: GoldenCase) -> Self"),
+            "the closed case tag is the builder's only construction input"
+        );
+        for forbidden in [
+            "fn new(case: GoldenCase,",
+            "Q1",
+            "q1_vectors",
+            "SUCCESS_GENERATION_INPUT_DIGEST",
+            "expected_generation_input_digest",
+            "expected_sections",
+            "expected_s7",
+            "frozen_sections",
+            "SECTION_HEX",
+            "SECTION_ROOT_HEX",
+        ] {
+            assert!(
+                !golden_builder_code.contains(forbidden),
+                "Q2 builder must not receive {forbidden} input"
+            );
+        }
+        assert_eq!(
+            q2_reencode
+                .matches("_reencodes_from_fully_validated_owner_to_frozen_literals")
+                .count(),
+            3,
+            "Q2 has exactly the minimal, explicit-abort, and successful positive reencodes"
+        );
+
+        let q2_retained_facade = retained
+            .split("/// Consume an actual codec-closed owner through the one catalog/allocator transition while the")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(super) fn validate_catalog_allocator_witness_identity").next())
+            .expect("retained keeps the bounded Q2 facade");
+        let q2_typed_reencode_bridges = typed_batch
+            .split("/// Test-only canonical S2 reencoder for an already validated, move-only decoded record.")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Test-only bridge to the canonical private sequence-chain fixture.").next())
+            .expect("typed batch keeps the bounded Q2 reconstruction bridges");
+        for (source_name, source) in [
+            ("Q2 witnesses", q2_witnesses),
+            ("Q2 reencode evidence", q2_reencode),
+            ("Q2 golden builder", golden_builder),
+            ("retained logical reencoder", reencode),
+            ("retained Q2 facade", q2_retained_facade),
+            ("typed Q2 reencode bridges", q2_typed_reencode_bridges),
+        ] {
+            for forbidden in [
+                "S8_",
+                "S8_BYTES",
+                "S8_MAGIC",
+                "AggregateReplayTxn",
+                "compile_replay",
+                "fn replay",
+                "replay_",
+                "struct Replay",
+                "fn apply",
+                "apply_",
+                "struct Apply",
+                "fn recover",
+                "recovery_",
+                "struct Recovery",
+                "fn publish",
+                "publication_",
+                "publish_generation",
+                "struct Publication",
+                "live_builder",
+                "LiveBuilder",
+                "crate::wal_binary",
+                "PreparedBinaryInsertTemplate",
+                "WalBuffer",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{source_name} must not grow a concrete {forbidden} symbol"
+                );
+            }
+            assert!(
+                !source.contains("pub fn "),
+                "{source_name} must not expose a public Q2 execution surface"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "generation_validation/fixture_tests.rs"]
 mod fixture_tests;
+#[cfg(test)]
+#[path = "generation_validation/golden_builder.rs"]
+pub(super) mod golden_builder;
