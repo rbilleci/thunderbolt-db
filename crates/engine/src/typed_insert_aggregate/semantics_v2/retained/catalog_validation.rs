@@ -29,6 +29,18 @@ use sha2::{Digest, Sha256};
 
 pub(super) use allocator::SemanticsV2DurableAllocatorIndexProof;
 
+#[cfg(test)]
+pub(super) use allocator::AllocatorLeaseSpecForTest;
+
+#[cfg(test)]
+pub(super) fn with_allocator_proof_for_test<T>(
+    identity: SemanticsV2BoundIdentity,
+    leases: &[AllocatorLeaseSpecForTest],
+    operation: impl FnOnce(SemanticsV2DurableAllocatorIndexProof<'_>) -> T,
+) -> T {
+    allocator::with_allocator_proof_for_test(identity, leases, operation)
+}
+
 const TARGET_TABLE: u8 = 1;
 const FOREIGN_PARENT_TABLE: u8 = 2;
 const MAINTAINED_INDEX: u8 = 3;

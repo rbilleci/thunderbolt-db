@@ -1,5 +1,21 @@
 //! Independent generation-input digest recomputation over retained S7 facts.
 
+#[path = "input/owned.rs"]
+mod owned;
+
+pub(in super::super) use owned::GenerationQuarantineRegistry;
+pub(super) use owned::{
+    measure, reserve_and_fill, GenerationBuilderReservation, GenerationOutputHeader,
+    GenerationOutputIndex, GenerationOutputTable, PreReservedQuarantine, QuarantineFailure,
+    ReservedGenerationLaunch, ReservedGenerationOutputs, SealedGenerationInput,
+};
+
+#[cfg(test)]
+pub(super) use owned::{
+    fail_reservation_at, test_builder_reservation, test_launch,
+    test_launch_with_retention_sentinels,
+};
+
 use super::super::{
     graph::{
         ReservedSemanticsV2Graph, RetainedIndexDescriptor, RetainedIndexKeyColumn,

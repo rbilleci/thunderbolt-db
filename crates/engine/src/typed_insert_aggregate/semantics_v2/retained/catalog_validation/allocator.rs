@@ -103,6 +103,104 @@ pub(super) fn proof_from_immutable_checked_records_for_test<'a>(
     }
 }
 
+/// Closure-scoped input for a retained-boundary test proof.  It carries only the table allocator
+/// interval; the durable snapshot, authenticated root, active pin, selected rows, and all marker
+/// lifecycle fields are constructed locally below and cannot escape this adapter.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(in crate::typed_insert_aggregate::semantics_v2::retained) struct AllocatorLeaseSpecForTest {
+    pub(in crate::typed_insert_aggregate::semantics_v2::retained) stable_allocator_id: u64,
+    pub(in crate::typed_insert_aggregate::semantics_v2::retained) lease_start: u64,
+    pub(in crate::typed_insert_aggregate::semantics_v2::retained) lease_end: u64,
+}
+
+/// Build an authoritative allocator proof only for the dynamic extent of `operation`.  The proof
+/// borrows local records/snapshot/pin, so neither it nor its fixture backing can escape; callers
+/// must consume it immediately through the ordinary catalog-and-allocator validation path.
+#[cfg(test)]
+pub(super) fn with_allocator_proof_for_test<T>(
+    identity: SemanticsV2BoundIdentity,
+    leases: &[AllocatorLeaseSpecForTest],
+    operation: impl FnOnce(SemanticsV2DurableAllocatorIndexProof<'_>) -> T,
+) -> T {
+    assert!(
+        identity.commit_sequence > 2,
+        "test allocator proof needs a prior durable marker"
+    );
+    let marker_transaction = if identity.stable_transaction_id == 1 {
+        2
+    } else {
+        1
+    };
+    let records: Vec<_> = leases
+        .iter()
+        .map(|lease| {
+            assert!(
+                lease.stable_allocator_id != 0
+                    && lease.lease_start != 0
+                    && lease.lease_start < lease.lease_end,
+                "test allocator lease has an invalid exact interval"
+            );
+            SemanticsV2DurableAllocatorLeaseRecord {
+                database_id: identity.database_id,
+                allocator_kind: 1,
+                stable_allocator_id: lease.stable_allocator_id,
+                lease_epoch: 1,
+                lease_start: lease.lease_start,
+                lease_end: lease.lease_end,
+                prior_high_water: lease.lease_start,
+                new_high_water: lease.lease_end,
+                marker_system_transaction_id: marker_transaction,
+                marker_commit_sequence: 1,
+            }
+        })
+        .collect();
+    let selected: Vec<_> = records
+        .iter()
+        .enumerate()
+        .map(
+            |(ordinal, record)| SemanticsV2SelectedAllocatorLeaseWitness {
+                record_ordinal: u32::try_from(ordinal).expect("test allocator record ordinal fits"),
+                database_id: record.database_id,
+                allocator_kind: record.allocator_kind,
+                stable_allocator_id: record.stable_allocator_id,
+                lease_epoch: record.lease_epoch,
+                lease_start: record.lease_start,
+                lease_end: record.lease_end,
+                prior_high_water: record.prior_high_water,
+                new_high_water: record.new_high_water,
+                marker_system_transaction_id: record.marker_system_transaction_id,
+                marker_commit_sequence: record.marker_commit_sequence,
+            },
+        )
+        .collect();
+    let mut snapshot = SemanticsV2ImmutableDurableAllocatorIndex {
+        database_id: identity.database_id,
+        index_generation: 1,
+        index_root: [0; 32],
+        complete_next_commit_sequence: identity.commit_sequence + 1,
+        durable_next_commit_sequence: identity.commit_sequence + 1,
+        published_next_commit_sequence: identity.commit_sequence + 1,
+        records: &records,
+    };
+    snapshot.index_root = immutable_index_root(&snapshot);
+    let pin = SemanticsV2PinnedAllocatorIndexGeneration {
+        database_id: identity.database_id,
+        cluster_id: identity.cluster_id,
+        timeline_id: identity.timeline_id,
+        format_epoch: identity.format_epoch,
+        leader_epoch: identity.leader_epoch,
+        index_generation: snapshot.index_generation,
+        index_root: snapshot.index_root,
+        retained_through_commit_sequence: identity.commit_sequence,
+    };
+    operation(SemanticsV2DurableAllocatorIndexProof {
+        snapshot: &snapshot,
+        checkpoint_pin: &pin,
+        selected: &selected,
+    })
+}
+
 pub(super) fn validate_durable_allocator_index_identity(
     identity: SemanticsV2BoundIdentity,
     proof: &SemanticsV2DurableAllocatorIndexProof<'_>,

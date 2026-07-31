@@ -220,22 +220,18 @@ pub(super) struct GenerationPendingSemanticsV2<'a> {
     catalog_and_allocator: CatalogAndAllocatorValidated<'a>,
 }
 
-/// All catalog, lease, and generation output equality checks have succeeded. Test-only byte
-/// reencoding will be implemented exclusively on this state after the retained graph is full.
+/// All catalog, lease, and generation output equality checks have succeeded.  The catalog and
+/// allocator borrows end at this transition: a future reencoder can only receive the retained
+/// graph plus the builder's opaque, fully-owned generation result.
 #[allow(dead_code)]
-pub(super) struct FullyWitnessValidatedSemanticsV2<'a> {
+pub(super) struct FullyWitnessValidatedSemanticsV2<C> {
     graph: RetainedSemanticsV2Graph,
-    witnesses: FullyValidatedWitnesses<'a>,
+    generation: generation_validation::OwnedGenerationResult<C>,
 }
 
 struct CatalogAndAllocatorValidated<'a> {
     catalog: SemanticsV2CatalogWitness<'a>,
     allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'a>,
-}
-
-struct FullyValidatedWitnesses<'a> {
-    catalog: SemanticsV2CatalogWitness<'a>,
-    generation: SemanticsV2GenerationWitness<'a>,
 }
 
 /// Seal the complete, exact post-reservation graph into the context-free quarantine state.
@@ -349,11 +345,23 @@ impl<'a> GenerationPendingSemanticsV2<'a> {
     fn validate_generation_with_reserved_builder<B>(
         self,
         builder: B,
-    ) -> Result<FullyWitnessValidatedSemanticsV2<'a>, crate::EngineError>
+        quarantine_registry: &generation_validation::GenerationQuarantineRegistry<
+            B::Candidate,
+            B::Work,
+        >,
+    ) -> Result<FullyWitnessValidatedSemanticsV2<B::Candidate>, crate::EngineError>
     where
-        B: generation_validation::SemanticsV2ReservedGenerationBuilder<'a>,
+        B: generation_validation::SemanticsV2ReservedGenerationBuilder,
     {
-        generation_validation::validate_reserved_builder_result(self, builder)
+        generation_validation::validate_reserved_builder_result(self, builder, quarantine_registry)
+    }
+
+    #[cfg(test)]
+    fn mutate_final_table_generation_before_neutral_seal_for_test(&mut self) {
+        self.graph.graph.tables[0].data_generation_after = self.graph.graph.tables[0]
+            .data_generation_after
+            .checked_add(1)
+            .expect("test final generation remains representable");
     }
 }
 
@@ -391,42 +399,601 @@ pub(super) fn validate_catalog_allocator_witness_identity(
     )
 }
 
-/// Generation output is intentionally an opaque builder-owned capability. The wire reader may
-/// compare a supplied value only after `GenerationPendingSemanticsV2` has been consumed by the
-/// reserved builder; no sibling module can assemble one from S7 roots.
-#[allow(dead_code)]
-pub(super) struct SemanticsV2GenerationWitness<'a> {
-    root_descriptor_version: u16,
-    database_id: [u8; 16],
-    catalog_epoch: u64,
-    catalog_digest: [u8; 32],
-    stable_transaction_id: u64,
-    commit_sequence: u64,
-    initial_database_root: [u8; 32],
-    generation_input_digest: [u8; 32],
-    final_database_root: [u8; 32],
-    tables: &'a [SemanticsV2GenerationTableWitness<'a>],
-}
-
-#[allow(dead_code)]
-pub(super) struct SemanticsV2GenerationTableWitness<'a> {
-    stable_table_id: u64,
-    final_data_generation: u64,
-    final_table_root: [u8; 32],
-    final_logical_row_count: u64,
-    indexes: &'a [SemanticsV2GenerationIndexWitness],
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SemanticsV2GenerationIndexWitness {
-    stable_index_id: u64,
-    final_index_generation: u64,
-    final_index_root: [u8; 32],
-}
-
 fn retained_error(message: &str) -> crate::EngineError {
     crate::EngineError::Durability(format!(
         "typed INSERT aggregate semantics-v2 retained: {message}"
     ))
+}
+
+#[cfg(test)]
+mod generation_lifecycle_tests {
+    use super::*;
+    use crate::typed_insert_aggregate::{
+        encode_status_v2, TypedInsertStatusV2, AGGREGATE_CHUNK_FLAG_FIRST,
+        AGGREGATE_CHUNK_FLAG_LAST, AGGREGATE_CHUNK_HEADER_BYTES, AGGREGATE_CHUNK_MAGIC,
+        AGGREGATE_FORMAT_VERSION, AGGREGATE_SECTION_COUNT, AGGREGATE_STATUS_V2_BYTES,
+        AGGREGATE_STREAM_MAGIC, ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE, OUTER_CONTENT_ROW,
+        OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1,
+    };
+    use sha2::{Digest, Sha256};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    const TABLE_ID: u64 = 101;
+    const TABLE_GENERATION: u64 = 11;
+    const TERMINAL_CONSTRAINT_ID: u64 = 301;
+    const STABLE_TRANSACTION_ID: u64 = 77;
+    const COMMIT_SEQUENCE: u64 = 17;
+    const CATALOG_EPOCH: u64 = 7;
+    const ABSENT_U32: u32 = u32::MAX;
+
+    #[test]
+    fn checked_in_abort_fixture_crosses_fill_catalog_pending_and_owned_lifecycle() {
+        let (result, calls, drops) =
+            run_abort_lifecycle(generation_validation::DeterministicAbortSabotage::None);
+        result.expect("checked-in fixture reaches fully owned generation result");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn checked_in_abort_fixture_rejects_prelaunch_and_output_sabotage() {
+        use generation_validation::DeterministicAbortSabotage as Sabotage;
+
+        let (result, calls, drops) = run_abort_lifecycle(Sabotage::CandidateReservationFailure);
+        assert!(
+            result.is_err(),
+            "candidate reservation failure rejects before launch"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "prelaunch failure performs no work"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "no candidate exists on reserve failure"
+        );
+
+        for (name, sabotage) in [
+            ("missing", Sabotage::MissingOutput),
+            ("duplicate", Sabotage::DuplicateOutput),
+            ("extra", Sabotage::ExtraOutput),
+            ("header identity", Sabotage::HeaderIdentity),
+            ("header input digest", Sabotage::HeaderInputDigest),
+            ("header final root", Sabotage::HeaderFinalRoot),
+            ("table identity", Sabotage::TableIdentity),
+            ("table generation", Sabotage::TableGeneration),
+            ("table root", Sabotage::TableRoot),
+            ("table count", Sabotage::TableCount),
+            ("table index range", Sabotage::TableIndexRange),
+            ("neutral input", Sabotage::NeutralInput),
+        ] {
+            let (result, calls, drops) = run_abort_lifecycle(sabotage);
+            assert!(
+                result.is_err(),
+                "{name} sabotage must fail independent validation"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "sabotage still drains once"
+            );
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "quiesced sabotage releases candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_in_abort_fixture_drains_immediate_and_partial_launch_failures() {
+        use generation_validation::DeterministicAbortSabotage as Sabotage;
+
+        let (result, calls, drops, parked) =
+            run_abort_lifecycle_with_observer(Sabotage::ImmediateLaunchFailure, None);
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(parked, 0, "immediate failure is proven quiesced");
+
+        let (result, calls, drops, parked) =
+            run_abort_lifecycle_with_observer(Sabotage::PartialLaunchFailure, None);
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            parked, 1,
+            "partial failure retains the real fixture backing"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "only the authorized reaper releases partial fixture backing",
+        );
+    }
+
+    fn run_abort_lifecycle(
+        sabotage: generation_validation::DeterministicAbortSabotage,
+    ) -> (
+        Result<(), crate::EngineError>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let (result, calls, drops, _) = run_abort_lifecycle_with_observer(sabotage, None);
+        (result, calls, drops)
+    }
+
+    #[test]
+    fn neutral_input_digest_ignores_final_output_sabotage() {
+        use generation_validation::DeterministicAbortSabotage as Sabotage;
+
+        let normal = Arc::new(Mutex::new(None));
+        let root = Arc::new(Mutex::new(None));
+        let generation = Arc::new(Mutex::new(None));
+        assert!(
+            run_abort_lifecycle_with_observer(Sabotage::None, Some(Arc::clone(&normal)))
+                .0
+                .is_ok()
+        );
+        assert!(run_abort_lifecycle_with_observer(
+            Sabotage::HeaderFinalRoot,
+            Some(Arc::clone(&root))
+        )
+        .0
+        .is_err());
+        assert!(run_abort_lifecycle_with_observer(
+            Sabotage::TableGeneration,
+            Some(Arc::clone(&generation))
+        )
+        .0
+        .is_err());
+        let normal = normal
+            .lock()
+            .expect("normal observation lock")
+            .expect("normal digest");
+        assert_eq!(
+            normal,
+            root.lock()
+                .expect("root observation lock")
+                .expect("root digest"),
+            "final database root is not a neutral builder input",
+        );
+        assert_eq!(
+            normal,
+            generation
+                .lock()
+                .expect("generation observation lock")
+                .expect("generation digest"),
+            "final generation is not a neutral builder input",
+        );
+    }
+
+    #[test]
+    fn preseal_final_generation_mutation_keeps_neutral_digest_but_rejects_output() {
+        use generation_validation::DeterministicAbortSabotage as Sabotage;
+
+        let baseline = Arc::new(Mutex::new(None));
+        let mutated = Arc::new(Mutex::new(None));
+        assert!(
+            run_abort_lifecycle_with_observer(Sabotage::None, Some(Arc::clone(&baseline)))
+                .0
+                .is_ok()
+        );
+        let (result, calls, drops, parked) =
+            run_abort_lifecycle_inner(Sabotage::None, Some(Arc::clone(&mutated)), true);
+        assert!(
+            result.is_err(),
+            "S7 final generation output must still be validated"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(parked, 0);
+        let baseline_digest = *baseline.lock().expect("baseline input-digest lock");
+        let mutated_digest = *mutated.lock().expect("mutated input-digest lock");
+        assert_eq!(
+            baseline_digest, mutated_digest,
+            "pre-seal S7 final generation is outside the neutral builder digest",
+        );
+    }
+
+    fn run_abort_lifecycle_with_observer(
+        sabotage: generation_validation::DeterministicAbortSabotage,
+        observed_input_digest: Option<Arc<Mutex<Option<[u8; 32]>>>>,
+    ) -> (
+        Result<(), crate::EngineError>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        usize,
+    ) {
+        run_abort_lifecycle_inner(sabotage, observed_input_digest, false)
+    }
+
+    fn run_abort_lifecycle_inner(
+        sabotage: generation_validation::DeterministicAbortSabotage,
+        observed_input_digest: Option<Arc<Mutex<Option<[u8; 32]>>>>,
+        mutate_final_generation_before_neutral_seal: bool,
+    ) -> (
+        Result<(), crate::EngineError>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        usize,
+    ) {
+        let (outer, outcome, fragment, status) = checked_in_minimal_abort_fixture();
+        let fragments = [
+            gpu_db_wal::CanonicalFragmentRef {
+                kind: gpu_db_wal::CanonicalFragmentKind::RowMutation,
+                body: &fragment,
+            },
+            gpu_db_wal::CanonicalFragmentRef {
+                kind: gpu_db_wal::CanonicalFragmentKind::TransactionClaimStatus,
+                body: &status,
+            },
+        ];
+        let closed =
+            super::super::fill_canonical_semantics_v2_for_test(&outer, &outcome, &fragments)
+                .expect("checked-in minimal abort fixture fills retained owners")
+                .close_codec_for_test()
+                .expect("checked-in minimal abort fixture closes codec witnesses");
+
+        let record = crate::typed_insert_batch::decode_canonical_typed_insert_record(&frozen_hex(
+            "MINIMAL_ABORT_NULL_S2_TYPED_INSERT_HEX",
+        ))
+        .expect("checked-in fixture S2 record decodes");
+        let facts = record.facts();
+        let source_column = record
+            .catalog_columns()
+            .next()
+            .expect("checked-in fixture has one target column");
+        assert!(record.catalog_columns().nth(1).is_none());
+        let columns = [SemanticsV2CatalogColumnWitness {
+            catalog_column_ordinal: source_column.catalog_column_ordinal,
+            stable_column_id: source_column.column_id,
+            attnum: source_column.attnum,
+            name: source_column.name,
+            storage: storage(source_column.ty),
+            declared_type_oid: source_column.type_oid,
+            signed_type_size: source_column.type_size,
+            column_shape_digest: [0x23; 32],
+            column_root: [0x24; 32],
+        }];
+        let guards = [not_null_guard(facts.target.oid)];
+        let tables = [SemanticsV2CatalogTableWitness {
+            stable_table_id: TABLE_ID,
+            display_oid: facts.target.oid,
+            schema: "public",
+            name: "codec_golden",
+            schema_digest: facts.target.schema_digest,
+            data_generation: TABLE_GENERATION,
+            data_root: [0x22; 32],
+            catalog_columns: &columns,
+            not_null_guards: &guards,
+            check_guards: &[],
+            foreign_keys: &[],
+        }];
+        let catalog = SemanticsV2CatalogWitness {
+            database_id: [0xa1; 16],
+            catalog_epoch: CATALOG_EPOCH,
+            catalog_digest: [0x33; 32],
+            tables: &tables,
+            indexes: &[],
+            domains: &[],
+            guards: &guards,
+            sequences: &[],
+        };
+        let identity = SemanticsV2BoundIdentity {
+            database_id: [0xa1; 16],
+            cluster_id: [0xa3; 16],
+            timeline_id: [0xa2; 16],
+            format_epoch: 5,
+            leader_epoch: 6,
+            catalog_epoch: CATALOG_EPOCH,
+            catalog_digest: [0x33; 32],
+            stable_transaction_id: STABLE_TRANSACTION_ID,
+            autocommit: true,
+            commit_sequence: COMMIT_SEQUENCE,
+            initial_database_root: [0x44; 32],
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let quarantine_registry = generation_validation::GenerationQuarantineRegistry::<
+            generation_validation::AbortCandidate,
+            generation_validation::AbortWork,
+        >::new();
+        let result = catalog_validation::with_allocator_proof_for_test(
+            identity,
+            &[catalog_validation::AllocatorLeaseSpecForTest {
+                stable_allocator_id: TABLE_ID,
+                lease_start: 1,
+                lease_end: 1_000,
+            }],
+            |allocator_index| {
+                let mut pending = closed
+                    .validate_catalog_and_allocator_for_test(SemanticsV2CatalogAllocatorWitness {
+                        catalog,
+                        allocator_index,
+                    })
+                    .expect("checked-in fixture closes pinned catalog and allocator");
+                if mutate_final_generation_before_neutral_seal {
+                    pending.mutate_final_table_generation_before_neutral_seal_for_test();
+                }
+                pending.validate_generation_with_reserved_builder(match observed_input_digest {
+                        Some(observed) => generation_validation::DeterministicAbortBuilder::with_observed_input_digest(
+                            Arc::clone(&calls),
+                            Arc::clone(&drops),
+                            sabotage,
+                            observed,
+                        ),
+                        None => generation_validation::DeterministicAbortBuilder::with_sabotage(
+                            Arc::clone(&calls),
+                            Arc::clone(&drops),
+                            sabotage,
+                        ),
+                    }, &quarantine_registry)
+            },
+        );
+        let quarantine_reaper = quarantine_registry.authorized_reaper_for_test();
+        let parked = quarantine_reaper.occupancy().occupied;
+        if parked != 0 {
+            quarantine_reaper.reap_after_external_quiescence();
+        }
+        // Successful output has no catalog/allocator lifetime and can move past every borrowed
+        // witness; unknown failure is retained until this separately authorized test reaper.
+        let result = result.map(drop);
+        (result, calls, drops, parked)
+    }
+
+    fn not_null_guard(table_oid: u32) -> SemanticsV2CatalogGuardWitness<'static> {
+        SemanticsV2CatalogGuardWitness {
+            kind: 9,
+            stable_guard_id: TERMINAL_CONSTRAINT_ID,
+            display_oid: 0,
+            schema: "",
+            name: "",
+            synthesized_not_null: true,
+            owner_kind: 1,
+            owner_stable_id: TABLE_ID,
+            owner_display_oid: table_oid,
+            owner_catalog_column_ordinal: 0,
+            domain_ordinal: ABSENT_U32,
+            raw_constraint_ordinal: 0,
+            source_ordinal: 0,
+            shape_digest: [0x23; 32],
+            program_or_descriptor_root: [0x24; 32],
+            catalog_generation: 12,
+        }
+    }
+
+    fn storage(ty: crate::SqlType) -> [u8; 4] {
+        match ty {
+            crate::SqlType::Int2 => [1, 0, 0, 0],
+            crate::SqlType::Int4 => [2, 0, 0, 0],
+            crate::SqlType::Int8 => [3, 0, 0, 0],
+            crate::SqlType::Numeric { precision, scale } => [4, precision, scale, 0],
+            crate::SqlType::Bool => [5, 0, 0, 0],
+            crate::SqlType::Text => [6, 0, 0, 0],
+            crate::SqlType::Date => [7, 0, 0, 0],
+            crate::SqlType::Timestamp => [8, 0, 0, 0],
+            crate::SqlType::Uuid => [9, 0, 0, 0],
+        }
+    }
+
+    fn checked_in_minimal_abort_fixture() -> (
+        gpu_db_wal::CanonicalPreApplyHeader,
+        gpu_db_wal::CanonicalOutcome,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let s1 = frozen_hex("MINIMAL_ABORT_S1_HEX");
+        let s2 = frozen_hex("MINIMAL_ABORT_NULL_S2_TYPED_INSERT_HEX");
+        let s7 = frozen_hex("MINIMAL_ABORT_S7_HEX");
+        let typed_digest: [u8; 32] = s1[16..48].try_into().expect("S1 digest width");
+        let overlay_after: [u8; 32] = s1[112..144].try_into().expect("S1 overlay width");
+        let mut s4 = vec![0; 64];
+        s4[8..16].copy_from_slice(&100_u64.to_le_bytes());
+        s4[16] = 3;
+        s4[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        s4[24..28].copy_from_slice(&ABSENT_U32.to_le_bytes());
+        s4[32..64].copy_from_slice(&typed_digest);
+        let statement_outcome = gpu_db_wal::CanonicalOutcome {
+            kind: gpu_db_wal::CanonicalOutcomeKind::AbortError,
+            affected_rows: 0,
+            sqlstate: Some(*b"23502"),
+            constraint_id: TERMINAL_CONSTRAINT_ID,
+            target_digest: overlay_after,
+            returning_digest: [0; 32],
+        };
+        let mut statement_outcome_bytes = [0; gpu_db_wal::CANONICAL_OUTCOME_BYTES];
+        gpu_db_wal::encode_canonical_outcome_into_exact(
+            &statement_outcome,
+            &mut statement_outcome_bytes,
+        )
+        .expect("test abort outcome encodes");
+        let mut s6 = vec![0; 136];
+        s6[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        s6[12..44].copy_from_slice(&typed_digest);
+        s6[44..136].copy_from_slice(&statement_outcome_bytes);
+        let mut s2_section = (s2.len() as u32).to_le_bytes().to_vec();
+        s2_section.extend_from_slice(&s2);
+        let sections = [
+            s1,
+            s2_section,
+            Vec::new(),
+            s4,
+            Vec::new(),
+            s6,
+            s7,
+            Vec::new(),
+        ];
+        let entries = [1_u32, 1, 0, 1, 0, 1, 1, 0];
+        let headers: [[u8; 16]; AGGREGATE_SECTION_COUNT] = std::array::from_fn(|index| {
+            let mut header = [0; 16];
+            header[..2].copy_from_slice(&(index as u16 + 1).to_le_bytes());
+            header[4..8].copy_from_slice(&entries[index].to_le_bytes());
+            header[8..16].copy_from_slice(&(sections[index].len() as u64).to_le_bytes());
+            header
+        });
+        let section_bytes = headers
+            .iter()
+            .zip(sections.iter())
+            .map(|(_, section)| 16_u64 + section.len() as u64)
+            .sum::<u64>();
+        let mut aggregate_header = [0; 96];
+        aggregate_header[..16].copy_from_slice(AGGREGATE_STREAM_MAGIC);
+        aggregate_header[16..18].copy_from_slice(&AGGREGATE_FORMAT_VERSION.to_le_bytes());
+        aggregate_header[18..20].copy_from_slice(&2_u16.to_le_bytes());
+        aggregate_header[20..22].copy_from_slice(&AGGREGATE_FORMAT_VERSION.to_le_bytes());
+        aggregate_header[22..24].copy_from_slice(&AGGREGATE_FORMAT_VERSION.to_le_bytes());
+        aggregate_header[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        aggregate_header[28..30].copy_from_slice(&(AGGREGATE_SECTION_COUNT as u16).to_le_bytes());
+        aggregate_header[32..40].copy_from_slice(&section_bytes.to_le_bytes());
+        aggregate_header[40..48].copy_from_slice(&STABLE_TRANSACTION_ID.to_le_bytes());
+        aggregate_header[48..52].copy_from_slice(&1_u32.to_le_bytes());
+        aggregate_header[52..56].copy_from_slice(&1_u32.to_le_bytes());
+        aggregate_header[56..64].copy_from_slice(&1_u64.to_le_bytes());
+        aggregate_header[88..92].copy_from_slice(&1_u32.to_le_bytes());
+        let section_roots: [[u8; 32]; AGGREGATE_SECTION_COUNT] = std::array::from_fn(|index| {
+            v1_digest(
+                b"gpu-db/write001/aggregate-section/v1",
+                &[&headers[index], &sections[index]],
+            )
+        });
+        let aggregate_root = v1_digest(
+            b"gpu-db/write001/aggregate-root/v1",
+            &[
+                &aggregate_header,
+                &section_roots[0],
+                &section_roots[1],
+                &section_roots[2],
+                &section_roots[3],
+                &section_roots[4],
+                &section_roots[5],
+                &section_roots[6],
+                &section_roots[7],
+            ],
+        );
+        let mut stream = aggregate_header.to_vec();
+        for (header, section) in headers.iter().zip(sections.iter()) {
+            stream.extend_from_slice(header);
+            stream.extend_from_slice(section);
+        }
+        stream.extend_from_slice(&aggregate_root);
+        let mut fragment = vec![0; AGGREGATE_CHUNK_HEADER_BYTES as usize];
+        fragment[..8].copy_from_slice(AGGREGATE_CHUNK_MAGIC);
+        fragment[8] = ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE;
+        fragment[9] = AGGREGATE_FORMAT_VERSION as u8;
+        fragment[10..12].copy_from_slice(
+            &(AGGREGATE_CHUNK_FLAG_FIRST | AGGREGATE_CHUNK_FLAG_LAST).to_le_bytes(),
+        );
+        fragment[12..20].copy_from_slice(&(stream.len() as u64).to_le_bytes());
+        fragment[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        fragment[36..40].copy_from_slice(&(stream.len() as u32).to_le_bytes());
+        fragment[44..76].copy_from_slice(&aggregate_root);
+        fragment.extend_from_slice(&stream);
+        let request_digest = v2_digest(
+            b"gpu-db/write001/aggregate-request/v2",
+            &[
+                &[1],
+                &1_u32.to_le_bytes(),
+                &0_u32.to_le_bytes(),
+                &typed_digest,
+                &0_u32.to_le_bytes(),
+            ],
+        );
+        let status = TypedInsertStatusV2 {
+            database_id: [0xa1; 16],
+            timeline_id: [0xa2; 16],
+            txn_id: STABLE_TRANSACTION_ID,
+            request_digest,
+            isolation: 1,
+            flags: 0,
+            retention_deadline: 0,
+            statement_count: 1,
+            response_artifact_count: 0,
+            statement_outcome_root: section_roots[5],
+            response_root: [0; 32],
+            aggregate_root,
+        };
+        let mut status_bytes = vec![0; AGGREGATE_STATUS_V2_BYTES as usize];
+        encode_status_v2(&status, &mut status_bytes).expect("test STATUS2 encodes");
+        let outer = gpu_db_wal::CanonicalPreApplyHeader {
+            identity: gpu_db_wal::CanonicalIdentity {
+                database_id: [0xa1; 16],
+                cluster_id: [0xa3; 16],
+                timeline_id: [0xa2; 16],
+                format_epoch: 5,
+            },
+            leader_epoch: 6,
+            commit_seq: COMMIT_SEQUENCE,
+            stable_transaction_id: STABLE_TRANSACTION_ID,
+            request_digest,
+            isolation: gpu_db_wal::CanonicalIsolation::ReadCommitted,
+            flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
+            catalog_before_epoch: CATALOG_EPOCH,
+            catalog_after_epoch: CATALOG_EPOCH,
+            catalog_before_digest: [0x33; 32],
+            catalog_after_digest: [0x33; 32],
+            operation_count: 2,
+            table_block_count: 1,
+            allocator_high_water: 0,
+        };
+        let outcome = gpu_db_wal::CanonicalOutcome {
+            kind: gpu_db_wal::CanonicalOutcomeKind::AbortError,
+            affected_rows: 0,
+            sqlstate: Some(*b"23502"),
+            constraint_id: TERMINAL_CONSTRAINT_ID,
+            target_digest: aggregate_root,
+            returning_digest: [0; 32],
+        };
+        (outer, outcome, fragment, status_bytes)
+    }
+
+    fn frozen_hex(name: &str) -> Vec<u8> {
+        let source = include_str!("goldens.rs");
+        let prefix = format!("const {name}: &str =");
+        let declaration = source
+            .find(&prefix)
+            .expect("checked-in fixture constant exists")
+            + prefix.len();
+        let start = source[declaration..]
+            .find('"')
+            .expect("checked-in fixture constant opens")
+            + declaration
+            + 1;
+        let end = source[start..]
+            .find("\";")
+            .expect("checked-in fixture constant terminates")
+            + start;
+        source.as_bytes()[start..end]
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("fixture ASCII"), 16)
+                    .expect("fixture hex")
+            })
+            .collect()
+    }
+
+    fn v1_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update((domain.len() as u64).to_le_bytes());
+        digest.update(domain);
+        for field in fields {
+            digest.update((field.len() as u64).to_le_bytes());
+            digest.update(field);
+        }
+        digest.finalize().into()
+    }
+
+    fn v2_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update((domain.len() as u64).to_le_bytes());
+        digest.update(domain);
+        for field in fields {
+            digest.update(field);
+        }
+        digest.finalize().into()
+    }
 }

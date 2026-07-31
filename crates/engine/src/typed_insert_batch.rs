@@ -43,6 +43,8 @@ pub(crate) use typed_image_codec::{
     measure_decoded_typed_image, measure_decoded_typed_image_from_source, DecodedTypedImage,
     TypedImageDecodeMeasure, TypedImageReadAt, TypedImageRole,
 };
+#[cfg(test)]
+pub(crate) use typed_image_codec::{encode_typed_image, TypedImageColumnView, TypedImageView};
 mod constraint_source;
 mod defaults;
 mod resident_source;
