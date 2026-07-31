@@ -81,24 +81,32 @@ starts at WRITE-001:
    interleaved two-table goldens plus ten coherently rehashed hostile vectors close the Q1 boundary. Q1 retains no
    reencoder, constructible generation builder, or live caller.
 
-   The next independently reviewable checkpoint is **Q2 witness closure**. Replace the current witness scaffold,
-   not merely its fixtures: independently validate a pinned catalog and a concrete immutable durable allocator
-   lease proof; consume `CodecClosed` into `GenerationPending`; expose to a pre-reserved builder only a sealed
-   reference-neutral input that omits every final root/generation and final-bound codec digest; and require an
-   owned launched attempt to drain before any output becomes readable. A sealed immutable result owns flat
-   table/index outputs and an opaque generation candidate; validator-side input recomputation then compares every
-   output before constructing `FullyWitnessValidated`. Attempt drop drains exactly once, and failed quiescence
-   retains/quarantines backing ownership rather than releasing in-flight resources.
+   The independently accepted **Q2 witness closure** now validates a pinned catalog and concrete immutable durable
+   allocator lease proof before consuming `CodecClosed` into `GenerationPending`. Its pre-reserved builder receives
+   only a sealed reference-neutral input that omits every final root/generation and final-bound codec digest. The
+   launched attempt owns all backing, drains exactly once before output is readable, and quarantines all four
+   owners when quiescence is unknown. A sealed result owns flat table/index outputs plus an opaque generation
+   candidate; validator-side input recomputation and exact output comparison are the only route to
+   `FullyWitnessValidated`.
 
-   Q2 also closes exact per-statement catalog guard owner/source/target bijections, terminal FK constraint identity,
-   and durable lease completeness, lineage, checkpoint retention, non-overlap, order, and full consumed-interval
+   Q2 closes per-statement catalog guard owner/source/target bijections, terminal FK constraint identity, and
+   durable lease completeness, lineage, checkpoint retention, non-overlap, order, and full consumed-interval
    rules. Coherent catalog/lease/generation/root substitutions and pre-reservation, launch, drain, validation,
-   abandonment, and retry failures must reject without exposing reencoding. Test-only byte reencoding borrows
-   exclusively from `FullyWitnessValidated` and reproduces all S1--S7 bytes for the three Q1 goldens; no production
-   builder implementation or reencoder exists. Keep Q1/Q2 unreachable from live WAL/recovery/apply/publication.
-   S8, the final destructive replay IR, live durable-sequence validation, GPU replay compilation, and the complete
-   live pre-WAL capacity lease remain later WRITE-001 checkpoints; none may add another WAL, operation,
-   publication, or eligibility authority.
+   abandonment, and retry failures reject without exposing reencoding. A `cfg(test)` reencoder borrows exclusively
+   from `FullyWitnessValidated` and reproduces exact S1--S7 bytes for all three Q1 goldens. The explicit-abort
+   golden now carries distinct ordinary and terminal NOT NULL tokens for the same catalog guard; a coherently
+   rehashed old shape reaches codec closure and then fails the catalog-use bijection. No production builder,
+   reencoder, S8, WAL, recovery, apply, publication, or live caller exists.
+
+   The next PLAN-owned checkpoint is the **exact S8 and replay contract freeze**. Before adding an S8 reader,
+   digest, replay owner, writer, or historical translator, freeze and independently audit one internally complete
+   typed retained-response wire: exact header/directories/entries/arenas, unique digest domains and preimages,
+   S6-outcome/S7-projection/result-row bijections, nonempty zero-row `RETURNING`, abort/no-artifact rules, checked
+   decode and bounded allocation. The same design gate must specify the destructive move-only
+   `AggregateReplayTxn`, durable published-sequence validation phase, generation-witness eligibility transition,
+   same-operator GPU replay ordering, and complete live pre-WAL capacity ownership. Implementation remains
+   forbidden until that contract is accepted, and no checkpoint may add another WAL, operation, publication, or
+   eligibility authority.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as

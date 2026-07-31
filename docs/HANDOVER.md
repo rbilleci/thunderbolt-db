@@ -133,23 +133,22 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. Q1 codec-closed quarantine received final independent **ACCEPT** on
-2026-07-31. Its exact source seal is staged tree `f0b6c50f85a58c0cba60ca333675a5ad17b34c6f`, cached-diff SHA-256
-`c5779f8d7e6caaed1d1f25bc8892f2a86ac7f2892966125297b61dedc2353e33`, and 18 source paths with no drift.
-Focused/static gates and the **1,125 passed / 669 GPU-required ignored / 0 failed** serial engine sweep are accepted;
-GPU/HAZARD, recovery-specific execution, and cards were inapplicable to the inert host-only slice.
+**WRITE-001** is the sole active **NOW** task. Q2 witness closure received architecture and final independent
+**ACCEPT** on 2026-07-31 with no finding. Its exact source commit is
+`f288df1c3f4ddd8ef4ff1212c74f6c0a305fe434`, tree `540275d1a581010a2f3d1196c2dc019407eefaec`,
+cached-diff SHA-256 `d427b19ddee9b77dfd1147236301008c1fe1d369701fec3a3e3c7ed8db09f3e0`, and 11 source paths
+without drift. Semantics-v2 passes **68/68** and the serial all-feature engine sweep passes
+**1,168 / 669 GPU-required ignored / 0 failed**; workspace all-target/all-feature check, strict Clippy, scoped
+formatting, source-boundary, diff, and size gates are clean. GPU/HAZARD, recovery execution, and cards were
+inapplicable to the test-only host slice.
 
-Resume with **Q2 witness closure**. Replace the borrowed generation scaffold with a consuming
-`CodecClosed -> GenerationPending -> FullyWitnessValidated` protocol: exact pinned catalog guard/terminal closure,
-a concrete immutable durable allocator lease proof, reference-neutral builder input, pre-reserved owned output,
-drain-before-seal, validator-independent input recomputation, and retained opaque generation-candidate ownership.
-Add coherent catalog/lease/input/root/output/failure sabotage and expose test-only S1--S7 byte reencoding only from
-the fully witness-validated state for all three Q1 goldens. Keep Q2 unreachable from live
-WAL/recovery/apply/publication and provide no production builder implementation or reencoder.
-
-S8, final replay ownership, live durable-sequence validation, GPU replay compilation, and the complete live pre-WAL
-capacity lease remain later WRITE-001 checkpoints; do not add another live operation, WAL, publication, or
-eligibility authority.
+Resume with the **exact S8 and replay contract freeze** before implementation. Freeze and independently audit the
+typed retained-response wire, including exact geometry and digest preimages, S6/S7/result bijections, zero-row
+`RETURNING`, abort/no-artifact rules, checked decode, and bounded ownership. The same gate must specify destructive
+move-only `AggregateReplayTxn` ownership, live durable-sequence validation, generation-witness eligibility, GPU
+replay through the shared typed operators, and the complete live pre-WAL capacity lease. Do not add an S8
+reader/writer/digest, historical translator, live operation, WAL, replay, publication, or eligibility authority
+until that contract is accepted.
 
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read

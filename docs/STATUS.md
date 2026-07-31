@@ -304,6 +304,41 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   drain-before-seal, independent opaque-root proof, and test-only exact reencoding remain Q2 work owned by
   `PLAN.md`.
 
+## WRITE-001 semantics-v2 Q2 witness closure accepted — 2026-07-31
+
+- `CodecClosedSemanticsV2` now advances only through exact pinned-catalog validation plus a closure-scoped,
+  immutable durable allocator index proof. Guard validation closes table/domain/index/FK ownership, source and
+  target statement-use bijections, terminal constraint identity, and synthesized NOT NULL identity. Allocator
+  validation closes authoritative membership, lineage, durability/publication/checkpoint retention, ordering,
+  global non-overlap, and exact consumed intervals before constructing `GenerationPendingSemanticsV2`.
+- The generation builder sees only pre-reserved, sealed, reference-neutral facts; final database/table/index roots,
+  final generations, and final-bound codec digests remain validator-side. A total launch owns the neutral input,
+  candidate, output buffers, and work until an exact-once drain. Unknown quiescence parks all four owners in the
+  quarantine registry. Only independent input recomputation and exact header/table/index output comparison can
+  construct `FullyWitnessValidatedSemanticsV2`, which retains the opaque generation candidate.
+- Independent literal catalog/lease witnesses and one closed-case test builder complete all three checked-in
+  minimal-abort, explicit-abort, and successful interleaved A/B/A cases. A `cfg(test)` logical reencoder is callable
+  only from `FullyWitnessValidated` and reproduces every frozen S1--S7 byte, including S7 directory,
+  root-descriptor, payload-digest, and section-root evidence. Coherent root/generation/builder/guard substitutions
+  reject before reencoding. Source guards pin the two typed component bridges, three positive goldens, witness and
+  builder independence, and absence of S8/live WAL/replay/apply/recovery/publication authority.
+- Q2 exposed and repaired the Q1 explicit-abort oracle: statement 0 now uses an ordinary flags-clear NOT NULL token
+  and statement 1 uses a distinct terminal token for the same pinned catalog guard. The canonical S7 is exactly
+  **3,396 bytes**. A coherently reframed old shape physically removes the ordinary dependency/use, passes strict
+  fill and codec closure, and then fails the catalog one-use bijection.
+- Independent architecture review and the frozen-candidate acceptance audit both returned **ACCEPT** with no
+  unresolved finding. The exact accepted source commit is `f288df1c3f4ddd8ef4ff1212c74f6c0a305fe434`, tree
+  `540275d1a581010a2f3d1196c2dc019407eefaec`, cached-diff SHA-256
+  `d427b19ddee9b77dfd1147236301008c1fe1d369701fec3a3e3c7ed8db09f3e0`, across **11 source paths** with no
+  drift. Semantics-v2 passes **68/68**; the serial all-feature engine library passes **1,168 / 669 / 0**
+  (passed/GPU-required ignored/failed); workspace all-target/all-feature check, strict workspace Clippy, scoped
+  rustfmt, diff, source-boundary, and size gates are clean.
+- GPU NULL differential, HAZARD, recovery execution, roofline, quick/full report cards, and benchmark provenance
+  are inapplicable because every new builder/reencoder/golden surface is test-only and no live device, read,
+  result, WAL, recovery, apply, or publication path changed. S8, destructive replay ownership, live durable
+  sequence validation, GPU replay compilation, and the complete live pre-WAL capacity lease remain PLAN-owned
+  work.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted
