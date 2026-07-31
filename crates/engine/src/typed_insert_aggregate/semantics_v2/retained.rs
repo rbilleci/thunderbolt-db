@@ -22,6 +22,8 @@ mod graph;
 mod reencode;
 #[path = "retained/reservation.rs"]
 mod reservation;
+#[path = "retained/retention_authority.rs"]
+mod retention_authority;
 
 /// Shared identity captured from the canonical outer/S7 framing before a model can leave raw
 /// proof. It owns no catalog or publication authority.
@@ -253,11 +255,20 @@ pub(super) struct AggregateReplayTxn<Phase> {
 #[allow(dead_code)]
 pub(super) struct CodecQuarantined(PrivateSeal);
 
-/// The codec-only retained closure has completed.  This inert slice deliberately ends here:
-/// retention-claim proof, catalog/allocator proof, sequence proof, GPU replay, and publication
-/// are not production successors.
+/// The codec-only retained closure has completed.  The next sealed phase authenticates the one
+/// durable retention claim (or the sealed historical no-retention proof) before catalog or
+/// allocator validation becomes available.
 #[allow(dead_code)]
 pub(super) struct RetentionAuthorityPending(PrivateSeal);
+
+/// The sole retention authority has been authenticated and is carried opaquely to the later
+/// catalog/allocator phase.  This state intentionally has no catalog, allocator, sequence, GPU,
+/// WAL, recovery, apply, result, or publication operation yet.
+#[allow(dead_code)]
+pub(super) struct CatalogAllocatorPending<'a> {
+    authority: retention_authority::ValidatedRetentionAuthority<'a>,
+    seal: PrivateSeal,
+}
 
 /// Only this module can construct a phase marker, keeping the move-only graph transition sealed.
 struct PrivateSeal;
@@ -383,6 +394,27 @@ impl AggregateReplayTxn<CodecQuarantined> {
     ) -> Result<(), crate::EngineError> {
         self.close_codec_for_test()?
             .validate_guards_for_test(catalog)
+    }
+}
+
+impl AggregateReplayTxn<RetentionAuthorityPending> {
+    /// Consume the codec-closed owner only after the authenticated claim/status index proves the
+    /// immutable retention intent, or a sealed historical proof establishes no retention.  This
+    /// phase is deliberately before catalog, allocator, durable sequence, GPU replay, WAL, apply,
+    /// and publication work.
+    pub(super) fn validate_retention_authority<'a>(
+        self,
+        input: retention_authority::RetentionAuthorityInput<'a>,
+    ) -> Result<AggregateReplayTxn<CatalogAllocatorPending<'a>>, crate::EngineError> {
+        let authority =
+            retention_authority::validate(self.graph.identity, &self.graph.graph, input)?;
+        Ok(AggregateReplayTxn {
+            graph: self.graph,
+            phase: CatalogAllocatorPending {
+                authority,
+                seal: PrivateSeal,
+            },
+        })
     }
 }
 
@@ -605,10 +637,11 @@ fn retained_error(message: &str) -> crate::EngineError {
 #[cfg(test)]
 mod replay_shell_source_guards {
     #[test]
-    fn production_replay_shell_has_no_catalog_or_live_successor() {
+    fn retained_shell_has_one_sealed_retention_transition_and_no_later_owner() {
         let source = include_str!("retained.rs");
         let facade = include_str!("../semantics_v2.rs");
         let fill = include_str!("retained/fill.rs");
+        let retention = include_str!("retained/retention_authority.rs");
         let sealed = ["struct Private", "Seal;"].concat();
         let quarantined = ["struct Codec", "Quarantined(PrivateSeal);"].concat();
         let pending = ["struct RetentionAuthority", "Pending(PrivateSeal);"].concat();
@@ -636,7 +669,15 @@ mod replay_shell_source_guards {
             "codec quarantine has exactly one production phase transition"
         );
         let pending_impl = ["impl AggregateReplayTxn<", "RetentionAuthorityPending", ">"].concat();
-        assert!(!source.contains(&pending_impl));
+        assert_eq!(
+            source.matches(&pending_impl).count(),
+            1,
+            "retention authority has one sealed aggregate transition"
+        );
+        let catalog_pending = ["struct CatalogAllocator", "Pending<'a>"].concat();
+        let catalog_pending_impl = ["impl AggregateReplayTxn<", "CatalogAllocatorPending"].concat();
+        assert!(source.contains(&catalog_pending));
+        assert!(!source.contains(&catalog_pending_impl));
         let transaction_decl = ["pub(super) struct AggregateReplayTxn", "<Phase>"].concat();
         let declaration_offset = source
             .find(&transaction_decl)
@@ -691,6 +732,53 @@ mod replay_shell_source_guards {
         assert!(fill.contains("This has no transition to WAL, recovery, execution, GPU, result, or publication state."));
         assert!(!fill.contains("fn publish"));
         assert!(!fill.contains("fn replay"));
+        assert!(retention.contains("struct AuthenticatedClaimStatusIndex"));
+        assert!(retention.contains("struct ValidatedRetentionAuthority"));
+        assert!(retention.contains("HistoricalNoRetention"));
+        let production_retention = retention
+            .split("#[cfg(test)]")
+            .next()
+            .expect("retention authority has a production boundary");
+        for forbidden in ["HashMap", "Vec<", "Box<", ".clone()", ".collect()"] {
+            assert!(
+                !production_retention.contains(forbidden),
+                "retention authority must borrow without clone or allocation: {forbidden}"
+            );
+        }
+        let live_claim_validator = retention
+            .split("fn validate_live_claim")
+            .nth(1)
+            .and_then(|source| source.split("fn validate_historical_no_retention").next())
+            .expect("retention authority has one live-claim validator");
+        for sealed_terminal_field in [
+            "s6_retained_statement_bits",
+            "s7_retained_statement_bits",
+            "s8_artifact_statement_ordinals",
+            "s8_artifact_count",
+            "aggregate_retained_response",
+            "status_artifact_count",
+            "status_deadline",
+        ] {
+            assert!(
+                !live_claim_validator.contains(sealed_terminal_field),
+                "retention authority must carry, not inspect, terminal field {sealed_terminal_field}"
+            );
+        }
+        for forbidden in [
+            "SemanticsV2Catalog",
+            "allocator_index",
+            "GenerationPending",
+            "WalBuffer",
+            "DeviceInsertPlan",
+            "fn publish",
+            "fn replay",
+            "fn apply",
+        ] {
+            assert!(
+                !retention.contains(forbidden),
+                "retention authority must not gain later authority {forbidden}"
+            );
+        }
         for (name, q2_source) in [
             ("Q2 witnesses", include_str!("goldens/q2_witnesses.rs")),
             (
