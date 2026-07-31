@@ -339,6 +339,35 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   sequence validation, GPU replay compilation, and the complete live pre-WAL capacity lease remain PLAN-owned
   work.
 
+## WRITE-001 exact S8 retained-response and replay design accepted — 2026-07-31
+
+- The exact design is accepted at
+  [design/write-001-codec5-s8-replay.md](design/write-001-codec5-s8-replay.md), file SHA-256
+  `acef17d5bf1a53bd12b9635add7b84648d09edf9effd5a383360692efb6fbd1c`, commit
+  `e15304618afc160e4d8bba0914b1021bb6572ad6`, tree
+  `fb768ad38b3df7cbf77b0842ee45916074a9cab9`, and accepted cached-diff SHA-256
+  `17ab2de115cc0cede06d7889d2a099df4ba7b8f1bf773c452713eae821b78e85`. Architecture review and the
+  independent acceptance audit both returned **ACCEPT**.
+- S8 is now byte-exact: nonempty payloads use the 256-byte GPUDBS8RESPONSE2 header, adjacent
+  288-byte artifact and 32-byte row-selection directories, and an exact image arena. The inherited
+  length-prefixed v1 response-root hash remains distinct from S8-local v2 digest domains. Exact S6/S7,
+  row-selection, typed-image, status/deadline, and aggregate closure remain acyclic.
+- The audits found and repaired two retention contradictions. First, pre-effect RetentionIntent now owns only the
+  outcome-independent eligible RETURNING bitset and candidate deadline, while independently observed outcomes
+  derive the final S6/S7 retention bits, S8 artifacts, aggregate flag, and STATUS2 deadline. Second, local codec
+  checks cannot prove an eligible-artifact omission: RetentionAuthorityPending now validates the durable
+  TransactionClaimStatus proof before catalog/allocator progress and carries the sealed
+  `ValidatedRetentionAuthority` sum through replay for consumption only by the final comparator. Its live arm owns
+  `ValidatedRetentionIntent`; its historical arm owns only `HistoricalNoRetentionProof` from an authenticated
+  literal legacy form.
+- The accepted design closes durable published-sequence proof, source-guarded same-operator GPU replay,
+  launch/drain/quarantine, final comparator eligibility, and all-domain pre-WAL capacity accounting without
+  creating a second WAL, status, apply, recovery, or publication authority.
+- This was documentation-only: no source, device, residency, read/result, WAL, recovery, apply, publication,
+  GPU/HAZARD, quick/full card, or benchmark evidence changed or applied. The next PLAN checkpoint is the inert
+  final-abort RETURNING repair plus nonempty S8 pass-zero/reservation/fill/local codec closure and only the minimal
+  CodecQuarantined to RetentionAuthorityPending shell; PLAN.md owns its sequencing and later authority phases.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted

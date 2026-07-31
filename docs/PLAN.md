@@ -98,15 +98,23 @@ starts at WRITE-001:
    rehashed old shape reaches codec closure and then fails the catalog-use bijection. No production builder,
    reencoder, S8, WAL, recovery, apply, publication, or live caller exists.
 
-   The next PLAN-owned checkpoint is the **exact S8 and replay contract freeze**. Before adding an S8 reader,
-   digest, replay owner, writer, or historical translator, freeze and independently audit one internally complete
-   typed retained-response wire: exact header/directories/entries/arenas, unique digest domains and preimages,
-   S6-outcome/S7-projection/result-row bijections, nonempty zero-row `RETURNING`, abort/no-artifact rules, checked
-   decode and bounded allocation. The same design gate must specify the destructive move-only
-   `AggregateReplayTxn`, durable published-sequence validation phase, generation-witness eligibility transition,
-   same-operator GPU replay ordering, and complete live pre-WAL capacity ownership. Implementation remains
-   forbidden until that contract is accepted, and no checkpoint may add another WAL, operation, publication, or
-   eligibility authority.
+   The exact S8 retained-response and replay design is now accepted at
+   [design/write-001-codec5-s8-replay.md](design/write-001-codec5-s8-replay.md), file SHA-256
+   `acef17d5bf1a53bd12b9635add7b84648d09edf9effd5a383360692efb6fbd1c`, commit
+   `e15304618afc160e4d8bba0914b1021bb6572ad6`, tree
+   `fb768ad38b3df7cbf77b0842ee45916074a9cab9`; architecture and the independent acceptance audit both
+   returned **ACCEPT**. It freezes a 256-byte `GPUDBS8RESPONSE2` header with adjacent 288-byte artifact,
+   32-byte row-selection, and image-arena directories; keeps the inherited length-prefixed v1 response hash
+   distinct from local v2 S8 digest domains; closes RetentionIntent and
+   RetentionAuthorityPending claim proof, including sealed live and historical no-retention forms; and specifies
+   durable-sequence proof, source-guarded GPU replay, launch/drain/quarantine, and all-domain pre-WAL capacity
+   ownership.
+
+   The next PLAN-owned checkpoint is an **inert final-abort RETURNING repair plus nonempty S8
+   pass-zero/reservation/fill/local codec closure**. It begins the minimal
+   `AggregateReplayTxn<CodecQuarantined> -> RetentionAuthorityPending` shell only. It must not add claim,
+   catalog, sequence, GPU, live, WAL, recovery, apply, publication, or other eligibility authority; those remain
+   later PLAN-owned work under the accepted design.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as

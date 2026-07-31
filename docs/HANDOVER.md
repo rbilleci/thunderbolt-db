@@ -142,13 +142,21 @@ without drift. Semantics-v2 passes **68/68** and the serial all-feature engine s
 formatting, source-boundary, diff, and size gates are clean. GPU/HAZARD, recovery execution, and cards were
 inapplicable to the test-only host slice.
 
-Resume with the **exact S8 and replay contract freeze** before implementation. Freeze and independently audit the
-typed retained-response wire, including exact geometry and digest preimages, S6/S7/result bijections, zero-row
-`RETURNING`, abort/no-artifact rules, checked decode, and bounded ownership. The same gate must specify destructive
-move-only `AggregateReplayTxn` ownership, live durable-sequence validation, generation-witness eligibility, GPU
-replay through the shared typed operators, and the complete live pre-WAL capacity lease. Do not add an S8
-reader/writer/digest, historical translator, live operation, WAL, replay, publication, or eligibility authority
-until that contract is accepted.
+The exact S8 retained-response and replay design is accepted at
+[design/write-001-codec5-s8-replay.md](design/write-001-codec5-s8-replay.md), file SHA-256
+`acef17d5bf1a53bd12b9635add7b84648d09edf9effd5a383360692efb6fbd1c`, commit
+`e15304618afc160e4d8bba0914b1021bb6572ad6`, tree
+`fb768ad38b3df7cbf77b0842ee45916074a9cab9`; architecture and the independent acceptance audit both returned
+**ACCEPT**. It fixes the 256-byte S8 header and adjacent 288-byte artifact, 32-byte row-selection, and image-arena
+directories; distinguishes the inherited length-prefixed v1 response root from local v2 S8 digests; and closes
+RetentionIntent/RetentionAuthorityPending, sealed live and historical no-retention proof, durable sequence proof,
+source-guarded GPU replay, launch/drain/quarantine, and pre-WAL capacity ownership.
+
+Resume with PLAN.md's next inert final-abort RETURNING repair plus nonempty S8
+pass-zero/reservation/fill/local codec closure. It may introduce only the minimal
+`AggregateReplayTxn<CodecQuarantined> -> RetentionAuthorityPending` shell. It must not add claim, catalog, sequence,
+GPU, live, WAL, recovery, apply, publication, or other eligibility authority. Q2's accepted source facts above and
+the CARD-001/COPY-001 blocks remain unchanged.
 
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read
