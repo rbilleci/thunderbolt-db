@@ -27,6 +27,8 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
+pub(super) use allocator::SemanticsV2DurableAllocatorIndexProof;
+
 const TARGET_TABLE: u8 = 1;
 const FOREIGN_PARENT_TABLE: u8 = 2;
 const MAINTAINED_INDEX: u8 = 3;
@@ -49,12 +51,19 @@ pub(super) fn validate(
     validate_catalog_allocator_witness_identity(identity, witness)?;
     validate_retained_header_identity(identity, graph)?;
     validate_catalog_order(&witness.catalog)?;
-    allocator::validate_allocator_closure(identity, graph, witness.allocator_index.leases())?;
+    allocator::validate_allocator_closure(identity, graph, &witness.allocator_index)?;
     allocator::validate_table_closure(identity, graph, &witness.catalog)?;
     validate_index_closure(identity, graph, &witness.catalog)?;
     validate_domain_closure(identity, graph, &witness.catalog)?;
     guards::validate_guard_closure(identity, graph, &witness.catalog)?;
     validate_sequence_closure(identity, graph, &witness.catalog)
+}
+
+pub(super) fn validate_durable_allocator_index_identity(
+    identity: SemanticsV2BoundIdentity,
+    proof: &SemanticsV2DurableAllocatorIndexProof<'_>,
+) -> Result<(), crate::EngineError> {
+    allocator::validate_durable_allocator_index_identity(identity, proof)
 }
 
 fn validate_retained_header_identity(

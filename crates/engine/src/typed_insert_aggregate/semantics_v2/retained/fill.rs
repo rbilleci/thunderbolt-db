@@ -110,6 +110,10 @@ pub(super) fn fill_after_pass_zero(
 
     let identity = SemanticsV2BoundIdentity {
         database_id: outer.identity.database_id,
+        cluster_id: outer.identity.cluster_id,
+        timeline_id: outer.identity.timeline_id,
+        format_epoch: outer.identity.format_epoch,
+        leader_epoch: outer.leader_epoch,
         catalog_epoch: outer.catalog_before_epoch,
         catalog_digest: outer.catalog_before_digest,
         stable_transaction_id: outer.stable_transaction_id,

@@ -3,34 +3,286 @@
 use super::super::{
     graph::{ReservedSemanticsV2Graph, RetainedDependencyToken, RetainedTable},
     SemanticsV2BoundIdentity, SemanticsV2CatalogColumnWitness, SemanticsV2CatalogTableWitness,
-    SemanticsV2CatalogWitness, SemanticsV2RowAllocatorLeaseWitness,
+    SemanticsV2CatalogWitness,
 };
 use crate::typed_insert_batch::DecodedDependencyFacts;
+use sha2::{Digest, Sha256};
 
-/// The durable allocator index has already established marker provenance.  This codec boundary
-/// only closes each proven lease against exactly one retained S7 table and its contained row
-/// interval; it never tries to reconstruct allocator state from the transaction bytes.
+#[cfg(test)]
+#[path = "allocator_tests.rs"]
+mod allocator_tests;
+
+/// Concrete borrowed authority from the durable allocator index.  It carries both the complete
+/// immutable index and the transaction's explicit frozen selection; the latter is never inferred
+/// from an epoch.  The non-`Copy` proof borrows an opaque pin, so its lifetime keeps the pinned
+/// checkpoint/index generation alive until generation validation consumes the pending owner.
+pub(in crate::typed_insert_aggregate::semantics_v2::retained) struct SemanticsV2DurableAllocatorIndexProof<
+    'a,
+> {
+    snapshot: &'a SemanticsV2ImmutableDurableAllocatorIndex<'a>,
+    checkpoint_pin: &'a SemanticsV2PinnedAllocatorIndexGeneration,
+    selected: &'a [SemanticsV2SelectedAllocatorLeaseWitness],
+}
+
+/// The immutable complete index carries authenticated marker frontiers and a root recomputed
+/// over every row.  Its fields are private to the durable-index adapter; codec bytes cannot
+/// manufacture either a root or a record selection from this owner.
+#[allow(dead_code)]
+pub(super) struct SemanticsV2ImmutableDurableAllocatorIndex<'a> {
+    database_id: [u8; 16],
+    index_generation: u64,
+    index_root: [u8; 32],
+    complete_next_commit_sequence: u64,
+    durable_next_commit_sequence: u64,
+    published_next_commit_sequence: u64,
+    records: &'a [SemanticsV2DurableAllocatorLeaseRecord],
+}
+
+/// Opaque active checkpoint/index-generation ownership.  Its non-`Copy` shape is intentional:
+/// a proof can borrow this guard but cannot duplicate, retire, or recreate its retention claim.
+#[allow(dead_code)]
+pub(super) struct SemanticsV2PinnedAllocatorIndexGeneration {
+    database_id: [u8; 16],
+    cluster_id: [u8; 16],
+    timeline_id: [u8; 16],
+    format_epoch: u64,
+    leader_epoch: u64,
+    index_generation: u64,
+    index_root: [u8; 32],
+    retained_through_commit_sequence: u64,
+}
+
+/// One record in the authoritative complete index.  It stores only the frozen allocator-marker
+/// tuple; complete/durable/published state comes from authenticated snapshot frontiers instead
+/// of self-described copies on every row.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SemanticsV2DurableAllocatorLeaseRecord {
+    database_id: [u8; 16],
+    allocator_kind: u8,
+    stable_allocator_id: u64,
+    lease_epoch: u64,
+    lease_start: u64,
+    lease_end: u64,
+    prior_high_water: u64,
+    new_high_water: u64,
+    marker_system_transaction_id: u64,
+    marker_commit_sequence: u64,
+}
+
+/// Exact transaction-selected witness.  The index ordinal is a bounded handle, while the full
+/// frozen tuple prevents a narrowed/reconstructed lease from posing as the authoritative row.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SemanticsV2SelectedAllocatorLeaseWitness {
+    record_ordinal: u32,
+    database_id: [u8; 16],
+    allocator_kind: u8,
+    stable_allocator_id: u64,
+    lease_epoch: u64,
+    lease_start: u64,
+    lease_end: u64,
+    prior_high_water: u64,
+    new_high_water: u64,
+    marker_system_transaction_id: u64,
+    marker_commit_sequence: u64,
+}
+
+/// Test-only adapter for immutable authoritative records and explicit selected witnesses.  It
+/// is the sole local construction seam; production has no callback or codec-visible constructor.
+#[cfg(test)]
+pub(super) fn proof_from_immutable_checked_records_for_test<'a>(
+    snapshot: &'a SemanticsV2ImmutableDurableAllocatorIndex<'a>,
+    checkpoint_pin: &'a SemanticsV2PinnedAllocatorIndexGeneration,
+    selected: &'a [SemanticsV2SelectedAllocatorLeaseWitness],
+) -> SemanticsV2DurableAllocatorIndexProof<'a> {
+    SemanticsV2DurableAllocatorIndexProof {
+        snapshot,
+        checkpoint_pin,
+        selected,
+    }
+}
+
+pub(super) fn validate_durable_allocator_index_identity(
+    identity: SemanticsV2BoundIdentity,
+    proof: &SemanticsV2DurableAllocatorIndexProof<'_>,
+) -> Result<(), crate::EngineError> {
+    validate_complete_index(identity, proof)?;
+    validate_selected_marker_lifecycle(identity, proof)
+}
+
+fn validate_complete_index(
+    identity: SemanticsV2BoundIdentity,
+    proof: &SemanticsV2DurableAllocatorIndexProof<'_>,
+) -> Result<(), crate::EngineError> {
+    let snapshot = proof.snapshot;
+    let pin = proof.checkpoint_pin;
+    super::require(
+        snapshot.database_id == identity.database_id
+            && snapshot.index_generation != 0
+            && snapshot.index_generation != u64::MAX
+            && snapshot.index_root != [0; 32]
+            && snapshot.complete_next_commit_sequence != 0
+            && snapshot.durable_next_commit_sequence != 0
+            && snapshot.published_next_commit_sequence != 0
+            && pin.database_id == identity.database_id
+            && pin.cluster_id == identity.cluster_id
+            && pin.timeline_id == identity.timeline_id
+            && pin.format_epoch == identity.format_epoch
+            && pin.leader_epoch == identity.leader_epoch
+            && pin.leader_epoch != 0
+            && pin.index_generation == snapshot.index_generation
+            && pin.index_root == snapshot.index_root
+            && pin.retained_through_commit_sequence != 0
+            && immutable_index_root(snapshot) == snapshot.index_root,
+        "durable allocator pinned index identity or authenticated root is invalid",
+    )?;
+
+    for (record_ordinal, record) in snapshot.records.iter().enumerate() {
+        validate_complete_record(identity, record)?;
+        for earlier in &snapshot.records[..record_ordinal] {
+            if earlier.stable_allocator_id == record.stable_allocator_id
+                && earlier.lease_epoch == record.lease_epoch
+            {
+                super::require(
+                    earlier.lease_end <= record.lease_start
+                        || record.lease_end <= earlier.lease_start,
+                    "complete durable allocator index has hidden allocator lease overlap",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_complete_record(
+    identity: SemanticsV2BoundIdentity,
+    record: &SemanticsV2DurableAllocatorLeaseRecord,
+) -> Result<(), crate::EngineError> {
+    super::require(
+        record.database_id == identity.database_id
+            && record.allocator_kind == 1
+            && record.stable_allocator_id != 0
+            && record.stable_allocator_id != u64::MAX
+            && record.lease_epoch != 0
+            && record.lease_epoch != u64::MAX
+            && record.lease_start != 0
+            && record.lease_start != u64::MAX
+            && record.lease_end != 0
+            && record.lease_end != u64::MAX
+            && record.prior_high_water <= record.lease_start
+            && record.lease_start < record.lease_end
+            && record.new_high_water == record.lease_end
+            && record.marker_system_transaction_id != 0
+            && record.marker_system_transaction_id != u64::MAX
+            && record.marker_commit_sequence != 0
+            && record.marker_commit_sequence != u64::MAX,
+        "complete durable allocator index record has an invalid immutable shape",
+    )
+}
+
+fn validate_selected_marker_lifecycle(
+    identity: SemanticsV2BoundIdentity,
+    proof: &SemanticsV2DurableAllocatorIndexProof<'_>,
+) -> Result<(), crate::EngineError> {
+    for (selected_ordinal, selected) in proof.selected.iter().enumerate() {
+        let record = proof
+            .snapshot
+            .records
+            .get(usize::try_from(selected.record_ordinal).map_err(|_| {
+                super::validation_error(
+                    "selected durable allocator record ordinal is unaddressable",
+                )
+            })?)
+            .ok_or_else(|| {
+                super::validation_error("selected durable allocator record is absent")
+            })?;
+        super::require(
+            selected_matches_record(selected, record)
+                && selected.marker_system_transaction_id != identity.stable_transaction_id
+                && selected.marker_commit_sequence < identity.commit_sequence
+                && selected.marker_commit_sequence < proof.snapshot.complete_next_commit_sequence
+                && selected.marker_commit_sequence < proof.snapshot.durable_next_commit_sequence
+                && selected.marker_commit_sequence < proof.snapshot.published_next_commit_sequence
+                && selected.marker_commit_sequence
+                    <= proof.checkpoint_pin.retained_through_commit_sequence,
+            "selected durable allocator witness lacks exact member, lifecycle, or checkpoint evidence",
+        )?;
+        for earlier in &proof.selected[..selected_ordinal] {
+            super::require(
+                earlier.record_ordinal != selected.record_ordinal,
+                "selected durable allocator witness duplicates an authoritative record",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn selected_matches_record(
+    selected: &SemanticsV2SelectedAllocatorLeaseWitness,
+    record: &SemanticsV2DurableAllocatorLeaseRecord,
+) -> bool {
+    selected.database_id == record.database_id
+        && selected.allocator_kind == record.allocator_kind
+        && selected.stable_allocator_id == record.stable_allocator_id
+        && selected.lease_epoch == record.lease_epoch
+        && selected.lease_start == record.lease_start
+        && selected.lease_end == record.lease_end
+        && selected.prior_high_water == record.prior_high_water
+        && selected.new_high_water == record.new_high_water
+        && selected.marker_system_transaction_id == record.marker_system_transaction_id
+        && selected.marker_commit_sequence == record.marker_commit_sequence
+}
+
+fn immutable_index_root(snapshot: &SemanticsV2ImmutableDurableAllocatorIndex<'_>) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"gpu-db/write001/durable-allocator-index/v1");
+    digest.update(snapshot.database_id);
+    digest.update(snapshot.index_generation.to_le_bytes());
+    digest.update(snapshot.complete_next_commit_sequence.to_le_bytes());
+    digest.update(snapshot.durable_next_commit_sequence.to_le_bytes());
+    digest.update(snapshot.published_next_commit_sequence.to_le_bytes());
+    digest.update(
+        u64::try_from(snapshot.records.len())
+            .expect("durable allocator index record count fits u64")
+            .to_le_bytes(),
+    );
+    for record in snapshot.records {
+        digest.update(record.database_id);
+        digest.update([record.allocator_kind]);
+        digest.update(record.stable_allocator_id.to_le_bytes());
+        digest.update(record.lease_epoch.to_le_bytes());
+        digest.update(record.lease_start.to_le_bytes());
+        digest.update(record.lease_end.to_le_bytes());
+        digest.update(record.prior_high_water.to_le_bytes());
+        digest.update(record.new_high_water.to_le_bytes());
+        digest.update(record.marker_system_transaction_id.to_le_bytes());
+        digest.update(record.marker_commit_sequence.to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// Match the explicit selected witnesses, in stable S7 table order, to the complete immutable
+/// index.  Unrelated index records at any epoch remain valid evidence and are never selected by
+/// a heuristic scan.
 pub(super) fn validate_allocator_closure(
     identity: SemanticsV2BoundIdentity,
     graph: &ReservedSemanticsV2Graph,
-    leases: &[SemanticsV2RowAllocatorLeaseWitness],
+    proof: &SemanticsV2DurableAllocatorIndexProof<'_>,
 ) -> Result<(), crate::EngineError> {
+    validate_durable_allocator_index_identity(identity, proof)?;
     super::require(
-        leases.len() == graph.tables.len(),
-        "durable allocator proof does not have exactly one lease per S7 table",
+        proof.selected.len() == graph.tables.len(),
+        "durable allocator proof does not have exactly one selected lease per S7 table",
     )?;
     let mut prior_table_id = None;
-    for (table, lease) in graph.tables.iter().zip(leases) {
+    for (table, selected) in graph.tables.iter().zip(proof.selected) {
         super::require(
             prior_table_id.is_none_or(|prior| prior < table.stable_table_id)
-                && lease.database_id == identity.database_id
-                && lease.allocator_kind == 1
-                && lease.stable_allocator_id == table.stable_table_id
-                && lease.marker_commit_sequence < identity.commit_sequence
-                && lease.marker_system_transaction_id != identity.stable_transaction_id
-                && lease.lease_start <= table.row_allocator_before
-                && table.row_allocator_high_water <= lease.lease_end,
-            "durable allocator lease order, marker precedence, or table interval is invalid",
+                && selected.stable_allocator_id == table.stable_table_id
+                && selected.lease_start <= table.row_allocator_before
+                && table.row_allocator_high_water <= selected.lease_end,
+            "selected durable allocator lease order or full S7 table interval is invalid",
         )?;
         prior_table_id = Some(table.stable_table_id);
     }

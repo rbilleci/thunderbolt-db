@@ -25,6 +25,10 @@ mod reservation;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SemanticsV2BoundIdentity {
     pub(super) database_id: [u8; 16],
+    pub(super) cluster_id: [u8; 16],
+    pub(super) timeline_id: [u8; 16],
+    pub(super) format_epoch: u64,
+    pub(super) leader_epoch: u64,
     pub(super) catalog_epoch: u64,
     pub(super) catalog_digest: [u8; 32],
     pub(super) stable_transaction_id: u64,
@@ -42,38 +46,7 @@ pub(super) struct SemanticsV2BoundIdentity {
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogAllocatorWitness<'a> {
     pub(super) catalog: SemanticsV2CatalogWitness<'a>,
-    allocator_index: SemanticsV2DurableAllocatorIndexProof<'a>,
-}
-
-/// Borrowed evidence returned by the durable allocator index after it has established marker
-/// durability, publication lineage, epoch non-overlap, and checkpoint retention.  The proof is
-/// a private callback, not a codec-constructable wrapper around claimed Boolean fields.
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-pub(super) struct SemanticsV2DurableAllocatorIndexProof<'a> {
-    index: &'a dyn DurableAllocatorIndexLeaseProof,
-}
-
-impl<'a> SemanticsV2DurableAllocatorIndexProof<'a> {
-    fn leases(self) -> &'a [SemanticsV2RowAllocatorLeaseWitness] {
-        self.index.proven_table_row_leases()
-    }
-}
-
-/// Implemented only by the retained durable-index adapter.  There is deliberately no public
-/// constructor or codec-visible trait: calling this method asserts that the index has already
-/// proved the complete/durable/published/same-lineage/non-overlap/checkpoint predicates.
-trait DurableAllocatorIndexLeaseProof {
-    fn proven_table_row_leases(&self) -> &[SemanticsV2RowAllocatorLeaseWitness];
-}
-
-/// The only production constructor will be placed with the durable allocator-index adapter,
-/// which is a child of this retained boundary and can prove the trait's preconditions.  Keeping
-/// it private leaves the current inert codec with no way to manufacture lease evidence.
-fn durable_allocator_index_proof_from_proven_index(
-    index: &dyn DurableAllocatorIndexLeaseProof,
-) -> SemanticsV2DurableAllocatorIndexProof<'_> {
-    SemanticsV2DurableAllocatorIndexProof { index }
+    allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'a>,
 }
 
 #[allow(dead_code)]
@@ -213,21 +186,6 @@ pub(super) struct SemanticsV2CatalogSequenceWitness<'a> {
     pub(super) descriptor_digest: [u8; 32],
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SemanticsV2RowAllocatorLeaseWitness {
-    pub(super) database_id: [u8; 16],
-    pub(super) allocator_kind: u8,
-    pub(super) stable_allocator_id: u64,
-    pub(super) lease_epoch: u64,
-    pub(super) lease_start: u64,
-    pub(super) lease_end: u64,
-    pub(super) prior_high_water: u64,
-    pub(super) new_high_water: u64,
-    pub(super) marker_system_transaction_id: u64,
-    pub(super) marker_commit_sequence: u64,
-}
-
 /// Private retained graph placeholder. It is intentionally unconstructable outside the complete
 /// post-reservation source/image decoder, which is the sole owner allowed to add decoded S1--S7
 /// fields. Keeping it private prevents a test helper from manufacturing a phase transition.
@@ -271,13 +229,12 @@ pub(super) struct FullyWitnessValidatedSemanticsV2<'a> {
 }
 
 struct CatalogAndAllocatorValidated<'a> {
-    catalog: &'a SemanticsV2CatalogWitness<'a>,
-    allocator_index: SemanticsV2DurableAllocatorIndexProof<'a>,
+    catalog: SemanticsV2CatalogWitness<'a>,
+    allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'a>,
 }
 
 struct FullyValidatedWitnesses<'a> {
-    catalog: &'a SemanticsV2CatalogWitness<'a>,
-    allocator_index: SemanticsV2DurableAllocatorIndexProof<'a>,
+    catalog: SemanticsV2CatalogWitness<'a>,
     generation: SemanticsV2GenerationWitness<'a>,
 }
 
@@ -332,14 +289,18 @@ impl CodecClosedSemanticsV2 {
     /// closure. No generation result is accepted, retained, or constructed at this boundary.
     pub(super) fn validate_catalog_and_allocator<'a>(
         self,
-        witness: &'a SemanticsV2CatalogAllocatorWitness<'a>,
+        witness: SemanticsV2CatalogAllocatorWitness<'a>,
     ) -> Result<GenerationPendingSemanticsV2<'a>, crate::EngineError> {
-        catalog_validation::validate(self.graph.identity, &self.graph.graph, witness)?;
+        catalog_validation::validate(self.graph.identity, &self.graph.graph, &witness)?;
+        let SemanticsV2CatalogAllocatorWitness {
+            catalog,
+            allocator_index,
+        } = witness;
         Ok(GenerationPendingSemanticsV2 {
             graph: self.graph,
             catalog_and_allocator: CatalogAndAllocatorValidated {
-                catalog: &witness.catalog,
-                allocator_index: witness.allocator_index,
+                catalog,
+                allocator_index,
             },
         })
     }
@@ -349,7 +310,7 @@ impl CodecClosedSemanticsV2 {
     #[cfg(test)]
     pub(super) fn validate_catalog_and_allocator_for_test<'a>(
         self,
-        witness: &'a SemanticsV2CatalogAllocatorWitness<'a>,
+        witness: SemanticsV2CatalogAllocatorWitness<'a>,
     ) -> Result<GenerationPendingSemanticsV2<'a>, crate::EngineError> {
         self.validate_catalog_and_allocator(witness)
     }
@@ -383,6 +344,10 @@ pub(super) fn validate_catalog_allocator_witness_identity(
     if identity.database_id == [0; 16]
         || identity.catalog_epoch == 0
         || identity.catalog_digest == [0; 32]
+        || identity.cluster_id == [0; 16]
+        || identity.timeline_id == [0; 16]
+        || identity.format_epoch == 0
+        || identity.leader_epoch == 0
         || identity.stable_transaction_id == 0
         || identity.commit_sequence == 0
         || identity.initial_database_root == [0; 32]
@@ -394,31 +359,10 @@ pub(super) fn validate_catalog_allocator_witness_identity(
             "witness group identity does not match the sealed v2 envelope",
         ));
     }
-    for lease in witness.allocator_index.leases() {
-        if lease.database_id != identity.database_id
-            || lease.allocator_kind != 1
-            || lease.stable_allocator_id == 0
-            || lease.stable_allocator_id == u64::MAX
-            || lease.lease_epoch == 0
-            || lease.lease_epoch == u64::MAX
-            || lease.lease_start == 0
-            || lease.lease_start == u64::MAX
-            || lease.lease_end == 0
-            || lease.lease_end == u64::MAX
-            || lease.prior_high_water > lease.lease_start
-            || lease.lease_start >= lease.lease_end
-            || lease.new_high_water != lease.lease_end
-            || lease.marker_system_transaction_id == 0
-            || lease.marker_system_transaction_id == u64::MAX
-            || lease.marker_commit_sequence == 0
-            || lease.marker_commit_sequence == u64::MAX
-        {
-            return Err(retained_error(
-                "allocator lease witness has an invalid durable shape",
-            ));
-        }
-    }
-    Ok(())
+    catalog_validation::validate_durable_allocator_index_identity(
+        identity,
+        &witness.allocator_index,
+    )
 }
 
 /// Generation output is intentionally an opaque builder-owned capability. The wire reader may

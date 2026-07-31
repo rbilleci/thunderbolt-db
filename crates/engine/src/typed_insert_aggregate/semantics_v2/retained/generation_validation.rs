@@ -10,8 +10,8 @@
 mod input;
 
 use super::{
-    FullyValidatedWitnesses, FullyWitnessValidatedSemanticsV2, GenerationPendingSemanticsV2,
-    SemanticsV2GenerationTableWitness, SemanticsV2GenerationWitness,
+    CatalogAndAllocatorValidated, FullyValidatedWitnesses, FullyWitnessValidatedSemanticsV2,
+    GenerationPendingSemanticsV2, SemanticsV2GenerationTableWitness, SemanticsV2GenerationWitness,
 };
 use crate::typed_insert_aggregate::semantics_v2::retained::graph::{
     ReservedSemanticsV2Graph, RetainedTable,
@@ -135,11 +135,14 @@ where
     match (validation, drain) {
         (Ok(()), Ok(())) => {
             let (pending, generation) = completed.into_parts();
+            let CatalogAndAllocatorValidated {
+                catalog,
+                allocator_index: _,
+            } = pending.catalog_and_allocator;
             Ok(FullyWitnessValidatedSemanticsV2 {
                 graph: pending.graph,
                 witnesses: FullyValidatedWitnesses {
-                    catalog: pending.catalog_and_allocator.catalog,
-                    allocator_index: pending.catalog_and_allocator.allocator_index,
+                    catalog,
                     generation,
                 },
             })
@@ -158,7 +161,7 @@ fn validate_witness(
 ) -> Result<(), EngineError> {
     let identity = pending.graph.identity;
     let graph = &pending.graph.graph;
-    let catalog = pending.catalog_and_allocator.catalog;
+    let catalog = &pending.catalog_and_allocator.catalog;
     if witness.root_descriptor_version != ROOT_DESCRIPTOR_VERSION
         || witness.root_descriptor_version != graph.header.root_descriptor_version
         || witness.database_id != identity.database_id
