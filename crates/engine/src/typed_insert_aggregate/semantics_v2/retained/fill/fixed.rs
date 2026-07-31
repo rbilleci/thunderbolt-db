@@ -11,6 +11,7 @@ use crate::typed_insert_aggregate::semantics_v2::retained::graph::{
     RetainedStatementOutcome,
 };
 use crate::EngineError;
+use sha2::{Digest, Sha256};
 
 const S1_BYTES: u64 = 144;
 const S4_BYTES: u64 = 64;
@@ -160,9 +161,11 @@ fn fill_s6(
                 &mut graph.outcomes,
                 RetainedStatementOutcome {
                     statement_ordinal: u32_at(&raw, 0),
+                    family_ordinal: u32_at(&raw, 4),
                     semantic_class: u16_at(&raw, 8),
                     flags: u16_at(&raw, 10),
                     typed_statement_digest: digest_at(&raw, 12),
+                    outcome_digest: s6_entry_digest(&raw),
                     outcome,
                 },
                 "S6 outcome directory",
@@ -180,6 +183,15 @@ fn fill_s6(
         ));
     }
     Ok(())
+}
+
+fn s6_entry_digest(raw: &[u8; S6_BYTES as usize]) -> [u8; 32] {
+    let domain = b"gpu-db/write001/s7-s6-entry/v2";
+    let mut digest = Sha256::new();
+    digest.update((domain.len() as u64).to_le_bytes());
+    digest.update(domain);
+    digest.update(raw);
+    digest.finalize().into()
 }
 
 pub(super) fn push_exact<T>(values: &mut Vec<T>, value: T, owner: &str) -> Result<(), EngineError> {

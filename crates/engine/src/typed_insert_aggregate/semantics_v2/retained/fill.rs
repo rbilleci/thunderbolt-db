@@ -113,6 +113,9 @@ pub(super) fn fill_after_pass_zero(
         catalog_epoch: outer.catalog_before_epoch,
         catalog_digest: outer.catalog_before_digest,
         stable_transaction_id: outer.stable_transaction_id,
+        autocommit: framing.header_scalars().flags
+            & crate::typed_insert_aggregate::AGGREGATE_FLAG_AUTOCOMMIT
+            != 0,
         commit_sequence: outer.commit_seq,
         initial_database_root: owner.graph_mut().header.initial_database_root,
     };

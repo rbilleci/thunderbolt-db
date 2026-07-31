@@ -133,23 +133,24 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. Resume with **Q1 codec-closed quarantine**, not witness activation.
-Consume Q0's structurally filled owner into a new move-only codec-closed state only after closing every
-codec-computable S1--S7 fact: final-row and logical-`RETURNING` digests; statement disposition/sequence/dependency/
-projection and overlay roots; S4-survivor/transition bijection; S2/final-image cells; index/unique/FK effects and
-composite NULL participation; dependency guard keys; table transition/index-effect roots, manifests, and the
-manifest-bound root descriptor. Correct `ForeignKeyGuard` token identity to the supporting parent index. Move
-catalog/allocator advancement so raw quarantine cannot invoke it. Pin all three frozen golden shapes and coherent
-inner-root sabotage, but give Q1 no reencoder, generation builder, or live caller.
+**WRITE-001** is the sole active **NOW** task. Q1 codec-closed quarantine received final independent **ACCEPT** on
+2026-07-31. Its exact source seal is staged tree `f0b6c50f85a58c0cba60ca333675a5ad17b34c6f`, cached-diff SHA-256
+`c5779f8d7e6caaed1d1f25bc8892f2a86ac7f2892966125297b61dedc2353e33`, and 18 source paths with no drift.
+Focused/static gates and the **1,125 passed / 669 GPU-required ignored / 0 failed** serial engine sweep are accepted;
+GPU/HAZARD, recovery-specific execution, and cards were inapplicable to the inert host-only slice.
 
-After independent Q1 acceptance, Q2 owns pinned catalog/durable-allocator validation, the sealed/drained generation
-builder and independent witness, opaque-root/generation-input sabotage, and test-only byte equality from the fully
-validated state. Keep both phases unreachable from live WAL/recovery/apply/publication. S8, final replay ownership,
-live durable-sequence validation, GPU replay compilation, and the complete live pre-WAL capacity lease remain later
-WRITE-001 checkpoints; do not add another live operation, WAL, publication, or eligibility authority.
+Resume with **Q2 witness closure**. Replace the borrowed generation scaffold with a consuming
+`CodecClosed -> GenerationPending -> FullyWitnessValidated` protocol: exact pinned catalog guard/terminal closure,
+a concrete immutable durable allocator lease proof, reference-neutral builder input, pre-reserved owned output,
+drain-before-seal, validator-independent input recomputation, and retained opaque generation-candidate ownership.
+Add coherent catalog/lease/input/root/output/failure sabotage and expose test-only S1--S7 byte reencoding only from
+the fully witness-validated state for all three Q1 goldens. Keep Q2 unreachable from live
+WAL/recovery/apply/publication and provide no production builder implementation or reencoder.
 
-The local worktree intentionally retains user-owned unstaged changes in `AGENTS.md`, `docs/CODE_SIZE.md`, and the
-source-size-policy hunks of `docs/PLAN.md`; do not stage, revert, or overwrite them.
+S8, final replay ownership, live durable-sequence validation, GPU replay compilation, and the complete live pre-WAL
+capacity lease remain later WRITE-001 checkpoints; do not add another live operation, WAL, publication, or
+eligibility authority.
+
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read
 floor, and INSERT-001's sealed qualification, differential, HAZARD, and canonical-card evidence in `STATUS.md`.

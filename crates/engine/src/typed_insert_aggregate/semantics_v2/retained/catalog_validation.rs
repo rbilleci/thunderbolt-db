@@ -1368,8 +1368,19 @@ fn catalog_fk_matches_source(
         || supporting_index.owner_display_oid != catalog.parent_display_oid
         || !graph.dependencies.iter().any(|dependency| {
             dependency.kind == FOREIGN_KEY_GUARD
-                && dependency.stable_object_id == catalog.stable_constraint_id
-                && dependency.display_oid == catalog.display_oid
+                && dependency.stable_object_id == supporting_index.stable_index_id
+                && dependency.display_oid == supporting_index.display_oid
+                && dependency.base_generation == supporting_index.base_generation
+                && dependency.schema_digest == supporting_index.schema_digest
+                && dependency.base_root == supporting_index.base_root
+                && qualified_name_digest(supporting_index.schema, supporting_index.name)
+                    .is_ok_and(|digest| dependency.name_digest == digest)
+                && graph.indexes.iter().any(|descriptor| {
+                    dependency.descriptor_ref == descriptor.index_ref
+                        && descriptor.stable_index_id == supporting_index.stable_index_id
+                        && descriptor.display_oid == supporting_index.display_oid
+                        && descriptor.descriptor_digest != [0; 32]
+                })
                 && dependency.target_table_ref == retained.table_ref
         })
     {

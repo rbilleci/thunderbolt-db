@@ -118,6 +118,9 @@ fn fill_tables(
                 image_content_digest: digest_at(&raw, 256),
                 transition_root: digest_at(&raw, 288),
                 index_effect_root: digest_at(&raw, 320),
+                image_arena_offset: 0,
+                image_encoded_bytes: 0,
+                image_descriptor_digest: [0; 32],
                 manifest_digest: digest_at(&raw, 352),
             },
             "S7 table directory",
@@ -217,6 +220,7 @@ fn fill_dependencies(
                 base_root: digest_at(&raw, 96),
                 name_digest: digest_at(&raw, 128),
                 identity_digest: digest_at(&raw, 160),
+                token_digest: digest_at(&raw, 192),
             },
             "S7 dependency-token directory",
         )?;
@@ -386,9 +390,13 @@ fn fill_key_components(
             RetainedKeyComponent {
                 component_ref: u32_at(&raw, 0),
                 effect_ref: u32_at(&raw, 4),
+                side: raw[8],
+                validity: raw[9],
                 component_ordinal: u32_at(&raw, 12),
                 key_column_ref: u32_at(&raw, 16),
                 source_catalog_ordinal: u32_at(&raw, 20),
+                value_arena_offset: u64_at(&raw, 24),
+                value_bytes: u32_at(&raw, 32),
                 storage: raw[36..40].try_into().expect("fixed component storage"),
                 declared_type_oid: u32_at(&raw, 40),
                 signed_type_size: i16_at(&raw, 44),
@@ -422,10 +430,16 @@ fn fill_projections(
                 statement_ordinal,
                 projection_ordinal: u32_at(&raw, 8),
                 source_catalog_ordinal: u32_at(&raw, 12),
+                stable_column_id: u32_at(&raw, 16),
                 table_ref: u32_at(&raw, 20),
+                attnum: i16_at(&raw, 24),
+                storage: raw[28..32].try_into().expect("fixed projection storage"),
+                declared_type_oid: u32_at(&raw, 32),
+                signed_type_size: i16_at(&raw, 36),
                 record_ref,
                 result_format: u16_at(&raw, 38),
                 s2_projection_ordinal: u32_at(&raw, 40),
+                name_digest: digest_at(&raw, 64),
                 projection_digest: digest_at(&raw, 96),
             },
             "S7 projection-binding directory",
@@ -485,7 +499,7 @@ fn fill_images(
         let table =
             graph
                 .tables
-                .get(usize::try_from(table_ref).map_err(|_| {
+                .get_mut(usize::try_from(table_ref).map_err(|_| {
                     fill_error("S7 image table reference exceeds host addressability")
                 })?)
                 .ok_or_else(|| fill_error("S7 image has no retained table descriptor"))?;
@@ -506,6 +520,9 @@ fn fill_images(
                 "decoded S7 image does not match its retained descriptor",
             ));
         }
+        table.image_arena_offset = u64_at(&raw, 24);
+        table.image_encoded_bytes = bytes;
+        table.image_descriptor_digest = digest_at(&raw, 128);
         push_exact(&mut graph.images, decoded, "S7 decoded image directory")?;
     }
     Ok(())

@@ -123,6 +123,16 @@ fn fill_canonical_semantics_v2_for_test<'a>(
 }
 
 #[cfg(test)]
+fn close_canonical_semantics_v2_for_test<'a>(
+    outer: &gpu_db_wal::CanonicalPreApplyHeader,
+    outcome: &gpu_db_wal::CanonicalOutcome,
+    fragments: &[gpu_db_wal::CanonicalFragmentRef<'a>],
+) -> Result<(), EngineError> {
+    fill_canonical_semantics_v2_for_test(outer, outcome, fragments)?.close_codec_for_test()?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn fail_retained_source_copy_at_for_test<T>(attempt: u64, operation: impl FnOnce() -> T) -> T {
     retained::fail_source_copy_at_for_test(attempt, operation)
 }

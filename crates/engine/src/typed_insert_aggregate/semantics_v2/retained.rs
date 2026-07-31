@@ -8,6 +8,8 @@
 
 #[path = "retained/catalog_validation.rs"]
 mod catalog_validation;
+#[path = "retained/codec_closure.rs"]
+mod codec_closure;
 #[path = "retained/fill.rs"]
 mod fill;
 #[path = "retained/generation_validation.rs"]
@@ -26,6 +28,7 @@ pub(super) struct SemanticsV2BoundIdentity {
     pub(super) catalog_epoch: u64,
     pub(super) catalog_digest: [u8; 32],
     pub(super) stable_transaction_id: u64,
+    pub(super) autocommit: bool,
     pub(super) commit_sequence: u64,
     pub(super) initial_database_root: [u8; 32],
 }
@@ -234,10 +237,20 @@ struct RetainedSemanticsV2Graph {
     graph: graph::ReservedSemanticsV2Graph,
 }
 
-/// Context-free structural decode. This state may be dropped or witness-checked, but has no
-/// reencoder, publication, replay, or mutation conversion.
+/// Context-free structural decode. This state has only raw/fixed-directory proof plus strict
+/// source ownership. It is deliberately unable to consult catalog or allocator evidence: Q1
+/// must first consume it through the codec-only S1--S7 closure.
 #[allow(dead_code)]
 pub(super) struct QuarantinedSemanticsV2 {
+    graph: RetainedSemanticsV2Graph,
+}
+
+/// Context-free codec closure has recomputed every witness-free S1--S7 fact from the retained
+/// typed graph. Only this move-only state may consume catalog/allocator evidence. It remains
+/// inert: no generation builder, reencoder, WAL, recovery, apply, device, result, or
+/// publication path is reachable here.
+#[allow(dead_code)]
+pub(super) struct CodecClosedSemanticsV2 {
     graph: RetainedSemanticsV2Graph,
 }
 
@@ -298,8 +311,25 @@ pub(super) fn fail_source_copy_at_for_test<T>(attempt: u64, operation: impl FnOn
 }
 
 impl QuarantinedSemanticsV2 {
-    /// Consume the sole context-free owner after exact pinned-catalog and durable allocator
-    /// closure.  No generation result is accepted, retained, or constructed at this boundary.
+    /// Consume structural ownership only after every witness-free S1--S7 relation has been
+    /// recomputed from strict S2/image owners. A failed close drops the raw quarantine, so no
+    /// caller can retain a partially closed or externally advanceable graph.
+    pub(super) fn close_codec(self) -> Result<CodecClosedSemanticsV2, crate::EngineError> {
+        codec_closure::validate(self.graph.identity, &self.graph.graph)?;
+        Ok(CodecClosedSemanticsV2 { graph: self.graph })
+    }
+
+    /// Test-only continuation from an actual strict-fill state. It has no raw constructor and
+    /// still must traverse the same consuming codec closure as production scaffolding.
+    #[cfg(test)]
+    pub(super) fn close_codec_for_test(self) -> Result<CodecClosedSemanticsV2, crate::EngineError> {
+        self.close_codec()
+    }
+}
+
+impl CodecClosedSemanticsV2 {
+    /// Consume the sole codec-closed owner after exact pinned-catalog and durable allocator
+    /// closure. No generation result is accepted, retained, or constructed at this boundary.
     pub(super) fn validate_catalog_and_allocator<'a>(
         self,
         witness: &'a SemanticsV2CatalogAllocatorWitness<'a>,
@@ -314,8 +344,8 @@ impl QuarantinedSemanticsV2 {
         })
     }
 
-    /// Test-only continuation from an actual strict-fill quarantine state.  It cannot construct
-    /// a raw/S7 graph and does not expose the generation witness constructor or any live path.
+    /// Test-only continuation from an actual codec-closed state. It cannot construct a raw/S7
+    /// graph and does not expose the generation witness constructor or any live path.
     #[cfg(test)]
     pub(super) fn validate_catalog_and_allocator_for_test<'a>(
         self,

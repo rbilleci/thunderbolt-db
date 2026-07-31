@@ -69,9 +69,13 @@ pub(super) struct RetainedSequenceEffect {
 
 pub(super) struct RetainedStatementOutcome {
     pub(super) statement_ordinal: u32,
+    pub(super) family_ordinal: u32,
     pub(super) semantic_class: u16,
     pub(super) flags: u16,
     pub(super) typed_statement_digest: Digest,
+    /// Exact S6 entry digest, recomputed at strict fill while the fixed source is borrowed.
+    /// Keeping only the digest lets Q1 bind the resolution without retaining S6 bytes.
+    pub(super) outcome_digest: Digest,
     pub(super) outcome: gpu_db_wal::CanonicalOutcome,
 }
 
@@ -104,6 +108,11 @@ pub(super) struct RetainedTable {
     pub(super) index_effect_root: Digest,
     pub(super) image_layout_digest: Digest,
     pub(super) image_content_digest: Digest,
+    /// Compact image-descriptor facts needed by the table-manifest closure. The decoded image
+    /// remains the only value/vector owner; these fields never retain image-arena bytes.
+    pub(super) image_arena_offset: u64,
+    pub(super) image_encoded_bytes: u64,
+    pub(super) image_descriptor_digest: Digest,
     pub(super) manifest_digest: Digest,
 }
 
@@ -164,6 +173,8 @@ pub(super) struct RetainedDependencyToken {
     pub(super) base_root: Digest,
     pub(super) name_digest: Digest,
     pub(super) identity_digest: Digest,
+    /// Exact token digest. The dependency-root closure needs this digest but not token bytes.
+    pub(super) token_digest: Digest,
 }
 
 pub(super) struct RetainedStatementDependencyUse {
@@ -257,9 +268,13 @@ pub(super) struct RetainedKeyEffect {
 pub(super) struct RetainedKeyComponent {
     pub(super) component_ref: u32,
     pub(super) effect_ref: u32,
+    pub(super) side: u8,
+    pub(super) validity: u8,
     pub(super) component_ordinal: u32,
     pub(super) key_column_ref: u32,
     pub(super) source_catalog_ordinal: u32,
+    pub(super) value_arena_offset: u64,
+    pub(super) value_bytes: u32,
     pub(super) storage: [u8; 4],
     pub(super) declared_type_oid: u32,
     pub(super) signed_type_size: i16,
@@ -275,7 +290,12 @@ pub(super) struct RetainedProjectionBinding {
     pub(super) statement_ordinal: u32,
     pub(super) projection_ordinal: u32,
     pub(super) source_catalog_ordinal: u32,
+    pub(super) stable_column_id: u32,
     pub(super) table_ref: u32,
+    pub(super) attnum: i16,
+    pub(super) storage: [u8; 4],
+    pub(super) declared_type_oid: u32,
+    pub(super) signed_type_size: i16,
     /// The statement resolution selects the move-only S2 record; this is intentionally a
     /// compact reference to its catalog column instead of a duplicated source name/type shape.
     pub(super) record_ref: u32,
@@ -285,5 +305,6 @@ pub(super) struct RetainedProjectionBinding {
     /// S2's projection ordinal is an independently encoded wire fact. It need not be inferred
     /// from SQL projection order until the strict S2 closure has proved their equality.
     pub(super) s2_projection_ordinal: u32,
+    pub(super) name_digest: Digest,
     pub(super) projection_digest: Digest,
 }

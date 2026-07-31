@@ -268,6 +268,42 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   accepted slice is host-only, cannot construct an executable witness state, and cannot reach a device or live
   mutation path.
 
+## WRITE-001 codec-closed semantics-v2 quarantine accepted — 2026-07-31
+
+- The private semantics-v2 path now consumes `QuarantinedSemanticsV2` into `CodecClosedSemanticsV2` only after
+  witness-free S1--S7 closure. It recomputes statement resolutions/outcomes/projections and logical `RETURNING`;
+  S4/table/final-image rows and cells; index descriptors, NULL-aware key components, transitions, and effects;
+  dependency tokens, exact S2 uses, terminal classes, published sequences, overlay roots, table roots, manifests,
+  the root descriptor, and the database-root change law. Raw quarantine cannot advance catalog or allocator
+  validation.
+- `ForeignKeyGuard` identity is the supporting parent index, and its exact S2 FK joins the parent token through
+  stable owner ID plus display/schema/generation/root/name fields. Domain token shape is recomputed from strict S2
+  storage/OID/size. Domain terminal SQLSTATE remains provisionally limited to `23502` or `23514` until the Q2 pinned
+  catalog classifies it. Published-sequence names bind the strict S2 target schema/effective name in both
+  dependency-use and S5/token closure.
+- Three checked-in full S1--S7 shapes close minimal final abort, explicit multi-statement final abort with durable
+  sequence retention, and successful interleaved A/B/A two-table execution with composite UNIQUE/FK, NULL
+  suppression, mixed-format duplicate `RETURNING`, and a sequence. Ten coherent hostile vectors reach codec
+  closure, including final-image, row-ID, typed-key cell, equality-use, S5 flag, projection format, manifest,
+  FK-parent stable owner, sequence name, and changed-table/unchanged-database-root substitutions.
+- The first independent audit rejected five missing witness-free equalities: FK parent stable owner, domain storage
+  shape, provisional domain NOT NULL classification, published-sequence qualified name, and database-root
+  inequality. All were repaired with focused or coherently rehashed evidence. Independent re-audit returned
+  **ACCEPT** with no unresolved finding on exact staged tree
+  `f0b6c50f85a58c0cba60ca333675a5ad17b34c6f`, cached-diff SHA-256
+  `c5779f8d7e6caaed1d1f25bc8892f2a86ac7f2892966125297b61dedc2353e33`, and **18 staged source paths** with no
+  drift.
+- Exact-candidate gates pass semantics v2 **25/25**, aggregate **74/74**, canonical typed record **38/38**, typed
+  image **10/10**, workspace all-target/all-feature check, strict Clippy, scoped rustfmt, allocation/source guards,
+  frozen-design hash, and the full serial engine library **1,125 passed / 669 GPU-required ignored / 0 failed**.
+  The sole writer remains v1 and the only close caller is `cfg(test)`. GPU NULL differential, HAZARD,
+  recovery-specific execution, quick card, and full card are inapplicable because Q1 remains host-only and cannot
+  reach a live/device/read/result/WAL/recovery/apply/publication path.
+- Q1 deliberately has no fully witness-validated state, reencoder, production generation-builder implementation,
+  or publication conversion. Pinned catalog/durable allocator closure, neutral-input generation ownership,
+  drain-before-seal, independent opaque-root proof, and test-only exact reencoding remain Q2 work owned by
+  `PLAN.md`.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted

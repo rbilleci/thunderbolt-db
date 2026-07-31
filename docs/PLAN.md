@@ -70,25 +70,35 @@ starts at WRITE-001:
    S4/S7 checkpoint: complete semantic roots, external witness activation, the fully validated reencoder, and two
    of the three required goldens remain absent.
 
-   The next independently reviewable checkpoint is **Q1 codec-closed quarantine**. Consume the structural owner
-   into a new move-only codec-closed quarantine state only after allocation-free closure of every S1--S7 fact
-   derivable without external witnesses. Recompute final-row and logical-`RETURNING` digests; statement
+   The independently accepted **Q1 codec-closed quarantine** now consumes the structural owner into one move-only
+   codec-closed state only after allocation-free closure of every S1--S7 fact derivable without external witnesses.
+   It recomputes final-row and logical-`RETURNING` digests; statement
    disposition/sequence/dependency/projection and overlay roots; S4-survivor/transition bijection; S2/final-image
    cell equality; exact index/unique/FK effect inventories and composite NULL participation; reference-neutral
-   dependency guard keys; table transition/index-effect roots and manifests; and the root descriptor after those
-   manifests. Correct `ForeignKeyGuard` token identity to the supporting parent-index identity rather than the FK
-   constraint identity. Move catalog/allocator advancement off raw quarantine so only the codec-closed owner can
-   invoke it. Pin all three frozen minimal-abort, explicit multi-statement-abort, and successful interleaved
-   two-table golden shapes as checked-in bytes with independently expected Q1 roots, plus coherently rehashed
-   sabotage that reaches each new semantic boundary. Q1 has no reencoder, generation builder, or live caller.
+   dependency guard keys; table transition/index-effect roots and manifests; and the manifest-bound root
+   descriptor. `ForeignKeyGuard` uses the supporting parent-index identity, and catalog/allocator advancement is
+   unavailable from raw quarantine. Three checked-in minimal-abort, explicit multi-statement-abort, and successful
+   interleaved two-table goldens plus ten coherently rehashed hostile vectors close the Q1 boundary. Q1 retains no
+   reencoder, constructible generation builder, or live caller.
 
-   **Q2 witness closure** follows Q1: independently validate the pinned catalog and durable allocator leases,
-   consume that owner through a sealed/drained generation builder and independent generation witness, reject
-   coherent opaque-root and generation-input substitutions, and expose test-only byte reencoding exclusively from
-   the fully witness-validated state for all three goldens. Keep Q1/Q2 unreachable from live
-   WAL/recovery/apply/publication. S8, the final destructive replay IR, live durable-sequence validation, GPU replay
-   compilation, and the complete live pre-WAL capacity lease remain later WRITE-001 checkpoints; none may add
-   another WAL, operation, publication, or eligibility authority.
+   The next independently reviewable checkpoint is **Q2 witness closure**. Replace the current witness scaffold,
+   not merely its fixtures: independently validate a pinned catalog and a concrete immutable durable allocator
+   lease proof; consume `CodecClosed` into `GenerationPending`; expose to a pre-reserved builder only a sealed
+   reference-neutral input that omits every final root/generation and final-bound codec digest; and require an
+   owned launched attempt to drain before any output becomes readable. A sealed immutable result owns flat
+   table/index outputs and an opaque generation candidate; validator-side input recomputation then compares every
+   output before constructing `FullyWitnessValidated`. Attempt drop drains exactly once, and failed quiescence
+   retains/quarantines backing ownership rather than releasing in-flight resources.
+
+   Q2 also closes exact per-statement catalog guard owner/source/target bijections, terminal FK constraint identity,
+   and durable lease completeness, lineage, checkpoint retention, non-overlap, order, and full consumed-interval
+   rules. Coherent catalog/lease/generation/root substitutions and pre-reservation, launch, drain, validation,
+   abandonment, and retry failures must reject without exposing reencoding. Test-only byte reencoding borrows
+   exclusively from `FullyWitnessValidated` and reproduces all S1--S7 bytes for the three Q1 goldens; no production
+   builder implementation or reencoder exists. Keep Q1/Q2 unreachable from live WAL/recovery/apply/publication.
+   S8, the final destructive replay IR, live durable-sequence validation, GPU replay compilation, and the complete
+   live pre-WAL capacity lease remain later WRITE-001 checkpoints; none may add another WAL, operation,
+   publication, or eligibility authority.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as
