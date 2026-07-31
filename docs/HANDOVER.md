@@ -133,26 +133,25 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. The inert S8 codec-ownership checkpoint received architecture and
-final independent **ACCEPT** on 2026-07-31 with no finding. Its exact source commit is
-`586a0af427f6cd9e71b11b7398ec093f59fe21fa`, tree `4320b6430c36a75fdb2bf0810dbe494f7f6e8f75`,
-cached-diff SHA-256 `b8810cf34954740c03254e256a36f7725a0c3ea5ba186f10030653e81f6746e9`, and 26 source/test
-paths without drift.
+**WRITE-001** is the sole active **NOW** task. The sealed retention-authority checkpoint received fresh independent
+**ACCEPT** on 2026-07-31 after a repaired terminal-fact carry-through. Its exact source commit is
+`86f82ec4045b055e95fca71ffcba0a7b20a35bc6`, tree `40e94f3f99dd76f3cf6fc1c3513be24643e3a963`,
+cached-diff SHA-256 `8bdd6fd440c2ca6d645a2f71b6740529f4bba26af6e1f1a83664c5db84f3550e`, across two source paths
+without drift.
 
-The accepted boundary validates and strictly fills exact S8 artifacts, selections, and role-2 images, then
-recomputes their identity, digest, descriptor, membership, and S2 value closure before the one move-only
-`AggregateReplayTxn<CodecQuarantined> -> RetentionAuthorityPending` transition. Six legal canonical chunk fixtures
-split inside every new S8 owner class and traverse real measure/reserve/fill/close. Q2 remains test-only and
-empty-S8-only; `RetentionAuthorityPending` has no successor; the production writer remains semantics v1. The exact
-release boundary proof passes **1/1** in **21.11s**, and the serial all-feature engine sweep passes
-**1,179 / 669 GPU-required ignored / 0 failed** in **514.05s**. Workspace check, strict Clippy, formatting, diff,
-source-boundary, reservation, and size gates are clean. GPU/HAZARD, recovery, NULL differential, and cards are
-inapplicable to this production-unreachable host codec slice.
+The accepted boundary consumes `RetentionAuthorityPending` into `CatalogAllocatorPending` only after the sole
+borrowed claim/status authority proves the live claim or sealed historical no-retention form. It closes exact
+identity, statement digest, immutable intent, durable lineage/location/order, and terminal-predecessor intent
+preservation; terminal S6/S7/S8/aggregate/STATUS2 facts are opaque carry-through only. No catalog/allocator,
+sequence, GPU, WAL, recovery, apply, result, or publication successor exists. Retention proof tests pass **9/9**;
+the retained ownership/source-boundary suite passes **53/53**; workspace check, strict Clippy, scoped formatting,
+and diff checks are clean. The production writer remains semantics v1. The attempted broad serial library
+diagnostic timed out under an external 43.9-GiB VLLM GPU occupant and is not acceptance evidence; GPU/HAZARD,
+recovery, NULL differential, and cards remain inapplicable to this host-only unreachable slice.
 
-Resume only with PLAN.md's next sealed retention-authority proof:
-`RetentionAuthorityPending -> CatalogAllocatorPending` using the sole authenticated claim/status index and the
-accepted live/historical authority sum. Do not combine catalog/allocator validation, durable sequence validation,
-GPU replay/capacity, WAL, recovery, apply, publication, or a second RetentionIntent authority into that checkpoint.
+Resume only with PLAN.md's next pinned catalog plus ADR-014 allocator-lease proof:
+`CatalogAllocatorPending -> DurableSequencePending`. Do not combine durable sequence validation, GPU
+replay/capacity, WAL, recovery, apply, publication, or a second RetentionIntent authority into that checkpoint.
 The accepted design and prior Q2 facts remain unchanged, and the CARD-001/COPY-001 blocks remain in force.
 
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.

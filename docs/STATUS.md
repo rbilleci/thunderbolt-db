@@ -406,6 +406,32 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   path, runtime dependency, recovery/apply/publication route, or benchmark harness. PLAN.md owns the next sealed
   retention-authority proof and every later authority phase.
 
+## WRITE-001 sealed retention-authority proof accepted — 2026-07-31
+
+- `RetentionAuthorityPending` now has exactly one move-only successor,
+  `CatalogAllocatorPending`. It borrows and scans the sole authenticated claim/status index without allocation or
+  cloning, looks up only `(database, timeline, stable transaction ID)`, then independently closes request identity,
+  ordered statement digests, complete same-lineage/prefix claim durability, authenticated checkpoint-or-WAL-suffix
+  location, and claim-before-child ordering. The immutable eligible-RETURNING bitset is canonical and every set bit
+  names an S2 statement with `RETURNING`; its deadline has the exact empty/nonempty form.
+- Live and authenticated historical no-retention authority are the only sealed alternatives. A terminal live claim
+  additionally carries opaque S6/S7 retention bitsets, S8 membership/count, aggregate retained-response flag, and
+  STATUS2 count/deadline through `ValidatedRetentionAuthority`; the current phase proves only predecessor intent
+  immutability and cannot inspect those final facts. Catalog/allocator, durable sequence, GPU capacity/replay, WAL,
+  recovery, apply, result, and publication authority remain unreachable.
+- The first independent audit correctly rejected the missing terminal-fact carry-through. The repaired exact staged
+  candidate received a fresh independent **ACCEPT** with no unresolved finding: source commit
+  `86f82ec4045b055e95fca71ffcba0a7b20a35bc6`, tree
+  `40e94f3f99dd76f3cf6fc1c3513be24643e3a963`, cached-diff SHA-256
+  `8bdd6fd440c2ca6d645a2f71b6740529f4bba26af6e1f1a83664c5db84f3550e`, across two source paths with no drift.
+- Exact-candidate evidence passes the retention proof **9/9** and retained ownership/source-boundary suite **53/53**,
+  workspace all-target/all-feature check, strict all-feature engine Clippy, scoped rustfmt, and diff checks. An
+  additional serial all-feature engine-library diagnostic timed out at 900 seconds while an external VLLM process
+  occupied 43.9 GiB of the shared GPU; it is not acceptance evidence and does not replace the accepted prior
+  engine-suite baseline. GPU/HAZARD, NULL differential, recovery runtime, roofline, and report cards are
+  inapplicable because this source-only proof is production-unreachable and introduces no device or live write/read
+  path.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted
