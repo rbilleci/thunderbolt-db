@@ -1,4 +1,4 @@
-//! Borrowed bounded sources and exact transient copies for retained S2/S7 decoding.
+//! Borrowed bounded sources and exact transient copies for retained S2/S7/S8 decoding.
 //!
 //! These adapters deliberately expose no aggregate slice. A strict subdecoder can reread only
 //! its measured region, and every temporary copy is dropped immediately after its move-only
@@ -139,6 +139,24 @@ pub(super) fn fail_copy_at_for_test<T>(attempt: u64, operation: impl FnOnce() ->
             failure.set(None);
             attempts.set(0);
             result
+        })
+    })
+}
+
+#[cfg(test)]
+pub(super) fn observe_copy_attempts_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+    COPY_FAILURE.with(|failure| {
+        COPY_ATTEMPTS.with(|attempts| {
+            assert!(failure.replace(Some(u64::MAX)).is_none());
+            assert_eq!(
+                attempts.replace(0),
+                0,
+                "retained copy observation cannot nest"
+            );
+            let result = operation();
+            let observed = attempts.replace(0);
+            failure.set(None);
+            (result, observed)
         })
     })
 }

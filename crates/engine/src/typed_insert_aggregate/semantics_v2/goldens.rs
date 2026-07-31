@@ -18,6 +18,12 @@ mod q2_guard_sabotage;
 mod q2_reencode;
 #[path = "goldens/q2_witnesses.rs"]
 mod q2_witnesses;
+#[path = "goldens/s8_literals.rs"]
+mod s8_literals;
+#[path = "goldens/s8_sabotage.rs"]
+mod s8_sabotage;
+#[path = "goldens/s8_vectors.rs"]
+mod s8_vectors;
 
 use super::{
     close_canonical_semantics_v2_for_test, fail_retained_source_copy_at_for_test,
@@ -832,9 +838,9 @@ fn minimal_abort_vector_is_a_single_chunk_bounded_v2_pass_zero_fixture() {
     assert_eq!(measure.terminal_sqlstate, Some(*b"23502"));
     assert_eq!(measure.terminal_constraint_id, TERMINAL_CONSTRAINT_ID);
     fill_canonical_semantics_v2_for_test(&fixture.outer, &fixture.outcome, &fragments)
-        .expect("minimal abort fills its exact retained S1--S7 owners");
+        .expect("minimal abort fills its exact retained S1--S8 owners");
     close_canonical_semantics_v2_for_test(&fixture.outer, &fixture.outcome, &fragments)
-        .expect("minimal abort closes every witness-free S1--S7 fact");
+        .expect("minimal abort closes every witness-free S1--S8 fact");
     assert_eq!(fixture.sections[6].len(), 2_266);
     assert_eq!(fixture.stream.len(), 3_318);
     assert_eq!(fixture.fragment_body.len(), 3_394);
@@ -1107,4 +1113,6 @@ fn golden_builder_stays_test_only_and_v1_writer_stays_hardwired() {
         .expect("codec keeps one bounded header encoder");
     assert!(encoder.contains("writer.u16(AGGREGATE_SEMANTICS_V1)?"));
     assert!(!encoder.contains("AGGREGATE_SEMANTICS_V2"));
+    assert!(!encoder.contains("AGGREGATE_FLAG_RETAINED_RESPONSE"));
+    assert!(!encoder.contains("S8"));
 }

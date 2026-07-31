@@ -1,14 +1,16 @@
-//! Witness-free S1--S7 closure for the semantics-v2 retained graph.
+//! Witness-free S1--S8 closure for the semantics-v2 retained graph.
 //!
 //! Q0 proved the hostile raw grammar before allocation. This owner deliberately replays the
 //! semantic joins from the strict S2/image owners without consulting a catalog, allocator, or
-//! generation witness. The resulting typestate is the only retained state allowed to advance to
-//! those external checks.
+//! generation witness. The resulting typestate is `RetentionAuthorityPending`; this inert slice
+//! defines no production successor for external checks.
 
 #[path = "codec_closure/dependencies.rs"]
 mod dependencies;
 #[path = "codec_closure/indexes.rs"]
 mod indexes;
+#[path = "codec_closure/response.rs"]
+mod response;
 #[path = "codec_closure/roots.rs"]
 mod roots;
 #[path = "codec_closure/rows.rs"]
@@ -31,6 +33,7 @@ pub(super) fn validate(
     dependencies::validate(graph)?;
     sequences::validate(identity, graph)?;
     statements::validate_returning(graph)?;
+    response::validate(identity, graph)?;
     roots::validate(graph)
 }
 

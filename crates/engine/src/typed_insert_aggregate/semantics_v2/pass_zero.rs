@@ -1,12 +1,25 @@
 //! Semantics-v2 pass-zero facade.
 //!
-//! The substantial S1--S7 streaming proof lives in `pass_zero/s7.rs`; keeping this facade small
-//! makes the allocation-phase owner distinct from the fixed-directory grammar it measures.
+//! The substantial S1--S8 streaming proof lives in `pass_zero/s7.rs` and `pass_zero/s8.rs`;
+//! keeping this facade small makes the allocation-phase owner distinct from the fixed-directory
+//! grammar it measures.
 
 #[path = "pass_zero/s7.rs"]
 mod s7;
+#[path = "pass_zero/s8.rs"]
+mod s8;
 
 pub(crate) use s7::SemanticsV2PassZero;
+pub(super) use s8::S8PassZeroMeasure;
+#[cfg(test)]
+pub(super) fn empty_s8_measure_for_test() -> S8PassZeroMeasure {
+    s8::empty_measure_for_test()
+}
+
+#[cfg(test)]
+pub(super) fn nonempty_s8_measure_for_test() -> S8PassZeroMeasure {
+    s8::nonempty_measure_for_test()
+}
 
 /// Every variable identity field from the fixed S7 header.  Pass zero has already checked these
 /// against the canonical outer/S1 closure; carrying the scalar header identity forward lets the
@@ -40,6 +53,7 @@ pub(super) struct SemanticsV2StructuralMeasure {
     pub(super) s6_outcome_count: u32,
     pub(super) s7_directory_counts: [u32; 12],
     pub(super) s7_header: SemanticsV2S7HeaderIdentity,
+    pub(super) s8: S8PassZeroMeasure,
     /// Exact retained owners below this layer, measured by their strict source decoders.  The
     /// retained graph must add only its own typed directory vectors; wire widths and arenas are
     /// not a persistent allocation ABI.
@@ -65,6 +79,7 @@ impl SemanticsV2PassZero {
             s6_outcome_count: self.s6_outcome_count,
             s7_directory_counts: self.s7_directory_counts,
             s7_header: self.s7_header,
+            s8: self.s8,
             s2_decoded_persistent_bytes: self.s2_decoded_persistent_bytes,
             s2_decoded_persistent_slots: self.s2_decoded_persistent_slots,
             image_decoded_persistent_bytes: self.image_decoded_persistent_bytes,
@@ -88,4 +103,19 @@ pub(super) fn validate_dependency_token_digests_for_test(
     raw: &[u8; 224],
 ) -> Result<(), crate::EngineError> {
     s7::validate_dependency_token_digests_for_test(framing, raw)
+}
+
+#[cfg(test)]
+pub(super) fn measure_s8_against_reference_for_test(
+    reference_framing: &super::super::codec::DecodedAggregateFraming<'_>,
+    reference_outer: &gpu_db_wal::CanonicalPreApplyHeader,
+    candidate_framing: &super::super::codec::DecodedAggregateFraming<'_>,
+    candidate_outer: &gpu_db_wal::CanonicalPreApplyHeader,
+) -> Result<S8PassZeroMeasure, crate::EngineError> {
+    let reference_s7 = s7::measure(reference_framing, reference_outer)?;
+    s8::measure_with_known_s7_counts_for_test(
+        candidate_framing,
+        candidate_outer,
+        &reference_s7.s7_directory_counts,
+    )
 }

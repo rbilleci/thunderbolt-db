@@ -1,10 +1,10 @@
-//! Private typed S1--S7 ownership graph reserved before semantic joins.
+//! Private typed S1--S8 ownership graph reserved before semantic joins.
 //!
 //! No entry has a raw aggregate-body field. The later decoder fills these typed owners only after
-//! every corresponding fallible reservation succeeds, then closes cross-directory and witness
-//! invariants before moving the graph into `QuarantinedSemanticsV2`.
+//! every corresponding fallible reservation succeeds, then closes local cross-directory
+//! invariants before moving the graph into `AggregateReplayTxn<CodecQuarantined>`.
 
-#![allow(dead_code)] // The inert retained graph has no production caller until its strict decoder lands.
+#![allow(dead_code)] // The inert retained graph has no live caller until retention authority lands.
 
 use crate::typed_insert_batch::{DecodedTypedImage, DecodedTypedInsertRecord};
 
@@ -12,7 +12,7 @@ type Digest = gpu_db_wal::CanonicalDigest;
 
 pub(super) struct ReservedSemanticsV2Graph {
     /// Fixed S7 root identity, carried as typed fields after pass zero rather than a header-byte
-    /// duplicate. All variable header facts needed for a future test-only logical reencoder live
+    /// duplicate. All variable S7 header facts needed for the test-only logical reencoder live
     /// here; fixed version/flag constants remain derived.
     pub(super) header: super::super::pass_zero::SemanticsV2S7HeaderIdentity,
     pub(super) statements: Vec<RetainedStatement>,
@@ -32,6 +32,93 @@ pub(super) struct ReservedSemanticsV2Graph {
     pub(super) key_components: Vec<RetainedKeyComponent>,
     pub(super) projections: Vec<RetainedProjectionBinding>,
     pub(super) images: Vec<DecodedTypedImage>,
+    /// S8 owns role-2 response images independently of S7 final-table images.  Its explicit
+    /// empty/present sum keeps canonical empty S8 from manufacturing a hidden owner.
+    pub(super) response: RetainedResponseEnvelope,
+}
+
+pub(super) enum RetainedResponseEnvelope {
+    Empty(RetainedResponseEnvelopeIdentity),
+    Present(RetainedResponseGraph),
+}
+
+/// Minimal inert response owner for fixtures that exercise a pre-S8 closure only.  It is never
+/// accepted by the production codec closure, which carries the fully bound pass-zero identity.
+#[cfg(test)]
+pub(super) fn empty_response_for_test() -> RetainedResponseEnvelope {
+    RetainedResponseEnvelope::Empty(RetainedResponseEnvelopeIdentity {
+        present: false,
+        aggregate_flags: 0,
+        stable_transaction_id: 0,
+        request_digest: [0; 32],
+        s6_section_root: [0; 32],
+        s7_section_root: [0; 32],
+        s8_section_root: [0; 32],
+        response_root: [0; 32],
+        status_artifact_count: 0,
+        retention_deadline: 0,
+        total_bytes: 0,
+        artifact_count: 0,
+        selection_count: 0,
+        image_arena_bytes: 0,
+        payload_digest: [0; 32],
+    })
+}
+
+pub(super) struct RetainedResponseGraph {
+    pub(super) identity: RetainedResponseEnvelopeIdentity,
+    pub(super) artifacts: Vec<RetainedResponseArtifact>,
+    pub(super) selections: Vec<RetainedResponseSelection>,
+    pub(super) images: Vec<DecodedTypedImage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RetainedResponseEnvelopeIdentity {
+    pub(super) present: bool,
+    pub(super) aggregate_flags: u32,
+    pub(super) stable_transaction_id: u64,
+    pub(super) request_digest: Digest,
+    pub(super) s6_section_root: Digest,
+    pub(super) s7_section_root: Digest,
+    pub(super) s8_section_root: Digest,
+    pub(super) response_root: Digest,
+    pub(super) status_artifact_count: u32,
+    pub(super) retention_deadline: u64,
+    pub(super) total_bytes: u64,
+    pub(super) artifact_count: u32,
+    pub(super) selection_count: u32,
+    pub(super) image_arena_bytes: u64,
+    pub(super) payload_digest: Digest,
+}
+
+pub(super) struct RetainedResponseArtifact {
+    pub(super) artifact_ref: u32,
+    pub(super) statement_ref: u32,
+    pub(super) selection_start: u32,
+    pub(super) selection_count: u32,
+    pub(super) projection_start: u32,
+    pub(super) projection_count: u32,
+    pub(super) image_rows: u32,
+    pub(super) image_columns: u32,
+    pub(super) image_arena_offset: u64,
+    pub(super) image_bytes: u64,
+    pub(super) typed_statement_digest: Digest,
+    pub(super) logical_result_digest: Digest,
+    pub(super) projection_root: Digest,
+    pub(super) selection_root: Digest,
+    pub(super) image_layout_digest: Digest,
+    pub(super) image_content_digest: Digest,
+    pub(super) artifact_digest: Digest,
+}
+
+pub(super) struct RetainedResponseSelection {
+    pub(super) artifact_ref: u32,
+    pub(super) image_row_ordinal: u32,
+    pub(super) disposition_ref: u32,
+    pub(super) statement_ref: u32,
+    pub(super) source_row_ordinal: u32,
+    pub(super) table_ref: u32,
+    pub(super) stable_row_id: u64,
 }
 
 pub(super) struct RetainedStatement {

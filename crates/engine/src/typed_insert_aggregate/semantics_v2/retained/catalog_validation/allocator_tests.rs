@@ -37,6 +37,7 @@ fn identity() -> SemanticsV2BoundIdentity {
         catalog_epoch: CATALOG_EPOCH,
         catalog_digest: [4; 32],
         stable_transaction_id: USER_TRANSACTION,
+        request_digest: [11; 32],
         autocommit: true,
         commit_sequence: USER_COMMIT,
         initial_database_root: [5; 32],
@@ -200,6 +201,8 @@ fn graph(tables: Vec<RetainedTable>) -> ReservedSemanticsV2Graph {
         key_components: Vec::new(),
         projections: Vec::new(),
         images: Vec::new(),
+        response:
+            crate::typed_insert_aggregate::semantics_v2::retained::graph::empty_response_for_test(),
     }
 }
 

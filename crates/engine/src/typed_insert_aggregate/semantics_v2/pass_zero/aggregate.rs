@@ -8,8 +8,8 @@ use super::super::super::super::codec::DecodedAggregateFraming;
 use super::{checked_mul, error, read_u32, ABSENT_U32, S4_BYTES};
 use crate::typed_insert_aggregate::{
     AGGREGATE_FLAG_AUTOCOMMIT, AGGREGATE_FLAG_EXPLICIT, AGGREGATE_FLAG_PUBLISHED_SEQUENCE,
-    AGGREGATE_FLAG_RETURNING, OUTER_CONTENT_PUBLISHED_SEQUENCE, OUTER_CONTENT_RETURNING,
-    OUTER_CONTENT_ROW, OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH,
+    AGGREGATE_FLAG_RETAINED_RESPONSE, AGGREGATE_FLAG_RETURNING, OUTER_CONTENT_PUBLISHED_SEQUENCE,
+    OUTER_CONTENT_RETURNING, OUTER_CONTENT_ROW, OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH,
     OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1,
 };
 use crate::typed_insert_batch::{
@@ -31,7 +31,8 @@ pub(super) fn validate_scalar_and_outer_flags(
     let aggregate_allowed = AGGREGATE_FLAG_AUTOCOMMIT
         | AGGREGATE_FLAG_EXPLICIT
         | AGGREGATE_FLAG_PUBLISHED_SEQUENCE
-        | AGGREGATE_FLAG_RETURNING;
+        | AGGREGATE_FLAG_RETURNING
+        | AGGREGATE_FLAG_RETAINED_RESPONSE;
     let mode = scalar.flags & (AGGREGATE_FLAG_AUTOCOMMIT | AGGREGATE_FLAG_EXPLICIT);
     if scalar.stable_transaction_id == 0
         || scalar.flags & !aggregate_allowed != 0
@@ -62,10 +63,10 @@ pub(super) fn validate_scalar_and_outer_flags(
     let status = framing.status();
     if status.txn_id != scalar.stable_transaction_id
         || status.statement_count != scalar.statement_count
-        || status.response_artifact_count != 0
-        || status.retention_deadline != 0
     {
-        return Err(error("STATUS2 does not match the v2 aggregate/S8 profile"));
+        return Err(error(
+            "STATUS2 does not match the v2 aggregate identity profile",
+        ));
     }
     Ok(())
 }
@@ -380,7 +381,8 @@ pub(super) fn measure_s1_s4_s6(
                         || u16::from_le_bytes(
                             outcome_entry[8..10].try_into().expect("fixed S6 class"),
                         ) != 1
-                        || flags & !1 != 0
+                        || flags & !3 != 0
+                        || (flags & 2 != 0 && flags & 1 == 0)
                         || outcome_entry[12..44] != statement_digest
                         || outcome.target_digest != overlay_after
                     {
@@ -406,7 +408,7 @@ pub(super) fn measure_s1_s4_s6(
                                 && outcome.returning_digest == [0; 32]
                                 && outcome.constraint_id != 0
                                 && outcome.sqlstate.is_some_and(is_constraint_sqlstate)
-                                && flags == 0 => {}
+                                && flags & 2 == 0 => {}
                         _ => return Err(error("S6 outcome does not match the v2 terminal matrix")),
                     }
                     for expected_source in 0..input_rows {

@@ -1,17 +1,18 @@
 //! Move-only post-pass-zero ownership states for codec-5 semantics v2.
 //!
 //! This module deliberately has no WAL, recovery, apply, device, result, or publication caller.
-//! It defines the only retained-state boundary: a raw-proof owner is quarantined, exact catalog
-//! plus allocator witnesses can make it generation-pending, and only an independently produced
-//! generation witness may make it fully witness-validated.  A later strict S2 source pass fills
-//! the private retained graph before any transition constructor is exposed.
+//! Production ends at the move-only `CodecQuarantined -> RetentionAuthorityPending` transition
+//! after strict S1--S8 fill and local codec closure. Historical Q2 catalog/allocator/generation
+//! evidence is compiled only for tests and cannot become a production successor.
 
+#[cfg(test)]
 #[path = "retained/catalog_validation.rs"]
 mod catalog_validation;
 #[path = "retained/codec_closure.rs"]
 mod codec_closure;
 #[path = "retained/fill.rs"]
 mod fill;
+#[cfg(test)]
 #[path = "retained/generation_validation.rs"]
 mod generation_validation;
 #[path = "retained/graph.rs"]
@@ -35,6 +36,7 @@ pub(super) struct SemanticsV2BoundIdentity {
     pub(super) catalog_epoch: u64,
     pub(super) catalog_digest: [u8; 32],
     pub(super) stable_transaction_id: u64,
+    pub(super) request_digest: [u8; 32],
     pub(super) autocommit: bool,
     pub(super) commit_sequence: u64,
     pub(super) initial_database_root: [u8; 32],
@@ -46,6 +48,7 @@ pub(super) struct SemanticsV2BoundIdentity {
 ///
 /// The allocator input is a sealed proof from the durable allocator index, not a codec-owned
 /// slice of Boolean claims.  Its construction remains unavailable to the raw decoder.
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogAllocatorWitness<'a> {
     pub(super) catalog: SemanticsV2CatalogWitness<'a>,
@@ -82,6 +85,7 @@ pub(super) enum Q2GoldenSabotage {
     FinalRoot,
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogWitness<'a> {
     pub(super) database_id: [u8; 16],
@@ -94,6 +98,7 @@ pub(super) struct SemanticsV2CatalogWitness<'a> {
     pub(super) sequences: &'a [SemanticsV2CatalogSequenceWitness<'a>],
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogTableWitness<'a> {
     pub(super) stable_table_id: u64,
@@ -109,6 +114,7 @@ pub(super) struct SemanticsV2CatalogTableWitness<'a> {
     pub(super) foreign_keys: &'a [SemanticsV2CatalogForeignKeyWitness<'a>],
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogColumnWitness<'a> {
     pub(super) catalog_column_ordinal: u32,
@@ -122,6 +128,7 @@ pub(super) struct SemanticsV2CatalogColumnWitness<'a> {
     pub(super) column_root: [u8; 32],
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogIndexWitness<'a> {
     pub(super) stable_index_id: u64,
@@ -146,6 +153,7 @@ pub(super) struct SemanticsV2CatalogIndexWitness<'a> {
     pub(super) base_root: [u8; 32],
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogIndexKeyWitness<'a> {
     pub(super) key_ordinal: u32,
@@ -159,6 +167,7 @@ pub(super) struct SemanticsV2CatalogIndexKeyWitness<'a> {
     pub(super) column_name_digest: [u8; 32],
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogDomainWitness<'a> {
     pub(super) stable_domain_id: u64,
@@ -173,6 +182,7 @@ pub(super) struct SemanticsV2CatalogDomainWitness<'a> {
     pub(super) constraints: &'a [SemanticsV2CatalogGuardWitness<'a>],
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogGuardWitness<'a> {
     pub(super) kind: u8,
@@ -193,6 +203,7 @@ pub(super) struct SemanticsV2CatalogGuardWitness<'a> {
     pub(super) catalog_generation: u64,
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogForeignKeyWitness<'a> {
     pub(super) stable_constraint_id: u64,
@@ -209,6 +220,7 @@ pub(super) struct SemanticsV2CatalogForeignKeyWitness<'a> {
     pub(super) supporting_stable_index_id: u64,
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogSequenceWitness<'a> {
     pub(super) stable_sequence_id: u64,
@@ -220,7 +232,7 @@ pub(super) struct SemanticsV2CatalogSequenceWitness<'a> {
 }
 
 /// Private retained graph placeholder. It is intentionally unconstructable outside the complete
-/// post-reservation source/image decoder, which is the sole owner allowed to add decoded S1--S7
+/// post-reservation source/image decoder, which is the sole owner allowed to add decoded S1--S8
 /// fields. Keeping it private prevents a test helper from manufacturing a phase transition.
 #[allow(dead_code)]
 struct RetainedSemanticsV2Graph {
@@ -228,25 +240,38 @@ struct RetainedSemanticsV2Graph {
     graph: graph::ReservedSemanticsV2Graph,
 }
 
-/// Context-free structural decode. This state has only raw/fixed-directory proof plus strict
-/// source ownership. It is deliberately unable to consult catalog or allocator evidence: Q1
-/// must first consume it through the codec-only S1--S7 closure.
+/// Unique retained aggregate owner.  Its phase is private, move-only state rather than a
+/// capability bag: no phase exposes raw aggregate bytes, a graph getter, or a live successor.
 #[allow(dead_code)]
-pub(super) struct QuarantinedSemanticsV2 {
+pub(super) struct AggregateReplayTxn<Phase> {
     graph: RetainedSemanticsV2Graph,
+    phase: Phase,
 }
 
-/// Context-free codec closure has recomputed every witness-free S1--S7 fact from the retained
-/// typed graph. Only this move-only state may consume catalog/allocator evidence. It remains
-/// inert: no generation builder, reencoder, WAL, recovery, apply, device, result, or
-/// publication path is reachable here.
+/// Strict structural decode and typed fill have completed, but witness-free codec closure has
+/// not yet recomputed the retained relations.
 #[allow(dead_code)]
-pub(super) struct CodecClosedSemanticsV2 {
+pub(super) struct CodecQuarantined(PrivateSeal);
+
+/// The codec-only retained closure has completed.  This inert slice deliberately ends here:
+/// retention-claim proof, catalog/allocator proof, sequence proof, GPU replay, and publication
+/// are not production successors.
+#[allow(dead_code)]
+pub(super) struct RetentionAuthorityPending(PrivateSeal);
+
+/// Only this module can construct a phase marker, keeping the move-only graph transition sealed.
+struct PrivateSeal;
+
+/// Q2's historical empty-S8 evidence bridge.  It is test-only and can be formed only by
+/// consuming an actual `RetentionAuthorityPending` owner after proving canonical empty S8.
+#[cfg(test)]
+pub(super) struct Q2CodecClosedSemanticsV2 {
     graph: RetainedSemanticsV2Graph,
 }
 
 /// Catalog and durable allocator closure has succeeded. Only this state may be handed to the
 /// external reserved generation builder; it is still not publication eligible.
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct GenerationPendingSemanticsV2<'a> {
     graph: RetainedSemanticsV2Graph,
@@ -256,6 +281,7 @@ pub(super) struct GenerationPendingSemanticsV2<'a> {
 /// All catalog, lease, and generation output equality checks have succeeded.  The catalog and
 /// allocator borrows end at this transition: a future reencoder can only receive the retained
 /// graph plus the builder's opaque, fully-owned generation result.
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct FullyWitnessValidatedSemanticsV2<C> {
     graph: RetainedSemanticsV2Graph,
@@ -273,6 +299,7 @@ impl<C> FullyWitnessValidatedSemanticsV2<C> {
     }
 }
 
+#[cfg(test)]
 struct CatalogAndAllocatorValidated<'a> {
     catalog: SemanticsV2CatalogWitness<'a>,
     allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'a>,
@@ -280,14 +307,15 @@ struct CatalogAndAllocatorValidated<'a> {
 
 /// Seal the complete, exact post-reservation graph into the context-free quarantine state.
 ///
-/// The strict S1--S7 fill is the sole caller: it consumes `into_exact_graph()` immediately
+/// The strict S1--S8 fill is the sole caller: it consumes `into_exact_graph()` immediately
 /// before this transition, so a partially filled owner cannot become witness-checkable.
 fn quarantine_after_strict_fill(
     identity: SemanticsV2BoundIdentity,
     graph: graph::ReservedSemanticsV2Graph,
-) -> QuarantinedSemanticsV2 {
-    QuarantinedSemanticsV2 {
+) -> AggregateReplayTxn<CodecQuarantined> {
+    AggregateReplayTxn {
         graph: RetainedSemanticsV2Graph { identity, graph },
+        phase: CodecQuarantined(PrivateSeal),
     }
 }
 
@@ -298,7 +326,7 @@ pub(super) fn fill_after_pass_zero(
     framing: &super::super::codec::DecodedAggregateFraming<'_>,
     outer: &gpu_db_wal::CanonicalPreApplyHeader,
     pass_zero: super::pass_zero::SemanticsV2PassZero,
-) -> Result<QuarantinedSemanticsV2, crate::EngineError> {
+) -> Result<AggregateReplayTxn<CodecQuarantined>, crate::EngineError> {
     fill::fill_after_pass_zero(framing, outer, pass_zero)
 }
 
@@ -307,20 +335,43 @@ pub(super) fn fail_source_copy_at_for_test<T>(attempt: u64, operation: impl FnOn
     fill::fail_copy_at_for_test(attempt, operation)
 }
 
-impl QuarantinedSemanticsV2 {
-    /// Consume structural ownership only after every witness-free S1--S7 relation has been
+#[cfg(test)]
+pub(super) fn observe_source_copy_attempts_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+    fill::observe_copy_attempts_for_test(operation)
+}
+
+impl AggregateReplayTxn<CodecQuarantined> {
+    /// Consume structural ownership only after every witness-free S1--S8 relation has been
     /// recomputed from strict S2/image owners. A failed close drops the raw quarantine, so no
     /// caller can retain a partially closed or externally advanceable graph.
-    pub(super) fn close_codec(self) -> Result<CodecClosedSemanticsV2, crate::EngineError> {
+    pub(super) fn close_codec(
+        self,
+    ) -> Result<AggregateReplayTxn<RetentionAuthorityPending>, crate::EngineError> {
         codec_closure::validate(self.graph.identity, &self.graph.graph)?;
-        Ok(CodecClosedSemanticsV2 { graph: self.graph })
+        Ok(AggregateReplayTxn {
+            graph: self.graph,
+            phase: RetentionAuthorityPending(PrivateSeal),
+        })
     }
 
-    /// Test-only continuation from an actual strict-fill state. It has no raw constructor and
-    /// still must traverse the same consuming codec closure as production scaffolding.
+    /// Q2's test-only adapter consumes the sole production shell and accepts only canonical
+    /// empty S8.  Nonempty retained responses cannot enter the historical Q2 chain.
     #[cfg(test)]
-    pub(super) fn close_codec_for_test(self) -> Result<CodecClosedSemanticsV2, crate::EngineError> {
-        self.close_codec()
+    pub(super) fn close_codec_for_test(
+        self,
+    ) -> Result<Q2CodecClosedSemanticsV2, crate::EngineError> {
+        let pending = self.close_codec()?;
+        if !matches!(
+            &pending.graph.graph.response,
+            graph::RetainedResponseEnvelope::Empty(_)
+        ) {
+            return Err(retained_error(
+                "Q2 codec-closed adapter requires canonical empty S8",
+            ));
+        }
+        Ok(Q2CodecClosedSemanticsV2 {
+            graph: pending.graph,
+        })
     }
 
     /// Test-only guard continuation.  It takes the sole existing codec-close bridge before the
@@ -335,7 +386,8 @@ impl QuarantinedSemanticsV2 {
     }
 }
 
-impl CodecClosedSemanticsV2 {
+#[cfg(test)]
+impl Q2CodecClosedSemanticsV2 {
     /// Consume the sole codec-closed owner after exact pinned-catalog and durable allocator
     /// closure. No generation result is accepted, retained, or constructed at this boundary.
     pub(super) fn validate_catalog_and_allocator<'a>(
@@ -388,7 +440,7 @@ impl CodecClosedSemanticsV2 {
 /// spell another codec-close transition.
 #[cfg(test)]
 pub(super) fn with_catalog_allocator_pending_for_test<T>(
-    closed: CodecClosedSemanticsV2,
+    closed: Q2CodecClosedSemanticsV2,
     catalog: SemanticsV2CatalogWitness<'_>,
     leases: &[AllocatorLeaseSpecForTest],
     operation: impl FnOnce(GenerationPendingSemanticsV2<'_>) -> Result<T, crate::EngineError>,
@@ -422,7 +474,7 @@ pub(super) fn with_catalog_allocator_pending_for_test<T>(
 /// validated owner never cross this retained facade.
 #[cfg(test)]
 pub(super) fn reencode_q2_golden_from_closed_for_test(
-    closed: CodecClosedSemanticsV2,
+    closed: Q2CodecClosedSemanticsV2,
     catalog: SemanticsV2CatalogWitness<'_>,
     leases: &[AllocatorLeaseSpecForTest],
     case: Q2GoldenCase,
@@ -440,7 +492,7 @@ pub(super) fn reencode_q2_golden_from_closed_for_test(
 /// become a side channel around the fully validated typestate.
 #[cfg(test)]
 pub(super) fn validate_q2_golden_sabotage_from_closed_for_test(
-    closed: CodecClosedSemanticsV2,
+    closed: Q2CodecClosedSemanticsV2,
     catalog: SemanticsV2CatalogWitness<'_>,
     leases: &[AllocatorLeaseSpecForTest],
     case: Q2GoldenCase,
@@ -481,6 +533,7 @@ fn golden_builder_sabotage(
     }
 }
 
+#[cfg(test)]
 impl<'a> GenerationPendingSemanticsV2<'a> {
     /// Consume this sole post-catalog owner through the sealed, already-reserved generation
     /// builder.  The builder result is compared against the retained graph before this returns
@@ -512,6 +565,7 @@ impl<'a> GenerationPendingSemanticsV2<'a> {
 /// This is the first phase only: it deliberately cannot inspect, store, or accept a generation
 /// result. The complete graph validator consumes this proof before it constructs the pending
 /// owner and hands that owner to the sealed generation-builder interface.
+#[cfg(test)]
 #[allow(dead_code)]
 pub(super) fn validate_catalog_allocator_witness_identity(
     identity: SemanticsV2BoundIdentity,
@@ -546,6 +600,120 @@ fn retained_error(message: &str) -> crate::EngineError {
     crate::EngineError::Durability(format!(
         "typed INSERT aggregate semantics-v2 retained: {message}"
     ))
+}
+
+#[cfg(test)]
+mod replay_shell_source_guards {
+    #[test]
+    fn production_replay_shell_has_no_catalog_or_live_successor() {
+        let source = include_str!("retained.rs");
+        let facade = include_str!("../semantics_v2.rs");
+        let fill = include_str!("retained/fill.rs");
+        let sealed = ["struct Private", "Seal;"].concat();
+        let quarantined = ["struct Codec", "Quarantined(PrivateSeal);"].concat();
+        let pending = ["struct RetentionAuthority", "Pending(PrivateSeal);"].concat();
+        let quarantined_impl = ["impl AggregateReplayTxn<", "CodecQuarantined", ">"].concat();
+        let pending_transition = [
+            "Result<AggregateReplayTxn<",
+            "RetentionAuthorityPending",
+            ">",
+        ]
+        .concat();
+        let strict_fill = ["fn quarantine_", "after_strict_fill("].concat();
+        assert!(source.contains(&sealed));
+        assert!(source.contains(&quarantined));
+        assert!(source.contains(&pending));
+        assert!(source.contains(&quarantined_impl));
+        assert!(source.contains(&pending_transition));
+        assert_eq!(
+            source.matches(&strict_fill).count(),
+            1,
+            "strict fill has exactly one move-only aggregate constructor"
+        );
+        assert_eq!(
+            source.matches(&pending_transition).count(),
+            1,
+            "codec quarantine has exactly one production phase transition"
+        );
+        let pending_impl = ["impl AggregateReplayTxn<", "RetentionAuthorityPending", ">"].concat();
+        assert!(!source.contains(&pending_impl));
+        let transaction_decl = ["pub(super) struct AggregateReplayTxn", "<Phase>"].concat();
+        let declaration_offset = source
+            .find(&transaction_decl)
+            .expect("move-only aggregate owner is declared");
+        let derive_window = &source[declaration_offset.saturating_sub(128)..declaration_offset];
+        assert!(
+            !derive_window.contains("#[derive"),
+            "AggregateReplayTxn cannot derive Clone or Copy"
+        );
+        for forbidden in [
+            ["impl Clone for ", "AggregateReplayTxn"].concat(),
+            ["impl Copy for ", "AggregateReplayTxn"].concat(),
+            ["impl<Phase> Clone for ", "AggregateReplayTxn"].concat(),
+            ["impl<Phase> Copy for ", "AggregateReplayTxn"].concat(),
+            ["impl<Phase> std::ops::Deref for ", "AggregateReplayTxn"].concat(),
+            ["impl<Phase> AsRef", "<"].concat(),
+            ["fn raw_", "aggregate"].concat(),
+            ["fn aggregate_", "body"].concat(),
+            ["fn into_", "inner"].concat(),
+            ["fn reencode_", "s8"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "replay shell must not expose {forbidden}"
+            );
+        }
+        let catalog_module = [
+            "#[cfg(test)]\n#[path = \"",
+            "retained/catalog_validation.rs\"]",
+        ]
+        .concat();
+        let generation_module = [
+            "#[cfg(test)]\n#[path = \"",
+            "retained/generation_validation.rs\"]",
+        ]
+        .concat();
+        let q2_struct = [
+            "#[cfg(test)]\npub(super) struct ",
+            "Q2CodecClosedSemanticsV2",
+        ]
+        .concat();
+        let q2_impl = ["#[cfg(test)]\nimpl ", "Q2CodecClosedSemanticsV2"].concat();
+        let q2_empty = ["Q2 codec-closed adapter ", "requires canonical empty S8"].concat();
+        assert!(source.contains(&catalog_module));
+        assert!(source.contains(&generation_module));
+        assert!(source.contains(&q2_struct));
+        assert!(source.contains(&q2_impl));
+        assert!(source.contains(&q2_empty));
+        assert!(facade.contains("#[cfg(test)]\nfn fill_canonical_semantics_v2_for_test"));
+        assert!(facade.contains("#[cfg(test)]\nfn codec_closed_canonical_semantics_v2_for_test"));
+        assert!(!facade.contains("pub(super) fn fill_canonical_semantics_v2_for_test"));
+        assert!(fill.contains("This has no transition to WAL, recovery, execution, GPU, result, or publication state."));
+        assert!(!fill.contains("fn publish"));
+        assert!(!fill.contains("fn replay"));
+        for (name, q2_source) in [
+            ("Q2 witnesses", include_str!("goldens/q2_witnesses.rs")),
+            (
+                "Q2 golden reencoder",
+                include_str!("goldens/q2_reencode.rs"),
+            ),
+            (
+                "Q2 generation builder",
+                include_str!("retained/generation_validation/golden_builder.rs"),
+            ),
+            (
+                "Q2 retained reencoder",
+                include_str!("retained/reencode.rs"),
+            ),
+        ] {
+            for forbidden in ["S8", "AggregateReplayTxn"] {
+                assert!(
+                    !q2_source.contains(forbidden),
+                    "{name} must remain isolated from {forbidden}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +1004,7 @@ mod generation_lifecycle_tests {
             catalog_epoch: CATALOG_EPOCH,
             catalog_digest: [0x33; 32],
             stable_transaction_id: STABLE_TRANSACTION_ID,
+            request_digest: [0x55; 32],
             autocommit: true,
             commit_sequence: COMMIT_SEQUENCE,
             initial_database_root: [0x44; 32],

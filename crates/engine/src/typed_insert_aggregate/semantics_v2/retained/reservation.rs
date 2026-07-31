@@ -8,12 +8,16 @@
 //! those move-only owners.
 
 use super::super::pass_zero::SemanticsV2StructuralMeasure;
+#[cfg(test)]
+use super::super::pass_zero::{empty_s8_measure_for_test, nonempty_s8_measure_for_test};
 use super::graph::{
     ReservedSemanticsV2Graph, RetainedDependencyToken, RetainedDisposition,
     RetainedIndexDescriptor, RetainedIndexKeyColumn, RetainedKeyComponent, RetainedKeyEffect,
-    RetainedProjectionBinding, RetainedSequenceEffect, RetainedStatement,
-    RetainedStatementDependencyUse, RetainedStatementOutcome, RetainedStatementResolution,
-    RetainedTable, RetainedTableDisposition, RetainedTransition,
+    RetainedProjectionBinding, RetainedResponseArtifact, RetainedResponseEnvelope,
+    RetainedResponseEnvelopeIdentity, RetainedResponseGraph, RetainedResponseSelection,
+    RetainedSequenceEffect, RetainedStatement, RetainedStatementDependencyUse,
+    RetainedStatementOutcome, RetainedStatementResolution, RetainedTable, RetainedTableDisposition,
+    RetainedTransition,
 };
 use crate::typed_insert_batch::{DecodedTypedImage, DecodedTypedInsertRecord};
 use crate::EngineError;
@@ -49,6 +53,8 @@ pub(super) struct RetainedSemanticsV2SourceMeasure {
     pub(super) s2_persistent_slots: u64,
     pub(super) image_persistent_bytes: u64,
     pub(super) image_persistent_slots: u64,
+    pub(super) response_image_persistent_bytes: u64,
+    pub(super) response_image_persistent_slots: u64,
     pub(super) maximum_scratch_bytes: u64,
     pub(super) maximum_scratch_slots: u64,
 }
@@ -72,6 +78,10 @@ struct RetainedSemanticsV2ExpectedGraph {
     key_components: usize,
     projections: usize,
     images: usize,
+    response_artifacts: usize,
+    response_selections: usize,
+    response_images: usize,
+    response_identity: RetainedResponseEnvelopeIdentity,
 }
 
 /// Reserved direct graph capacity plus its consumed exact measure.  No field is exposed outside
@@ -118,16 +128,44 @@ impl RetainedSemanticsV2Reservation {
             )?,
             projections: exact_count(structural.s7_directory_counts[10], "S7 projection count")?,
             images: exact_count(structural.s7_directory_counts[11], "S7 image count")?,
+            response_artifacts: exact_count(
+                structural.s8.identity.artifact_count,
+                "S8 artifact count",
+            )?,
+            response_selections: exact_count(
+                structural.s8.identity.selection_count,
+                "S8 selection count",
+            )?,
+            response_images: exact_count(structural.s8.identity.artifact_count, "S8 image count")?,
+            response_identity: RetainedResponseEnvelopeIdentity {
+                present: structural.s8.identity.present,
+                aggregate_flags: structural.s8.identity.aggregate_flags,
+                stable_transaction_id: structural.s8.identity.stable_transaction_id,
+                request_digest: structural.s8.identity.request_digest,
+                s6_section_root: structural.s8.identity.s6_section_root,
+                s7_section_root: structural.s8.identity.s7_section_root,
+                s8_section_root: structural.s8.identity.s8_section_root,
+                response_root: structural.s8.identity.response_root,
+                status_artifact_count: structural.s8.identity.status_artifact_count,
+                retention_deadline: structural.s8.identity.retention_deadline,
+                total_bytes: structural.s8.identity.total_bytes,
+                artifact_count: structural.s8.identity.artifact_count,
+                selection_count: structural.s8.identity.selection_count,
+                image_arena_bytes: structural.s8.identity.image_arena_bytes,
+                payload_digest: structural.s8.identity.payload_digest,
+            },
         };
         let direct_persistent_bytes = expected.direct_persistent_bytes()?;
         let direct_persistent_allocation_slots = expected.direct_persistent_allocation_slots()?;
         let persistent_bytes = direct_persistent_bytes
             .checked_add(structural.s2_decoded_persistent_bytes)
             .and_then(|value| value.checked_add(structural.image_decoded_persistent_bytes))
+            .and_then(|value| value.checked_add(structural.s8.image_persistent_bytes))
             .ok_or_else(|| reservation_error("retained persistent byte budget overflows"))?;
         let persistent_allocation_slots = direct_persistent_allocation_slots
             .checked_add(structural.s2_decoded_persistent_slots)
             .and_then(|value| value.checked_add(structural.image_decoded_persistent_slots))
+            .and_then(|value| value.checked_add(structural.s8.image_persistent_slots))
             .ok_or_else(|| {
                 reservation_error("retained persistent allocation-slot budget overflows")
             })?;
@@ -139,14 +177,24 @@ impl RetainedSemanticsV2Reservation {
                 s2_persistent_slots: structural.s2_decoded_persistent_slots,
                 image_persistent_bytes: structural.image_decoded_persistent_bytes,
                 image_persistent_slots: structural.image_decoded_persistent_slots,
-                maximum_scratch_bytes: structural.raw_maximum_scratch_bytes,
-                maximum_scratch_slots: structural.raw_maximum_scratch_slots,
+                response_image_persistent_bytes: structural.s8.image_persistent_bytes,
+                response_image_persistent_slots: structural.s8.image_persistent_slots,
+                maximum_scratch_bytes: structural
+                    .raw_maximum_scratch_bytes
+                    .max(structural.s8.maximum_scratch_bytes),
+                maximum_scratch_slots: structural
+                    .raw_maximum_scratch_slots
+                    .max(structural.s8.maximum_scratch_slots),
             },
             budget: RetainedSemanticsV2ReservationBudget {
                 persistent_bytes,
                 persistent_allocation_slots,
-                maximum_scratch_bytes: structural.raw_maximum_scratch_bytes,
-                maximum_scratch_allocation_slots: structural.raw_maximum_scratch_slots,
+                maximum_scratch_bytes: structural
+                    .raw_maximum_scratch_bytes
+                    .max(structural.s8.maximum_scratch_bytes),
+                maximum_scratch_allocation_slots: structural
+                    .raw_maximum_scratch_slots
+                    .max(structural.s8.maximum_scratch_slots),
             },
             direct_persistent_bytes,
             direct_persistent_allocation_slots,
@@ -202,6 +250,25 @@ impl RetainedSemanticsV2Reservation {
                 )?,
                 projections: reserve_exact(expected.projections, "S7 projection directory")?,
                 images: reserve_exact(expected.images, "S7 decoded image directory")?,
+                response: if !expected.response_identity.present {
+                    RetainedResponseEnvelope::Empty(expected.response_identity)
+                } else {
+                    RetainedResponseEnvelope::Present(RetainedResponseGraph {
+                        identity: expected.response_identity,
+                        artifacts: reserve_exact(
+                            expected.response_artifacts,
+                            "S8 response-artifact directory",
+                        )?,
+                        selections: reserve_exact(
+                            expected.response_selections,
+                            "S8 response-selection directory",
+                        )?,
+                        images: reserve_exact(
+                            expected.response_images,
+                            "S8 decoded response-image directory",
+                        )?,
+                    })
+                },
             },
             expected,
             source_measure: self.source_measure,
@@ -252,6 +319,9 @@ impl RetainedSemanticsV2ExpectedGraph {
         add_owner!(self.key_components, RetainedKeyComponent);
         add_owner!(self.projections, RetainedProjectionBinding);
         add_owner!(self.images, DecodedTypedImage);
+        add_owner!(self.response_artifacts, RetainedResponseArtifact);
+        add_owner!(self.response_selections, RetainedResponseSelection);
+        add_owner!(self.response_images, DecodedTypedImage);
         Ok(bytes)
     }
 
@@ -275,6 +345,9 @@ impl RetainedSemanticsV2ExpectedGraph {
             self.key_components,
             self.projections,
             self.images,
+            self.response_artifacts,
+            self.response_selections,
+            self.response_images,
         ] {
             slots = slots.checked_add(u64::from(count != 0)).ok_or_else(|| {
                 reservation_error("retained graph allocation-slot budget overflows")
@@ -334,7 +407,8 @@ impl RetainedSemanticsV2ExpectedGraph {
             && graph.key_effects.len() == self.key_effects
             && graph.key_components.len() == self.key_components
             && graph.projections.len() == self.projections
-            && graph.images.len() == self.images;
+            && graph.images.len() == self.images
+            && response_lengths_match(graph, self);
         if !(exact && filled) {
             return Err(reservation_error(
                 "strict retained decoder did not fill every exact graph owner",
@@ -361,6 +435,49 @@ impl RetainedSemanticsV2ExpectedGraph {
             && graph.key_components.capacity() == self.key_components
             && graph.projections.capacity() == self.projections
             && graph.images.capacity() == self.images
+            && response_capacities_match(graph, self)
+    }
+}
+
+fn response_lengths_match(
+    graph: &ReservedSemanticsV2Graph,
+    expected: &RetainedSemanticsV2ExpectedGraph,
+) -> bool {
+    match &graph.response {
+        RetainedResponseEnvelope::Empty(identity) => {
+            !expected.response_identity.present
+                && expected.response_artifacts == 0
+                && expected.response_selections == 0
+                && expected.response_images == 0
+                && identity == &expected.response_identity
+        }
+        RetainedResponseEnvelope::Present(response) => {
+            expected.response_identity.present
+                && response.identity == expected.response_identity
+                && response.artifacts.len() == expected.response_artifacts
+                && response.selections.len() == expected.response_selections
+                && response.images.len() == expected.response_images
+        }
+    }
+}
+
+fn response_capacities_match(
+    graph: &ReservedSemanticsV2Graph,
+    expected: &RetainedSemanticsV2ExpectedGraph,
+) -> bool {
+    match &graph.response {
+        RetainedResponseEnvelope::Empty(identity) => {
+            !identity.present
+                && expected.response_artifacts == 0
+                && expected.response_selections == 0
+                && expected.response_images == 0
+        }
+        RetainedResponseEnvelope::Present(response) => {
+            response.identity.present
+                && response.artifacts.capacity() == expected.response_artifacts
+                && response.selections.capacity() == expected.response_selections
+                && response.images.capacity() == expected.response_images
+        }
     }
 }
 
@@ -538,6 +655,7 @@ mod tests {
                 root_descriptor: [6; 32],
                 payload_digest: [7; 32],
             },
+            s8: empty_s8_measure_for_test(),
             // These stand for the complete nested decoded-record/image ABI, including their
             // names, text/vector values, and allocation slots. The outer graph only reserves
             // the move-only owner directories themselves.
@@ -548,6 +666,12 @@ mod tests {
             raw_maximum_scratch_bytes: 2048,
             raw_maximum_scratch_slots: 3,
         }
+    }
+
+    fn present_s8_structural_measure() -> SemanticsV2StructuralMeasure {
+        let mut measure = structural_measure();
+        measure.s8 = nonempty_s8_measure_for_test();
+        measure
     }
 
     #[test]
@@ -579,8 +703,9 @@ mod tests {
 
     #[test]
     fn rejects_one_byte_below_persistent_or_scratch_before_any_owner_reservation() {
-        let measure = RetainedSemanticsV2Reservation::from_structural(structural_measure())
-            .expect("test structural measure is addressable");
+        let measure =
+            RetainedSemanticsV2Reservation::from_structural(present_s8_structural_measure())
+                .expect("test structural measure is addressable");
         let exact = measure.required_budget();
         let persistent_short = RetainedSemanticsV2ReservationBudget {
             persistent_bytes: exact.persistent_bytes - 1,
@@ -591,8 +716,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(stats.attempts, 0);
 
-        let measure = RetainedSemanticsV2Reservation::from_structural(structural_measure())
-            .expect("test structural measure is addressable");
+        let measure =
+            RetainedSemanticsV2Reservation::from_structural(present_s8_structural_measure())
+                .expect("test structural measure is addressable");
         let exact = measure.required_budget();
         let scratch_short = RetainedSemanticsV2ReservationBudget {
             maximum_scratch_bytes: exact.maximum_scratch_bytes - 1,
@@ -602,8 +728,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(stats.attempts, 0);
 
-        let measure = RetainedSemanticsV2Reservation::from_structural(structural_measure())
-            .expect("test structural measure is addressable");
+        let measure =
+            RetainedSemanticsV2Reservation::from_structural(present_s8_structural_measure())
+                .expect("test structural measure is addressable");
         let exact = measure.required_budget();
         let persistent_slots_short = RetainedSemanticsV2ReservationBudget {
             persistent_allocation_slots: exact.persistent_allocation_slots - 1,
@@ -614,8 +741,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(stats.attempts, 0);
 
-        let measure = RetainedSemanticsV2Reservation::from_structural(structural_measure())
-            .expect("test structural measure is addressable");
+        let measure =
+            RetainedSemanticsV2Reservation::from_structural(present_s8_structural_measure())
+                .expect("test structural measure is addressable");
         let exact = measure.required_budget();
         let scratch_slots_short = RetainedSemanticsV2ReservationBudget {
             maximum_scratch_allocation_slots: exact.maximum_scratch_allocation_slots - 1,
@@ -645,6 +773,53 @@ mod tests {
             assert!(
                 retry.is_ok(),
                 "injected owner {attempt} leaves no retained state"
+            );
+        }
+    }
+
+    #[test]
+    fn present_s8_reservation_owns_response_directories_and_retries_every_failure() {
+        let measure =
+            RetainedSemanticsV2Reservation::from_structural(present_s8_structural_measure())
+                .expect("present S8 structural measure is addressable");
+        let expected_bytes = measure.direct_persistent_bytes();
+        let expected_slots = measure.direct_persistent_allocation_slots();
+        let (owner, stats) = observe_reservations(|| measure.reserve());
+        let owner = owner.expect("present S8 graph reserves exactly");
+        assert!(owner.capacities_match_expected());
+        assert_eq!(
+            stats.attempts, 20,
+            "S8 adds artifact, selection, and image owners"
+        );
+        assert_eq!(expected_slots, 20, "all direct owners are nonempty");
+        assert_eq!(stats.direct_persistent_bytes, expected_bytes);
+        assert_eq!(
+            owner.budget().persistent_bytes,
+            expected_bytes + 4096 + 8192 + 3072,
+            "nested S2, S7-image, and S8-image ownership is budgeted"
+        );
+        assert_eq!(
+            owner.budget().persistent_allocation_slots,
+            expected_slots + 37 + 19 + 11
+        );
+        assert_eq!(owner.budget().maximum_scratch_bytes, 2048);
+        assert_eq!(owner.budget().maximum_scratch_allocation_slots, 5);
+
+        for attempt in 1..=stats.attempts {
+            let result = fail_reservation_at(attempt, || {
+                RetainedSemanticsV2Reservation::from_structural(present_s8_structural_measure())
+                    .and_then(RetainedSemanticsV2Reservation::reserve)
+            });
+            assert!(
+                result.is_err(),
+                "present S8 owner {attempt} must fail injected reservation"
+            );
+            let retry =
+                RetainedSemanticsV2Reservation::from_structural(present_s8_structural_measure())
+                    .and_then(RetainedSemanticsV2Reservation::reserve);
+            assert!(
+                retry.is_ok(),
+                "present S8 owner {attempt} leaves no partial owner"
             );
         }
     }

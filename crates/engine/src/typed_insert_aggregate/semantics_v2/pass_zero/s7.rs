@@ -12,6 +12,7 @@ use super::super::super::codec::DecodedAggregateFraming;
 use super::SemanticsV2S7HeaderIdentity;
 use crate::typed_insert_aggregate::{
     AGGREGATE_FLAG_AUTOCOMMIT, AGGREGATE_FLAG_EXPLICIT, AGGREGATE_FLAG_PUBLISHED_SEQUENCE,
+    AGGREGATE_FLAG_RETAINED_RESPONSE,
 };
 use crate::typed_insert_batch::{measure_decoded_typed_image_from_source, TypedImageReadAt};
 use crate::EngineError;
@@ -48,6 +49,7 @@ pub(crate) struct SemanticsV2PassZero {
     pub(super) s6_outcome_count: u32,
     pub(super) s7_directory_counts: [u32; 12],
     pub(super) s7_header: SemanticsV2S7HeaderIdentity,
+    pub(super) s8: super::s8::S8PassZeroMeasure,
     pub(super) s2_wire_bytes: u64,
     pub(super) s5_wire_bytes: u64,
     pub(super) s7_value_arena_bytes: u64,
@@ -93,8 +95,6 @@ pub(super) fn measure(
         || u64::from(sections[3].entry_count) != scalar.original_inserted_row_count
         || sections[5].entry_count != scalar.statement_count
         || sections[6].entry_count != 1
-        || sections[7].entry_count != 0
-        || sections[7].payload_bytes != 0
     {
         return Err(error("v2 aggregate scalar/section profile is invalid"));
     }
@@ -129,6 +129,13 @@ pub(super) fn measure(
         scalar.original_inserted_row_count,
         terminal.abort_at.is_some(),
     )?;
+    let s8 = super::s8::measure(
+        framing,
+        outer,
+        &s7,
+        terminal.abort_at,
+        scalar.flags & AGGREGATE_FLAG_RETAINED_RESPONSE != 0,
+    )?;
     Ok(SemanticsV2PassZero {
         statement_count: scalar.statement_count,
         original_row_count: scalar.original_inserted_row_count,
@@ -142,6 +149,7 @@ pub(super) fn measure(
         s6_outcome_count: scalar.statement_count,
         s7_directory_counts: s7.directory_counts,
         s7_header: s7.header,
+        s8,
         s2_wire_bytes: sections[1].payload_bytes,
         s5_wire_bytes: sections[4].payload_bytes,
         s7_value_arena_bytes: s7.value_arena_bytes,
@@ -165,7 +173,7 @@ pub(super) fn measure(
 }
 
 #[derive(Clone, Copy)]
-struct S7Measure {
+pub(super) struct S7Measure {
     table_count: u32,
     transition_count: u32,
     image_count: u32,
@@ -174,7 +182,7 @@ struct S7Measure {
     image_persistent_slots: u64,
     image_maximum_scratch_bytes: u64,
     image_maximum_scratch_slots: u64,
-    directory_counts: [u32; 12],
+    pub(super) directory_counts: [u32; 12],
     header: SemanticsV2S7HeaderIdentity,
     value_arena_bytes: u64,
     image_arena_bytes: u64,
@@ -1798,8 +1806,9 @@ fn validate_statement_resolutions(
                 || read_u32(&raw, 8) != ordinal
                 || read_u32(&raw, 12) != ordinal
                 || read_u32(&raw, 16) >= counts[0]
-                || flags & !1 != 0
-                || (flags & 1 != 0) != (s6_flags & 1 != 0)
+                || flags & !3 != 0
+                || (flags & 2 != 0 && flags & 1 == 0)
+                || flags != u32::from(s6_flags)
                 || s4_start != next_s4
                 || s4_count != input_rows
                 || s5_start != next_s5

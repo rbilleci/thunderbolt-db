@@ -43,6 +43,7 @@ fn nonempty_neutral_fixture_measures_fills_and_matches_independent_digest() {
         catalog_epoch: CATALOG_EPOCH,
         catalog_digest: [4; 32],
         stable_transaction_id: 90,
+        request_digest: [11; 32],
         autocommit: true,
         commit_sequence: 91,
         initial_database_root: [5; 32],
@@ -376,6 +377,8 @@ fn fixture_graph(
         }],
         projections: Vec::new(),
         images: vec![image],
+        response:
+            crate::typed_insert_aggregate::semantics_v2::retained::graph::empty_response_for_test(),
     }
 }
 

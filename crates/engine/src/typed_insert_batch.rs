@@ -41,7 +41,7 @@ pub(crate) use canonical_codec::{
 pub(crate) use typed_image_codec::{
     copy_typed_image_after_measure, decode_typed_image, decode_typed_image_after_measure,
     measure_decoded_typed_image, measure_decoded_typed_image_from_source, DecodedTypedImage,
-    TypedImageDecodeMeasure, TypedImageReadAt, TypedImageRole,
+    DecodedTypedImageColumnFacts, TypedImageDecodeMeasure, TypedImageReadAt, TypedImageRole,
 };
 #[cfg(test)]
 pub(crate) use typed_image_codec::{encode_typed_image, TypedImageColumnView, TypedImageView};

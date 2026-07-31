@@ -13,11 +13,15 @@ mod source;
 mod s2;
 #[path = "fill/s7.rs"]
 mod s7;
+#[path = "fill/s8.rs"]
+mod s8;
 
 use super::reservation::{
     ReservedSemanticsV2GraphOwner, RetainedSemanticsV2Reservation, RetainedSemanticsV2SourceMeasure,
 };
-use super::{quarantine_after_strict_fill, QuarantinedSemanticsV2, SemanticsV2BoundIdentity};
+use super::{
+    quarantine_after_strict_fill, AggregateReplayTxn, CodecQuarantined, SemanticsV2BoundIdentity,
+};
 use crate::typed_insert_aggregate::codec::DecodedAggregateFraming;
 use crate::typed_insert_aggregate::semantics_v2::pass_zero::SemanticsV2PassZero;
 use crate::EngineError;
@@ -28,6 +32,8 @@ pub(super) struct ObservedSourceMeasure {
     s2_persistent_slots: u64,
     image_persistent_bytes: u64,
     image_persistent_slots: u64,
+    response_image_persistent_bytes: u64,
+    response_image_persistent_slots: u64,
     maximum_scratch_bytes: u64,
     maximum_scratch_slots: u64,
 }
@@ -73,11 +79,33 @@ impl ObservedSourceMeasure {
         Ok(())
     }
 
+    fn checked_add_response_image(
+        &mut self,
+        persistent_bytes: u64,
+        persistent_slots: u64,
+        scratch_bytes: u64,
+        scratch_slots: u64,
+    ) -> Result<(), EngineError> {
+        self.response_image_persistent_bytes = self
+            .response_image_persistent_bytes
+            .checked_add(persistent_bytes)
+            .ok_or_else(|| source::fill_error("decoded S8 image persistent bytes overflow"))?;
+        self.response_image_persistent_slots = self
+            .response_image_persistent_slots
+            .checked_add(persistent_slots)
+            .ok_or_else(|| source::fill_error("decoded S8 image persistent slots overflow"))?;
+        self.maximum_scratch_bytes = self.maximum_scratch_bytes.max(scratch_bytes);
+        self.maximum_scratch_slots = self.maximum_scratch_slots.max(scratch_slots);
+        Ok(())
+    }
+
     fn require_exact(self, expected: RetainedSemanticsV2SourceMeasure) -> Result<(), EngineError> {
         if self.s2_persistent_bytes != expected.s2_persistent_bytes
             || self.s2_persistent_slots != expected.s2_persistent_slots
             || self.image_persistent_bytes != expected.image_persistent_bytes
             || self.image_persistent_slots != expected.image_persistent_slots
+            || self.response_image_persistent_bytes != expected.response_image_persistent_bytes
+            || self.response_image_persistent_slots != expected.response_image_persistent_slots
             || self.maximum_scratch_bytes != expected.maximum_scratch_bytes
             || self.maximum_scratch_slots != expected.maximum_scratch_slots
         {
@@ -95,7 +123,7 @@ pub(super) fn fill_after_pass_zero(
     framing: &DecodedAggregateFraming<'_>,
     outer: &gpu_db_wal::CanonicalPreApplyHeader,
     pass_zero: SemanticsV2PassZero,
-) -> Result<QuarantinedSemanticsV2, EngineError> {
+) -> Result<AggregateReplayTxn<CodecQuarantined>, EngineError> {
     let reservation =
         RetainedSemanticsV2Reservation::from_structural(pass_zero.into_structural_measure())?;
     let mut owner = reservation.reserve()?;
@@ -105,6 +133,7 @@ pub(super) fn fill_after_pass_zero(
     fixed::fill_fixed_sections(framing, owner.graph_mut())?;
     s2::fill_s2_records(framing, owner.graph_mut(), &mut observed)?;
     s7::fill_s7(framing, owner.graph_mut(), &mut observed)?;
+    s8::fill_s8(framing, owner.graph_mut(), &mut observed)?;
     observed.require_exact(expected_source)?;
     validate_filled_bindings(&owner)?;
 
@@ -117,6 +146,7 @@ pub(super) fn fill_after_pass_zero(
         catalog_epoch: outer.catalog_before_epoch,
         catalog_digest: outer.catalog_before_digest,
         stable_transaction_id: outer.stable_transaction_id,
+        request_digest: outer.request_digest,
         autocommit: framing.header_scalars().flags
             & crate::typed_insert_aggregate::AGGREGATE_FLAG_AUTOCOMMIT
             != 0,
@@ -206,4 +236,9 @@ fn validate_filled_bindings(owner: &ReservedSemanticsV2GraphOwner) -> Result<(),
 #[cfg(test)]
 pub(super) fn fail_copy_at_for_test<T>(attempt: u64, operation: impl FnOnce() -> T) -> T {
     source::fail_copy_at_for_test(attempt, operation)
+}
+
+#[cfg(test)]
+pub(super) fn observe_copy_attempts_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+    source::observe_copy_attempts_for_test(operation)
 }

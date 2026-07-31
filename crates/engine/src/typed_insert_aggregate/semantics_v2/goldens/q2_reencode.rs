@@ -199,7 +199,7 @@ fn assert_s7_evidence(actual: &[u8], expected: &[u8], expected_section_root: [u8
 
 fn codec_closed(
     fixture: &impl Q2Fixture,
-) -> crate::typed_insert_aggregate::semantics_v2::retained::CodecClosedSemanticsV2 {
+) -> crate::typed_insert_aggregate::semantics_v2::retained::Q2CodecClosedSemanticsV2 {
     let fragments = [
         gpu_db_wal::CanonicalFragmentRef {
             kind: gpu_db_wal::CanonicalFragmentKind::RowMutation,

@@ -150,7 +150,7 @@ pub(super) fn validate(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineErr
         let has_returning = resolution.projection_count != 0;
         if (resolution.flags & !3) != 0
             || (resolution.flags & 1 != 0) != has_returning
-            || resolution.flags & 2 != 0
+            || (resolution.flags & 2 != 0 && resolution.flags & 1 == 0)
             || has_returning != (facts.returning.column_count != 0)
             || projections.len() != facts.returning.column_count as usize
         {
@@ -158,7 +158,9 @@ pub(super) fn validate(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineErr
         }
         match outcome.outcome.kind {
             gpu_db_wal::CanonicalOutcomeKind::CommitSuccess => {
-                if outcome.flags != u16::from(has_returning)
+                if outcome.flags & !3 != 0
+                    || (outcome.flags & 1 != 0) != has_returning
+                    || (outcome.flags & 2 != 0 && outcome.flags & 1 == 0)
                     || outcome.outcome.affected_rows != affected as u64
                     || resolution.affected_row_count != affected as u64
                     || resolution.terminal_dependency_ref != ABSENT_U32
@@ -169,7 +171,9 @@ pub(super) fn validate(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineErr
                 }
             }
             gpu_db_wal::CanonicalOutcomeKind::AbortError => {
-                if outcome.flags != 0
+                if outcome.flags & !3 != 0
+                    || (outcome.flags & 1 != 0) != has_returning
+                    || outcome.flags & 2 != 0
                     || outcome.outcome.affected_rows != 0
                     || resolution.affected_row_count != 0
                     || resolution.terminal_dependency_ref == ABSENT_U32

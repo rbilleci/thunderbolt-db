@@ -1261,6 +1261,8 @@ fn blank_graph(
         key_components: Vec::new(),
         projections: Vec::new(),
         images: Vec::new(),
+        response:
+            crate::typed_insert_aggregate::semantics_v2::retained::graph::empty_response_for_test(),
     }
 }
 
@@ -1405,6 +1407,8 @@ fn graph_with_not_null_record() -> ReservedSemanticsV2Graph {
         key_components: Vec::new(),
         projections: Vec::new(),
         images: Vec::new(),
+        response:
+            crate::typed_insert_aggregate::semantics_v2::retained::graph::empty_response_for_test(),
     }
 }
 
@@ -1689,6 +1693,7 @@ fn bound_identity() -> SemanticsV2BoundIdentity {
         catalog_epoch: TEST_CATALOG_EPOCH,
         catalog_digest: [0; 32],
         stable_transaction_id: 0,
+        request_digest: [0; 32],
         autocommit: true,
         commit_sequence: 0,
         initial_database_root: [0; 32],

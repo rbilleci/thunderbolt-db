@@ -23,8 +23,8 @@ use crate::EngineError;
 /// the original codec-5 chunk bodies.  The returned measurement has no decoded raw aggregate,
 /// S2, image, catalog, lease, generation, replay, or publication capability.
 ///
-/// This is deliberately crate-private and has no production caller while the remaining retained
-/// S1--S7 owner is built.  It exists to make version dispatch explicit and to ensure v2 never
+/// This is deliberately crate-private and has no production caller while the full retained
+/// S1--S8 owner remains inert.  It exists to make version dispatch explicit and to ensure v2 never
 /// takes the historical semantics-v1 global-allocator path.
 pub(super) fn measure_canonical_semantics_v2<'a>(
     outer: &gpu_db_wal::CanonicalPreApplyHeader,
@@ -103,6 +103,41 @@ pub(super) fn measure_canonical_semantics_v2<'a>(
     Ok(measured)
 }
 
+/// Test-only S8 measurement seam.  It decodes two complete canonical aggregate framings and
+/// reuses the production S7 directory measure from the unretained reference before measuring
+/// the candidate's S8 through the production artifact proof.  It does not define a second S8
+/// grammar or construct an S8 payload in isolation.
+#[cfg(test)]
+fn measure_s8_against_reference_for_test<'reference, 'candidate>(
+    reference_outer: &gpu_db_wal::CanonicalPreApplyHeader,
+    reference_fragments: &[gpu_db_wal::CanonicalFragmentRef<'reference>],
+    candidate_outer: &gpu_db_wal::CanonicalPreApplyHeader,
+    candidate_fragments: &[gpu_db_wal::CanonicalFragmentRef<'candidate>],
+) -> Result<pass_zero::S8PassZeroMeasure, EngineError> {
+    let mut reference_bodies = [&[][..]; AGGREGATE_MAX_CHUNKS + 1];
+    for (target, fragment) in reference_bodies.iter_mut().zip(reference_fragments.iter()) {
+        *target = fragment.body;
+    }
+    let reference = decode_aggregate_framing(
+        reference_outer.flags,
+        &reference_bodies[..reference_fragments.len()],
+    )?;
+    let mut candidate_bodies = [&[][..]; AGGREGATE_MAX_CHUNKS + 1];
+    for (target, fragment) in candidate_bodies.iter_mut().zip(candidate_fragments.iter()) {
+        *target = fragment.body;
+    }
+    let candidate = decode_aggregate_framing(
+        candidate_outer.flags,
+        &candidate_bodies[..candidate_fragments.len()],
+    )?;
+    pass_zero::measure_s8_against_reference_for_test(
+        &reference,
+        reference_outer,
+        &candidate,
+        candidate_outer,
+    )
+}
+
 /// Test-only end-to-end retained construction.  Production has no caller and no exported
 /// conversion from its quarantine owner; this bridge exists solely to prove that the frozen
 /// golden bytes can complete post-reservation source/image filling and immediately drain on a
@@ -112,7 +147,7 @@ fn fill_canonical_semantics_v2_for_test<'a>(
     outer: &gpu_db_wal::CanonicalPreApplyHeader,
     outcome: &gpu_db_wal::CanonicalOutcome,
     fragments: &[gpu_db_wal::CanonicalFragmentRef<'a>],
-) -> Result<retained::QuarantinedSemanticsV2, EngineError> {
+) -> Result<retained::AggregateReplayTxn<retained::CodecQuarantined>, EngineError> {
     let measured = measure_canonical_semantics_v2(outer, outcome, fragments)?;
     let mut bodies = [&[][..]; AGGREGATE_MAX_CHUNKS + 1];
     for (target, fragment) in bodies.iter_mut().zip(fragments.iter()) {
@@ -140,7 +175,7 @@ fn codec_closed_canonical_semantics_v2_for_test<'a>(
     outer: &gpu_db_wal::CanonicalPreApplyHeader,
     outcome: &gpu_db_wal::CanonicalOutcome,
     fragments: &[gpu_db_wal::CanonicalFragmentRef<'a>],
-) -> Result<retained::CodecClosedSemanticsV2, EngineError> {
+) -> Result<retained::Q2CodecClosedSemanticsV2, EngineError> {
     fill_canonical_semantics_v2_for_test(outer, outcome, fragments)?.close_codec_for_test()
 }
 
@@ -160,6 +195,11 @@ fn validate_canonical_semantics_v2_guards_for_test<'a>(
 #[cfg(test)]
 fn fail_retained_source_copy_at_for_test<T>(attempt: u64, operation: impl FnOnce() -> T) -> T {
     retained::fail_source_copy_at_for_test(attempt, operation)
+}
+
+#[cfg(test)]
+fn observe_retained_source_copy_attempts_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+    retained::observe_source_copy_attempts_for_test(operation)
 }
 
 #[cfg(test)]
