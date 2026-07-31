@@ -368,6 +368,44 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   final-abort RETURNING repair plus nonempty S8 pass-zero/reservation/fill/local codec closure and only the minimal
   CodecQuarantined to RetentionAuthorityPending shell; PLAN.md owns its sequencing and later authority phases.
 
+## WRITE-001 inert S8 codec ownership accepted — 2026-07-31
+
+- The accepted source implements the exact empty/nonempty S8 structural and local-codec boundary without making it
+  live. Allocation-free pass zero validates the 256-byte header, adjacent artifact/selection directories, role-2
+  typed images, exact geometry, S2/S4/S6/S7 membership, local digests, aggregate flags, and STATUS2 closure over
+  canonical chunk readers. Exact fallible reservation includes typed artifact, selection, and decoded-image owners;
+  strict fill remeasures and copies each bounded image, retains only typed facts, and drops raw scratch before local
+  closure.
+- Local closure independently recomputes response identity, selection/projection/artifact roots, role-2 descriptors,
+  and every retained value against the move-only S2 records. The final failing `RETURNING` statement retains only
+  bit 0 and a zero logical result, while an earlier `AppliedThenCanceled` response may remain retained. A coherent
+  successful eligible omission is intentionally not disproved locally and can advance only to
+  `RetentionAuthorityPending`.
+- The production shell has one sealed consuming transition:
+  `AggregateReplayTxn<CodecQuarantined> -> AggregateReplayTxn<RetentionAuthorityPending>`.
+  `RetentionAuthorityPending` has no implementation or production successor. Q2 catalog/allocator/generation and
+  reencoding remain `cfg(test)` behind a canonical-empty-S8 adapter. The only S8 encoder is a test golden builder;
+  the production writer remains hardwired to semantics v1. No claim, catalog, sequence, GPU, WAL, recovery, apply,
+  result, or publication authority was added.
+- Accepted evidence includes independently captured exact B/C/D S8/STATUS/root literals; explicit-abort,
+  selective A/B/A, zero-selection/zero-row, all-source-copy failure/retry, all-owner reservation failure/retry and
+  one-below-budget coverage; three coherently reframed hostility cases; and six real canonical two-chunk fixtures
+  whose boundary lands inside the S8 header, artifact descriptor, selection, nested image header, packed name, or
+  value vector before running production measure/reserve/fill/close. The exact release boundary proof passes
+  **1/1** in **21.11s**. The exact serial all-feature engine library passes
+  **1,179 / 669 GPU-required ignored / 0 failed** in **514.05s**; workspace all-target/all-feature check, strict
+  Clippy, rustfmt, diff, source-boundary, reservation, and size gates are clean. `q1_vectors.rs` remains below its
+  original size at **3,922** lines; every new owner is below the preferred module threshold.
+- The accepted source commit is `586a0af427f6cd9e71b11b7398ec093f59fe21fa`, tree
+  `4320b6430c36a75fdb2bf0810dbe494f7f6e8f75`, based on
+  `9838d05e06e0abaa815d6f7a035264def7b388ca`, with cached-diff SHA-256
+  `b8810cf34954740c03254e256a36f7725a0c3ea5ba186f10030653e81f6746e9` across **26 source/test paths**.
+  Architecture review and the independent acceptance audit both returned **ACCEPT** with no unresolved finding.
+- NULL differential, GPU HAZARD, WAL recovery, roofline, quick/full report card, and benchmark provenance are
+  inapplicable: this slice changes no live SQL execution, device ownership, writer, read kernel, residency/result
+  path, runtime dependency, recovery/apply/publication route, or benchmark harness. PLAN.md owns the next sealed
+  retention-authority proof and every later authority phase.
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted

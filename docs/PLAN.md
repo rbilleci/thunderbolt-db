@@ -110,11 +110,24 @@ starts at WRITE-001:
    durable-sequence proof, source-guarded GPU replay, launch/drain/quarantine, and all-domain pre-WAL capacity
    ownership.
 
-   The next PLAN-owned checkpoint is an **inert final-abort RETURNING repair plus nonempty S8
-   pass-zero/reservation/fill/local codec closure**. It begins the minimal
-   `AggregateReplayTxn<CodecQuarantined> -> RetentionAuthorityPending` shell only. It must not add claim,
-   catalog, sequence, GPU, live, WAL, recovery, apply, publication, or other eligibility authority; those remain
-   later PLAN-owned work under the accepted design.
+   The independently accepted **inert S8 codec-ownership checkpoint** now implements that exact boundary. It
+   repairs final-abort `RETURNING`, validates the byte-exact empty/nonempty S8 form allocation-free over canonical
+   chunk readers, reserves every typed artifact/selection/role-2 image owner before fill, drops all raw copies, and
+   recomputes local S2/S4/S6/S7/S8 identity, membership, digest, descriptor, and value closure before the sole
+   move-only `AggregateReplayTxn<CodecQuarantined> -> RetentionAuthorityPending` transition. Six legal canonical
+   chunk fixtures split inside the S8 header, artifact descriptor, selection, nested image header, packed name,
+   and value vector and traverse the real measure/reserve/fill/close path. Q2's historical catalog/generation
+   chain is `cfg(test)` and accepts only canonical empty S8; the production writer remains semantics v1.
+   The exact source commit is `586a0af427f6cd9e71b11b7398ec093f59fe21fa`, tree
+   `4320b6430c36a75fdb2bf0810dbe494f7f6e8f75`, and accepted cached-diff SHA-256
+   `b8810cf34954740c03254e256a36f7725a0c3ea5ba186f10030653e81f6746e9`; architecture and independent
+   acceptance audits both returned **ACCEPT**.
+
+   The next PLAN-owned checkpoint is the **sealed retention-authority proof** that consumes
+   `RetentionAuthorityPending` into `CatalogAllocatorPending` using the sole authenticated claim/status index and
+   the accepted `ValidatedRetentionAuthority` live/historical sum. It must not add catalog/allocator validation,
+   durable sequence validation, GPU capacity or replay, WAL/recovery/apply/publication authority, or a second
+   retention-intent source; those remain later ordered phases under the accepted design.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as

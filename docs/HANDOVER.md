@@ -133,30 +133,27 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. Q2 witness closure received architecture and final independent
-**ACCEPT** on 2026-07-31 with no finding. Its exact source commit is
-`f288df1c3f4ddd8ef4ff1212c74f6c0a305fe434`, tree `540275d1a581010a2f3d1196c2dc019407eefaec`,
-cached-diff SHA-256 `d427b19ddee9b77dfd1147236301008c1fe1d369701fec3a3e3c7ed8db09f3e0`, and 11 source paths
-without drift. Semantics-v2 passes **68/68** and the serial all-feature engine sweep passes
-**1,168 / 669 GPU-required ignored / 0 failed**; workspace all-target/all-feature check, strict Clippy, scoped
-formatting, source-boundary, diff, and size gates are clean. GPU/HAZARD, recovery execution, and cards were
-inapplicable to the test-only host slice.
+**WRITE-001** is the sole active **NOW** task. The inert S8 codec-ownership checkpoint received architecture and
+final independent **ACCEPT** on 2026-07-31 with no finding. Its exact source commit is
+`586a0af427f6cd9e71b11b7398ec093f59fe21fa`, tree `4320b6430c36a75fdb2bf0810dbe494f7f6e8f75`,
+cached-diff SHA-256 `b8810cf34954740c03254e256a36f7725a0c3ea5ba186f10030653e81f6746e9`, and 26 source/test
+paths without drift.
 
-The exact S8 retained-response and replay design is accepted at
-[design/write-001-codec5-s8-replay.md](design/write-001-codec5-s8-replay.md), file SHA-256
-`acef17d5bf1a53bd12b9635add7b84648d09edf9effd5a383360692efb6fbd1c`, commit
-`e15304618afc160e4d8bba0914b1021bb6572ad6`, tree
-`fb768ad38b3df7cbf77b0842ee45916074a9cab9`; architecture and the independent acceptance audit both returned
-**ACCEPT**. It fixes the 256-byte S8 header and adjacent 288-byte artifact, 32-byte row-selection, and image-arena
-directories; distinguishes the inherited length-prefixed v1 response root from local v2 S8 digests; and closes
-RetentionIntent/RetentionAuthorityPending, sealed live and historical no-retention proof, durable sequence proof,
-source-guarded GPU replay, launch/drain/quarantine, and pre-WAL capacity ownership.
+The accepted boundary validates and strictly fills exact S8 artifacts, selections, and role-2 images, then
+recomputes their identity, digest, descriptor, membership, and S2 value closure before the one move-only
+`AggregateReplayTxn<CodecQuarantined> -> RetentionAuthorityPending` transition. Six legal canonical chunk fixtures
+split inside every new S8 owner class and traverse real measure/reserve/fill/close. Q2 remains test-only and
+empty-S8-only; `RetentionAuthorityPending` has no successor; the production writer remains semantics v1. The exact
+release boundary proof passes **1/1** in **21.11s**, and the serial all-feature engine sweep passes
+**1,179 / 669 GPU-required ignored / 0 failed** in **514.05s**. Workspace check, strict Clippy, formatting, diff,
+source-boundary, reservation, and size gates are clean. GPU/HAZARD, recovery, NULL differential, and cards are
+inapplicable to this production-unreachable host codec slice.
 
-Resume with PLAN.md's next inert final-abort RETURNING repair plus nonempty S8
-pass-zero/reservation/fill/local codec closure. It may introduce only the minimal
-`AggregateReplayTxn<CodecQuarantined> -> RetentionAuthorityPending` shell. It must not add claim, catalog, sequence,
-GPU, live, WAL, recovery, apply, publication, or other eligibility authority. Q2's accepted source facts above and
-the CARD-001/COPY-001 blocks remain unchanged.
+Resume only with PLAN.md's next sealed retention-authority proof:
+`RetentionAuthorityPending -> CatalogAllocatorPending` using the sole authenticated claim/status index and the
+accepted live/historical authority sum. Do not combine catalog/allocator validation, durable sequence validation,
+GPU replay/capacity, WAL, recovery, apply, publication, or a second RetentionIntent authority into that checkpoint.
+The accepted design and prior Q2 facts remain unchanged, and the CARD-001/COPY-001 blocks remain in force.
 
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read
