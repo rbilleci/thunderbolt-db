@@ -12,6 +12,7 @@ use crate::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDeviceSnapshot, CudaOwnedDeviceMemoryChunk,
     CudaResidentDeviceMemory, CudaRuntimeProbeError, CudaRuntimeSnapshot, GpuFallbackReason,
     GpuRuntime, PendingCudaResidentDeviceCopy, PlannedOp, RecompactFill, RecompactSegment,
+    RuntimeGenerationRebuildTarget,
 };
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,22 @@ impl CudaDriverRuntime {
         self.snapshot.clone()
     }
 
+    /// Retain the exact primary CUDA target for a closed runtime-generation rebuild. The target
+    /// carries no raw context/pointer surface; engine code can use it even for all-cold sources
+    /// without inferring a device from a cache.
+    pub fn runtime_generation_rebuild_target(
+        &self,
+        gpu_id: u16,
+    ) -> Result<RuntimeGenerationRebuildTarget, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+        Ok(RuntimeGenerationRebuildTarget::from_primary(
+            gpu_id,
+            gpu_primary_context(gpu_id)?,
+        ))
+    }
+
     pub fn launch_smoke_add_one(&self, input: u32) -> Result<u32, CudaRuntimeProbeError> {
         if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
             return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
@@ -97,7 +114,7 @@ impl CudaDriverRuntime {
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
         let resident = launch_cuda_resident_device_memory(gpu_id, payload)?;
-        Ok(CudaResidentDeviceMemory::from_raw_parts(
+        let memory = CudaResidentDeviceMemory::from_raw_parts(
             CudaDeviceMemoryProof {
                 gpu_id,
                 device_name: device.name,
@@ -107,7 +124,11 @@ impl CudaDriverRuntime {
             },
             resident.device_ptr,
             resident.primary,
-        ))
+        );
+        // This constructor uploads one payload into a freshly allocated buffer at offset zero,
+        // so it is the narrow synchronous authority for a full contiguous-init proof.
+        memory.mark_full_contiguous_initialization();
+        Ok(memory)
     }
 
     /// Transaction/query-scoped analogue of [`Self::retain_device_memory_copy`]. The exact raw
@@ -133,20 +154,20 @@ impl CudaDriverRuntime {
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
         let resident = launch_cuda_resident_device_memory(gpu_id, payload)?;
-        Ok(
-            CudaResidentDeviceMemory::from_raw_parts_with_scope_reservation(
-                CudaDeviceMemoryProof {
-                    gpu_id,
-                    device_name: device.name,
-                    allocated_bytes: payload.len() as u64,
-                    copied_bytes: payload.len() as u64,
-                    retained: true,
-                },
-                resident.device_ptr,
-                resident.primary,
-                Some(reservation),
-            ),
-        )
+        let memory = CudaResidentDeviceMemory::from_raw_parts_with_scope_reservation(
+            CudaDeviceMemoryProof {
+                gpu_id,
+                device_name: device.name,
+                allocated_bytes: payload.len() as u64,
+                copied_bytes: payload.len() as u64,
+                retained: true,
+            },
+            resident.device_ptr,
+            resident.primary,
+            Some(reservation),
+        );
+        memory.mark_full_contiguous_initialization();
+        Ok(memory)
     }
 
     /// Allocate a retained device buffer and initialize every byte with `cuMemsetD8`. This is the

@@ -57,6 +57,25 @@ starts at WRITE-001:
    including exact bytes/allocation-slot accounting and hostile pre-allocation rejection. These pieces remain
    production-ineligible.
 
+   **Bootstrap TEXT prerequisite — NEXT within WRITE-001; blocks live bootstrap integration and WRITE-001
+   closure.** The ownership-only physical encoding v1 deliberately rejects every `SqlType::Text` table-value or
+   index-key descriptor, including zero-row sources. This fail-closed temporary scope is not supported-type
+   completion. Before `BootstrapPublicationSource` or its materializer gains any production recovery or publication
+   caller, introduce and freeze a new versioned GPU-ready TEXT layout using the canonical `(row_count + 1)` `u64`
+   offsets plus byte blob and separate validity. Validate zero start, monotonicity, bounds, exact terminal offset,
+   UTF-8/canonical-value, NULL, empty-string, multibyte, multi-row, and text-index-key behavior without CPU
+   relational decoding or hashing. Prove resident/cold/recovery root determinism and malformed offset/blob sabotage
+   on the GPU. Bootstrap must not be described as current-catalog/type complete until this prerequisite is
+   independently accepted.
+
+   The sealed, root-free bootstrap Rebuild compiler/proof schema is accepted, as is its first private executable
+   `V1SingleTableInt4` path: one nonempty nullable Int4 table without indexes, over resident/cold/mixed canonical
+   shards, GPU-validating stable IDs/visibility/validity and returning one opaque 135-slot typed-root proof through
+   one pre-reserved asynchronous fence lifecycle. It remains neither full bootstrap completion nor a live path. The
+   next checkpoint broadens only through another sealed grammar: remaining fixed-width types, indexes/status/multiple
+   tables, then the separately accepted comparator and persistent-map import/install boundary. Do not start live
+   integration until the Text prerequisite and that comparison/install boundary are independently accepted.
+
    The exact semantics-v2 S7 wire contract is frozen and independently architecture-accepted at
    [`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md), file SHA-256
    `b673127af53148fb26a5e26e32ad00bacb3206aadea0440a155d1a8d05624453`. It permanently admits only typed

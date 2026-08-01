@@ -726,6 +726,7 @@ dependencies = [
  "gpu_db_snapshot",
  "libloading",
  "serde",
+ "sha2 0.10.9",
 ]
 
 [[package]]

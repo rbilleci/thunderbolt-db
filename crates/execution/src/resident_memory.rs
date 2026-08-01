@@ -1,6 +1,9 @@
 use std::fmt;
 use std::os::raw::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use libloading::Library;
 
@@ -26,6 +29,10 @@ pub struct CudaResidentDeviceMemory {
     /// Shared allocation lifetime. Read views clone this guard, so every safe owner or view that can
     /// submit a kernel keeps the exact device pointer allocated until its last clone is dropped.
     allocation: Arc<CudaResidentDeviceAllocation>,
+    /// A provenance bit, not an accounting counter: it is set only by a constructor which has
+    /// established that every byte of this allocation was initialized contiguously. In particular,
+    /// `copied_bytes == allocated_bytes` is insufficient because chunk uploads can overlap.
+    full_contiguous_initialization: AtomicBool,
     pub(super) last_kernel_event_elapsed_us: Mutex<Option<u64>>,
 }
 
@@ -233,6 +240,20 @@ impl CudaResidentDeviceMemory {
         Arc::as_ptr(&self.allocation) as usize
     }
 
+    /// Whether a sealed constructor proved this entire allocation was initialized exactly over
+    /// `[0, allocated_bytes)`. This deliberately does not infer coverage from `copied_bytes`.
+    pub fn has_full_contiguous_initialization(&self) -> bool {
+        self.full_contiguous_initialization.load(Ordering::Acquire)
+    }
+
+    /// Mint the narrow full-allocation initialization proof after the owning CUDA path has
+    /// synchronously established contiguous coverage. Kept crate-visible so the async-copy
+    /// completion path can mint it only after its stream fence succeeds.
+    pub(crate) fn mark_full_contiguous_initialization(&self) {
+        self.full_contiguous_initialization
+            .store(true, Ordering::Release);
+    }
+
     /// Transfer one freshly allocated raw device pointer into the shared owner/read-view lifetime.
     /// Every construction path funnels through this helper so a safe read view can never outlive the
     /// allocation it addresses.
@@ -260,6 +281,7 @@ impl CudaResidentDeviceMemory {
             device_ptr,
             primary,
             allocation,
+            full_contiguous_initialization: AtomicBool::new(false),
             last_kernel_event_elapsed_us: Mutex::new(None),
         }
     }
@@ -476,6 +498,9 @@ impl CudaResidentDeviceMemory {
             device_ptr: self.device_ptr,
             primary,
             allocation: Arc::clone(&self.allocation),
+            full_contiguous_initialization: AtomicBool::new(
+                self.has_full_contiguous_initialization(),
+            ),
             last_kernel_event_elapsed_us: Mutex::new(None),
         }
     }
@@ -490,6 +515,9 @@ impl CudaResidentDeviceMemory {
             device_ptr: self.device_ptr,
             primary: Arc::clone(&self.primary),
             allocation: Arc::clone(&self.allocation),
+            full_contiguous_initialization: AtomicBool::new(
+                self.has_full_contiguous_initialization(),
+            ),
             last_kernel_event_elapsed_us: Mutex::new(None),
         }
     }

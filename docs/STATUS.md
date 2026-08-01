@@ -432,6 +432,79 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inapplicable because this source-only proof is production-unreachable and introduces no device or live write/read
   path.
 
+## WRITE-001 sealed typed bootstrap-resource attachment accepted — 2026-08-01
+
+- `BootstrapPublicationSource` now validates a closed v1 physical-resource grammar before it can produce the
+  private, move-only `BootstrapResourceAttachmentBundle`. Table layouts bind exact current catalog columns, SQL
+  physical representations, validity/value pairs, and created/deleted MVCC sidecars. Index key layouts bind the
+  catalog-authoritative ordered `RelationalIndex.key_columns`, rather than replay-provided order. Typed payloads
+  reject opaque roles; base manifest/status owners remain the only opaque full-resource grammar.
+- Physical encoding accepts exactly version 1. V1 rejects every `Text` value or index-key layout at source
+  validation, including zero-row sources, until a versioned GPU-ready offsets/blob layout exists. Empty tables have
+  one canonical table payload and every table/index/sidecar typed resource uses the exact one-byte, zero-role
+  sentinel; nonempty table shards cannot carry redundant zero-row payloads.
+- Exact attachment retains detached RAM or the full CUDA allocation and its context, consumes the sealed lease, and
+  validates every ordered claim, owner range, resource kind, physical layout, and resident full-contiguous
+  initialization provenance. The attached capability and its failure carrier remain private and non-cloneable; no
+  cold cache, spill owner, live reader, install, publication, root relabeling, or CPU relational hashing surface was
+  introduced.
+- Independent acceptance returned **ACCEPT** for `bootstrap_publication.rs` SHA-256
+  `36d2b324d8971b589b823d4c42babc36d0a62341f5ecae347e0d0f02fd75e4fe`, `resources.rs`
+  `b3fc7ef9e204c52c590ca7b0aafef64f5af32e1f9ff6925e4aabde02af417ff6`,
+  `resident_memory.rs` `fbe2f1a4dd571e5de1ef6cb9b1be7939c356ecf7f1e88cb666f558a01b5c9ee9`,
+  `cuda_driver.rs` `afeab670c368f4eb4ca9953aeb683bfcd9637218975872c9bf7c73f823331742`, and
+  `cuda_context.rs` `834cfab875ddc4cc20d5931ae0123d314987c47345124de13f28e105098a21d4`.
+  Generation tests pass **44/44** and execution tests **84 passed / 106 ignored**; package check, strict Clippy,
+  scoped rustfmt, and whitespace checks are clean. The real CUDA attachment gate passed three serial and two
+  concurrent runs without CUDA 700/716/717. NULL differential, recovery, and the report card remain inapplicable:
+  this is a private, production-unreachable source/ownership boundary.
+
+## WRITE-001 root-free bootstrap Rebuild proof schema accepted — 2026-08-01
+
+- A private `bootstrap_rebuild` boundary now consumes the exact attached resource carrier into two separate,
+  move-only capabilities: root-free compiler input retaining opaque detached owners and typed source semantics, and
+  comparator-only expectations retaining checkpoint/WAL roots. Expected roots, terminal replay facts, raw pointers,
+  byte readers, cache handles, CPU relational hashing, CUDA enqueue, reader, installation, and publication surfaces
+  are absent from the compiler carrier.
+- The compiler binds canonical table columns by ordinal, stable ID, and SQL type; ordered index keys bind the same
+  semantic type plus physical storage/stride. Its closed proof contract binds each semantic table/index/role/depth
+  slot to SQL type, storage type, stride, and exact byte range. Missing, duplicate, reordered, omitted-column, and
+  same-width logical/physical substitutions fail before any future enqueue.
+- Independent acceptance returned **ACCEPT** for `mod.rs` SHA-256
+  `7d5647527ce7eb64b14e2a5787b152176732d1117b9a150bec9772719325ad90`,
+  `bootstrap_publication.rs` `7d08daedd9d9c19f7a68aea49fe00f5acae8592c25e213f2e89be2f6c127af25`,
+  `resources.rs` `62cb821b47881f0a746f0c070530e31ce4afea8228a810226e282b41bab26c69`, and
+  `bootstrap_rebuild.rs` `419613e09666c2b40a9063da48c719e5d3cc9a89e9bc0927c1f06a2ad15370ad`.
+  Generation tests pass **51/51**; package check, strict lib/test Clippy, engine formatting, and whitespace checks
+  are clean. This is private and runtime-unreachable, so HAZARD, NULL/recovery differential, and report-card
+  evidence are inapplicable.
+
+## WRITE-001 V1 single-table Int4 GPU Rebuild proof accepted — 2026-08-01
+
+- The new private `CudaRuntimeGenerationV1Rebuild` is a dedicated asynchronous device operator, not a generic SHA
+  completion mode. Its sealed engine adapter admits exactly one arbitrary nonempty table with one nullable `Int4`
+  column, no indexes, and one or more canonical resident, detached-RAM, or mixed shards; it rejects Text, every
+  other type, predicates, indexes, and multi-table input before enqueue.
+- Root-free compiler facts now include stable row-ID source roles, table generation, and column attnum/OID/signed-size
+  ABI data. The GPU validates globally nonzero/strictly ascending stable IDs, visibility, and validity tails, then
+  constructs canonical typed-value/current-row/radix/table/database proof roots. It never relabels physical
+  `row_start` as a stable row ID, uses no CPU sort/root hashing/fallback, and exposes only a 135-slot opaque proof
+  with structural metadata and opaque digests.
+- Preparation reserves one pinned HtoD descriptor/cold-source arena, rehydration/workspace/proof allocations, one
+  pinned DtoH proof arena, and a private stream before enqueue. Completion is one covering fence; unknown quiescence
+  retains every owner and supports fence-only retry or fail-closed parking. Full framed proof-vector geometry is
+  checked on both host and device before any narrowing/write, rejecting the former vector-only row-count ceiling
+  before CUDA allocation or enqueue.
+- Independent acceptance returned **ACCEPT** for `runtime_generation_rebuild.rs` SHA-256
+  `95bb0721041918b5e76082befe3029ef47267c50732e74f72964f46368fe59bf`, ABI
+  `981ad8cb4d30744dedd241a970facd2e338148639624c624e2bc8f48bf4689d0`, CUDA source
+  `ca63c315054ee43cdac1fe515faf5993a30ccf761e80cf2204f85167a7935aae`, and regenerated PTX
+  `9bf462c9ff4364298bcbaaac6a9a083d4c89bafb9e9bd760a4fe3c49c3ec804a`. Rebuild GPU tests pass **9/9**,
+  the device SHA KAT **1/1**, and engine data-generation **52/52**; check, strict all-target Clippy, all-format, and
+  whitespace gates are clean. Three serial and two concurrent real-GPU HAZARD runs had no CUDA 700/716/717. A full
+  card remains inapplicable: this private operator has no read/result/install/publication path.
+
+
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
 - The exact report-card workload now reaches one canonical typed INSERT owner through the accepted

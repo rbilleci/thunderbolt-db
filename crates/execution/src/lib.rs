@@ -50,6 +50,30 @@ use resident_visibility_count::launch_cuda_resident_visible_count;
 mod resident_visible_digest;
 use resident_visible_digest::launch_cuda_resident_visible_digest;
 pub use resident_visible_digest::{CudaVisibleDigestColumn, CudaVisibleSourceDigest};
+mod sha256;
+pub use sha256::{
+    CudaSha256DeviceBuffer, CUDA_SHA256_DIGEST_BYTES, CUDA_SHA256_MAX_BATCH_BUFFERS,
+    CUDA_SHA256_MAX_DESCRIPTOR_BYTES, CUDA_SHA256_MAX_INPUT_BYTES,
+};
+mod sha256_completion;
+pub use sha256_completion::{
+    CudaSha256BatchId, CudaSha256Completion, CudaSha256CompletionDescriptor,
+    CudaSha256CompletionInput, CudaSha256CompletionPrepareError, CudaSha256Submission,
+    CudaSha256UnknownQuiescence, OpaqueCudaSha256Batch, OpaqueCudaSha256Digest,
+    OpaqueCudaSha256Token, PreparedCudaSha256Completion,
+    CUDA_RUNTIME_GENERATION_V1_GENESIS_ROOT_SLOTS,
+};
+mod runtime_generation_rebuild;
+pub use runtime_generation_rebuild::{
+    OpaqueRuntimeGenerationRebuildProof, PreparedRuntimeGenerationRebuild,
+    RuntimeGenerationRebuildAttempt, RuntimeGenerationRebuildCompletion,
+    RuntimeGenerationRebuildError, RuntimeGenerationRebuildInput,
+    RuntimeGenerationRebuildPrepareError, RuntimeGenerationRebuildPrepareFailure,
+    RuntimeGenerationRebuildRoleSpan, RuntimeGenerationRebuildShard,
+    RuntimeGenerationRebuildShardRoles, RuntimeGenerationRebuildSource,
+    RuntimeGenerationRebuildSubmission, RuntimeGenerationRebuildTarget,
+    RuntimeGenerationRebuildUnknownQuiescence,
+};
 mod resident_index_build;
 #[cfg(any(test, feature = "probe-timing"))]
 pub use resident_index_build::prepared_resident_typed_indexes_insert_counters;

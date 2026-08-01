@@ -299,6 +299,72 @@ impl GpuPrimaryContext {
         check_cuda(unsafe { (self.cu_ctx_set_current)(self.context) })
     }
 
+    /// Bind this context and prove one private stream idle.  Deferred owners use this instead of
+    /// open-coding a raw synchronize so an unproved fence has one fail-closed representation.
+    pub(super) fn synchronize_owned_stream(
+        &self,
+        stream: *mut c_void,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        self.set_current()?;
+        #[cfg(test)]
+        if take_fail_next_owned_stream_sync() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_991));
+        }
+        check_cuda(unsafe { (self.cu_stream_synchronize)(stream) })
+    }
+
+    /// Queue a pinned host-to-device copy on an owned private stream.  The replay submission
+    /// retains the source backing itself; this context primitive only owns the driver's dispatch.
+    pub(super) fn enqueue_owned_stream_htod(
+        &self,
+        destination: u64,
+        source: *const c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        let htod = self
+            .cu_memcpy_htod_async
+            .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+        check_cuda(unsafe { htod(destination, source, bytes, stream) })
+    }
+
+    /// Queue the bounded device verdict readback behind an owned private-stream kernel.  The
+    /// test hook fails before dispatch so the caller exercises the launched-kernel drain path.
+    pub(super) fn enqueue_owned_stream_dtoh(
+        &self,
+        destination: *mut c_void,
+        source: u64,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        #[cfg(test)]
+        if take_fail_next_owned_stream_dtoh_enqueue() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_994));
+        }
+        let dtoh = self
+            .cu_memcpy_dtoh_async
+            .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+        check_cuda(unsafe { dtoh(destination, source, bytes, stream) })
+    }
+
+    /// Turn the immediate result of a private-stream launch into the common error channel.  The
+    /// test fault is deliberately observed *after* dispatch, covering the conservative drain
+    /// required when a driver reports a launch error while work may already be resident.
+    pub(super) fn check_owned_stream_launch_result(
+        &self,
+        result: i32,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        #[cfg(test)]
+        if take_fail_next_owned_stream_launch_after_dispatch() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_993));
+        }
+        check_cuda(result)
+    }
+
+    /// Shared post-submit phase boundary for deferred owners. It deliberately has no production
+    /// side effect; the owner still retains every resource until it proves stream quiescence.
+    pub(super) fn after_owned_stream_enqueue(&self) {}
+
     /// Return the entry function for `entry_name`, loading + caching its module the first
     /// time. `ptx_with_nul` must be NUL-terminated PTX. The returned handle is reused on
     /// every subsequent call and is safe to launch concurrently on distinct streams.
@@ -528,6 +594,27 @@ impl GpuPrimaryContext {
         Some(PinnedHostLease {
             primary: self,
             ptr: ptr.0,
+            capacity,
+        })
+    }
+
+    /// Owned analogue of [`Self::lease_pinned_host_buffer`].  Deferred CUDA submissions must
+    /// retain the page-locked backing until their private stream is known idle; a borrow-scoped
+    /// lease would otherwise return the bytes to the shared pool when the submit stack unwinds.
+    ///
+    /// This is intentionally crate-private ownership plumbing.  It exposes no general raw
+    /// pointer mutation API: execution operators obtain a bounded mutable byte slice only while
+    /// materializing their exact pre-enqueue staging image.
+    pub(super) fn lease_pinned_host_buffer_owned(
+        self: &Arc<Self>,
+        min_bytes: usize,
+    ) -> Option<PinnedHostBufferOwned> {
+        let lease = self.lease_pinned_host_buffer(min_bytes)?;
+        let (ptr, capacity) = (lease.ptr, lease.capacity);
+        std::mem::forget(lease);
+        Some(PinnedHostBufferOwned {
+            primary: Arc::clone(self),
+            ptr,
             capacity,
         })
     }
@@ -922,10 +1009,14 @@ impl PendingCudaResidentDeviceCopy {
         if let Some(mut transport) = self.in_flight.take() {
             transport.complete()?;
         }
-        Ok(self
+        let memory = self
             .memory
             .take()
-            .expect("pending device copy already waited"))
+            .expect("pending device copy already waited");
+        // The async constructor is the same one-payload, offset-zero allocation as the synchronous
+        // copy path, but its initialization proof cannot exist until the copy stream is fenced.
+        memory.mark_full_contiguous_initialization();
+        Ok(memory)
     }
 }
 
@@ -939,6 +1030,38 @@ pub(super) struct PinnedHostLease<'a> {
 }
 
 impl Drop for PinnedHostLease<'_> {
+    fn drop(&mut self) {
+        self.primary
+            .release_pinned_host_buffer(self.ptr, self.capacity);
+    }
+}
+
+/// Owned page-locked host-buffer lease for a deferred CUDA submission.  The buffer returns to
+/// the same shared pool as [`PinnedHostLease`] only after the owner has established stream
+/// quiescence (or deliberately parks it on an unprovable drain failure).
+pub(super) struct PinnedHostBufferOwned {
+    pub(super) primary: Arc<GpuPrimaryContext>,
+    pub(super) ptr: *mut c_void,
+    pub(super) capacity: usize,
+}
+
+// SAFETY: ownership is exclusive, all access is bounded by `as_mut_bytes`, and deferred
+// submissions re-bind the primary context before issuing or draining DMA on another thread.
+unsafe impl Send for PinnedHostBufferOwned {}
+
+impl PinnedHostBufferOwned {
+    pub(super) fn as_mut_bytes(&mut self, len: usize) -> Result<&mut [u8], CudaRuntimeProbeError> {
+        if len > self.capacity {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(len));
+        }
+        // SAFETY: `ptr` is a live page-locked allocation of `capacity` bytes, exclusively owned
+        // by this lease.  Callers are limited to `len <= capacity` and never retain the slice
+        // across the lease's move into an in-flight submission.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.cast::<u8>(), len) })
+    }
+}
+
+impl Drop for PinnedHostBufferOwned {
     fn drop(&mut self) {
         self.primary
             .release_pinned_host_buffer(self.ptr, self.capacity);
@@ -980,6 +1103,55 @@ pub(super) fn check_cuda(code: i32) -> Result<(), CudaRuntimeProbeError> {
     } else {
         Err(CudaRuntimeProbeError::KernelLaunchFailed(code))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_OWNED_STREAM_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_OWNED_STREAM_LAUNCH_AFTER_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fault injection for any new owned async submission that uses
+/// [`GpuPrimaryContext::synchronize_owned_stream`].  Production submission code contains no
+/// test-only branch: this hook merely makes the context fence return the same error channel a
+/// driver failure would use, so tests can exercise resource parking without a hardware fault.
+#[cfg(test)]
+pub(super) fn fail_owned_stream_syncs_for_test(count: u32) {
+    FAIL_NEXT_OWNED_STREAM_SYNCS.with(|value| value.set(count));
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_owned_stream_launch_after_dispatch_for_test() {
+    FAIL_NEXT_OWNED_STREAM_LAUNCH_AFTER_DISPATCH.with(|value| value.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_owned_stream_dtoh_enqueue_for_test() {
+    FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE.with(|value| value.set(true));
+}
+
+#[cfg(test)]
+fn take_fail_next_owned_stream_sync() -> bool {
+    FAIL_NEXT_OWNED_STREAM_SYNCS.with(|value| {
+        let remaining = value.get();
+        if remaining == 0 {
+            false
+        } else {
+            value.set(remaining - 1);
+            true
+        }
+    })
+}
+
+#[cfg(test)]
+fn take_fail_next_owned_stream_launch_after_dispatch() -> bool {
+    FAIL_NEXT_OWNED_STREAM_LAUNCH_AFTER_DISPATCH.with(|value| value.replace(false))
+}
+
+#[cfg(test)]
+fn take_fail_next_owned_stream_dtoh_enqueue() -> bool {
+    FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE.with(|value| value.replace(false))
 }
 
 pub(super) struct CudaContextGuard {

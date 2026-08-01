@@ -32,6 +32,12 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
   [`design/write-001-general-insert-pipeline.md`](design/write-001-general-insert-pipeline.md): all INSERT inputs
   converge on move-only `TypedInsertBatch` and composable `DeviceInsertPlan`, with the accepted i32 append retained
   only as a physical strategy beneath the one canonical allocator/WAL/status/apply/poison/publication path.
+- WRITE-001's sealed typed bootstrap-resource attachment is accepted as a private, production-unreachable source
+  boundary. Its root-free compiler/proof schema and the private `V1SingleTableInt4` asynchronous GPU Rebuild proof
+  are accepted; the next slice is grammar breadth (remaining fixed-width types, indexes/status/multiple tables),
+  followed by the separately accepted comparator and persistent-map import/install boundary. `Text` remains an
+  explicit PLAN prerequisite requiring a versioned GPU-ready offsets/blob layout before any live bootstrap or
+  recovery integration.
 - WRITE-001's 2026-07-28 checkpoint accepted device pre-WAL CHECK/primary-key NULL/dense-batch key/current-resident
   key proof, exact diagnostic ordering, default/sequence error precedence, and an inert test-only indexed in-place
   append/index-delta ownership proof. The accepted runtime/card seal is tree `e1a7713f633403a9552b9f202fc8c87932fe3305`,

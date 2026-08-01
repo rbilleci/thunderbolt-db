@@ -19,3 +19,6 @@ probe-timing = []
 # probe to publish a resident generation and prove epoch-safe reclamation of real
 # device memory. Test-only edge (snapshot is std-only; no dependency cycle).
 gpu_db_snapshot = { path = "../snapshot" }
+# Test-only SHA-256 reference for device known-answer coverage; production execution has no CPU
+# digest implementation or dependency.
+sha2 = "0.10"

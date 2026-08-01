@@ -169,6 +169,8 @@ mod engine_transaction_delta;
 mod engine_transaction_reset;
 mod table_access;
 use table_access::{TableAccessLease, TableAccessRegistry};
+#[allow(dead_code)]
+mod engine_data_generation;
 mod engine_wal_archive;
 mod engine_write_apply;
 
