@@ -120,10 +120,11 @@ the later owner of the bounded streaming producer; WRITE-001 acceptance neither 
 
 ## Migration contract and evidence gates
 
-The following ordered implementation slices describe required convergence evidence; they do not own work outside
-WRITE-001 in `PLAN.md`.
+The following are convergence dimensions of one integrated WRITE-001 milestone candidate, not independently
+accepted or sequential sub-slices. They do not own work outside WRITE-001 in `PLAN.md`; implementation may close
+them in parallel while keeping a production vertical route executable.
 
-| Slice | Required outcome | Minimum gate before the next slice |
+| Convergence dimension | Required outcome | Evidence required in the integrated candidate |
 |---|---|---|
 | Semantic boundary | Introduce move-only `TypedInsertBatch` with catalog-order typed vectors/validity and an exact overlay/catalog contract; route current i32 append through it without changing physical layout. | Focused type/NULL/default/column-order/parameter tests, device execution proof, source ownership inventory, and PostgreSQL differential for the retained i32 shape. |
 | Composable plan | Compile the batch to `DeviceInsertPlan` validation/default/sequence/append/index/FK/`RETURNING` operators; preserve i32 append as one strategy. | PostgreSQL differential across supported types and constraints, non-vacuous device checks, bounded-resource refusal, and `RETURNING`/statement-order tests. |
@@ -131,12 +132,13 @@ WRITE-001 in `PLAN.md`.
 | Durable/replay convergence | Encode one typed envelope and replay it with the same operators; remove post-WAL reprepare/fallback and duplicate INSERT encoder/apply behavior. | Durable reopen, crash-prefix, torn/failing-I/O and sabotage matrix; fresh-context replay equality and no post-WAL alternate route. |
 | Deletion seal and COPY-ready boundary | Converge the existing COPY-to-INSERT compatibility ingress, expose the final typed boundary for COPY-001, and remove deprecated INSERT-only surfaces after current consumers move. | Deletion search/compile proof, full differential/recovery/HAZARD/benchmark acceptance below; no bounded streaming COPY implementation or COPY-001 prerequisite. |
 
-Each slice uses focused correctness/static gates and required NULL differential/HAZARD coverage. When a successful
-read route, residency/layout, result path, allocator/runtime dependency, release/link setting, or benchmark harness
-may move, it also uses `scripts/benchmark_report_card.sh --quick` only as the clean-build A+B screen. The candidate
-is then frozen, independently audited, repaired and re-audited if necessary, and receives one applicable canonical
-`--full` card. A repair after that card creates a new candidate and follows the development-gate applicability rules;
-quick evidence never substitutes for the full seal.
+Each dimension uses focused correctness/static tests while implementation is WIP, including NULL differential and
+targeted HAZARD coverage where useful. None is separately frozen, audited, recorded as accepted, or given a full
+card. When a successful read route, residency/layout, result path, allocator/runtime dependency, release/link
+setting, or benchmark harness may move, `scripts/benchmark_report_card.sh --quick` remains only the clean-build A+B
+screen. The complete milestone candidate is frozen once, independently audited, repaired and re-audited if
+necessary, and receives one applicable canonical `--full` card. A repair after that card creates a new candidate and
+follows the development-gate applicability rules; quick evidence never substitutes for the full seal.
 
 ## KEEP / GENERALIZE / DELETE ledger
 
@@ -147,7 +149,7 @@ quick evidence never substitutes for the full seal.
 | **DELETE** | `PreparedInsertBatch` and `PreparedI32AppendSource`; the Offlock Legacy/Fixed fork; `FixedInsertPreflight`; `WaveCanonicalOperation::FixedInsert`; every fixed fallback/reprepare branch; legacy INSERT `WriteDelta`, predicted row keys, and legacy apply; every live INSERT WAL encoder/constructor (including duplicate template/encoders); the `binary_wal_records_enabled` setter/flag; fixed/legacy/direct counters and their old route-qualification assumptions. Historical readers above are not blanket deletion targets until the retention decision. |
 
 The DELETE row means all remaining live producers, consumers, tests, metrics, and source/runtime guards must move to
-the general batch/plan contract in the same accepted slice. The explicit historical-reader allowance does **not**
+the general batch/plan contract in the same accepted milestone candidate. The explicit historical-reader allowance does **not**
 permit a live constructor, encoder, or alternate apply path. It also does **not** permit premature deletion of generic
 UPDATE/DELETE `WriteDelta`; only its INSERT-specific legacy branch is removed here. A temporary adapter is acceptable
 only if it is private, carries no semantic authority, emits no alternative WAL/apply/publication behavior, and has an

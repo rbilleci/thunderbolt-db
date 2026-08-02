@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use gpu_db_sql::SqlType;
 
 use super::{
+    bootstrap_candidate::PreparedBootstrapPublicationBuild,
     bootstrap_publication::{
         BootstrapMaterializationLease, BootstrapPhysicalLayoutRoleKind,
-        BootstrapPhysicalStorageType, BootstrapRebuildExpectationSource,
+        BootstrapPhysicalStorageType, BootstrapPublicationCarry, BootstrapRebuildExpectationSource,
         BootstrapRebuildRootFreeResource, BootstrapRebuildRootFreeRole,
         BootstrapRebuildRootFreeSource, BootstrapResourceLedgerKind, BootstrapResourceLedgerOwner,
         BootstrapResourceStorageTier,
@@ -25,6 +26,7 @@ use super::{
 
 const V1_BOOTSTRAP_LAYOUT_ENCODING: u16 = 1;
 const RADIX_DEPTH_COUNT: u8 = 64;
+const V1_SINGLE_TABLE_INT4_PROOF_SLOTS: usize = 200;
 const V1_EMPTY_TYPED_RESOURCE_SENTINEL_BYTES: u64 = 1;
 const MAX_BOOTSTRAP_REBUILD_OUTPUT_SLOTS: usize = 1_048_576;
 
@@ -39,6 +41,11 @@ struct BootstrapRebuildSemanticTables {
     columns: BootstrapRebuildColumnTypes,
     index_keys: BootstrapRebuildIndexKeys,
 }
+
+/// Private-construction authority for [`PreparedBootstrapPublicationBuild`]. The tuple field is
+/// intentionally private to this module, so sibling generation modules cannot forge a candidate
+/// factory call even though the candidate itself is private to `engine_data_generation`.
+pub(super) struct BootstrapRebuildPreparationToken(());
 
 /// The only compiler capability formed from an attached bootstrap source. It retains opaque,
 /// exact owners and the root-free semantic source, plus the closed proof-slot contract a later
@@ -85,6 +92,7 @@ pub(super) struct BootstrapRebuildPreparationFailure {
     owners: BootstrapRebuildAttachedOwners,
     source: BootstrapRebuildRootFreeSource,
     expected: BootstrapRebuildExpectationSource,
+    publication_carry: BootstrapPublicationCarry,
 }
 
 struct BootstrapRebuildSemanticLayout {
@@ -100,7 +108,7 @@ pub(super) struct BootstrapRebuildPreparedProofLayout {
     slots: Box<[BootstrapRebuildOutputSlot]>,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum BootstrapRebuildOutputSlot {
     ColumnShape {
         table_id: StableTableId,
@@ -120,24 +128,29 @@ pub(super) enum BootstrapRebuildOutputSlot {
     TableRoot {
         table_id: StableTableId,
     },
-    DatabaseMapDepth {
+    TableMapEmptyDepth {
+        depth: u8,
+    },
+    TableMapLeaf {
+        table_id: StableTableId,
+    },
+    TableMapPathDepth {
+        table_id: StableTableId,
         depth: u8,
     },
     DatabaseRoot,
 }
 
-/// Atomically consume an attached uninstalled source. Success creates exactly the root-free
-/// compiler capability and the comparator-only expectation capability. Failure owns all input
-/// pieces, so none can be published, reattached, or partially reused.
+/// Atomically consume an attached bootstrap source. Success returns one move-only, phase-only
+/// build that retains the root-free compiler capability, comparator-only expectations, and every
+/// replay/checkpoint publication fact. Failure retains the exact precursor, so no component can
+/// be published, reattached, or partially reused.
 pub(super) fn prepare_bootstrap_rebuild(
     attached: BootstrapAttachedUninstalledResources,
-) -> Result<
-    (BootstrapRebuildCompilerInput, BootstrapRebuildExpectations),
-    Box<BootstrapRebuildPreparationFailure>,
-> {
+) -> Result<PreparedBootstrapPublicationBuild, Box<BootstrapRebuildPreparationFailure>> {
     let (lease, owners) = resources::into_bootstrap_rebuild_attached_owners(attached);
-    let (source, expected) = into_rebuild_sources(lease);
-    prepare_from_parts(owners, source, expected)
+    let (source, expected, publication_carry) = into_rebuild_sources(lease);
+    prepare_from_parts(owners, source, expected, publication_carry)
 }
 
 impl BootstrapRebuildPreparationFailure {
@@ -147,11 +160,13 @@ impl BootstrapRebuildPreparationFailure {
     #[allow(dead_code)]
     fn retry(
         self,
-    ) -> Result<
-        (BootstrapRebuildCompilerInput, BootstrapRebuildExpectations),
-        Box<BootstrapRebuildPreparationFailure>,
-    > {
-        prepare_from_parts(self.owners, self.source, self.expected)
+    ) -> Result<PreparedBootstrapPublicationBuild, Box<BootstrapRebuildPreparationFailure>> {
+        prepare_from_parts(
+            self.owners,
+            self.source,
+            self.expected,
+            self.publication_carry,
+        )
     }
 }
 
@@ -172,7 +187,9 @@ impl BootstrapRebuildPreparedProofLayout {
     }
 
     pub(super) fn is_v1_single_table_int4_contract(&self) -> bool {
-        if self.exact_output_count != 135 || self.slots.len() != 135 {
+        if self.exact_output_count != V1_SINGLE_TABLE_INT4_PROOF_SLOTS as u32
+            || self.slots.len() != V1_SINGLE_TABLE_INT4_PROOF_SLOTS
+        {
             return false;
         }
         let Some(BootstrapRebuildOutputSlot::ColumnShape {
@@ -200,17 +217,42 @@ impl BootstrapRebuildPreparedProofLayout {
                     table_id: *table_id,
                     depth,
                 })
-                || self.slots.get(69 + usize::from(depth))
-                    != Some(&BootstrapRebuildOutputSlot::DatabaseMapDepth { depth })
             {
                 return false;
             }
         }
-        self.slots.get(68)
-            == Some(&BootstrapRebuildOutputSlot::TableRoot {
+        if self.slots.get(68)
+            != Some(&BootstrapRebuildOutputSlot::TableRoot {
                 table_id: *table_id,
             })
-            && self.slots.get(134) == Some(&BootstrapRebuildOutputSlot::DatabaseRoot)
+        {
+            return false;
+        }
+        for depth in 0..=RADIX_DEPTH_COUNT {
+            if self.slots.get(69 + usize::from(depth))
+                != Some(&BootstrapRebuildOutputSlot::TableMapEmptyDepth { depth })
+            {
+                return false;
+            }
+        }
+        if self.slots.get(134)
+            != Some(&BootstrapRebuildOutputSlot::TableMapLeaf {
+                table_id: *table_id,
+            })
+        {
+            return false;
+        }
+        for depth in 0..RADIX_DEPTH_COUNT {
+            if self.slots.get(135 + usize::from(depth))
+                != Some(&BootstrapRebuildOutputSlot::TableMapPathDepth {
+                    table_id: *table_id,
+                    depth,
+                })
+            {
+                return false;
+            }
+        }
+        self.slots.get(199) == Some(&BootstrapRebuildOutputSlot::DatabaseRoot)
     }
 }
 
@@ -219,6 +261,7 @@ fn into_rebuild_sources(
 ) -> (
     BootstrapRebuildRootFreeSource,
     BootstrapRebuildExpectationSource,
+    BootstrapPublicationCarry,
 ) {
     lease.into_bootstrap_rebuild_sources()
 }
@@ -227,10 +270,8 @@ fn prepare_from_parts(
     owners: BootstrapRebuildAttachedOwners,
     source: BootstrapRebuildRootFreeSource,
     expected: BootstrapRebuildExpectationSource,
-) -> Result<
-    (BootstrapRebuildCompilerInput, BootstrapRebuildExpectations),
-    Box<BootstrapRebuildPreparationFailure>,
-> {
+    publication_carry: BootstrapPublicationCarry,
+) -> Result<PreparedBootstrapPublicationBuild, Box<BootstrapRebuildPreparationFailure>> {
     let prepared = match prepare_proof_layout(&owners, &source) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -239,18 +280,50 @@ fn prepare_from_parts(
                 owners,
                 source,
                 expected,
+                publication_carry,
             }))
         }
     };
     let runtime = owners.runtime_identity();
-    Ok((
+    Ok(PreparedBootstrapPublicationBuild::from_prepared_parts(
+        BootstrapRebuildPreparationToken(()),
         BootstrapRebuildCompilerInput {
             owners,
             semantic: BootstrapRebuildSemanticLayout { source, runtime },
             prepared,
         },
         BootstrapRebuildExpectations { expected },
+        publication_carry,
     ))
+}
+
+/// Test-only preservation seam for the pre-existing execution-adapter rejection coverage. The
+/// production preparation boundary returns `PreparedBootstrapPublicationBuild`; this helper
+/// deliberately has no production build and is never a candidate conversion path.
+#[cfg(test)]
+pub(super) fn compiler_input_for_adapter_rejection_test(
+    attached: BootstrapAttachedUninstalledResources,
+) -> Result<BootstrapRebuildCompilerInput, Box<BootstrapRebuildPreparationFailure>> {
+    let (lease, owners) = resources::into_bootstrap_rebuild_attached_owners(attached);
+    let (source, expected, publication_carry) = into_rebuild_sources(lease);
+    let prepared = match prepare_proof_layout(&owners, &source) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(Box::new(BootstrapRebuildPreparationFailure {
+                error,
+                owners,
+                source,
+                expected,
+                publication_carry,
+            }))
+        }
+    };
+    let runtime = owners.runtime_identity();
+    Ok(BootstrapRebuildCompilerInput {
+        owners,
+        semantic: BootstrapRebuildSemanticLayout { source, runtime },
+        prepared,
+    })
 }
 
 fn prepare_proof_layout(
@@ -1021,7 +1094,27 @@ fn build_prepared_proof_layout(
         insert_output_slot(
             &mut slots,
             &mut expected_count,
-            BootstrapRebuildOutputSlot::DatabaseMapDepth { depth },
+            BootstrapRebuildOutputSlot::TableMapEmptyDepth { depth },
+        )?;
+    }
+    let table = source.tables.first().ok_or(DataGenerationError::Missing(
+        "bootstrap rebuild proof table",
+    ))?;
+    insert_output_slot(
+        &mut slots,
+        &mut expected_count,
+        BootstrapRebuildOutputSlot::TableMapLeaf {
+            table_id: table.table_id,
+        },
+    )?;
+    for depth in 0..RADIX_DEPTH_COUNT {
+        insert_output_slot(
+            &mut slots,
+            &mut expected_count,
+            BootstrapRebuildOutputSlot::TableMapPathDepth {
+                table_id: table.table_id,
+                depth,
+            },
         )?;
     }
     insert_output_slot(
@@ -1116,47 +1209,41 @@ impl BootstrapRebuildPreparedProofLayout {
 mod tests {
     use super::*;
 
-    #[test]
-    fn attached_source_becomes_root_free_compiler_and_comparator_capabilities() {
+    fn v1_single_table_int4_layout_for_test() -> BootstrapRebuildPreparedProofLayout {
         let attached = resources::attached_resources_for_bootstrap_rebuild_test();
-        let (compiler, expectations) =
-            prepare_bootstrap_rebuild(attached).unwrap_or_else(|_| panic!("prepared rebuild"));
+        let (lease, _owners) = resources::into_bootstrap_rebuild_attached_owners(attached);
+        let (source, _expected, _publication_carry) = into_rebuild_sources(lease);
+        build_prepared_proof_layout(&source).expect("one-table proof layout")
+    }
 
-        assert_eq!(
-            compiler.owners.attachment_count(),
-            compiler.semantic.source.resources.len()
+    #[test]
+    fn attached_source_becomes_one_phase_only_prepared_publication_build() {
+        let attached = resources::attached_resources_for_bootstrap_rebuild_test();
+        let _build = prepare_bootstrap_rebuild(attached)
+            .unwrap_or_else(|_| panic!("prepared bootstrap publication build"));
+    }
+
+    #[test]
+    fn prepared_build_retains_and_releases_its_attached_resource_owners() {
+        let (attached, owner) =
+            resources::attached_resources_with_owner_witness_for_bootstrap_rebuild_test();
+        assert!(
+            owner.upgrade().is_some(),
+            "fixture owns its detached RAM source"
         );
-        assert_eq!(compiler.semantic.source.tables.len(), 1);
-        let table = &compiler.semantic.source.tables[0];
-        assert_eq!(table.columns.len(), 1);
-        assert_eq!(table.columns[0].ordinal, 0);
-        assert_eq!(table.columns[0].column_id.get(), 7);
-        assert_eq!(table.columns[0].sql_type, SqlType::Int4);
-        assert_eq!(table.columns[0].attnum, 1);
-        assert_eq!(
-            table.columns[0].declared_type_oid,
-            SqlType::Int4.postgres_oid()
+
+        let build = prepare_bootstrap_rebuild(attached)
+            .unwrap_or_else(|_| panic!("prepared bootstrap publication build"));
+        assert!(
+            owner.upgrade().is_some(),
+            "prepared build must retain the attached resource owner"
         );
-        assert_eq!(table.columns[0].signed_type_size, SqlType::Int4.type_size());
-        assert!(compiler.prepared.slots.iter().any(|slot| {
-            matches!(
-                slot,
-                BootstrapRebuildOutputSlot::ColumnShape { column_id, .. } if column_id.get() == 7
-            )
-        }));
-        assert!(compiler.prepared.slots.iter().any(|slot| {
-            matches!(
-                slot,
-                BootstrapRebuildOutputSlot::TypedValueVector { column_id, .. }
-                    if column_id.get() == 7
-            )
-        }));
-        assert_eq!(
-            compiler.prepared.exact_output_count as usize,
-            compiler.prepared.slots.len()
+
+        drop(build);
+        assert!(
+            owner.upgrade().is_none(),
+            "dropping the prepared build releases its attached resource owner"
         );
-        assert_eq!(compiler.prepared.slots.len(), 135);
-        let _ = expectations;
     }
 
     #[test]
@@ -1198,10 +1285,133 @@ mod tests {
     }
 
     #[test]
+    fn v1_single_table_int4_layout_matches_every_runtime_abi_slot() {
+        let layout = v1_single_table_int4_layout_for_test();
+        assert_eq!(layout.exact_output_count(), 200);
+        assert_eq!(layout.slots.len(), 200);
+        assert!(layout.is_v1_single_table_int4_contract());
+
+        let BootstrapRebuildOutputSlot::ColumnShape {
+            table_id,
+            column_id,
+        } = layout.slots[0]
+        else {
+            panic!("slot zero is column shape");
+        };
+        assert!(matches!(
+            layout.slots[1],
+            BootstrapRebuildOutputSlot::TypedValueVector {
+                table_id: actual_table,
+                column_id: actual_column,
+            } if actual_table == table_id && actual_column == column_id
+        ));
+        assert!(matches!(
+            layout.slots[2],
+            BootstrapRebuildOutputSlot::CurrentRowLeaves {
+                table_id: actual_table,
+            } if actual_table == table_id
+        ));
+        for depth in 0..=RADIX_DEPTH_COUNT {
+            assert!(matches!(
+                layout.slots[3 + usize::from(depth)],
+                BootstrapRebuildOutputSlot::RowMapDepth {
+                    table_id: actual_table,
+                    depth: actual_depth,
+                } if actual_table == table_id && actual_depth == depth
+            ));
+            assert!(matches!(
+                layout.slots[69 + usize::from(depth)],
+                BootstrapRebuildOutputSlot::TableMapEmptyDepth {
+                    depth: actual_depth,
+                } if actual_depth == depth
+            ));
+        }
+        assert!(matches!(
+            layout.slots[68],
+            BootstrapRebuildOutputSlot::TableRoot {
+                table_id: actual_table,
+            } if actual_table == table_id
+        ));
+        assert!(matches!(
+            layout.slots[134],
+            BootstrapRebuildOutputSlot::TableMapLeaf {
+                table_id: actual_table,
+            } if actual_table == table_id
+        ));
+        for depth in 0..RADIX_DEPTH_COUNT {
+            assert!(matches!(
+                layout.slots[135 + usize::from(depth)],
+                BootstrapRebuildOutputSlot::TableMapPathDepth {
+                    table_id: actual_table,
+                    depth: actual_depth,
+                } if actual_table == table_id && actual_depth == depth
+            ));
+        }
+        assert!(matches!(
+            layout.slots[199],
+            BootstrapRebuildOutputSlot::DatabaseRoot
+        ));
+    }
+
+    #[test]
+    fn v1_layout_rejects_old_slot_134_and_map_order_count_sabotage_without_a_proof() {
+        let layout = v1_single_table_int4_layout_for_test();
+        let mut missing = layout.slots.to_vec();
+        missing.pop();
+        assert_eq!(
+            layout.validate_observed_bindings(&missing),
+            Err(DataGenerationError::Missing("bootstrap rebuild proof slot"))
+        );
+        let mut surplus = layout.slots.to_vec();
+        surplus.push(BootstrapRebuildOutputSlot::DatabaseRoot);
+        assert_eq!(
+            layout.validate_observed_bindings(&surplus),
+            Err(DataGenerationError::Unexpected(
+                "bootstrap rebuild proof slot"
+            ))
+        );
+        assert_eq!(
+            RootFormatVersion::new(2),
+            Err(DataGenerationError::UnsupportedRootFormat(2)),
+            "invalid root format is rejected before any proof exists"
+        );
+
+        let mut wrong_count = v1_single_table_int4_layout_for_test();
+        wrong_count.exact_output_count = 199;
+        assert!(!wrong_count.is_v1_single_table_int4_contract());
+
+        let mut old_slot_134 = v1_single_table_int4_layout_for_test();
+        old_slot_134.slots[134] = BootstrapRebuildOutputSlot::DatabaseRoot;
+        assert!(
+            !old_slot_134.is_v1_single_table_int4_contract(),
+            "the former 135-slot database-root position is not a V1 proof contract"
+        );
+
+        let mut wrong_empty_depth = v1_single_table_int4_layout_for_test();
+        wrong_empty_depth.slots[69] = BootstrapRebuildOutputSlot::TableMapEmptyDepth { depth: 1 };
+        assert!(!wrong_empty_depth.is_v1_single_table_int4_contract());
+
+        let mut wrong_path_depth = v1_single_table_int4_layout_for_test();
+        let BootstrapRebuildOutputSlot::TableMapPathDepth { table_id, .. } =
+            wrong_path_depth.slots[135]
+        else {
+            panic!("first table-map path slot");
+        };
+        wrong_path_depth.slots[135] =
+            BootstrapRebuildOutputSlot::TableMapPathDepth { table_id, depth: 1 };
+        assert!(!wrong_path_depth.is_v1_single_table_int4_contract());
+
+        let mut reordered_path = v1_single_table_int4_layout_for_test();
+        reordered_path.slots.swap(135, 136);
+        assert!(!reordered_path.is_v1_single_table_int4_contract());
+    }
+
+    #[test]
     fn coherent_table_role_reordering_is_rejected_before_compiler_input() {
-        let attached = resources::attached_resources_for_bootstrap_rebuild_test();
+        let (attached, owner) =
+            resources::attached_resources_with_owner_witness_for_bootstrap_rebuild_test();
         let (lease, owners) = resources::into_bootstrap_rebuild_attached_owners(attached);
-        let (mut source, expected) = into_rebuild_sources(lease);
+        let (mut source, expected, publication_carry) = into_rebuild_sources(lease);
         let roles = &mut source.resources[2].layout.roles;
         roles.swap(1, 2);
         roles[1].ordinal = 1;
@@ -1209,20 +1419,47 @@ mod tests {
         roles[1].byte_offset = 8;
         roles[2].byte_offset = 12;
 
-        match prepare_from_parts(owners, source, expected) {
+        let final_failure = match prepare_from_parts(owners, source, expected, publication_carry) {
             Ok(_) => panic!("role substitution must fail"),
-            Err(failure) => assert_eq!(
-                failure.error,
-                DataGenerationError::NonCanonicalOrder("bootstrap rebuild table role order")
-            ),
-        }
+            Err(failure) => {
+                assert_eq!(
+                    failure.error,
+                    DataGenerationError::NonCanonicalOrder("bootstrap rebuild table role order")
+                );
+                assert!(
+                    owner.upgrade().is_some(),
+                    "first preparation failure retains its attached resource owner"
+                );
+                match failure.retry() {
+                    Ok(_) => panic!("unrepaired precursor unexpectedly succeeded"),
+                    Err(retried) => {
+                        assert_eq!(
+                            retried.error,
+                            DataGenerationError::NonCanonicalOrder(
+                                "bootstrap rebuild table role order"
+                            )
+                        );
+                        assert!(
+                            owner.upgrade().is_some(),
+                            "retried preparation failure retains its attached resource owner"
+                        );
+                        retried
+                    }
+                }
+            }
+        };
+        drop(final_failure);
+        assert!(
+            owner.upgrade().is_none(),
+            "dropping the final failed preparation releases its attached resource owner"
+        );
     }
 
     #[test]
     fn table_payload_cannot_omit_both_validity_and_value_roles() {
         let attached = resources::attached_resources_for_bootstrap_rebuild_test();
         let (lease, owners) = resources::into_bootstrap_rebuild_attached_owners(attached);
-        let (mut source, expected) = into_rebuild_sources(lease);
+        let (mut source, expected, publication_carry) = into_rebuild_sources(lease);
         let retained_roles = std::mem::replace(&mut source.resources[2].layout.roles, Box::new([]))
             .into_vec()
             .into_iter()
@@ -1237,7 +1474,7 @@ mod tests {
             .into_boxed_slice();
         source.resources[2].layout.roles = retained_roles;
 
-        match prepare_from_parts(owners, source, expected) {
+        match prepare_from_parts(owners, source, expected, publication_carry) {
             Ok(_) => panic!("missing table columns must fail"),
             Err(failure) => assert_eq!(
                 failure.error,
@@ -1250,11 +1487,11 @@ mod tests {
     fn table_payload_same_width_sql_type_substitution_is_rejected() {
         let attached = resources::attached_resources_for_bootstrap_rebuild_test();
         let (lease, owners) = resources::into_bootstrap_rebuild_attached_owners(attached);
-        let (mut source, expected) = into_rebuild_sources(lease);
+        let (mut source, expected, publication_carry) = into_rebuild_sources(lease);
         source.resources[2].layout.roles[1].sql_type = Some(SqlType::Date);
         source.resources[2].layout.roles[2].sql_type = Some(SqlType::Date);
 
-        match prepare_from_parts(owners, source, expected) {
+        match prepare_from_parts(owners, source, expected, publication_carry) {
             Ok(_) => panic!("same-width table SQL type substitution must fail"),
             Err(failure) => assert_eq!(
                 failure.error,
@@ -1267,10 +1504,10 @@ mod tests {
     fn index_key_same_width_sql_storage_substitution_is_rejected() {
         let attached = resources::attached_resources_for_bootstrap_rebuild_test();
         let (lease, owners) = resources::into_bootstrap_rebuild_attached_owners(attached);
-        let (mut source, expected) = into_rebuild_sources(lease);
+        let (mut source, expected, publication_carry) = into_rebuild_sources(lease);
         source.resources[3].layout.roles[0].sql_type = Some(SqlType::Date);
 
-        match prepare_from_parts(owners, source, expected) {
+        match prepare_from_parts(owners, source, expected, publication_carry) {
             Ok(_) => panic!("same-width index SQL storage substitution must fail"),
             Err(failure) => assert_eq!(
                 failure.error,
@@ -1296,5 +1533,23 @@ mod tests {
         assert!(!compiler.contains("impl Clone for BootstrapRebuildCompilerInput"));
         assert!(!compiler.contains("impl std::fmt::Debug for BootstrapRebuildCompilerInput"));
         assert!(!compiler.contains("fn new("));
+
+        let failure = source
+            .split("pub(super) struct BootstrapRebuildPreparationFailure")
+            .nth(1)
+            .and_then(|section| {
+                section
+                    .split("struct BootstrapRebuildSemanticLayout")
+                    .next()
+            })
+            .expect("failure source section");
+        for required in [
+            "owners: BootstrapRebuildAttachedOwners",
+            "source: BootstrapRebuildRootFreeSource",
+            "expected: BootstrapRebuildExpectationSource",
+            "publication_carry: BootstrapPublicationCarry",
+        ] {
+            assert!(failure.contains(required), "failure lost {required}");
+        }
     }
 }

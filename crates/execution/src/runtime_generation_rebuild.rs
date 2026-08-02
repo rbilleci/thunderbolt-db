@@ -26,6 +26,7 @@ const ROOT_FORMAT_V1: u16 = 1;
 const INT4_OID: u32 = 23;
 const INT4_SIGNED_SIZE: i16 = 4;
 const PARKED_REBUILD_COMPLETIONS: usize = 8;
+const QUARANTINED_REBUILD_COMPLETIONS: usize = 8;
 /// Exact durable V1 encoding of the table root followed by the database root.
 pub const RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES: usize = 64;
 
@@ -632,6 +633,12 @@ pub struct RuntimeGenerationRebuildSubmission {
     function: *mut c_void,
     launch: CuLaunchKernel,
     phase: RuntimeGenerationRebuildPhase,
+    /// The first terminal CUDA result after submission.  A later failed fence may leave
+    /// quiescence unknown, but a subsequent successful fence must return this original failure.
+    first_terminal_error: Option<CudaRuntimeProbeError>,
+    /// CUDA API results after submission permanently quarantine the private stream and all
+    /// context-bound pooled backing, even if a later fence proves the stream idle.
+    driver_error_observed: bool,
 }
 
 /// Known quiescence is separated from an unproved fence. The latter has only a fence retry, never
@@ -684,10 +691,7 @@ struct RuntimeGenerationRebuildResources {
 enum RuntimeGenerationRebuildPhase {
     InFlight,
     ReadbackQueued,
-    TerminalFailure {
-        error: CudaRuntimeProbeError,
-        drain_required: bool,
-    },
+    TerminalFailure { drain_required: bool },
     Quiesced,
 }
 
@@ -743,6 +747,8 @@ impl PreparedRuntimeGenerationRebuild {
             function: self.function,
             launch: self.launch,
             phase: RuntimeGenerationRebuildPhase::InFlight,
+            first_terminal_error: None,
+            driver_error_observed: false,
         };
         submission.enqueue_inner();
         submission
@@ -772,9 +778,9 @@ impl RuntimeGenerationRebuildSubmission {
     }
 
     fn enqueue_inner(&mut self) {
-        if let Err(error) = self.primary.set_current() {
+        if let Err(error) = self.primary.bind_owned_stream_before_submission() {
+            self.retain_first_terminal_error(&error);
             self.phase = RuntimeGenerationRebuildPhase::TerminalFailure {
-                error,
                 drain_required: false,
             };
             return;
@@ -787,8 +793,8 @@ impl RuntimeGenerationRebuildSubmission {
             resources.input_bytes,
             stream,
         ) {
+            self.retain_driver_error(&error);
             self.phase = RuntimeGenerationRebuildPhase::TerminalFailure {
-                error,
                 drain_required: true,
             };
             return;
@@ -803,10 +809,14 @@ impl RuntimeGenerationRebuildSubmission {
             )
         };
         match self.primary.check_owned_stream_launch_result(launch_status) {
-            Ok(()) => self.primary.after_owned_stream_enqueue(),
+            Ok(()) => {
+                self.primary.after_owned_stream_enqueue();
+                #[cfg(test)]
+                REBUILD_SUCCESSFUL_ENQUEUES.with(|value| value.set(value.get() + 1));
+            }
             Err(error) => {
+                self.retain_driver_error(&error);
                 self.phase = RuntimeGenerationRebuildPhase::TerminalFailure {
-                    error,
                     drain_required: true,
                 };
             }
@@ -817,7 +827,9 @@ impl RuntimeGenerationRebuildSubmission {
         if !matches!(self.phase, RuntimeGenerationRebuildPhase::InFlight) {
             return Ok(());
         }
-        self.primary.set_current()?;
+        self.primary
+            .bind_owned_stream_for_completion()
+            .map_err(|failure| failure.error())?;
         let stream = self.stream();
         let resources = self.resources();
         self.primary.enqueue_owned_stream_dtoh(
@@ -830,15 +842,24 @@ impl RuntimeGenerationRebuildSubmission {
         Ok(())
     }
 
-    fn drain_stream(&self) -> Result<(), CudaRuntimeProbeError> {
-        self.primary.synchronize_owned_stream(self.stream())
+    fn drain_stream(&self) -> Result<(), crate::cuda_context::CompletionOwnedStreamFenceFailure> {
+        self.primary
+            .synchronize_owned_stream_for_completion(self.stream())
     }
 
     fn terminal_error(&self) -> Option<CudaRuntimeProbeError> {
-        match &self.phase {
-            RuntimeGenerationRebuildPhase::TerminalFailure { error, .. } => Some(error.clone()),
-            _ => None,
+        self.first_terminal_error.clone()
+    }
+
+    fn retain_first_terminal_error(&mut self, error: &CudaRuntimeProbeError) {
+        if self.first_terminal_error.is_none() {
+            self.first_terminal_error = Some(error.clone());
         }
+    }
+
+    fn retain_driver_error(&mut self, error: &CudaRuntimeProbeError) {
+        self.retain_first_terminal_error(error);
+        self.driver_error_observed = true;
     }
 
     fn unknown(self, error: RuntimeGenerationRebuildError) -> RuntimeGenerationRebuildCompletion {
@@ -856,14 +877,18 @@ impl RuntimeGenerationRebuildSubmission {
             && matches!(self.phase, RuntimeGenerationRebuildPhase::InFlight)
         {
             if let Err(error) = self.queue_readback() {
+                self.retain_driver_error(&error);
                 self.phase = RuntimeGenerationRebuildPhase::TerminalFailure {
-                    error,
                     drain_required: true,
                 };
             }
         }
         if self.phase.drain_required() {
-            if let Err(error) = self.drain_stream() {
+            if let Err(failure) = self.drain_stream() {
+                let error = failure.error();
+                if let Some(cuda_error) = failure.cuda_error() {
+                    self.retain_driver_error(cuda_error);
+                }
                 return self.unknown(error.into());
             }
         }
@@ -875,6 +900,7 @@ impl RuntimeGenerationRebuildSubmission {
             Err(CudaRuntimeProbeError::KernelLaunchFailed(-1).into())
         };
         self.phase = RuntimeGenerationRebuildPhase::Quiesced;
+        self.quarantine_if_driver_error();
         RuntimeGenerationRebuildCompletion::Quiesced(result)
     }
 
@@ -900,19 +926,39 @@ impl RuntimeGenerationRebuildSubmission {
             slots,
         })
     }
+
+    fn quarantine_if_driver_error(&mut self) {
+        if self.driver_error_observed {
+            if let Some(resources) = self.resources.take() {
+                quarantine_runtime_generation_rebuild_resources(resources);
+            }
+        }
+    }
 }
 
 impl Drop for RuntimeGenerationRebuildSubmission {
     fn drop(&mut self) {
         if !self.phase.drain_required() {
+            self.quarantine_if_driver_error();
             return;
         }
-        if self.drain_stream().is_ok() {
-            self.phase = RuntimeGenerationRebuildPhase::Quiesced;
-            return;
-        }
-        if let Some(resources) = self.resources.take() {
-            park_runtime_generation_rebuild_resources(resources);
+        match self.drain_stream() {
+            Ok(()) => {
+                self.phase = RuntimeGenerationRebuildPhase::Quiesced;
+                self.quarantine_if_driver_error();
+            }
+            Err(failure) => {
+                if let Some(cuda_error) = failure.cuda_error() {
+                    self.retain_driver_error(cuda_error);
+                }
+                if let Some(resources) = self.resources.take() {
+                    if self.driver_error_observed {
+                        quarantine_runtime_generation_rebuild_resources(resources);
+                    } else {
+                        park_runtime_generation_rebuild_resources(resources);
+                    }
+                }
+            }
         }
     }
 }
@@ -934,6 +980,15 @@ static PARKED_REBUILDS: Mutex<
     [Option<RuntimeGenerationRebuildResources>; PARKED_REBUILD_COMPLETIONS],
 > = Mutex::new([const { None }; PARKED_REBUILD_COMPLETIONS]);
 
+static QUARANTINED_REBUILDS: Mutex<
+    [Option<RuntimeGenerationRebuildResources>; QUARANTINED_REBUILD_COMPLETIONS],
+> = Mutex::new([const { None }; QUARANTINED_REBUILD_COMPLETIONS]);
+
+#[cfg(test)]
+thread_local! {
+    static REBUILD_SUCCESSFUL_ENQUEUES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn park_runtime_generation_rebuild_resources(resources: RuntimeGenerationRebuildResources) {
     let Ok(mut parked) = PARKED_REBUILDS.lock() else {
         std::mem::forget(resources);
@@ -944,6 +999,98 @@ fn park_runtime_generation_rebuild_resources(resources: RuntimeGenerationRebuild
     } else {
         std::mem::forget(resources);
     }
+}
+
+fn quarantine_runtime_generation_rebuild_resources(resources: RuntimeGenerationRebuildResources) {
+    let Ok(mut quarantined) = QUARANTINED_REBUILDS.lock() else {
+        std::mem::forget(resources);
+        return;
+    };
+    if let Some(slot) = quarantined.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(resources);
+    } else {
+        // A poisoned stream or buffer must never return to the shared context pool.
+        std::mem::forget(resources);
+    }
+}
+
+#[cfg(test)]
+fn parked_runtime_generation_rebuild_count_for_test() -> usize {
+    PARKED_REBUILDS
+        .lock()
+        .map(|parked| parked.iter().filter(|slot| slot.is_some()).count())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn parked_runtime_generation_rebuild_contains_resident_owner_for_test(identity: usize) -> bool {
+    PARKED_REBUILDS
+        .lock()
+        .map(|parked| {
+            parked.iter().flatten().any(|resources| {
+                resources
+                    ._resident_owners
+                    .iter()
+                    .any(|owner| Arc::as_ptr(owner) as usize == identity)
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn drain_parked_runtime_generation_rebuilds_for_test() -> Result<usize, CudaRuntimeProbeError> {
+    let mut parked = PARKED_REBUILDS
+        .lock()
+        .map_err(|_| CudaRuntimeProbeError::KernelLaunchFailed(-9_995))?;
+    let mut drained = 0_usize;
+    for slot in parked.iter_mut() {
+        let Some(resources) = slot.take() else {
+            continue;
+        };
+        let stream = resources
+            .stream
+            .pooled
+            .as_ref()
+            .expect("parked rebuild retains its private stream")
+            .stream;
+        if let Err(error) = resources.stream.primary.synchronize_owned_stream(stream) {
+            *slot = Some(resources);
+            return Err(error);
+        }
+        drop(resources);
+        drained += 1;
+    }
+    Ok(drained)
+}
+
+#[cfg(test)]
+fn quarantined_runtime_generation_rebuild_count_for_test() -> usize {
+    QUARANTINED_REBUILDS
+        .lock()
+        .map(|quarantined| quarantined.iter().filter(|slot| slot.is_some()).count())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn quarantined_runtime_generation_rebuild_contains_resident_owner_for_test(
+    identity: usize,
+) -> bool {
+    QUARANTINED_REBUILDS
+        .lock()
+        .map(|quarantined| {
+            quarantined.iter().flatten().any(|resources| {
+                resources
+                    ._resident_owners
+                    .iter()
+                    .any(|owner| Arc::as_ptr(owner) as usize == identity)
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn rebuild_successful_enqueue_count_for_test() -> u64 {
+    REBUILD_SUCCESSFUL_ENQUEUES.with(std::cell::Cell::get)
 }
 
 fn prepare_inner(
@@ -1414,7 +1561,18 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::CudaDriverRuntime;
+    use crate::{
+        cuda_context::{
+            fail_next_owned_stream_dtoh_enqueue_for_test,
+            fail_next_owned_stream_htod_enqueue_after_dispatch_for_test,
+            fail_next_owned_stream_launch_after_dispatch_for_test,
+            fail_next_owned_stream_post_submit_bind_raw_cuda_result_for_test,
+            fail_next_owned_stream_pre_submit_bind_raw_cuda_result_for_test,
+            fail_next_owned_stream_synthetic_fence_not_attempted_for_test,
+            fail_owned_stream_syncs_for_test,
+        },
+        CudaDriverRuntime,
+    };
     use sha2::{Digest, Sha256};
 
     fn cuda_runtime() -> Option<CudaDriverRuntime> {
@@ -1542,6 +1700,24 @@ mod tests {
                 )
             }
         }
+    }
+
+    fn resident_submission(
+        target: RuntimeGenerationRebuildTarget,
+        attempt: u64,
+        source: &Arc<CudaResidentDeviceMemory>,
+        source_bytes: u64,
+    ) -> RuntimeGenerationRebuildSubmission {
+        PreparedRuntimeGenerationRebuild::prepare(input(
+            target,
+            attempt,
+            vec![(
+                RuntimeGenerationRebuildSource::resident(Arc::clone(source), 0, source_bytes),
+                1,
+            )],
+        ))
+        .expect("resident submission preparation")
+        .enqueue()
     }
 
     fn proof_for_commitment_test(
@@ -2136,6 +2312,245 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_post_submission_cuda_errors_quarantine_and_synthetic_fences_can_release() {
+        let Some(runtime) = cuda_runtime() else {
+            return;
+        };
+        let target = runtime
+            .runtime_generation_rebuild_target(0)
+            .expect("primary target");
+        let quarantined_before = quarantined_runtime_generation_rebuild_count_for_test();
+
+        let rejected_source = payload(&[(2, Some(11))], 3, 100, true);
+        assert!(matches!(
+            PreparedRuntimeGenerationRebuild::prepare(input(
+                target.clone(),
+                10_000,
+                vec![(
+                    RuntimeGenerationRebuildSource::cold_ram(
+                        Arc::<[u8]>::from(rejected_source.clone()),
+                        0,
+                        rejected_source.len() as u64,
+                    ),
+                    1,
+                )],
+            ))
+            .expect("device-rejection preparation")
+            .enqueue()
+            .complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(
+                RuntimeGenerationRebuildError::DeviceRejected(3)
+            ))
+        ));
+        assert_eq!(
+            quarantined_runtime_generation_rebuild_count_for_test(),
+            quarantined_before,
+            "a semantic device verdict is not a CUDA API contamination event"
+        );
+
+        let pre_submit_bytes = payload(&[(2, Some(11))], 3, 100, false);
+        let pre_submit_source = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &pre_submit_bytes)
+                .expect("pre-submit resident source"),
+        );
+        let pre_submit_weak = pre_submit_source.allocation_weak_for_test();
+        fail_next_owned_stream_pre_submit_bind_raw_cuda_result_for_test(-9_989);
+        assert!(matches!(
+            resident_submission(
+                target.clone(),
+                10_001,
+                &pre_submit_source,
+                pre_submit_bytes.len() as u64,
+            )
+            .complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(
+                RuntimeGenerationRebuildError::Runtime(CudaRuntimeProbeError::KernelLaunchFailed(
+                    -9_989
+                ))
+            ))
+        ));
+        drop(pre_submit_source);
+        assert!(
+            !pre_submit_weak.is_alive(),
+            "pre-submit bind failure releases resources because no stream command was attempted"
+        );
+        assert_eq!(
+            quarantined_runtime_generation_rebuild_count_for_test(),
+            quarantined_before
+        );
+
+        let bytes = payload(&[(2, Some(11))], 3, 100, false);
+        let source = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &bytes)
+                .expect("quarantine resident source"),
+        );
+        let source_identity = source.allocation_identity();
+        let source_weak = source.allocation_weak_for_test();
+
+        fail_next_owned_stream_htod_enqueue_after_dispatch_for_test();
+        assert!(matches!(
+            resident_submission(target.clone(), 10_002, &source, bytes.len() as u64).complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(
+                RuntimeGenerationRebuildError::Runtime(CudaRuntimeProbeError::KernelLaunchFailed(
+                    -9_992
+                ))
+            ))
+        ));
+
+        fail_next_owned_stream_launch_after_dispatch_for_test();
+        let launch_then_fence =
+            resident_submission(target.clone(), 10_003, &source, bytes.len() as u64);
+        fail_owned_stream_syncs_for_test(1);
+        let launch_then_fence = match launch_then_fence.complete() {
+            RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
+            RuntimeGenerationRebuildCompletion::Quiesced(result) => {
+                panic!("launch plus raw fence result must retain unknown quiescence: {result:?}")
+            }
+        };
+        assert!(matches!(
+            launch_then_fence.retry_complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(
+                RuntimeGenerationRebuildError::Runtime(CudaRuntimeProbeError::KernelLaunchFailed(
+                    -9_993
+                ))
+            ))
+        ));
+
+        let dtoh = resident_submission(target.clone(), 10_004, &source, bytes.len() as u64);
+        fail_next_owned_stream_dtoh_enqueue_for_test();
+        assert!(matches!(
+            dtoh.complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(
+                RuntimeGenerationRebuildError::Runtime(CudaRuntimeProbeError::KernelLaunchFailed(
+                    -9_994
+                ))
+            ))
+        ));
+
+        let bind = resident_submission(target.clone(), 10_005, &source, bytes.len() as u64);
+        fail_next_owned_stream_post_submit_bind_raw_cuda_result_for_test(-9_995);
+        assert!(matches!(
+            bind.complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(
+                RuntimeGenerationRebuildError::Runtime(CudaRuntimeProbeError::KernelLaunchFailed(
+                    -9_995
+                ))
+            ))
+        ));
+
+        let enqueues_before_fence_retry = rebuild_successful_enqueue_count_for_test();
+        let fence = resident_submission(target.clone(), 10_006, &source, bytes.len() as u64);
+        fail_owned_stream_syncs_for_test(1);
+        let fence = match fence.complete() {
+            RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
+            RuntimeGenerationRebuildCompletion::Quiesced(result) => {
+                panic!("raw CUDA fence result must retain unknown quiescence: {result:?}")
+            }
+        };
+        assert!(matches!(
+            fence.retry_complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(
+                RuntimeGenerationRebuildError::Runtime(CudaRuntimeProbeError::KernelLaunchFailed(
+                    -9_991
+                ))
+            ))
+        ));
+        assert_eq!(
+            rebuild_successful_enqueue_count_for_test(),
+            enqueues_before_fence_retry + 1,
+            "retrying unknown quiescence fences only the original rebuild submission"
+        );
+
+        fail_next_owned_stream_launch_after_dispatch_for_test();
+        drop(resident_submission(
+            target.clone(),
+            10_009,
+            &source,
+            bytes.len() as u64,
+        ));
+        assert_eq!(
+            quarantined_runtime_generation_rebuild_count_for_test(),
+            quarantined_before + 6,
+            "every post-submit CUDA result, including a Drop-drained owner, quarantines"
+        );
+        drop(source);
+        assert!(source_weak.is_alive());
+        assert!(
+            quarantined_runtime_generation_rebuild_contains_resident_owner_for_test(
+                source_identity
+            )
+        );
+
+        let clean_bytes = payload(&[(3, Some(12))], 3, 100, false);
+        let clean_source = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &clean_bytes)
+                .expect("synthetic-fence resident source"),
+        );
+        let clean_weak = clean_source.allocation_weak_for_test();
+        let clean = resident_submission(
+            target.clone(),
+            10_007,
+            &clean_source,
+            clean_bytes.len() as u64,
+        );
+        drop(clean_source);
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+        let clean = match clean.complete() {
+            RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
+            RuntimeGenerationRebuildCompletion::Quiesced(result) => {
+                panic!("synthetic interruption must leave quiescence unknown: {result:?}")
+            }
+        };
+        assert!(matches!(
+            clean.retry_complete(),
+            RuntimeGenerationRebuildCompletion::Quiesced(Ok(_))
+        ));
+        assert!(!clean_weak.is_alive());
+        assert_eq!(
+            quarantined_runtime_generation_rebuild_count_for_test(),
+            quarantined_before + 6,
+            "synthetic interruption remains non-contaminating"
+        );
+
+        let parking_before = parked_runtime_generation_rebuild_count_for_test();
+        let parked_bytes = payload(&[(4, Some(13))], 3, 100, false);
+        let parked_source = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &parked_bytes)
+                .expect("parking resident source"),
+        );
+        let parked_identity = parked_source.allocation_identity();
+        let parked_weak = parked_source.allocation_weak_for_test();
+        let parked = resident_submission(target, 10_008, &parked_source, parked_bytes.len() as u64);
+        drop(parked_source);
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+        let parked = match parked.complete() {
+            RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
+            RuntimeGenerationRebuildCompletion::Quiesced(result) => {
+                panic!("synthetic interruption must leave parking owner unknown: {result:?}")
+            }
+        };
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+        drop(parked);
+        assert_eq!(
+            parked_runtime_generation_rebuild_count_for_test(),
+            parking_before + 1
+        );
+        assert!(
+            parked_runtime_generation_rebuild_contains_resident_owner_for_test(parked_identity)
+        );
+        assert!(parked_weak.is_alive());
+        assert_eq!(
+            drain_parked_runtime_generation_rebuilds_for_test().expect("parked drain"),
+            1
+        );
+        assert!(!parked_weak.is_alive());
+    }
+
+    #[test]
     fn gpu_rebuild_unknown_fence_retries_without_relaunching() {
         let Some(runtime) = cuda_runtime() else {
             return;
@@ -2158,7 +2573,7 @@ mod tests {
         ))
         .expect("preparation")
         .enqueue();
-        crate::cuda_context::fail_owned_stream_syncs_for_test(1);
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
         let unknown = match submission.complete() {
             RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
             _ => panic!("injected fence failure must retain unknown quiescence"),
@@ -2202,11 +2617,12 @@ mod tests {
         // The first failure makes quiescence unknown; the second proves that a fence retry can
         // remain unknown. Higher layers must surface this owner to their bounded fresh-context
         // retry instead of polling forever.
-        crate::cuda_context::fail_owned_stream_syncs_for_test(2);
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
         let unknown = match submission.complete() {
             RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
             _ => panic!("first persistent fence failure must retain unknown quiescence"),
         };
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
         match unknown.retry_complete() {
             RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => {
                 assert!(matches!(
@@ -2249,7 +2665,7 @@ mod tests {
             ))
             .expect("serial preparation")
             .enqueue();
-            crate::cuda_context::fail_owned_stream_syncs_for_test(1);
+            fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
             let unknown = match submission.complete() {
                 RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
                 _ => panic!("serial injected fence failure must retain resources"),
@@ -2279,7 +2695,7 @@ mod tests {
                     ))
                     .expect("concurrent preparation")
                     .enqueue();
-                    crate::cuda_context::fail_owned_stream_syncs_for_test(1);
+                    fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
                     match submission.complete() {
                         RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => {
                             matches!(

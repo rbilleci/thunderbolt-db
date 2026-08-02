@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn adapter_rejects_indexes_before_any_execution_owner_is_consumed() {
         let attached = resources::attached_resources_for_bootstrap_rebuild_test();
-        let (compiler, _expectations) = bootstrap_rebuild::prepare_bootstrap_rebuild(attached)
+        let compiler = bootstrap_rebuild::compiler_input_for_adapter_rejection_test(attached)
             .unwrap_or_else(|_| panic!("prepared root-free compiler input"));
         let parts = compiler.into_gpu_parts();
         assert_eq!(
@@ -393,5 +393,15 @@ mod tests {
             ))
         );
         let _compiler = parts.into_compiler_input();
+
+        let candidate = include_str!("bootstrap_candidate.rs");
+        let prepared_build = candidate
+            .split("/// Private ownership relay around the sealed V1 rebuild adapter.")
+            .next()
+            .expect("prepared build section");
+        assert!(
+            !prepared_build.contains("into_gpu_parts") && !prepared_build.contains("fn enqueue"),
+            "prepared bootstrap publication build must remain phase-only"
+        );
     }
 }

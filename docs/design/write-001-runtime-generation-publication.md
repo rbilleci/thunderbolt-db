@@ -653,9 +653,11 @@ coverage, table/index root, or logical row count is durability corruption and fa
 
 ### Quiescent bootstrap and nonempty rebuild
 
-The first runtime construction path for a nonempty v1 generation is a private
-`BootstrapPublicationSource -> UninstalledPublicationGeneration` boundary. It may run only during
-fresh recovery/startup before service exposure, or after a complete reader, writer, and GPU drain.
+The first runtime construction path for a nonempty v1 generation begins at a private sealed
+`BootstrapPublicationSource -> BootstrapMaterializationLease` boundary. Its internal validated
+replay owner is a `ValidatedBootstrapSource` held in a `BootstrapMaterializationSeed`; neither is
+an uninstalled generation. It may run only during fresh recovery/startup before service exposure,
+or after a complete reader, writer, and GPU drain.
 It binds one common durable-and-applied cut `C`, `visible_next = C + 1`, database/root-format
 identity, the exact WAL catalog epoch/digest pair, and the catalog snapshot produced by that same
 replay. It also owns the persisted v1 stable-ID migration map and allocator high-waters, the
@@ -694,6 +696,10 @@ the S7 initial table/database identities against it, and separately pin exact GP
 cannot create, modify, or publish a logical generation.
 
 ## Required evidence
+
+This evidence is a dimension of the integrated WRITE-001 milestone candidate, not a separately accepted
+publication slice. Focused tests may close it during implementation; WRITE-001 receives the single final
+audit/HAZARD/report-card seal defined by `PLAN.md` and `AGENTS.md`.
 
 The implementation must demonstrate deterministic live-versus-fresh-recovery roots; exact domain,
 count, ordering, type/index-shape, and migration-map sabotage rejection; bounded

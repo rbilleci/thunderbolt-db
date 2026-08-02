@@ -99,8 +99,35 @@ standard and the affected subsystem.
 
 ## Development gate order
 
-Quality attaches to the exact accepted candidate, not to repeated full-card runs on intermediate repairs. Use this
-order for every independently reviewable slice:
+### End-to-end delivery discipline
+
+- The unit of acceptance is a user-visible `PLAN.md` milestone, not a private helper, proof type, codec phase,
+  source extraction, or production-unreachable sub-boundary. Intermediate work is integrated WIP: keep it tested,
+  but do not call it accepted, add a `STATUS.md` acceptance entry, advance `HANDOVER.md`, or run a standalone
+  acceptance audit merely because it can be reviewed in isolation.
+- Start every feature milestone with one production-reachable vertical route and keep that route executable while
+  breadth is added. A private or `cfg(test)` prerequisite may exist only when a failing end-to-end test proves it is
+  required. It must be connected to the production call graph in the same milestone candidate; source guards whose
+  purpose is to preserve production unreachability are prohibited.
+- Measure progress by closed end-to-end acceptance rows, production call-graph reachability, and deletion of the
+  superseded path. Commit count, slice count, test count, lines added, proof types, and audit rounds are not progress
+  measures.
+- Use one integrated candidate and one milestone acceptance cycle. Focused tests, sabotage, static checks, and
+  optional advisory reviews run during implementation. Freeze once after the complete functional matrix passes,
+  then run the required independent adversarial audit and applicable full card. A valid audit finding reopens that
+  same candidate; it does not create a new accepted sub-milestone.
+- For an explicitly time-boxed milestone, `PLAN.md` must carry elapsed-time checkpoints and a production-reachability
+  stop-loss. Ninety minutes without a newly passing production end-to-end assertion or removal of a superseded live
+  branch requires stopping helper expansion and returning to the shortest failing vertical route.
+- Parallel agents are encouraged only as lanes inside the same milestone candidate. Give them disjoint ownership
+  such as live cutover, durability/recovery, and acceptance evidence; integrate at least every 90 minutes. Do not
+  assign separate agents to invent or accept the next micro-boundary.
+- New prerequisite milestones, wire-format versions, or generalized authorities may be added only when an existing
+  milestone acceptance test fails for their absence and the current design cannot satisfy it. Record that evidence
+  in the existing PLAN item; do not grow a prerequisite chain from architecture preference alone.
+
+Quality attaches to the exact accepted milestone candidate, not to repeated full-card runs on intermediate repairs.
+Use this order once per complete PLAN milestone:
 
 1. Use the preceding accepted comparable card as the before-baseline. Rerun the base revision only when the device,
    driver/runtime, Rust/C toolchain, release profile, lockfile/native inputs, report-card harness, or calibrated

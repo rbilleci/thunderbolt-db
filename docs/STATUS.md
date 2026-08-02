@@ -778,7 +778,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Root-free compiler facts now include stable row-ID source roles, table generation, and column attnum/OID/signed-size
   ABI data. The GPU validates globally nonzero/strictly ascending stable IDs, visibility, and validity tails, then
   constructs canonical typed-value/current-row/radix/table/database proof roots. It never relabels physical
-  `row_start` as a stable row ID, uses no CPU sort/root hashing/fallback, and exposes only a 135-slot opaque proof
+  `row_start` as a stable row ID, uses no CPU sort/root hashing/fallback, and exposes only a 200-slot opaque proof
   with structural metadata and opaque digests.
 - Preparation reserves one pinned HtoD descriptor/cold-source arena, rehydration/workspace/proof allocations, one
   pinned DtoH proof arena, and a private stream before enqueue. Completion is one covering fence; unknown quiescence
@@ -793,6 +793,120 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   the device SHA KAT **1/1**, and engine data-generation **52/52**; check, strict all-target Clippy, all-format, and
   whitespace gates are clean. Three serial and two concurrent real-GPU HAZARD runs had no CUDA 700/716/717. A full
   card remains inapplicable: this private operator has no read/result/install/publication path.
+
+## WRITE-001 terminal descriptor and phase-only bootstrap-attempt checkpoint accepted — 2026-08-02
+
+- Canonical WAL now has a private, versioned root-format-v1 terminal-marker extension. Its 92-byte legacy marker is
+  byte-identical and retains its historical outcome grammar; the generic public decoder and recovery paths reject
+  the extension until a later sealed consumer exists. The extension binds its own domain-separated terminal digest
+  and fails closed on every descriptor-local contradiction: V1 outcome shape, non-success/catalog-only closure,
+  nonzero catalog commitments, transition presence/count rules, `ResetEmpty` predecessor/final-row rules, RowSet
+  index-shape and changed-table rules, and table/index commit-generation evolution. Predecessor equality, GPU root
+  recomputation, exact empty-map roots, and fragment affected-object closure remain deliberately owned by the later
+  generation validator.
+- The bootstrap source is accurately modeled as `ValidatedBootstrapSource -> BootstrapMaterializationSeed ->
+  BootstrapMaterializationLease`, not as an uninstalled generation. Preparation now returns one move-only,
+  phase-only build that retains its root-free compiler capability, comparator expectations, and complete replay /
+  checkpoint carry. Its only following private wrapper carries the same owners through adapter preparation, enqueue,
+  completion, terminal failure, unknown quiescence, and retry. The opaque GPU proof has no root-comparison,
+  generation, reader, install, publication, WAL, recovery, or live-state surface.
+- Shared SHA-256 completion and runtime-generation rebuild now distinguish a synthetic unfenced interruption from a
+  reported post-submission CUDA API error. They retain the first error, retry only the covering fence, and permanently
+  quarantine contaminated stream/device/pinned owners even if a later fence observes idleness; semantic device
+  rejection and pre-submit errors remain non-contaminating. This closes the prerequisite that previously blocked any
+  later promotion boundary.
+- The final independent audit returned **ACCEPT** for the frozen 12-path content manifest
+  `968851ec7a8db58f9d18c9a8b942701a776f2f6dfea7c443a828bac18caa0661`, terminal codec
+  `b341b7f6595d84e7cd20d85d6e2601107e4526e2ce95e8483f7fd09b6d40e94c`, attempt wrapper
+  `dbd68e47d692640d537c0206bfbecbb207f7a084a476c6683131ff1dd57eab4c`, and adapter
+  `4710b6797e870be3ecaf2761529fb9c193094bc081270e3764e0ae7b49735a7a`. WAL passes **173/173**;
+  the engine inventory passes **1,922**; execution passes **100** with **106** intentionally ignored; focused
+  real-GPU NULL and serial/concurrent HAZARD coverage, all-target/all-feature workspace check, strict Clippy,
+  formatting, and whitespace checks are clean. No report card applies: successful read kernels, residency layout,
+  and result paths are unchanged.
+
+## WRITE-001 200-slot phase-only bootstrap proof ABI repair accepted — 2026-08-02
+
+- The private phase-only adapter now binds execution's fixed 200-slot proof ABI exactly: column shape/value/current
+  rows in slots 0–2; row-map depths in 3–67; table root at 68; table-map empty depths in 69–133; table-map leaf at
+  134; table-map path depths in 135–198; and database root at 199. The former 135-slot engine contract was not a
+  compatible prefix because its slot 134 had a different meaning. Count, former-slot-134, depth, order, root-format,
+  missing, and surplus-slot sabotage fail before a phase proof can exist.
+- A test-only cold nullable-Int4 fixture drives the real wrapper through build, prepare, enqueue, and completion for
+  nullable and all-valid tails on the RTX GPU. Production code remains phase-only: it exposes no comparator, root
+  extraction, generation conversion, persistent-map import, WAL, recovery, reader, installation, or publication
+  authority.
+- Independent audit returned **ACCEPT** for `bootstrap_rebuild.rs` SHA-256
+  `79571d2999c8615c88a24033533c7c75a06625d4d291c72df30fc39c3b5670f9`, test-only wrapper
+  `bootstrap_candidate.rs` `6bebecf765cb1f11df7bd591804f06c538a004e78b53fcb25067b0fdcd080d86`, fixture owners
+  `bootstrap_publication.rs` `be0c20b4c68460944292145e870f04ed9fa3c4fd351bf7a729d15ae16f027ced` and
+  `resources.rs` `dfceeb03929ef972e30645a0d796900835edcd6b0e429a19674a6aa4d5cebdb5`; the unchanged phase adapter
+  is `4710b6797e870be3ecaf2761529fb9c193094bc081270e3764e0ae7b49735a7a` and terminal codec is
+  `b341b7f6595d84e7cd20d85d6e2601107e4526e2ce95e8483f7fd09b6d40e94c`.
+- Focused gates pass: engine data-generation **59/59**, candidate wrapper **4/4** with actual GPU execution,
+  execution rebuild **12/12**, execution **100** passed with **106** intentionally ignored, and WAL **173/173**;
+  required NULL/all-valid and three-serial/two-concurrent HAZARD evidence, workspace all-target/all-feature check,
+  strict workspace Clippy, formatting, and whitespace checks are clean. A 40-failure default-parallel engine
+  diagnostic was invalid under the required serial gate and had oversubscribed `/tmp`; seven representative failures
+  and the intentional fsync-wedge expected-panic test passed serially on the exact binary. No report card applies:
+  no successful read kernel, residency layout, result path, or benchmark harness changed.
+
+## WRITE-001 private immutable publication-authority kernel accepted — 2026-08-02
+
+- A new private `publication_authority` module retains one complete immutable logical publication tuple: the existing
+  `PublicationGeneration`, checked catalog-snapshot witness, authenticated status view, and exact physical-resource
+  owner. Its private holder has one `ArcSwap` acquisition/pin path and one consuming predecessor-checked CAS
+  replacement; no production constructor, `EngineState`, reader, WAL, recovery, `committed_seq`, installation, or
+  bootstrap-proof conversion is wired to it.
+- Candidates retain the exact predecessor `Arc`, captured tuple, terminal index, and full immutable
+  `PublishedStatusEntry`. They fail closed unless the successor logical and authenticated status views contain that
+  exact entry, its valid outcome/commit sequence/envelope digest match the candidate, status coverage/epoch advance
+  exactly once, and catalog/resource/identity closure holds. `CommitNoOp` and `AbortError` additionally retain prior
+  catalog identity, database root, and table-map root; catalog-only success therefore carries `CommitSuccess`.
+- Independent serial audit returned **ACCEPT** for `publication_authority.rs` SHA-256
+  `fd28a05f15bf3adab79764021a53faeb8f896adbb4798a535a721e09bb33bff6`, `status.rs`
+  `0bbe770c51f7ae7f8a0b25b48d0f92e840dc866dd9774b0a02cf3b847f71ee70`, and module hook
+  `db6a89f2f2f5e3e55a3645f474f7a49fed7b818567f4418fc02b22ce7975ed62`. The final candidate includes direct
+  sabotage of stale/gapped/epoch/catalog/status/root/resource substitutions, terminal-entry absence/substitution,
+  malformed outcomes, sequence/digest mismatch, and no-op/abort data or table-map relabeling, plus concurrent
+  complete-tuple pin and old-resource lifetime coverage.
+- Serial gates pass: authority **12/12**, engine data-generation **71/71**, engine all-target check, strict engine
+  all-target Clippy, full formatting, and whitespace checks. NULL/HAZARD, recovery, and report-card evidence are
+  inapplicable: the kernel has no device execution, successful read/result path, or live publication integration.
+
+## WRITE-001 private placement-only resource republication accepted — 2026-08-02
+
+- The private authority kernel now has a distinct move-only `PlacementReplacementCandidate`. It derives its
+  successor only from the retained predecessor tuple and a newly sealed resource owner; it accepts no caller-supplied
+  successor identity. Every logical field remains exact—root format, database ID, full `PublicationIdentity`,
+  table/status state and roots, catalog/status witnesses, visibility/coverage, and terminal digest—while only the
+  checked `publication_epoch = predecessor + 1` and resource owner differ.
+- Placement replacement has its own exact-predecessor pointer CAS with no rebase. Terminal-vs-placement and
+  placement-vs-placement candidates therefore make one another stale. Direct sabotage rejects logical/witness/table
+  root/visibility/coverage/digest/resource/epoch substitutions and overflow; pins observe only whole old/new tuples
+  and old placement resources remain alive through the final old pin.
+- Independent serial audit returned **ACCEPT** for `publication_authority.rs` SHA-256
+  `4dcf5dec09f950914ca9b81b3a8c4eb3402f0da760294545d3ec2f74deb9036e`; the module hook is
+  `db6a89f2f2f5e3e55a3645f474f7a49fed7b818567f4418fc02b22ce7975ed62`. Authority tests pass **20/20** serial and
+  engine data-generation passes **79/79** serial; engine all-target check, strict engine all-target Clippy, full
+  formatting, and whitespace checks are clean. The module remains private and production-unreachable, with no
+  device work, live reader, coordinator, WAL/recovery/checkpoint/install, replay/pending, bootstrap-conversion,
+  comparator/root extraction, or grammar path; NULL/HAZARD/recovery/report-card evidence is therefore inapplicable.
+
+## WRITE-001 delivery-process RCA and recovery protocol recorded — 2026-08-02
+
+- Repository and session evidence showed a systemic flow failure rather than insufficient activity: the retained
+  history contains 423 commits since 2026-07-12 and 298 named STRUCT slices, WRITE-001 accumulated 31 accepted
+  sub-boundaries, and a 5 h 24 m session used 17 agent tasks yet ended with another deliberately private authority.
+  The concluded analysis is `docs/archive/reviews/write-001-delivery-rca-2026-08-02.md`.
+- Governance now makes the complete PLAN milestone—not a private helper or proof phase—the unit of acceptance.
+  Intermediate work stays integrated WIP; progress requires production reachability, a closed end-to-end matrix row,
+  or deletion of an alternate live branch. A 90-minute stop-loss prevents further helper expansion without such
+  progress, and the milestone receives one final HAZARD/audit/full-card cycle.
+- `PLAN.md` now owns a 12-hour critical path with hard 2:30 production-vertical, 6:30 differential, 7:30 one-path,
+  and final-seal gates. This changes cadence and ordering only. WRITE-001's original semantics, durability,
+  GPU-native execution, breadth, recovery, deletion, HAZARD, and performance acceptance contract remains unchanged
+  and incomplete.
 
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 
