@@ -11,10 +11,16 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 mod exact;
+mod generation_terminal;
 pub use exact::{
     encode_canonical_record_exact_from_borrowed, encode_canonical_record_exact_into,
     measure_canonical_exact_buffers, measure_canonical_exact_buffers_from_fragments,
     CanonicalFragmentRef, ExactCanonicalRecordEncoding,
+};
+use generation_terminal::{
+    canonical_terminal_marker_digest_from_encoded, decode_canonical_terminal_marker,
+    encode_canonical_terminal_marker_into, measure_canonical_terminal_marker,
+    CanonicalTerminalMarker,
 };
 #[cfg(test)]
 mod exact_tests;
@@ -104,7 +110,15 @@ pub fn canonical_wal_footprint(
 /// path can traverse existing fragments without building a length collection.
 pub(super) fn canonical_wal_footprint_by_index(
     fragment_len: usize,
+    body_len: impl FnMut(usize) -> Result<u64, EngineError>,
+) -> Result<CanonicalWalFootprint, EngineError> {
+    canonical_wal_footprint_by_index_with_marker(fragment_len, body_len, CANONICAL_OUTCOME_BYTES)
+}
+
+fn canonical_wal_footprint_by_index_with_marker(
+    fragment_len: usize,
     mut body_len: impl FnMut(usize) -> Result<u64, EngineError>,
+    terminal_marker_bytes: usize,
 ) -> Result<CanonicalWalFootprint, EngineError> {
     let fragment_count = u32::try_from(fragment_len)
         .map_err(|_| durability("fragment count exceeds u32 framing"))?;
@@ -129,8 +143,8 @@ pub(super) fn canonical_wal_footprint_by_index(
         .map_err(|_| durability("packed record prefix exceeds u64"))?;
     let packed_length = u64::try_from(PACKED_FRAME_LENGTH_BYTES)
         .map_err(|_| durability("packed frame length exceeds u64"))?;
-    let outcome_bytes = u64::try_from(CANONICAL_OUTCOME_BYTES)
-        .map_err(|_| durability("outcome bytes exceed u64"))?;
+    let terminal_marker_bytes = u64::try_from(terminal_marker_bytes)
+        .map_err(|_| durability("terminal marker bytes exceed u64"))?;
     let outer_record = u64::try_from(crate::WAL_RECORD_HEADER_LEN)
         .map_err(|_| durability("outer WAL header exceeds u64"))?;
 
@@ -162,9 +176,15 @@ pub(super) fn canonical_wal_footprint_by_index(
     }
 
     let marker_frame_bytes = frame_fixed
-        .checked_add(outcome_bytes)
+        .checked_add(terminal_marker_bytes)
         .and_then(|bytes| bytes.checked_add(frame_digest))
         .ok_or_else(|| durability("marker frame byte length overflows"))?;
+    // The packed-record budget is deliberately looser than one canonical frame.  A variable
+    // root-format-v1 terminal marker must still fit the decoder's per-frame ceiling, otherwise
+    // the encoder could persist a record the canonical reader is required to reject.
+    if marker_frame_bytes > max_envelope {
+        return Err(durability("terminal marker frame exceeds byte bound"));
+    }
     let fragment_packed_bytes = fragment_frame_bytes
         .checked_add(
             packed_length
@@ -599,6 +619,9 @@ pub struct CanonicalEnvelope {
     pub physical: CanonicalPhysicalRange,
     pub header: CanonicalPreApplyHeader,
     pub fragments: Vec<CanonicalFragment>,
+    /// The exact terminal marker body. `outcome` is retained as a compatibility projection for
+    /// existing callers that need only PostgreSQL result fields.
+    pub(crate) terminal_marker: CanonicalTerminalMarker,
     pub outcome: CanonicalOutcome,
     pub ordered_fragment_root: CanonicalDigest,
     pub final_digest: CanonicalDigest,
@@ -918,9 +941,28 @@ pub fn encode_canonical_envelope(
     fragments: &[CanonicalFragment],
     outcome: &CanonicalOutcome,
 ) -> Result<EncodedCanonicalEnvelope, EngineError> {
+    encode_canonical_envelope_with_terminal_marker(
+        physical,
+        header,
+        fragments,
+        &CanonicalTerminalMarker::Legacy(outcome.clone()),
+    )
+}
+
+/// Encode a canonical envelope with either the historical 92-byte terminal marker or the
+/// root-format-v1 terminal descriptor extension.  Current live writers call only the legacy
+/// wrapper above; this generic entry point is intentionally the later authority seam for
+/// root-format-v1 resolved/WAL-first operations.
+pub(crate) fn encode_canonical_envelope_with_terminal_marker(
+    physical: CanonicalPhysicalRange,
+    header: &CanonicalPreApplyHeader,
+    fragments: &[CanonicalFragment],
+    marker: &CanonicalTerminalMarker,
+) -> Result<EncodedCanonicalEnvelope, EngineError> {
     if fragments.is_empty() || fragments.len() > u32::MAX as usize - 1 {
         return Err(durability("fragment count must be in 1..u32::MAX"));
     }
+    marker.validate_for_header(header)?;
     if header.operation_count as usize != fragments.len() {
         return Err(durability(format!(
             "header operation count {} does not match {} fragments",
@@ -928,6 +970,18 @@ pub fn encode_canonical_envelope(
             fragments.len()
         )));
     }
+    let marker_measure = measure_canonical_terminal_marker(marker)?;
+    // Reject marker/frame growth before this allocating compatibility encoder materializes any
+    // canonical body, leaf, frame, or packed record.  Root-format-v1 callers use the same
+    // measure before their later exact reservation path exists.
+    canonical_wal_footprint_by_index_with_marker(
+        fragments.len(),
+        |index| {
+            u64::try_from(fragments[index].body.len())
+                .map_err(|_| durability("fragment byte length exceeds u64 framing"))
+        },
+        marker_measure.marker_bytes,
+    )?;
     let frame_count = fragments.len() as u32 + 1;
     physical.validate(frame_count)?;
     let header_bytes = header.encode()?;
@@ -965,8 +1019,10 @@ pub fn encode_canonical_envelope(
         root_material.extend_from_slice(leaf);
     }
     let root = digest_parts(FRAGMENT_ROOT_DOMAIN, &[&root_material]);
-    let outcome_bytes = outcome.encode()?;
-    let final_digest = digest_parts(FINAL_DOMAIN, &[&header_bytes, &root, &outcome_bytes]);
+    let mut marker_bytes = vec![0; marker_measure.marker_bytes];
+    encode_canonical_terminal_marker_into(marker, &mut marker_bytes)?;
+    let final_digest =
+        canonical_terminal_marker_digest_from_encoded(&header_bytes, root, marker, &marker_bytes)?;
     let mut frames = Vec::with_capacity(frame_count as usize);
     for (index, (fragment, leaf)) in fragments.iter().zip(&leaves).enumerate() {
         frames.push(encode_frame(
@@ -995,7 +1051,7 @@ pub fn encode_canonical_envelope(
         fragments.len() as u32,
         0,
         &[],
-        &outcome_bytes,
+        &marker_bytes,
         header_digest,
         root,
         final_digest,
@@ -1112,7 +1168,25 @@ pub(super) fn encode_frame_into(
     Ok(())
 }
 
+/// Decode the legacy canonical envelope form accepted by all current engine recovery/apply
+/// callers. A root-format-v1 marker fails here until a later semantic decoder proves that its
+/// fragments and root descriptor belong to the one immutable-generation authority.
 pub fn decode_canonical_envelope(frames: &[Vec<u8>]) -> Result<CanonicalEnvelope, EngineError> {
+    let envelope = decode_canonical_envelope_with_terminal_marker(frames)?;
+    if !matches!(envelope.terminal_marker, CanonicalTerminalMarker::Legacy(_)) {
+        return Err(durability(
+            "root-format-v1 terminal descriptor requires its authenticated generation decoder",
+        ));
+    }
+    Ok(envelope)
+}
+
+/// Private extended-marker decoder. A later root-format-v1 semantic/recovery owner may call this
+/// only after it has authenticated the operation class and fragment grammar; it must not be
+/// surfaced through the legacy generic replay path above.
+pub(crate) fn decode_canonical_envelope_with_terminal_marker(
+    frames: &[Vec<u8>],
+) -> Result<CanonicalEnvelope, EngineError> {
     if frames.len() < 2 || frames.len() > u32::MAX as usize {
         return Err(durability("envelope requires fragments plus one marker"));
     }
@@ -1189,12 +1263,14 @@ pub fn decode_canonical_envelope(frames: &[Vec<u8>]) -> Result<CanonicalEnvelope
     {
         return Err(durability("terminal marker is absent or malformed"));
     }
-    let outcome = CanonicalOutcome::decode(marker.body)?;
-    let outcome_bytes = outcome.encode()?;
-    let final_digest = digest_parts(
-        FINAL_DOMAIN,
-        &[&header_bytes, &expected_root, &outcome_bytes],
-    );
+    let terminal_marker = decode_canonical_terminal_marker(marker.body)?;
+    terminal_marker.validate_for_header(&header)?;
+    let final_digest = canonical_terminal_marker_digest_from_encoded(
+        &header_bytes,
+        expected_root,
+        &terminal_marker,
+        marker.body,
+    )?;
     if marker.leaf_or_final != final_digest {
         return Err(durability("terminal outcome digest mismatch"));
     }
@@ -1202,7 +1278,8 @@ pub fn decode_canonical_envelope(frames: &[Vec<u8>]) -> Result<CanonicalEnvelope
         physical,
         header,
         fragments,
-        outcome,
+        outcome: terminal_marker.outcome().clone(),
+        terminal_marker,
         ordered_fragment_root: expected_root,
         final_digest,
     })
@@ -1723,6 +1800,19 @@ mod tests {
 
         let one_byte_over = [body_limit, body_limit, body_limit, body_limit - 239];
         assert!(canonical_wal_footprint(&one_byte_over).is_err());
+    }
+
+    #[test]
+    fn canonical_wal_footprint_keeps_the_terminal_marker_frame_limit_inclusive() {
+        let exact_marker_body = MAX_ENVELOPE_BYTES - FRAME_FIXED_BYTES - FRAME_DIGEST_BYTES;
+        let exact = canonical_wal_footprint_by_index_with_marker(1, |_| Ok(0), exact_marker_body)
+            .expect("terminal marker frame fits exactly");
+        assert_eq!(exact.marker_frame_bytes, MAX_ENVELOPE_BYTES as u64);
+
+        assert!(
+            canonical_wal_footprint_by_index_with_marker(1, |_| Ok(0), exact_marker_body + 1,)
+                .is_err()
+        );
     }
 
     #[test]

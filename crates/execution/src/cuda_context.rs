@@ -300,10 +300,10 @@ enum GpuContextOwnership {
 unsafe impl Send for GpuPrimaryContext {}
 unsafe impl Sync for GpuPrimaryContext {}
 
-/// Replay-only ownership of a private-stream fence result.  This deliberately does not alter the
-/// shared owned-stream wrapper used by SHA-256 completion and generation rebuild: replay needs to
-/// distinguish a control-plane test interruption from a CUDA API result that can poison the
-/// stream's context-bound pool resources.
+/// Replay-only ownership of a private-stream fence result.  Replay keeps its own provenance seam
+/// because its status readback bind has a separate contract; it likewise distinguishes a
+/// control-plane test interruption from a CUDA API result that can poison context-bound pool
+/// resources.
 #[derive(Debug, Clone)]
 pub(super) enum ReplayOwnedStreamFenceFailure {
     #[cfg(test)]
@@ -312,6 +312,34 @@ pub(super) enum ReplayOwnedStreamFenceFailure {
 }
 
 impl ReplayOwnedStreamFenceFailure {
+    pub(super) fn cuda_error(&self) -> Option<&CudaRuntimeProbeError> {
+        match self {
+            #[cfg(test)]
+            Self::SyntheticFenceNotAttempted => None,
+            Self::CudaApiReported(error) => Some(error),
+        }
+    }
+}
+
+/// Ownership of a SHA-256 completion or generation-rebuild private-stream fence result.  The
+/// synthetic test control exits before every CUDA API; every other variant is an actual CUDA API
+/// result after submission and can poison the context-bound pool resources.
+#[derive(Debug, Clone)]
+pub(super) enum CompletionOwnedStreamFenceFailure {
+    #[cfg(test)]
+    SyntheticFenceNotAttempted,
+    CudaApiReported(CudaRuntimeProbeError),
+}
+
+impl CompletionOwnedStreamFenceFailure {
+    pub(super) fn error(&self) -> CudaRuntimeProbeError {
+        match self {
+            #[cfg(test)]
+            Self::SyntheticFenceNotAttempted => CudaRuntimeProbeError::KernelLaunchFailed(-9_991),
+            Self::CudaApiReported(error) => error.clone(),
+        }
+    }
+
     pub(super) fn cuda_error(&self) -> Option<&CudaRuntimeProbeError> {
         match self {
             #[cfg(test)]
@@ -336,8 +364,21 @@ impl GpuPrimaryContext {
         check_cuda(unsafe { (self.cu_ctx_set_current)(self.context) })
     }
 
+    /// Bind before the first HtoD submission.  An error here is terminal for that attempt but no
+    /// command has reached the private stream yet, so callers may release their unsubmitted pool
+    /// leases normally rather than quarantining them.
+    pub(super) fn bind_owned_stream_before_submission(&self) -> Result<(), CudaRuntimeProbeError> {
+        self.set_current()?;
+        #[cfg(test)]
+        if let Some(code) = take_completion_pre_submit_bind_raw_cuda_result() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(code));
+        }
+        Ok(())
+    }
+
     /// Bind this context and prove one private stream idle.  Deferred owners use this instead of
     /// open-coding a raw synchronize so an unproved fence has one fail-closed representation.
+    #[cfg(test)]
     pub(super) fn synchronize_owned_stream(
         &self,
         stream: *mut c_void,
@@ -350,6 +391,46 @@ impl GpuPrimaryContext {
             ));
         }
         check_cuda(unsafe { (self.cu_stream_synchronize)(stream) })
+    }
+
+    /// Bind after a SHA-256 completion or generation-rebuild submission.  A bind result at this
+    /// edge may surface submitted asynchronous work, so it is always represented as a CUDA API
+    /// result rather than a retryable synthetic fence interruption.
+    pub(super) fn bind_owned_stream_for_completion(
+        &self,
+    ) -> Result<(), CompletionOwnedStreamFenceFailure> {
+        self.set_current()
+            .map_err(CompletionOwnedStreamFenceFailure::CudaApiReported)?;
+        #[cfg(test)]
+        if let Some(code) = take_completion_post_submit_bind_raw_cuda_result() {
+            return Err(CompletionOwnedStreamFenceFailure::CudaApiReported(
+                CudaRuntimeProbeError::KernelLaunchFailed(code),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fence provenance for SHA-256 completion and generation rebuild.  A synthetic interruption
+    /// is available only to prove retry behavior in tests; all driver calls and injected raw
+    /// results remain distinguishable CUDA API failures for quarantine accounting.
+    pub(super) fn synchronize_owned_stream_for_completion(
+        &self,
+        stream: *mut c_void,
+    ) -> Result<(), CompletionOwnedStreamFenceFailure> {
+        #[cfg(test)]
+        if take_completion_synthetic_fence_not_attempted() {
+            return Err(CompletionOwnedStreamFenceFailure::SyntheticFenceNotAttempted);
+        }
+        self.set_current()
+            .map_err(CompletionOwnedStreamFenceFailure::CudaApiReported)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if take_fail_next_owned_stream_sync() {
+            return Err(CompletionOwnedStreamFenceFailure::CudaApiReported(
+                CudaRuntimeProbeError::KernelLaunchFailed(take_owned_stream_sync_failure_code()),
+            ));
+        }
+        check_cuda(unsafe { (self.cu_stream_synchronize)(stream) })
+            .map_err(CompletionOwnedStreamFenceFailure::CudaApiReported)
     }
 
     /// Replay-only bind after a private-stream submission.  A `cuCtxSetCurrent` result at this
@@ -402,7 +483,12 @@ impl GpuPrimaryContext {
         let htod = self
             .cu_memcpy_htod_async
             .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
-        check_cuda(unsafe { htod(destination, source, bytes, stream) })
+        let result = check_cuda(unsafe { htod(destination, source, bytes, stream) });
+        #[cfg(test)]
+        if take_fail_next_owned_stream_htod_enqueue_after_dispatch() {
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_992));
+        }
+        result
     }
 
     /// Queue the bounded device verdict readback behind an owned private-stream kernel.  The
@@ -1234,6 +1320,8 @@ thread_local! {
     #[cfg(test)]
     static FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
+    static FAIL_NEXT_OWNED_STREAM_HTOD_ENQUEUE_AFTER_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
     static PANIC_NEXT_OWNED_STREAM_AFTER_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1242,6 +1330,9 @@ thread_local! {
     static REPLAY_SYNTHETIC_FENCE_NOT_ATTEMPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REPLAY_RAW_STREAM_SYNC_RESULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static REPLAY_POST_SUBMIT_BIND_RAW_CUDA_RESULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static COMPLETION_PRE_SUBMIT_BIND_RAW_CUDA_RESULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static COMPLETION_SYNTHETIC_FENCE_NOT_ATTEMPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COMPLETION_POST_SUBMIT_BIND_RAW_CUDA_RESULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Replay-only control-plane interruption before every CUDA fence API.  It is deliberately not a
@@ -1265,10 +1356,30 @@ pub(super) fn fail_next_replay_post_submit_bind_raw_cuda_result_for_test(code: i
     REPLAY_POST_SUBMIT_BIND_RAW_CUDA_RESULT.with(|value| value.set(Some(code)));
 }
 
-/// Fault injection for any new owned async submission that uses
-/// [`GpuPrimaryContext::synchronize_owned_stream`].  Production submission code contains no
-/// test-only branch: this hook merely makes the context fence return the same error channel a
-/// driver failure would use, so tests can exercise resource parking without a hardware fault.
+/// Completion/rebuild-only bind result before the first HtoD.  It is deliberately terminal but
+/// non-contaminating because the private stream has not accepted any command.
+#[cfg(test)]
+pub(super) fn fail_next_owned_stream_pre_submit_bind_raw_cuda_result_for_test(code: i32) {
+    COMPLETION_PRE_SUBMIT_BIND_RAW_CUDA_RESULT.with(|value| value.set(Some(code)));
+}
+
+/// Completion/rebuild-only control-plane interruption before every CUDA fence API.  Unlike the
+/// raw sync hook below, a retry may return the original healthy result and release its resources.
+#[cfg(test)]
+pub(super) fn fail_next_owned_stream_synthetic_fence_not_attempted_for_test() {
+    COMPLETION_SYNTHETIC_FENCE_NOT_ATTEMPTED.with(|value| value.set(true));
+}
+
+/// Completion/rebuild-only post-submit `cuCtxSetCurrent` result injection.  The injected result
+/// is a CUDA API failure and therefore contaminates the owner even if a later fence drains it.
+#[cfg(test)]
+pub(super) fn fail_next_owned_stream_post_submit_bind_raw_cuda_result_for_test(code: i32) {
+    COMPLETION_POST_SUBMIT_BIND_RAW_CUDA_RESULT.with(|value| value.set(Some(code)));
+}
+
+/// Raw nonzero owned-stream fence result injection.  This models a CUDA API result after
+/// submission; completion/rebuild owners must quarantine after a later successful drain, while
+/// their ordinary parked-resource drain keeps using the same raw driver-result channel.
 #[cfg(test)]
 pub(super) fn fail_owned_stream_syncs_for_test(count: u32) {
     fail_owned_stream_syncs_with_code_for_test(count, -9_991);
@@ -1288,6 +1399,13 @@ pub(super) fn fail_next_owned_stream_launch_after_dispatch_for_test() {
 #[cfg(test)]
 pub(super) fn fail_next_owned_stream_dtoh_enqueue_for_test() {
     FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE.with(|value| value.set(true));
+}
+
+/// Inject an HtoD API result after the real dispatch.  The caller must still drain and
+/// quarantine because the stream may have accepted the copy before reporting its error.
+#[cfg(test)]
+pub(super) fn fail_next_owned_stream_htod_enqueue_after_dispatch_for_test() {
+    FAIL_NEXT_OWNED_STREAM_HTOD_ENQUEUE_AFTER_DISPATCH.with(|value| value.set(true));
 }
 
 #[cfg(test)]
@@ -1329,6 +1447,21 @@ fn take_replay_post_submit_bind_raw_cuda_result() -> Option<i32> {
 }
 
 #[cfg(test)]
+fn take_completion_pre_submit_bind_raw_cuda_result() -> Option<i32> {
+    COMPLETION_PRE_SUBMIT_BIND_RAW_CUDA_RESULT.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+fn take_completion_synthetic_fence_not_attempted() -> bool {
+    COMPLETION_SYNTHETIC_FENCE_NOT_ATTEMPTED.with(|value| value.replace(false))
+}
+
+#[cfg(test)]
+fn take_completion_post_submit_bind_raw_cuda_result() -> Option<i32> {
+    COMPLETION_POST_SUBMIT_BIND_RAW_CUDA_RESULT.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
 fn take_fail_next_owned_stream_launch_after_dispatch() -> bool {
     FAIL_NEXT_OWNED_STREAM_LAUNCH_AFTER_DISPATCH.with(|value| value.replace(false))
 }
@@ -1336,6 +1469,11 @@ fn take_fail_next_owned_stream_launch_after_dispatch() -> bool {
 #[cfg(test)]
 fn take_fail_next_owned_stream_dtoh_enqueue() -> bool {
     FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE.with(|value| value.replace(false))
+}
+
+#[cfg(test)]
+fn take_fail_next_owned_stream_htod_enqueue_after_dispatch() -> bool {
+    FAIL_NEXT_OWNED_STREAM_HTOD_ENQUEUE_AFTER_DISPATCH.with(|value| value.replace(false))
 }
 
 #[cfg(test)]

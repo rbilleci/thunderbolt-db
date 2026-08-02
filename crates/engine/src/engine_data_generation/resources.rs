@@ -535,6 +535,84 @@ fn validate_range(
     Ok(())
 }
 
+/// Exact cold V1 bytes for the two-row engine-wrapper fixture. The source layout is sealed by
+/// `bootstrap_publication`; this helper merely supplies the detached payload owner it describes.
+#[cfg(test)]
+fn v1_single_table_int4_gpu_wrapper_payload(all_valid_tail: bool) -> Box<[u8]> {
+    let mut bytes = Vec::with_capacity(60);
+    for row_id in [2_u64, 5] {
+        bytes.extend_from_slice(&row_id.to_le_bytes());
+    }
+    bytes.extend_from_slice(&if all_valid_tail { 0b11_u32 } else { 0b01_u32 }.to_le_bytes());
+    for value in [11_i32, if all_valid_tail { 17 } else { 0 }] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for _ in 0..2 {
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+    }
+    for _ in 0..2 {
+        bytes.extend_from_slice(&3_u64.to_le_bytes());
+    }
+    assert_eq!(bytes.len(), 60, "sealed two-row V1 test payload length");
+    bytes.into_boxed_slice()
+}
+
+/// Narrow test-only attached source for actual engine-wrapper CUDA success. It derives the
+/// attachment target from the retained execution target, keeps every owner cold, and changes no
+/// production construction path or resident-owner surface.
+#[cfg(test)]
+pub(super) fn attached_v1_single_table_int4_resources_for_gpu_wrapper_test(
+    target: &RuntimeGenerationRebuildTarget,
+    all_valid_tail: bool,
+) -> BootstrapAttachedUninstalledResources {
+    let access = BootstrapResourceLeaseAccess { _private: () };
+    let lease = super::bootstrap_publication::tests::validated_v1_single_table_int4_materialization_lease_for_gpu_wrapper(&access)
+        .expect("valid V1 single-table INT4 GPU-wrapper source");
+    let payload = v1_single_table_int4_gpu_wrapper_payload(all_valid_tail);
+    let attachments = lease
+        .resource_claims(&access)
+        .iter()
+        .cloned()
+        .map(|claim| {
+            let owner_bytes = claim
+                .byte_offset
+                .checked_add(claim.byte_len.get())
+                .and_then(|value| usize::try_from(value).ok())
+                .expect("test RAM owner length");
+            let mut bytes = vec![0_u8; owner_bytes];
+            if claim.kind == BootstrapResourceLedgerKind::TablePayload {
+                let start = usize::try_from(claim.byte_offset).expect("test payload offset");
+                let end = start.checked_add(payload.len()).expect("test payload end");
+                assert_eq!(end, bytes.len(), "sealed table payload owner extent");
+                bytes[start..end].copy_from_slice(&payload);
+            }
+            BootstrapResourceAttachment {
+                owner: BootstrapDetachedResourceOwner::ColdRam(BootstrapDetachedColdRamOwner {
+                    bytes: Arc::from(bytes),
+                    range: BootstrapResourceByteRange {
+                        offset: claim.byte_offset,
+                        len: claim.byte_len,
+                    },
+                }),
+                claim,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    attach_bootstrap_resource_bundle(
+        lease,
+        BootstrapResourceAttachmentBundle {
+            target: BootstrapRebuildTarget {
+                device_ordinal: target.device_ordinal(),
+                context_identity: NonZeroUsize::new(target.context_identity())
+                    .expect("primary CUDA context identity"),
+            },
+            attachments,
+        },
+    )
+    .unwrap_or_else(|_| panic!("exact V1 cold GPU-wrapper owners attach"))
+}
+
 /// Narrow test-only source for the rebuild-proof child. Production code has no constructor for
 /// attached owners other than the sealed lease/attachment handoff above.
 #[cfg(test)]
@@ -580,6 +658,24 @@ pub(super) fn attached_resources_for_bootstrap_rebuild_test(
         Ok(attached) => attached,
         Err(_) => panic!("exact synthetic detached owners attach"),
     }
+}
+
+/// Test-only retention witness for the complete attached-owner handoff. The weak reference is
+/// intentionally the only non-owning observer: a prepared build must keep the RAM owner alive,
+/// then release it when the build is dropped.
+#[cfg(test)]
+pub(super) fn attached_resources_with_owner_witness_for_bootstrap_rebuild_test(
+) -> (BootstrapAttachedUninstalledResources, std::sync::Weak<[u8]>) {
+    let attached = attached_resources_for_bootstrap_rebuild_test();
+    let Some(BootstrapResourceAttachment {
+        owner: BootstrapDetachedResourceOwner::ColdRam(owner),
+        ..
+    }) = attached._attachments.first()
+    else {
+        panic!("synthetic bootstrap source begins with a detached RAM owner");
+    };
+    let owner = Arc::downgrade(&owner.bytes);
+    (attached, owner)
 }
 
 #[cfg(test)]

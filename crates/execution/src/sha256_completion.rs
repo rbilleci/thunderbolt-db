@@ -205,6 +205,12 @@ pub struct CudaSha256Submission {
     launch: CuLaunchKernel,
     work: Sha256CompletionWork,
     phase: Sha256CompletionPhase,
+    /// The first terminal CUDA result after submission.  A later fence can leave quiescence
+    /// unknown, but it may not redeem this attempt when a retry eventually drains the stream.
+    first_terminal_error: Option<CudaRuntimeProbeError>,
+    /// Any real CUDA API result after submission keeps these exact private-stream pool leases out
+    /// of reuse permanently, even after a later fence proves the stream is idle.
+    driver_error_observed: bool,
 }
 
 /// A quiesced outcome proves every HtoD/kernel/DtoH access has stopped.  An unknown fence retains
@@ -256,14 +262,30 @@ static PARKED_SHA256_COMPLETIONS: Mutex<Sha256CompletionParkingLot> =
         slots: [const { None }; PARKED_SHA256_COMPLETION_CAPACITY],
     });
 
+// A successfully drained stream is not automatically reusable after a CUDA API result.  Keep the
+// exact stream, DMA backings, and source guards here so another completion cannot inherit a
+// context-bound poisoned lease.
+const QUARANTINED_SHA256_COMPLETION_CAPACITY: usize = 8;
+
+struct Sha256CompletionQuarantineLot {
+    slots: [Option<Sha256CompletionResources>; QUARANTINED_SHA256_COMPLETION_CAPACITY],
+}
+
+static QUARANTINED_SHA256_COMPLETIONS: Mutex<Sha256CompletionQuarantineLot> =
+    Mutex::new(Sha256CompletionQuarantineLot {
+        slots: [const { None }; QUARANTINED_SHA256_COMPLETION_CAPACITY],
+    });
+
+#[cfg(test)]
+thread_local! {
+    static SHA256_SUCCESSFUL_ENQUEUES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone)]
 enum Sha256CompletionPhase {
     InFlight,
     ReadbackQueued,
-    TerminalFailure {
-        error: CudaRuntimeProbeError,
-        drain_required: bool,
-    },
+    TerminalFailure { drain_required: bool },
     Quiesced,
 }
 
@@ -401,6 +423,8 @@ impl PreparedCudaSha256Completion {
             launch: self.launch,
             work: self.work,
             phase: Sha256CompletionPhase::InFlight,
+            first_terminal_error: None,
+            driver_error_observed: false,
         };
         submission.enqueue_inner();
         submission
@@ -424,9 +448,9 @@ impl CudaSha256Submission {
     }
 
     fn enqueue_inner(&mut self) {
-        if let Err(error) = self.primary.set_current() {
+        if let Err(error) = self.primary.bind_owned_stream_before_submission() {
+            self.retain_first_terminal_error(&error);
             self.phase = Sha256CompletionPhase::TerminalFailure {
-                error,
                 drain_required: false,
             };
             return;
@@ -439,8 +463,8 @@ impl CudaSha256Submission {
             resources.descriptor_bytes,
             stream,
         ) {
+            self.retain_driver_error(&error);
             self.phase = Sha256CompletionPhase::TerminalFailure {
-                error,
                 drain_required: true,
             };
             return;
@@ -468,12 +492,14 @@ impl CudaSha256Submission {
         };
         let launch = self.primary.check_owned_stream_launch_result(launch_status);
         if let Err(error) = launch {
+            self.retain_driver_error(&error);
             self.phase = Sha256CompletionPhase::TerminalFailure {
-                error,
                 drain_required: true,
             };
         } else {
             self.primary.after_owned_stream_enqueue();
+            #[cfg(test)]
+            SHA256_SUCCESSFUL_ENQUEUES.with(|value| value.set(value.get() + 1));
         }
     }
 
@@ -481,7 +507,9 @@ impl CudaSha256Submission {
         if !matches!(self.phase, Sha256CompletionPhase::InFlight) {
             return Ok(());
         }
-        self.primary.set_current()?;
+        self.primary
+            .bind_owned_stream_for_completion()
+            .map_err(|failure| failure.error())?;
         let stream = self.stream();
         let resources = self.resources();
         self.primary.enqueue_owned_stream_dtoh(
@@ -494,15 +522,24 @@ impl CudaSha256Submission {
         Ok(())
     }
 
-    fn drain_stream(&self) -> Result<(), CudaRuntimeProbeError> {
-        self.primary.synchronize_owned_stream(self.stream())
+    fn drain_stream(&self) -> Result<(), crate::cuda_context::CompletionOwnedStreamFenceFailure> {
+        self.primary
+            .synchronize_owned_stream_for_completion(self.stream())
     }
 
     fn completion_error(&self) -> Option<CudaRuntimeProbeError> {
-        match &self.phase {
-            Sha256CompletionPhase::TerminalFailure { error, .. } => Some(error.clone()),
-            _ => None,
+        self.first_terminal_error.clone()
+    }
+
+    fn retain_first_terminal_error(&mut self, error: &CudaRuntimeProbeError) {
+        if self.first_terminal_error.is_none() {
+            self.first_terminal_error = Some(error.clone());
         }
+    }
+
+    fn retain_driver_error(&mut self, error: &CudaRuntimeProbeError) {
+        self.retain_first_terminal_error(error);
+        self.driver_error_observed = true;
     }
 
     fn unknown(self, error: CudaRuntimeProbeError) -> CudaSha256Completion {
@@ -517,14 +554,18 @@ impl CudaSha256Submission {
     pub fn complete(mut self) -> CudaSha256Completion {
         if self.phase.drain_required() && matches!(self.phase, Sha256CompletionPhase::InFlight) {
             if let Err(error) = self.queue_readback() {
+                self.retain_driver_error(&error);
                 self.phase = Sha256CompletionPhase::TerminalFailure {
-                    error,
                     drain_required: true,
                 };
             }
         }
         if self.phase.drain_required() {
-            if let Err(error) = self.drain_stream() {
+            if let Err(failure) = self.drain_stream() {
+                let error = failure.error();
+                if let Some(cuda_error) = failure.cuda_error() {
+                    self.retain_driver_error(cuda_error);
+                }
                 return self.unknown(error);
             }
         }
@@ -536,6 +577,7 @@ impl CudaSha256Submission {
             Err(CudaRuntimeProbeError::KernelLaunchFailed(-1))
         };
         self.phase = Sha256CompletionPhase::Quiesced;
+        self.quarantine_if_driver_error();
         CudaSha256Completion::Quiesced(result)
     }
 
@@ -548,19 +590,39 @@ impl CudaSha256Submission {
         };
         opaque_batch_from_quiesced_bytes(self.batch_id, &self.descriptors, bytes)
     }
+
+    fn quarantine_if_driver_error(&mut self) {
+        if self.driver_error_observed {
+            if let Some(resources) = self.resources.take() {
+                quarantine_sha256_completion_resources(resources);
+            }
+        }
+    }
 }
 
 impl Drop for CudaSha256Submission {
     fn drop(&mut self) {
         if !self.phase.drain_required() {
+            self.quarantine_if_driver_error();
             return;
         }
-        if self.drain_stream().is_ok() {
-            self.phase = Sha256CompletionPhase::Quiesced;
-            return;
-        }
-        if let Some(resources) = self.resources.take() {
-            park_sha256_completion_resources(resources);
+        match self.drain_stream() {
+            Ok(()) => {
+                self.phase = Sha256CompletionPhase::Quiesced;
+                self.quarantine_if_driver_error();
+            }
+            Err(failure) => {
+                if let Some(cuda_error) = failure.cuda_error() {
+                    self.retain_driver_error(cuda_error);
+                }
+                if let Some(resources) = self.resources.take() {
+                    if self.driver_error_observed {
+                        quarantine_sha256_completion_resources(resources);
+                    } else {
+                        park_sha256_completion_resources(resources);
+                    }
+                }
+            }
         }
     }
 }
@@ -586,6 +648,19 @@ fn park_sha256_completion_resources(resources: Sha256CompletionResources) {
     if let Some(slot) = parking.slots.iter_mut().find(|slot| slot.is_none()) {
         *slot = Some(resources);
     } else {
+        std::mem::forget(resources);
+    }
+}
+
+fn quarantine_sha256_completion_resources(resources: Sha256CompletionResources) {
+    let Ok(mut quarantine) = QUARANTINED_SHA256_COMPLETIONS.lock() else {
+        std::mem::forget(resources);
+        return;
+    };
+    if let Some(slot) = quarantine.slots.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(resources);
+    } else {
+        // Quarantine exhaustion must fail closed: these leases may no longer re-enter a pool.
         std::mem::forget(resources);
     }
 }
@@ -790,6 +865,57 @@ pub(crate) fn parked_sha256_completion_count_for_test() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn parked_sha256_completion_contains_source_owner_for_test(identity: usize) -> bool {
+    PARKED_SHA256_COMPLETIONS
+        .lock()
+        .map(|parking| {
+            parking.slots.iter().flatten().any(|resources| {
+                resources
+                    ._source_owners
+                    .iter()
+                    .any(|owner| Arc::as_ptr(owner) as usize == identity)
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn quarantined_sha256_completion_count_for_test() -> usize {
+    QUARANTINED_SHA256_COMPLETIONS
+        .lock()
+        .map(|quarantine| {
+            quarantine
+                .slots
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn quarantined_sha256_completion_contains_source_owner_for_test(
+    identity: usize,
+) -> bool {
+    QUARANTINED_SHA256_COMPLETIONS
+        .lock()
+        .map(|quarantine| {
+            quarantine.slots.iter().flatten().any(|resources| {
+                resources
+                    ._source_owners
+                    .iter()
+                    .any(|owner| Arc::as_ptr(owner) as usize == identity)
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn sha256_successful_enqueue_count_for_test() -> u64 {
+    SHA256_SUCCESSFUL_ENQUEUES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 pub(crate) fn drain_parked_sha256_completions_for_test() -> Result<usize, CudaRuntimeProbeError> {
     let mut parking = PARKED_SHA256_COMPLETIONS
         .lock()
@@ -821,7 +947,11 @@ mod tests {
     use crate::{
         cuda_context::{
             distinct_gpu_primary_context_for_test, fail_next_owned_stream_dtoh_enqueue_for_test,
+            fail_next_owned_stream_htod_enqueue_after_dispatch_for_test,
             fail_next_owned_stream_launch_after_dispatch_for_test,
+            fail_next_owned_stream_post_submit_bind_raw_cuda_result_for_test,
+            fail_next_owned_stream_pre_submit_bind_raw_cuda_result_for_test,
+            fail_next_owned_stream_synthetic_fence_not_attempted_for_test,
             fail_owned_stream_syncs_for_test,
         },
         CudaDriverRuntime,
@@ -842,6 +972,18 @@ mod tests {
             CudaSha256DeviceBuffer::new(source, 0, source.metadata().allocated_bytes),
             CudaSha256CompletionDescriptor::new(batch_id, 0),
         )
+    }
+
+    fn genesis_submission(
+        source: &crate::CudaResidentDeviceMemory,
+        batch_id: CudaSha256BatchId,
+    ) -> CudaSha256Submission {
+        PreparedCudaSha256Completion::prepare_runtime_generation_v1_genesis(
+            CudaSha256DeviceBuffer::new(source, 0, 16),
+            batch_id,
+        )
+        .expect("genesis submission preparation")
+        .enqueue()
     }
 
     fn runtime_generation_v1_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
@@ -1087,81 +1229,223 @@ mod tests {
     }
 
     #[test]
-    fn completion_cuda_launch_dtoh_sync_retry_and_drop_are_fail_closed() {
+    fn completion_post_submission_cuda_errors_quarantine_and_synthetic_fences_can_release() {
         let Some(runtime) = runtime() else {
             return;
         };
         let _ = drain_parked_sha256_completions_for_test();
+        let quarantined_before = quarantined_sha256_completion_count_for_test();
+
+        let pre_submit_source = runtime
+            .retain_device_memory_copy(0, &[0x10_u8; 16])
+            .expect("pre-submit source");
+        let pre_submit_weak = pre_submit_source.allocation_weak_for_test();
+        fail_next_owned_stream_pre_submit_bind_raw_cuda_result_for_test(-9_989);
+        assert!(matches!(
+            genesis_submission(
+                &pre_submit_source,
+                CudaSha256BatchId::new(10_001).expect("pre-submit batch"),
+            )
+            .complete(),
+            CudaSha256Completion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_989)))
+        ));
+        drop(pre_submit_source);
+        assert!(
+            !pre_submit_weak.is_alive(),
+            "a pre-submit bind failure releases never-enqueued pool leases"
+        );
+        assert_eq!(
+            quarantined_sha256_completion_count_for_test(),
+            quarantined_before,
+            "the pre-submit terminal error is not a poisoned stream result"
+        );
+
         let source = runtime
             .retain_device_memory_copy(0, &[0x11_u8; 16])
             .expect("resident database identity");
-        let batch_id = CudaSha256BatchId::new(11).expect("batch id");
+        let source_identity = source.allocation_identity();
+        let source_weak = source.allocation_weak_for_test();
+        let batch_id = CudaSha256BatchId::new(10_002).expect("batch id");
+
+        fail_next_owned_stream_htod_enqueue_after_dispatch_for_test();
+        assert!(matches!(
+            genesis_submission(&source, batch_id).complete(),
+            CudaSha256Completion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_992)))
+        ));
 
         fail_next_owned_stream_launch_after_dispatch_for_test();
-        let launch = PreparedCudaSha256Completion::prepare_runtime_generation_v1_genesis(
-            CudaSha256DeviceBuffer::new(&source, 0, 16),
-            batch_id,
-        )
-        .expect("genesis launch preparation")
-        .enqueue()
-        .complete();
+        let launch_then_fence = genesis_submission(&source, batch_id);
+        fail_owned_stream_syncs_for_test(1);
+        let launch_then_fence = match launch_then_fence.complete() {
+            CudaSha256Completion::UnknownQuiescence(unknown) => unknown,
+            CudaSha256Completion::Quiesced(result) => {
+                panic!("launch plus raw fence result must retain unknown quiescence: {result:?}")
+            }
+        };
         assert!(matches!(
-            launch,
+            launch_then_fence.retry_complete(),
             CudaSha256Completion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_993)))
         ));
 
-        let dtoh_submission = PreparedCudaSha256Completion::prepare_runtime_generation_v1_genesis(
-            CudaSha256DeviceBuffer::new(&source, 0, 16),
-            batch_id,
-        )
-        .expect("genesis DtoH preparation")
-        .enqueue();
+        let dtoh_submission = genesis_submission(&source, batch_id);
         fail_next_owned_stream_dtoh_enqueue_for_test();
         assert!(matches!(
             dtoh_submission.complete(),
             CudaSha256Completion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_994)))
         ));
 
-        let sync_submission = PreparedCudaSha256Completion::prepare_runtime_generation_v1_genesis(
-            CudaSha256DeviceBuffer::new(&source, 0, 16),
-            batch_id,
-        )
-        .expect("genesis sync preparation")
-        .enqueue();
+        let bind_submission = genesis_submission(&source, batch_id);
+        fail_next_owned_stream_post_submit_bind_raw_cuda_result_for_test(-9_995);
+        assert!(matches!(
+            bind_submission.complete(),
+            CudaSha256Completion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_995)))
+        ));
+
+        let enqueues_before_fence_retry = sha256_successful_enqueue_count_for_test();
+        let sync_submission = genesis_submission(&source, batch_id);
         fail_owned_stream_syncs_for_test(1);
         let unknown = match sync_submission.complete() {
             CudaSha256Completion::UnknownQuiescence(unknown) => unknown,
             CudaSha256Completion::Quiesced(result) => {
-                panic!("expected unknown quiescence, got {result:?}")
+                panic!("raw CUDA fence result must retain unknown quiescence: {result:?}")
             }
         };
-        match unknown.retry_complete() {
-            CudaSha256Completion::Quiesced(Ok(batch)) => {
-                batch.consume(|_, tokens| {
-                    assert_eq!(tokens.len(), CUDA_RUNTIME_GENERATION_V1_GENESIS_ROOT_SLOTS)
-                });
+        assert!(matches!(
+            unknown.retry_complete(),
+            CudaSha256Completion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_991)))
+        ));
+        assert_eq!(
+            sha256_successful_enqueue_count_for_test(),
+            enqueues_before_fence_retry + 1,
+            "retrying unknown quiescence only fences the original SHA submission"
+        );
+
+        fail_next_owned_stream_launch_after_dispatch_for_test();
+        drop(genesis_submission(&source, batch_id));
+        assert_eq!(
+            quarantined_sha256_completion_count_for_test(),
+            quarantined_before + 6,
+            "every post-submit CUDA result, including a Drop-drained owner, quarantines"
+        );
+        drop(source);
+        assert!(source_weak.is_alive());
+        assert!(quarantined_sha256_completion_contains_source_owner_for_test(source_identity));
+
+        let clean_source = runtime
+            .retain_device_memory_copy(0, &[0x12_u8; 16])
+            .expect("synthetic-fence source");
+        let clean_weak = clean_source.allocation_weak_for_test();
+        let clean_submission = genesis_submission(
+            &clean_source,
+            CudaSha256BatchId::new(10_003).expect("synthetic-fence batch"),
+        );
+        drop(clean_source);
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+        let clean_unknown = match clean_submission.complete() {
+            CudaSha256Completion::UnknownQuiescence(unknown) => unknown,
+            CudaSha256Completion::Quiesced(result) => {
+                panic!("synthetic interruption must leave quiescence unknown: {result:?}")
             }
+        };
+        match clean_unknown.retry_complete() {
+            CudaSha256Completion::Quiesced(Ok(batch)) => batch.consume(|_, _| {}),
             CudaSha256Completion::Quiesced(Err(error)) => {
-                panic!("retry completion failed: {error}")
+                panic!("synthetic fence retry must remain clean: {error}")
             }
             CudaSha256Completion::UnknownQuiescence(_) => {
-                panic!("retry completion remained unknown")
+                panic!("synthetic fence retry remained unknown")
             }
         }
-
-        fail_owned_stream_syncs_for_test(1);
-        drop(
-            PreparedCudaSha256Completion::prepare_runtime_generation_v1_genesis(
-                CudaSha256DeviceBuffer::new(&source, 0, 16),
-                batch_id,
-            )
-            .expect("genesis drop preparation")
-            .enqueue(),
+        assert!(!clean_weak.is_alive());
+        assert_eq!(
+            quarantined_sha256_completion_count_for_test(),
+            quarantined_before + 6,
+            "the synthetic unattempted fence is the sole retry-to-success path"
         );
-        assert_eq!(parked_sha256_completion_count_for_test(), 1);
+
+        let parking_before = parked_sha256_completion_count_for_test();
+        let parked_source = runtime
+            .retain_device_memory_copy(0, &[0x13_u8; 16])
+            .expect("parking source");
+        let parked_identity = parked_source.allocation_identity();
+        let parked_weak = parked_source.allocation_weak_for_test();
+        let parked_submission = genesis_submission(
+            &parked_source,
+            CudaSha256BatchId::new(10_004).expect("parking batch"),
+        );
+        drop(parked_source);
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+        let parked = match parked_submission.complete() {
+            CudaSha256Completion::UnknownQuiescence(unknown) => unknown,
+            CudaSha256Completion::Quiesced(result) => {
+                panic!("synthetic interruption must leave parking owner unknown: {result:?}")
+            }
+        };
+        fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+        drop(parked);
+        assert_eq!(
+            parked_sha256_completion_count_for_test(),
+            parking_before + 1
+        );
+        assert!(parked_sha256_completion_contains_source_owner_for_test(
+            parked_identity
+        ));
+        assert!(parked_weak.is_alive());
         assert_eq!(
             drain_parked_sha256_completions_for_test().expect("parked drain"),
             1
         );
+        assert!(!parked_weak.is_alive());
+    }
+
+    #[test]
+    fn sha256_synthetic_fence_retry_is_safe_for_three_serial_and_two_concurrent_submissions() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let source = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &[0x14_u8; 16])
+                .expect("serial and concurrent SHA source"),
+        );
+        for raw_batch in 10_100..10_103 {
+            let submission = genesis_submission(
+                &source,
+                CudaSha256BatchId::new(raw_batch).expect("serial batch"),
+            );
+            fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+            let unknown = match submission.complete() {
+                CudaSha256Completion::UnknownQuiescence(unknown) => unknown,
+                CudaSha256Completion::Quiesced(result) => {
+                    panic!("serial synthetic fence must retain unknown quiescence: {result:?}")
+                }
+            };
+            assert!(matches!(
+                unknown.retry_complete(),
+                CudaSha256Completion::Quiesced(Ok(_))
+            ));
+        }
+        let joins = (0..2)
+            .map(|offset| {
+                let source = std::sync::Arc::clone(&source);
+                std::thread::spawn(move || {
+                    let submission = genesis_submission(
+                        &source,
+                        CudaSha256BatchId::new(10_200 + offset).expect("concurrent batch"),
+                    );
+                    fail_next_owned_stream_synthetic_fence_not_attempted_for_test();
+                    match submission.complete() {
+                        CudaSha256Completion::UnknownQuiescence(unknown) => matches!(
+                            unknown.retry_complete(),
+                            CudaSha256Completion::Quiesced(Ok(_))
+                        ),
+                        CudaSha256Completion::Quiesced(_) => false,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for join in joins {
+            assert!(join.join().expect("concurrent SHA completion thread"));
+        }
     }
 }

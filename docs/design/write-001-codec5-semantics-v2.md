@@ -1983,10 +1983,12 @@ alternate encoding, or alternate apply is legal.
 
 ## PLAN-owned wire-freeze gates
 
-Before any writer can emit aggregate semantics 2, or any normative semantics-v2 S4/S7 reader,
-digest, or replay owner is added, the next WRITE-001 checkpoint freezes and independently audits
-one internally complete exact S7 contract. That gate covers only semantic classes implemented in
-the same checkpoint and assigns every magic/version, numeric tag and flag mask; proves every
+Before any writer could emit aggregate semantics 2, or any normative semantics-v2 S4/S7 reader,
+digest, or replay owner could be added, WRITE-001 had to freeze and independently audit one
+internally complete exact S7 contract. That historical gate is satisfied. Further implementation
+and supported-class breadth remains WIP inside the one integrated WRITE-001 milestone candidate;
+it is not a new accepted checkpoint. The frozen contract assigns every magic/version, numeric tag
+and flag mask; proves every
 width and offset sum; defines every offset base, ordering, absence, reference, and bijection rule;
 pins the digest primitive, unique domain, and byte preimage for every digest; closes every
 dependency-token, index-descriptor/key, projection, and supported statement-class payload

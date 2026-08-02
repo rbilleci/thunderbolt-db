@@ -118,10 +118,12 @@ ADR-012), never by CPU execution or hardware demand-paging.
 ## Execution discipline (non-negotiable)
 - **GPU-native or it does not land.** No host stub committed as "done"; no "deferred/follow-up/clean-error-for-now"
   escape past a hard kernel. Interim host code a later slice will replace is **WIP, not a deferral.**
-- **Every device-touching slice:** behavior-preserving where possible; **differential test WITH NULL data** (the
-  S10a/S10b lesson — the deleted probes were NULL-blind); **HAZARD** protocol (`--ignored` 3× sequential + 2×
-  concurrent, **zero CUDA 700/716/717**); a **separate independent adversarial audit** (never self-audit; prove
-  non-vacuity by sabotage); **adopt findings, don't defer.**
+- **Every device-touching milestone candidate:** behavior-preserving where possible; **differential test WITH NULL
+  data** (the S10a/S10b lesson — the deleted probes were NULL-blind); **HAZARD** protocol (`--ignored` 3×
+  sequential + 2× concurrent, **zero CUDA 700/716/717**); a **separate independent adversarial audit** (never
+  self-audit; prove non-vacuity by sabotage); **adopt findings, don't defer.** Private helpers and proof phases are
+  WIP inside that candidate, never separately accepted slices. They receive focused tests while the production
+  vertical route stays executable; the complete milestone receives the HAZARD/audit/performance seal once.
 - **Parity tests use GPU-native oracles** (on-device serial-vs-parallel / construction / closed-form), never a CPU
   re-implementation as the source of truth.
 

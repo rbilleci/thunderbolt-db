@@ -1333,13 +1333,11 @@ struct BootstrapPublicationSource {
 }
 
 impl BootstrapPublicationSource {
-    /// Validate the sealed replay witness atomically, then transfer ownership into an explicitly
-    /// uninstalled candidate. This does not materialize manifests or expose a runtime read path.
-    fn validate_into_uninstalled(
-        self,
-    ) -> Result<UninstalledPublicationGeneration, DataGenerationError> {
+    /// Validate the sealed replay witness atomically, then retain it as a sealed, pre-GPU
+    /// bootstrap source. This does not materialize manifests or expose a runtime read path.
+    fn validate_into_source(self) -> Result<ValidatedBootstrapSource, DataGenerationError> {
         self.replay.validate()?;
-        Ok(UninstalledPublicationGeneration {
+        Ok(ValidatedBootstrapSource {
             replay: self.replay,
         })
     }
@@ -1351,8 +1349,9 @@ impl BootstrapPublicationSource {
         self,
         _access: &super::resources::BootstrapResourceLeaseAccess,
     ) -> Result<BootstrapMaterializationLease, DataGenerationError> {
-        self.validate_into_uninstalled()
-            .map(UninstalledPublicationGeneration::into_materialization_lease)
+        self.validate_into_source()
+            .map(ValidatedBootstrapSource::into_materialization_seed)
+            .map(BootstrapMaterializationSeed::into_materialization_lease)
     }
 }
 
@@ -1885,27 +1884,34 @@ struct BootstrapRebuildExpectedIndex {
     key_shape_roots: Box<[ColumnShapeRoot]>,
 }
 
-/// A fully checked bootstrap payload with no installation, publication, or read capability. Its
-/// fields remain private so resources can consume it only through the sealed lease below.
-#[derive(Debug)]
-struct UninstalledPublicationGeneration {
+/// A fully checked pre-GPU replay source with no installation, publication, or read capability.
+/// It is not an uninstalled generation: materialization has not built any logical manifest,
+/// persistent map, or GPU result. Its fields remain private so resources can consume it only
+/// through the sealed source-to-lease path below.
+struct ValidatedBootstrapSource {
     replay: BootstrapReplayWitness,
 }
 
-/// The only sibling-visible carrier of an uninstalled generation's physical ledger. It owns the
-/// whole logical candidate so resource records from another replay source cannot be substituted
-/// for this source's canonical claims. The resource module may inspect the immutable claim list,
-/// but cannot reload replay state or install the candidate.
-pub(super) struct BootstrapMaterializationLease {
-    _candidate: UninstalledPublicationGeneration,
-    claims: Box<[BootstrapResourceLedgerEntry]>,
+/// The exact validated replay source plus its canonical physical-resource ledger. It is a
+/// pre-materialization ownership seed, not a publication candidate or a live-generation wrapper.
+struct BootstrapMaterializationSeed {
+    source: ValidatedBootstrapSource,
+    resource_ledger: Box<[BootstrapResourceLedgerEntry]>,
 }
 
-impl UninstalledPublicationGeneration {
-    /// Consume this uninstalled candidate into the one move-only materialization lease. There is
-    /// deliberately no reverse conversion or public constructor.
-    fn into_materialization_lease(self) -> BootstrapMaterializationLease {
-        let claims = self
+/// The only sibling-visible carrier of a validated source's physical ledger. It owns the
+/// whole validated source so resource records from another replay source cannot be substituted
+/// for this source's canonical claims. The resource module may inspect the immutable claim list,
+/// but cannot reload replay state or install a candidate.
+pub(super) struct BootstrapMaterializationLease {
+    _seed: BootstrapMaterializationSeed,
+}
+
+impl ValidatedBootstrapSource {
+    /// Form the one move-only materialization seed. There is deliberately no reverse conversion
+    /// or public constructor.
+    fn into_materialization_seed(self) -> BootstrapMaterializationSeed {
+        let resource_ledger = self
             .replay
             .resources
             .iter()
@@ -1913,10 +1919,16 @@ impl UninstalledPublicationGeneration {
             .map(BootstrapResourceLedgerEntry::from)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        BootstrapMaterializationLease {
-            _candidate: self,
-            claims,
+        BootstrapMaterializationSeed {
+            source: self,
+            resource_ledger,
         }
+    }
+}
+
+impl BootstrapMaterializationSeed {
+    fn into_materialization_lease(self) -> BootstrapMaterializationLease {
+        BootstrapMaterializationLease { _seed: self }
     }
 }
 
@@ -1928,20 +1940,25 @@ impl BootstrapMaterializationLease {
         &self,
         _access: &super::resources::BootstrapResourceLeaseAccess,
     ) -> &[BootstrapResourceLedgerEntry] {
-        &self.claims
+        &self._seed.resource_ledger
     }
 
-    /// Split a consumed attached lease into the only two rebuild-domain projections. Exact owner
-    /// retention is handled by `resources`; this method strips comparator roots from the compiler
-    /// source and drops replay/catalog/terminal payloads after extracting their expected outputs.
+    /// Split a consumed attached lease into root-free compiler input, comparator-only expected
+    /// roots, and the complete retained replay/checkpoint carry. Exact owner retention is handled
+    /// by `resources`; comparator commitments never enter the compiler source, and the carry
+    /// makes every publication fact available only to a later private phase.
     pub(super) fn into_bootstrap_rebuild_sources(
         self,
     ) -> (
         BootstrapRebuildRootFreeSource,
         BootstrapRebuildExpectationSource,
+        BootstrapPublicationCarry,
     ) {
-        let BootstrapMaterializationLease { _candidate, claims } = self;
-        let UninstalledPublicationGeneration { replay } = _candidate;
+        let BootstrapMaterializationLease { _seed } = self;
+        let BootstrapMaterializationSeed {
+            source: ValidatedBootstrapSource { replay },
+            resource_ledger,
+        } = _seed;
         let BootstrapReplayWitness {
             cut,
             root_format,
@@ -1949,12 +1966,15 @@ impl BootstrapMaterializationLease {
             catalog_snapshot,
             expected_database_root,
             expected_status_view_root,
+            catalog,
+            stable_ids,
             current_tables,
+            terminal_status,
             ..
         } = replay;
         let mut root_free_tables = Vec::with_capacity(current_tables.len());
         let mut expected_tables = Vec::with_capacity(current_tables.len());
-        for table in current_tables {
+        for table in current_tables.iter() {
             let catalog_table = catalog_snapshot
                 .relational_catalog
                 .values()
@@ -2042,13 +2062,25 @@ impl BootstrapMaterializationLease {
                 indexes: expected_indexes,
             });
         }
+        let publication_carry = BootstrapPublicationCarry {
+            _durable_cut: cut,
+            _root_format: root_format,
+            _database_id: database_id,
+            _catalog_identity: catalog,
+            _catalog_snapshot: Arc::clone(&catalog_snapshot),
+            _stable_ids: stable_ids,
+            _terminal_status: terminal_status,
+            _current_table_expectations: current_tables,
+            _canonical_resource_ledger: resource_ledger,
+        };
         (
             BootstrapRebuildRootFreeSource {
                 database_id,
                 root_format,
                 covered_through: cut.covered_through,
                 tables: root_free_tables.into_boxed_slice(),
-                resources: claims
+                resources: publication_carry
+                    ._canonical_resource_ledger
                     .iter()
                     .map(BootstrapRebuildRootFreeResource::from)
                     .collect::<Vec<_>>()
@@ -2059,8 +2091,24 @@ impl BootstrapMaterializationLease {
                 expected_status_view_root,
                 tables: expected_tables.into_boxed_slice(),
             },
+            publication_carry,
         )
     }
+}
+
+/// Exact validated replay/checkpoint facts retained by a prepared bootstrap publication build.
+/// The fields intentionally have no accessors: they are one move-only carry for a later private
+/// materialization comparator and never a source of live-state reloads or root construction.
+pub(super) struct BootstrapPublicationCarry {
+    _durable_cut: BootstrapDurableCut,
+    _root_format: RootFormatVersion,
+    _database_id: DatabaseId,
+    _catalog_identity: BootstrapCatalogPair,
+    _catalog_snapshot: Arc<crate::engine_state::CatalogSnapshot>,
+    _stable_ids: BootstrapStableIdState,
+    _terminal_status: ReplayedTerminalStatusWitness,
+    _current_table_expectations: Vec<BootstrapCurrentTable>,
+    _canonical_resource_ledger: Box<[BootstrapResourceLedgerEntry]>,
 }
 
 #[cfg(test)]
@@ -2735,10 +2783,53 @@ pub(super) mod tests {
         source.validate_into_materialization_lease(access)
     }
 
+    /// Test-only V1 source for the engine's closed GPU-wrapper success path. It keeps one
+    /// nullable INT4 table and removes the current index/payload pair so the adapter reaches the
+    /// device rather than exercising its deliberately early index rejection.
+    pub(in crate::engine_data_generation) fn validated_v1_single_table_int4_materialization_lease_for_gpu_wrapper(
+        access: &super::super::resources::BootstrapResourceLeaseAccess,
+    ) -> Result<BootstrapMaterializationLease, DataGenerationError> {
+        let mut source = source();
+        source.replay.current_tables[0].logical_row_count = 2;
+        source.replay.current_tables[0].enrolled_indexes.clear();
+        Arc::make_mut(&mut source.replay.catalog_snapshot)
+            .relational_catalog
+            .get_mut("bootstrap_table")
+            .expect("fixture table")
+            .indexes
+            .clear();
+        source.replay.resources = source
+            .replay
+            .resources
+            .into_vec()
+            .into_iter()
+            .filter(|resource| resource.kind != BootstrapPhysicalResourceKind::IndexPayload)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let table = &mut source.replay.resources[2];
+        table.byte_len = 60;
+        table.layout.row_count = 2;
+        let [stable_row_ids, validity, values, created_by, deleted_by] = &mut *table.layout.roles
+        else {
+            panic!("one-column test table has exactly five physical roles");
+        };
+        stable_row_ids.byte_len = 16;
+        validity.byte_offset = 16;
+        validity.byte_len = 4;
+        values.byte_offset = 20;
+        values.byte_len = 8;
+        created_by.byte_offset = 28;
+        created_by.byte_len = 16;
+        deleted_by.byte_offset = 44;
+        deleted_by.byte_len = 16;
+        source.validate_into_materialization_lease(access)
+    }
+
     #[test]
-    fn bootstrap_source_moves_only_validated_owned_facts_into_an_uninstalled_candidate() {
+    fn bootstrap_source_moves_only_validated_owned_facts_into_a_pre_gpu_source() {
         let candidate = source()
-            .validate_into_uninstalled()
+            .validate_into_source()
             .expect("valid bootstrap source");
         assert_eq!(candidate.replay.cut.covered_through, 2);
         assert_eq!(candidate.replay.resources.len(), 4);
@@ -2760,7 +2851,7 @@ pub(super) mod tests {
         let mut stale_visible = source();
         stale_visible.replay.cut.visible_next = VisibleNext::new(2).expect("visible next");
         assert!(matches!(
-            stale_visible.validate_into_uninstalled(),
+            stale_visible.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap visibility boundary"
             ))
@@ -2769,7 +2860,7 @@ pub(super) mod tests {
         let mut status_cut = source();
         status_cut.replay.terminal_status.covered_through = 1;
         assert!(matches!(
-            status_cut.validate_into_uninstalled(),
+            status_cut.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap status identity"
             ))
@@ -2779,7 +2870,7 @@ pub(super) mod tests {
         foreign_status.replay.terminal_status.database_id =
             DatabaseId::new([0x43; 16]).expect("foreign database ID");
         assert!(matches!(
-            foreign_status.validate_into_uninstalled(),
+            foreign_status.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap status identity"
             ))
@@ -2791,7 +2882,7 @@ pub(super) mod tests {
         let mut catalog_mismatch = source();
         catalog_mismatch.replay.catalog.retained = catalog(99);
         assert!(matches!(
-            catalog_mismatch.validate_into_uninstalled(),
+            catalog_mismatch.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap catalog identity"
             ))
@@ -2800,7 +2891,7 @@ pub(super) mod tests {
         let mut absent_migration = source();
         absent_migration.replay.stable_ids.migration_complete = false;
         assert!(matches!(
-            absent_migration.validate_into_uninstalled(),
+            absent_migration.validate_into_source(),
             Err(DataGenerationError::Missing("stable-ID migration state"))
         ));
 
@@ -2818,7 +2909,7 @@ pub(super) mod tests {
                 },
             );
         assert!(matches!(
-            duplicate_stable_id.validate_into_uninstalled(),
+            duplicate_stable_id.validate_into_source(),
             Err(DataGenerationError::Invalid("duplicate stable table ID"))
         ));
 
@@ -2826,7 +2917,7 @@ pub(super) mod tests {
         high_water.replay.stable_ids.index_high_water = 19;
         high_water.replay.stable_ids.checkpoint_index_high_water = 19;
         assert!(matches!(
-            high_water.validate_into_uninstalled(),
+            high_water.validate_into_source(),
             Err(DataGenerationError::Invalid("index stable-ID high water"))
         ));
 
@@ -2844,7 +2935,7 @@ pub(super) mod tests {
             .stable_ids
             .column_high_water = 8;
         assert!(matches!(
-            coherently_inflated_high_waters.validate_into_uninstalled(),
+            coherently_inflated_high_waters.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "stable-ID checkpoint high waters"
             ))
@@ -2867,7 +2958,7 @@ pub(super) mod tests {
             .stable_ids
             .checkpoint_column_high_water = 8;
         assert!(matches!(
-            noncanonical_columns.validate_into_uninstalled(),
+            noncanonical_columns.validate_into_source(),
             Err(DataGenerationError::NonCanonicalOrder(
                 "stable column migration keys"
             ))
@@ -2877,7 +2968,7 @@ pub(super) mod tests {
         absent_current_table.replay.current_tables[0].table_id =
             StableTableId::new(999).expect("absent current table ID");
         assert!(matches!(
-            absent_current_table.validate_into_uninstalled(),
+            absent_current_table.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap current table mapping"
             ))
@@ -2886,7 +2977,7 @@ pub(super) mod tests {
         let mut empty_current_tables = source();
         empty_current_tables.replay.current_tables.clear();
         assert!(matches!(
-            empty_current_tables.validate_into_uninstalled(),
+            empty_current_tables.validate_into_source(),
             Err(DataGenerationError::Missing("bootstrap current tables"))
         ));
 
@@ -2896,7 +2987,7 @@ pub(super) mod tests {
             .current_tables
             .push(duplicate_current_table.replay.current_tables[0].clone());
         assert!(matches!(
-            duplicate_current_table.validate_into_uninstalled(),
+            duplicate_current_table.validate_into_source(),
             Err(DataGenerationError::NonCanonicalOrder(
                 "bootstrap current tables"
             ))
@@ -2930,7 +3021,7 @@ pub(super) mod tests {
             },
         ];
         assert!(matches!(
-            unordered_indexes.validate_into_uninstalled(),
+            unordered_indexes.validate_into_source(),
             Err(DataGenerationError::NonCanonicalOrder(
                 "bootstrap enrolled stable index IDs"
             ))
@@ -2944,7 +3035,7 @@ pub(super) mod tests {
             .enrolled_columns
             .clear();
         assert!(matches!(
-            missing_column.validate_into_uninstalled(),
+            missing_column.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap catalog column enrollment"
             ))
@@ -2954,7 +3045,7 @@ pub(super) mod tests {
         mismatched_column.replay.current_tables[0].enrolled_columns[0].stable_column_id =
             StableColumnId::new(8).expect("stable column ID");
         assert!(matches!(
-            mismatched_column.validate_into_uninstalled(),
+            mismatched_column.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap current column mapping"
             ))
@@ -2968,7 +3059,7 @@ pub(super) mod tests {
             .columns[0]
             .id = 8;
         assert!(matches!(
-            substituted_catalog_column.validate_into_uninstalled(),
+            substituted_catalog_column.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap catalog column enrollment"
             ))
@@ -2980,7 +3071,7 @@ pub(super) mod tests {
         let mut wrong_snapshot_cut = source();
         wrong_snapshot_cut.replay.catalog_snapshot = catalog_snapshot(1);
         assert!(matches!(
-            wrong_snapshot_cut.validate_into_uninstalled(),
+            wrong_snapshot_cut.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap replayed catalog witness"
             ))
@@ -2994,7 +3085,7 @@ pub(super) mod tests {
             .indexes[0]
             .oid = 201;
         assert!(matches!(
-            substituted_catalog.validate_into_uninstalled(),
+            substituted_catalog.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap catalog index enrollment"
             ))
@@ -3006,14 +3097,14 @@ pub(super) mod tests {
         let mut missing = source();
         missing.replay.terminal_status.entries.pop();
         assert!(matches!(
-            missing.validate_into_uninstalled(),
+            missing.validate_into_source(),
             Err(DataGenerationError::Invalid("bootstrap status coverage"))
         ));
 
         let mut reordered = source();
         reordered.replay.terminal_status.entries.swap(0, 1);
         assert!(matches!(
-            reordered.validate_into_uninstalled(),
+            reordered.validate_into_source(),
             Err(DataGenerationError::NonCanonicalOrder(
                 "bootstrap terminal status sequence"
             ))
@@ -3032,7 +3123,7 @@ pub(super) mod tests {
             .entry
             .transaction_id;
         assert!(matches!(
-            duplicate_transaction.validate_into_uninstalled(),
+            duplicate_transaction.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "duplicate bootstrap status transaction"
             ))
@@ -3044,7 +3135,7 @@ pub(super) mod tests {
             .clone();
         early_envelope_substitution.replay.terminal_status.entries[0].canonical = substituted;
         assert!(matches!(
-            early_envelope_substitution.validate_into_uninstalled(),
+            early_envelope_substitution.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap terminal envelope provenance"
             ))
@@ -3056,7 +3147,7 @@ pub(super) mod tests {
             .entry
             .request_digest = root(9_998);
         assert!(matches!(
-            retry_commitment_substitution.validate_into_uninstalled(),
+            retry_commitment_substitution.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap terminal envelope provenance"
             ))
@@ -3065,7 +3156,7 @@ pub(super) mod tests {
         let mut tail = source();
         tail.replay.terminal_status.last_terminal_envelope = Some(root(9_999));
         assert!(matches!(
-            tail.validate_into_uninstalled(),
+            tail.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap terminal-status tail"
             ))
@@ -3077,7 +3168,7 @@ pub(super) mod tests {
         let mut stale_resource = source();
         stale_resource.replay.resources[2].covered_through = 1;
         assert!(matches!(
-            stale_resource.validate_into_uninstalled(),
+            stale_resource.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap resource provenance"
             ))
@@ -3086,7 +3177,7 @@ pub(super) mod tests {
         let mut duplicate_resource = source();
         duplicate_resource.replay.resources[3].resource_id = 3;
         assert!(matches!(
-            duplicate_resource.validate_into_uninstalled(),
+            duplicate_resource.validate_into_source(),
             Err(DataGenerationError::Invalid("duplicate bootstrap resource"))
         ));
 
@@ -3094,7 +3185,7 @@ pub(super) mod tests {
         duplicate_layout.replay.resources[3].layout.id =
             duplicate_layout.replay.resources[2].layout.id;
         assert!(matches!(
-            duplicate_layout.validate_into_uninstalled(),
+            duplicate_layout.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "duplicate bootstrap physical layout descriptor"
             ))
@@ -3103,7 +3194,7 @@ pub(super) mod tests {
         let mut empty_range = source();
         empty_range.replay.resources[2].byte_len = 0;
         assert!(matches!(
-            empty_range.validate_into_uninstalled(),
+            empty_range.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap resource source range"
             ))
@@ -3112,7 +3203,7 @@ pub(super) mod tests {
         let mut overflowing_range = source();
         overflowing_range.replay.resources[2].byte_offset = u64::MAX;
         assert!(matches!(
-            overflowing_range.validate_into_uninstalled(),
+            overflowing_range.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap resource source range"
             ))
@@ -3123,7 +3214,7 @@ pub(super) mod tests {
             StableTableId::new(999).expect("unknown table ID"),
         );
         assert!(matches!(
-            noncurrent_owner.validate_into_uninstalled(),
+            noncurrent_owner.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap resource current table"
             ))
@@ -3133,7 +3224,7 @@ pub(super) mod tests {
         foreign_database.replay.resources[2].database_id =
             DatabaseId::new([0x43; 16]).expect("foreign database ID");
         assert!(matches!(
-            foreign_database.validate_into_uninstalled(),
+            foreign_database.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap resource provenance"
             ))
@@ -3143,7 +3234,7 @@ pub(super) mod tests {
         foreign_layout_column.replay.resources[2].layout.roles[2].column_id =
             Some(StableColumnId::new(8).expect("foreign stable column ID"));
         assert!(matches!(
-            foreign_layout_column.validate_into_uninstalled(),
+            foreign_layout_column.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap physical layout column enrollment"
             ))
@@ -3152,7 +3243,7 @@ pub(super) mod tests {
         let mut wrong_layout_type = source();
         wrong_layout_type.replay.resources[2].layout.roles[2].sql_type = Some(SqlType::Date);
         assert!(matches!(
-            wrong_layout_type.validate_into_uninstalled(),
+            wrong_layout_type.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap physical layout column type"
             ))
@@ -3161,7 +3252,7 @@ pub(super) mod tests {
         let mut wrong_index_key_ordinal = source();
         wrong_index_key_ordinal.replay.resources[3].layout.roles[0].key_ordinal = Some(1);
         assert!(matches!(
-            wrong_index_key_ordinal.validate_into_uninstalled(),
+            wrong_index_key_ordinal.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap index-key physical layout role"
             ))
@@ -3170,7 +3261,7 @@ pub(super) mod tests {
         let mut wrong_index_key_shape = source();
         wrong_index_key_shape.replay.resources[3].layout.roles[0].key_shape_root = Some(root(99));
         assert!(matches!(
-            wrong_index_key_shape.validate_into_uninstalled(),
+            wrong_index_key_shape.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap index physical layout key shape"
             ))
@@ -3184,7 +3275,7 @@ pub(super) mod tests {
         opaque.roles[0].byte_len = opaque_payload.replay.resources[2].byte_len;
         opaque_payload.replay.resources[2].layout = opaque;
         assert!(matches!(
-            opaque_payload.validate_into_uninstalled(),
+            opaque_payload.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap table physical layout grammar"
             ))
@@ -3199,7 +3290,7 @@ pub(super) mod tests {
         }
         missing_value.replay.resources[2].layout.roles = roles.into_boxed_slice();
         assert!(matches!(
-            missing_value.validate_into_uninstalled(),
+            missing_value.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap table physical layout value validity pairing"
             ))
@@ -3216,7 +3307,7 @@ pub(super) mod tests {
         }
         missing_columns.replay.resources[2].layout.roles = roles.into_boxed_slice();
         assert!(matches!(
-            missing_columns.validate_into_uninstalled(),
+            missing_columns.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap table physical layout column coverage"
             ))
@@ -3228,7 +3319,7 @@ pub(super) mod tests {
         roles.drain(3..);
         missing_mvcc.replay.resources[2].layout.roles = roles.into_boxed_slice();
         assert!(matches!(
-            missing_mvcc.validate_into_uninstalled(),
+            missing_mvcc.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap table physical layout MVCC coverage"
             ))
@@ -3245,7 +3336,7 @@ pub(super) mod tests {
         }
         mismatched_pair.replay.resources[2].layout.roles = roles.into_boxed_slice();
         assert!(matches!(
-            mismatched_pair.validate_into_uninstalled(),
+            mismatched_pair.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap table physical layout value validity pairing"
             ))
@@ -3262,7 +3353,7 @@ pub(super) mod tests {
             value.byte_stride = NonZeroU64::new(byte_stride).expect("test stride");
             value.byte_len = byte_len;
             assert!(matches!(
-                malformed.validate_into_uninstalled(),
+                malformed.validate_into_source(),
                 Err(DataGenerationError::Invalid(
                     "bootstrap physical layout storage geometry"
                 ))
@@ -3274,7 +3365,7 @@ pub(super) mod tests {
         opaque.roles[0].byte_len = opaque_index_payload.replay.resources[3].byte_len;
         opaque_index_payload.replay.resources[3].layout = opaque;
         assert!(matches!(
-            opaque_index_payload.validate_into_uninstalled(),
+            opaque_index_payload.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap index physical layout grammar"
             ))
@@ -3287,7 +3378,7 @@ pub(super) mod tests {
         roles.pop();
         incomplete_index_payload.replay.resources[3].layout.roles = roles.into_boxed_slice();
         assert!(matches!(
-            incomplete_index_payload.validate_into_uninstalled(),
+            incomplete_index_payload.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap index physical layout key coverage"
             ))
@@ -3296,14 +3387,14 @@ pub(super) mod tests {
 
     #[test]
     fn bootstrap_catalog_index_order_is_independent_of_replay_and_physical_layout() {
-        assert!(compound_source().validate_into_uninstalled().is_ok());
+        assert!(compound_source().validate_into_source().is_ok());
 
         let mut missing_descriptor = compound_source();
         missing_descriptor.replay.current_tables[0].enrolled_indexes[0]
             .key_descriptors
             .pop();
         assert!(matches!(
-            missing_descriptor.validate_into_uninstalled(),
+            missing_descriptor.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap index key descriptor coverage"
             ))
@@ -3317,7 +3408,7 @@ pub(super) mod tests {
             .indexes[0]
             .column = "secondary".to_owned();
         assert!(matches!(
-            bad_catalog_first_key.validate_into_uninstalled(),
+            bad_catalog_first_key.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap catalog index first key"
             ))
@@ -3338,7 +3429,7 @@ pub(super) mod tests {
             role.key_ordinal = Some(ordinal);
         }
         assert!(matches!(
-            coherent_reorder.validate_into_uninstalled(),
+            coherent_reorder.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap index key catalog order"
             ))
@@ -3354,7 +3445,7 @@ pub(super) mod tests {
         role.sql_type = Some(SqlType::Date);
         role.key_shape_root = Some(root(8));
         assert!(matches!(
-            coherent_replacement.validate_into_uninstalled(),
+            coherent_replacement.validate_into_source(),
             Err(DataGenerationError::PredecessorMismatch(
                 "bootstrap index key catalog order"
             ))
@@ -3436,7 +3527,7 @@ pub(super) mod tests {
         table.layout.roles[4].byte_offset = 39;
         table.layout.roles[4].byte_len = 16;
         assert!(matches!(
-            multi_row_value.validate_into_uninstalled(),
+            multi_row_value.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "unsupported bootstrap V1 variable-width layout"
             ))
@@ -3452,7 +3543,7 @@ pub(super) mod tests {
         key.byte_stride = NonZeroU64::new(1).expect("text stride");
         key.byte_len = 3;
         assert!(matches!(
-            multi_row_index.validate_into_uninstalled(),
+            multi_row_index.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "unsupported bootstrap V1 variable-width layout"
             ))
@@ -3472,7 +3563,7 @@ pub(super) mod tests {
         value.storage_type = BootstrapPhysicalStorageType::Bytes;
         value.byte_stride = NonZeroU64::new(1).expect("text stride");
         assert!(matches!(
-            zero_row_value.validate_into_uninstalled(),
+            zero_row_value.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "unsupported bootstrap V1 variable-width layout"
             ))
@@ -3484,7 +3575,7 @@ pub(super) mod tests {
         key.storage_type = BootstrapPhysicalStorageType::Bytes;
         key.byte_stride = NonZeroU64::new(1).expect("text stride");
         assert!(matches!(
-            zero_row_index.validate_into_uninstalled(),
+            zero_row_index.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "unsupported bootstrap V1 variable-width layout"
             ))
@@ -3498,7 +3589,7 @@ pub(super) mod tests {
             malformed.replay.resources[2].layout.encoding_version = version;
             malformed.replay.resources[2].layout.roles = Box::new([]);
             assert!(matches!(
-                malformed.validate_into_uninstalled(),
+                malformed.validate_into_source(),
                 Err(DataGenerationError::Invalid(
                     "unsupported bootstrap physical layout encoding version"
                 ))
@@ -3518,7 +3609,7 @@ pub(super) mod tests {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         assert!(matches!(
-            missing_table_payload.validate_into_uninstalled(),
+            missing_table_payload.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap table resource coverage"
             ))
@@ -3534,7 +3625,7 @@ pub(super) mod tests {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         assert!(matches!(
-            missing_index_payload.validate_into_uninstalled(),
+            missing_index_payload.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap index resource coverage"
             ))
@@ -3546,7 +3637,7 @@ pub(super) mod tests {
             index_id: StableIndexId::new(21).expect("un-enrolled index ID"),
         };
         assert!(matches!(
-            un_enrolled_index.validate_into_uninstalled(),
+            un_enrolled_index.validate_into_source(),
             Err(DataGenerationError::Missing(
                 "bootstrap resource index enrollment"
             ))
@@ -3569,7 +3660,7 @@ pub(super) mod tests {
         resources.insert(3, second_shard);
         multi_shard.replay.resources = resources.into_boxed_slice();
         let candidate = multi_shard
-            .validate_into_uninstalled()
+            .validate_into_source()
             .expect("canonically ordered table shards");
         assert_eq!(candidate.replay.resources.len(), 5);
 
@@ -3584,7 +3675,7 @@ pub(super) mod tests {
         resources.insert(3, repeated_shard);
         duplicate_ordinal.replay.resources = resources.into_boxed_slice();
         assert!(matches!(
-            duplicate_ordinal.validate_into_uninstalled(),
+            duplicate_ordinal.validate_into_source(),
             Err(DataGenerationError::NonCanonicalOrder(
                 "bootstrap physical resources"
             ))
@@ -3610,13 +3701,13 @@ pub(super) mod tests {
         resources.insert(3, zero_shard);
         redundant_zero_shard.replay.resources = resources.into_boxed_slice();
         assert!(matches!(
-            redundant_zero_shard.validate_into_uninstalled(),
+            redundant_zero_shard.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap nonempty table payload zero-row shard"
             ))
         ));
 
-        assert!(empty_table_source().validate_into_uninstalled().is_ok());
+        assert!(empty_table_source().validate_into_source().is_ok());
 
         let mut duplicate_empty_resource = empty_table_source();
         let mut duplicate = duplicate_empty_resource.replay.resources[2].clone();
@@ -3630,7 +3721,7 @@ pub(super) mod tests {
         resources.insert(3, duplicate);
         duplicate_empty_resource.replay.resources = resources.into_boxed_slice();
         assert!(matches!(
-            duplicate_empty_resource.validate_into_uninstalled(),
+            duplicate_empty_resource.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap empty table payload multiplicity"
             ))
@@ -3640,7 +3731,7 @@ pub(super) mod tests {
         noncanonical_empty_extent.replay.resources[2].byte_len =
             V1_EMPTY_TABLE_PAYLOAD_SENTINEL_BYTES + 1;
         assert!(matches!(
-            noncanonical_empty_extent.validate_into_uninstalled(),
+            noncanonical_empty_extent.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap empty table typed resource V1 geometry"
             ))
@@ -3650,33 +3741,29 @@ pub(super) mod tests {
         noncanonical_empty_index_extent.replay.resources[3].byte_len =
             V1_EMPTY_TABLE_PAYLOAD_SENTINEL_BYTES + 1;
         assert!(matches!(
-            noncanonical_empty_index_extent.validate_into_uninstalled(),
+            noncanonical_empty_index_extent.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap empty table typed resource V1 geometry"
             ))
         ));
 
-        assert!(empty_table_sidecar_source()
-            .validate_into_uninstalled()
-            .is_ok());
+        assert!(empty_table_sidecar_source().validate_into_source().is_ok());
         let mut noncanonical_table_sidecar = empty_table_sidecar_source();
         noncanonical_table_sidecar.replay.resources[4].byte_len =
             V1_EMPTY_TABLE_PAYLOAD_SENTINEL_BYTES + 1;
         assert!(matches!(
-            noncanonical_table_sidecar.validate_into_uninstalled(),
+            noncanonical_table_sidecar.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap empty table typed resource V1 geometry"
             ))
         ));
 
-        assert!(empty_index_sidecar_source()
-            .validate_into_uninstalled()
-            .is_ok());
+        assert!(empty_index_sidecar_source().validate_into_source().is_ok());
         let mut noncanonical_index_sidecar = empty_index_sidecar_source();
         noncanonical_index_sidecar.replay.resources[4].byte_len =
             V1_EMPTY_TABLE_PAYLOAD_SENTINEL_BYTES + 1;
         assert!(matches!(
-            noncanonical_index_sidecar.validate_into_uninstalled(),
+            noncanonical_index_sidecar.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap empty table typed resource V1 geometry"
             ))
@@ -3688,7 +3775,7 @@ pub(super) mod tests {
         let mut sole_nonzero_ordinal = source();
         sole_nonzero_ordinal.replay.resources[2].ordinal = 7;
         assert!(matches!(
-            sole_nonzero_ordinal.validate_into_uninstalled(),
+            sole_nonzero_ordinal.validate_into_source(),
             Err(DataGenerationError::NonCanonicalOrder(
                 "bootstrap resource group ordinals"
             ))
@@ -3705,7 +3792,7 @@ pub(super) mod tests {
         resources.insert(3, shard);
         ordinal_gap.replay.resources = resources.into_boxed_slice();
         assert!(matches!(
-            ordinal_gap.validate_into_uninstalled(),
+            ordinal_gap.validate_into_source(),
             Err(DataGenerationError::NonCanonicalOrder(
                 "bootstrap resource group ordinals"
             ))
@@ -3722,7 +3809,7 @@ pub(super) mod tests {
         resources.insert(3, shard);
         inconsistent_member_count.replay.resources = resources.into_boxed_slice();
         assert!(matches!(
-            inconsistent_member_count.validate_into_uninstalled(),
+            inconsistent_member_count.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap resource member count"
             ))
@@ -3748,7 +3835,7 @@ pub(super) mod tests {
         resources.insert(3, status_view);
         mismatched_base_multiplicity.replay.resources = resources.into_boxed_slice();
         assert!(matches!(
-            mismatched_base_multiplicity.validate_into_uninstalled(),
+            mismatched_base_multiplicity.validate_into_source(),
             Err(DataGenerationError::Invalid(
                 "bootstrap base resource multiplicity"
             ))
@@ -3794,8 +3881,8 @@ pub(super) mod tests {
             ["pub(super) struct ", "BootstrapStableIdState"].concat(),
             ["pub(super) struct ", "ReplayedTerminalStatusWitness"].concat(),
             ["pub(super) struct ", "BootstrapPhysicalResource"].concat(),
-            ["pub(super) struct ", "UninstalledPublicationGeneration"].concat(),
-            ["pub(super) fn ", "validate_into_uninstalled"].concat(),
+            ["struct ", "Uninstalled", "PublicationGeneration"].concat(),
+            ["pub(super) fn ", "validate_into_source"].concat(),
             ["pub(super) fn ", "into_materialization_lease"].concat(),
             ["fn ", "from_snapshot"].concat(),
             ["fn ", "from_identity"].concat(),

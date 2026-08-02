@@ -13,20 +13,75 @@ task ID here or be explicitly historical.
   `STATUS.md` or the implementation archive.
 - Future agents update one row here rather than creating a new plan, checklist, proposal sequence, or open
   board. Design documents may be linked as evidence but never override this ledger.
-- Every implementation slice follows `CHARTER.md`, includes non-vacuous GPU execution evidence, and runs the
+- Every implementation milestone candidate follows `CHARTER.md`, includes non-vacuous GPU execution evidence, and runs the
   relevant correctness/performance gates in `AGENTS.md`.
 
-## Current focus
+## Current focus — WRITE-001 12-hour end-to-end recovery
 
-Maintain one active priority path; do not start another feature slice while its acceptance is unresolved. The
-BENCH-001 preflight made three existing tasks explicit prerequisite owners. READ-002's canonical compound-key
-milestone and PRODUCT-002's canonical SQL/type milestone passed on 2026-07-19; their broader post-benchmark breadth
-does not delay the architecture evidence gate. PRODUCT-001 completed its independent implementation and full-card
-acceptance on 2026-07-26; `STATUS.md` owns that accepted evidence. PERF-002 then restored and permanently guarded the
-canonical in-L2 point-read throughput on 2026-07-26. INSERT-001 was accepted on 2026-07-27; the active sequence now
-starts at WRITE-001:
+WRITE-001 remains the sole active priority. Its original product scope and final acceptance contract are unchanged;
+the recovery changes delivery order and acceptance cadence, not semantics, durability, GPU-native execution, type or
+transaction breadth, deletion requirements, HAZARD evidence, or performance floors. The 12-hour clock starts when
+implementation resumes from the current working tree. If the original contract is not proven at hour 12, WRITE-001
+remains incomplete; elapsed time may not be hidden by renaming partial work as an accepted checkpoint.
 
-1. **WRITE-001 — general typed INSERT pipeline — NOW.** Converge every INSERT ingress on one move-only
+The former sealed-sub-boundary sequence is stopped. Private helpers, codec phases, proof carriers, source
+extractions, and production-unreachable authorities are WIP inside one integrated WRITE-001 candidate. They receive
+focused tests but no independent acceptance, `STATUS.md` entry, handover advance, architecture review of the “next
+boundary,” or standalone benchmark card. A new prerequisite or format is admissible only when a failing production
+end-to-end assertion proves the current design cannot satisfy the WRITE-001 contract without it.
+
+### Delivery controls
+
+- **One candidate, three lanes, 90-minute integration cadence.** A primary integrator owns the shared candidate.
+  Parallel workers may own only disjoint live-cutover, durability/recovery/publication, and evidence/deletion lanes;
+  each lane must integrate or yield a concrete failing end-to-end assertion every 90 minutes.
+- **Production reachability is the progress measure.** Count a change only when it makes a required ingress reach the
+  canonical typed WAL/GPU apply/publication/reopen path, closes an acceptance-matrix row, or deletes a superseded live
+  branch. Do not count commits, private types, hashes, tests, audits, or lines changed.
+- **Stop-loss.** Ninety minutes without a newly passing production assertion or deleted alternate live branch stops
+  helper expansion. Resume from the shortest failing pgwire-to-reopen route. No agent may design or accept another
+  private boundary during the recovery window.
+- **One seal.** Focused/static tests run continuously. Freeze only after the complete functional matrix and one-path
+  proof pass; then run the three serial/two concurrent HAZARD campaigns, one independent adversarial audit, one
+  applicable canonical full card, and the post-card evidence check. Repairs reopen this milestone candidate rather
+  than creating accepted sub-slices.
+- **No scope substitution.** The narrow nullable-Int4 recovery route is a regression fixture, not completion. Existing
+  v1/v2/private foundations may be reused, simplified, or deleted according to which choice closes the original
+  end-to-end contract fastest without creating a second live authority.
+
+### Twelve-hour critical path
+
+| Elapsed | Integrated outcome and hard gate |
+|---|---|
+| **0:00–0:45** | Reconcile the current WIP tree into one buildable candidate. Capture the deletion/source inventory and one failing production test for each missing end-to-end class. No new design or helper work. |
+| **0:45–2:30** | Make a representative simple and extended, literal and bound, one- and multi-row INSERT execute `TypedInsertBatch -> PreparedDeviceInsertPlan -> canonical WAL/status -> GPU apply -> immutable publication -> pgwire result -> fresh reopen`. At **2:30** this production vertical path must pass or all breadth work stops. |
+| **0:45–4:30, parallel** | Complete the already-designed async completion safety repair and connect the existing generation/replay/publication foundations to the sole live commit coordinator. Live and fresh recovery must produce the same authenticated generation; private authority modules cease being unreachable. |
+| **2:30–6:30** | Broaden the same route—without fallback—to autocommit/explicit overlays, defaults/sequences, reordered/omitted/NULL inputs, all supported types/coercions/domains, CHECK/UNIQUE/index/FK, `RETURNING`, intent-fast, and existing COPY-to-INSERT compatibility. At **6:30** the PostgreSQL differential matrix must be functionally green. |
+| **4:30–7:30, parallel** | Promote the one typed envelope/replay route, prove crash-prefix/retry/reopen equality, and delete INSERT-specific legacy/fixed/direct encoder, reprepare, apply, publication, flag, counter, and qualification branches named by the design contract. At **7:30** source and runtime guards must show exactly one live INSERT authority. |
+| **7:30–9:15** | Run the full focused/serial correctness, PostgreSQL differential, recovery/sabotage, bounded-memory/W1, formatting, check, and strict Clippy gates. Repair only failing acceptance rows; no refactoring or new abstraction. |
+| **9:15–10:15** | Run three serial plus two concurrent HAZARD cohorts with zero CUDA 700/716/717. Freeze the complete candidate and obtain the single independent adversarial audit; repair and re-audit only concrete findings. |
+| **10:15–12:00** | Run the one applicable canonical full report card and post-card evidence audit. Preserve INSERT-001 48M throughput and the PERF-002 260M point-read floor, update STATUS/HANDOVER once, and accept WRITE-001 only if every original requirement is proven. |
+
+### End-to-end acceptance matrix
+
+The integrator maintains this matrix in the WRITE-001 row below; a row closes only with a production call path and
+its named evidence. Private/unit proof alone is insufficient.
+
+| Gate | Required proof before final freeze |
+|---|---|
+| Ingress and transactions | Simple/extended, literal/bound, one/many-row, intent-fast, compatibility, autocommit and explicit-overlay differential through the same typed carrier, including rollback, retry, failed-statement isolation, and result/SQLSTATE parity. |
+| Semantics and GPU operators | NULL/omitted/reordered/default/sequence, supported types/domains/coercions, CHECK/UNIQUE/index/FK and device `RETURNING`, including PostgreSQL failure precedence and statement order. |
+| Durability and publication | One pre-WAL reservation and typed WAL/status/apply/poison/publication route; live-versus-fresh-replay roots equal; crash-prefix, torn/failing-I/O, retry and sabotage pass; no acknowledgement or visibility precedes the canonical durable-and-applied outcome. |
+| Deletion | No live INSERT legacy/fixed/direct constructor, fallback, reprepare, alternate apply/publication, `binary_wal_records_enabled`, or obsolete counters/eligibility path remains. |
+| Final seal | Bounded host/device/WAL/result memory, W1, non-vacuous GPU operator evidence, one-path source/runtime proof, 3+2 HAZARD, independent audit, 48M INSERT throughput and 260M point-read floor. |
+
+### Superseded sub-boundary record
+
+The detailed narrative below is retained temporarily as accepted-history context only. Its “next,” “after,”
+“deferred,” and checkpoint wording does not sequence work and may not authorize another micro-slice; the critical
+path and WRITE-001 work-ledger row are the sole current order.
+
+1. **WRITE-001 — general typed INSERT pipeline — historical sub-boundary record.** Converge every INSERT ingress on one move-only
    `TypedInsertBatch` semantic authority compiled to composable `DeviceInsertPlan` operators. Do **not** generalize
    `FixedInsert`: retain the current i32 append only as a physical plan strategy. Simple/extended, literal/bound,
    autocommit/explicit, single/multi-row, intent-fast, sequence/default, compatibility, and the existing
@@ -57,9 +112,9 @@ starts at WRITE-001:
    including exact bytes/allocation-slot accounting and hostile pre-allocation rejection. These pieces remain
    production-ineligible.
 
-   **Bootstrap TEXT prerequisite — NEXT within WRITE-001; blocks live bootstrap integration and WRITE-001
-   closure.** The ownership-only physical encoding v1 deliberately rejects every `SqlType::Text` table-value or
-   index-key descriptor, including zero-row sources. This fail-closed temporary scope is not supported-type
+   **Bootstrap TEXT prerequisite — later bootstrap-breadth checkpoint within WRITE-001; blocks live bootstrap
+   integration and WRITE-001 closure.** The ownership-only physical encoding v1 deliberately rejects every
+   `SqlType::Text` table-value or index-key descriptor, including zero-row sources. This fail-closed temporary scope is not supported-type
    completion. Before `BootstrapPublicationSource` or its materializer gains any production recovery or publication
    caller, introduce and freeze a new versioned GPU-ready TEXT layout using the canonical `(row_count + 1)` `u64`
    offsets plus byte blob and separate validity. Validate zero start, monotonicity, bounds, exact terminal offset,
@@ -70,10 +125,11 @@ starts at WRITE-001:
 
    The sealed, root-free bootstrap Rebuild compiler/proof schema is accepted, as is its first private executable
    `V1SingleTableInt4` path: one nonempty nullable Int4 table without indexes, over resident/cold/mixed canonical
-   shards, GPU-validating stable IDs/visibility/validity and returning one opaque 135-slot typed-root proof through
-   one pre-reserved asynchronous fence lifecycle. It remains neither full bootstrap completion nor a live path. The
-   next checkpoint broadens only through another sealed grammar: remaining fixed-width types, indexes/status/multiple
-   tables, then the separately accepted comparator and persistent-map import/install boundary. The Text prerequisite
+   shards, GPU-validating stable IDs/visibility/validity and returning one opaque 200-slot typed-root proof through
+   one pre-reserved asynchronous fence lifecycle. It remains neither full bootstrap completion nor a live path. Its
+   next bootstrap-breadth checkpoint broadens only through another sealed grammar: remaining fixed-width types,
+   indexes/status/multiple tables, then the separately accepted comparator and persistent-map import/install boundary.
+   The Text prerequisite
    still blocks every Text/general bootstrap claim. The explicitly scoped nullable-Int4 recovery spine below is the
    sole approved live exception; it must not be described as broad bootstrap completion.
 
@@ -240,6 +296,18 @@ starts at WRITE-001:
    roots, empty-table support, multi-column/type/table grammar, automatic checkpoint rotation, or any extra SELECT
    shape. The installed one-entry immutable map is owned by the existing coordinator; full table/status-map import
    resumes only when the trigger evidence exists.
+
+   **Accepted sealed authority sub-boundary — placement-only resource republication.** The accepted private
+   publication-authority kernel with one distinct move-only replacement candidate derived from its exact pinned
+   predecessor and a newly sealed physical-resource owner. It must derive—not accept from a caller—an identity with
+   byte-identical root format, database ID, `PublicationIdentity`, table-map root, catalog/status witnesses, status
+   count/root, visibility/coverage, and terminal digest; only the checked `publication_epoch = predecessor + 1` and
+   physical resource owner may differ. One exact-predecessor CAS may replace it; terminal and placement candidates
+   make each other stale rather than rebase. It remains private and production-unreachable: no `EngineState`,
+   reader/acquisition export, commit coordinator, WAL/recovery/checkpoint/install hook, `committed_seq`,
+   `GenerationPending`/`ReplayBaseGenerationPin`, bootstrap conversion, comparator, root extraction/hash, or type
+   grammar work. Cover logical/witness/resource/epoch sabotage, terminal-vs-placement and placement-vs-placement
+   stale races, whole-tuple pins, old-resource lifetime, and epoch overflow before independently accepting it.
 
    After this narrow spine is accepted, the next PLAN-owned broad checkpoint is the missing **sole immutable
    publication-generation authority**, a prerequisite
@@ -461,7 +529,7 @@ the final acceptance source.
 |---|---|---:|---|---|---|
 | **READ-002** | BLOCKED | P2 | The BENCH prerequisite milestone passed on 2026-07-19: the typed engine API prepares one exact-generation, O(1) GPU directory for compound `(tenant_id int4, account_id int8)` equality, exact-rechecks collisions and MVCC on-device, gathers the required fixed-width projections, proves nonzero GPU/index/cache hits, and retains zero cold accesses with GPU-scan parity. Broader bigint/text/UUID/numeric and composite point-lookup breadth remains under READ-002 after BENCH-001. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical compound milestone is complete | `docs/design/non-int4-index-design-inputs.md`; 2026-07-19 STATUS evidence |
 | **PRODUCT-002** | BLOCKED | P2 | The BENCH canonical SQL/type milestone passed on 2026-07-19: the immutable schema and W1 statements parse unchanged; typed placeholders and required pgwire codecs are available; every named primary/secondary index publishes and mutates in resident GPU generations; checked expression UPDATE and DML `RETURNING` execute without host relational fallback. After BENCH evidence, complete persistent GPU system catalogs, large NUMERIC, and unrelated protocol/type breadth. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical SQL/type milestone is complete | ARCHITECTURE §3; `docs/design/oltp-benchmark-workload-v1.md`; 2026-07-19 STATUS evidence |
-| **WRITE-001** | NOW | P0 | Replace plural INSERT semantic authorities with one move-only `TypedInsertBatch`, compiled into composable `DeviceInsertPlan` operators under the sole canonical allocator/WalBuffer/status/apply/poison/publication owner. It covers all literal/bound, simple/extended, autocommit/explicit, one/many-row and existing COPY-to-INSERT compatibility forms using typed catalog-order vectors plus validity, correct NULL/omitted/reordered/default/sequence/coercion/domain/constraint/index/FK/`RETURNING` semantics, a one-statement autocommit overlay or the existing explicit private overlay, pre-WAL full reservation, and typed-envelope replay. `FixedInsert` is not generalized; the accepted i32 append remains a physical strategy only. Delete the fixed/legacy duplicate ingress, preflight, operation, fallback/reprepare, apply/WAL/counter/qualification surfaces named in the WRITE-001 contract, while retaining generic UPDATE/DELETE `WriteDelta` until its own owner and allowlisting only historical INSERT decoding through its translator pending a WAL-retention decision. **Urgent prerequisite before any live GenerationPending/replay promotion:** repair the shared SHA-256-completion and runtime-generation-rebuild async completion owners so a reported CUDA error cannot re-enter pooled resources after a later fence; this private replay-only seam neither satisfies nor extends those owners. Acceptance: PostgreSQL differential across types, shapes, constraints, `RETURNING`, and transaction modes; crash-prefix/recovery/sabotage; 3 serial + 2 concurrent HAZARD runs with zero CUDA 700/716/717; W1, bounded-memory, and one-path source/runtime proof; and no regression below INSERT-001's 48M throughput or PERF-002's 260M point-read floor. Use focused gates/quick screen as applicable, freeze, independent audit, then one applicable full card. | INSERT-001 accepted 2026-07-27; preserve ADR-014/015 and PRODUCT-001 sole authority | `docs/design/write-001-general-insert-pipeline.md`; ARCHITECTURE §§6–8; ADR-014/015; INSERT-001/PERF-002 accepted evidence |
+| **WRITE-001** | NOW | P0 | Complete the original general typed INSERT contract through the 12-hour recovery schedule above as one integrated milestone candidate. All required ingress and transaction forms must converge on one move-only `TypedInsertBatch`/`DeviceInsertPlan`, one pre-WAL reservation and canonical typed WAL/status/apply/poison/publication lifecycle, one fresh-context replay path, and one immutable GPU-resident generation. Repair the shared SHA-256/rebuild async-completion owners as part of that live route; connect or delete the existing private foundations instead of accepting more prerequisites. Delete every named live INSERT fixed/legacy/direct fallback, reprepare, encoder, apply/publication, flag, counter, and eligibility branch while retaining only the allowed historical decoder and generic UPDATE/DELETE authority. Acceptance remains the complete PostgreSQL differential, recovery/crash/sabotage, bounded-memory/W1, one-path source/runtime, 3 serial + 2 concurrent HAZARD, independent audit, 48M INSERT throughput, 260M point-read floor, and one canonical full-card seal. No internal phase may be accepted separately. | INSERT-001 accepted 2026-07-27; preserve ADR-014/015 and PRODUCT-001 sole authority | Recovery schedule above; `docs/design/write-001-general-insert-pipeline.md`; `docs/archive/reviews/write-001-delivery-rca-2026-08-02.md` |
 | **CARD-001** | BLOCKED | P0 | After accepted WRITE-001, use INSERT-001's accepted phase records as the before-baseline, then add a machine-readable whole-card phase ledger covering lock/preflight, candidate export and isolated target setup, dependency/native/example/link builds, artifact identity, A/B/C initialization, fixtures, warm-up, measurement, cool-downs, throughput gates, drift/completion checks, cleanup, resource peaks, and total wall time on success, failure, and timeout. Reconcile exclusive phases plus a named residual to total within the greater of 1% or 1s, reuse aggregated `probe-timing` for engine subphases, freeze an instrumentation-only baseline, and remove only measured harness waste. Acceptance preserves every canonical workload and provenance control, completes post-build A+B+C in at most 10 minutes and the fresh-target invocation in at most 20 minutes, fails closed on malformed phase evidence, and passes independent audit plus one canonical full seal; INSERT-001's measured gain cannot be counted again as a CARD-001 improvement. | Accept WRITE-001; INSERT-001 accepted 2026-07-27; use its accepted phase records | AGENTS development gate; `scripts/benchmark_report_card.sh`; PERF-002 accepted harness evidence |
 | **COPY-001** | BLOCKED | P0 | After WRITE-001 and CARD-001, deliver PostgreSQL-compatible, bounded, GPU-native bulk `COPY FROM STDIN` behind the sole PRODUCT-001 admission/WAL/publication authority, reusing the accepted general typed INSERT/device-plan owner rather than creating a second write authority. Parse once; stream text/CSV/binary `CopyData` into typed columnar chunks; preserve PostgreSQL 16 NULL, column/default/sequence, constraint, transaction, cancellation, SQLSTATE, and command-count behavior; generate canonical typed WAL without SQL rendering/reparse; perform device-batch encode/validation/append/sidecar/index work; keep chunks private so autocommit COPY publishes once and explicit COPY publishes only with its enclosing transaction; and prove RPO-0 fresh-context recovery with no host relational authority or O(total rows) staging. Real `psql \copy`, simple/extended clients, autocommit/explicit transactions, failure/retry/reopen parity, bounded-memory accounting, non-vacuous GPU evidence, HAZARD, and independent audit are mandatory. Replace only report-card Layer 2 fixture construction after INSERT-versus-COPY semantic/layout equivalence; preserve INSERT-001 ordinary-INSERT performance, CARD-001 phase evidence and 10/20-minute budgets, and PERF-002's point-read floor. COPY is a product ingestion feature, not the repair for unexplained INSERT or report-card overhead. | Accept WRITE-001 and CARD-001; INSERT-001 accepted 2026-07-27; preserve PRODUCT-001/PERF-002 ownership and floors | `docs/design/write-001-general-insert-pipeline.md`; CHARTER host-control-plane COPY staging; ARCHITECTURE §§1, 6–8; ADR-014/015; accepted INSERT-001/CARD-001 evidence |
 | **BENCH-001** | BLOCKED | P0 | The mutation-boundary repair plus READ-002 and PRODUCT-002 canonical milestones are complete. After COPY-001 passes, use the canonical bulk COPY path for the deterministic 34M-row seed, then build the remaining benchmark-owned pieces: fixed 3.3M+66M arrival generator, `B01`–`B10` driver, versioned result artifact, and reproducible tuned PostgreSQL durability/checkpoint profile. Run the complete same-host comparison in a qualified quiet window and report per-class p50/p99/p99.9/p99.99, committed TPS, logical operations/s, producer slip, queueing, WAL, saturation, and drain. The accepted artifact publishes the exact host, CPU/governor, GPU/driver/runtime, durability, and PostgreSQL configuration. Exclude warm-up, preserve the fixed schedule/mix, never add a benchmark-only write authority, and never substitute the older P8 `order_line` suite. Preserve the accepted pre-DUR result for the DUR-001 overhead comparison. | Complete COPY-001 and its bulk-seed gates; PRODUCT-001 serving, recovery, compatibility, deletion, and source ownership were accepted 2026-07-26; then PostgreSQL profile and qualified quiet window | ADR-008; `docs/design/oltp-benchmark-workload-v1.md`; ARCHITECTURE §§6, 10; 2026-07-19 STATUS preflight |

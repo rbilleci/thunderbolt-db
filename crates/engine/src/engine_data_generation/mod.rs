@@ -2,6 +2,7 @@
 //! spine. The live module below owns no independent WAL/apply/publication authority: the commit
 //! coordinator remains the sole visibility boundary.
 
+mod bootstrap_candidate;
 mod bootstrap_publication;
 mod bootstrap_rebuild;
 mod bootstrap_rebuild_gpu;
@@ -11,6 +12,7 @@ mod input;
 mod live_spine;
 mod manifest;
 mod publication;
+mod publication_authority;
 mod resources;
 mod status;
 
