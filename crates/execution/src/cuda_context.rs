@@ -300,6 +300,27 @@ enum GpuContextOwnership {
 unsafe impl Send for GpuPrimaryContext {}
 unsafe impl Sync for GpuPrimaryContext {}
 
+/// Replay-only ownership of a private-stream fence result.  This deliberately does not alter the
+/// shared owned-stream wrapper used by SHA-256 completion and generation rebuild: replay needs to
+/// distinguish a control-plane test interruption from a CUDA API result that can poison the
+/// stream's context-bound pool resources.
+#[derive(Debug, Clone)]
+pub(super) enum ReplayOwnedStreamFenceFailure {
+    #[cfg(test)]
+    SyntheticFenceNotAttempted,
+    CudaApiReported(CudaRuntimeProbeError),
+}
+
+impl ReplayOwnedStreamFenceFailure {
+    pub(super) fn cuda_error(&self) -> Option<&CudaRuntimeProbeError> {
+        match self {
+            #[cfg(test)]
+            Self::SyntheticFenceNotAttempted => None,
+            Self::CudaApiReported(error) => Some(error),
+        }
+    }
+}
+
 impl GpuPrimaryContext {
     pub(super) fn context(&self) -> *mut c_void {
         self.context
@@ -329,6 +350,44 @@ impl GpuPrimaryContext {
             ));
         }
         check_cuda(unsafe { (self.cu_stream_synchronize)(stream) })
+    }
+
+    /// Replay-only bind after a private-stream submission.  A `cuCtxSetCurrent` result at this
+    /// edge may surface asynchronous work already submitted by replay, so it is never treated as
+    /// a benign retryable fence interruption.
+    pub(super) fn bind_owned_stream_for_replay(&self) -> Result<(), ReplayOwnedStreamFenceFailure> {
+        self.set_current()
+            .map_err(ReplayOwnedStreamFenceFailure::CudaApiReported)?;
+        #[cfg(test)]
+        if let Some(code) = take_replay_post_submit_bind_raw_cuda_result() {
+            return Err(ReplayOwnedStreamFenceFailure::CudaApiReported(
+                CudaRuntimeProbeError::KernelLaunchFailed(code),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replay-only fence provenance.  The synthetic test control exits before every CUDA API;
+    /// injected raw CUDA results model a nonzero `cuStreamSynchronize` result before invoking the
+    /// real fence, so quiescence remains unproved.  No other async owner calls this seam.
+    pub(super) fn synchronize_owned_stream_for_replay(
+        &self,
+        stream: *mut c_void,
+    ) -> Result<(), ReplayOwnedStreamFenceFailure> {
+        #[cfg(test)]
+        if take_replay_synthetic_fence_not_attempted() {
+            return Err(ReplayOwnedStreamFenceFailure::SyntheticFenceNotAttempted);
+        }
+        self.set_current()
+            .map_err(ReplayOwnedStreamFenceFailure::CudaApiReported)?;
+        #[cfg(test)]
+        if let Some(code) = take_replay_raw_stream_sync_result() {
+            return Err(ReplayOwnedStreamFenceFailure::CudaApiReported(
+                CudaRuntimeProbeError::KernelLaunchFailed(code),
+            ));
+        }
+        check_cuda(unsafe { (self.cu_stream_synchronize)(stream) })
+            .map_err(ReplayOwnedStreamFenceFailure::CudaApiReported)
     }
 
     /// Queue a pinned host-to-device copy on an owned private stream.  The replay submission
@@ -379,9 +438,15 @@ impl GpuPrimaryContext {
         check_cuda(result)
     }
 
-    /// Shared post-submit phase boundary for deferred owners. It deliberately has no production
-    /// side effect; the owner still retains every resource until it proves stream quiescence.
-    pub(super) fn after_owned_stream_enqueue(&self) {}
+    /// A narrow unwind probe used by deferred-owner tests.  The submission invokes it only after
+    /// the first HtoD and kernel dispatch have succeeded, so normal Drop must drain before any
+    /// pooled resource can be reused.  Production builds compile this as a no-op.
+    pub(super) fn after_owned_stream_enqueue(&self) {
+        #[cfg(test)]
+        if take_panic_next_owned_stream_after_enqueue() {
+            panic!("injected panic after owned CUDA replay enqueue");
+        }
+    }
 
     /// Return the entry function for `entry_name`, loading + caching its module the first
     /// time. `ptx_with_nul` must be NUL-terminated PTX. The returned handle is reused on
@@ -1168,6 +1233,36 @@ thread_local! {
     static FAIL_NEXT_OWNED_STREAM_LAUNCH_AFTER_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
     static FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    static PANIC_NEXT_OWNED_STREAM_AFTER_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_SYNTHETIC_FENCE_NOT_ATTEMPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPLAY_RAW_STREAM_SYNC_RESULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static REPLAY_POST_SUBMIT_BIND_RAW_CUDA_RESULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Replay-only control-plane interruption before every CUDA fence API.  It is deliberately not a
+/// CUDA result, so only this synthetic path may retry to a normal replay outcome.
+#[cfg(test)]
+pub(super) fn fail_next_replay_synthetic_fence_not_attempted_for_test() {
+    REPLAY_SYNTHETIC_FENCE_NOT_ATTEMPTED.with(|value| value.set(true));
+}
+
+/// Replay-only raw nonzero `cuStreamSynchronize` result injection.  The real fence is not called,
+/// leaving quiescence unknown and requiring replay to quarantine after a later drain proves idle.
+#[cfg(test)]
+pub(super) fn fail_next_replay_raw_stream_sync_result_for_test(code: i32) {
+    REPLAY_RAW_STREAM_SYNC_RESULT.with(|value| value.set(Some(code)));
+}
+
+/// Replay-only post-submit `cuCtxSetCurrent` result injection.  It fires after a real bind call
+/// and models a CUDA API result, never the synthetic pre-fence control path.
+#[cfg(test)]
+pub(super) fn fail_next_replay_post_submit_bind_raw_cuda_result_for_test(code: i32) {
+    REPLAY_POST_SUBMIT_BIND_RAW_CUDA_RESULT.with(|value| value.set(Some(code)));
 }
 
 /// Fault injection for any new owned async submission that uses
@@ -1195,6 +1290,11 @@ pub(super) fn fail_next_owned_stream_dtoh_enqueue_for_test() {
     FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE.with(|value| value.set(true));
 }
 
+#[cfg(test)]
+pub(super) fn panic_next_owned_stream_after_enqueue_for_test() {
+    PANIC_NEXT_OWNED_STREAM_AFTER_ENQUEUE.with(|value| value.set(true));
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn take_fail_next_owned_stream_sync() -> bool {
     FAIL_NEXT_OWNED_STREAM_SYNCS.with(|value| {
@@ -1214,6 +1314,21 @@ fn take_owned_stream_sync_failure_code() -> i32 {
 }
 
 #[cfg(test)]
+fn take_replay_synthetic_fence_not_attempted() -> bool {
+    REPLAY_SYNTHETIC_FENCE_NOT_ATTEMPTED.with(|value| value.replace(false))
+}
+
+#[cfg(test)]
+fn take_replay_raw_stream_sync_result() -> Option<i32> {
+    REPLAY_RAW_STREAM_SYNC_RESULT.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+fn take_replay_post_submit_bind_raw_cuda_result() -> Option<i32> {
+    REPLAY_POST_SUBMIT_BIND_RAW_CUDA_RESULT.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
 fn take_fail_next_owned_stream_launch_after_dispatch() -> bool {
     FAIL_NEXT_OWNED_STREAM_LAUNCH_AFTER_DISPATCH.with(|value| value.replace(false))
 }
@@ -1221,6 +1336,11 @@ fn take_fail_next_owned_stream_launch_after_dispatch() -> bool {
 #[cfg(test)]
 fn take_fail_next_owned_stream_dtoh_enqueue() -> bool {
     FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE.with(|value| value.replace(false))
+}
+
+#[cfg(test)]
+fn take_panic_next_owned_stream_after_enqueue() -> bool {
+    PANIC_NEXT_OWNED_STREAM_AFTER_ENQUEUE.with(|value| value.replace(false))
 }
 
 pub(super) struct CudaContextGuard {

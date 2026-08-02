@@ -3,18 +3,19 @@
 //! The cfg(test) adapter supplies an authenticated immutable index, opaque pin, and explicit
 //! selected witnesses to the production validator. No test relies on an inferred active epoch.
 
+use super::super::{
+    ValidatedAllocatorAssignment, ValidatedAllocatorReplayRowBinding,
+    ValidatedAllocatorReplayRowBindings,
+};
 use super::{
     immutable_index_root, proof_from_immutable_checked_records_for_test,
-    validate_allocator_closure, validate_durable_allocator_index_identity,
-    SemanticsV2DurableAllocatorLeaseRecord, SemanticsV2ImmutableDurableAllocatorIndex,
-    SemanticsV2PinnedAllocatorIndexGeneration, SemanticsV2SelectedAllocatorLeaseWitness,
+    validate_durable_allocator_index_identity, AllocatorAssignmentSeal,
+    SemanticsV2DurableAllocatorAssignmentRecord, SemanticsV2DurableAllocatorLeaseRecord,
+    SemanticsV2ImmutableDurableAllocatorIndex, SemanticsV2PinnedAllocatorIndexGeneration,
+    SemanticsV2SelectedAllocatorAssignmentWitness, SemanticsV2SelectedAllocatorLeaseWitness,
 };
-use crate::typed_insert_aggregate::semantics_v2::{
-    pass_zero::SemanticsV2S7HeaderIdentity,
-    retained::{
-        graph::{ReservedSemanticsV2Graph, RetainedTable},
-        SemanticsV2BoundIdentity,
-    },
+use crate::typed_insert_aggregate::semantics_v2::retained::{
+    graph::RetainedTable, SemanticsV2BoundIdentity,
 };
 
 const DATABASE: [u8; 16] = [1; 16];
@@ -60,7 +61,7 @@ fn record(
         lease_end: end,
         prior_high_water: start,
         new_high_water: end,
-        marker_system_transaction_id: 9,
+        marker_system_transaction_id: marker_commit_sequence,
         marker_commit_sequence,
     }
 }
@@ -84,8 +85,72 @@ fn selected(
     }
 }
 
+fn selected_assignment(
+    assignment_ordinal: u32,
+    stable_table_id: u64,
+    statement_ordinal: u32,
+    source_row_ordinal: u32,
+    stable_row_id: u64,
+) -> SemanticsV2SelectedAllocatorAssignmentWitness {
+    SemanticsV2SelectedAllocatorAssignmentWitness {
+        assignment_ordinal,
+        database_id: DATABASE,
+        cluster_id: CLUSTER,
+        timeline_id: TIMELINE,
+        format_epoch: FORMAT_EPOCH,
+        leader_epoch: LEADER_EPOCH,
+        parent_stable_transaction_id: USER_TRANSACTION,
+        parent_request_digest: [11; 32],
+        parent_commit_sequence: USER_COMMIT,
+        parent_autocommit: true,
+        parent_statement_ordinal: statement_ordinal,
+        parent_statement_request_digest: [12; 32],
+        parent_typed_statement_digest: [13; 32],
+        lease_record_ordinal: assignment_ordinal,
+        allocator_kind: 1,
+        stable_allocator_id: stable_table_id,
+        lease_epoch: 12,
+        lease_start: stable_row_id,
+        lease_end: stable_row_id + 1,
+        mapping_version: 1,
+        source_order: u64::from(source_row_ordinal),
+        source_row_ordinal,
+        assignment_start: stable_row_id,
+        assignment_end: stable_row_id + 1,
+        marker_system_transaction_id: 49,
+        marker_commit_sequence: 49,
+    }
+}
+
+fn assert_replay_binding(
+    binding: ValidatedAllocatorReplayRowBinding,
+    stable_table_id: u64,
+    statement_ordinal: u32,
+    source_row_ordinal: u32,
+    stable_row_id: u64,
+) {
+    assert_eq!(binding.stable_table_id(), stable_table_id);
+    assert_eq!(binding.statement_ordinal(), statement_ordinal);
+    assert_eq!(binding.source_row_ordinal(), source_row_ordinal);
+    assert_eq!(binding.stable_row_id(), stable_row_id);
+}
+
+fn replay_binding_count(rows: ValidatedAllocatorReplayRowBindings<'_>) -> usize {
+    rows.len()
+}
+
 fn snapshot<'a>(
     records: &'a [SemanticsV2DurableAllocatorLeaseRecord],
+    complete_next: u64,
+    durable_next: u64,
+    published_next: u64,
+) -> SemanticsV2ImmutableDurableAllocatorIndex<'a> {
+    snapshot_with_assignments(records, &[], complete_next, durable_next, published_next)
+}
+
+fn snapshot_with_assignments<'a>(
+    records: &'a [SemanticsV2DurableAllocatorLeaseRecord],
+    assignments: &'a [SemanticsV2DurableAllocatorAssignmentRecord],
     complete_next: u64,
     durable_next: u64,
     published_next: u64,
@@ -98,9 +163,44 @@ fn snapshot<'a>(
         durable_next_commit_sequence: durable_next,
         published_next_commit_sequence: published_next,
         records,
+        assignments,
     };
     snapshot.index_root = immutable_index_root(&snapshot);
     snapshot
+}
+
+fn immutable_assignment(
+    lease_record_ordinal: u32,
+    lease: SemanticsV2DurableAllocatorLeaseRecord,
+    stable_row_id: u64,
+) -> SemanticsV2DurableAllocatorAssignmentRecord {
+    SemanticsV2DurableAllocatorAssignmentRecord {
+        database_id: DATABASE,
+        cluster_id: CLUSTER,
+        timeline_id: TIMELINE,
+        format_epoch: FORMAT_EPOCH,
+        leader_epoch: LEADER_EPOCH,
+        parent_stable_transaction_id: USER_TRANSACTION,
+        parent_request_digest: [11; 32],
+        parent_commit_sequence: USER_COMMIT,
+        parent_autocommit: true,
+        parent_statement_ordinal: 0,
+        parent_statement_request_digest: [12; 32],
+        parent_typed_statement_digest: [13; 32],
+        lease_record_ordinal,
+        allocator_kind: lease.allocator_kind,
+        stable_allocator_id: lease.stable_allocator_id,
+        lease_epoch: lease.lease_epoch,
+        lease_start: lease.lease_start,
+        lease_end: lease.lease_end,
+        mapping_version: 1,
+        source_order: 0,
+        source_row_ordinal: 0,
+        assignment_start: stable_row_id,
+        assignment_end: stable_row_id + 1,
+        marker_system_transaction_id: lease.marker_system_transaction_id,
+        marker_commit_sequence: lease.marker_commit_sequence,
+    }
 }
 
 fn pin(
@@ -126,7 +226,7 @@ fn validates_identity(
 ) -> bool {
     validate_durable_allocator_index_identity(
         identity(),
-        &proof_from_immutable_checked_records_for_test(snapshot, pin, selected),
+        &proof_from_immutable_checked_records_for_test(snapshot, pin, selected, &[]),
     )
     .is_ok()
 }
@@ -168,56 +268,25 @@ fn table(table_ref: u32, stable_table_id: u64, before: u64, high_water: u64) -> 
     }
 }
 
-fn graph(tables: Vec<RetainedTable>) -> ReservedSemanticsV2Graph {
-    ReservedSemanticsV2Graph {
-        header: SemanticsV2S7HeaderIdentity {
-            total_bytes: 1,
-            root_descriptor_version: 1,
-            catalog_before_epoch: CATALOG_EPOCH,
-            catalog_after_epoch: CATALOG_EPOCH,
-            catalog_before_digest: [4; 32],
-            catalog_after_digest: [4; 32],
-            initial_database_root: [5; 32],
-            final_database_root: [6; 32],
-            initial_overlay_root: [7; 32],
-            final_overlay_root: [8; 32],
-            root_descriptor: [9; 32],
-            payload_digest: [10; 32],
-        },
-        statements: Vec::new(),
-        records: Vec::new(),
-        dispositions: Vec::new(),
-        sequence_effects: Vec::new(),
-        outcomes: Vec::new(),
-        tables,
-        table_dispositions: Vec::new(),
-        resolutions: Vec::new(),
-        dependencies: Vec::new(),
-        dependency_uses: Vec::new(),
-        indexes: Vec::new(),
-        index_key_columns: Vec::new(),
-        transitions: Vec::new(),
-        key_effects: Vec::new(),
-        key_components: Vec::new(),
-        projections: Vec::new(),
-        images: Vec::new(),
-        response:
-            crate::typed_insert_aggregate::semantics_v2::retained::graph::empty_response_for_test(),
-    }
-}
-
 fn closes(
     snapshot: &SemanticsV2ImmutableDurableAllocatorIndex<'_>,
     pin: &SemanticsV2PinnedAllocatorIndexGeneration,
     selected: &[SemanticsV2SelectedAllocatorLeaseWitness],
     tables: Vec<RetainedTable>,
 ) -> bool {
-    validate_allocator_closure(
-        identity(),
-        &graph(tables),
-        &proof_from_immutable_checked_records_for_test(snapshot, pin, selected),
-    )
-    .is_ok()
+    let proof = proof_from_immutable_checked_records_for_test(snapshot, pin, selected, &[]);
+    validate_durable_allocator_index_identity(identity(), &proof).is_ok()
+        && selected.len() == tables.len()
+        && tables
+            .iter()
+            .zip(selected)
+            .enumerate()
+            .all(|(ordinal, (table, lease))| {
+                table.table_ref == ordinal as u32
+                    && table.stable_table_id == lease.stable_allocator_id
+                    && lease.lease_start <= table.row_allocator_before
+                    && table.row_allocator_high_water <= lease.lease_end
+            })
 }
 
 #[test]
@@ -330,6 +399,31 @@ fn durable_index_proof_rejects_selected_incomplete_nondurable_or_unpublished_mar
 }
 
 #[test]
+fn durable_index_proof_rejects_frontier_before_parent_with_unselected_same_parent_assignment() {
+    let records = [record(101, 12, 10, 20, 1), record(102, 12, 30, 40, 49)];
+    let assignments = [immutable_assignment(1, records[1], 30)];
+    // Marker one is a valid selected predecessor, while marker 49 is a later durable assignment
+    // for this same parent. A next frontier of two would let a partial root omit that row unless
+    // complete/durable/published frontiers are all bound beyond the parent commit (50).
+    let snapshot = snapshot_with_assignments(&records, &assignments, 2, 2, 2);
+    let pin = pin(&snapshot, 49);
+    let error = validate_durable_allocator_index_identity(
+        identity(),
+        &proof_from_immutable_checked_records_for_test(
+            &snapshot,
+            &pin,
+            &[selected(0, records[0])],
+            &[],
+        ),
+    )
+    .expect_err("a complete allocator root must cover the parent commit");
+    assert!(
+        error.to_string().contains("lineage/frontier"),
+        "the incomplete frontier must reject before an omitted same-parent assignment can pose: {error}"
+    );
+}
+
+#[test]
 fn durable_index_proof_rejects_selected_wrong_lineage_post_user_or_unretained_marker() {
     let records = [record(101, 12, 10, 20, 49)];
     let selected_snapshot = snapshot(&records, 80, 80, 80);
@@ -398,6 +492,18 @@ fn durable_index_proof_rejects_global_same_allocator_epoch_overlap() {
 }
 
 #[test]
+fn durable_index_proof_rejects_system_transaction_reused_at_a_second_commit() {
+    let mut records = [record(101, 12, 10, 20, 49), record(102, 12, 30, 40, 70)];
+    records[1].marker_system_transaction_id = records[0].marker_system_transaction_id;
+    let snapshot = snapshot(&records, 80, 80, 80);
+    let pin = pin(&snapshot, 70);
+    assert!(
+        !validates_identity(&snapshot, &pin, &[]),
+        "one stable system transaction must not authenticate allocator records at two commits"
+    );
+}
+
+#[test]
 fn durable_index_proof_rejects_malformed_complete_record_without_self_described_lifecycle_bits() {
     let mut malformed = record(101, 12, 10, 20, 49);
     malformed.new_high_water = 19;
@@ -409,4 +515,161 @@ fn durable_index_proof_rejects_malformed_complete_record_without_self_described_
         &pin,
         &[selected(0, records[0])],
     ));
+}
+
+#[test]
+fn replay_row_bindings_project_prevalidated_rows_in_canonical_table_statement_source_order() {
+    // These slots model canonical S1/S2 source rows whose later retained dispositions are
+    // canceled and suppressed.  The capability intentionally does not inspect those later
+    // relations: each input source row remains assigned before generation.
+    let selected = [
+        selected_assignment(0, 101, 0, 0, 11),
+        selected_assignment(1, 101, 0, 1, 12),
+        selected_assignment(2, 102, 1, 0, 30),
+    ];
+    let assignment = ValidatedAllocatorAssignment {
+        selected: &selected,
+        seal: AllocatorAssignmentSeal,
+    };
+
+    let mut rows = assignment.replay_row_bindings();
+    assert_eq!(
+        replay_binding_count(assignment.replay_row_bindings()),
+        3,
+        "the re-exported iterator remains usable by a sibling retained compiler module"
+    );
+    assert_eq!(
+        rows.len(),
+        3,
+        "the exact-size iterator retains all source rows"
+    );
+    assert_eq!(rows.size_hint(), (3, Some(3)));
+
+    let first = rows.next().expect("first canonical binding");
+    assert_replay_binding(first, 101, 0, 0, 11);
+
+    let second = rows.next().expect("canceled source-row binding");
+    assert_replay_binding(second, 101, 0, 1, 12);
+
+    let third = rows.next().expect("suppressed source-row binding");
+    assert_replay_binding(third, 102, 1, 0, 30);
+    assert_eq!(rows.len(), 0);
+    assert!(rows.next().is_none());
+}
+
+#[test]
+fn production_replay_row_binding_iteration_stays_narrow_and_allocation_free() {
+    let source = include_str!("allocator.rs");
+    let binding_fields = source
+        .split("struct ValidatedAllocatorReplayRowBinding")
+        .nth(1)
+        .and_then(|tail| tail.split("struct AllocatorReplayRowBindingSeal").next())
+        .expect("allocator source has a sealed replay-row binding");
+    for required in [
+        "stable_table_id: u64",
+        "statement_ordinal: u32",
+        "source_row_ordinal: u32",
+        "stable_row_id: u64",
+    ] {
+        assert!(
+            binding_fields.contains(required),
+            "replay-row binding must retain scalar compiler input {required}"
+        );
+    }
+    for forbidden in [
+        "lease_",
+        "marker_",
+        "root",
+        "assignment_",
+        "selected",
+        "range",
+    ] {
+        assert!(
+            !binding_fields.contains(forbidden),
+            "replay-row binding must not expose allocator authority through {forbidden}"
+        );
+    }
+    let projection = source
+        .split("impl Iterator for ValidatedAllocatorReplayRowBindings")
+        .nth(1)
+        .and_then(|tail| tail.split("/// Test-only adapter").next())
+        .expect("allocator source has a replay-row iterator boundary");
+    for required in [
+        "ExactSizeIterator for ValidatedAllocatorReplayRowBindings",
+        "stable_table_id: assignment.stable_allocator_id",
+        "statement_ordinal: assignment.parent_statement_ordinal",
+        "source_row_ordinal: assignment.source_row_ordinal",
+        "stable_row_id: assignment.assignment_start",
+    ] {
+        assert!(
+            projection.contains(required),
+            "production replay-row iterator must retain {required}"
+        );
+    }
+    for forbidden in [
+        "HashMap",
+        "Vec<",
+        "Box<",
+        ".collect()",
+        ".clone()",
+        "assignment_end",
+        "lease_",
+        "marker_",
+        "index_root",
+        "graph.",
+        "S4",
+        "S7",
+        "disposition",
+        "resolution",
+        "row_allocator",
+    ] {
+        assert!(
+            !projection.contains(forbidden),
+            "production replay-row iterator must not infer compiler inputs through {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn production_allocator_assignment_closure_stays_root_bound_and_allocation_free() {
+    let source = include_str!("allocator.rs");
+    let production = source
+        .split("fn validate_exact_assignment_closure")
+        .nth(1)
+        .and_then(|tail| tail.split("pub(super) fn validate_table_order").next())
+        .expect("allocator source has an assignment-validation boundary");
+    for required in [
+        "SemanticsV2DurableAllocatorAssignmentRecord",
+        "SemanticsV2SelectedAllocatorAssignmentWitness",
+        "ValidatedAllocatorAssignment",
+        "validate_exact_assignment_closure",
+        "immutable_index_root",
+    ] {
+        assert!(
+            source.contains(required),
+            "production durable allocator proof must retain {required}"
+        );
+    }
+    for forbidden in ["HashMap", "Vec<", "Box<", ".collect()", ".clone()"] {
+        assert!(
+            !production.contains(forbidden),
+            "production durable allocator assignment validation must not allocate through {forbidden}"
+        );
+    }
+    for forbidden in [
+        "graph.dispositions",
+        "graph.resolutions",
+        "graph.tables",
+        "row_allocator",
+        "S4",
+        "S6",
+        "S7",
+        "outcome",
+        "RetentionAuthority",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "production assignment validation must not select compiler inputs through {forbidden}"
+        );
+    }
 }

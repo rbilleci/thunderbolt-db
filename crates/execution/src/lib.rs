@@ -19,8 +19,8 @@ pub use runtime_contract::{
 
 mod cuda_context;
 use cuda_context::{
-    check_cuda, GpuPrimaryContext, PinnedHostLease, PooledBufferLease, PooledDeviceBufferOwned,
-    PooledStream, PooledStreamOwned, POOLED_STREAM_SCRATCH_BYTES,
+    check_cuda, GpuPrimaryContext, PinnedHostBufferOwned, PinnedHostLease, PooledBufferLease,
+    PooledDeviceBufferOwned, PooledStream, PooledStreamOwned, POOLED_STREAM_SCRATCH_BYTES,
 };
 #[cfg(test)]
 use cuda_context::{
@@ -250,9 +250,12 @@ pub use write_locate::{
 };
 mod write_apply;
 pub use write_apply::{
-    i32_fused_apply_footprint_for_shape, CudaCompoundFoldColumn, CudaWriteDestination,
-    CudaWriteIndex, FusedApplyPreparation, FusedApplyPreparationFootprint, FusedApplyRequest,
-    PreparedI32FusedApply, PreparedI32FusedApplyHostRetention, PreparedI32FusedHeader,
+    i32_fused_apply_footprint_for_shape, CudaCompoundFoldColumn, CudaI32InsertReplayPreparation,
+    CudaI32InsertReplayResourceGeometry, CudaI32InsertReplayResult, CudaInsertReplayCompletion,
+    CudaInsertReplayPrepareError, CudaInsertReplaySubmission, CudaInsertReplayUnknownQuiescence,
+    CudaWriteDestination, CudaWriteIndex, FusedApplyPreparation, FusedApplyPreparationFootprint,
+    FusedApplyRequest, PreparedI32FusedApply, PreparedI32FusedApplyHostRetention,
+    PreparedI32FusedHeader,
 };
 #[cfg(any(test, feature = "probe-timing"))]
 pub use write_apply::{prepared_i32_fused_apply_counters, PreparedI32FusedApplyCounters};

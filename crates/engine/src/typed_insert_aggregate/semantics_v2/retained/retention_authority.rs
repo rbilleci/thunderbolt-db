@@ -405,6 +405,102 @@ fn authority_error(message: &str) -> EngineError {
     ))
 }
 
+/// Test-only adapter for the checked-in historical empty-S8 vectors.  It owns the only
+/// allowlisted historical-no-retention proof long enough to drive the real catalog/allocator
+/// successor, while keeping both the proof and resulting typestate from escaping the callback.
+#[cfg(test)]
+pub(super) fn with_historical_no_retention_pending_for_test<T>(
+    pending: super::AggregateReplayTxn<super::RetentionAuthorityPending>,
+    operation: impl FnOnce(super::AggregateReplayTxn<super::CatalogAllocatorPending<'_>>) -> T,
+) -> T {
+    let identity = pending.graph.identity;
+    assert!(
+        matches!(
+            &pending.graph.graph.response,
+            super::graph::RetainedResponseEnvelope::Empty(_)
+        ),
+        "historical no-retention test adapter accepts only canonical empty S8"
+    );
+    let statement_digests: Vec<_> = pending
+        .graph
+        .graph
+        .statements
+        .iter()
+        .map(|statement| statement.typed_statement_digest)
+        .collect();
+    let catalog_pending = pending
+        .validate_retention_authority(RetentionAuthorityInput(
+            RetentionAuthoritySource::HistoricalNoRetention(HistoricalNoRetentionProof {
+                database_id: identity.database_id,
+                timeline_id: identity.timeline_id,
+                stable_transaction_id: identity.stable_transaction_id,
+                request_digest: identity.request_digest,
+                statement_digests: &statement_digests,
+                recovery_prefix: identity.commit_sequence,
+                source_is_allowlisted: true,
+                no_retention_is_proven: true,
+            }),
+        ))
+        .expect("canonical empty-S8 fixture has a sealed historical no-retention proof");
+    operation(catalog_pending)
+}
+
+/// Test-only live-claim adapter for checked-in vectors.  Like the production boundary it borrows
+/// one authenticated index and carries the resulting opaque authority through the callback; the
+/// local claim/index/bitset backing cannot escape it.
+#[cfg(test)]
+pub(super) fn with_live_claim_pending_for_test<T>(
+    pending: super::AggregateReplayTxn<super::RetentionAuthorityPending>,
+    operation: impl FnOnce(super::AggregateReplayTxn<super::CatalogAllocatorPending<'_>>) -> T,
+) -> T {
+    let identity = pending.graph.identity;
+    let statement_digests: Vec<_> = pending
+        .graph
+        .graph
+        .statements
+        .iter()
+        .map(|statement| statement.typed_statement_digest)
+        .collect();
+    let eligible_statement_bits = vec![0; statement_digests.len().div_ceil(8)];
+    let claim = AuthenticatedTransactionClaimStatus {
+        database_id: identity.database_id,
+        timeline_id: identity.timeline_id,
+        stable_transaction_id: identity.stable_transaction_id,
+        request_digest: identity.request_digest,
+        statement_digests: &statement_digests,
+        intent: RetentionIntent {
+            eligible_statement_bits: &eligible_statement_bits,
+            candidate_deadline: 0,
+        },
+        head: ClaimHead::Pending,
+        completion: ClaimCompletion::Complete(CompleteClaimDurability {
+            claim_sequence: 1,
+            recovery_prefix: identity.commit_sequence,
+            location: AuthenticatedClaimLocation::CheckpointStatus {
+                checkpoint_sequence: 1,
+            },
+            allocator_child_sequence: Some(2),
+            sequence_child_sequence: None,
+            parent_effect_sequence: Some(identity.commit_sequence),
+        }),
+    };
+    let claims = [claim];
+    let index = AuthenticatedClaimStatusIndex {
+        lineage: ClaimStatusIndexLineage {
+            database_id: identity.database_id,
+            timeline_id: identity.timeline_id,
+            recovery_prefix: identity.commit_sequence,
+        },
+        claims: &claims,
+    };
+    let catalog_pending = pending
+        .validate_retention_authority(RetentionAuthorityInput(RetentionAuthoritySource::Claim(
+            &index,
+        )))
+        .expect("checked-in fixture has an exact authenticated live retention claim");
+    operation(catalog_pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -864,9 +960,9 @@ mod tests {
                 root_descriptor_version: 1,
                 catalog_before_epoch: 1,
                 catalog_after_epoch: 1,
-                catalog_before_digest: [1; 32],
-                catalog_after_digest: [1; 32],
-                initial_database_root: [1; 32],
+                catalog_before_digest: [6; 32],
+                catalog_after_digest: [6; 32],
+                initial_database_root: [7; 32],
                 final_database_root: [1; 32],
                 initial_overlay_root: [1; 32],
                 final_overlay_root: [1; 32],

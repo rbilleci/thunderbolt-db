@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::insert_semantic_ir::InsertStatementOrdinal;
+use crate::typed_insert_aggregate::semantics_v2::retained::SequenceOutcomeSpecForTest;
 use crate::typed_insert_aggregate::{
     AGGREGATE_FLAG_EXPLICIT, AGGREGATE_FLAG_PUBLISHED_SEQUENCE, AGGREGATE_FLAG_RETURNING,
     OUTER_CONTENT_PUBLISHED_SEQUENCE, OUTER_CONTENT_RETURNING,
@@ -2178,6 +2179,58 @@ pub(super) fn explicit_abort_fixture() -> Q1Fixture {
     explicit_abort_fixture_from_records_for_test(first_bytes, final_bytes)
 }
 
+/// Independently materialize the exact durable child record expected by the checked-in explicit
+/// abort vector. This deliberately starts from the ordinary typed source rather than a retained
+/// S5 owner, so durable-index tests cannot make their expected transition from the graph under
+/// validation.
+pub(super) fn explicit_abort_sequence_outcome_for_test() -> SequenceOutcomeSpecForTest<'static> {
+    let engine = crate::Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE q1_abort (id serial, required int4)")
+        .expect("Q1 abort table creates");
+    let record = decode_record(&typed_record(
+        &engine,
+        "INSERT INTO q1_abort (required) VALUES (NULL)",
+        1,
+        Q1_TXN,
+        true,
+    ));
+    let parent = record
+        .sequence_parent()
+        .expect("published Q1 source has a sequence parent");
+    let effect = record
+        .sequence_effects()
+        .next()
+        .expect("published Q1 source has one sequence effect");
+    let binding = record
+        .sequence_bindings()
+        .next()
+        .expect("published Q1 source has one sequence binding");
+    let DecodedSequenceEffectKindFacts::Published {
+        transition_txn_id,
+        input_digest,
+        returned_value,
+    } = effect.kind
+    else {
+        panic!("Q1 explicit abort sequence is published")
+    };
+    assert_eq!(binding.source_name, "q1_abort_id_seq");
+    SequenceOutcomeSpecForTest {
+        transition_txn_id,
+        applied_commit_sequence: 3,
+        sequence_oid: effect.request.sequence_oid,
+        parent_txn_id: parent.txn_id,
+        parent_autocommit: parent.autocommit,
+        parent_request_digest: parent.request_digest,
+        statement_ordinal: parent.statement_ordinal.as_u32(),
+        expression_ordinal: effect.request.absolute_expression_ordinal,
+        returned_value,
+        input_digest,
+        source_name: "q1_abort_id_seq",
+        operation: crate::BinarySequenceValueOperation::Default,
+    }
+}
+
 pub(super) fn explicit_abort_fixture_from_records_for_test(
     first_bytes: Vec<u8>,
     final_bytes: Vec<u8>,
@@ -3630,8 +3683,8 @@ fn q1_codec_closure_has_only_the_cfg_test_bridge_and_v1_writer() {
     assert!(!facade.contains("pub fn codec_closed_canonical_semantics_v2"));
     assert_eq!(
         retained.matches("close_codec(").count(),
-        2,
-        "one definition and its cfg(test) bridge call"
+        4,
+        "one definition, its cfg(test) bridge call, and sealed live/historical catalog handoffs"
     );
     assert!(retained.contains("#[cfg(test)]\n    pub(super) fn close_codec_for_test"));
     let encoder = codec

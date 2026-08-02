@@ -32,6 +32,10 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
   [`design/write-001-general-insert-pipeline.md`](design/write-001-general-insert-pipeline.md): all INSERT inputs
   converge on move-only `TypedInsertBatch` and composable `DeviceInsertPlan`, with the accepted i32 append retained
   only as a physical strategy beneath the one canonical allocator/WAL/status/apply/poison/publication path.
+- **Before any live `GenerationPending` or replay promotion, complete the urgent shared async-completion
+  prerequisite in PLAN:** SHA-256 completion and runtime-generation rebuild must quarantine a post-submission CUDA
+  failure even if a later fence proves idle. The current typed-Int4 replay seam is private execution-only evidence;
+  it is not a shared-owner repair, recovery authority, or promotion authorization.
 - WRITE-001's sealed typed bootstrap-resource attachment is accepted as a private, production-unreachable source
   boundary. Its root-free compiler/proof schema and the private `V1SingleTableInt4` asynchronous GPU Rebuild proof
   are accepted. The deliberately narrower live exception is now accepted: one explicit durable sealed

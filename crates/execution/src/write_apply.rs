@@ -2,6 +2,7 @@ use crate::{check_cuda, CudaResidentDeviceMemory, CudaResidentReadSource, CudaRu
 use std::{ffi::c_void, sync::Arc};
 
 mod prepared_fused;
+mod replay_submission;
 #[cfg(test)]
 pub(crate) use prepared_fused::{
     fail_next_prepared_i32_fused_apply_after_launch,
@@ -14,6 +15,16 @@ pub use prepared_fused::{
 };
 #[cfg(any(test, feature = "probe-timing"))]
 pub use prepared_fused::{prepared_i32_fused_apply_counters, PreparedI32FusedApplyCounters};
+#[cfg(test)]
+pub(crate) use replay_submission::{
+    drain_parked_replay_resources_for_test, parked_replay_resource_count_for_test,
+    quarantined_replay_resource_count_for_test, replay_successful_enqueue_count_for_test,
+};
+pub use replay_submission::{
+    CudaI32InsertReplayPreparation, CudaI32InsertReplayResourceGeometry, CudaI32InsertReplayResult,
+    CudaInsertReplayCompletion, CudaInsertReplayPrepareError, CudaInsertReplaySubmission,
+    CudaInsertReplayUnknownQuiescence,
+};
 
 #[derive(Debug, Clone)]
 pub struct CudaWriteDestination {
@@ -96,6 +107,171 @@ fn checked_span_end(
         ));
     }
     Ok(end)
+}
+
+/// A fused append kernel may write all of its payload destinations before a later host row-count
+/// publication.  Destination allocations may alias the header allocation, but their checked
+/// half-open byte ranges may not overlap the nonempty header word.  Empty future ABI spans remain
+/// disjoint by definition rather than manufacturing overlap at a shared endpoint.
+pub(super) fn validate_fused_apply_destination_disjoint_from_header(
+    header: &CudaWriteDestination,
+    destination_memory: &CudaResidentDeviceMemory,
+    destination_byte_offset: u64,
+    destination_byte_len: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    if destination_byte_len == 0 {
+        return Ok(());
+    }
+    validate_fused_apply_destination_spans_disjoint(
+        &header.memory,
+        header.byte_offset,
+        std::mem::size_of::<u64>() as u64,
+        destination_memory,
+        destination_byte_offset,
+        destination_byte_len,
+    )
+}
+
+/// Reject overlapping nonempty fused-kernel output spans.  The kernel scatters these destinations
+/// concurrently, so output-to-output aliasing is as unsafe as a header alias.  Bounds and
+/// overflow are checked before the allocation-identity comparison; adjacent, empty, and
+/// different-allocation spans remain disjoint.
+pub(super) fn validate_fused_apply_destination_spans_disjoint(
+    left_memory: &CudaResidentDeviceMemory,
+    left_byte_offset: u64,
+    left_byte_len: u64,
+    right_memory: &CudaResidentDeviceMemory,
+    right_byte_offset: u64,
+    right_byte_len: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    if left_byte_len == 0 || right_byte_len == 0 {
+        return Ok(());
+    }
+    checked_span_end(
+        left_memory.metadata().allocated_bytes,
+        left_byte_offset,
+        left_byte_len,
+    )?;
+    checked_span_end(
+        right_memory.metadata().allocated_bytes,
+        right_byte_offset,
+        right_byte_len,
+    )?;
+    if left_memory.allocation_identity() == right_memory.allocation_identity()
+        && checked_nonempty_spans_overlap(
+            left_byte_offset,
+            left_byte_len,
+            right_byte_offset,
+            right_byte_len,
+        )?
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(right_byte_offset).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject every unintentional pairwise overlap among the spans the fused kernel can write.  This
+/// is deliberately separate from the header rule: the header is published later by the host,
+/// whereas these destinations can be written concurrently by the kernel itself.
+pub(super) fn validate_fused_apply_kernel_write_spans(
+    columns: &[CudaWriteDestination],
+    value_bytes_per_column: u64,
+    created_by: &CudaWriteDestination,
+    stamp_bytes: u64,
+    row_ids: Option<&CudaWriteDestination>,
+    index: Option<(&CudaResidentDeviceMemory, u64)>,
+) -> Result<(), CudaRuntimeProbeError> {
+    for (column_index, column) in columns.iter().enumerate() {
+        for earlier_column in &columns[..column_index] {
+            validate_fused_apply_destination_spans_disjoint(
+                &earlier_column.memory,
+                earlier_column.byte_offset,
+                value_bytes_per_column,
+                &column.memory,
+                column.byte_offset,
+                value_bytes_per_column,
+            )?;
+        }
+        validate_fused_apply_destination_spans_disjoint(
+            &column.memory,
+            column.byte_offset,
+            value_bytes_per_column,
+            &created_by.memory,
+            created_by.byte_offset,
+            stamp_bytes,
+        )?;
+        if let Some(row_ids) = row_ids {
+            validate_fused_apply_destination_spans_disjoint(
+                &column.memory,
+                column.byte_offset,
+                value_bytes_per_column,
+                &row_ids.memory,
+                row_ids.byte_offset,
+                stamp_bytes,
+            )?;
+        }
+        if let Some((index_memory, index_bytes)) = index {
+            validate_fused_apply_destination_spans_disjoint(
+                &column.memory,
+                column.byte_offset,
+                value_bytes_per_column,
+                index_memory,
+                0,
+                index_bytes,
+            )?;
+        }
+    }
+    if let Some(row_ids) = row_ids {
+        validate_fused_apply_destination_spans_disjoint(
+            &created_by.memory,
+            created_by.byte_offset,
+            stamp_bytes,
+            &row_ids.memory,
+            row_ids.byte_offset,
+            stamp_bytes,
+        )?;
+    }
+    if let Some((index_memory, index_bytes)) = index {
+        validate_fused_apply_destination_spans_disjoint(
+            &created_by.memory,
+            created_by.byte_offset,
+            stamp_bytes,
+            index_memory,
+            0,
+            index_bytes,
+        )?;
+        if let Some(row_ids) = row_ids {
+            validate_fused_apply_destination_spans_disjoint(
+                &row_ids.memory,
+                row_ids.byte_offset,
+                stamp_bytes,
+                index_memory,
+                0,
+                index_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn checked_nonempty_spans_overlap(
+    left_byte_offset: u64,
+    left_byte_len: u64,
+    right_byte_offset: u64,
+    right_byte_len: u64,
+) -> Result<bool, CudaRuntimeProbeError> {
+    if left_byte_len == 0 || right_byte_len == 0 {
+        return Ok(false);
+    }
+    let left_end = left_byte_offset
+        .checked_add(left_byte_len)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let right_end = right_byte_offset
+        .checked_add(right_byte_len)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    Ok(left_byte_offset < right_end && right_byte_offset < left_end)
 }
 
 fn validate_index_geometry(
@@ -659,6 +835,7 @@ pub struct FusedApplyRequest<'a> {
     pub base_row: u32,
     /// The shard's device row-count header word. The host publishes checked `base_row + k` only
     /// after the kernel-completing readback, preserving stamp-before-publication across blocks.
+    /// It must be disjoint from every nonempty fused-kernel destination span.
     pub header: CudaWriteDestination,
 }
 
@@ -734,70 +911,112 @@ impl CudaResidentDeviceMemory {
         let value_bytes_per_column = k
             .checked_mul(std::mem::size_of::<i32>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let value_bytes_per_column_u64 = u64::try_from(value_bytes_per_column)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let stamp_bytes = k
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let stamp_bytes_u64 = u64::try_from(stamp_bytes)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let primary = self.primary_arc();
-        let mut column_destinations = Vec::with_capacity(num_cols);
-        for destination in request.columns {
-            column_destinations.push(checked_destination(
-                &primary,
-                destination,
-                value_bytes_per_column as u64,
-                std::mem::align_of::<i32>() as u64,
-            )?);
-        }
-        let created_by_dest = checked_destination(
-            &primary,
-            &request.created_by,
-            stamp_bytes as u64,
-            std::mem::align_of::<u64>() as u64,
-        )?;
-        let row_id_dest = request
-            .row_ids
-            .as_ref()
-            .map(|(_, destination)| {
-                checked_destination(
-                    &primary,
-                    destination,
-                    stamp_bytes as u64,
-                    std::mem::align_of::<u64>() as u64,
-                )
-            })
-            .transpose()?
-            .unwrap_or(0);
         let header_dest = checked_destination(
             &primary,
             &request.header,
             std::mem::size_of::<u64>() as u64,
             std::mem::align_of::<u64>() as u64,
         )?;
-
-        let (pk_col, base_row, index_ptr, index_mask, index_shift) = if let Some(index) =
-            request.index.as_ref()
-        {
-            if !Arc::ptr_eq(&primary, &index.memory.primary_arc()) || index.key_column >= cols_u32 {
-                return Err(CudaRuntimeProbeError::InvalidInputLength(
-                    index.key_column as usize,
-                ));
-            }
-            validate_index_append(
-                &index.memory,
-                index.table_mask,
-                index.hash_shift,
-                request.base_row,
-                k_u32,
+        let mut column_destinations = Vec::with_capacity(num_cols);
+        for destination in request.columns {
+            let destination_ptr = checked_destination(
+                &primary,
+                destination,
+                value_bytes_per_column_u64,
+                std::mem::align_of::<i32>() as u64,
             )?;
-            (
-                index.key_column,
-                request.base_row,
-                index.memory.device_ptr(),
-                index.table_mask,
-                index.hash_shift,
-            )
+            validate_fused_apply_destination_disjoint_from_header(
+                &request.header,
+                &destination.memory,
+                destination.byte_offset,
+                value_bytes_per_column_u64,
+            )?;
+            column_destinations.push(destination_ptr);
+        }
+        let created_by_dest = checked_destination(
+            &primary,
+            &request.created_by,
+            stamp_bytes_u64,
+            std::mem::align_of::<u64>() as u64,
+        )?;
+        validate_fused_apply_destination_disjoint_from_header(
+            &request.header,
+            &request.created_by.memory,
+            request.created_by.byte_offset,
+            stamp_bytes_u64,
+        )?;
+        let row_id_dest = if let Some((_, destination)) = request.row_ids.as_ref() {
+            let destination_ptr = checked_destination(
+                &primary,
+                destination,
+                stamp_bytes_u64,
+                std::mem::align_of::<u64>() as u64,
+            )?;
+            validate_fused_apply_destination_disjoint_from_header(
+                &request.header,
+                &destination.memory,
+                destination.byte_offset,
+                stamp_bytes_u64,
+            )?;
+            destination_ptr
         } else {
-            (u32::MAX, 0, 0, 0, 0)
+            0
         };
+
+        let (pk_col, base_row, index_ptr, index_mask, index_shift, index_write_span) =
+            if let Some(index) = request.index.as_ref() {
+                if !Arc::ptr_eq(&primary, &index.memory.primary_arc())
+                    || index.key_column >= cols_u32
+                {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(
+                        index.key_column as usize,
+                    ));
+                }
+                validate_index_append(
+                    &index.memory,
+                    index.table_mask,
+                    index.hash_shift,
+                    request.base_row,
+                    k_u32,
+                )?;
+                let index_bytes = crate::resident_index_allocated_bytes(
+                    index.table_mask,
+                    u64::from(new_row_count),
+                )
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                validate_fused_apply_destination_disjoint_from_header(
+                    &request.header,
+                    &index.memory,
+                    0,
+                    index_bytes,
+                )?;
+                (
+                    index.key_column,
+                    request.base_row,
+                    index.memory.device_ptr(),
+                    index.table_mask,
+                    index.hash_shift,
+                    Some((&*index.memory, index_bytes)),
+                )
+            } else {
+                (u32::MAX, 0, 0, 0, 0, None)
+            };
+        validate_fused_apply_kernel_write_spans(
+            request.columns,
+            value_bytes_per_column_u64,
+            &request.created_by,
+            stamp_bytes_u64,
+            request.row_ids.as_ref().map(|(_, destination)| destination),
+            index_write_span,
+        )?;
 
         // Assemble the staging image (header layout documented at FUSED_APPLY_PTX).
         let values_bytes = expected_values
@@ -1399,12 +1618,21 @@ impl CudaResidentDeviceMemory {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_span_end;
+    use super::{checked_nonempty_spans_overlap, checked_span_end};
 
     #[test]
     fn write_apply_span_arithmetic_is_exact_and_overflow_safe() {
         assert_eq!(checked_span_end(16, 8, 8).unwrap(), 16);
         assert!(checked_span_end(16, 9, 8).is_err());
         assert!(checked_span_end(u64::MAX, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn fused_apply_output_spans_use_checked_half_open_intervals() {
+        assert!(!checked_nonempty_spans_overlap(0, 0, 0, 8).unwrap());
+        assert!(!checked_nonempty_spans_overlap(0, 8, 8, 8).unwrap());
+        assert!(checked_nonempty_spans_overlap(0, 8, 7, 1).unwrap());
+        assert!(checked_nonempty_spans_overlap(7, 1, 0, 8).unwrap());
+        assert!(checked_nonempty_spans_overlap(u64::MAX, 1, 0, 1).is_err());
     }
 }

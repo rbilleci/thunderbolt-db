@@ -583,7 +583,7 @@ fn validate_terminal_catalog_identity(
             _ => {
                 return Err(super::validation_error(
                     "terminal token kind is not a catalog guard",
-                ))
+                ));
             }
         }
     }
@@ -629,7 +629,7 @@ fn validate_terminal_catalog_guard(
         _ => {
             return Err(super::validation_error(
                 "terminal catalog guard kind is invalid",
-            ))
+            ));
         }
     };
     super::require(
@@ -902,7 +902,7 @@ fn guard_name_digest(
             _ => {
                 return Err(super::validation_error(
                     "synthesized guard owner kind is invalid",
-                ))
+                ));
             }
         };
         Ok(super::v2_digest(

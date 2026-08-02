@@ -1,11 +1,11 @@
 //! Move-only post-pass-zero ownership states for codec-5 semantics v2.
 //!
 //! This module deliberately has no WAL, recovery, apply, device, result, or publication caller.
-//! Production ends at the move-only `CodecQuarantined -> RetentionAuthorityPending` transition
-//! after strict S1--S8 fill and local codec closure. Historical Q2 catalog/allocator/generation
-//! evidence is compiled only for tests and cannot become a production successor.
+//! Production ends at the move-only `DurableSequencePending -> GenerationPending` transition
+//! after strict S1--S8 fill, local codec closure, retention authority, pinned catalog/allocator,
+//! and the durable Engine sequence-index proof. Historical Q2 generation evidence is compiled
+//! only for tests and cannot become a production successor.
 
-#[cfg(test)]
 #[path = "retained/catalog_validation.rs"]
 mod catalog_validation;
 #[path = "retained/codec_closure.rs"]
@@ -24,6 +24,8 @@ mod reencode;
 mod reservation;
 #[path = "retained/retention_authority.rs"]
 mod retention_authority;
+#[path = "retained/sequence_validation.rs"]
+pub(super) mod sequence_validation;
 
 /// Shared identity captured from the canonical outer/S7 framing before a model can leave raw
 /// proof. It owns no catalog or publication authority.
@@ -50,7 +52,6 @@ pub(super) struct SemanticsV2BoundIdentity {
 ///
 /// The allocator input is a sealed proof from the durable allocator index, not a codec-owned
 /// slice of Boolean claims.  Its construction remains unavailable to the raw decoder.
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogAllocatorWitness<'a> {
     pub(super) catalog: SemanticsV2CatalogWitness<'a>,
@@ -68,6 +69,18 @@ pub(super) struct AllocatorLeaseSpecForTest {
     pub(super) lease_start: u64,
     pub(super) lease_end: u64,
 }
+
+/// Exact test fixture row for a durable published sequence outcome. The real production bridge
+/// remains responsible for borrowing the sole Engine outcome index; this narrow shape exists only
+/// to hold checked-in hostile-proof backing for one callback extent.
+#[cfg(test)]
+pub(super) use sequence_validation::{
+    SequenceOutcomeProofSabotageForTest, SequenceOutcomeSpecForTest,
+};
+
+/// Test-only hostile input for the callback-scoped durable allocator assignment adapter.
+#[cfg(test)]
+pub(super) use catalog_validation::AllocatorAssignmentProofSabotageForTest;
 
 /// Closed independent generation evidence cases accepted by the retained Q2 fixture facade.
 /// This is intentionally distinct from the private builder's enum so sibling golden tests never
@@ -87,7 +100,6 @@ pub(super) enum Q2GoldenSabotage {
     FinalRoot,
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogWitness<'a> {
     pub(super) database_id: [u8; 16],
@@ -100,7 +112,6 @@ pub(super) struct SemanticsV2CatalogWitness<'a> {
     pub(super) sequences: &'a [SemanticsV2CatalogSequenceWitness<'a>],
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogTableWitness<'a> {
     pub(super) stable_table_id: u64,
@@ -116,7 +127,6 @@ pub(super) struct SemanticsV2CatalogTableWitness<'a> {
     pub(super) foreign_keys: &'a [SemanticsV2CatalogForeignKeyWitness<'a>],
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogColumnWitness<'a> {
     pub(super) catalog_column_ordinal: u32,
@@ -130,7 +140,6 @@ pub(super) struct SemanticsV2CatalogColumnWitness<'a> {
     pub(super) column_root: [u8; 32],
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogIndexWitness<'a> {
     pub(super) stable_index_id: u64,
@@ -155,7 +164,6 @@ pub(super) struct SemanticsV2CatalogIndexWitness<'a> {
     pub(super) base_root: [u8; 32],
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogIndexKeyWitness<'a> {
     pub(super) key_ordinal: u32,
@@ -169,7 +177,6 @@ pub(super) struct SemanticsV2CatalogIndexKeyWitness<'a> {
     pub(super) column_name_digest: [u8; 32],
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogDomainWitness<'a> {
     pub(super) stable_domain_id: u64,
@@ -184,7 +191,6 @@ pub(super) struct SemanticsV2CatalogDomainWitness<'a> {
     pub(super) constraints: &'a [SemanticsV2CatalogGuardWitness<'a>],
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogGuardWitness<'a> {
     pub(super) kind: u8,
@@ -205,7 +211,6 @@ pub(super) struct SemanticsV2CatalogGuardWitness<'a> {
     pub(super) catalog_generation: u64,
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogForeignKeyWitness<'a> {
     pub(super) stable_constraint_id: u64,
@@ -222,7 +227,6 @@ pub(super) struct SemanticsV2CatalogForeignKeyWitness<'a> {
     pub(super) supporting_stable_index_id: u64,
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) struct SemanticsV2CatalogSequenceWitness<'a> {
     pub(super) stable_sequence_id: u64,
@@ -270,6 +274,33 @@ pub(super) struct CatalogAllocatorPending<'a> {
     seal: PrivateSeal,
 }
 
+/// The retained graph has exactly matched the one pinned catalog plus concrete durable
+/// allocator-lease authority.  The retained retention authority remains opaque and accompanies
+/// these borrowed witnesses into the later durable-sequence proof.  No sequence, GPU, WAL,
+/// recovery, apply, result, or publication successor is available in this checkpoint.
+#[allow(dead_code)]
+pub(super) struct DurableSequencePending<'retention, 'catalog> {
+    authority: retention_authority::ValidatedRetentionAuthority<'retention>,
+    catalog: SemanticsV2CatalogWitness<'catalog>,
+    allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'catalog>,
+    allocator_assignment: catalog_validation::ValidatedAllocatorAssignment<'catalog>,
+    seal: PrivateSeal,
+}
+
+/// Every retained published S5 effect has been bound to its exact durable, complete, published,
+/// retained, same-lineage `Default` transition strictly before the parent.  This owner carries
+/// the retention, catalog, allocator, and sequence proofs opaquely but offers no compiler, GPU,
+/// WAL, recovery, apply, result, or publication successor in this checkpoint.
+#[allow(dead_code)]
+pub(super) struct GenerationPending<'retention, 'catalog, 'sequence> {
+    authority: retention_authority::ValidatedRetentionAuthority<'retention>,
+    catalog: SemanticsV2CatalogWitness<'catalog>,
+    allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'catalog>,
+    allocator_assignment: catalog_validation::ValidatedAllocatorAssignment<'catalog>,
+    sequence_index: sequence_validation::SemanticsV2DurableSequenceOutcomeIndexProof<'sequence>,
+    seal: PrivateSeal,
+}
+
 /// Only this module can construct a phase marker, keeping the move-only graph transition sealed.
 struct PrivateSeal;
 
@@ -314,6 +345,7 @@ impl<C> FullyWitnessValidatedSemanticsV2<C> {
 struct CatalogAndAllocatorValidated<'a> {
     catalog: SemanticsV2CatalogWitness<'a>,
     allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'a>,
+    allocator_assignment: catalog_validation::ValidatedAllocatorAssignment<'a>,
 }
 
 /// Seal the complete, exact post-reservation graph into the context-free quarantine state.
@@ -418,6 +450,62 @@ impl AggregateReplayTxn<RetentionAuthorityPending> {
     }
 }
 
+impl<'retention> AggregateReplayTxn<CatalogAllocatorPending<'retention>> {
+    /// Consume the authenticated retention authority only after the one pinned catalog and the
+    /// concrete ADR-014 allocator-lease index close the complete retained graph.  The resulting
+    /// owner deliberately stops before durable sequence validation, GPU capacity/replay, WAL,
+    /// recovery, apply, result, or publication work.
+    pub(super) fn validate_catalog_and_allocator<'catalog>(
+        self,
+        witness: SemanticsV2CatalogAllocatorWitness<'catalog>,
+    ) -> Result<AggregateReplayTxn<DurableSequencePending<'retention, 'catalog>>, crate::EngineError>
+    {
+        let allocator_assignment =
+            catalog_validation::validate(self.graph.identity, &self.graph.graph, &witness)?;
+        let SemanticsV2CatalogAllocatorWitness {
+            catalog,
+            allocator_index,
+        } = witness;
+        Ok(AggregateReplayTxn {
+            graph: self.graph,
+            phase: DurableSequencePending {
+                authority: self.phase.authority,
+                catalog,
+                allocator_index,
+                allocator_assignment,
+                seal: PrivateSeal,
+            },
+        })
+    }
+}
+
+impl<'retention, 'catalog> AggregateReplayTxn<DurableSequencePending<'retention, 'catalog>> {
+    /// Consume the pinned catalog/allocator owner only after the sole Engine
+    /// `sequence_value_outcomes` index proves every retained S5 transition.  This performs no
+    /// sequence inference or re-evaluation and stops before GPU capacity/replay, compiler, WAL,
+    /// recovery, apply, result, and publication work.
+    pub(super) fn validate_durable_sequence_outcomes<'sequence>(
+        self,
+        sequence_index: sequence_validation::SemanticsV2DurableSequenceOutcomeIndexProof<'sequence>,
+    ) -> Result<
+        AggregateReplayTxn<GenerationPending<'retention, 'catalog, 'sequence>>,
+        crate::EngineError,
+    > {
+        sequence_validation::validate(self.graph.identity, &self.graph.graph, &sequence_index)?;
+        Ok(AggregateReplayTxn {
+            graph: self.graph,
+            phase: GenerationPending {
+                authority: self.phase.authority,
+                catalog: self.phase.catalog,
+                allocator_index: self.phase.allocator_index,
+                allocator_assignment: self.phase.allocator_assignment,
+                sequence_index,
+                seal: PrivateSeal,
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 impl Q2CodecClosedSemanticsV2 {
     /// Consume the sole codec-closed owner after exact pinned-catalog and durable allocator
@@ -426,7 +514,8 @@ impl Q2CodecClosedSemanticsV2 {
         self,
         witness: SemanticsV2CatalogAllocatorWitness<'a>,
     ) -> Result<GenerationPendingSemanticsV2<'a>, crate::EngineError> {
-        catalog_validation::validate(self.graph.identity, &self.graph.graph, &witness)?;
+        let allocator_assignment =
+            catalog_validation::validate(self.graph.identity, &self.graph.graph, &witness)?;
         let SemanticsV2CatalogAllocatorWitness {
             catalog,
             allocator_index,
@@ -436,6 +525,7 @@ impl Q2CodecClosedSemanticsV2 {
             catalog_and_allocator: CatalogAndAllocatorValidated {
                 catalog,
                 allocator_index,
+                allocator_assignment,
             },
         })
     }
@@ -466,6 +556,75 @@ impl Q2CodecClosedSemanticsV2 {
     }
 }
 
+/// Build test-only allocator backing while this move-only owner is disassembled, then restore the
+/// owner only inside the same proof callback.  Assignment rows are synthesized from the real
+/// retained graph but can neither escape this extent nor be constructed beside a second proof.
+#[cfg(test)]
+fn with_scoped_allocator_proof_for_test<T, Phase>(
+    pending: AggregateReplayTxn<Phase>,
+    leases: &[AllocatorLeaseSpecForTest],
+    sabotage: Option<AllocatorAssignmentProofSabotageForTest>,
+    operation: impl FnOnce(
+        AggregateReplayTxn<Phase>,
+        catalog_validation::SemanticsV2DurableAllocatorIndexProof<'_>,
+    ) -> T,
+) -> T {
+    let AggregateReplayTxn {
+        graph: RetainedSemanticsV2Graph { identity, graph },
+        phase,
+    } = pending;
+    let authority_leases: Vec<_> = leases
+        .iter()
+        .map(|lease| catalog_validation::AllocatorLeaseSpecForTest {
+            stable_allocator_id: lease.stable_allocator_id,
+            lease_start: lease.lease_start,
+            lease_end: lease.lease_end,
+        })
+        .collect();
+    catalog_validation::with_allocator_proof_for_test(
+        identity,
+        graph,
+        &authority_leases,
+        sabotage,
+        |allocator_index, graph| {
+            operation(
+                AggregateReplayTxn {
+                    graph: RetainedSemanticsV2Graph { identity, graph },
+                    phase,
+                },
+                allocator_index,
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+fn with_q2_scoped_allocator_proof_for_test<T>(
+    closed: Q2CodecClosedSemanticsV2,
+    leases: &[AllocatorLeaseSpecForTest],
+    operation: impl FnOnce(
+        Q2CodecClosedSemanticsV2,
+        catalog_validation::SemanticsV2DurableAllocatorIndexProof<'_>,
+    ) -> T,
+) -> T {
+    with_scoped_allocator_proof_for_test(
+        AggregateReplayTxn {
+            graph: closed.graph,
+            phase: PrivateSeal,
+        },
+        leases,
+        None,
+        |closed, allocator_index| {
+            operation(
+                Q2CodecClosedSemanticsV2 {
+                    graph: closed.graph,
+                },
+                allocator_index,
+            )
+        },
+    )
+}
+
 /// Consume an actual codec-closed owner through the one catalog/allocator transition while the
 /// test fixture's durable proof is still scoped to this call.  The callback receives only the
 /// resulting pending typestate; it cannot retain or construct a proof, inspect the graph, or
@@ -477,27 +636,107 @@ pub(super) fn with_catalog_allocator_pending_for_test<T>(
     leases: &[AllocatorLeaseSpecForTest],
     operation: impl FnOnce(GenerationPendingSemanticsV2<'_>) -> Result<T, crate::EngineError>,
 ) -> Result<T, crate::EngineError> {
-    let identity = closed.graph.identity;
-    let authority_leases: Vec<_> = leases
-        .iter()
-        .map(|lease| catalog_validation::AllocatorLeaseSpecForTest {
-            stable_allocator_id: lease.stable_allocator_id,
-            lease_start: lease.lease_start,
-            lease_end: lease.lease_end,
-        })
-        .collect();
-    catalog_validation::with_allocator_proof_for_test(
-        identity,
-        &authority_leases,
-        |allocator_index| {
-            operation(closed.validate_catalog_and_allocator_for_test(
+    with_q2_scoped_allocator_proof_for_test(closed, leases, |closed, allocator_index| {
+        operation(closed.validate_catalog_and_allocator_for_test(
+            SemanticsV2CatalogAllocatorWitness {
+                catalog,
+                allocator_index,
+            },
+        )?)
+    })
+}
+
+/// Consume a real production-shaped catalog/allocator owner through the one durable sequence
+/// transition while both the durable allocator and Engine-index-shaped proof remain scoped to the
+/// callback. The caller cannot retain, manufacture, or inspect any carried authority.
+#[cfg(test)]
+fn with_catalog_allocator_sequence_pending_for_test<T>(
+    catalog_pending: AggregateReplayTxn<CatalogAllocatorPending<'_>>,
+    catalog: SemanticsV2CatalogWitness<'_>,
+    leases: &[AllocatorLeaseSpecForTest],
+    outcomes: &[SequenceOutcomeSpecForTest<'_>],
+    sabotage: Option<SequenceOutcomeProofSabotageForTest>,
+    assignment_sabotage: Option<AllocatorAssignmentProofSabotageForTest>,
+    operation: impl FnOnce(
+        AggregateReplayTxn<GenerationPending<'_, '_, '_>>,
+    ) -> Result<T, crate::EngineError>,
+) -> Result<T, crate::EngineError> {
+    with_scoped_allocator_proof_for_test(
+        catalog_pending,
+        leases,
+        assignment_sabotage,
+        |catalog_pending, allocator_index| {
+            let identity = catalog_pending.graph.identity;
+            let sequence_pending = catalog_pending.validate_catalog_and_allocator(
                 SemanticsV2CatalogAllocatorWitness {
                     catalog,
                     allocator_index,
                 },
-            )?)
+            )?;
+            sequence_validation::with_sequence_outcome_proof_for_test(
+                identity,
+                outcomes,
+                sabotage,
+                |sequence_index| {
+                    operation(sequence_pending.validate_durable_sequence_outcomes(sequence_index)?)
+                },
+            )
         },
     )
+}
+
+/// Test-only live-retention continuation over the same production phase arrows. It is callback
+/// scoped so the authenticated claim, allocator pin, and sequence-index proof cannot escape.
+#[cfg(test)]
+pub(super) fn with_live_sequence_pending_for_test<T>(
+    pending: AggregateReplayTxn<RetentionAuthorityPending>,
+    catalog: SemanticsV2CatalogWitness<'_>,
+    leases: &[AllocatorLeaseSpecForTest],
+    outcomes: &[SequenceOutcomeSpecForTest<'_>],
+    sabotage: Option<SequenceOutcomeProofSabotageForTest>,
+    assignment_sabotage: Option<AllocatorAssignmentProofSabotageForTest>,
+    operation: impl FnOnce(
+        AggregateReplayTxn<GenerationPending<'_, '_, '_>>,
+    ) -> Result<T, crate::EngineError>,
+) -> Result<T, crate::EngineError> {
+    retention_authority::with_live_claim_pending_for_test(pending, |catalog_pending| {
+        with_catalog_allocator_sequence_pending_for_test(
+            catalog_pending,
+            catalog,
+            leases,
+            outcomes,
+            sabotage,
+            assignment_sabotage,
+            operation,
+        )
+    })
+}
+
+/// Historical no-retention follows the same catalog/allocator/sequence boundary. In particular,
+/// an empty S5 vector must still authenticate the complete borrowed index before it advances.
+#[cfg(test)]
+pub(super) fn with_historical_sequence_pending_for_test<T>(
+    pending: AggregateReplayTxn<RetentionAuthorityPending>,
+    catalog: SemanticsV2CatalogWitness<'_>,
+    leases: &[AllocatorLeaseSpecForTest],
+    outcomes: &[SequenceOutcomeSpecForTest<'_>],
+    sabotage: Option<SequenceOutcomeProofSabotageForTest>,
+    assignment_sabotage: Option<AllocatorAssignmentProofSabotageForTest>,
+    operation: impl FnOnce(
+        AggregateReplayTxn<GenerationPending<'_, '_, '_>>,
+    ) -> Result<T, crate::EngineError>,
+) -> Result<T, crate::EngineError> {
+    retention_authority::with_historical_no_retention_pending_for_test(pending, |catalog_pending| {
+        with_catalog_allocator_sequence_pending_for_test(
+            catalog_pending,
+            catalog,
+            leases,
+            outcomes,
+            sabotage,
+            assignment_sabotage,
+            operation,
+        )
+    })
 }
 
 /// Complete the Q2 test-only catalog, allocator, generation, and logical-reencoding chain.
@@ -597,7 +836,6 @@ impl<'a> GenerationPendingSemanticsV2<'a> {
 /// This is the first phase only: it deliberately cannot inspect, store, or accept a generation
 /// result. The complete graph validator consumes this proof before it constructs the pending
 /// owner and hands that owner to the sealed generation-builder interface.
-#[cfg(test)]
 #[allow(dead_code)]
 pub(super) fn validate_catalog_allocator_witness_identity(
     identity: SemanticsV2BoundIdentity,
@@ -637,11 +875,12 @@ fn retained_error(message: &str) -> crate::EngineError {
 #[cfg(test)]
 mod replay_shell_source_guards {
     #[test]
-    fn retained_shell_has_one_sealed_retention_transition_and_no_later_owner() {
+    fn retained_shell_has_one_sealed_durable_sequence_transition_and_stops_before_gpu_replay() {
         let source = include_str!("retained.rs");
         let facade = include_str!("../semantics_v2.rs");
         let fill = include_str!("retained/fill.rs");
         let retention = include_str!("retained/retention_authority.rs");
+        let sequence = include_str!("retained/sequence_validation.rs");
         let sealed = ["struct Private", "Seal;"].concat();
         let quarantined = ["struct Codec", "Quarantined(PrivateSeal);"].concat();
         let pending = ["struct RetentionAuthority", "Pending(PrivateSeal);"].concat();
@@ -675,9 +914,55 @@ mod replay_shell_source_guards {
             "retention authority has one sealed aggregate transition"
         );
         let catalog_pending = ["struct CatalogAllocator", "Pending<'a>"].concat();
-        let catalog_pending_impl = ["impl AggregateReplayTxn<", "CatalogAllocatorPending"].concat();
+        let catalog_pending_impl = [
+            "impl<'retention> AggregateReplayTxn<",
+            "CatalogAllocatorPending<'retention>>",
+        ]
+        .concat();
         assert!(source.contains(&catalog_pending));
-        assert!(!source.contains(&catalog_pending_impl));
+        assert_eq!(
+            source.matches(&catalog_pending_impl).count(),
+            1,
+            "the catalog/allocator phase has exactly one sealed aggregate transition"
+        );
+        let sequence_pending = ["struct DurableSequence", "Pending<'"].concat();
+        let sequence_pending_impl = [
+            "impl<'retention, 'catalog> AggregateReplayTxn<",
+            "DurableSequencePending<'retention, 'catalog>>",
+        ]
+        .concat();
+        assert!(source.contains(&sequence_pending));
+        assert_eq!(
+            source.matches(&sequence_pending_impl).count(),
+            1,
+            "the durable-sequence phase has exactly one sealed aggregate transition"
+        );
+        let generation_pending = ["struct Generation", "Pending<'"].concat();
+        let generation_pending_impl = [
+            "impl<'retention, 'catalog, 'sequence> AggregateReplayTxn<",
+            "GenerationPending<'retention, 'catalog, 'sequence>>",
+        ]
+        .concat();
+        assert!(source.contains(&generation_pending));
+        assert!(
+            !source.contains(&generation_pending_impl),
+            "this checkpoint must stop before the generation/GPU replay successor"
+        );
+        let production_shell = source
+            .split("#[cfg(test)]\nmod replay_shell_source_guards")
+            .next()
+            .expect("retained source has a production boundary");
+        for forbidden in [
+            "ReplayBaseGenerationPin",
+            "CudaI32InsertReplayPreparation",
+            "CudaInsertReplaySubmission",
+            "engine_data_generation",
+        ] {
+            assert!(
+                !production_shell.contains(forbidden),
+                "the retained prerequisite must not consume or couple to later replay authority: {forbidden}"
+            );
+        }
         let transaction_decl = ["pub(super) struct AggregateReplayTxn", "<Phase>"].concat();
         let declaration_offset = source
             .find(&transaction_decl)
@@ -704,11 +989,7 @@ mod replay_shell_source_guards {
                 "replay shell must not expose {forbidden}"
             );
         }
-        let catalog_module = [
-            "#[cfg(test)]\n#[path = \"",
-            "retained/catalog_validation.rs\"]",
-        ]
-        .concat();
+        let catalog_module = ["#[path = \"", "retained/catalog_validation.rs\"]"].concat();
         let generation_module = [
             "#[cfg(test)]\n#[path = \"",
             "retained/generation_validation.rs\"]",
@@ -729,7 +1010,9 @@ mod replay_shell_source_guards {
         assert!(facade.contains("#[cfg(test)]\nfn fill_canonical_semantics_v2_for_test"));
         assert!(facade.contains("#[cfg(test)]\nfn codec_closed_canonical_semantics_v2_for_test"));
         assert!(!facade.contains("pub(super) fn fill_canonical_semantics_v2_for_test"));
-        assert!(fill.contains("This has no transition to WAL, recovery, execution, GPU, result, or publication state."));
+        assert!(fill.contains(
+            "This has no transition to WAL, recovery, execution, GPU, result, or publication state."
+        ));
         assert!(!fill.contains("fn publish"));
         assert!(!fill.contains("fn replay"));
         assert!(retention.contains("struct AuthenticatedClaimStatusIndex"));
@@ -777,6 +1060,80 @@ mod replay_shell_source_guards {
             assert!(
                 !retention.contains(forbidden),
                 "retention authority must not gain later authority {forbidden}"
+            );
+        }
+        let catalog_allocator = source
+            .split(&catalog_pending_impl)
+            .nth(1)
+            .and_then(|source| source.split(&sequence_pending_impl).next())
+            .expect("catalog/allocator transition is bounded before durable sequence validation");
+        for forbidden in [
+            "sequence_value_outcomes",
+            "DeviceInsertPlan",
+            "WalBuffer",
+            "fn replay",
+            "fn apply",
+            "fn publish",
+        ] {
+            assert!(
+                !catalog_allocator.contains(forbidden),
+                "catalog/allocator transition must not gain later authority {forbidden}"
+            );
+        }
+        let durable_sequence = source
+            .split(&sequence_pending_impl)
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("#[cfg(test)]\nimpl Q2CodecClosedSemanticsV2")
+                    .next()
+            })
+            .expect("durable-sequence transition is bounded before the test-only Q2 bridge");
+        for forbidden in [
+            "SemanticsV2CatalogAllocatorWitness",
+            "RetentionAuthorityInput",
+            "catalog_validation::validate",
+            "DeviceInsertPlan",
+            "WalBuffer",
+            "fn replay",
+            "fn apply",
+            "fn publish",
+        ] {
+            assert!(
+                !durable_sequence.contains(forbidden),
+                "durable-sequence transition must not gain a second authority or later work: {forbidden}"
+            );
+        }
+        let production_sequence = sequence
+            .split("#[cfg(test)]")
+            .next()
+            .expect("durable sequence has a production boundary");
+        for forbidden in [
+            "HashMap",
+            "Vec<",
+            "Box<",
+            ".clone()",
+            ".collect()",
+            "sequence_value_input_digest",
+            "canonical_request_digest",
+        ] {
+            assert!(
+                !production_sequence.contains(forbidden),
+                "durable sequence proof must borrow without clone or allocation: {forbidden}"
+            );
+        }
+        for forbidden in [
+            "SemanticsV2Catalog",
+            "ValidatedRetentionAuthority",
+            "DeviceInsertPlan",
+            "WalBuffer",
+            "fn replay",
+            "fn apply",
+            "fn publish",
+        ] {
+            assert!(
+                !production_sequence.contains(forbidden),
+                "durable sequence proof must not gain later authority {forbidden}"
             );
         }
         for (name, q2_source) in [
@@ -829,7 +1186,7 @@ mod generation_lifecycle_tests {
     const ABSENT_U32: u32 = u32::MAX;
 
     #[test]
-    fn checked_in_abort_fixture_crosses_fill_catalog_pending_and_owned_lifecycle() {
+    fn checked_in_abort_fixture_crosses_retention_catalog_allocator_and_owned_lifecycle() {
         let (result, calls, drops) =
             run_abort_lifecycle(generation_validation::DeterministicAbortSabotage::None);
         result.expect("checked-in fixture reaches fully owned generation result");
@@ -1032,6 +1389,16 @@ mod generation_lifecycle_tests {
                 body: &status,
             },
         ];
+        let retention_pending =
+            super::super::fill_canonical_semantics_v2_for_test(&outer, &outcome, &fragments)
+                .expect("checked-in minimal abort fixture fills retained owners")
+                .close_codec()
+                .expect("checked-in minimal abort fixture closes codec witnesses");
+        let live_retention_pending =
+            super::super::fill_canonical_semantics_v2_for_test(&outer, &outcome, &fragments)
+                .expect("checked-in minimal abort fixture fills retained owners")
+                .close_codec()
+                .expect("checked-in minimal abort fixture closes codec witnesses");
         let closed =
             super::super::fill_canonical_semantics_v2_for_test(&outer, &outcome, &fragments)
                 .expect("checked-in minimal abort fixture fills retained owners")
@@ -1083,7 +1450,27 @@ mod generation_lifecycle_tests {
             guards: &guards,
             sequences: &[],
         };
-        let identity = SemanticsV2BoundIdentity {
+        let catalog_for_retention = SemanticsV2CatalogWitness {
+            database_id: [0xa1; 16],
+            catalog_epoch: CATALOG_EPOCH,
+            catalog_digest: [0x33; 32],
+            tables: &tables,
+            indexes: &[],
+            domains: &[],
+            guards: &guards,
+            sequences: &[],
+        };
+        let catalog_for_live_retention = SemanticsV2CatalogWitness {
+            database_id: [0xa1; 16],
+            catalog_epoch: CATALOG_EPOCH,
+            catalog_digest: [0x33; 32],
+            tables: &tables,
+            indexes: &[],
+            domains: &[],
+            guards: &guards,
+            sequences: &[],
+        };
+        let _identity = SemanticsV2BoundIdentity {
             database_id: [0xa1; 16],
             cluster_id: [0xa3; 16],
             timeline_id: [0xa2; 16],
@@ -1097,26 +1484,85 @@ mod generation_lifecycle_tests {
             commit_sequence: COMMIT_SEQUENCE,
             initial_database_root: [0x44; 32],
         };
+        let retention_transition =
+            retention_authority::with_historical_no_retention_pending_for_test(
+                retention_pending,
+                |catalog_pending| {
+                    with_scoped_allocator_proof_for_test(
+                        catalog_pending,
+                        &[AllocatorLeaseSpecForTest {
+                            stable_allocator_id: TABLE_ID,
+                            lease_start: 1,
+                            lease_end: 1_000,
+                        }],
+                        None,
+                        |catalog_pending, allocator_index| {
+                            catalog_pending
+                                .validate_catalog_and_allocator(
+                                    SemanticsV2CatalogAllocatorWitness {
+                                        catalog: catalog_for_retention,
+                                        allocator_index,
+                                    },
+                                )
+                                .map(drop)
+                        },
+                    )
+                },
+            );
+        retention_transition.expect(
+            "checked-in empty-S8 fixture crosses retention authority and pinned catalog/allocator",
+        );
+        let live_retention_transition = retention_authority::with_live_claim_pending_for_test(
+            live_retention_pending,
+            |catalog_pending| {
+                with_scoped_allocator_proof_for_test(
+                    catalog_pending,
+                    &[AllocatorLeaseSpecForTest {
+                        stable_allocator_id: TABLE_ID,
+                        lease_start: 1,
+                        lease_end: 1_000,
+                    }],
+                    None,
+                    |catalog_pending, allocator_index| {
+                        catalog_pending
+                            .validate_catalog_and_allocator(SemanticsV2CatalogAllocatorWitness {
+                                catalog: catalog_for_live_retention,
+                                allocator_index,
+                            })
+                            .map(drop)
+                    },
+                )
+            },
+        );
+        live_retention_transition.expect(
+            "checked-in empty-S8 fixture carries a live claim through catalog/allocator validation",
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
         let quarantine_registry = generation_validation::GenerationQuarantineRegistry::<
             generation_validation::AbortCandidate,
             generation_validation::AbortWork,
         >::new();
-        let result = catalog_validation::with_allocator_proof_for_test(
-            identity,
-            &[catalog_validation::AllocatorLeaseSpecForTest {
+        let result = with_scoped_allocator_proof_for_test(
+            AggregateReplayTxn {
+                graph: closed.graph,
+                phase: PrivateSeal,
+            },
+            &[AllocatorLeaseSpecForTest {
                 stable_allocator_id: TABLE_ID,
                 lease_start: 1,
                 lease_end: 1_000,
             }],
-            |allocator_index| {
-                let mut pending = closed
-                    .validate_catalog_and_allocator_for_test(SemanticsV2CatalogAllocatorWitness {
-                        catalog,
-                        allocator_index,
-                    })
-                    .expect("checked-in fixture closes pinned catalog and allocator");
+            None,
+            |closed, allocator_index| {
+                let mut pending = Q2CodecClosedSemanticsV2 {
+                    graph: closed.graph,
+                }
+                .validate_catalog_and_allocator_for_test(SemanticsV2CatalogAllocatorWitness {
+                    catalog,
+                    allocator_index,
+                })
+                .expect("checked-in fixture closes pinned catalog and allocator");
                 if mutate_final_generation_before_neutral_seal {
                     pending.mutate_final_table_generation_before_neutral_seal_for_test();
                 }

@@ -18,6 +18,8 @@ mod q2_guard_sabotage;
 mod q2_reencode;
 #[path = "goldens/q2_witnesses.rs"]
 mod q2_witnesses;
+#[path = "goldens/q3_sequence.rs"]
+mod q3_sequence;
 #[path = "goldens/s8_literals.rs"]
 mod s8_literals;
 #[path = "goldens/s8_sabotage.rs"]
@@ -116,8 +118,7 @@ const MINIMAL_ABORT_IMAGE_CONTENT_HEX: &str =
 const MINIMAL_ABORT_OVERLAY_AFTER_HEX: &str =
     "7276ad2d1a97797b8546de45a871b4d0366e7518709c2410f1bde8b17112a2ba";
 
-const MINIMAL_ABORT_S1_HEX: &str =
-    "0000000000000000010000000100000026fae30b557b8e22e36a2894e497466e572b572a9fd22c2623a08a334f649e4426fae30b557b8e22e36a2894e497466e572b572a9fd22c2623a08a334f649e4455555555555555555555555555555555555555555555555555555555555555557276ad2d1a97797b8546de45a871b4d0366e7518709c2410f1bde8b17112a2ba";
+const MINIMAL_ABORT_S1_HEX: &str = "0000000000000000010000000100000026fae30b557b8e22e36a2894e497466e572b572a9fd22c2623a08a334f649e4426fae30b557b8e22e36a2894e497466e572b572a9fd22c2623a08a334f649e4455555555555555555555555555555555555555555555555555555555555555557276ad2d1a97797b8546de45a871b4d0366e7518709c2410f1bde8b17112a2ba";
 
 // The complete S7 stream is one independently frozen literal. No fixture constructor or digest
 // helper participates in the expected-byte comparison below.

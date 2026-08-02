@@ -524,6 +524,30 @@ source-guarded out of the plan compiler and execution input; they may not choose
 arbitration, or output. ValidatedRetentionAuthority and all claim/historical proof fields are
 likewise source-guarded out of compiler, execution, and verdict selection.
 
+Before GenerationPending may compile, the same immutable durable allocator authority must bind
+one sealed exact replay assignment for each target table. A selected lease alone is deliberately
+insufficient: it may contain unused prefix or suffix, so neither lease boundary nor S4/S7 may
+infer the parent transaction's row IDs. The assignment is root-authenticated and checkpoint-pinned
+with the selected lease record; it binds database/timeline lineage, stable parent transaction and
+S1/S2 request-chain identity, selected allocator/lease/marker identity, mapping version, and an
+exact `[assignment_start, assignment_end)` range. Version one assigns every S2 source row once in
+stable-table then statement/source-row order, including rows later canceled or suppressed, to the
+contiguous nonzero/nonmaximum IDs in that range. The range is within the selected durable lease
+and precedes the parent under the same complete/durable/published retention regime. Every
+authenticated `*_next_commit_sequence` frontier strictly exceeds the parent commit, so the
+root covers every same-parent pre-parent assignment rather than merely extending past the
+selected marker. A future noncontiguous allocator format must authenticate its exact ordered
+row-ID vector; it may never guess from the lease. Catalog/allocator validation constructs this non-Copy capability once and
+carries it through sequence validation. It exposes only the narrow ordered binding
+`(stable_table_id, statement_ordinal, source_row_ordinal, stable_row_id)` to compilation; S4/S7
+remain final comparator evidence and cannot select input, capacity, execution, or output.
+
+The implemented checkpoint stops at that sealed `GenerationPending` capability. It has no
+`ReplayBaseGenerationPin`, compiler, resource reservation, enqueue, WAL, recovery, apply, or
+publication consumer. The separately available asynchronous typed-Int4 submission is likewise an
+execution-only prerequisite: it cannot receive this owner or publish a header, terminal status,
+or generation. PLAN.md alone sequences the later consuming replay-builder boundary.
+
 For every statement, the frozen replay order, followed by a statement barrier, is:
 
 1. recorded default/sequence materialization;
@@ -552,12 +576,18 @@ coordinator handoff.
 
 Only GenerationPending may reserve, compile, and launch the sole GPU generation/replay builder.
 The launched attempt owns its source, output, candidate, work, backing, pins, and pre-reserved
-quarantine ticket until drained. Output is unreadable before exactly one drain. Proven
-quiescence plus an execution error safely drops/retries through canonical recovery. Unknown
-quiescence or a drain panic parks all ownership and capacity and poisons/stops the context. No
-double drain, backing release, or legacy apply exists; retry is the same durable record on a
-known-clean or fresh context. The existing sole ADR-014/015 durable/apply/status/publication
-authority is the only possible subsequent live consumer.
+quarantine ticket until drained. Output is unreadable before exactly one drain. The presently
+available typed-Int4 submission is a private execution-only prerequisite, not that consumer: a
+real CUDA API error after its first enqueue quarantines its exact stream, pinned backing, and
+device backing permanently. A later successful fence can prove those resources idle, but cannot
+redeem that operation or return its leases to a shared pool; the first terminal CUDA error remains
+the result. Only a synthetic test control path that runs before a CUDA fence is retryable to a
+normal execution-only outcome. Fresh canonical recovery on a newly admitted context is a later
+GenerationPending-owned operation and is distinct from retrying a fence on the failed private
+attempt. Unknown quiescence or a drain panic parks all ownership and capacity and poisons/stops
+the context. No double drain, backing release, or legacy apply exists. The existing sole
+ADR-014/015 durable/apply/status/publication authority is the only possible subsequent live
+consumer.
 
 No state exposes a raw section body, reencoder, extractor, SQL text, parsed command, host row
 matrix, WriteDelta, WalBuffer constructor, WAL constructor, alternate replay operation, apply

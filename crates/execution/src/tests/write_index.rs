@@ -66,7 +66,10 @@ fn prepared_fused_apply_token_is_pre_wal_only_and_post_wal_build_free() {
     let before_header = source
         .split("pub fn apply_before_header(")
         .nth(1)
-        .and_then(|body| body.split("/// Preserve the original one-call behavior").next())
+        .and_then(|body| {
+            body.split("/// Preserve the original one-call behavior")
+                .next()
+        })
         .expect("prepared fused payload application is bounded before its wrapper");
     let publish_header = source
         .split("pub fn publish(self)")
@@ -97,12 +100,12 @@ fn prepared_fused_apply_token_is_pre_wal_only_and_post_wal_build_free() {
     assert!(source.contains("live mutation route"));
     for body in [apply, before_header, publish_header] {
         for forbidden in [
-        "Vec",
-        "cached_function",
-        ".get::<",
-        "prepare_i32_fused_apply",
-        "to_string",
-        "collect",
+            "Vec",
+            "cached_function",
+            ".get::<",
+            "prepare_i32_fused_apply",
+            "to_string",
+            "collect",
         ] {
             assert!(
                 !body.contains(forbidden),
@@ -126,6 +129,678 @@ fn prepared_fused_apply_token_is_pre_wal_only_and_post_wal_build_free() {
     assert!(
         !legacy.contains("prepare_i32_fused_apply"),
         "the prepared token must remain production-ineligible"
+    );
+}
+
+#[test]
+fn async_i32_insert_replay_submission_stays_owned_and_execution_only() {
+    fn assert_send<T: Send>() {}
+    assert_send::<CudaI32InsertReplayPreparation>();
+    assert_send::<CudaInsertReplaySubmission>();
+    assert_send::<CudaInsertReplayUnknownQuiescence>();
+
+    let source = include_str!("../write_apply/replay_submission.rs");
+    let enqueue = source
+        .split("pub fn enqueue(self)")
+        .nth(1)
+        .and_then(|body| body.split("impl CudaInsertReplaySubmission").next())
+        .expect("owned replay enqueue body");
+    let complete = source
+        .split("pub fn complete(mut self)")
+        .nth(1)
+        .and_then(|body| {
+            body.split("impl Drop for CudaInsertReplaySubmission")
+                .next()
+        })
+        .expect("owned replay completion body");
+    let drop_body = source
+        .split("impl Drop for CudaInsertReplaySubmission")
+        .nth(1)
+        .and_then(|body| body.split("impl CudaInsertReplayUnknownQuiescence").next())
+        .expect("owned replay drop body");
+
+    assert!(source.contains("pub struct CudaI32InsertReplayPreparation"));
+    assert!(source.contains("pub struct CudaInsertReplaySubmission"));
+    assert!(source.contains("pub enum CudaInsertReplayCompletion"));
+    assert!(source.contains("UnknownQuiescence"));
+    assert!(source.contains("PinnedHostBufferOwned"));
+    assert!(source.contains("PooledStreamOwned"));
+    assert!(source.contains("PooledDeviceBufferOwned"));
+    assert!(source.contains("gpu_db_resident_i32_fused_apply"));
+    for forbidden in [
+        "PreparedI32FusedApply",
+        "submit_i32_fused_apply",
+        "std::thread",
+        "PreparedDeviceInsertPlan",
+        "WAL",
+        "publish(",
+    ] {
+        assert!(
+            !enqueue.contains(forbidden),
+            "enqueue must remain an execution-only owned kernel submit, not {forbidden}"
+        );
+    }
+    assert!(!enqueue.contains("#[cfg(test)]"));
+    for forbidden in [
+        "Vec",
+        "Box",
+        "cached_function",
+        ".get::<",
+        "collect",
+        "to_string",
+    ] {
+        assert!(
+            !complete.contains(forbidden),
+            "completion must not allocate or rebuild after enqueue: {forbidden}"
+        );
+    }
+    assert!(!complete.contains("#[cfg(test)]"));
+    assert!(drop_body.contains("self.drain_stream()"));
+    assert!(source.contains("fn drain_stream("));
+    assert!(source.contains("synchronize_owned_stream_for_replay(self.stream())"));
+    assert!(source.contains("first_terminal_error"));
+    assert!(source.contains("fn retain_first_terminal_error"));
+    assert!(source.contains("quarantine_if_driver_error"));
+    let cuda_context = include_str!("../cuda_context.rs");
+    assert_eq!(
+        cuda_context
+            .matches("synchronize_owned_stream_for_replay")
+            .count(),
+        1,
+        "the replay-only fence seam has one declaration"
+    );
+    assert_eq!(
+        source
+            .matches("synchronize_owned_stream_for_replay")
+            .count(),
+        1,
+        "replay submission is the seam's sole production caller"
+    );
+    assert!(
+        !include_str!("../sha256_completion.rs").contains("synchronize_owned_stream_for_replay")
+    );
+    assert!(!include_str!("../runtime_generation_rebuild.rs")
+        .contains("synchronize_owned_stream_for_replay"));
+    let direct_apply = include_str!("../write_apply.rs")
+        .split("pub fn submit_i32_fused_apply_status")
+        .nth(1)
+        .and_then(|body| body.split("/// M1").next())
+        .expect("public direct fused apply entrypoint");
+    assert!(direct_apply.contains("validate_fused_apply_destination_disjoint_from_header"));
+    assert!(direct_apply.contains("validate_fused_apply_kernel_write_spans"));
+    assert!(drop_body.contains("std::mem::forget(resources)"));
+    assert!(drop_body.contains("self.resources.take()"));
+}
+
+#[test]
+fn async_i32_insert_replay_executes_or_skips_without_gpu_and_parks_unknown_quiescence() {
+    let Ok(runtime) = CudaDriverRuntime::probe() else {
+        return;
+    };
+    if !runtime.snapshot().driver_available || runtime.snapshot().device_count == 0 {
+        return;
+    }
+    let owner = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &[0_u8; 64])
+            .expect("async replay owner"),
+    );
+    let columns = [CudaWriteDestination {
+        memory: std::sync::Arc::clone(&owner),
+        byte_offset: 16,
+    }];
+    let preparation = FusedApplyPreparation {
+        columns: &columns,
+        values: &[7_i32],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 24,
+        },
+        row_ids: None,
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let overlapping_created_by = FusedApplyPreparation {
+        columns: &columns,
+        values: &[7_i32],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+        row_ids: None,
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let overlapping_direct_request = FusedApplyRequest {
+        columns: &columns,
+        values: &[7_i32],
+        stamps: &[11],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+        row_ids: None,
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    assert!(matches!(
+        overlapping_created_by.footprint(&owner),
+        Err(CudaRuntimeProbeError::InvalidInputLength(0))
+    ));
+    assert!(matches!(
+        CudaI32InsertReplayPreparation::prepare(
+            std::sync::Arc::clone(&owner),
+            &overlapping_created_by,
+            &[11],
+        ),
+        Err(CudaInsertReplayPrepareError::Runtime(
+            CudaRuntimeProbeError::InvalidInputLength(0)
+        ))
+    ));
+    assert!(matches!(
+        owner.submit_i32_fused_apply_status(&overlapping_direct_request),
+        Err(CudaRuntimeProbeError::InvalidInputLength(0))
+    ));
+    let header_overlapping_row_ids = FusedApplyPreparation {
+        columns: &columns,
+        values: &[7_i32],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 24,
+        },
+        row_ids: Some((
+            &[91_u64],
+            CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 0,
+            },
+        )),
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let header_overlapping_row_ids_direct = FusedApplyRequest {
+        columns: &columns,
+        values: &[7_i32],
+        stamps: &[11],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 24,
+        },
+        row_ids: Some((
+            &[91_u64],
+            CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 0,
+            },
+        )),
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    assert!(matches!(
+        header_overlapping_row_ids.footprint(&owner),
+        Err(CudaRuntimeProbeError::InvalidInputLength(0))
+    ));
+    assert!(matches!(
+        CudaI32InsertReplayPreparation::prepare(
+            std::sync::Arc::clone(&owner),
+            &header_overlapping_row_ids,
+            &[11],
+        ),
+        Err(CudaInsertReplayPrepareError::Runtime(
+            CudaRuntimeProbeError::InvalidInputLength(0)
+        ))
+    ));
+    assert!(matches!(
+        owner.submit_i32_fused_apply_status(&header_overlapping_row_ids_direct),
+        Err(CudaRuntimeProbeError::InvalidInputLength(0))
+    ));
+    let header_overlapping_index = FusedApplyPreparation {
+        columns: &columns,
+        values: &[7_i32],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 24,
+        },
+        row_ids: None,
+        index: Some(CudaWriteIndex {
+            memory: std::sync::Arc::clone(&owner),
+            table_mask: 3,
+            hash_shift: 30,
+            key_column: 0,
+        }),
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let header_overlapping_index_direct = FusedApplyRequest {
+        columns: &columns,
+        values: &[7_i32],
+        stamps: &[11],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 24,
+        },
+        row_ids: None,
+        index: Some(CudaWriteIndex {
+            memory: std::sync::Arc::clone(&owner),
+            table_mask: 3,
+            hash_shift: 30,
+            key_column: 0,
+        }),
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    assert!(matches!(
+        header_overlapping_index.footprint(&owner),
+        Err(CudaRuntimeProbeError::InvalidInputLength(0))
+    ));
+    assert!(matches!(
+        CudaI32InsertReplayPreparation::prepare(
+            std::sync::Arc::clone(&owner),
+            &header_overlapping_index,
+            &[11],
+        ),
+        Err(CudaInsertReplayPrepareError::Runtime(
+            CudaRuntimeProbeError::InvalidInputLength(0)
+        ))
+    ));
+    assert!(matches!(
+        owner.submit_i32_fused_apply_status(&header_overlapping_index_direct),
+        Err(CudaRuntimeProbeError::InvalidInputLength(0))
+    ));
+    assert_eq!(
+        owner.read_resident_u64_column(0, 1).unwrap(),
+        vec![0],
+        "prepared and direct overlap validation reject before enqueue or header mutation"
+    );
+    let pairwise_overlapping_preparation = FusedApplyPreparation {
+        columns: &columns,
+        values: &[7_i32],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 16,
+        },
+        row_ids: None,
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let pairwise_overlapping_direct_request = FusedApplyRequest {
+        columns: &columns,
+        values: &[7_i32],
+        stamps: &[11],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 16,
+        },
+        row_ids: None,
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    assert!(matches!(
+        pairwise_overlapping_preparation.footprint(&owner),
+        Err(CudaRuntimeProbeError::InvalidInputLength(16))
+    ));
+    assert!(matches!(
+        CudaI32InsertReplayPreparation::prepare(
+            std::sync::Arc::clone(&owner),
+            &pairwise_overlapping_preparation,
+            &[11],
+        ),
+        Err(CudaInsertReplayPrepareError::Runtime(
+            CudaRuntimeProbeError::InvalidInputLength(16)
+        ))
+    ));
+    assert!(matches!(
+        owner.submit_i32_fused_apply_status(&pairwise_overlapping_direct_request),
+        Err(CudaRuntimeProbeError::InvalidInputLength(16))
+    ));
+    assert!(matches!(
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[]),
+        Err(CudaInsertReplayPrepareError::Runtime(
+            CudaRuntimeProbeError::InvalidInputLength(0)
+        ))
+    ));
+
+    let prepared = match CudaI32InsertReplayPreparation::prepare(
+        std::sync::Arc::clone(&owner),
+        &preparation,
+        &[13],
+    ) {
+        Ok(prepared) => prepared,
+        Err(CudaInsertReplayPrepareError::AsyncTransportUnavailable) => return,
+        Err(error) => panic!("prepare real async replay: {error:?}"),
+    };
+    let geometry = prepared.resource_geometry_report();
+    assert_eq!(geometry.pinned_cuda_allocation_count, 1);
+    assert_eq!(
+        geometry.owner_array_backing_bytes,
+        std::mem::size_of::<std::sync::Arc<crate::resident_memory::CudaResidentDeviceAllocation>>()
+            as u64
+    );
+    assert_eq!(geometry.owner_array_allocation_slots, 1);
+    assert_eq!(geometry.pinned_htod_staging_bytes, 256);
+    assert_eq!(geometry.pinned_htod_staging_allocation_slots, 1);
+    assert_eq!(geometry.pinned_status_bytes, 256);
+    assert_eq!(geometry.pinned_status_allocation_slots, 1);
+    assert_eq!(geometry.pooled_device_staging_bytes, 256);
+    assert_eq!(geometry.pooled_device_staging_allocation_slots, 1);
+    assert_eq!(geometry.private_stream_count, 1);
+    assert_eq!(geometry.private_stream_scratch_bytes, 64);
+    assert_eq!(geometry.private_stream_scratch_allocation_slots, 1);
+    assert!(matches!(geometry.private_stream_timing_event_count, 0 | 2));
+    assert_eq!(geometry.private_stream_timing_event_host_backing_bytes, 0);
+    assert_eq!(geometry.private_stream_timing_event_host_backing_slots, 0);
+    assert!(geometry.transient_ptx_staging_bytes > 1);
+    assert_eq!(geometry.transient_ptx_staging_allocation_slots, 1);
+    match prepared.enqueue().complete() {
+        CudaInsertReplayCompletion::Quiesced(Ok(result)) => {
+            assert!(!result.index_declined);
+            assert!(!result.created_posting);
+        }
+        CudaInsertReplayCompletion::Quiesced(Err(error)) => {
+            panic!("real async replay must quiesce successfully: {error:?}")
+        }
+        CudaInsertReplayCompletion::UnknownQuiescence(unknown) => {
+            panic!(
+                "healthy real async replay must prove quiescence: {:?}",
+                unknown.error()
+            )
+        }
+    }
+    assert_eq!(owner.read_resident_i32_column(16, 1).unwrap(), vec![7]);
+    assert_eq!(owner.read_resident_u64_column(24, 1).unwrap(), vec![13]);
+    assert_eq!(
+        owner.read_resident_u64_column(0, 1).unwrap(),
+        vec![0],
+        "execution-only replay never publishes the row-count header"
+    );
+
+    let other_owner = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &[0_u8; 16])
+            .expect("different-allocation fused destination"),
+    );
+    let different_allocation_request = FusedApplyRequest {
+        columns: &columns,
+        values: &[8_i32],
+        stamps: &[15],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&other_owner),
+            byte_offset: 0,
+        },
+        row_ids: None,
+        index: None,
+        base_row: 0,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    assert!(
+        owner
+            .submit_i32_fused_apply_status(&different_allocation_request)
+            .is_ok(),
+        "nonoverlapping outputs in different allocations remain valid"
+    );
+    assert_eq!(
+        other_owner.read_resident_u64_column(0, 1).unwrap(),
+        vec![15]
+    );
+
+    let unknown_prepared =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[17])
+            .expect("fresh owned launch for unknown-quiescence fault");
+    crate::cuda_context::fail_next_replay_synthetic_fence_not_attempted_for_test();
+    let unknown = match unknown_prepared.enqueue().complete() {
+        CudaInsertReplayCompletion::UnknownQuiescence(unknown) => unknown,
+        CudaInsertReplayCompletion::Quiesced(result) => {
+            panic!("injected fence failure must not claim quiescence: {result:?}")
+        }
+    };
+    assert!(matches!(
+        unknown.error(),
+        CudaRuntimeProbeError::KernelLaunchFailed(-9_991)
+    ));
+    assert!(matches!(
+        unknown.retry_complete(),
+        CudaInsertReplayCompletion::Quiesced(Ok(_))
+    ));
+
+    let quarantined_before = crate::write_apply::quarantined_replay_resource_count_for_test();
+    let observed_driver_error =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[19])
+            .expect("fresh owned launch for driver-boundary fence fault");
+    let enqueues_before = crate::write_apply::replay_successful_enqueue_count_for_test();
+    crate::cuda_context::fail_next_replay_raw_stream_sync_result_for_test(-9_990);
+    let observed_driver_error = match observed_driver_error.enqueue().complete() {
+        CudaInsertReplayCompletion::UnknownQuiescence(unknown) => unknown,
+        CudaInsertReplayCompletion::Quiesced(result) => {
+            panic!("driver-boundary fence error must retain unknown quiescence: {result:?}")
+        }
+    };
+    assert!(matches!(
+        observed_driver_error.error(),
+        CudaRuntimeProbeError::KernelLaunchFailed(-9_990)
+    ));
+    crate::cuda_context::fail_next_replay_raw_stream_sync_result_for_test(-9_989);
+    let observed_driver_error = match observed_driver_error.retry_complete() {
+        CudaInsertReplayCompletion::UnknownQuiescence(unknown) => unknown,
+        CudaInsertReplayCompletion::Quiesced(result) => {
+            panic!("a second CUDA fence error must retain unknown quiescence: {result:?}")
+        }
+    };
+    assert!(matches!(
+        observed_driver_error.error(),
+        CudaRuntimeProbeError::KernelLaunchFailed(-9_989)
+    ));
+    assert!(matches!(
+        observed_driver_error.retry_complete(),
+        CudaInsertReplayCompletion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(
+            -9_990
+        )))
+    ));
+    assert_eq!(
+        crate::write_apply::replay_successful_enqueue_count_for_test(),
+        enqueues_before + 1,
+        "retrying unknown quiescence must only fence the original submission, never relaunch it"
+    );
+    assert_eq!(
+        owner.read_resident_u64_column(24, 1).unwrap(),
+        vec![19],
+        "a retry proves quiescence without replaying the already-submitted kernel"
+    );
+
+    let launch_then_fence_error =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[21])
+            .expect("fresh owned launch for terminal launch error precedence");
+    crate::cuda_context::fail_next_owned_stream_launch_after_dispatch_for_test();
+    let launch_then_fence_error = launch_then_fence_error.enqueue();
+    crate::cuda_context::fail_next_replay_raw_stream_sync_result_for_test(-9_990);
+    let launch_then_fence_error = match launch_then_fence_error.complete() {
+        CudaInsertReplayCompletion::UnknownQuiescence(unknown) => unknown,
+        CudaInsertReplayCompletion::Quiesced(result) => {
+            panic!("terminal launch error plus fence error must retain quiescence: {result:?}")
+        }
+    };
+    assert!(matches!(
+        launch_then_fence_error.retry_complete(),
+        CudaInsertReplayCompletion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(
+            -9_993
+        )))
+    ));
+
+    let dtoh_then_fence_error =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[22])
+            .expect("fresh owned launch for terminal DtoH error precedence");
+    let dtoh_then_fence_error = dtoh_then_fence_error.enqueue();
+    crate::cuda_context::fail_next_owned_stream_dtoh_enqueue_for_test();
+    crate::cuda_context::fail_next_replay_raw_stream_sync_result_for_test(-9_990);
+    let dtoh_then_fence_error = match dtoh_then_fence_error.complete() {
+        CudaInsertReplayCompletion::UnknownQuiescence(unknown) => unknown,
+        CudaInsertReplayCompletion::Quiesced(result) => {
+            panic!("terminal DtoH error plus fence error must retain quiescence: {result:?}")
+        }
+    };
+    assert!(matches!(
+        dtoh_then_fence_error.retry_complete(),
+        CudaInsertReplayCompletion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(
+            -9_994
+        )))
+    ));
+
+    let post_htod_launch_failure =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[23])
+            .expect("fresh owned launch for post-HtoD launch fault");
+    crate::cuda_context::fail_next_owned_stream_launch_after_dispatch_for_test();
+    assert!(matches!(
+        post_htod_launch_failure.enqueue().complete(),
+        CudaInsertReplayCompletion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(
+            -9_993
+        )))
+    ));
+    assert_eq!(
+        owner.read_resident_u64_column(24, 1).unwrap(),
+        vec![23],
+        "the injected post-dispatch error still drains a real launched kernel"
+    );
+
+    let status_dtoh_failure =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[25])
+            .expect("fresh owned launch for status-DtoH fault");
+    crate::cuda_context::fail_next_owned_stream_dtoh_enqueue_for_test();
+    assert!(matches!(
+        status_dtoh_failure.enqueue().complete(),
+        CudaInsertReplayCompletion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(
+            -9_994
+        )))
+    ));
+    assert_eq!(
+        owner.read_resident_u64_column(24, 1).unwrap(),
+        vec![25],
+        "a status-DtoH enqueue failure drains the already-launched kernel"
+    );
+
+    let post_bind_error =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[26])
+            .expect("fresh owned launch for post-submit bind error");
+    crate::cuda_context::fail_next_replay_post_submit_bind_raw_cuda_result_for_test(-9_995);
+    assert!(matches!(
+        post_bind_error.enqueue().complete(),
+        CudaInsertReplayCompletion::Quiesced(Err(CudaRuntimeProbeError::KernelLaunchFailed(
+            -9_995
+        )))
+    ));
+    assert_eq!(
+        crate::write_apply::quarantined_replay_resource_count_for_test(),
+        quarantined_before + 6,
+        "every post-submission CUDA error quarantines its stream and pooled DMA backing even after a later drain"
+    );
+
+    let panic_after_enqueue =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[27])
+            .expect("fresh owned launch for unwind drain");
+    crate::cuda_context::panic_next_owned_stream_after_enqueue_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = panic_after_enqueue.enqueue();
+    }))
+    .is_err());
+    assert_eq!(
+        owner.read_resident_u64_column(24, 1).unwrap(),
+        vec![27],
+        "unwinding after the first enqueue drains before pool release"
+    );
+
+    let cross_thread =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[29])
+            .expect("fresh owned launch for cross-thread completion");
+    let cross_thread_result = std::thread::spawn(move || cross_thread.enqueue().complete())
+        .join()
+        .expect("cross-thread replay completion thread");
+    assert!(matches!(
+        cross_thread_result,
+        CudaInsertReplayCompletion::Quiesced(Ok(_))
+    ));
+    assert_eq!(
+        owner.read_resident_u64_column(24, 1).unwrap(),
+        vec![29],
+        "the Send submission retains its shared-pool owners across threads"
+    );
+
+    assert_eq!(
+        crate::write_apply::parked_replay_resource_count_for_test(),
+        0,
+        "prior retries and drains leave no global parked resource"
+    );
+    let repeated_sync_failure =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[31])
+            .expect("fresh owned launch for repeated-sync park");
+    crate::cuda_context::fail_next_replay_synthetic_fence_not_attempted_for_test();
+    let parked = match repeated_sync_failure.enqueue().complete() {
+        CudaInsertReplayCompletion::UnknownQuiescence(unknown) => unknown,
+        CudaInsertReplayCompletion::Quiesced(result) => {
+            panic!("first injected sync failure must be unknown: {result:?}")
+        }
+    };
+    crate::cuda_context::fail_next_replay_synthetic_fence_not_attempted_for_test();
+    drop(parked);
+    assert_eq!(
+        crate::write_apply::parked_replay_resource_count_for_test(),
+        1,
+        "a second Drop fence failure parks rather than returns in-flight pool resources"
+    );
+    assert_eq!(
+        crate::write_apply::drain_parked_replay_resources_for_test()
+            .expect("parked submission becomes drainable after transient sync failure"),
+        1
+    );
+    assert_eq!(
+        crate::write_apply::parked_replay_resource_count_for_test(),
+        0,
+        "test reclaims the bounded parking slot without cross-test leakage"
+    );
+
+    let dropped =
+        CudaI32InsertReplayPreparation::prepare(std::sync::Arc::clone(&owner), &preparation, &[33])
+            .expect("fresh owned launch for drop drain")
+            .enqueue();
+    drop(dropped);
+    assert_eq!(
+        owner.read_resident_u64_column(24, 1).unwrap(),
+        vec![33],
+        "drop must drain the private stream before its staging can be pooled"
     );
 }
 
@@ -188,8 +863,7 @@ fn prepared_fused_apply_owns_exact_host_geometry_and_drains_every_post_launch_fa
     assert_eq!(footprint.temporary_destination_array_bytes, 0);
     assert_eq!(footprint.owner_construction_spare_bytes, 0);
     assert_eq!(
-        footprint.maximum_temporary_host_scratch_bytes,
-        footprint.temporary_ptx_nul_staging_bytes,
+        footprint.maximum_temporary_host_scratch_bytes, footprint.temporary_ptx_nul_staging_bytes,
         "the NUL-terminated PTX image is the sole temporary preparation backing"
     );
     let counters_before = prepared_i32_fused_apply_counters();
@@ -210,10 +884,12 @@ fn prepared_fused_apply_owns_exact_host_geometry_and_drains_every_post_launch_fa
         "materialized exact staging backing agrees with the allocation-free prediction"
     );
     assert_eq!(
-        retention.owner_array_allocation_slots, footprint.owner_array_allocation_slots
+        retention.owner_array_allocation_slots,
+        footprint.owner_array_allocation_slots
     );
     assert_eq!(
-        retention.staging_allocation_slots, footprint.staging_allocation_slots
+        retention.staging_allocation_slots,
+        footprint.staging_allocation_slots
     );
     assert_eq!(
         token.preparation_bytes(),
@@ -375,19 +1051,24 @@ fn prepared_fused_apply_footprint_deduplicates_distinct_allocation_wrappers() {
         .expect("alias-aware prepared fused token");
     let retention = token.host_retention_report().unwrap();
     assert_eq!(
-        retention.owner_array_element_count, footprint.pinned_cuda_allocation_count
+        retention.owner_array_element_count,
+        footprint.pinned_cuda_allocation_count
     );
     assert_eq!(
-        retention.owner_array_backing_bytes, footprint.owner_array_backing_bytes
+        retention.owner_array_backing_bytes,
+        footprint.owner_array_backing_bytes
     );
     assert_eq!(
-        retention.owner_array_allocation_slots, footprint.owner_array_allocation_slots
+        retention.owner_array_allocation_slots,
+        footprint.owner_array_allocation_slots
     );
     assert_eq!(
-        retention.staging_backing_bytes, footprint.staging_backing_bytes
+        retention.staging_backing_bytes,
+        footprint.staging_backing_bytes
     );
     assert_eq!(
-        token.preparation_bytes(), footprint.pooled_device_scratch_bytes
+        token.preparation_bytes(),
+        footprint.pooled_device_scratch_bytes
     );
 }
 

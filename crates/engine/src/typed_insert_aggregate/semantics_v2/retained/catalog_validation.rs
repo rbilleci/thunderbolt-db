@@ -27,18 +27,27 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
-pub(super) use allocator::SemanticsV2DurableAllocatorIndexProof;
+#[allow(unused_imports)]
+// The sealed replay builder consumes these immediately after this slice.
+pub(in crate::typed_insert_aggregate::semantics_v2::retained) use allocator::{
+    SemanticsV2DurableAllocatorIndexProof, ValidatedAllocatorAssignment,
+    ValidatedAllocatorReplayRowBinding, ValidatedAllocatorReplayRowBindings,
+};
 
+#[cfg(test)]
+pub(crate) use allocator::AllocatorAssignmentProofSabotageForTest;
 #[cfg(test)]
 pub(super) use allocator::AllocatorLeaseSpecForTest;
 
 #[cfg(test)]
 pub(super) fn with_allocator_proof_for_test<T>(
     identity: SemanticsV2BoundIdentity,
+    graph: ReservedSemanticsV2Graph,
     leases: &[AllocatorLeaseSpecForTest],
-    operation: impl FnOnce(SemanticsV2DurableAllocatorIndexProof<'_>) -> T,
+    sabotage: Option<AllocatorAssignmentProofSabotageForTest>,
+    operation: impl FnOnce(SemanticsV2DurableAllocatorIndexProof<'_>, ReservedSemanticsV2Graph) -> T,
 ) -> T {
-    allocator::with_allocator_proof_for_test(identity, leases, operation)
+    allocator::with_allocator_proof_for_test(identity, graph, leases, sabotage, operation)
 }
 
 const TARGET_TABLE: u8 = 1;
@@ -55,20 +64,26 @@ const DOMAIN_CONSTRAINT_GUARD: u8 = 11;
 
 const FOREIGN_PARENT_TABLE_ROLE: u16 = 4;
 
-pub(super) fn validate(
+pub(super) fn validate<'a>(
     identity: SemanticsV2BoundIdentity,
     graph: &ReservedSemanticsV2Graph,
-    witness: &SemanticsV2CatalogAllocatorWitness<'_>,
-) -> Result<(), crate::EngineError> {
+    witness: &SemanticsV2CatalogAllocatorWitness<'a>,
+) -> Result<ValidatedAllocatorAssignment<'a>, crate::EngineError> {
     validate_catalog_allocator_witness_identity(identity, witness)?;
     validate_retained_header_identity(identity, graph)?;
     validate_catalog_order(&witness.catalog)?;
-    allocator::validate_allocator_closure(identity, graph, &witness.allocator_index)?;
+    let assignment = allocator::validate_allocator_closure(
+        identity,
+        graph,
+        &witness.catalog,
+        &witness.allocator_index,
+    )?;
     allocator::validate_table_closure(identity, graph, &witness.catalog)?;
     validate_index_closure(identity, graph, &witness.catalog)?;
     validate_domain_closure(identity, graph, &witness.catalog)?;
     guards::validate_guard_closure(identity, graph, &witness.catalog)?;
-    validate_sequence_closure(identity, graph, &witness.catalog)
+    validate_sequence_closure(identity, graph, &witness.catalog)?;
+    Ok(assignment)
 }
 
 /// Test-only terminal leaf for hostile catalog-guard evidence.  It consumes the codec-closed

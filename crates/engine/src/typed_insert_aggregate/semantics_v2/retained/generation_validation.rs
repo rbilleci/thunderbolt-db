@@ -224,6 +224,7 @@ where
             let CatalogAndAllocatorValidated {
                 catalog: _,
                 allocator_index: _,
+                allocator_assignment: _,
             } = pending.catalog_and_allocator;
             Ok(FullyWitnessValidatedSemanticsV2 {
                 graph: pending.graph,
@@ -1455,7 +1456,12 @@ mod boundary_tests {
         let q2_retained_facade = retained
             .split("/// Consume an actual codec-closed owner through the one catalog/allocator transition while the")
             .nth(1)
-            .and_then(|tail| tail.split("pub(super) fn validate_catalog_allocator_witness_identity").next())
+            .and_then(|tail| {
+                tail.split(
+                    "/// Consume a real production-shaped catalog/allocator owner through the one durable sequence",
+                )
+                .next()
+            })
             .expect("retained keeps the bounded Q2 facade");
         let q2_typed_reencode_bridges = typed_batch
             .split("/// Test-only canonical S2 reencoder for an already validated, move-only decoded record.")

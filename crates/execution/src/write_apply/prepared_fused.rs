@@ -35,6 +35,9 @@ pub struct FusedApplyPreparation<'a> {
     pub row_ids: Option<(&'a [u64], CudaWriteDestination)>,
     pub index: Option<CudaWriteIndex>,
     pub base_row: u32,
+    /// The host-only row-count publication word.  Validation requires this to be disjoint from
+    /// every nonempty destination the fused kernel can write, so the kernel never clobbers the
+    /// later publication value.
     pub header: CudaWriteDestination,
 }
 
@@ -216,24 +219,24 @@ fn fused_i32_apply_shape_geometry(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FusedApplyValidatedGeometry {
-    k: usize,
-    k_u32: u32,
-    cols_u32: u32,
+pub(super) struct FusedApplyValidatedGeometry {
+    pub(super) k: usize,
+    pub(super) k_u32: u32,
+    pub(super) cols_u32: u32,
     new_row_count: u32,
     value_bytes_per_column: usize,
-    header_bytes: usize,
-    values_padded: usize,
-    stamp_bytes: usize,
-    total_staging_bytes: usize,
-    pk_col: u32,
-    index_ptr: u64,
-    index_mask: u32,
-    index_shift: u32,
-    created_by_dest: u64,
-    row_id_dest: u64,
+    pub(super) header_bytes: usize,
+    pub(super) values_padded: usize,
+    pub(super) stamp_bytes: usize,
+    pub(super) total_staging_bytes: usize,
+    pub(super) pk_col: u32,
+    pub(super) index_ptr: u64,
+    pub(super) index_mask: u32,
+    pub(super) index_shift: u32,
+    pub(super) created_by_dest: u64,
+    pub(super) row_id_dest: u64,
     header_dest: u64,
-    footprint: FusedApplyPreparationFootprint,
+    pub(super) footprint: FusedApplyPreparationFootprint,
 }
 
 /// Exact host ownership retained by one prepared launch. The device lease is charged by the
@@ -599,7 +602,7 @@ impl CudaResidentDeviceMemory {
     }
 }
 
-fn validate_fused_apply_preparation(
+pub(super) fn validate_fused_apply_preparation(
     source: &CudaResidentDeviceMemory,
     preparation: &FusedApplyPreparation<'_>,
 ) -> Result<FusedApplyValidatedGeometry, CudaRuntimeProbeError> {
@@ -626,32 +629,12 @@ fn validate_fused_apply_preparation(
         .checked_add(k_u32)
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(k))?;
     let value_bytes_per_column = shape.value_bytes_per_column;
+    let value_bytes_per_column_u64 = u64::try_from(value_bytes_per_column)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let stamp_bytes = shape.stamp_bytes;
+    let stamp_bytes_u64 = u64::try_from(stamp_bytes)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let primary = source.primary_arc();
-    for destination in preparation.columns {
-        checked_destination(
-            &primary,
-            destination,
-            value_bytes_per_column as u64,
-            std::mem::align_of::<i32>() as u64,
-        )?;
-    }
-    let created_by_dest = checked_destination(
-        &primary,
-        &preparation.created_by,
-        stamp_bytes as u64,
-        std::mem::align_of::<u64>() as u64,
-    )?;
-    let row_id_dest = if let Some((_, destination)) = preparation.row_ids.as_ref() {
-        checked_destination(
-            &primary,
-            destination,
-            stamp_bytes as u64,
-            std::mem::align_of::<u64>() as u64,
-        )?
-    } else {
-        0
-    };
     let header_dest = checked_destination(
         &primary,
         &preparation.header,
@@ -661,7 +644,50 @@ fn validate_fused_apply_preparation(
     if preparation.header.memory.allocation_identity() != source.allocation_identity() {
         return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
     }
-    let (pk_col, index_ptr, index_mask, index_shift) =
+    for destination in preparation.columns {
+        checked_destination(
+            &primary,
+            destination,
+            value_bytes_per_column_u64,
+            std::mem::align_of::<i32>() as u64,
+        )?;
+        validate_fused_apply_destination_disjoint_from_header(
+            &preparation.header,
+            &destination.memory,
+            destination.byte_offset,
+            value_bytes_per_column_u64,
+        )?;
+    }
+    let created_by_dest = checked_destination(
+        &primary,
+        &preparation.created_by,
+        stamp_bytes_u64,
+        std::mem::align_of::<u64>() as u64,
+    )?;
+    validate_fused_apply_destination_disjoint_from_header(
+        &preparation.header,
+        &preparation.created_by.memory,
+        preparation.created_by.byte_offset,
+        stamp_bytes_u64,
+    )?;
+    let row_id_dest = if let Some((_, destination)) = preparation.row_ids.as_ref() {
+        let row_id_dest = checked_destination(
+            &primary,
+            destination,
+            stamp_bytes_u64,
+            std::mem::align_of::<u64>() as u64,
+        )?;
+        validate_fused_apply_destination_disjoint_from_header(
+            &preparation.header,
+            &destination.memory,
+            destination.byte_offset,
+            stamp_bytes_u64,
+        )?;
+        row_id_dest
+    } else {
+        0
+    };
+    let (pk_col, index_ptr, index_mask, index_shift, index_write_span) =
         if let Some(index) = preparation.index.as_ref() {
             if !Arc::ptr_eq(&primary, &index.memory.primary_arc()) || index.key_column >= cols_u32 {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(
@@ -675,15 +701,36 @@ fn validate_fused_apply_preparation(
                 preparation.base_row,
                 k_u32,
             )?;
+            let index_bytes =
+                crate::resident_index_allocated_bytes(index.table_mask, u64::from(new_row_count))
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            validate_fused_apply_destination_disjoint_from_header(
+                &preparation.header,
+                &index.memory,
+                0,
+                index_bytes,
+            )?;
             (
                 index.key_column,
                 index.memory.device_ptr(),
                 index.table_mask,
                 index.hash_shift,
+                Some((&*index.memory, index_bytes)),
             )
         } else {
-            (u32::MAX, 0, 0, 0)
+            (u32::MAX, 0, 0, 0, None)
         };
+    validate_fused_apply_kernel_write_spans(
+        preparation.columns,
+        value_bytes_per_column_u64,
+        &preparation.created_by,
+        stamp_bytes_u64,
+        preparation
+            .row_ids
+            .as_ref()
+            .map(|(_, destination)| destination),
+        index_write_span,
+    )?;
     let distinct_owner_count = distinct_preparation_owner_count(source, preparation)?;
     let footprint = i32_fused_apply_footprint_for_shape(
         k,
@@ -739,7 +786,7 @@ fn distinct_preparation_owner_count(
 /// Visit owner candidates in the exact pinning order. The nested rescan in
 /// [`owner_memory_seen_before`] is intentional: preparation cardinalities are bounded and this
 /// avoids a map/set allocation before materialization while deduplicating allocation aliases.
-fn visit_preparation_owner_memories(
+pub(super) fn visit_preparation_owner_memories(
     source: &CudaResidentDeviceMemory,
     preparation: &FusedApplyPreparation<'_>,
     mut visit: impl FnMut(usize, &CudaResidentDeviceMemory),
