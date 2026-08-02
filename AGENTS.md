@@ -53,9 +53,9 @@ When choosing between implementation approaches:
 - Use the `worker` agent for bounded implementation, fixes, tests, and verification. It uses Terra with `xhigh`
   reasoning and may inherit the parent write permissions.
 - Use the `architect` agent for ambiguous, cross-subsystem architecture, transaction, WAL/recovery, concurrency,
-  GPU-residency, and ownership decisions. It uses Sol with `max` reasoning and is read-only.
-- Use the `acceptance_auditor` agent for the independent acceptance gate. It uses Sol with `max` reasoning and is
-  read-only.
+  GPU-residency, and ownership decisions. It uses Sol with `xhigh` reasoning and is read-only.
+- Use the `acceptance_auditor` agent for the independent acceptance gate. It uses Terra with `xhigh` reasoning and
+  is read-only.
 - Use the `explorer` agent only for read-only search, inventory, evidence extraction, and log triage. It uses Luna
   with `medium` reasoning and must return any coding work to the parent.
 - Any task that creates or modifies source, tests, build scripts, benchmark harnesses, migrations, generated code,
