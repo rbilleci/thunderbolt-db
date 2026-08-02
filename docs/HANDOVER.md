@@ -34,10 +34,20 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
   only as a physical strategy beneath the one canonical allocator/WAL/status/apply/poison/publication path.
 - WRITE-001's sealed typed bootstrap-resource attachment is accepted as a private, production-unreachable source
   boundary. Its root-free compiler/proof schema and the private `V1SingleTableInt4` asynchronous GPU Rebuild proof
-  are accepted; the next slice is grammar breadth (remaining fixed-width types, indexes/status/multiple tables),
-  followed by the separately accepted comparator and persistent-map import/install boundary. `Text` remains an
-  explicit PLAN prerequisite requiring a versioned GPU-ready offsets/blob layout before any live bootstrap or
-  recovery integration.
+  are accepted. The deliberately narrower live exception is now accepted: one explicit durable sealed
+  nullable-Int4 table recovery generation, terminal-canonical-cut/root comparison, an imported immutable one-entry
+  persistent table map (65 empties, leaf, 64-node path), coordinator install, and a telemetry-proved plain GPU
+  `SELECT *` route reached through that map. The accepted corrected-storage candidate is commit
+  `b24889c985e3284a7a10b7a68fc709858dd5eade`, tree `b0fbe39d618d44f23a70a6ce4a16a0527fb77d22`, and staged-diff
+  SHA-256 `ff92eab4e4d7dc82869b24f1db0f6231ab2ffbc441a144c17eaa676fc03c979a`. It passed focused Rebuild/real-GPU
+  nullable reopen/CUDA-719 HAZARD gates, independent audit, and a retained quick Section-B median of
+  `272,655,388` lookups/s (3/3 above PERF-002's 260M floor). Its single complete full-card transcript is
+  `/home/richard/projects/gpu-db-write001-storage-v6-candidate.kC89eg/candidate/target/benchmark-report-card-runs/runner.b24889c985e3.b0fbe39d618d.Tdf2lk.log`;
+  it records canonical A/B/C completion, valid closeout, Section-B median `266,839,011` (3/3 above 260M), and
+  Section-C `258,705,357` lookups/s at 48M rows/300 batches before the exact terminal completion record. The
+  independent post-card audit returned **FINAL ACCEPT**. This closing documentation-only update leaves its
+  runtime/harness evidence applicable. It does not import a generic/multi-table persistent map or status/index
+  roots; the full grammar, `Text`, and generalized publication authority remain PLAN-owned deferred work.
 - WRITE-001's 2026-07-28 checkpoint accepted device pre-WAL CHECK/primary-key NULL/dense-batch key/current-resident
   key proof, exact diagnostic ordering, default/sequence error precedence, and an inert test-only indexed in-place
   append/index-delta ownership proof. The accepted runtime/card seal is tree `e1a7713f633403a9552b9f202fc8c87932fe3305`,
@@ -139,26 +149,43 @@ work; [`STATUS.md`](STATUS.md) owns accepted evidence and current facts.
 
 ## Resume here
 
-**WRITE-001** is the sole active **NOW** task. The sealed retention-authority checkpoint received fresh independent
-**ACCEPT** on 2026-07-31 after a repaired terminal-fact carry-through. Its exact source commit is
-`86f82ec4045b055e95fca71ffcba0a7b20a35bc6`, tree `40e94f3f99dd76f3cf6fc1c3513be24643e3a963`,
-cached-diff SHA-256 `8bdd6fd440c2ca6d645a2f71b6740529f4bba26af6e1f1a83664c5db84f3550e`, across two source paths
-without drift.
+**WRITE-001** is the sole active **NOW** task. The durable sequence-index checkpoint received fresh independent
+**ACCEPT** on 2026-08-01. Its frozen seven-path content manifest SHA-256 is
+`f50daf9f0bd3852ce8166540cd94a07a0cedfb52c6006623433caf557b4c5a85`, with no audit finding.
 
-The accepted boundary consumes `RetentionAuthorityPending` into `CatalogAllocatorPending` only after the sole
-borrowed claim/status authority proves the live claim or sealed historical no-retention form. It closes exact
-identity, statement digest, immutable intent, durable lineage/location/order, and terminal-predecessor intent
-preservation; terminal S6/S7/S8/aggregate/STATUS2 facts are opaque carry-through only. No catalog/allocator,
-sequence, GPU, WAL, recovery, apply, result, or publication successor exists. Retention proof tests pass **9/9**;
-the retained ownership/source-boundary suite passes **53/53**; workspace check, strict Clippy, scoped formatting,
-and diff checks are clean. The production writer remains semantics v1. The attempted broad serial library
-diagnostic timed out under an external 43.9-GiB VLLM GPU occupant and is not acceptance evidence; GPU/HAZARD,
-recovery, NULL differential, and cards remain inapplicable to this host-only unreachable slice.
+The accepted boundary consumes `DurableSequencePending` into `GenerationPending` after authenticating one immutable
+same-lineage complete/durable/published sequence-outcome index and checkpoint pin, even when S5 is empty. It walks
+S5 in canonical source order and closes every exact S1/S2/S4/S7 and durable record field, including an allocation-free
+streamed Default input digest whose bytes match the writer codec. Missing, pruned, forward, cross-lineage,
+mismatched, or non-Default outcomes fail closed; the child survives a parent abort. The 92-test semantics suite,
+1,853-test engine library, workspace check, strict Clippy, scoped formatting, diff, and size gates are clean. GPU/
+HAZARD, recovery, NULL differential, and cards remain inapplicable to this host-only, production-unreachable slice.
 
-Resume only with PLAN.md's next pinned catalog plus ADR-014 allocator-lease proof:
-`CatalogAllocatorPending -> DurableSequencePending`. Do not combine durable sequence validation, GPU
-replay/capacity, WAL, recovery, apply, publication, or a second RetentionIntent authority into that checkpoint.
-The accepted design and prior Q2 facts remain unchanged, and the CARD-001/COPY-001 blocks remain in force.
+The exact allocator replay-assignment closure received fresh independent **ACCEPT** on 2026-08-01. Its frozen
+ten-path content manifest SHA-256 is
+`319a3486848b05314634fd6931be084e1b632efc69d206444e53fb93e558eb9d`. The shared immutable allocator root now
+authenticates parent-bound exact assignments: no S4/S7 or lease-boundary inference is possible. Complete-root
+validation closes stable-parent provenance before mutable fields, assignment/lease marker identity, and the
+one-system-transaction/one-commit rule; the sealed narrow binding covers all S1/S2 source rows, including canceled
+and suppressed rows, through `GenerationPending`.
+
+The compiler-only binding projection received independent **ACCEPT** on 2026-08-01, manifest
+`7453e4179de98f36486fab8e5c6cc1e4fff9ea48bf506199e0b43fac2a4c43c1`. It is an allocation-free exact-size iterator
+that exposes only `(stable_table_id, statement_ordinal, source_row_ordinal, stable_row_id)`; complete-root singleton,
+lease containment, and all-parent overlap checks prevent an unselected assignment from duplicating any replay ID.
+
+The asynchronous typed-i32 replay submission prerequisite also received independent **ACCEPT** on 2026-08-01: its
+six-path content manifest is `b160464f4936d37388caaf0b6444bf6f2d0fdf9fe8f0fdf5e6bdcb8dd44dfdcb`. It queues a real
+fused typed-write kernel on an owned private CUDA stream and retains exact staging, pins, stream/event ownership, and
+quarantine-safe completion without header publication or any WAL/apply authority.
+
+Resume with PLAN.md's next ordered WRITE-001 checkpoint: the sole immutable publication-generation authority. The
+accepted narrow spine remains one sealed nullable-Int4 table and does not relax its breadth boundary. Runtime has no
+codec-v2 authenticated data generation/root: catalog commit sequences, residency cache generations, route tokens,
+device pointers, and shard maps must never be relabeled or hashed as roots. Do not start `ReplayBaseGenerationPin`
+or `GenerationPending` consumption until the later domain-separated persistent database/table/index **data**
+manifest authority is accepted. Do not add a second evaluator or production builder. The accepted design and prior
+Q2 facts remain unchanged, and the CARD-001/COPY-001 blocks remain in force.
 
 **CARD-001** is blocked on accepted WRITE-001, and **COPY-001** is blocked on both.
 Preserve PRODUCT-001's sole server/facade/admission/WAL/recovery/publication authority, PERF-002's 260M point-read

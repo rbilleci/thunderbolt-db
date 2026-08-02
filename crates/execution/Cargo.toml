@@ -13,6 +13,10 @@ libloading.workspace = true
 # probe code is not compiled (zero perturbation; we measure in --release). Enable for benches/measurement:
 # `cargo run --features probe-timing ...`. Keep probes behind this rather than write-then-revert.
 probe-timing = []
+# Narrow cross-crate hardware fault injection used by engine recovery HAZARD tests.  It is never
+# enabled by production dependencies and only makes the existing owned-stream fence return a
+# caller-chosen CUDA status.
+test-support = []
 
 [dev-dependencies]
 # Reader/writer snapshot substrate, used by the P1-M3 step-1 real-GPU soundness

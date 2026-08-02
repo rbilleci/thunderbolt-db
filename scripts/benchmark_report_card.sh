@@ -41,6 +41,9 @@
 #   GPU_GAP            quick-screen cool-down, seconds      (default 12; full mode is fixed at 12)
 #   BENCH_TARGET_DIR   caller-owned EMPTY build directory   (default: fresh target/benchmark-report-card.*)
 #   BENCH_KEEP_TARGET  retain the auto-created target       (default 0; set to 1 for diagnosis)
+#   BENCH_REPORT_CARD_LOG
+#                      durable full-card stdout/stderr transcript (default: a fresh file under
+#                      target/benchmark-report-card-runs; it is deliberately outside the disposable build target)
 #
 # Acceptance floor:
 #   Section B batch-65,536 production-compact whole-run wall throughput must be
@@ -580,7 +583,10 @@ cleanup_owned_bench_target() {
   fi
   case "$cleanup_target" in
     "$cleanup_repo_root"/target/benchmark-report-card.??????)
-      rm -rf -- "$cleanup_target"
+      if ! rm -rf -- "$cleanup_target"; then
+        echo "failed to remove isolated benchmark target: $cleanup_target" >&2
+        return 1
+      fi
       echo "# removed isolated benchmark target: $cleanup_target"
       ;;
     *)
@@ -588,6 +594,100 @@ cleanup_owned_bench_target() {
       return 1
       ;;
   esac
+}
+
+# A canonical card may clean its fresh build target, but its result transcript is acceptance evidence and must
+# survive that cleanup. Keep it separately and make a failed durable capture fail the runner rather than leaving a
+# superficially successful terminal status with no inspectable provenance.
+report_card_log=""
+report_card_log_tee_pid=""
+
+start_durable_report_card_log() {
+  local requested_log="${BENCH_REPORT_CARD_LOG:-}"
+  local log_dir
+  local log_name
+
+  [[ "$mode" == "full" ]] || return 0
+  if [[ -n "$requested_log" ]]; then
+    log_dir="$(dirname -- "$requested_log")"
+    log_name="$(basename -- "$requested_log")"
+    if [[ "$log_name" == "." || "$log_name" == "/" ]]; then
+      echo "BENCH_REPORT_CARD_LOG must name a file" >&2
+      return 1
+    fi
+    if ! mkdir -p -- "$log_dir"; then
+      echo "failed to create BENCH_REPORT_CARD_LOG parent: $log_dir" >&2
+      return 1
+    fi
+    log_dir="$(cd "$log_dir" && pwd -P)" || return 1
+    report_card_log="$log_dir/$log_name"
+    case "$report_card_log" in
+      "$bench_target_dir"|"$bench_target_dir"/*)
+        echo "BENCH_REPORT_CARD_LOG must be outside the disposable benchmark target" >&2
+        return 1
+        ;;
+    esac
+    if [[ -e "$report_card_log" ]]; then
+      echo "BENCH_REPORT_CARD_LOG must not already exist: $report_card_log" >&2
+      return 1
+    fi
+    if ! (set -C; : >"$report_card_log") 2>/dev/null; then
+      echo "failed to create BENCH_REPORT_CARD_LOG: $report_card_log" >&2
+      return 1
+    fi
+  else
+    log_dir="$repo_root/target/benchmark-report-card-runs"
+    if ! mkdir -p -- "$log_dir"; then
+      echo "failed to create durable report-card log directory: $log_dir" >&2
+      return 1
+    fi
+    report_card_log="$(mktemp "$log_dir/runner.${git_head:0:12}.${candidate_index_tree:0:12}.XXXXXX.log")" || {
+      echo "failed to create durable report-card log" >&2
+      return 1
+    }
+  fi
+
+  exec 3>&1
+  exec 4>&2
+  # The host-facing console is best-effort. `-p` keeps its broken pipe from terminating the primary transcript
+  # writer, while a failure writing the transcript itself still reaches `wait` below as a hard runner failure.
+  exec > >(tee -p -a "$report_card_log" >&3) 2>&1
+  report_card_log_tee_pid=$!
+  echo "# durable report-card transcript: $report_card_log"
+}
+
+finish_durable_report_card_log() {
+  local tee_pid="$report_card_log_tee_pid"
+  [[ -n "$tee_pid" ]] || return 0
+  exec 1>&3 2>&4
+  if ! wait "$tee_pid"; then
+    echo "durable report-card transcript capture failed: $report_card_log" >&2
+    return 1
+  fi
+  exec 3>&-
+  exec 4>&-
+  report_card_log_tee_pid=""
+  return 0
+}
+
+exit_after_durable_cleanup() {
+  local original_rc="$1"
+  local cleanup_rc="$2"
+  if [[ "$original_rc" -ne 0 ]]; then
+    exit "$original_rc"
+  fi
+  exit "$cleanup_rc"
+}
+
+cleanup_bench_target() {
+  local original_rc=$?
+  local cleanup_rc=0
+  cleanup_owned_bench_target \
+    "$repo_root" "$bench_target_dir" "$bench_target_owned" "${BENCH_KEEP_TARGET:-0}" || cleanup_rc=$?
+  if ! finish_durable_report_card_log; then
+    cleanup_rc=1
+  fi
+  exit_after_durable_cleanup "$original_rc" "$cleanup_rc"
 }
 
 run_section() {
@@ -677,6 +777,18 @@ run_self_check() {
   local probe_rc
   local probe_output
   local terminal_failure_class
+  local mode="$mode"
+  local repo_root="${repo_root:-}"
+  local git_head="${git_head:-}"
+  local candidate_index_tree="${candidate_index_tree:-}"
+  local bench_target_owned="${bench_target_owned:-0}"
+  local BENCH_REPORT_CARD_LOG="${BENCH_REPORT_CARD_LOG:-}"
+  local report_card_log="$report_card_log"
+  local report_card_log_tee_pid="$report_card_log_tee_pid"
+  local self_durable_log
+  local self_console_fd
+  local self_cleanup_rc
+  local self_exit_rc
   local saved_bench_target_dir="${bench_target_dir:-}"
   local -a saved_section_failures=("${section_failures[@]-}")
   scratch="$(mktemp -d "${TMPDIR:-/tmp}/gpu-db-report-card-self-check.XXXXXX")" || return 1
@@ -1039,6 +1151,54 @@ run_self_check() {
   [[ ! -e "$scratch/cleanup-root/target/benchmark-report-card.ABC123" ]] ||
     failures=$((failures + 1))
 
+  mkdir -p -- "$scratch/cleanup-root/target/benchmark-report-card.ABC124"
+  (
+    rm() { return 1; }
+    cleanup_owned_bench_target "$scratch/cleanup-root" \
+      "$scratch/cleanup-root/target/benchmark-report-card.ABC124" 1 0 >/dev/null
+  ) >/dev/null 2>&1
+  self_cleanup_rc=$?
+  [[ "$self_cleanup_rc" -ne 0 ]] || failures=$((failures + 1))
+
+  (
+    cleanup_owned_bench_target() { return 0; }
+    finish_durable_report_card_log() { return 1; }
+    repo_root="$scratch/cleanup-root"
+    bench_target_dir="$scratch/cleanup-root/target/benchmark-report-card.ABC125"
+    bench_target_owned=1
+    trap cleanup_bench_target EXIT
+    exit 0
+  ) >/dev/null 2>&1
+  self_exit_rc=$?
+  [[ "$self_exit_rc" -eq 1 ]] || failures=$((failures + 1))
+
+  # The terminal record must outlive the disposable build target. Exercise the same descriptor handoff used by a
+  # canonical run; merely creating a side file would not prove that the runner's stdout/stderr reaches it.
+  mode="full"
+  repo_root="$scratch/cleanup-root"
+  git_head="self-check-head"
+  candidate_index_tree="self-check-tree"
+  bench_target_dir="$scratch/cleanup-root/target/benchmark-report-card.DEF456"
+  bench_target_owned=1
+  mkdir -p -- "$bench_target_dir"
+  BENCH_REPORT_CARD_LOG="$scratch/durable/runner.log"
+  exec {self_console_fd}>&1
+  exec > >(head -n 0)
+  if ! start_durable_report_card_log; then
+    failures=$((failures + 1))
+  else
+    echo "report-card-self-check durable-transcript-marker"
+    self_durable_log="$report_card_log"
+    if ! finish_durable_report_card_log; then
+      failures=$((failures + 1))
+    elif [[ "$self_durable_log" == "$bench_target_dir"/* || ! -f "$self_durable_log" ]] ||
+      ! grep -Fq "report-card-self-check durable-transcript-marker" "$self_durable_log"; then
+      failures=$((failures + 1))
+    fi
+  fi
+  exec 1>&"$self_console_fd"
+  exec {self_console_fd}>&-
+
   rm -rf -- "$scratch"
   if [[ "$failures" -ne 0 ]]; then
     echo "benchmark report-card self-check failed: ${failures} assertion(s)" >&2
@@ -1125,11 +1285,11 @@ else
   bench_target_owned=1
 fi
 
-cleanup_bench_target() {
-  cleanup_owned_bench_target \
-    "$repo_root" "$bench_target_dir" "$bench_target_owned" "${BENCH_KEEP_TARGET:-0}"
-}
 trap cleanup_bench_target EXIT
+
+if ! start_durable_report_card_log; then
+  exit 2
+fi
 
 export CARGO_TARGET_DIR="$bench_target_dir"
 # prost-build and other native build helpers may expect the target-local temp directory to exist.

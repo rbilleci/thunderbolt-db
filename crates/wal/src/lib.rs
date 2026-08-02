@@ -56,7 +56,7 @@ pub use checkpoint::{
     lanes_checkpoint_segment_path, lanes_checkpoint_sidecar_path, read_lanes_checkpoint,
     read_wal_checkpoint, read_wal_control_file, wal_checkpoint_control_path,
     wal_checkpoint_segment_path, write_lanes_checkpoint, write_wal_control_file, LanesCheckpoint,
-    WalCheckpointMeta, WalControlFile,
+    SealedInt4RebuildManifestV1, WalCheckpointMeta, WalControlFile,
 };
 
 mod canonical;

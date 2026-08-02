@@ -7,7 +7,10 @@
 pub(super) const DESCRIPTOR_HEADER_BYTES: usize = 80;
 pub(super) const SHARD_DESCRIPTOR_BYTES: usize = 56;
 pub(super) const OUTPUT_STATUS_BYTES: usize = 4;
-pub(super) const PROOF_DIGEST_SLOTS: usize = 135;
+// Closed V1 output: table proof roots, 65 empty table-map roots, one table-map leaf, the
+// 64-node one-entry COW path, then the database root. The map path is necessary to import the
+// sole immutable one-table publication map; no status/index or multi-table completion exists.
+pub(super) const PROOF_DIGEST_SLOTS: usize = 200;
 pub(super) const OUTPUT_BYTES: usize = OUTPUT_STATUS_BYTES + PROOF_DIGEST_SLOTS * 32;
 
 pub(super) const DIGEST_BYTES: u64 = 32;
@@ -48,12 +51,11 @@ pub(super) const SLOT_TYPED_VECTOR: usize = 1;
 pub(super) const SLOT_CURRENT_ROW_LEAVES: usize = 2;
 #[cfg(test)]
 pub(super) const SLOT_ROW_EMPTY: usize = 3;
-#[cfg(test)]
 pub(super) const SLOT_TABLE_ROOT: usize = 68;
-#[cfg(test)]
-pub(super) const SLOT_DATABASE_EMPTY: usize = 69;
-#[cfg(test)]
-pub(super) const SLOT_DATABASE_ROOT: usize = 134;
+pub(super) const SLOT_TABLE_MAP_EMPTY: usize = 69;
+pub(super) const SLOT_TABLE_MAP_LEAF: usize = 134;
+pub(super) const SLOT_TABLE_MAP_PATH: usize = 135;
+pub(super) const SLOT_DATABASE_ROOT: usize = 199;
 
 pub(super) fn descriptor_bytes(shards: usize) -> Option<usize> {
     DESCRIPTOR_HEADER_BYTES.checked_add(shards.checked_mul(SHARD_DESCRIPTOR_BYTES)?)
@@ -136,9 +138,10 @@ mod tests {
         assert_eq!(SLOT_TYPED_VECTOR, 1);
         assert_eq!(SLOT_CURRENT_ROW_LEAVES, 2);
         assert_eq!(SLOT_ROW_EMPTY + 64, SLOT_TABLE_ROOT - 1);
-        assert_eq!(SLOT_DATABASE_EMPTY + 64, SLOT_DATABASE_ROOT - 1);
+        assert_eq!(SLOT_TABLE_MAP_EMPTY + 64, SLOT_TABLE_MAP_LEAF - 1);
+        assert_eq!(SLOT_TABLE_MAP_PATH + 63, SLOT_DATABASE_ROOT - 1);
         assert_eq!(SLOT_DATABASE_ROOT + 1, PROOF_DIGEST_SLOTS);
-        assert_eq!(OUTPUT_BYTES, 4 + 135 * 32);
+        assert_eq!(OUTPUT_BYTES, 4 + 200 * 32);
     }
 
     #[test]

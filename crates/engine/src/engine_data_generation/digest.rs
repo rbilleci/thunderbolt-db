@@ -196,6 +196,15 @@ impl DatabaseRoot {
     }
 }
 
+impl TableRoot {
+    /// The sealed recovery comparator is the sole production handoff that may relabel the
+    /// runtime Rebuild table-root completion.  Keeping this conversion beside the other root
+    /// handoffs prevents a generic host digest-construction surface.
+    pub(super) fn from_gpu_completion(digest: GpuCompletedDigest) -> Self {
+        Self(digest.root())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CatalogIdentity {
     pub(super) epoch: CatalogEpoch,

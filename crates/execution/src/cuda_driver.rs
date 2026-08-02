@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+use std::fmt;
 use std::os::raw::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use libloading::Library;
 
@@ -15,15 +17,87 @@ use crate::{
     RuntimeGenerationRebuildTarget,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CudaDriverRuntime {
     snapshot: CudaRuntimeSnapshot,
+    context_source: CudaContextSource,
+}
+
+/// Context selection belongs to the runtime handle rather than to each allocation helper.  The
+/// normal path keeps its process-wide primary context.  A recovery retry gets a private set of
+/// contexts, lazily one per touched GPU, and nothing in that set is visible to the primary
+/// registry.
+#[derive(Clone)]
+enum CudaContextSource {
+    SharedPrimary,
+    DedicatedRecovery(Arc<RecoveryContextSet>),
+}
+
+struct RecoveryContextSet {
+    contexts: Mutex<BTreeMap<u16, Arc<GpuPrimaryContext>>>,
+}
+
+impl RecoveryContextSet {
+    fn context_for(&self, gpu_id: u16) -> Result<Arc<GpuPrimaryContext>, CudaRuntimeProbeError> {
+        let mut contexts = self
+            .contexts
+            .lock()
+            .expect("dedicated recovery CUDA contexts poisoned");
+        if let Some(existing) = contexts.get(&gpu_id) {
+            return Ok(Arc::clone(existing));
+        }
+        let context = Arc::new(GpuPrimaryContext::create_dedicated_recovery(gpu_id)?);
+        contexts.insert(gpu_id, Arc::clone(&context));
+        Ok(context)
+    }
+}
+
+impl CudaContextSource {
+    fn context_for(&self, gpu_id: u16) -> Result<Arc<GpuPrimaryContext>, CudaRuntimeProbeError> {
+        match self {
+            Self::SharedPrimary => gpu_primary_context(gpu_id),
+            Self::DedicatedRecovery(contexts) => contexts.context_for(gpu_id),
+        }
+    }
+
+    fn is_dedicated_recovery(&self) -> bool {
+        matches!(self, Self::DedicatedRecovery(_))
+    }
+}
+
+impl fmt::Debug for CudaDriverRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CudaDriverRuntime")
+            .field("snapshot", &self.snapshot)
+            .field(
+                "dedicated_recovery_contexts",
+                &self.context_source.is_dedicated_recovery(),
+            )
+            .finish()
+    }
 }
 
 impl CudaDriverRuntime {
     pub fn probe() -> Result<Self, CudaRuntimeProbeError> {
         let snapshot = probe_cuda_runtime_snapshot()?;
-        Ok(Self { snapshot })
+        Ok(Self {
+            snapshot,
+            context_source: CudaContextSource::SharedPrimary,
+        })
+    }
+
+    /// Probe device inventory while binding future allocations to a non-registry CUDA context.
+    /// This is recovery-only: ordinary engines retain the shared primary path for its resident
+    /// module/stream caches and concurrency behaviour.
+    pub fn probe_dedicated_recovery() -> Result<Self, CudaRuntimeProbeError> {
+        let snapshot = probe_cuda_runtime_snapshot()?;
+        Ok(Self {
+            snapshot,
+            context_source: CudaContextSource::DedicatedRecovery(Arc::new(RecoveryContextSet {
+                contexts: Mutex::new(BTreeMap::new()),
+            })),
+        })
     }
 
     pub fn from_device_count(device_count: u16) -> Self {
@@ -40,6 +114,7 @@ impl CudaDriverRuntime {
                     })
                     .collect(),
             },
+            context_source: CudaContextSource::SharedPrimary,
         }
     }
 
@@ -51,7 +126,17 @@ impl CudaDriverRuntime {
                 device_count: 0,
                 devices: Vec::new(),
             },
+            context_source: CudaContextSource::SharedPrimary,
         }
+    }
+
+    fn context_for(&self, gpu_id: u16) -> Result<Arc<GpuPrimaryContext>, CudaRuntimeProbeError> {
+        self.context_source.context_for(gpu_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn uses_dedicated_recovery_contexts_for_test(&self) -> bool {
+        self.context_source.is_dedicated_recovery()
     }
 
     pub fn snapshot(&self) -> CudaRuntimeSnapshot {
@@ -70,7 +155,7 @@ impl CudaDriverRuntime {
         }
         Ok(RuntimeGenerationRebuildTarget::from_primary(
             gpu_id,
-            gpu_primary_context(gpu_id)?,
+            self.context_for(gpu_id)?,
         ))
     }
 
@@ -113,7 +198,8 @@ impl CudaDriverRuntime {
             .find(|device| device.id == gpu_id)
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
-        let resident = launch_cuda_resident_device_memory(gpu_id, payload)?;
+        let resident =
+            launch_cuda_resident_device_memory_in_context(self.context_for(gpu_id)?, payload)?;
         let memory = CudaResidentDeviceMemory::from_raw_parts(
             CudaDeviceMemoryProof {
                 gpu_id,
@@ -153,7 +239,8 @@ impl CudaDriverRuntime {
             .find(|device| device.id == gpu_id)
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
-        let resident = launch_cuda_resident_device_memory(gpu_id, payload)?;
+        let resident =
+            launch_cuda_resident_device_memory_in_context(self.context_for(gpu_id)?, payload)?;
         let memory = CudaResidentDeviceMemory::from_raw_parts_with_scope_reservation(
             CudaDeviceMemoryProof {
                 gpu_id,
@@ -215,7 +302,7 @@ impl CudaDriverRuntime {
             .find(|device| device.id == gpu_id)
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
-        let primary = gpu_primary_context(gpu_id)?;
+        let primary = self.context_for(gpu_id)?;
         primary.set_current()?;
         // Degrade to the synchronous copy when true-async staging is unavailable (missing
         // cuMemcpyHtoDAsync, or no pinned buffer — an async copy from PAGEABLE memory is not
@@ -337,7 +424,11 @@ impl CudaDriverRuntime {
             .find(|device| device.id == gpu_id)
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
-        let resident = launch_cuda_resident_device_memory_chunks(gpu_id, allocated_len, chunks)?;
+        let resident = launch_cuda_resident_device_memory_chunks_in_context(
+            self.context_for(gpu_id)?,
+            allocated_len,
+            chunks,
+        )?;
         Ok(CudaResidentDeviceMemory::from_raw_parts(
             CudaDeviceMemoryProof {
                 gpu_id,
@@ -376,8 +467,11 @@ impl CudaDriverRuntime {
             .find(|device| device.id == gpu_id)
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
-        let resident =
-            launch_cuda_resident_device_memory_owned_chunks(gpu_id, allocated_len, chunks)?;
+        let resident = launch_cuda_resident_device_memory_owned_chunks_in_context(
+            self.context_for(gpu_id)?,
+            allocated_len,
+            chunks,
+        )?;
         Ok(CudaResidentDeviceMemory::from_raw_parts(
             CudaDeviceMemoryProof {
                 gpu_id,
@@ -422,8 +516,8 @@ impl CudaDriverRuntime {
             .find(|device| device.id == gpu_id)
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
-        let resident = launch_cuda_resident_device_memory_recompacted(
-            gpu_id,
+        let resident = launch_cuda_resident_device_memory_recompacted_in_context(
+            self.context_for(gpu_id)?,
             allocated_len,
             header,
             fills,
@@ -469,8 +563,8 @@ impl CudaDriverRuntime {
             .find(|device| device.id == gpu_id)
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
-        let resident = launch_cuda_resident_device_memory_recompacted(
-            gpu_id,
+        let resident = launch_cuda_resident_device_memory_recompacted_in_context(
+            self.context_for(gpu_id)?,
             allocated_len,
             header,
             fills,
@@ -499,12 +593,12 @@ pub(super) struct RawCudaResidentDeviceMemory {
     copied_bytes: u64,
 }
 
-pub(super) fn launch_cuda_resident_device_memory(
-    gpu_id: u16,
+pub(super) fn launch_cuda_resident_device_memory_in_context(
+    primary: Arc<GpuPrimaryContext>,
     payload: &[u8],
 ) -> Result<RawCudaResidentDeviceMemory, CudaRuntimeProbeError> {
-    launch_cuda_resident_device_memory_chunks(
-        gpu_id,
+    launch_cuda_resident_device_memory_chunks_in_context(
+        primary,
         payload.len(),
         &[CudaDeviceMemoryChunk {
             byte_offset: 0,
@@ -513,8 +607,8 @@ pub(super) fn launch_cuda_resident_device_memory(
     )
 }
 
-fn launch_cuda_resident_device_memory_chunks(
-    gpu_id: u16,
+fn launch_cuda_resident_device_memory_chunks_in_context(
+    primary: Arc<GpuPrimaryContext>,
     allocated_len: usize,
     chunks: &[CudaDeviceMemoryChunk<'_>],
 ) -> Result<RawCudaResidentDeviceMemory, CudaRuntimeProbeError> {
@@ -522,10 +616,9 @@ fn launch_cuda_resident_device_memory_chunks(
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
 
-    // §9.3: allocate into the shared primary context for this GPU (created + cached on
-    // first use), not a fresh per-allocation context. Make it current on this thread so
-    // the allocation and host→device copies land in it.
-    let primary = gpu_primary_context(gpu_id)?;
+    // The caller selects either the shared primary or one dedicated recovery context before
+    // allocation.  Make that exact owner current so the allocation and HtoD copies cannot drift
+    // into a global context during retry.
     primary.set_current()?;
 
     let cu_mem_alloc = unsafe {
@@ -587,8 +680,8 @@ fn launch_cuda_resident_device_memory_chunks(
     })
 }
 
-fn launch_cuda_resident_device_memory_owned_chunks<I>(
-    gpu_id: u16,
+fn launch_cuda_resident_device_memory_owned_chunks_in_context<I>(
+    primary: Arc<GpuPrimaryContext>,
     allocated_len: usize,
     chunks: I,
 ) -> Result<RawCudaResidentDeviceMemory, CudaRuntimeProbeError>
@@ -599,10 +692,7 @@ where
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
 
-    // §9.3: allocate into the shared primary context for this GPU (created + cached on
-    // first use), not a fresh per-allocation context. Make it current on this thread so
-    // the allocation and host→device copies land in it.
-    let primary = gpu_primary_context(gpu_id)?;
+    // The runtime selects the context before this first retry allocation.
     primary.set_current()?;
 
     let cu_mem_alloc = unsafe {
@@ -677,8 +767,8 @@ where
     })
 }
 
-fn launch_cuda_resident_device_memory_recompacted(
-    gpu_id: u16,
+fn launch_cuda_resident_device_memory_recompacted_in_context(
+    primary: Arc<GpuPrimaryContext>,
     allocated_len: usize,
     header: &[u8],
     fills: &[RecompactFill],
@@ -690,10 +780,9 @@ fn launch_cuda_resident_device_memory_recompacted(
     type CuMemcpyDtoD = unsafe extern "C" fn(u64, u64, usize) -> i32;
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
 
-    // §9.3: allocate into the shared primary context for this GPU (created + cached on
-    // first use), not a fresh per-allocation context. Make it current on this thread so
-    // the allocation, the header host→device copy, and the device→device copies land in it.
-    let primary = gpu_primary_context(gpu_id)?;
+    // The runtime selects the context before this first retry allocation.  In particular, every
+    // D2D source here must belong to this owner; the Rebuild path rejects a cross-context source
+    // before it can enqueue.
     primary.set_current()?;
 
     let cu_mem_alloc = unsafe {

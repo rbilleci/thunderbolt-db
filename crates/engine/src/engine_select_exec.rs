@@ -528,6 +528,20 @@ impl Engine {
         // (GROUP BY/HAVING, aggregate value types, DISTINCT ordering) and never reads tuple-store
         // rows: route selection and device execution still own all relational work.
         let _ = self.bind_relational_select_at(select, s)?;
+        // WRITE-001 V1: the recovery-only map route stays out of this ordinary hot dispatch
+        // layout. The zero gate avoids even an ArcSwap guard for normal SELECTs; a nonzero gate
+        // transfers to the cold helper, which acquires the immutable map exactly once.
+        if self
+            .read_state
+            .sealed_int4_publication_table_oid
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            if let Some(result) = self.execute_sealed_int4_recovery_select(select, &catalog, s) {
+                on_pinned();
+                return result;
+            }
+        }
         let resident_route = self.plan_relational_resident_route(select);
         if resident_route.accepted {
             // The resident route does not use the inter-bind-and-pin window the hook targets; fire the
@@ -1011,6 +1025,25 @@ impl Engine {
             offset: None,
         };
         self.execute_transient_rows_via_general(&select, table, vec![vec![value]], boundary)
+    }
+}
+
+impl Engine {
+    /// The sealed V1 route exists only immediately after a matching durable reopen. Keeping this
+    /// map traversal in a cold, non-inlined helper preserves ordinary point-read code placement
+    /// while still acquiring one exact immutable publication before any retained shard is used.
+    #[cold]
+    #[inline(never)]
+    fn execute_sealed_int4_recovery_select(
+        &self,
+        select: &Select,
+        catalog: &Arc<CatalogSnapshot>,
+        copin_s: Index,
+    ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
+        let sealed_generation = self.read_state.sealed_int4_publication.load();
+        sealed_generation
+            .as_deref()
+            .and_then(|generation| generation.execute_plain_select(self, select, catalog, copin_s))
     }
 }
 

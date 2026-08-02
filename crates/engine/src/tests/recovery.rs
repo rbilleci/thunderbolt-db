@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest as _, Sha256};
 
 /// A SERIAL-durable engine, PINNED to the serial backend regardless of the process
 /// `GPU_DB_WAL_DURABILITY` env. The tests that use it exercise serial-backend on-disk mechanics —
@@ -13,6 +14,70 @@ fn serial_durable_engine(path: impl AsRef<std::path::Path>) -> Engine {
     let mut engine = Engine::new_local_test_engine();
     engine.commit_state_mut().wal = WalBuffer::with_durable_segment(path.as_ref());
     engine
+}
+
+const SEALED_INT4_MANIFEST_COVERED_THROUGH_BYTE_OFFSET: usize = 190;
+const SEALED_INT4_MANIFEST_VISIBLE_NEXT_BYTE_OFFSET: usize = 198;
+const SEALED_INT4_MANIFEST_TABLE_ROOT_BYTE_OFFSET: usize = 206;
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Change exactly one durable manifest byte and recompute the control-file trailer. This models
+/// a syntactically intact, separately durable but wrong expected-root/cut sidecar; ordinary file
+/// checksum rejection would not exercise the sealed recovery gate.
+fn rewrite_sealed_control_manifest_bytes(
+    control: &std::path::Path,
+    byte_offset: usize,
+    replacement: &[u8],
+) {
+    let content = std::fs::read_to_string(control).expect("sealed control content");
+    let trailer = content
+        .rfind("sha256=")
+        .expect("checksummed control trailer");
+    let mut protected = content[..trailer].to_string();
+    let field = protected
+        .find("sealed_int4_rebuild=")
+        .expect("sealed manifest field")
+        + "sealed_int4_rebuild=".len();
+    let start = field + byte_offset * 2;
+    let end = start + replacement.len() * 2;
+    assert!(
+        end <= protected.len(),
+        "manifest byte range must be present"
+    );
+    protected.replace_range(start..end, &lower_hex(replacement));
+    let digest = Sha256::digest(protected.as_bytes());
+    let rewritten = format!("{protected}sha256={}\n", lower_hex(&digest));
+    std::fs::write(control, rewritten).expect("rewrite sealed control");
+}
+
+fn flip_sealed_control_manifest_byte(control: &std::path::Path, byte_offset: usize) {
+    let content = std::fs::read_to_string(control).expect("sealed control content");
+    let trailer = content
+        .rfind("sha256=")
+        .expect("checksummed control trailer");
+    let protected = &content[..trailer];
+    let field = protected
+        .find("sealed_int4_rebuild=")
+        .expect("sealed manifest field")
+        + "sealed_int4_rebuild=".len();
+    let hex = &protected[field + byte_offset * 2..field + byte_offset * 2 + 2];
+    let original = u8::from_str_radix(hex, 16).expect("manifest hex byte");
+    rewrite_sealed_control_manifest_bytes(control, byte_offset, &[original ^ 1]);
+}
+
+fn remove_sealed_checkpoint_artifacts(
+    control: &std::path::Path,
+    checkpoint: &std::path::Path,
+    segment: &std::path::Path,
+) {
+    let _ = std::fs::remove_file(control);
+    let _ = std::fs::remove_file(checkpoint);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(checkpoint));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(segment));
+    let _ = std::fs::remove_file(segment);
 }
 
 fn canonical_test_lane_record(
@@ -95,6 +160,279 @@ fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
         },
     );
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
+}
+
+#[test]
+fn sealed_nullable_int4_checkpoint_rebuilds_on_reopen_and_serves_gpu_route() {
+    let Ok(runtime) = gpu_db_execution::CudaDriverRuntime::probe() else {
+        return;
+    };
+    if !runtime.snapshot().driver_available || runtime.snapshot().device_count == 0 {
+        return;
+    }
+    let segment = test_wal_path("sealed-nullable-int4-live");
+    let control = segment.with_extension("control");
+    let checkpoint = segment.with_extension("checkpoint");
+    let e = serial_durable_engine(&segment);
+    e.execute_text(1, "CREATE TABLE sealed_values (value INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO sealed_values (value) VALUES (1), (NULL), (3)",
+    )
+    .unwrap();
+    let sealed_table = e.relational_catalog_table("sealed_values").unwrap();
+    assert_ne!(e.committed_seq(), 0, "sealed cut must be publishable");
+    assert_ne!(sealed_table.oid, 0);
+    assert_ne!(sealed_table.columns[0].id, 0);
+    assert_ne!(sealed_table.columns[0].attnum, 0);
+
+    e.seal_nullable_int4_rebuild_checkpoint(&control, &checkpoint, "sealed_values")
+        .unwrap();
+    let reopened = Engine::open_durable_wal_segment_with_checkpoint(&control, &segment).unwrap();
+    let generation = reopened
+        .read_state
+        .sealed_int4_publication
+        .load_full()
+        .expect("reopen must install the sealed one-entry table map");
+    generation
+        .validate_table_map_import_for_test()
+        .expect("the served recovery generation must retain the verified persistent map path");
+    assert_eq!(
+        reopened.sealed_int4_direct_source_gpu_served_total_for_test(),
+        0,
+        "the sealed direct-source route has not yet served a statement"
+    );
+    let Command::Select(select) = parse_command("SELECT * FROM sealed_values").unwrap() else {
+        panic!("expected SELECT");
+    };
+    let result = reopened.execute_relational_select(&select).unwrap();
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        reopened.sealed_int4_direct_source_gpu_served_total_for_test(),
+        1,
+        "SELECT * must use the installed generation's retained GPU source"
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Null],
+            vec![SqlValue::Int4(3)],
+        ]
+    );
+
+    // The commit coordinator clears the recovery-only base before publishing any later normal
+    // write. New readers cannot pair the sealed shards with an advanced committed boundary.
+    reopened
+        .execute_text(3, "INSERT INTO sealed_values (value) VALUES (4)")
+        .unwrap();
+    assert!(reopened
+        .read_state
+        .sealed_int4_publication
+        .load_full()
+        .is_none());
+
+    // The same control/checkpoint prefix remains a valid recovery source after a later durable
+    // suffix, but its sealed cut cannot be mixed with that suffix. Reopen must deterministically
+    // decline the optional base and still serve the newer ordinary GPU generation.
+    let suffix_reopened =
+        Engine::open_durable_wal_segment_with_checkpoint(&control, &segment).unwrap();
+    assert!(suffix_reopened
+        .read_state
+        .sealed_int4_publication
+        .load_full()
+        .is_none());
+    let suffix_result = suffix_reopened.execute_relational_select(&select).unwrap();
+    assert_eq!(
+        suffix_result.rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Null],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(4)],
+        ]
+    );
+    remove_sealed_checkpoint_artifacts(&control, &checkpoint, &segment);
+}
+
+#[test]
+fn sealed_nullable_int4_reopen_rejects_a_syntactically_valid_wrong_root() {
+    let Ok(runtime) = gpu_db_execution::CudaDriverRuntime::probe() else {
+        return;
+    };
+    if !runtime.snapshot().driver_available || runtime.snapshot().device_count == 0 {
+        return;
+    }
+    let segment = test_wal_path("sealed-nullable-int4-root-mismatch");
+    let control = segment.with_extension("control");
+    let checkpoint = segment.with_extension("checkpoint");
+    let e = serial_durable_engine(&segment);
+    e.execute_text(1, "CREATE TABLE sealed_values (value INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO sealed_values (value) VALUES (1), (NULL), (3)",
+    )
+    .unwrap();
+    e.seal_nullable_int4_rebuild_checkpoint(&control, &checkpoint, "sealed_values")
+        .unwrap();
+    flip_sealed_control_manifest_byte(&control, SEALED_INT4_MANIFEST_TABLE_ROOT_BYTE_OFFSET);
+
+    let error = match Engine::open_durable_wal_segment_with_checkpoint(&control, &segment) {
+        Ok(_) => panic!("a mismatched durable root installed a sealed generation"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("root mismatch"),
+        "wrong root must fail the GPU comparator gate: {error}"
+    );
+    remove_sealed_checkpoint_artifacts(&control, &checkpoint, &segment);
+}
+
+#[test]
+fn sealed_nullable_int4_reopen_rejects_a_checkpoint_cut_that_is_not_its_prefix_tail() {
+    let Ok(runtime) = gpu_db_execution::CudaDriverRuntime::probe() else {
+        return;
+    };
+    if !runtime.snapshot().driver_available || runtime.snapshot().device_count == 0 {
+        return;
+    }
+    let segment = test_wal_path("sealed-nullable-int4-cut-mismatch");
+    let control = segment.with_extension("control");
+    let checkpoint = segment.with_extension("checkpoint");
+    let e = serial_durable_engine(&segment);
+    e.execute_text(1, "CREATE TABLE sealed_values (value INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO sealed_values (value) VALUES (1), (2), (3)")
+        .unwrap();
+    let sealed_cut = e.committed_seq();
+    assert!(sealed_cut > 1);
+    let invalid_cut = sealed_cut.checked_add(100).expect("test cut headroom");
+    e.seal_nullable_int4_rebuild_checkpoint(&control, &checkpoint, "sealed_values")
+        .unwrap();
+    rewrite_sealed_control_manifest_bytes(
+        &control,
+        SEALED_INT4_MANIFEST_COVERED_THROUGH_BYTE_OFFSET,
+        &invalid_cut.to_le_bytes(),
+    );
+    rewrite_sealed_control_manifest_bytes(
+        &control,
+        SEALED_INT4_MANIFEST_VISIBLE_NEXT_BYTE_OFFSET,
+        &(invalid_cut + 1).to_le_bytes(),
+    );
+
+    let error = match Engine::open_durable_wal_segment_with_checkpoint(&control, &segment) {
+        Ok(_) => panic!("a stale checkpoint cut was accepted as a live suffix"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("canonical WAL prefix"),
+        "checkpoint cut must be bound to its terminal canonical record: {error}"
+    );
+    remove_sealed_checkpoint_artifacts(&control, &checkpoint, &segment);
+}
+
+#[test]
+fn sealed_nullable_int4_all_valid_tail_is_canonical_on_reopen() {
+    let Ok(runtime) = gpu_db_execution::CudaDriverRuntime::probe() else {
+        return;
+    };
+    if !runtime.snapshot().driver_available || runtime.snapshot().device_count == 0 {
+        return;
+    }
+    // Three rows takes the residency's absent-bitmap path and exercises the non-word validity
+    // tail. NULL-bearing coverage above exercises the retained-bitmap path independently.
+    let segment = test_wal_path("sealed-nullable-int4-all-valid-tail");
+    let control = segment.with_extension("control");
+    let checkpoint = segment.with_extension("checkpoint");
+    let e = serial_durable_engine(&segment);
+    e.execute_text(1, "CREATE TABLE sealed_values (value INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO sealed_values (value) VALUES (1), (2), (3)")
+        .unwrap();
+    e.seal_nullable_int4_rebuild_checkpoint(&control, &checkpoint, "sealed_values")
+        .unwrap();
+
+    let reopened = Engine::open_durable_wal_segment_with_checkpoint(&control, &segment).unwrap();
+    let Command::Select(select) = parse_command("SELECT * FROM sealed_values").unwrap() else {
+        panic!("expected SELECT plan");
+    };
+    let result = reopened.execute_relational_select(&select).unwrap();
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        reopened.sealed_int4_direct_source_gpu_served_total_for_test(),
+        1
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(3)],
+        ]
+    );
+    remove_sealed_checkpoint_artifacts(&control, &checkpoint, &segment);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn sealed_nullable_int4_reopen_parks_a_real_719_then_serves_from_a_dedicated_retry_context() {
+    let Ok(runtime) = gpu_db_execution::CudaDriverRuntime::probe() else {
+        return;
+    };
+    if !runtime.snapshot().driver_available || runtime.snapshot().device_count == 0 {
+        return;
+    }
+    let segment = test_wal_path("sealed-nullable-int4-fresh-context-retry");
+    let control = segment.with_extension("control");
+    let checkpoint = segment.with_extension("checkpoint");
+    // Keep this original engine (and therefore its shared-primary generation) alive throughout
+    // the reopen. A retry must not reset that process-wide primary context to make progress.
+    let e = serial_durable_engine(&segment);
+    e.execute_text(1, "CREATE TABLE sealed_values (value INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO sealed_values (value) VALUES (1), (NULL), (3)",
+    )
+    .unwrap();
+    e.seal_nullable_int4_rebuild_checkpoint(&control, &checkpoint, "sealed_values")
+        .unwrap();
+
+    // The first failure is reported by `complete`; the second is the unknown owner's bounded
+    // drain in Drop. That parks the first primary-context submission and leaves the retry's
+    // separately created driver context with a clean fault budget.
+    gpu_db_execution::fail_owned_stream_syncs_with_cuda_code_for_test(2, 719);
+    let reopened = Engine::open_durable_wal_segment_with_checkpoint(&control, &segment)
+        .expect("a dedicated recovery context must rebuild from immutable WAL authority");
+    assert_eq!(Engine::recovery_attempt_count(), 2);
+    assert!(reopened.uses_dedicated_recovery_cuda_contexts_for_test());
+
+    let Command::Select(select) = parse_command("SELECT * FROM sealed_values").unwrap() else {
+        panic!("expected SELECT plan");
+    };
+    let result = reopened.execute_relational_select(&select).unwrap();
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Null],
+            vec![SqlValue::Int4(3)],
+        ]
+    );
+    assert_eq!(
+        reopened.sealed_int4_direct_source_gpu_served_total_for_test(),
+        1
+    );
+
+    // The original engine still owns its ordinary shared-primary allocation. The dedicated retry
+    // must not have reset, evicted, or otherwise invalidated that independent live generation.
+    let original_result = e.execute_relational_select(&select).unwrap();
+    assert_eq!(original_result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(original_result.rows, result.rows);
+    remove_sealed_checkpoint_artifacts(&control, &checkpoint, &segment);
 }
 
 #[test]
@@ -2241,6 +2579,7 @@ fn w1b_auto_open_repairs_the_checkpoint_truncation_crash_window() {
                     durable_record_count: records.len(),
                     last_durable_txn_id: records.last().map(|r| r.txn_id),
                 },
+                sealed_int4_rebuild: None,
             },
         )
         .unwrap();
@@ -2344,6 +2683,7 @@ fn w1b_auto_open_repairs_a_second_rotation_crash_window() {
                     durable_record_count: records.len(),
                     last_durable_txn_id: records.last().map(|r| r.txn_id),
                 },
+                sealed_int4_rebuild: None,
             },
         )
         .unwrap();

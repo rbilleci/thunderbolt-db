@@ -5,7 +5,10 @@
 //! whose durability and apply work are complete. This owner advances the published boundary over
 //! the contiguous ready prefix and performs the sole release-store observed by readers.
 
-use super::{CommitState, Engine, EngineError, Index};
+use super::{
+    engine_data_generation::SealedInt4PublicationGenerationV1, CommitState, Engine, EngineError,
+    Index,
+};
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Condvar, Mutex};
@@ -183,6 +186,7 @@ impl Engine {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior_visible = state.visible_next - 1;
         for index in indices {
             if index == 0 || index == u64::MAX {
                 return Err(EngineError::Durability(format!(
@@ -203,10 +207,48 @@ impl Engine {
             })?;
         }
         let visible = state.visible_next - 1;
+        // The V1 object is a recovery-only, immutable read generation. A normal commit has no
+        // matching logical-generation candidate, so remove it before this ordinary visibility
+        // boundary advances. Existing readers retain their Arc; new readers cannot bind stale
+        // data after the release-store below.
+        if visible > prior_visible {
+            self.read_state
+                .sealed_int4_publication_table_oid
+                .store(0, AtomicOrdering::Release);
+            self.read_state.sealed_int4_publication.store(None);
+        }
         self.read_state
             .committed_seq
             .store(visible, AtomicOrdering::Release);
         Ok(visible)
+    }
+
+    /// Install the one sealed recovery generation while the engine is still quiescent. The
+    /// coordinator verifies it describes the exact already-published replay prefix; it does not
+    /// advance visibility and no other component may write the reader handle.
+    pub(crate) fn install_recovered_sealed_int4_generation(
+        &self,
+        generation: std::sync::Arc<SealedInt4PublicationGenerationV1>,
+    ) -> Result<(), EngineError> {
+        let state = self
+            .commit_publication
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let visible = state.visible_next - 1;
+        if visible != generation.visible_through() {
+            return Err(EngineError::Durability(format!(
+                "sealed nullable-int4 recovery generation covers {} but publication is at {visible}",
+                generation.visible_through()
+            )));
+        }
+        self.read_state
+            .sealed_int4_publication
+            .store(Some(std::sync::Arc::clone(&generation)));
+        self.read_state
+            .sealed_int4_publication_table_oid
+            .store(generation.table_oid(), AtomicOrdering::Release);
+        Ok(())
     }
 
     /// A non-pipelined claimant may acknowledge only if the exact terminal index it just reported
@@ -241,6 +283,10 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.visible_next = last_included.saturating_add(1);
         state.ready.clear();
+        self.read_state
+            .sealed_int4_publication_table_oid
+            .store(0, AtomicOrdering::Release);
+        self.read_state.sealed_int4_publication.store(None);
         self.read_state
             .committed_seq
             .store(last_included, AtomicOrdering::Release);

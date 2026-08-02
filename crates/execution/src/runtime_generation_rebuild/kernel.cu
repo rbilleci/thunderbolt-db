@@ -19,14 +19,16 @@ enum {
   GPU_DB_REBUILD_HEADER_BYTES = 80,
   GPU_DB_REBUILD_SHARD_BYTES = 56,
   GPU_DB_REBUILD_OUTPUT_STATUS_BYTES = 4,
-  GPU_DB_REBUILD_PROOF_SLOTS = 135,
+  GPU_DB_REBUILD_PROOF_SLOTS = 200,
   GPU_DB_REBUILD_SLOT_COLUMN_SHAPE = 0,
   GPU_DB_REBUILD_SLOT_TYPED_VECTOR = 1,
   GPU_DB_REBUILD_SLOT_ROW_LEAVES = 2,
   GPU_DB_REBUILD_SLOT_ROW_EMPTY = 3,
   GPU_DB_REBUILD_SLOT_TABLE_ROOT = 68,
-  GPU_DB_REBUILD_SLOT_DATABASE_EMPTY = 69,
-  GPU_DB_REBUILD_SLOT_DATABASE_ROOT = 134,
+  GPU_DB_REBUILD_SLOT_TABLE_MAP_EMPTY = 69,
+  GPU_DB_REBUILD_SLOT_TABLE_MAP_LEAF = 134,
+  GPU_DB_REBUILD_SLOT_TABLE_MAP_PATH = 135,
+  GPU_DB_REBUILD_SLOT_DATABASE_ROOT = 199,
 };
 
 __device__ __constant__ u8 gpu_db_column_shape_domain[] =
@@ -385,34 +387,34 @@ extern "C" __global__ void gpu_db_runtime_generation_v1_single_table_int4_rebuil
   const u8* database_id = descriptor;
   at = 0; gpu_db_append_domain(preimage, &at, gpu_db_map_empty_leaf_domain, sizeof(gpu_db_map_empty_leaf_domain) - 1);
   gpu_db_append_u16(preimage, &at, 1); gpu_db_append_bytes(preimage, &at, database_id, 16);
-  gpu_db_sha256_bytes(preimage, at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_DATABASE_EMPTY + 64));
+  gpu_db_sha256_bytes(preimage, at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_EMPTY + 64));
   for (int depth = 63; depth >= 0; --depth) {
     at = 0; gpu_db_append_domain(preimage, &at, gpu_db_map_empty_node_domain, sizeof(gpu_db_map_empty_node_domain) - 1);
     gpu_db_append_u16(preimage, &at, 1); gpu_db_append_bytes(preimage, &at, database_id, 16); preimage[at++] = (u8)depth;
-    gpu_db_append_bytes(preimage, &at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_DATABASE_EMPTY + depth + 1), 32);
-    gpu_db_append_bytes(preimage, &at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_DATABASE_EMPTY + depth + 1), 32);
-    gpu_db_sha256_bytes(preimage, at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_DATABASE_EMPTY + depth));
+    gpu_db_append_bytes(preimage, &at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_EMPTY + depth + 1), 32);
+    gpu_db_append_bytes(preimage, &at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_EMPTY + depth + 1), 32);
+    gpu_db_sha256_bytes(preimage, at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_EMPTY + depth));
   }
-  u8 table_map[32];
   at = 0; gpu_db_append_domain(preimage, &at, gpu_db_map_leaf_domain, sizeof(gpu_db_map_leaf_domain) - 1);
   gpu_db_append_u16(preimage, &at, 1); gpu_db_append_bytes(preimage, &at, database_id, 16);
   gpu_db_append_u64(preimage, &at, table_id); gpu_db_append_bytes(preimage, &at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_ROOT), 32);
-  gpu_db_sha256_bytes(preimage, at, table_map);
+  gpu_db_sha256_bytes(preimage, at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_LEAF));
   for (int depth = 63; depth >= 0; --depth) {
-    u8 next[32]; at = 0; gpu_db_append_domain(preimage, &at, gpu_db_map_node_domain, sizeof(gpu_db_map_node_domain) - 1);
+    at = 0; gpu_db_append_domain(preimage, &at, gpu_db_map_node_domain, sizeof(gpu_db_map_node_domain) - 1);
     gpu_db_append_u16(preimage, &at, 1); gpu_db_append_bytes(preimage, &at, database_id, 16); preimage[at++] = (u8)depth;
-    const u8* empty = gpu_db_slot(output, GPU_DB_REBUILD_SLOT_DATABASE_EMPTY + depth + 1);
+    const u8* empty = gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_EMPTY + depth + 1);
+    const u8* child = depth == 63
+        ? gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_LEAF)
+        : gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_PATH + depth + 1);
     if (((table_id >> (63u - (u32)depth)) & 1ull) == 0) {
-      gpu_db_append_bytes(preimage, &at, table_map, 32); gpu_db_append_bytes(preimage, &at, empty, 32);
+      gpu_db_append_bytes(preimage, &at, child, 32); gpu_db_append_bytes(preimage, &at, empty, 32);
     } else {
-      gpu_db_append_bytes(preimage, &at, empty, 32); gpu_db_append_bytes(preimage, &at, table_map, 32);
+      gpu_db_append_bytes(preimage, &at, empty, 32); gpu_db_append_bytes(preimage, &at, child, 32);
     }
-    gpu_db_sha256_bytes(preimage, at, next);
-    #pragma unroll
-    for (u32 byte = 0; byte < 32; ++byte) table_map[byte] = next[byte];
+    gpu_db_sha256_bytes(preimage, at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_PATH + depth));
   }
   at = 0; gpu_db_append_domain(preimage, &at, gpu_db_database_root_domain, sizeof(gpu_db_database_root_domain) - 1);
   gpu_db_append_u16(preimage, &at, 1); gpu_db_append_bytes(preimage, &at, database_id, 16);
-  gpu_db_append_bytes(preimage, &at, table_map, 32);
+  gpu_db_append_bytes(preimage, &at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_TABLE_MAP_PATH), 32);
   gpu_db_sha256_bytes(preimage, at, gpu_db_slot(output, GPU_DB_REBUILD_SLOT_DATABASE_ROOT));
 }

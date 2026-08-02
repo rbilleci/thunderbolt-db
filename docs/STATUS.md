@@ -14,6 +14,49 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## WRITE-001 narrow sealed nullable-Int4 recovery spine — accepted, 2026-08-02
+
+- `seal_nullable_int4_rebuild_checkpoint` freezes one durable quiescent WAL prefix for exactly one nonempty,
+  no-index, one-column nullable `Int4` table. It replays privately, keeps the final GPU owners, D2D-compacts a
+  dense immutable image, runs GPU Rebuild with root-free metadata, and persists only the completed table/database
+  commitments in the same checksummed checkpoint control record. An elided all-valid nullable bitmap is rebuilt as
+  device-filled whole words plus one four-byte canonical tail-word control constant, so unused tail bits remain zero.
+- Checkpoint reopen binds the manifest cut to the terminal canonical commit in its checkpoint prefix before replay;
+  only a strictly newer recovered boundary is a benign suffix. It verifies lineage, metadata/catalog identity,
+  reruns Rebuild, compares opaque commitments, then consumes the GPU-emitted one-entry table-map witness (65 empty
+  roots, leaf, 64 path roots) into an immutable persistent map before asking the existing commit-publication
+  coordinator to install it. Its only served shape is a plain `SELECT *`, whose map lookup reaches that leaf's
+  retained shards before entering the general GPU executor; build-only route telemetry proves that direct handoff.
+  Normal publication clears it before a new release boundary.
+- A recognized CUDA context-loss fence never resets, evicts, or re-retains the shared primary context. It retries
+  exactly once from the immutable WAL authority in a lazy, non-registry dedicated driver context; the injected real
+  CUDA-719 HAZARD proves the first unknown submission is parked, the second context rebuilds and serves the sealed
+  route, and the original live shared-primary generation remains readable. A second unknown failure has no third
+  attempt or CPU fallback.
+- The first candidate (`2c9a89cc7d5073fb8109770a05e2b140cbbcbdfb`) kept its retained full-card transcript but encountered
+  `/tmp` user quota failure during its clean build, before Section A; it is incomplete environmental evidence and
+  is not rerun. The accepted corrected-storage documentation-only candidate is commit
+  `b24889c985e3284a7a10b7a68fc709858dd5eade`, tree `b0fbe39d618d44f23a70a6ce4a16a0527fb77d22`, and staged-diff
+  SHA-256 `ff92eab4e4d7dc82869b24f1db0f6231ab2ffbc441a144c17eaa676fc03c979a`. Its byte-identical runtime passes
+  the 11-test Rebuild transport/HAZARD group, a real-GPU nullable reopen that validates the installed persistent
+  map and serves the route, and the dedicated-context CUDA-719 reopen HAZARD. Independent audit accepted the map
+  import, sole coordinator ownership, root gating, NULL route, and cold recovery-only code placement.
+- Its report-card harness records a canonical full run outside its disposable target. Its self-check proves both
+  non-vacuous controls: a broken host-output pipe does not stop the durable transcript, and replacing the cleanup
+  EXIT with `return` rather than `exit` makes the self-check fail. The fresh quick screen recorded valid
+  batch-65,536 production-compact Section-B samples **272,464,995 / 272,655,388 / 273,479,060 lookups/s**
+  (median **272,655,388**, 3/3 above the **260M** floor); raw out-of-L2 `sum_i32` was **1,440 GB/s**.
+- Its one clean-filesystem canonical full card retained a complete transcript at
+  `/home/richard/projects/gpu-db-write001-storage-v6-candidate.kC89eg/candidate/target/benchmark-report-card-runs/runner.b24889c985e3.b0fbe39d618d.Tdf2lk.log`
+  (SHA-256 `d91a1ea2536443d89af0952af1a9cb5dc10c5074c1ff303b2fcfd47b3c993a75`): Sections A/B/C and valid closeout
+  completed, its exact terminal canonical record occurs once, and the fresh owned target was removed. Section B
+  median was **266,839,011 lookups/s** (3/3 above 260M); Section C completed 48M rows/300 batches at
+  **258,705,357 lookups/s** with p50 **128us**; out-of-L2 `sum_i32` was **1,440 GB/s**. The independent post-card
+  audit returned **FINAL ACCEPT** after provenance and baseline comparison (B +0.02%, C +0.54%, roofline +0.81%).
+  This closing ledger edit is documentation-only, so that exact card remains applicable. Broader grammar,
+  generic/multi-table persistent-map import, status/index roots, and automated sealing remain deferred under
+  **WRITE-001** in `PLAN.md`.
+
 ## WRITE-001 accepted migration checkpoint — 2026-07-28
 
 - WRITE-001 remains the active migration and is not complete. Its accepted boundary now carries INSERT through the
@@ -432,6 +475,253 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inapplicable because this source-only proof is production-unreachable and introduces no device or live write/read
   path.
 
+## WRITE-001 pinned catalog and ADR-014 allocator-lease proof accepted — 2026-07-31
+
+- `CatalogAllocatorPending` now has exactly one production-compiled, move-only successor:
+  `DurableSequencePending`. It carries the opaque `ValidatedRetentionAuthority`, one pinned catalog witness, and one
+  non-`Copy` immutable durable allocator-index proof. It has no durable-sequence, GPU, WAL, recovery, apply, result,
+  reencoding, or publication successor; the production writer remains hardwired to semantics v1.
+- The reused validator closes the retained S7 header; exact catalog table/index/domain/guard/FK/sequence dependency
+  closure; and the ADR-014 allocator proof's authenticated root/pin lineage, selected-member equality, complete/
+  durable/published marker lifecycle, checkpoint retention, no same-allocator/epoch overlap, and full S7 table-range
+  coverage. It neither derives an allocator from S4/S7 nor accepts an inferred lease selection.
+- The checked-in empty-S8 abort fixture crosses real fill/codec closure, then both the authenticated live-claim and
+  sealed historical-no-retention predecessor arms through the new catalog/allocator transition. The three Q2 golden
+  classes retain their existing complete validator coverage; allocator/catalog sabotage, failure drain/retry, and
+  source-boundary tests remain non-vacuous.
+- The independent acceptance auditor returned **ACCEPT** with no unresolved finding for the frozen candidate: its
+  three source/test paths hash to
+  `5c770c501e6ef621e26c8e41dbd37bf29bdcf60953101689d744df2f61ef12af`. Focused semantics-v2 tests pass **88/88**;
+  the serial engine library passes **1,849 tests** with GPU-required cases ignored; workspace all-target/all-feature
+  check, strict engine Clippy, scoped rustfmt, diff, and source-size gates are clean. `retained.rs` is **1,542**
+  lines and the largest touched test source is **3,922**, within the applicable limits.
+- GPU NULL differential, HAZARD, runtime recovery, roofline, quick/full report cards, and benchmark provenance are
+  inapplicable: the checkpoint is production-unreachable and changes no live SQL, device, writer, recovery,
+  residency, result, kernel, or benchmark path. PLAN.md owns the next durable sequence-index proof.
+
+## WRITE-001 durable sequence-index proof accepted — 2026-08-01
+
+- `DurableSequencePending` now has exactly one production-compiled, move-only successor:
+  `GenerationPending`. It authenticates a borrowed, immutable Engine-shaped sequence-outcome index and pin before
+  walking retained S5 effects in canonical source order; an empty S5 still requires a complete/durable/published,
+  same-lineage retained index.
+- Each S5 child must be a strictly pre-parent durable outcome with exact transition identity, sequence OID, parent
+  provenance, statement/expression ordinals, returned value, source name, input digest, and `Default` operation.
+  The S5 tuple remains closed only against S2/S4/S7. The validator streams the exact canonical Default digest framing
+  directly into SHA-256, without per-effect allocation, and a test proves equivalence with the writer codec.
+- Focused evidence passes digest equivalence **1/1**, Q3 durable-index **3/3**, source guard **1/1**, and
+  semantics-v2 **92/92**; the engine library passes **1,853** cases (GPU-required cases ignored). Workspace
+  all-target/all-feature check, strict engine Clippy, scoped rustfmt, diff, and size gates are clean. The final
+  seven-path content manifest is `f50daf9f0bd3852ce8166540cd94a07a0cedfb52c6006623433caf557b4c5a85`; independent
+  acceptance returned **ACCEPT** with no unresolved finding after rejecting and repairing a transitive allocation and
+  a mis-scoped source guard.
+- GPU NULL differential, HAZARD, recovery runtime, roofline, quick/full report cards, and benchmark provenance are
+  inapplicable because this remains a host-only, production-unreachable proof with no live SQL, device, writer,
+  recovery, residency, result, kernel, or benchmark change. PLAN.md owns the exclusive generation/replay builder
+  boundary that follows.
+
+## WRITE-001 exact allocator replay-assignment closure accepted — 2026-08-01
+
+- The immutable durable allocator root now authenticates selected, parent-bound exact row-ID assignments rather than
+  inferring a subrange from a lease boundary or from expected S4/S7 facts. `ValidatedAllocatorAssignment` is sealed
+  and non-Copy, is constructed only during catalog/allocator validation, and is carried through
+  `DurableSequencePending` and `GenerationPending`.
+- Complete-root validation closes immutable database/lineage/stable-parent membership before parent request/commit
+  provenance and selected-witness coverage. It requires every assignment to share its selected lease's exact durable
+  marker tuple and rejects a stable system transaction that maps to multiple commit sequences. The production walk
+  uses only S1/S2 plus pinned catalog/allocator facts, verifies contiguous in-lease statement/source-row mapping, and
+  assigns every submitted row, including rows later canceled or suppressed. Expected S4/S6/S7/S8, retention facts,
+  and launch authority remain source-firewalled.
+- Focused allocator evidence passes **11/11** and Q3 sequence/assignment evidence **5/5**. The engine library passes
+  **1,857** cases; workspace all-target/all-feature check, strict all-target/all-feature engine Clippy, scoped
+  rustfmt, diff, and size gates are clean. The final ten-path content manifest is
+  `319a3486848b05314634fd6931be084e1b632efc69d206444e53fb93e558eb9d`; independent acceptance returned **ACCEPT**
+  after repairs for stable-parent completeness, marker lifecycle provenance, and a strict-Clippy static-gate failure.
+- GPU NULL differential, HAZARD, recovery runtime, roofline, quick/full report cards, and benchmark provenance are
+  inapplicable because this host-only, production-unreachable checkpoint changes no live SQL, device, writer,
+  recovery, residency, result, kernel, or benchmark behavior. PLAN.md owns the exclusive generation/replay builder
+  boundary that follows.
+
+## WRITE-001 asynchronous typed-i32 replay submission accepted — 2026-08-01
+
+- `gpu_db_execution` now provides one real execution-only pre-WAL replay primitive:
+  `CudaI32InsertReplayPreparation -> CudaInsertReplaySubmission -> CudaInsertReplayCompletion`. It prepares exact
+  retained host/device resources before its sole enqueue edge, queues the fused typed i32 write kernel on an owned
+  private CUDA stream, and never publishes the row-count header or acquires WAL, apply, status, recovery, or
+  publication authority.
+- Its resource geometry is derived from concrete retained guards: deduplicated source/destination pins and their
+  exact owner backing, pinned HtoD and status buffers, pooled device staging, private-stream scratch and timing-event
+  ownership, and transient NUL-terminated PTX staging. Completion distinguishes proven quiescence from an owned
+  unknown-quiescence submission; retry cannot replay the HtoD or kernel, while Drop drains or parks every resource.
+- Focused real-GPU sabotage covers healthy completion, post-dispatch launch failure, status-D2H failure, unwind,
+  cross-thread ownership, retry, repeated-fence parking/reclaim, and ordinary Drop drain. Independent audit reran
+  the fault path for three serial plus two concurrent GPU executions. The full execution suite passes **73** cases
+  with **106** intentional GPU-only ignores; all-target/all-feature check, strict Clippy, `cargo fmt --all`, and diff
+  checks are clean. The final six-path manifest is
+  `b160464f4936d37388caaf0b6444bf6f2d0fdf9fe8f0fdf5e6bdcb8dd44dfdcb`; independent acceptance returned **ACCEPT**
+  after repairing exact resource accounting and parking sabotage coverage.
+- NULL differential, WAL/recovery, and report-card evidence are inapplicable: this is a production-unintegrated
+  fixed-i32 execution primitive that changes no SQL NULL semantics, durable authority, live write route, read path,
+  or benchmark harness. PLAN.md owns its owned base-generation pin and compiler-only consumer.
+
+## WRITE-001 allocator replay-row binding capability accepted — 2026-08-01
+
+- `ValidatedAllocatorAssignment` now exposes only a sealed, allocation-free exact-size iterator of
+  `(stable_table_id, statement_ordinal, source_row_ordinal, stable_row_id)` scalars to a sibling retained replay
+  compiler. Constructors, raw assignment/lease spans, marker lifecycle, roots, and index selection remain private to
+  allocator validation.
+- Complete immutable-index validation now requires every root-authenticated assignment to be an overflow-safe
+  singleton within its referenced lease and rejects overlapping IDs across every parent sharing an allocator ID and
+  lease epoch. A rehashed, unselected foreign-parent assignment that duplicates a selected row ID fails before the
+  current parent can construct bindings; canceled and suppressed S1/S2 source slots remain covered.
+- Allocator evidence passes **24** cases with **1** intentional GPU ignore, Q3 passes **5/5**, and workspace rustfmt,
+  diff, engine all-target/all-feature check, and strict Clippy are clean. The final four-path manifest is
+  `7453e4179de98f36486fab8e5c6cc1e4fff9ea48bf506199e0b43fac2a4c43c1`; independent acceptance returned **ACCEPT**
+  after repairing a hidden different-parent overlap and formatting mismatch.
+- GPU/NULL, HAZARD, recovery, and report-card evidence remain inapplicable: this host-only, production-unreachable
+  proof changes no device execution or live path. PLAN.md owns the owned base-generation pin and compiler-only
+  consumer that follows.
+
+## WRITE-001 runtime logical-generation publication design accepted — 2026-08-01
+
+- The accepted design establishes the missing sole runtime authority before replay compilation:
+  engine_data_generation is the only logical table/index/database root constructor, and one
+  immutable ArcSwap<PublicationGeneration> atomically pairs its data root, distinct canonical
+  catalog identity, terminal-status root, visibility boundary, and all retained resident/cold
+  resources. Existing catalog commit sequences, residency generations, route tokens, device
+  pointers, placement, and cache state are explicitly not data roots.
+- The root grammar is domain-separated and GPU-produced over current typed rows and index
+  membership. It has persistent stable-ID table/index maps, exact before/after lifecycle
+  representations, and a root-free input that is distinct from codec-5 S7's
+  generation_input_digest. RowSet preserves complete index topology and updates only changed
+  memberships; index topology/shape changes require a complete Rebuild or an explicit empty
+  lifecycle form.
+- The design preserves the current outer canonical-WAL flags and 92-byte marker/digest for frozen
+  codec-5 INSERT. Root-format-v1 non-INSERT resolved/preflight writes carry a generic authenticated
+  terminal descriptor, while direct deterministic WAL-first writes use its separately authenticated
+  terminal form. Recovery begins from a logical checkpoint, rebuilds privately, compares every
+  sealed predecessor/catalog/table/index/database/status identity, and installs only one complete
+  publication object.
+- Independent adversarial design audit returned **ACCEPT** with no unresolved finding for
+  [write-001-runtime-generation-publication.md](design/write-001-runtime-generation-publication.md)
+  SHA-256 032215dfa1a79717b1b9c24f8f32edb12a91cc0059313595d0700e18e42fbff1,
+  PLAN SHA-256 bcc9b79f4ba2af270b79a9ae4e8ac1bfb77c182228da052d7a9b3caf0f4027a2,
+  and HANDOVER SHA-256 a5fdaa6c29715040e313772ebe0f534548646310881c800c9f19c01ce84af773.
+  This was documentation-only; no source behavior or benchmark evidence changed. PLAN.md owns the
+  implementation of this authority before ReplayBaseGenerationPin.
+
+## WRITE-001 GPU-resident SHA-256 commitment primitive accepted — 2026-08-01
+
+- `gpu_db_execution` now exposes a bounded device-to-device SHA-256 batch primitive for
+  caller-owned resident ranges and output. It uploads only pointer/length descriptors, runs on a
+  private pooled CUDA stream, validates allocation/context/range/overlap and descriptor limits,
+  and retains no production CPU hashing path or host digest readback.
+- CUDA known-answer coverage includes 55/56/63/64/65-byte ranges from a nonzero resident offset;
+  the 65-byte case detects wrapped or omitted source reads beyond byte 63. Its test-only `sha2`
+  reference is a dev-dependency only. Scoped format, diff, package check, strict Clippy, CUDA
+  smoke, and four focused tests passed.
+- Independent adversarial audit returned **ACCEPT** on the frozen implementation files:
+  `sha256.rs` SHA-256 `80537423973ce5d4e065c1b8d3f48572779b838e8d08a868728ea0e5febf7a10`,
+  `sha256_kernel.cu` SHA-256 `c76c67cd75f5413025106b37e4fd9ba0faa8f94be1dcc72641a899fc47b8a955`,
+  and `sha256_kernel.ptx` SHA-256 `65500f2cbfeaf42530d28d00ced750c1fcea15275cb14a17467e3e777e9f4d45`.
+  NULL differential, recovery, HAZARD retry, and report-card evidence are inapplicable until a
+  later slice wires this isolated primitive into a live root/publication path.
+
+## WRITE-001 private logical-generation foundation accepted — 2026-08-01
+
+- The production-compiled but live-unreachable `engine_data_generation` module establishes typed
+  opaque GPU-root identities, depth-bound canonical empty roots, persistent MSB-first row/index/
+  table/status maps, root-free lifecycle inputs, and an immutable `PublicationGeneration` /
+  `ReadyPublicationCandidate`. It has no `ReadState`, `ArcSwap`, coordinator, WAL, recovery,
+  reader, CUDA, or installation caller.
+- Hot RowSet construction retains exact unaffected `Arc`s and validates only fixed changed paths;
+  full recursive validation is explicit audit/checkpoint work. Its focused suite includes root
+  replay at every layer, canonical-empty/deletion, terminal/catalog, create/rebuild, composite
+  index-key ordinal/descriptor, versioned replacement-entry, zero-effect membership, and bounded
+  traversal sabotage. The 11 focused tests, package check, strict Clippy, rustfmt, and diff checks
+  passed.
+- Independent adversarial re-audit returned **ACCEPT** for the frozen foundation:
+  `digest.rs` `06ee9dcddedaa73b0fa85d21946cc10f1e54d92b2a0673b7351e468d52a1ba8d`,
+  `input.rs` `fe633d0d5a123b76d4148766df2dd9bf848c1a4fa917b6d6a8680253c61d7339`,
+  `manifest.rs` `50427902c2a94f1aa39704af9350e362ecd3a716a663796be1d59d2e90ac8027`,
+  `publication.rs` `91229fbbabc25de288f914f3432412cb52e3dd7d61ad792865ec68af9dbf541f`,
+  `status.rs` `f80716c706b58b6e7e5151699a6098d2b5be7db24074751ecfca4c9664576957`, and
+  module tests `4f6685fa45e13b1a2d9c7be178c2c0c7bef413e585067b37faaee3d8a7ad91c3`.
+  The GPU completion bridge and one live atomic publication replacement remain PLAN-owned;
+  CUDA/NULL/HAZARD/recovery/report-card evidence is inapplicable until that integration.
+
+## WRITE-001 GPU genesis-root completion bridge accepted — 2026-08-01
+
+- `gpu_db_execution` now owns a sealed asynchronous SHA completion lifecycle with bounded private
+  DtoH into opaque whole-batch tokens. It reserves source/config/output/readback/stream resources
+  before enqueue, rejects zero digests before exposure, and retains unknown-quiescence work for a
+  fence-only retry or fail-closed parking. No caller can read, format, hash, serialize, slice, or
+  relabel digest bytes.
+- The fixed genesis operator computes the exact GPU-resident root-format-v1 chains: table-map
+  empty roots depth 64 through 0, status empty roots depth 64 through 0 with zero subtree counts,
+  and the database root binding the table-map root only. Its shared device SHA implementation
+  hashes the documented length-prefixed ASCII domains and little-endian fields; engine consumes
+  the one 131-slot batch once through a sealed layout and materializes only table-map,
+  status-view, and database roots for local genesis.
+- Independent acceptance returned **ACCEPT** on `sha256.rs`
+  `c3a135aa01352ba33fe9ffdaa73bca1041601c473f075de471d38d02d42df3b2`,
+  `sha256_completion.rs`
+  `5725046e3743d773db9b8a02c83dd82a94b4ae57fa09f628f66086758a8eb993`,
+  `sha256_kernel.cu`
+  `e8e57c6134c272edbb0375cbd82c1322a0ca1c7a9a81c9aa48c788caad27c172`,
+  matching regenerated PTX
+  `e3fd9d82072f84b9c5b23aa2ba90a242988d827277af178b385d37caae3cc617`, and
+  engine `gpu_completion.rs`
+  `ad16917e2f1c00fa02fe1ea351a0c93341abeb30a7d353173512bd55294a0ecf`.
+  Execution focused CUDA tests pass **11/11** and generation tests **15/15**; three serial paired
+  runs and simultaneous direct binaries passed without CUDA 700/716/717. The source remains
+  private and live-unreachable: it has no publication install, WAL/recovery, residency, reader,
+  or read-path change, so SQL NULL differential, recovery, and report-card evidence remain
+  inapplicable.
+
+## WRITE-001 sealed quiescent bootstrap-source contract accepted — 2026-08-01
+
+- The private, live-unreachable `BootstrapReplayWitness` now owns one authenticated quiescent
+  recovery cut: catalog identity/snapshot, stable table/index/column migration state and checkpoint
+  high-waters, current catalog enrollment, expected database/status/table/index roots and
+  generations, complete canonical terminal-envelope provenance, and the exact physical-resource
+  ledger. It has no production constructor, export, or caller; nested `cfg(test)` code is the only
+  synthetic minting path until the separately audited replay-authority seam exists.
+- The source rejects same-cut catalog substitution, missing or mismatched column/index mappings,
+  noncanonical stable-index order, replayed terminal projection substitution, resource replacement,
+  incomplete or noncontiguous shard/chunk groups, and invalid base-resource multiplicity. The
+  materializer remains a later GPU-bulk slice: this contract creates no roots, reader, `ArcSwap`,
+  WAL/recovery callback, residency access, installation, or publication path.
+- Independent re-audit returned **ACCEPT** for
+  `bootstrap_publication.rs` SHA-256
+  `7a28208c4b8f3c3a60797d90afc3bd56c52744d6bd65a79840dd9baea3f5ab7e`, module hook
+  `b0aac49261cc757ff3a94f2a05d6121929541d04e32e7b8171faf5c61f960d8b`, and runtime design
+  `8bf0c8debec3338fbc9cf889435dcec3adbf5d45ffabb2fc636be94d1a96165a`. The focused suite passes
+  **11/11** and the generation suite **26/26**; package check, strict Clippy, formatting, and
+  whitespace checks are clean. NULL differential, recovery, HAZARD, and the report card remain
+  inapplicable while the contract is production-unreachable.
+
+## WRITE-001 sealed bootstrap resource-handoff foundation accepted — 2026-08-01
+
+- The private bootstrap source now moves a validated uninstalled candidate only through a
+  capability-gated, non-`Debug`/non-`Clone`/non-`Copy` materialization lease. Exact ordered
+  resource claims bind kind, logical owner, resource ID, ordinal, database identity, root format,
+  and durable cut; pointer-free allocation records reject coverage, ordering, owner, provenance,
+  identity, zero-length, overflow, and out-of-range substitutions before any later attach.
+- The lease retains its complete replay candidate but exposes only canonical claims to the private
+  resources module. A compiler-enforced negative `Debug` assertion prevents a future trait derive
+  from formatting the retained canonical terminal-envelope bytes. This is still a validation-only
+  foundation: it has no CUDA/cold owner, allocation or attach API, root builder, reader, `ArcSwap`,
+  WAL/recovery callback, installation, or publication route.
+- Independent acceptance returned **ACCEPT** for `bootstrap_publication.rs` SHA-256
+  `7edfe8ef5c51f6844eba2a661c06fe1118e8888741ba4094caccf1d7ed499954`, `resources.rs`
+  SHA-256 `b56a9d0d769f78cd56c5b5cfe7004a4fccc75e4ffef40a9b521424addb3ef7e9`, and module hook
+  `287b3cf2c8a93ace04ba206867f123f928ba4aa3fb7355a9b94b94710dfa58f1`. Focused resources,
+  bootstrap, and whole generation suites pass **7/7**, **11/11**, and **33/33**; package check,
+  strict Clippy, formatting, and whitespace checks are clean. GPU NULL differential, HAZARD,
+  recovery, and the report card remain inapplicable because no executable device or live path
+  changed.
+
 ## WRITE-001 sealed typed bootstrap-resource attachment accepted — 2026-08-01
 
 - `BootstrapPublicationSource` now validates a closed v1 physical-resource grammar before it can produce the
@@ -503,7 +793,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   the device SHA KAT **1/1**, and engine data-generation **52/52**; check, strict all-target Clippy, all-format, and
   whitespace gates are clean. Three serial and two concurrent real-GPU HAZARD runs had no CUDA 700/716/717. A full
   card remains inapplicable: this private operator has no read/result/install/publication path.
-
 
 ## INSERT-001 canonical multi-row INSERT — accepted 2026-07-27
 

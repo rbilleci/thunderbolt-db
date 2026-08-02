@@ -17,6 +17,7 @@ use crate::{
     cuda_context::{PinnedHostBufferOwned, PooledDeviceBufferOwned, PooledStreamOwned},
     sha256::CuLaunchKernel,
     CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, GpuPrimaryContext,
+    OpaqueCudaSha256Digest,
 };
 
 const RUNTIME_GENERATION_REBUILD_PTX: &[u8] =
@@ -25,6 +26,8 @@ const ROOT_FORMAT_V1: u16 = 1;
 const INT4_OID: u32 = 23;
 const INT4_SIGNED_SIZE: i16 = 4;
 const PARKED_REBUILD_COMPLETIONS: usize = 8;
+/// Exact durable V1 encoding of the table root followed by the database root.
+pub const RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES: usize = 64;
 
 /// A target is a retained primary CUDA context, never a raw context or device pointer.
 #[derive(Clone)]
@@ -134,6 +137,73 @@ impl RuntimeGenerationRebuildSource {
             | RuntimeGenerationRebuildSourceBacking::ColdRam { byte_len, .. } => *byte_len,
         }
     }
+
+    /// The one-source shard convenience may fan one moved source into its five fixed physical
+    /// roles, but callers cannot clone it into another submission.
+    fn clone_for_shard_role(&self) -> Self {
+        let backing = match &self.backing {
+            RuntimeGenerationRebuildSourceBacking::Resident {
+                memory,
+                byte_offset,
+                byte_len,
+            } => RuntimeGenerationRebuildSourceBacking::Resident {
+                memory: Arc::clone(memory),
+                byte_offset: *byte_offset,
+                byte_len: *byte_len,
+            },
+            RuntimeGenerationRebuildSourceBacking::ColdRam {
+                bytes,
+                byte_offset,
+                byte_len,
+            } => RuntimeGenerationRebuildSourceBacking::ColdRam {
+                bytes: Arc::clone(bytes),
+                byte_offset: *byte_offset,
+                byte_len: *byte_len,
+            },
+        };
+        Self { backing }
+    }
+
+    /// Equality is intentionally restricted to exact physical transport ownership, not byte
+    /// equality.  It lets one convenience source retain one HtoD cold-arena copy even though
+    /// each role owns its own move-only attachment.
+    fn is_same_transport_source(&self, other: &Self) -> bool {
+        match (&self.backing, &other.backing) {
+            (
+                RuntimeGenerationRebuildSourceBacking::Resident {
+                    memory: left_memory,
+                    byte_offset: left_offset,
+                    byte_len: left_len,
+                },
+                RuntimeGenerationRebuildSourceBacking::Resident {
+                    memory: right_memory,
+                    byte_offset: right_offset,
+                    byte_len: right_len,
+                },
+            ) => {
+                Arc::ptr_eq(left_memory, right_memory)
+                    && left_offset == right_offset
+                    && left_len == right_len
+            }
+            (
+                RuntimeGenerationRebuildSourceBacking::ColdRam {
+                    bytes: left_bytes,
+                    byte_offset: left_offset,
+                    byte_len: left_len,
+                },
+                RuntimeGenerationRebuildSourceBacking::ColdRam {
+                    bytes: right_bytes,
+                    byte_offset: right_offset,
+                    byte_len: right_len,
+                },
+            ) => {
+                Arc::ptr_eq(left_bytes, right_bytes)
+                    && left_offset == right_offset
+                    && left_len == right_len
+            }
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Debug for RuntimeGenerationRebuildSource {
@@ -160,13 +230,45 @@ pub struct RuntimeGenerationRebuildShardRoles {
     pub deleted_by: RuntimeGenerationRebuildRoleSpan,
 }
 
+/// One physical rebuild role paired with the exact source allocation that owns it.  All five
+/// roles remain mandatory: V1 has no device descriptor sentinel for an omitted MVCC vector, so
+/// treating a missing source as a host-side default would weaken the device proof.
+pub struct RuntimeGenerationRebuildShardRoleSource {
+    source: RuntimeGenerationRebuildSource,
+    span: RuntimeGenerationRebuildRoleSpan,
+}
+
+impl RuntimeGenerationRebuildShardRoleSource {
+    pub fn new(
+        source: RuntimeGenerationRebuildSource,
+        span: RuntimeGenerationRebuildRoleSpan,
+    ) -> Self {
+        Self { source, span }
+    }
+}
+
+impl fmt::Debug for RuntimeGenerationRebuildShardRoleSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RuntimeGenerationRebuildShardRoleSource(<opaque>)")
+    }
+}
+
+/// Exact independently retained physical owners for one canonical shard.  This is the direct
+/// five-source form; roles can be resident or cold independently without exposing pointers.
+pub struct RuntimeGenerationRebuildShardRoleSources {
+    pub stable_row_ids: RuntimeGenerationRebuildShardRoleSource,
+    pub validity: RuntimeGenerationRebuildShardRoleSource,
+    pub values: RuntimeGenerationRebuildShardRoleSource,
+    pub created_by: RuntimeGenerationRebuildShardRoleSource,
+    pub deleted_by: RuntimeGenerationRebuildShardRoleSource,
+}
+
 /// One canonical table shard. A source is consumed exactly once, so a caller cannot reuse a
 /// physical owner in two independently submitted rebuilds without an explicit reattachment.
 pub struct RuntimeGenerationRebuildShard {
-    source: RuntimeGenerationRebuildSource,
     row_start: u64,
     row_count: u64,
-    roles: RuntimeGenerationRebuildShardRoles,
+    roles: RuntimeGenerationRebuildShardRoleSources,
 }
 
 impl RuntimeGenerationRebuildShard {
@@ -176,12 +278,54 @@ impl RuntimeGenerationRebuildShard {
         row_count: u64,
         roles: RuntimeGenerationRebuildShardRoles,
     ) -> Self {
+        Self::from_role_sources(
+            row_start,
+            row_count,
+            RuntimeGenerationRebuildShardRoleSources {
+                stable_row_ids: RuntimeGenerationRebuildShardRoleSource::new(
+                    source.clone_for_shard_role(),
+                    roles.stable_row_ids,
+                ),
+                validity: RuntimeGenerationRebuildShardRoleSource::new(
+                    source.clone_for_shard_role(),
+                    roles.validity,
+                ),
+                values: RuntimeGenerationRebuildShardRoleSource::new(
+                    source.clone_for_shard_role(),
+                    roles.values,
+                ),
+                created_by: RuntimeGenerationRebuildShardRoleSource::new(
+                    source.clone_for_shard_role(),
+                    roles.created_by,
+                ),
+                deleted_by: RuntimeGenerationRebuildShardRoleSource::new(source, roles.deleted_by),
+            },
+        )
+    }
+
+    /// Consume five independently retained role sources for one canonical V1 shard.  This is
+    /// deliberately separate from [`Self::new`], which preserves the one-source convenience
+    /// without making the source itself cloneable across submissions.
+    pub fn from_role_sources(
+        row_start: u64,
+        row_count: u64,
+        roles: RuntimeGenerationRebuildShardRoleSources,
+    ) -> Self {
         Self {
-            source,
             row_start,
             row_count,
             roles,
         }
+    }
+
+    fn role_sources(&self) -> [&RuntimeGenerationRebuildShardRoleSource; 5] {
+        [
+            &self.roles.stable_row_ids,
+            &self.roles.validity,
+            &self.roles.values,
+            &self.roles.created_by,
+            &self.roles.deleted_by,
+        ]
     }
 }
 
@@ -278,23 +422,107 @@ impl fmt::Debug for RuntimeGenerationRebuildPrepareFailure {
     }
 }
 
-/// One opaque proof digest. The host cannot read value, validity, stable-row-ID, key, or raw-row
-/// bytes from this type.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct OpaqueRuntimeGenerationRebuildDigest([u8; 32]);
+/// The only durable V1 proof commitments: the final table root and final database root, in that
+/// exact order.  The intermediate proof slots never leave this transport.  Its byte encoding is
+/// intentionally a fixed serializer/deserializer rather than a generic digest accessor, so WAL
+/// code can persist the two sealed commitments without gaining a host-hash input surface.
+pub struct RuntimeGenerationRebuildV1DurableCommitments {
+    table_root: [u8; 32],
+    database_root: [u8; 32],
+}
 
-impl fmt::Debug for OpaqueRuntimeGenerationRebuildDigest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("OpaqueRuntimeGenerationRebuildDigest(<opaque>)")
+impl RuntimeGenerationRebuildV1DurableCommitments {
+    /// Serialize the exact V1 table/database-root pair into caller-owned durable storage.
+    pub fn encode_durable_into(
+        &self,
+        destination: &mut [u8],
+    ) -> Result<(), RuntimeGenerationRebuildV1CommitmentBytesError> {
+        if destination.len() != RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES {
+            return Err(
+                RuntimeGenerationRebuildV1CommitmentBytesError::InvalidLength(destination.len()),
+            );
+        }
+        destination[..32].copy_from_slice(&self.table_root);
+        destination[32..].copy_from_slice(&self.database_root);
+        Ok(())
+    }
+
+    /// Reconstruct the exact sealed V1 table/database-root pair from durable storage.  This
+    /// validates only the closed transport geometry; a later GPU proof comparison authenticates
+    /// the bytes without recomputing or hashing them on the host.
+    pub fn decode_durable(
+        source: &[u8],
+    ) -> Result<Self, RuntimeGenerationRebuildV1CommitmentBytesError> {
+        if source.len() != RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES {
+            return Err(
+                RuntimeGenerationRebuildV1CommitmentBytesError::InvalidLength(source.len()),
+            );
+        }
+        let mut table_root = [0_u8; 32];
+        let mut database_root = [0_u8; 32];
+        table_root.copy_from_slice(&source[..32]);
+        database_root.copy_from_slice(&source[32..]);
+        Ok(Self {
+            table_root,
+            database_root,
+        })
     }
 }
+
+impl fmt::Debug for RuntimeGenerationRebuildV1DurableCommitments {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RuntimeGenerationRebuildV1DurableCommitments(<opaque>)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeGenerationRebuildV1CommitmentBytesError {
+    InvalidLength(usize),
+}
+
+/// The two persisted semantic commitments did not match the later quiesced V1 proof.  The
+/// mismatch is intentionally not attributed to one root, avoiding an extra commitment oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeGenerationRebuildV1CommitmentMismatch;
 
 /// Whole opaque proof arena for one drained attempt. Slot meanings stay in the engine's sealed
 /// proof layout; this transport reveals only attempt/version/count structure.
 pub struct OpaqueRuntimeGenerationRebuildProof {
     attempt: RuntimeGenerationRebuildAttempt,
     root_format: u16,
-    slots: Box<[OpaqueRuntimeGenerationRebuildDigest]>,
+    slots: Box<[[u8; 32]]>,
+}
+
+/// The closed one-entry table-map completion emitted by the V1 rebuild kernel.  It is available
+/// only after the durable table/database commitments have matched.  All roots remain opaque:
+/// the engine may consume this fixed leaf/path/empty-root shape to import one persistent map,
+/// but cannot manufacture, reorder, or serialize a generic map completion.
+pub struct RuntimeGenerationRebuildV1TableMapCompletion {
+    empty_roots: Box<[OpaqueCudaSha256Digest]>,
+    leaf_root: OpaqueCudaSha256Digest,
+    path_roots: Box<[OpaqueCudaSha256Digest]>,
+}
+
+impl RuntimeGenerationRebuildV1TableMapCompletion {
+    /// Consume the exact closed completion. `empty_roots` are ordered depth 0 through 64 and
+    /// `path_roots` are ordered depth 0 through 63.  The callback has no access to raw digest
+    /// bytes, and there is no constructor outside the quiesced Rebuild proof.
+    pub fn consume<R>(
+        self,
+        consume: impl FnOnce(
+            &[OpaqueCudaSha256Digest],
+            OpaqueCudaSha256Digest,
+            &[OpaqueCudaSha256Digest],
+        ) -> R,
+    ) -> R {
+        consume(&self.empty_roots, self.leaf_root, &self.path_roots)
+    }
+}
+
+impl fmt::Debug for RuntimeGenerationRebuildV1TableMapCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RuntimeGenerationRebuildV1TableMapCompletion(<opaque>)")
+    }
 }
 
 impl OpaqueRuntimeGenerationRebuildProof {
@@ -308,6 +536,69 @@ impl OpaqueRuntimeGenerationRebuildProof {
 
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Consume a quiesced proof into the exact two V1 semantic commitments that may cross the
+    /// durable engine boundary.  This only copies device-produced bytes; it never host-hashes.
+    pub fn into_durable_v1_commitments(self) -> RuntimeGenerationRebuildV1DurableCommitments {
+        debug_assert_eq!(self.root_format, ROOT_FORMAT_V1);
+        debug_assert_eq!(self.slots.len(), abi::PROOF_DIGEST_SLOTS);
+        RuntimeGenerationRebuildV1DurableCommitments {
+            table_root: self.slots[abi::SLOT_TABLE_ROOT],
+            database_root: self.slots[abi::SLOT_DATABASE_ROOT],
+        }
+    }
+
+    /// Compare the only durable V1 commitments and, on success only, hand the sealed caller the
+    /// GPU-emitted one-table persistent-map path.  This does not widen the durable format: the
+    /// table-map root is already bound by the compared database root and is recomputed on every
+    /// recovery from the same device-owned table image.
+    pub fn compare_durable_v1_commitments_with_table_map<R>(
+        self,
+        expected: &RuntimeGenerationRebuildV1DurableCommitments,
+        consume: impl FnOnce(
+            RuntimeGenerationRebuildAttempt,
+            OpaqueCudaSha256Digest,
+            RuntimeGenerationRebuildV1TableMapCompletion,
+            OpaqueCudaSha256Digest,
+        ) -> R,
+    ) -> Result<R, RuntimeGenerationRebuildV1CommitmentMismatch> {
+        debug_assert_eq!(self.root_format, ROOT_FORMAT_V1);
+        debug_assert_eq!(self.slots.len(), abi::PROOF_DIGEST_SLOTS);
+        let table_matches =
+            constant_time_equal(&self.slots[abi::SLOT_TABLE_ROOT], &expected.table_root);
+        let database_matches = constant_time_equal(
+            &self.slots[abi::SLOT_DATABASE_ROOT],
+            &expected.database_root,
+        );
+        if !(table_matches && database_matches) {
+            return Err(RuntimeGenerationRebuildV1CommitmentMismatch);
+        }
+        let table_map = RuntimeGenerationRebuildV1TableMapCompletion {
+            empty_roots: self.slots[abi::SLOT_TABLE_MAP_EMPTY..=abi::SLOT_TABLE_MAP_EMPTY + 64]
+                .iter()
+                .copied()
+                .map(OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot)
+                .collect(),
+            leaf_root: OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot(
+                self.slots[abi::SLOT_TABLE_MAP_LEAF],
+            ),
+            path_roots: self.slots[abi::SLOT_TABLE_MAP_PATH..=abi::SLOT_TABLE_MAP_PATH + 63]
+                .iter()
+                .copied()
+                .map(OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot)
+                .collect(),
+        };
+        Ok(consume(
+            self.attempt,
+            OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot(
+                self.slots[abi::SLOT_TABLE_ROOT],
+            ),
+            table_map,
+            OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot(
+                self.slots[abi::SLOT_DATABASE_ROOT],
+            ),
+        ))
     }
 }
 
@@ -387,7 +678,7 @@ struct RuntimeGenerationRebuildResources {
     output_device: PooledDeviceBufferOwned,
     stream: PooledStreamOwned,
     input_bytes: usize,
-    proof_slots: Box<[OpaqueRuntimeGenerationRebuildDigest]>,
+    proof_slots: Box<[[u8; 32]]>,
 }
 
 enum RuntimeGenerationRebuildPhase {
@@ -418,6 +709,15 @@ unsafe impl Send for PreparedRuntimeGenerationRebuild {}
 unsafe impl Send for RuntimeGenerationRebuildSubmission {}
 unsafe impl Send for RuntimeGenerationRebuildUnknownQuiescence {}
 unsafe impl Send for RuntimeGenerationRebuildResources {}
+
+fn constant_time_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
 
 impl PreparedRuntimeGenerationRebuild {
     /// Validate, reserve, deduplicate source guards, and materialize the one pinned HtoD
@@ -591,7 +891,7 @@ impl RuntimeGenerationRebuildSubmission {
         }
         for (index, slot) in resources.proof_slots.iter_mut().enumerate() {
             let begin = abi::OUTPUT_STATUS_BYTES + index * 32;
-            slot.0.copy_from_slice(&bytes[begin..begin + 32]);
+            slot.copy_from_slice(&bytes[begin..begin + 32]);
         }
         let slots = std::mem::take(&mut resources.proof_slots);
         Ok(OpaqueRuntimeGenerationRebuildProof {
@@ -706,11 +1006,7 @@ fn prepare_inner(
             output_device,
             stream,
             input_bytes,
-            proof_slots: vec![
-                OpaqueRuntimeGenerationRebuildDigest([0; 32]);
-                abi::PROOF_DIGEST_SLOTS
-            ]
-            .into_boxed_slice(),
+            proof_slots: vec![[0; 32]; abi::PROOF_DIGEST_SLOTS].into_boxed_slice(),
         },
         attempt: input.attempt,
         function,
@@ -745,8 +1041,7 @@ fn validate_input(
                 "noncanonical rebuild shard coverage",
             ));
         }
-        validate_role_spans(shard)?;
-        validate_source(input, &shard.source)?;
+        validate_role_sources(input, shard)?;
         covered = covered.checked_add(shard.row_count).ok_or(
             RuntimeGenerationRebuildPrepareError::InvalidInput("rebuild row count overflow"),
         )?;
@@ -779,7 +1074,8 @@ fn validate_proof_vector_geometry(rows: u64) -> Result<(), RuntimeGenerationRebu
     Ok(())
 }
 
-fn validate_role_spans(
+fn validate_role_sources(
+    input: &RuntimeGenerationRebuildInput,
     shard: &RuntimeGenerationRebuildShard,
 ) -> Result<(), RuntimeGenerationRebuildPrepareError> {
     let ids = checked_bytes(shard.row_count, 8)?;
@@ -792,18 +1088,17 @@ fn validate_role_spans(
         .ok_or(RuntimeGenerationRebuildPrepareError::InvalidInput(
             "validity capacity",
         ))?;
-    for (span, required) in [
-        (shard.roles.stable_row_ids, ids),
-        (shard.roles.validity, validity),
-        (shard.roles.values, values),
-        (shard.roles.created_by, ids),
-        (shard.roles.deleted_by, ids),
-    ] {
-        if span.byte_len != required || span_end(span)? > shard.source.byte_len() {
+    for (role, required) in shard
+        .role_sources()
+        .into_iter()
+        .zip([ids, validity, values, ids, ids])
+    {
+        if role.span.byte_len != required || span_end(role.span)? > role.source.byte_len() {
             return Err(RuntimeGenerationRebuildPrepareError::InvalidInput(
                 "rebuild physical role geometry",
             ));
         }
+        validate_source(input, &role.source)?;
     }
     Ok(())
 }
@@ -852,26 +1147,55 @@ fn validate_source(
 fn checked_cold_bytes(
     input: &RuntimeGenerationRebuildInput,
 ) -> Result<usize, RuntimeGenerationRebuildPrepareError> {
-    input.shards.iter().try_fold(0_usize, |total, shard| {
-        let bytes = match &shard.source.backing {
-            RuntimeGenerationRebuildSourceBacking::Resident { .. } => 0,
-            RuntimeGenerationRebuildSourceBacking::ColdRam { byte_len, .. } => {
-                usize::try_from(*byte_len).map_err(|_| {
-                    RuntimeGenerationRebuildPrepareError::InvalidInput("cold arena addressability")
-                })?
-            }
-        };
-        total
-            .checked_add(bytes)
-            .ok_or(RuntimeGenerationRebuildPrepareError::InvalidInput(
-                "cold arena capacity",
-            ))
-    })
+    unique_rebuild_sources(input)
+        .into_iter()
+        .try_fold(0_usize, |total, source| {
+            let bytes = match &source.backing {
+                RuntimeGenerationRebuildSourceBacking::Resident { .. } => 0,
+                RuntimeGenerationRebuildSourceBacking::ColdRam { byte_len, .. } => {
+                    usize::try_from(*byte_len).map_err(|_| {
+                        RuntimeGenerationRebuildPrepareError::InvalidInput(
+                            "cold arena addressability",
+                        )
+                    })?
+                }
+            };
+            total
+                .checked_add(bytes)
+                .ok_or(RuntimeGenerationRebuildPrepareError::InvalidInput(
+                    "cold arena capacity",
+                ))
+        })
+}
+
+fn unique_rebuild_sources(
+    input: &RuntimeGenerationRebuildInput,
+) -> Vec<&RuntimeGenerationRebuildSource> {
+    let mut unique: Vec<&RuntimeGenerationRebuildSource> = Vec::new();
+    for source in input
+        .shards
+        .iter()
+        .flat_map(RuntimeGenerationRebuildShard::role_sources)
+        .map(|role| &role.source)
+    {
+        if !unique
+            .iter()
+            .any(|existing| existing.is_same_transport_source(source))
+        {
+            unique.push(source);
+        }
+    }
+    unique
 }
 
 type RuntimeGenerationRebuildResidentOwners =
     Box<[Arc<crate::resident_memory::CudaResidentDeviceAllocation>]>;
 type RuntimeGenerationRebuildColdOwners = Box<[Arc<[u8]>]>;
+
+struct EncodedRuntimeGenerationRebuildSource<'a> {
+    source: &'a RuntimeGenerationRebuildSource,
+    device_pointer: u64,
+}
 
 fn encode_input_arena(
     input: &RuntimeGenerationRebuildInput,
@@ -914,11 +1238,9 @@ fn encode_input_arena(
     let mut cold_cursor = descriptor_bytes;
     let mut resident_owners = Vec::new();
     let mut cold_owners = Vec::new();
-    for (ordinal, shard) in input.shards.iter().enumerate() {
-        let base = abi::DESCRIPTOR_HEADER_BYTES + ordinal * abi::SHARD_DESCRIPTOR_BYTES;
-        abi::put_u64(bytes, base + abi::SHARD_ROW_START_OFFSET, shard.row_start);
-        abi::put_u64(bytes, base + abi::SHARD_ROW_COUNT_OFFSET, shard.row_count);
-        let source_pointer = match &shard.source.backing {
+    let mut encoded_sources = Vec::new();
+    for source in unique_rebuild_sources(input) {
+        let device_pointer = match &source.backing {
             RuntimeGenerationRebuildSourceBacking::Resident {
                 memory,
                 byte_offset,
@@ -970,36 +1292,34 @@ fn encode_input_arena(
                 pointer
             }
         };
-        encode_shard_role_pointer(
-            bytes,
-            base + abi::SHARD_ROW_ID_POINTER_OFFSET,
-            source_pointer,
-            shard.roles.stable_row_ids,
-        )?;
-        encode_shard_role_pointer(
-            bytes,
-            base + abi::SHARD_VALIDITY_POINTER_OFFSET,
-            source_pointer,
-            shard.roles.validity,
-        )?;
-        encode_shard_role_pointer(
-            bytes,
-            base + abi::SHARD_VALUE_POINTER_OFFSET,
-            source_pointer,
-            shard.roles.values,
-        )?;
-        encode_shard_role_pointer(
-            bytes,
-            base + abi::SHARD_CREATED_POINTER_OFFSET,
-            source_pointer,
-            shard.roles.created_by,
-        )?;
-        encode_shard_role_pointer(
-            bytes,
-            base + abi::SHARD_DELETED_POINTER_OFFSET,
-            source_pointer,
-            shard.roles.deleted_by,
-        )?;
+        encoded_sources.push(EncodedRuntimeGenerationRebuildSource {
+            source,
+            device_pointer,
+        });
+    }
+    for (ordinal, shard) in input.shards.iter().enumerate() {
+        let base = abi::DESCRIPTOR_HEADER_BYTES + ordinal * abi::SHARD_DESCRIPTOR_BYTES;
+        abi::put_u64(bytes, base + abi::SHARD_ROW_START_OFFSET, shard.row_start);
+        abi::put_u64(bytes, base + abi::SHARD_ROW_COUNT_OFFSET, shard.row_count);
+        for (pointer_offset, role) in [
+            (
+                abi::SHARD_ROW_ID_POINTER_OFFSET,
+                &shard.roles.stable_row_ids,
+            ),
+            (abi::SHARD_VALIDITY_POINTER_OFFSET, &shard.roles.validity),
+            (abi::SHARD_VALUE_POINTER_OFFSET, &shard.roles.values),
+            (abi::SHARD_CREATED_POINTER_OFFSET, &shard.roles.created_by),
+            (abi::SHARD_DELETED_POINTER_OFFSET, &shard.roles.deleted_by),
+        ] {
+            let source_pointer = encoded_sources
+                .iter()
+                .find(|encoded| encoded.source.is_same_transport_source(&role.source))
+                .map(|encoded| encoded.device_pointer)
+                .ok_or(RuntimeGenerationRebuildPrepareError::InvalidInput(
+                    "rebuild role source",
+                ))?;
+            encode_shard_role_pointer(bytes, base + pointer_offset, source_pointer, role.span)?;
+        }
     }
     if cold_cursor != bytes.len() {
         return Err(RuntimeGenerationRebuildPrepareError::InvalidInput(
@@ -1224,6 +1544,189 @@ mod tests {
         }
     }
 
+    fn proof_for_commitment_test(
+        attempt: u64,
+        table_root: [u8; 32],
+        database_root: [u8; 32],
+    ) -> OpaqueRuntimeGenerationRebuildProof {
+        let mut slots = vec![[0_u8; 32]; abi::PROOF_DIGEST_SLOTS].into_boxed_slice();
+        slots[abi::SLOT_TABLE_ROOT] = table_root;
+        slots[abi::SLOT_DATABASE_ROOT] = database_root;
+        OpaqueRuntimeGenerationRebuildProof {
+            attempt: RuntimeGenerationRebuildAttempt::new(attempt).expect("nonzero attempt"),
+            root_format: ROOT_FORMAT_V1,
+            slots,
+        }
+    }
+
+    #[test]
+    fn durable_commitments_are_exactly_two_roots_and_gate_the_opaque_handoff() {
+        let expected =
+            proof_for_commitment_test(1, [0x41; 32], [0x42; 32]).into_durable_v1_commitments();
+        let mut durable = [0_u8; RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES];
+        expected
+            .encode_durable_into(&mut durable)
+            .expect("fixed durable commitment encoding");
+        assert_eq!(&durable[..32], &[0x41; 32]);
+        assert_eq!(&durable[32..], &[0x42; 32]);
+        assert!(matches!(
+            RuntimeGenerationRebuildV1DurableCommitments::decode_durable(&durable[..63]),
+            Err(RuntimeGenerationRebuildV1CommitmentBytesError::InvalidLength(63))
+        ));
+        let expected = RuntimeGenerationRebuildV1DurableCommitments::decode_durable(&durable)
+            .expect("fixed durable commitment decoding");
+        let table_map = proof_for_commitment_test(2, [0x41; 32], [0x42; 32])
+            .compare_durable_v1_commitments_with_table_map(
+                &expected,
+                |attempt, table_root, table_map, database_root| {
+                    table_map.consume(|empty_roots, leaf_root, path_roots| {
+                        (
+                            attempt.get(),
+                            format!("{table_root:?}"),
+                            empty_roots.len(),
+                            format!("{leaf_root:?}"),
+                            path_roots.len(),
+                            format!("{database_root:?}"),
+                        )
+                    })
+                },
+            )
+            .expect("matching commitments preserve the sealed table-map completion");
+        assert_eq!(table_map.0, 2);
+        assert_eq!(table_map.1, "OpaqueCudaSha256Digest(<opaque>)");
+        assert_eq!(table_map.2, 65);
+        assert_eq!(table_map.3, "OpaqueCudaSha256Digest(<opaque>)");
+        assert_eq!(table_map.4, 64);
+        assert_eq!(table_map.5, "OpaqueCudaSha256Digest(<opaque>)");
+
+        let mut map_consumed = false;
+        assert_eq!(
+            proof_for_commitment_test(3, [0x43; 32], [0x42; 32])
+                .compare_durable_v1_commitments_with_table_map(&expected, |_, _, _, _| {
+                    map_consumed = true;
+                }),
+            Err(RuntimeGenerationRebuildV1CommitmentMismatch)
+        );
+        assert!(
+            !map_consumed,
+            "a mismatched proof must not reveal the table-map completion"
+        );
+    }
+
+    #[test]
+    fn one_source_shard_convenience_retains_one_exact_source_for_all_roles() {
+        let source =
+            RuntimeGenerationRebuildSource::cold_ram(Arc::<[u8]>::from(vec![0_u8; 32]), 0, 32);
+        let shard = RuntimeGenerationRebuildShard::new(source, 0, 1, roles(1));
+        let roles = shard.role_sources();
+        for role in roles.iter().skip(1) {
+            assert!(roles[0].source.is_same_transport_source(&role.source));
+        }
+    }
+
+    fn independent_role_sources(
+        runtime: &CudaDriverRuntime,
+        bytes: &[u8],
+        rows: usize,
+    ) -> RuntimeGenerationRebuildShardRoleSources {
+        let roles = roles(rows);
+        let cold_source = |span: RuntimeGenerationRebuildRoleSpan| {
+            let begin = usize::try_from(span.byte_offset).expect("test role offset");
+            let end = begin
+                .checked_add(usize::try_from(span.byte_len).expect("test role length"))
+                .expect("test role range");
+            RuntimeGenerationRebuildShardRoleSource::new(
+                RuntimeGenerationRebuildSource::cold_ram(
+                    Arc::<[u8]>::from(bytes[begin..end].to_vec()),
+                    0,
+                    span.byte_len,
+                ),
+                RuntimeGenerationRebuildRoleSpan {
+                    byte_offset: 0,
+                    byte_len: span.byte_len,
+                },
+            )
+        };
+        let stable_begin =
+            usize::try_from(roles.stable_row_ids.byte_offset).expect("test role offset");
+        let stable_end = stable_begin
+            .checked_add(usize::try_from(roles.stable_row_ids.byte_len).expect("test role length"))
+            .expect("test role range");
+        let stable_row_ids = RuntimeGenerationRebuildShardRoleSource::new(
+            RuntimeGenerationRebuildSource::resident(
+                Arc::new(
+                    runtime
+                        .retain_device_memory_copy(0, &bytes[stable_begin..stable_end])
+                        .expect("resident stable IDs"),
+                ),
+                0,
+                roles.stable_row_ids.byte_len,
+            ),
+            RuntimeGenerationRebuildRoleSpan {
+                byte_offset: 0,
+                byte_len: roles.stable_row_ids.byte_len,
+            },
+        );
+        RuntimeGenerationRebuildShardRoleSources {
+            stable_row_ids,
+            validity: cold_source(roles.validity),
+            values: cold_source(roles.values),
+            created_by: cold_source(roles.created_by),
+            deleted_by: cold_source(roles.deleted_by),
+        }
+    }
+
+    #[test]
+    fn gpu_rebuild_accepts_independently_retained_five_role_sources() {
+        let Some(runtime) = cuda_runtime() else {
+            return;
+        };
+        let target = runtime
+            .runtime_generation_rebuild_target(0)
+            .expect("primary target");
+        let bytes = payload(&[(2, Some(11)), (5, None)], 3, 100, false);
+        let expected = complete(input(
+            target.clone(),
+            70,
+            vec![(
+                RuntimeGenerationRebuildSource::cold_ram(
+                    Arc::<[u8]>::from(bytes.clone()),
+                    0,
+                    bytes.len() as u64,
+                ),
+                2,
+            )],
+        ));
+        let actual = complete(RuntimeGenerationRebuildInput::new(
+            target,
+            RuntimeGenerationRebuildAttempt::new(71).expect("nonzero attempt"),
+            [0x5a; 16],
+            41,
+            9,
+            10,
+            2,
+            7,
+            1,
+            INT4_OID,
+            INT4_SIGNED_SIZE,
+            Box::new([RuntimeGenerationRebuildShard::from_role_sources(
+                0,
+                2,
+                independent_role_sources(&runtime, &bytes, 2),
+            )]),
+        ));
+        assert_eq!(
+            actual.slots[abi::SLOT_TABLE_ROOT],
+            expected.slots[abi::SLOT_TABLE_ROOT],
+            "per-role source ownership cannot enter the table root",
+        );
+        assert_eq!(
+            actual.slots[abi::SLOT_DATABASE_ROOT],
+            expected.slots[abi::SLOT_DATABASE_ROOT],
+            "per-role source ownership cannot enter the database root",
+        );
+    }
+
     #[test]
     fn former_vector_only_ceiling_is_rejected_before_cuda_enqueue() {
         let Some(runtime) = cuda_runtime() else {
@@ -1349,11 +1852,7 @@ mod tests {
                 &INT4_SIGNED_SIZE.to_le_bytes(),
             ],
         );
-        assert_eq!(
-            actual.slots[abi::SLOT_COLUMN_SHAPE].0,
-            shape,
-            "column shape"
-        );
+        assert_eq!(actual.slots[abi::SLOT_COLUMN_SHAPE], shape, "column shape");
         let leaf_rows = rows
             .iter()
             .map(|(row_id, value)| {
@@ -1404,7 +1903,7 @@ mod tests {
         }
         for (depth, root) in empty.iter().enumerate() {
             assert_eq!(
-                actual.slots[abi::SLOT_ROW_EMPTY + depth].0,
+                actual.slots[abi::SLOT_ROW_EMPTY + depth],
                 *root,
                 "row empty {depth}"
             );
@@ -1420,11 +1919,7 @@ mod tests {
                 &0_u32.to_le_bytes(),
             ],
         );
-        assert_eq!(
-            actual.slots[abi::SLOT_TABLE_ROOT].0,
-            table_root,
-            "table root"
-        );
+        assert_eq!(actual.slots[abi::SLOT_TABLE_ROOT], table_root, "table root");
         let mut map_empty = [[0_u8; 32]; 65];
         map_empty[64] = digest(
             b"gpu-db/runtime-generation/map-empty-leaf/v1",
@@ -1444,9 +1939,9 @@ mod tests {
         }
         for (depth, root) in map_empty.iter().enumerate() {
             assert_eq!(
-                actual.slots[abi::SLOT_DATABASE_EMPTY + depth].0,
+                actual.slots[abi::SLOT_TABLE_MAP_EMPTY + depth],
                 *root,
-                "database empty {depth}",
+                "table map empty {depth}",
             );
         }
         let mut map = digest(
@@ -1457,6 +1952,11 @@ mod tests {
                 &table_id.to_le_bytes(),
                 &table_root,
             ],
+        );
+        assert_eq!(
+            actual.slots[abi::SLOT_TABLE_MAP_LEAF],
+            map,
+            "table map leaf"
         );
         for depth in (0..64).rev() {
             map = if ((table_id >> (63 - depth)) & 1) == 0 {
@@ -1482,6 +1982,11 @@ mod tests {
                     ],
                 )
             };
+            assert_eq!(
+                actual.slots[abi::SLOT_TABLE_MAP_PATH + depth],
+                map,
+                "table map path {depth}",
+            );
         }
         digest(
             b"gpu-db/runtime-generation/database-root/v1",
@@ -1491,12 +1996,13 @@ mod tests {
 
     #[test]
     fn exact_output_abi_stays_opaque_and_closed() {
-        assert_eq!(abi::OUTPUT_BYTES, 4 + 135 * 32);
+        assert_eq!(abi::OUTPUT_BYTES, 4 + 200 * 32);
         assert_eq!(abi::SLOT_COLUMN_SHAPE, 0);
         assert_eq!(abi::SLOT_TYPED_VECTOR, 1);
         assert_eq!(abi::SLOT_CURRENT_ROW_LEAVES, 2);
         assert_eq!(abi::SLOT_ROW_EMPTY + 64, abi::SLOT_TABLE_ROOT - 1);
-        assert_eq!(abi::SLOT_DATABASE_EMPTY + 64, abi::SLOT_DATABASE_ROOT - 1);
+        assert_eq!(abi::SLOT_TABLE_MAP_EMPTY + 64, abi::SLOT_TABLE_MAP_LEAF - 1);
+        assert_eq!(abi::SLOT_TABLE_MAP_PATH + 63, abi::SLOT_DATABASE_ROOT - 1);
     }
 
     #[test]
@@ -1547,17 +2053,17 @@ mod tests {
         ));
         assert_eq!(mixed.slot_count(), abi::PROOF_DIGEST_SLOTS);
         assert_eq!(
-            mixed.slots[abi::SLOT_DATABASE_ROOT].0,
-            cold.slots[abi::SLOT_DATABASE_ROOT].0,
+            mixed.slots[abi::SLOT_DATABASE_ROOT],
+            cold.slots[abi::SLOT_DATABASE_ROOT],
             "physical source tier and shard boundaries cannot enter the database root",
         );
         assert_eq!(
-            mixed.slots[abi::SLOT_TABLE_ROOT].0,
-            cold.slots[abi::SLOT_TABLE_ROOT].0,
+            mixed.slots[abi::SLOT_TABLE_ROOT],
+            cold.slots[abi::SLOT_TABLE_ROOT],
             "the typed table root is independent of resident/cold ownership",
         );
         assert_eq!(
-            mixed.slots[abi::SLOT_DATABASE_ROOT].0,
+            mixed.slots[abi::SLOT_DATABASE_ROOT],
             database_root_reference(&[(2, Some(11)), (5, None), (9, Some(-7))], &mixed),
             "the device root must exactly follow the V1 canonical grammar",
         );
@@ -1666,6 +2172,55 @@ mod tests {
             }
             RuntimeGenerationRebuildCompletion::Quiesced(Err(error)) => {
                 panic!("retry fence quiesced a failed submission: {error:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn hazard_persistent_rebuild_fence_loss_remains_bounded_and_retains_owners() {
+        let Some(runtime) = cuda_runtime() else {
+            return;
+        };
+        let target = runtime
+            .runtime_generation_rebuild_target(0)
+            .expect("primary target");
+        let source = payload(&[(2, Some(11))], 3, 100, false);
+        let submission = PreparedRuntimeGenerationRebuild::prepare(input(
+            target,
+            5,
+            vec![(
+                RuntimeGenerationRebuildSource::cold_ram(
+                    Arc::<[u8]>::from(source.clone()),
+                    0,
+                    source.len() as u64,
+                ),
+                1,
+            )],
+        ))
+        .expect("preparation")
+        .enqueue();
+        // The first failure makes quiescence unknown; the second proves that a fence retry can
+        // remain unknown. Higher layers must surface this owner to their bounded fresh-context
+        // retry instead of polling forever.
+        crate::cuda_context::fail_owned_stream_syncs_for_test(2);
+        let unknown = match submission.complete() {
+            RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => unknown,
+            _ => panic!("first persistent fence failure must retain unknown quiescence"),
+        };
+        match unknown.retry_complete() {
+            RuntimeGenerationRebuildCompletion::UnknownQuiescence(unknown) => {
+                assert!(matches!(
+                    unknown.error(),
+                    RuntimeGenerationRebuildError::Runtime(_)
+                ));
+                // Dropping the retained owner takes its bounded drain/parking path.
+                drop(unknown);
+            }
+            RuntimeGenerationRebuildCompletion::Quiesced(Ok(_)) => {
+                panic!("second injected fence failure unexpectedly proved quiescence")
+            }
+            RuntimeGenerationRebuildCompletion::Quiesced(Err(error)) => {
+                panic!("persistent fence loss quiesced as a terminal error: {error:?}")
             }
         }
     }

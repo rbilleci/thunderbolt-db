@@ -73,8 +73,9 @@ starts at WRITE-001:
    shards, GPU-validating stable IDs/visibility/validity and returning one opaque 135-slot typed-root proof through
    one pre-reserved asynchronous fence lifecycle. It remains neither full bootstrap completion nor a live path. The
    next checkpoint broadens only through another sealed grammar: remaining fixed-width types, indexes/status/multiple
-   tables, then the separately accepted comparator and persistent-map import/install boundary. Do not start live
-   integration until the Text prerequisite and that comparison/install boundary are independently accepted.
+   tables, then the separately accepted comparator and persistent-map import/install boundary. The Text prerequisite
+   still blocks every Text/general bootstrap claim. The explicitly scoped nullable-Int4 recovery spine below is the
+   sole approved live exception; it must not be described as broad bootstrap completion.
 
    The exact semantics-v2 S7 wire contract is frozen and independently architecture-accepted at
    [`design/write-001-codec5-semantics-v2.md`](design/write-001-codec5-semantics-v2.md), file SHA-256
@@ -142,11 +143,135 @@ starts at WRITE-001:
    `b8810cf34954740c03254e256a36f7725a0c3ea5ba186f10030653e81f6746e9`; architecture and independent
    acceptance audits both returned **ACCEPT**.
 
-   The next PLAN-owned checkpoint is the **sealed retention-authority proof** that consumes
-   `RetentionAuthorityPending` into `CatalogAllocatorPending` using the sole authenticated claim/status index and
-   the accepted `ValidatedRetentionAuthority` live/historical sum. It must not add catalog/allocator validation,
-   durable sequence validation, GPU capacity or replay, WAL/recovery/apply/publication authority, or a second
-   retention-intent source; those remain later ordered phases under the accepted design.
+   The independently accepted **pinned catalog plus ADR-014 allocator-lease checkpoint** now consumes
+   `CatalogAllocatorPending` into `DurableSequencePending` while carrying the accepted
+   `ValidatedRetentionAuthority` live/historical sum opaquely. It validates one exact pinned catalog closure and
+   one complete immutable durable allocator-index proof: authoritative root/pin lineage, complete/durable/published
+   marker lifecycle, no hidden same-allocator/epoch overlap, explicit selected-member identity, and exactly one
+   selected non-refunding TableRow lease covering each S7 table interval. The full S1--S7 catalog/dependency/index/
+   guard/FK/sequence closure remains exact and allocation-free over the borrowed witnesses. The sole successor stays
+   production-compiled but unreachable from the semantics-v1 writer and stops before durable sequence validation,
+   GPU capacity/replay, WAL/recovery/apply/publication authority, or any second retention-intent source. The frozen
+   source candidate's three source/test paths hash to `5c770c501e6ef621e26c8e41dbd37bf29bdcf60953101689d744df2f61ef12af`;
+   independent acceptance returned **ACCEPT** with no finding.
+
+   The independently accepted **durable sequence-index checkpoint** now consumes
+   `DurableSequencePending` into `GenerationPending`. It authenticates one immutable Engine-shaped
+   `sequence_value_outcomes` index and pin, including empty S5, then walks retained S5 effects in canonical source
+   order. Every child must be complete/durable/published in the same retained lineage and strictly precede its
+   parent; exact transition, sequence, parent, ordinal, value, source-name, input-digest, and `Default` operation
+   equality closes against S1/S2/S4/S7. The validator streams the canonical Default input digest without allocation
+   and is byte-for-byte checked against the writer codec. Missing, pruned, forward, cross-lineage, mismatched, or
+   non-Default outcomes fail as durability corruption. The frozen seven-path content manifest is
+   `f50daf9f0bd3852ce8166540cd94a07a0cedfb52c6006623433caf557b4c5a85`; independent acceptance returned
+   **ACCEPT** with no finding.
+
+   The independently accepted **exact allocator replay-assignment closure** extends the same immutable allocator
+   root with selected parent-bound assignments rather than inferring a used subrange from S4/S7 or a lease boundary.
+   The root closes immutable lineage and stable-parent membership before mutable parent provenance, assignment
+   ordering/ranges, exact selected-lease marker identity, and the one-system-transaction/one-commit invariant. A
+   sealed non-Copy assignment is constructed during catalog/allocator validation and carried through
+   `DurableSequencePending` and `GenerationPending`; its production walk uses only S1/S2 plus pinned catalog/allocator
+   facts and covers every submitted source row, including canceled and suppressed rows. The frozen ten-path content
+   manifest is `319a3486848b05314634fd6931be084e1b632efc69d206444e53fb93e558eb9d`; independent acceptance returned
+   **ACCEPT** with no finding.
+
+   The independently accepted **allocator replay-row binding capability** narrows that sealed assignment for the
+   compiler to an allocation-free exact-size iterator of stable-table, statement, source-row, and stable-row-ID
+   scalars. Every root assignment is now an overflow-safe singleton inside its referenced lease, and the complete
+   immutable index rejects overlapping IDs across all parents in an allocator/epoch scope before selection. The
+   root-authenticated hidden-foreign-parent overlap sabotage proves that selected current-parent IDs cannot be
+   duplicated by an unselected record. The four-path manifest is
+   `7453e4179de98f36486fab8e5c6cc1e4fff9ea48bf506199e0b43fac2a4c43c1`; independent acceptance returned **ACCEPT**.
+
+   The independently accepted **asynchronous typed-i32 replay submission prerequisite** supplies the first real GPU
+   operator below `PreparedDeviceInsertPlan`: exact pre-enqueue preparation retains pinned HtoD/status host buffers,
+   device staging, deduplicated destination pins, a private stream, and its timing-event ownership. It queues the
+   fused typed write kernel without publishing a header, and completion is either proven quiescence or a retained
+   unknown-quiescence owner whose retry/drop path drains or parks every resource. The six-path manifest is
+   `b160464f4936d37388caaf0b6444bf6f2d0fdf9fe8f0fdf5e6bdcb8dd44dfdcb`; independent acceptance returned
+   **ACCEPT** with no finding.
+
+   **Narrow sealed nullable-Int4 recovery spine — accepted 2026-08-02.** Deliver exactly one explicit offline
+   sealing operation for one nonempty, no-index, one-column nullable `Int4` table at a durable, quiescent canonical
+   WAL cut. It privately replays the frozen prefix, retains the final device-resident row/value/validity/stable-row-ID/
+   creation-stamp owners, D2D-compacts only that image to dense immutable shards, runs the existing GPU Rebuild, and
+   writes only its table/database semantic commitments beside the same checkpoint metadata. Rebuild must emit the
+   exact closed one-entry table-map completion (65 canonical empty roots, one leaf, and its 64-node path); only after
+   durable table/database comparison may recovery consume that opaque completion into a specialized immutable
+   `FixedRadixMap<StableTableId, TableMapRoot, sealed-table-leaf>`, require the exact table ID/count/root, and let
+   the served route reach its retained GPU shards through that imported map. An elided all-valid
+   nullable bitmap must retain canonical zero tail bits (whole-word device fill plus at most its final control word),
+   never hash uninitialized capacity. Reopen must bind `covered_through` to the checkpoint prefix's terminal
+   canonical commit before replay, then verify lineage, catalog cut, closed V1 migration grammar, and independently
+   rebuilt roots before the sole commit coordinator installs one immutable sealed base. Only a strictly newer
+   recovered boundary is a suffix; an incomplete/stale checkpoint cut is durable failure. One plain `SELECT *` route
+   must pass that retained source directly to the existing general GPU executor and record build-only direct-source
+   GPU evidence. A later normal visibility advance clears the base before its release-store. HAZARD coverage must
+   include root-mismatch gating; a persistent unknown-quiescence retry in one new non-registry, dedicated CUDA
+   recovery context (never reset, evict, or re-retain the shared primary context); quarantine of each unproved
+   context with no third retry or CPU fallback; stale-suffix decline; post-install write invalidation; and real GPU
+   NULL/all-valid-tail reopen evidence, plus the applicable report-card gates.
+
+   **Acceptance record (2026-08-02).** The original map-backed runtime candidate
+   `2c9a89cc7d5073fb8109770a05e2b140cbbcbdfb` could not complete its one full card because its `/tmp` worktree hit
+   a user quota during the clean build; its retained pre-Section-A transcript is environmental evidence only and
+   must not be rerun. The genuinely new documentation-only candidate, with runtime and report-card harness sources
+   byte-identical, is commit `b24889c985e3284a7a10b7a68fc709858dd5eade`, tree
+   `b0fbe39d618d44f23a70a6ce4a16a0527fb77d22`, and staged-diff SHA-256
+   `ff92eab4e4d7dc82869b24f1db0f6231ab2ffbc441a144c17eaa676fc03c979a`. It passed the 11-test Rebuild transport/
+   HAZARD group, real-GPU nullable reopen/map-route, dedicated CUDA-719 reopen HAZARD, report-card durability
+   self-check, independent pre-full audit, and the retained quick Section-B median `272,655,388` lookups/s
+   (3/3 above the PERF-002 260M floor).
+
+   Its one canonical full card ran from the clean project filesystem and retained the complete durable transcript at
+   `/home/richard/projects/gpu-db-write001-storage-v6-candidate.kC89eg/candidate/target/benchmark-report-card-runs/runner.b24889c985e3.b0fbe39d618d.Tdf2lk.log`
+   (SHA-256 `d91a1ea2536443d89af0952af1a9cb5dc10c5074c1ff303b2fcfd47b3c993a75`). It has complete A/B/C sections,
+   valid closeout identity, one exact terminal `report_card_execution_status=complete mode=full sections=A,B,C
+   canonical=true` record, and removed its fresh owned target. Section B's three samples have median `266,839,011`
+   lookups/s (3/3 above 260M); Section C completed 48M rows and 300 measured batches at `258,705,357` lookups/s
+   with p50 `128us`; raw out-of-L2 `sum_i32` was `1,440 GB/s`. Independent post-card audit returned **FINAL
+   ACCEPT**, including a comparison to the applicable accepted baseline (B `+0.02%`, C `+0.54%`, roofline
+   `+0.81%`). This final ledger update is documentation-only, so the accepted runtime/harness artifact and card
+   remain applicable.
+
+   **Deferred breadth (trigger: Rebuild emits complete authenticated COW table-map/status paths).** This slice must
+   not claim a generic or multi-table `FixedRadixMap` import, a mutable publication generation, status roots, index
+   roots, empty-table support, multi-column/type/table grammar, automatic checkpoint rotation, or any extra SELECT
+   shape. The installed one-entry immutable map is owned by the existing coordinator; full table/status-map import
+   resumes only when the trigger evidence exists.
+
+   After this narrow spine is accepted, the next PLAN-owned broad checkpoint is the missing **sole immutable
+   publication-generation authority**, a prerequisite
+   to the exclusive generation/replay builder. The current catalog commit sequence, residency cache generation,
+   route token, device pointer, and shard map are not codec-v2 authenticated data roots; no replay path may hash,
+   copy, or relabel them as one. Freeze and implement one versioned, domain-separated runtime manifest/root format:
+   a persistent stable-table-ID map with a database **data** identity atomically paired with, but distinct from, the
+   catalog identity; a table manifest containing its logical data generation, logical row count, placement-neutral
+   GPU-produced typed data/artifact commitments, and complete ordered
+   `(stable_index_id, index_generation, index_root)` set; and an immutable publication object that atomically owns
+   `{visible_next, database_root, publication_epoch, catalog generation}` with every resident/cold payload, sidecar,
+   and index allocation it describes. Resolved/preflight records must prebuild changed table/index/database roots
+   privately before WAL. The accepted direct deterministic WAL-first class may fence only its root-free
+   intent/image prefix before hidden GPU apply; it must then build the same private roots and seal their exact
+   terminal descriptor before the one complete-marker fence or any publication. Both forms structurally share
+   unaffected entries and recover/checkpoint to identical roots. Names, host/device pointers, GPU placement, and
+   cache generations are never root inputs. Cover initial empty identity, changed data/index roots,
+   placement/compaction invariance, root substitution, multi-table/catalog atomicity, retained old-generation
+   lifetime, and deterministic recovery. This changes live publication/residency ownership, so the applicable quick
+   screen, independent audit, and canonical full report card are required.
+
+   Only after that authority is accepted may the **exclusive generation/replay builder boundary** begin with an owned
+   `ReplayBaseGenerationPin` and a compiler-only input that consumes `GenerationPending`. The pin must acquire one
+   exact publication object and capture its catalog generation, affected table/index entries, shard-map/device
+   allocations and sidecars, authenticated base generation/root, GPU identity, capacity lease, and quarantine
+   registration before any enqueue; it may never reload a table by name. Its compiler may use only typed S1/S2,
+   validated sequence values, pinned catalog/base snapshots, the sealed assignment, and outer identity; expected
+   S4/S6/S7/S8 and retention facts remain comparator-only. Then reserve success-worst-case host/device outputs,
+   scratch, candidate storage, pins, and the already-accepted stream/event ownership before consuming pending state.
+   Reuse only shared device operator definitions below `PreparedDeviceInsertPlan`; do not introduce a second
+   production builder. Pre-enqueue failure must return the exact pending owner; after first enqueue, every outcome is
+   an exclusively owned drainable attempt, and unknown quiescence parks its pins and capacity.
 
 2. **CARD-001 — whole report-card phase attribution and development-cycle wall time — BLOCKED on WRITE-001.** After
    WRITE-001 is accepted, INSERT-001's accepted phase records are the before-baseline and cannot be counted again as

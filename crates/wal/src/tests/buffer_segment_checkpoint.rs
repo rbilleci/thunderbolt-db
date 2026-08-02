@@ -1415,6 +1415,7 @@ fn wal_control_file_round_trips_checkpoint_metadata() {
             durable_record_count: 2,
             last_durable_txn_id: Some(42),
         },
+        sealed_int4_rebuild: None,
     };
 
     write_wal_control_file(&control_path, &control).unwrap();
@@ -1422,6 +1423,48 @@ fn wal_control_file_round_trips_checkpoint_metadata() {
     let _ = fs::remove_file(control_path);
 
     assert_eq!(recovered, control);
+}
+
+#[test]
+fn wal_control_file_round_trips_sealed_nullable_int4_rebuild_manifest() {
+    let control_path = test_wal_path("sealed-control").with_extension("control");
+    let checkpoint = WalCheckpointMeta {
+        durable_record_count: 3,
+        last_durable_txn_id: Some(44),
+    };
+    let manifest = SealedInt4RebuildManifestV1::new(
+        identity_test_value(7),
+        checkpoint,
+        100,
+        1,
+        1,
+        0,
+        1,
+        9,
+        100,
+        200,
+        1,
+        1,
+        1,
+        12,
+        [0x31; 32],
+        3,
+        [0x41; 32],
+        [0x42; 32],
+    )
+    .unwrap();
+    let control = WalControlFile {
+        segment_path: PathBuf::from("segment-0001.wal"),
+        checkpoint,
+        sealed_int4_rebuild: Some(manifest),
+    };
+
+    write_wal_control_file(&control_path, &control).unwrap();
+    let body = fs::read_to_string(&control_path).unwrap();
+    assert!(body.starts_with("GPUDBWALCONTROL3\n"));
+    assert!(body.contains("sealed_int4_rebuild="));
+    assert_eq!(read_wal_control_file(&control_path).unwrap(), control);
+    let _ = fs::remove_file(control_path);
 }
 
 #[test]
@@ -1434,12 +1477,13 @@ fn v2_control_and_lanes_checkpoint_sidecars_fail_closed_on_tamper_or_truncation(
             durable_record_count: 2,
             last_durable_txn_id: Some(42),
         },
+        sealed_int4_rebuild: None,
     };
     write_wal_control_file(&control_path, &control).unwrap();
     let original = fs::read_to_string(&control_path).unwrap();
-    assert!(original.starts_with("GPUDBWALCONTROL2\n"));
+    assert!(original.starts_with("GPUDBWALCONTROL3\n"));
     let legacy = original
-        .replace("GPUDBWALCONTROL2", "GPUDBWALCONTROL1")
+        .replace("GPUDBWALCONTROL3", "GPUDBWALCONTROL1")
         .lines()
         .filter(|line| !line.starts_with("sha256="))
         .collect::<Vec<_>>()
@@ -1518,6 +1562,7 @@ fn wal_checkpoint_reads_segment_named_by_control_file() {
             durable_record_count: 2,
             last_durable_txn_id: Some(2),
         },
+        sealed_int4_rebuild: None,
     };
 
     write_wal_segment(&segment_path, &records).unwrap();
@@ -1549,6 +1594,7 @@ fn wal_checkpoint_rejects_control_record_count_mismatch() {
             durable_record_count: 2,
             last_durable_txn_id: Some(1),
         },
+        sealed_int4_rebuild: None,
     };
 
     write_wal_segment(&segment_path, &records).unwrap();

@@ -80,6 +80,23 @@ impl Engine {
         Self::with_planner_config(PlannerConfig::default())
     }
 
+    /// Construct a recovery engine with the CUDA domain fixed before replay can allocate a
+    /// resident source.  `Some` is used only for the one context-loss retry and is deliberately
+    /// never installed into a normal engine's process-primary runtime cache.
+    fn new_recovery_engine(
+        planner_cfg: PlannerConfig,
+        recovery_runtime: Option<CudaDriverRuntime>,
+    ) -> Self {
+        let engine = Self::with_planner_config(planner_cfg);
+        if let Some(runtime) = recovery_runtime {
+            engine
+                .cached_cuda_probe_runtime
+                .set(runtime)
+                .expect("fresh recovery engine CUDA runtime cache must be empty");
+        }
+        engine
+    }
+
     /// Unit-test configuration with automatic residency admission disabled.
     ///
     /// This constructor does not select an execution backend. Each test explicitly chooses a
@@ -127,11 +144,112 @@ impl Engine {
             .cloned()
             .collect();
         for table in tables {
+            let sealed_capture_target = self
+                .catalog_snapshot()
+                .relational_catalog
+                .get(&table)
+                .is_some_and(|catalog_table| {
+                    self.sealed_int4_recovery_capture_is_armed_for(catalog_table.oid)
+                });
+            if sealed_capture_target {
+                // The sealed builder is still in quiescent recovery and has only the frozen
+                // canonical WAL prefix as input.  A CREATE initially admits an empty bootstrap
+                // shard while automatic post-replay admission is off, so materialize exactly one
+                // final device image here. Admission captures those owners before publication;
+                // the later served route uses that capture, never this recovery map or a host
+                // shadow.
+                self.populate_relational_residency_snapshot_shared(&table)
+                    .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+                // A replayed append may have replaced the CREATE-time empty shard after that
+                // admission hook ran. Take the one final map value while recovery is still
+                // quiescent, then retain its Arc owners; no served reader performs this lookup.
+                let table_oid = self
+                    .catalog_snapshot()
+                    .relational_catalog
+                    .get(&table)
+                    .map(|catalog_table| catalog_table.oid)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(
+                            "sealed nullable-int4 recovery table disappeared".to_string(),
+                        )
+                    })?;
+                let shards = self
+                    .read_residency_shards()
+                    .get(&table)
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(
+                            "sealed nullable-int4 recovery has no final shard generation"
+                                .to_string(),
+                        )
+                    })?;
+                self.capture_sealed_int4_recovery_shard(table_oid, shards)
+                    .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+                continue;
+            }
             if self.table_has_live_dml_generation(&table) {
                 continue;
             }
             self.populate_relational_residency_snapshot_shared(&table)
                 .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        }
+        // The sealed V1 object is intentionally constructed only after the ordinary canonical
+        // replay/admission path has completed.  It consumes the shard owners captured directly
+        // by admission, recomputes the GPU commitments, and asks the coordinator (the sole
+        // publication authority) to install the optional read-only generation before service.
+        if let Some(manifest) = self.take_staged_sealed_int4_recovery_manifest() {
+            let recovered_through = self.committed_seq();
+            if recovered_through == manifest.covered_through() {
+                let identity = self.commit_state().canonical_identity;
+                if !manifest.matches_lineage(identity) {
+                    return Err(EngineError::Durability(
+                        "sealed nullable-int4 checkpoint lineage does not match recovery WAL"
+                            .to_string(),
+                    ));
+                }
+                let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+                    identity,
+                    self.commit_state().wal.canonical_catalog_tail()?,
+                )?;
+                if catalog_epoch != manifest.catalog_epoch()
+                    || catalog_digest != manifest.catalog_digest()
+                {
+                    return Err(EngineError::Durability(
+                        "sealed nullable-int4 checkpoint catalog boundary does not match recovery WAL"
+                            .to_string(),
+                    ));
+                }
+                let catalog = self.catalog_snapshot();
+                let table_name = catalog
+                    .relational_catalog
+                    .iter()
+                    .find_map(|(name, table)| {
+                        (table.oid == manifest.table_oid()).then(|| name.clone())
+                    })
+                    .ok_or_else(|| {
+                        EngineError::Durability(
+                            "sealed nullable-int4 checkpoint table is absent after recovery"
+                                .to_string(),
+                        )
+                    })?;
+                let shards = self
+                    .take_sealed_int4_recovery_capture()
+                    .map_err(|error| EngineError::Durability(error.to_string()))?;
+                let generation = self.import_recovered_sealed_int4_generation(
+                    manifest, catalog, table_name, shards,
+                )?;
+                self.install_recovered_sealed_int4_generation(generation)?;
+            } else if recovered_through > manifest.covered_through() {
+                // A valid checkpoint may have a live suffix. It is safe to recover and serve the
+                // newer normal generation, but this sealed base no longer covers the reader cut.
+                // Consume/clear the private capture rather than ever mixing it with the suffix.
+                let _ = self.take_sealed_int4_recovery_capture();
+            } else {
+                return Err(EngineError::Durability(
+                    "sealed nullable-int4 recovery did not reach the checkpoint visibility cut"
+                        .to_string(),
+                ));
+            }
         }
         self.set_auto_admit_on_commit(true);
         Ok(())
@@ -158,20 +276,55 @@ impl Engine {
         matches!(code, 201 | 700 | 702 | 709 | 710 | 716 | 717 | 718 | 719)
     }
 
+    fn validate_sealed_int4_checkpoint_cut(
+        manifest: &gpu_db_wal::SealedInt4RebuildManifestV1,
+        checkpoint: gpu_db_wal::WalCheckpointMeta,
+        checkpoint_records: &[gpu_db_wal::WalRecord],
+    ) -> Result<(), EngineError> {
+        if checkpoint_records.len() != checkpoint.durable_record_count
+            || checkpoint_records.last().map(|record| record.txn_id)
+                != checkpoint.last_durable_txn_id
+        {
+            return Err(EngineError::Durability(
+                "sealed nullable-int4 checkpoint metadata does not match its WAL prefix"
+                    .to_string(),
+            ));
+        }
+        let terminal = checkpoint_records.last().ok_or_else(|| {
+            EngineError::Durability(
+                "sealed nullable-int4 checkpoint has no terminal canonical WAL record".to_string(),
+            )
+        })?;
+        let envelope =
+            gpu_db_wal::decode_canonical_record_payload(&terminal.payload)?.ok_or_else(|| {
+                EngineError::Durability(
+                    "sealed nullable-int4 checkpoint terminal WAL record is not canonical"
+                        .to_string(),
+                )
+            })?;
+        manifest.validate_checkpoint_cut(checkpoint, envelope.header.commit_seq)
+    }
+
     fn recover_with_fresh_context_retry<F>(mut attempt: F) -> Result<Self, EngineError>
     where
-        F: FnMut() -> Result<Self, EngineError>,
+        F: FnMut(Option<CudaDriverRuntime>) -> Result<Self, EngineError>,
     {
         #[cfg(test)]
         RECOVERY_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-        match attempt() {
+        match attempt(None) {
             Err(error) if Self::is_cuda_context_loss(&error) => {
-                // The failed engine is dropped before this second call. Construction reacquires
-                // runtime/context ownership and replay starts from immutable durable authority;
-                // no state from the possibly poisoned attempt is served or reused.
+                // Never reset, evict, or re-retain the process-wide primary context here: live
+                // readers or the unknown submission may still own allocations in it.  The retry
+                // instead receives a new non-registry driver context before replay's first
+                // allocation.  The failed context remains parked by its unknown owner.
+                let runtime = CudaDriverRuntime::probe_dedicated_recovery().map_err(|failure| {
+                    EngineError::ApplyFailed(format!(
+                        "sealed recovery dedicated CUDA context: {failure}"
+                    ))
+                })?;
                 #[cfg(test)]
                 RECOVERY_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-                attempt()
+                attempt(Some(runtime))
             }
             result => result,
         }
@@ -193,12 +346,24 @@ impl Engine {
         RECOVERY_ATTEMPT_COUNT.with(std::cell::Cell::get)
     }
 
-    pub fn recover_from_durable_wal(records: &[WalRecord]) -> Result<Self, EngineError> {
-        Self::recover_with_fresh_context_retry(|| Self::recover_from_durable_wal_once(records))
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn uses_dedicated_recovery_cuda_contexts_for_test(&self) -> bool {
+        self.cached_cuda_probe_runtime
+            .get()
+            .is_some_and(CudaDriverRuntime::uses_dedicated_recovery_contexts_for_test)
     }
 
-    fn recover_from_durable_wal_once(records: &[WalRecord]) -> Result<Self, EngineError> {
-        let engine = Self::new_local();
+    pub fn recover_from_durable_wal(records: &[WalRecord]) -> Result<Self, EngineError> {
+        Self::recover_with_fresh_context_retry(|runtime| {
+            Self::recover_from_durable_wal_once(records, runtime)
+        })
+    }
+
+    fn recover_from_durable_wal_once(
+        records: &[WalRecord],
+        recovery_runtime: Option<CudaDriverRuntime>,
+    ) -> Result<Self, EngineError> {
+        let engine = Self::new_recovery_engine(PlannerConfig::default(), recovery_runtime);
         engine.prepare_legacy_index_oid_recovery(records)?;
         // Recovery reconstructs the durable host/store image first. Per-record admission would
         // repeatedly upload partial generations and can enter device-authoritative elision while
@@ -228,8 +393,8 @@ impl Engine {
             return Self::open_durable_wal_segment(path);
         }
         let records = read_wal_segment(path)?;
-        Self::recover_with_fresh_context_retry(|| {
-            let engine = Self::new_local();
+        Self::recover_with_fresh_context_retry(|runtime| {
+            let engine = Self::new_recovery_engine(PlannerConfig::default(), runtime);
             engine.bind_durable_identity_for_recovery(path, &records)?;
             engine.begin_recovery_replay();
             engine.replay_durable_records(&records)?;
@@ -763,14 +928,19 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref().to_path_buf();
-        Self::recover_with_fresh_context_retry(|| {
-            Self::open_durable_wal_segment_with_planner_config_once(&segment_path, planner_cfg)
+        Self::recover_with_fresh_context_retry(|runtime| {
+            Self::open_durable_wal_segment_with_planner_config_once(
+                &segment_path,
+                planner_cfg,
+                runtime,
+            )
         })
     }
 
     fn open_durable_wal_segment_with_planner_config_once(
         segment_path: &std::path::Path,
         planner_cfg: PlannerConfig,
+        recovery_runtime: Option<CudaDriverRuntime>,
     ) -> Result<Self, EngineError> {
         // E2.5c-1: intent-lane files beside the base identify a LANES-MODE database. Its history
         // is the serial log (pre-activation DDL/warm-up) followed by the lane merge (explicit
@@ -778,7 +948,11 @@ impl Engine {
         // to the SAME lane set (disk-authoritative — the on-disk lane count wins over env).
         #[cfg(unix)]
         if Self::intent_lane_files_exist(segment_path) {
-            return Self::open_lanes_durable_wal_segment(segment_path, planner_cfg);
+            return Self::open_lanes_durable_wal_segment(
+                segment_path,
+                planner_cfg,
+                recovery_runtime,
+            );
         }
         // E1 step 3 — reopen is DISK-AUTHORITATIVE (not env-authoritative): a FUA log lives in
         // `<segment_path>.fua.*` frame-log segments (NO plain serial segment file), a serial log in
@@ -817,7 +991,7 @@ impl Engine {
                     ),
                 };
                 let records = gpu_db_wal::recover_fua_wal_records(segment_path)?;
-                let mut engine = Self::with_planner_config(planner_cfg);
+                let mut engine = Self::new_recovery_engine(planner_cfg, recovery_runtime);
                 engine.bind_durable_identity_for_recovery(segment_path, &records)?;
                 let durable_identity = engine.commit_state().canonical_identity;
                 engine.begin_recovery_replay();
@@ -841,7 +1015,7 @@ impl Engine {
             }
         }
         let recovery = recover_wal_segment(segment_path)?;
-        let mut engine = Self::with_planner_config(planner_cfg);
+        let mut engine = Self::new_recovery_engine(planner_cfg, recovery_runtime);
         engine.bind_durable_identity_for_recovery(segment_path, &recovery.records)?;
         let durable_identity = engine.commit_state().canonical_identity;
         engine.begin_recovery_replay();
@@ -875,6 +1049,7 @@ impl Engine {
     fn open_lanes_durable_wal_segment(
         segment_path: &std::path::Path,
         planner_cfg: PlannerConfig,
+        recovery_runtime: Option<CudaDriverRuntime>,
     ) -> Result<Self, EngineError> {
         let lane_count = gpu_db_wal::discover_lane_count(segment_path)?.ok_or_else(|| {
             EngineError::Durability(format!(
@@ -915,7 +1090,7 @@ impl Engine {
         }
         let lane_records = gpu_db_wal::recover_lanes_from(segment_path, lane_count, baseline)?;
 
-        let mut engine = Self::with_planner_config(planner_cfg);
+        let mut engine = Self::new_recovery_engine(planner_cfg, recovery_runtime);
         engine.begin_recovery_replay();
         // Replay (checkpoint | serial)-then-lanes WITHOUT durable backing (no segment I/O),
         // then install the continuation backends. The serial prefix's record count IS
@@ -1087,14 +1262,19 @@ impl Engine {
     ) -> Result<Self, EngineError> {
         let control_path = control_path.as_ref().to_path_buf();
         let segment_path = segment_path.as_ref().to_path_buf();
-        Self::recover_with_fresh_context_retry(|| {
-            Self::open_durable_wal_segment_with_checkpoint_once(&control_path, &segment_path)
+        Self::recover_with_fresh_context_retry(|runtime| {
+            Self::open_durable_wal_segment_with_checkpoint_once(
+                &control_path,
+                &segment_path,
+                runtime,
+            )
         })
     }
 
     fn open_durable_wal_segment_with_checkpoint_once(
         control_path: &std::path::Path,
         segment_path: &std::path::Path,
+        recovery_runtime: Option<CudaDriverRuntime>,
     ) -> Result<Self, EngineError> {
         // Checkpoint rotation is a SERIAL-log mechanism; a lanes-mode database's history spans
         // the serial log AND the lane logs, and cross-lane checkpoint/truncation is the E2.5c-2
@@ -1107,7 +1287,7 @@ impl Engine {
                 segment_path.display()
             )));
         }
-        let (_control, checkpoint_records) = read_wal_checkpoint(control_path)?;
+        let (control, checkpoint_records) = read_wal_checkpoint(control_path)?;
         let mut recovery = recover_wal_segment(segment_path)?;
         // W1b — the checkpoint/truncation crash window: `checkpoint_and_truncate_durable_wal`
         // writes the checkpoint segment (the FULL flushed history), then the control file, then
@@ -1139,11 +1319,27 @@ impl Engine {
         if overlap > 0 {
             recovery.records.drain(..overlap);
         }
-        let mut engine = Self::new_local();
+        let mut engine = Self::new_recovery_engine(PlannerConfig::default(), recovery_runtime);
         let mut identity_records = checkpoint_records.clone();
         identity_records.extend_from_slice(&recovery.records);
         engine.bind_durable_identity_for_recovery(segment_path, &identity_records)?;
         let durable_identity = engine.commit_state().canonical_identity;
+        if let Some(manifest) = control.sealed_int4_rebuild.map(Arc::new) {
+            if !manifest.matches_lineage(durable_identity) {
+                return Err(EngineError::Durability(
+                    "sealed nullable-int4 checkpoint lineage does not match control WAL"
+                        .to_string(),
+                ));
+            }
+            Self::validate_sealed_int4_checkpoint_cut(
+                &manifest,
+                control.checkpoint,
+                &checkpoint_records,
+            )?;
+            engine
+                .stage_sealed_int4_recovery_manifest(manifest)
+                .map_err(|error| EngineError::Durability(error.to_string()))?;
+        }
         engine.begin_recovery_replay();
         let checkpoint_count = checkpoint_records.len();
         let mut records = checkpoint_records;
@@ -1482,5 +1678,19 @@ impl Engine {
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {
         self.router.runtime_mut().set_saturated(saturated);
+    }
+}
+
+#[cfg(test)]
+mod sealed_int4_retry_tests {
+    use super::*;
+
+    #[test]
+    fn sealed_rebuild_unknown_quiescence_preserves_context_loss_for_the_bounded_retry() {
+        let error = EngineError::ApplyFailed(
+            "sealed nullable-int4 rebuild unknown quiescence: CUDA kernel launch failed: 719"
+                .to_string(),
+        );
+        assert!(Engine::is_cuda_context_loss(&error));
     }
 }

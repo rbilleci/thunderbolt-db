@@ -107,6 +107,15 @@ impl fmt::Debug for OpaqueCudaSha256Digest {
     }
 }
 
+impl OpaqueCudaSha256Digest {
+    /// Internal bridge for a quiesced fixed-slot GPU operator.  It deliberately remains
+    /// crate-private so only execution transports can re-label an already-produced device
+    /// digest; callers still have no constructor or byte accessor.
+    pub(crate) fn from_runtime_generation_rebuild_slot(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// A digest token can only be obtained from a fully quiesced whole batch.  It retains immutable
 /// batch/slot identity together with the opaque digest and is intentionally not Clone or Copy.
 pub struct OpaqueCudaSha256Token {

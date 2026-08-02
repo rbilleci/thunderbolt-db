@@ -3,8 +3,9 @@
 use std::os::raw::c_void;
 
 use super::{
-    check_cuda, launch_cuda_resident_device_memory, CudaDeviceMemoryProof, CudaJoinCoordinatesU32,
-    CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError,
+    check_cuda, launch_cuda_resident_device_memory_in_context, CudaDeviceMemoryProof,
+    CudaJoinCoordinatesU32, CudaResidentDeviceMemory, CudaResidentReadSource,
+    CudaRuntimeProbeError,
 };
 
 impl CudaResidentDeviceMemory {
@@ -16,8 +17,10 @@ impl CudaResidentDeviceMemory {
             return Err(CudaRuntimeProbeError::InvalidInputLength(0));
         }
         let byte_len = row_count as usize * std::mem::size_of::<u32>();
-        let allocation =
-            launch_cuda_resident_device_memory(self.metadata.gpu_id, &vec![0_u8; byte_len])?;
+        let allocation = launch_cuda_resident_device_memory_in_context(
+            self.primary_arc(),
+            &vec![0_u8; byte_len],
+        )?;
         Ok(CudaMatchBitmapU32 {
             marks: CudaResidentDeviceMemory::from_raw_parts(
                 CudaDeviceMemoryProof {

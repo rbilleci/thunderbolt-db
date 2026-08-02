@@ -236,6 +236,7 @@ impl CudaAllocationTracker {
 pub(super) struct GpuPrimaryContext {
     device: i32,
     context: *mut c_void,
+    ownership: GpuContextOwnership,
     pub(super) cu_mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> i32,
     pub(super) cu_mem_free: unsafe extern "C" fn(u64) -> i32,
     pub(super) cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> i32,
@@ -254,7 +255,6 @@ pub(super) struct GpuPrimaryContext {
     cu_mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> i32>,
     cu_mem_free_host: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
     cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
-    cu_primary_ctx_release: unsafe extern "C" fn(i32) -> i32,
     cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
     cu_module_unload: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_module_get_function: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32,
@@ -271,6 +271,22 @@ pub(super) struct GpuPrimaryContext {
     output_buffers: Mutex<OutputBufferPool>,
     pinned_host_buffers: Mutex<PinnedHostBufferPool>,
     lib: Arc<Library>,
+}
+
+/// The ordinary runtime shares CUDA's process-primary context. Recovery after a context-loss
+/// fence is deliberately different: it owns a private driver context which is never placed in
+/// the primary registry and can therefore be abandoned without invalidating unrelated readers.
+///
+/// Keep this distinction at the lowest owner boundary. Every allocation, module, stream and
+/// pooled buffer retains the same `Arc<GpuPrimaryContext>`, so a parked unknown completion also
+/// retains the correct destruction authority.
+enum GpuContextOwnership {
+    SharedPrimary {
+        release: unsafe extern "C" fn(i32) -> i32,
+    },
+    DedicatedRecovery {
+        destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    },
 }
 
 // SAFETY: the only !Send/!Sync fields are the raw `context` and the cached module/stream
@@ -293,7 +309,7 @@ impl GpuPrimaryContext {
         self.lib.as_ref()
     }
 
-    /// Make this primary context current on the calling thread (idempotent; a context may
+    /// Make this owned CUDA context current on the calling thread (idempotent; a context may
     /// be current on many threads). Every reader thread must call this before launching.
     pub(super) fn set_current(&self) -> Result<(), CudaRuntimeProbeError> {
         check_cuda(unsafe { (self.cu_ctx_set_current)(self.context) })
@@ -306,9 +322,11 @@ impl GpuPrimaryContext {
         stream: *mut c_void,
     ) -> Result<(), CudaRuntimeProbeError> {
         self.set_current()?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if take_fail_next_owned_stream_sync() {
-            return Err(CudaRuntimeProbeError::KernelLaunchFailed(-9_991));
+            return Err(CudaRuntimeProbeError::KernelLaunchFailed(
+                take_owned_stream_sync_failure_code(),
+            ));
         }
         check_cuda(unsafe { (self.cu_stream_synchronize)(stream) })
     }
@@ -679,10 +697,26 @@ impl GpuPrimaryContext {
     }
 
     fn create(gpu_id: u16) -> Result<Self, CudaRuntimeProbeError> {
+        Self::create_with_ownership(gpu_id, false)
+    }
+
+    /// Construct an isolated driver context for one recovery retry.  It is intentionally not a
+    /// second wrapper around CUDA's primary context: a loss in the primary cannot be safely
+    /// reset or re-retained while another live generation may still own allocations there.
+    pub(super) fn create_dedicated_recovery(gpu_id: u16) -> Result<Self, CudaRuntimeProbeError> {
+        Self::create_with_ownership(gpu_id, true)
+    }
+
+    fn create_with_ownership(
+        gpu_id: u16,
+        dedicated_recovery: bool,
+    ) -> Result<Self, CudaRuntimeProbeError> {
         type CuInit = unsafe extern "C" fn(u32) -> i32;
         type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
         type CuPrimaryCtxRetain = unsafe extern "C" fn(*mut *mut c_void, i32) -> i32;
         type CuPrimaryCtxRelease = unsafe extern "C" fn(i32) -> i32;
+        type CuCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
+        type CuCtxDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
         type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
         type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
         type CuMemFree = unsafe extern "C" fn(u64) -> i32;
@@ -736,6 +770,9 @@ impl GpuPrimaryContext {
             b"cuDevicePrimaryCtxRelease_v2\0",
             b"cuDevicePrimaryCtxRelease\0"
         );
+        let cu_ctx_create: CuCtxCreate = sym!(CuCtxCreate, b"cuCtxCreate_v2\0", b"cuCtxCreate\0");
+        let cu_ctx_destroy: CuCtxDestroy =
+            sym!(CuCtxDestroy, b"cuCtxDestroy_v2\0", b"cuCtxDestroy\0");
         let cu_ctx_set_current: CuCtxSetCurrent = sym!(CuCtxSetCurrent, b"cuCtxSetCurrent\0");
         let cu_mem_alloc: CuMemAlloc = sym!(CuMemAlloc, b"cuMemAlloc_v2\0", b"cuMemAlloc\0");
         let cu_mem_free: CuMemFree = sym!(CuMemFree, b"cuMemFree_v2\0", b"cuMemFree\0");
@@ -779,11 +816,22 @@ impl GpuPrimaryContext {
         let mut device = 0_i32;
         check_cuda(unsafe { cu_device_get(&mut device, i32::from(gpu_id)) })?;
         let mut context = std::ptr::null_mut();
-        check_cuda(unsafe { cu_primary_ctx_retain(&mut context, device) })?;
+        let ownership = if dedicated_recovery {
+            check_cuda(unsafe { cu_ctx_create(&mut context, 0, device) })?;
+            GpuContextOwnership::DedicatedRecovery {
+                destroy: cu_ctx_destroy,
+            }
+        } else {
+            check_cuda(unsafe { cu_primary_ctx_retain(&mut context, device) })?;
+            GpuContextOwnership::SharedPrimary {
+                release: cu_primary_ctx_release,
+            }
+        };
 
         Ok(Self {
             device,
             context,
+            ownership,
             cu_mem_alloc,
             cu_mem_free,
             cu_memcpy_dtoh,
@@ -793,7 +841,6 @@ impl GpuPrimaryContext {
             cu_mem_host_alloc,
             cu_mem_free_host,
             cu_ctx_set_current,
-            cu_primary_ctx_release,
             cu_module_load_data,
             cu_module_unload,
             cu_module_get_function,
@@ -815,8 +862,11 @@ impl GpuPrimaryContext {
 
 impl Drop for GpuPrimaryContext {
     fn drop(&mut self) {
-        // Unload cached modules and destroy pooled streams BEFORE releasing the primary
-        // context (they belong to it), then release our retain.
+        // Unload cached modules and destroy pooled streams before releasing the owning context.
+        // The dedicated-recovery case reaches this only after every known owner is gone; an
+        // unknown completion retains its Arc in the quarantine instead of tearing its context
+        // down beneath potentially in-flight work.
+        let _ = unsafe { (self.cu_ctx_set_current)(self.context) };
         if let Ok(mut modules) = self.modules.lock() {
             for (_, cached) in std::mem::take(&mut *modules) {
                 unsafe { (self.cu_module_unload)(cached.module) };
@@ -852,7 +902,12 @@ impl Drop for GpuPrimaryContext {
                 }
             }
         }
-        unsafe { (self.cu_primary_ctx_release)(self.device) };
+        unsafe {
+            match self.ownership {
+                GpuContextOwnership::SharedPrimary { release } => release(self.device),
+                GpuContextOwnership::DedicatedRecovery { destroy } => destroy(self.context),
+            }
+        };
     }
 }
 
@@ -1105,10 +1160,13 @@ pub(super) fn check_cuda(code: i32) -> Result<(), CudaRuntimeProbeError> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static FAIL_NEXT_OWNED_STREAM_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static OWNED_STREAM_SYNC_FAILURE_CODE: std::cell::Cell<i32> = const { std::cell::Cell::new(-9_991) };
+    #[cfg(test)]
     static FAIL_NEXT_OWNED_STREAM_LAUNCH_AFTER_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
     static FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1118,7 +1176,13 @@ thread_local! {
 /// driver failure would use, so tests can exercise resource parking without a hardware fault.
 #[cfg(test)]
 pub(super) fn fail_owned_stream_syncs_for_test(count: u32) {
+    fail_owned_stream_syncs_with_code_for_test(count, -9_991);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn fail_owned_stream_syncs_with_code_for_test(count: u32, code: i32) {
     FAIL_NEXT_OWNED_STREAM_SYNCS.with(|value| value.set(count));
+    OWNED_STREAM_SYNC_FAILURE_CODE.with(|value| value.set(code));
 }
 
 #[cfg(test)]
@@ -1131,7 +1195,7 @@ pub(super) fn fail_next_owned_stream_dtoh_enqueue_for_test() {
     FAIL_NEXT_OWNED_STREAM_DTOH_ENQUEUE.with(|value| value.set(true));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn take_fail_next_owned_stream_sync() -> bool {
     FAIL_NEXT_OWNED_STREAM_SYNCS.with(|value| {
         let remaining = value.get();
@@ -1142,6 +1206,11 @@ fn take_fail_next_owned_stream_sync() -> bool {
             true
         }
     })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn take_owned_stream_sync_failure_code() -> i32 {
+    OWNED_STREAM_SYNC_FAILURE_CODE.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

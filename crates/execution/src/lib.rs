@@ -31,8 +31,15 @@ pub use cuda_context::{
     CudaAllocationScope, CudaExternalAllocationReservation, PendingCudaResidentDeviceCopy,
 };
 mod cuda_driver;
-use cuda_driver::launch_cuda_resident_device_memory;
+use cuda_driver::launch_cuda_resident_device_memory_in_context;
 pub use cuda_driver::CudaDriverRuntime;
+/// Test-only fault injection for an owned private-stream completion fence.  This lives behind a
+/// dependency feature so engine recovery tests can exercise a real CUDA 719 path without making
+/// the hook part of production builds.
+#[cfg(feature = "test-support")]
+pub fn fail_owned_stream_syncs_with_cuda_code_for_test(count: u32, code: i32) {
+    cuda_context::fail_owned_stream_syncs_with_code_for_test(count, code);
+}
 mod staged_filter;
 
 mod resident_memory;
@@ -70,9 +77,13 @@ pub use runtime_generation_rebuild::{
     RuntimeGenerationRebuildError, RuntimeGenerationRebuildInput,
     RuntimeGenerationRebuildPrepareError, RuntimeGenerationRebuildPrepareFailure,
     RuntimeGenerationRebuildRoleSpan, RuntimeGenerationRebuildShard,
+    RuntimeGenerationRebuildShardRoleSource, RuntimeGenerationRebuildShardRoleSources,
     RuntimeGenerationRebuildShardRoles, RuntimeGenerationRebuildSource,
     RuntimeGenerationRebuildSubmission, RuntimeGenerationRebuildTarget,
-    RuntimeGenerationRebuildUnknownQuiescence,
+    RuntimeGenerationRebuildUnknownQuiescence, RuntimeGenerationRebuildV1CommitmentBytesError,
+    RuntimeGenerationRebuildV1CommitmentMismatch, RuntimeGenerationRebuildV1DurableCommitments,
+    RuntimeGenerationRebuildV1TableMapCompletion,
+    RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES,
 };
 mod resident_index_build;
 #[cfg(any(test, feature = "probe-timing"))]

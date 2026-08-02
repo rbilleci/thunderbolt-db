@@ -32,6 +32,9 @@ pg_query = "6"
 # enabling it here forwards to gpu_db_execution so the predicate/result-path probes in BOTH crates light up
 # with a single `cargo run --example ... --features probe-timing`. OFF by default (zero-cost).
 probe-timing = ["gpu_db_execution/probe-timing"]
+# End-to-end CUDA fault-injection coverage for recovery. It is opt-in so normal engine tests and
+# production builds never compile the execution fault hook.
+test-support = ["gpu_db_execution/test-support"]
 
 [dev-dependencies]
 # Phase-D SLO benchmark: jemalloc arm (the engine library itself never chooses an allocator).

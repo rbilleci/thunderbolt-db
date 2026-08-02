@@ -5,6 +5,7 @@
 //! telemetry. Small state aggregates the Engine owns; not the commit-critical core.
 
 use super::*;
+use std::sync::atomic::AtomicU32;
 
 mod point_slots;
 pub(crate) use point_slots::TablePointSlot;
@@ -340,6 +341,26 @@ pub struct ReadState {
     // so the concurrent commit critical section can bump it via `&self` (release-store, LAST — the
     // publish point) while lock-free readers acquire-load it once per statement (write-half Stage 4).
     pub(crate) committed_seq: AtomicU64,
+    /// Recovery-only WRITE-001 sealed immutable table-map generation. The commit publication
+    /// coordinator is its only installer/invalidator; normal reads take one Arc here and never
+    /// assemble a catalog/residency generation from unrelated loads.
+    pub(crate) sealed_int4_publication:
+        ArcSwapOption<crate::engine_data_generation::SealedInt4PublicationGenerationV1>,
+    /// Fast absent-route gate for ordinary SELECTs.  The coordinator stores the immutable
+    /// generation before release-publishing its table OID, and clears this gate before removing
+    /// that generation.  A zero avoids even an ArcSwap guard on the normal hot read path.
+    pub(crate) sealed_int4_publication_table_oid: AtomicU32,
+    /// Build-only route evidence for the sealed source handoff. It is absent from normal builds;
+    /// tests and `probe-timing` can prove that a real GPU result used this retained generation.
+    #[cfg(any(test, feature = "probe-timing"))]
+    pub(crate) sealed_int4_direct_source_gpu_served_total: AtomicU64,
+    /// Quiescent recovery-only handoff.  Admission captures the exact published shard owners for
+    /// a requested table once; the rebuild never performs a later name-map lookup to assemble its
+    /// physical source.  This state is cleared before service is enabled.
+    pub(crate) sealed_int4_capture_table_oid: AtomicU32,
+    pub(crate) sealed_int4_recovery_manifest:
+        Mutex<Option<Arc<gpu_db_wal::SealedInt4RebuildManifestV1>>>,
+    pub(crate) sealed_int4_recovery_capture: Mutex<Option<Arc<[RelationalResidentShard]>>>,
     /// Monotonic PostgreSQL-compatible non-MVCC rewrite fence keyed by stable table OID.
     /// Readers acquire the table guard before sampling this map; an older retained boundary then
     /// binds the typed empty root instead of traversing the retired generation.
@@ -356,6 +377,13 @@ impl ReadState {
             catalog_history: ArcSwap::new(Arc::new(CatalogHistory::initial())),
             mvcc: MvccData::new(),
             committed_seq: AtomicU64::new(0),
+            sealed_int4_publication: ArcSwapOption::empty(),
+            sealed_int4_publication_table_oid: AtomicU32::new(0),
+            #[cfg(any(test, feature = "probe-timing"))]
+            sealed_int4_direct_source_gpu_served_total: AtomicU64::new(0),
+            sealed_int4_capture_table_oid: AtomicU32::new(0),
+            sealed_int4_recovery_manifest: Mutex::new(None),
+            sealed_int4_recovery_capture: Mutex::new(None),
             table_rewrite_fences: ArcSwap::new(Arc::new(BTreeMap::new())),
             residency: ResidencyReadState::default(),
             route_telemetry: RouteTelemetry::default(),

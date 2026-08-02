@@ -79,8 +79,189 @@ impl Engine {
             &WalControlFile {
                 segment_path: control_segment_path,
                 checkpoint,
+                sealed_int4_rebuild: None,
             },
         )
+    }
+
+    /// Seal the first real WRITE-001 recovery generation at one already-durable, quiescent WAL
+    /// cut.  This is intentionally an explicit offline checkpoint operation, not automatic
+    /// rotation: it privately replays the frozen canonical prefix, captures the exact recovered
+    /// nullable-INT4 shard owners, and runs GPU Rebuild before atomically publishing the normal
+    /// checkpoint control file plus its semantic commitments.  The live engine remains on its
+    /// ordinary path; the sealed reader is admitted only by a later reopen of this control file.
+    pub fn seal_nullable_int4_rebuild_checkpoint(
+        &self,
+        control_path: impl AsRef<std::path::Path>,
+        checkpoint_segment_path: impl AsRef<std::path::Path>,
+        table_name: &str,
+    ) -> Result<WalCheckpointMeta, EngineError> {
+        let control_path = control_path.as_ref();
+        let checkpoint_segment_path = checkpoint_segment_path.as_ref();
+        let mut commit = self.commit_state_after_wave_quiescence()?;
+        if !commit.wal.is_durable() {
+            return Err(EngineError::Durability(
+                "sealed nullable-int4 checkpoint requires a durable WAL segment".to_string(),
+            ));
+        }
+        if commit.wal.unflushed_count() != 0 {
+            return Err(EngineError::Durability(
+                "sealed nullable-int4 checkpoint requires every committed WAL record to be durable"
+                    .to_string(),
+            ));
+        }
+        let checkpoint = commit.wal.checkpoint_meta();
+        let records = commit.wal.flushed_records().to_vec();
+        let identity = commit.canonical_identity;
+        let (catalog_epoch, catalog_digest) =
+            Self::canonical_catalog_boundary(identity, commit.wal.canonical_catalog_tail()?)?;
+        let visible_through = self.committed_seq();
+        let table_oid = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(table_name)
+            .map(|table| table.oid)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "sealed nullable-int4 checkpoint relation \"{table_name}\" does not exist"
+                ))
+            })?;
+
+        // Replaying the durable prefix into a fresh builder makes the rebuilt source independent
+        // of the mutable live admission generation.  Arm capture before recovery admission so
+        // exact row IDs and creation stamps cannot be compacted away as ordinary steady-state
+        // recovery would do.
+        let builder = Self::new_local();
+        builder.prepare_legacy_index_oid_recovery(&records)?;
+        builder
+            .arm_sealed_int4_recovery_capture(table_oid)
+            .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        builder.begin_recovery_replay();
+        builder.replay_durable_records(&records)?;
+        builder.finish_recovery_replay()?;
+        let builder_catalog = builder.catalog_snapshot();
+        let builder_table_name = builder_catalog
+            .relational_catalog
+            .iter()
+            .find_map(|(name, table)| (table.oid == table_oid).then(|| name.clone()))
+            .ok_or_else(|| {
+                EngineError::Durability(
+                    "sealed nullable-int4 checkpoint table disappeared during private replay"
+                        .to_string(),
+                )
+            })?;
+        let shards = builder
+            .take_sealed_int4_recovery_capture()
+            .map_err(|error| EngineError::Durability(error.to_string()))?;
+        let builder_table = builder_catalog
+            .relational_catalog
+            .get(&builder_table_name)
+            .ok_or_else(|| {
+                EngineError::Durability(
+                    "sealed nullable-int4 checkpoint table is absent from private catalog"
+                        .to_string(),
+                )
+            })?;
+        let column = builder_table.columns.first().ok_or_else(|| {
+            EngineError::Durability("sealed nullable-int4 checkpoint has no column".to_string())
+        })?;
+        let sealed_shards =
+            builder.seal_recovered_int4_shards_for_rebuild(builder_table, &shards)?;
+        let logical_row_count = sealed_shards.iter().try_fold(0_u64, |total, shard| {
+            total
+                .checked_add(u64::try_from(shard.row_count).map_err(|_| {
+                    EngineError::Durability(
+                        "sealed nullable-int4 checkpoint row count overflow".to_string(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    EngineError::Durability(
+                        "sealed nullable-int4 checkpoint row count overflow".to_string(),
+                    )
+                })
+        })?;
+
+        // Rebuild receives root-free grammar metadata plus exact device owners. Its completed
+        // GPU commitments below are the sole roots ever placed in the durable manifest.
+        let metadata = crate::engine_data_generation::SealedInt4RebuildMetadataV1::new(
+            identity.database_id,
+            builder_table.oid,
+            1,
+            1,
+            0,
+            1,
+            logical_row_count,
+            column.table_oid,
+            column.id,
+            1,
+            1,
+            column.attnum,
+            visible_through,
+        )
+        .map_err(|error| EngineError::Durability(error.to_string()))?;
+        let proof = builder.rebuild_sealed_int4_v1(
+            &metadata,
+            &builder_catalog,
+            &builder_table_name,
+            &sealed_shards,
+        )?;
+        let commitments = proof.into_durable_v1_commitments();
+        let mut root_bytes =
+            [0_u8; gpu_db_execution::RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES];
+        commitments
+            .encode_durable_into(&mut root_bytes)
+            .map_err(|error| {
+                EngineError::Durability(format!(
+                    "sealed nullable-int4 commitment encoding: {error:?}"
+                ))
+            })?;
+        let mut table_root = [0_u8; 32];
+        let mut database_root = [0_u8; 32];
+        table_root.copy_from_slice(&root_bytes[..32]);
+        database_root.copy_from_slice(&root_bytes[32..]);
+        let manifest = gpu_db_wal::SealedInt4RebuildManifestV1::new(
+            identity,
+            checkpoint,
+            builder_table.oid,
+            1,
+            1,
+            0,
+            1,
+            logical_row_count,
+            column.table_oid,
+            column.id,
+            1,
+            1,
+            column.attnum,
+            catalog_epoch,
+            catalog_digest,
+            visible_through,
+            table_root,
+            database_root,
+        )?;
+        if !manifest.matches_checkpoint(checkpoint) {
+            return Err(EngineError::Durability(
+                "sealed nullable-int4 checkpoint manifest binding drifted".to_string(),
+            ));
+        }
+        write_wal_segment(checkpoint_segment_path, &records)?;
+        let control_segment_path = checkpoint_segment_path
+            .strip_prefix(
+                control_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .unwrap_or(checkpoint_segment_path)
+            .to_path_buf();
+        write_wal_control_file(
+            control_path,
+            &WalControlFile {
+                segment_path: control_segment_path,
+                checkpoint,
+                sealed_int4_rebuild: Some(manifest),
+            },
+        )?;
+        Ok(checkpoint)
     }
 
     /// D2: bound the live WAL. Persist a self-contained checkpoint (control file + checkpoint
@@ -128,6 +309,7 @@ impl Engine {
             &WalControlFile {
                 segment_path: control_segment_path,
                 checkpoint: meta,
+                sealed_int4_rebuild: None,
             },
         )?;
         // W1b audit fix 1: the checkpoint + control RENAMES are not crash-durable until their

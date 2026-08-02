@@ -357,16 +357,19 @@ impl Engine {
         // from "written since BEGIN" after a rebuild. No active old boundary (or no newer row)
         // means no sidecar and zero steady-state sparse-version overhead.
         let oldest_active = self.active_snapshots_oldest();
-        let created_by_payload = oldest_active
-            .filter(|oldest| resident_created_by.iter().any(|created| created > oldest))
-            .map(|_| {
-                let mut payload =
-                    vec![CREATED_BY_VISIBLE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
-                for (slot, created_by) in resident_created_by.iter().enumerate() {
-                    payload[slot * 8..slot * 8 + 8].copy_from_slice(&created_by.to_le_bytes());
-                }
-                payload
-            });
+        let retain_created_by_for_sealed_recovery =
+            self.sealed_int4_recovery_capture_is_armed_for(catalog_table.oid);
+        let created_by_payload = (retain_created_by_for_sealed_recovery
+            || oldest_active
+                .is_some_and(|oldest| resident_created_by.iter().any(|created| *created > oldest)))
+        .then(|| {
+            let mut payload =
+                vec![CREATED_BY_VISIBLE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+            for (slot, created_by) in resident_created_by.iter().enumerate() {
+                payload[slot * 8..slot * 8 + 8].copy_from_slice(&created_by.to_le_bytes());
+            }
+            payload
+        });
 
         // S-F/R-1: allocate the complete mandatory replacement set BEFORE selecting or removing
         // an evictee. Allocation failure therefore leaves every published resident generation
@@ -631,6 +634,10 @@ impl Engine {
             };
             let mut shard_memory = BTreeMap::new();
             shard_memory.insert(0_u32, dm);
+            self.capture_sealed_int4_recovery_shard(catalog_table.oid, vec![shard.clone()])
+                .map_err(|error| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(error.to_string()))
+                })?;
             cat.relational_resident_cache.install_shards(
                 catalog_table.name.clone(),
                 vec![shard],

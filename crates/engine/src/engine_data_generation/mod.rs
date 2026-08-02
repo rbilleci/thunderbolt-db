@@ -1,7 +1,6 @@
-//! Private, production-compiled foundation for WRITE-001 logical data generations.
-//!
-//! It intentionally has no live caller. In particular it does not own an `ArcSwap`, a reader
-//! state, WAL/recovery, or a second publication authority.
+//! Production-compiled WRITE-001 logical-generation foundations and the one sealed recovery
+//! spine. The live module below owns no independent WAL/apply/publication authority: the commit
+//! coordinator remains the sole visibility boundary.
 
 mod bootstrap_publication;
 mod bootstrap_rebuild;
@@ -9,10 +8,13 @@ mod bootstrap_rebuild_gpu;
 mod digest;
 mod gpu_completion;
 mod input;
+mod live_spine;
 mod manifest;
 mod publication;
 mod resources;
 mod status;
+
+pub(crate) use live_spine::{SealedInt4PublicationGenerationV1, SealedInt4RebuildMetadataV1};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(super) enum DataGenerationError {
