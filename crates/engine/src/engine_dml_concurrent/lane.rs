@@ -131,11 +131,8 @@ impl Engine {
                 if !winner {
                     return None;
                 }
-                item.rows_affected = match item.op {
-                    LaneOpKind::Insert => 1,
-                    LaneOpKind::Delete | LaneOpKind::Update => target_count
-                        .expect("a selected lane mutation has an exact GPU target cardinality"),
-                };
+                item.rows_affected = target_count
+                    .expect("a selected lane mutation has an exact GPU target cardinality");
                 Some(item)
             })
             .collect();
@@ -255,11 +252,8 @@ impl Engine {
                 }
                 continue;
             }
-            item.rows_affected = match item.op {
-                LaneOpKind::Insert => 1,
-                LaneOpKind::Delete | LaneOpKind::Update => target_count
-                    .expect("the canonical recheck resolved an exact target cardinality"),
-            };
+            item.rows_affected =
+                target_count.expect("the canonical recheck resolved an exact target cardinality");
             accepted.push(item);
         }
         let mut winners = accepted;
@@ -268,18 +262,12 @@ impl Engine {
         }
         let k = winners.len() as u64;
 
-        // row-id block (atomic claim — safe under concurrent lanes) + W5a patches.
-        // U1/U2: INSERTS and UPDATES consume row ids — the allocator must stay in exact lock-step
-        // with replay, which advances it per INSERT record row (`rows_consumed`) and per UPDATE
-        // record (the new version, incl. the 0-row case). DELETES consume none. Ids are assigned in
-        // WINNERS ORDER (== seq order), so a single running offset feeds both the insert row-id
-        // patch and the update `new_row_id` patch below, and replay re-derives the identical
-        // assignment record-by-record. For UPDATE this is now a legacy reservation rather than
-        // entity identity; a delete claiming one would still skew replay's allocator high-water.
+        // UPDATE's v1 WAL record retains a legacy row-id reservation so replay's allocator stays
+        // in lock-step. DELETE consumes none.
         let patch_started = Instant::now();
         let row_consuming_count = winners
             .iter()
-            .filter(|item| item.op != LaneOpKind::Delete)
+            .filter(|item| item.op == LaneOpKind::Update)
             .count() as u64;
         let row_id_base = if row_consuming_count > 0 {
             let Some(base) = self.read_state.mvcc.claim_row_id_block(row_consuming_count) else {
@@ -292,7 +280,7 @@ impl Engine {
             };
             base
         } else {
-            0 // no insert/update in this wave; never read
+            0 // no update in this wave; never read
         };
         // Patch each resolved operation before the global sequence block is claimed. Canonical
         // headers need that global sequence, so physical envelope construction follows the claim.
@@ -301,19 +289,21 @@ impl Engine {
         let mut row_alloc_offset = 0u64;
         for item in winners.iter() {
             let payload = match item.op {
-                LaneOpKind::Insert | LaneOpKind::Update => {
-                    // INSERT patches its entity/row id; UPDATE patches the v1 record's legacy
-                    // allocator reservation. Both occupy `row_id_offset` (8 LE bytes) and draw the
-                    // next id from the shared block in winners order; a delete draws none.
+                LaneOpKind::Update => {
+                    // Patch the v1 record's legacy allocator reservation. A delete draws none.
                     let off = item.row_id_offset as usize;
+                    debug_assert!(
+                        off + 8 <= item.template.len(),
+                        "lane UPDATE row-id patch offset must lie within its canonical record"
+                    );
                     let row_id = row_id_base
                         .checked_add(row_alloc_offset)
                         .expect("claimed lane row-id block covers every winner");
                     row_alloc_offset += 1;
                     let mut payload: std::sync::Arc<[u8]> =
                         std::sync::Arc::from(&item.template[..]);
-                    std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
-                        [off..off + 8]
+                    std::sync::Arc::get_mut(&mut payload)
+                        .expect("fresh lane payload Arc is unique")[off..off + 8]
                         .copy_from_slice(&row_id.to_le_bytes());
                     payload
                 }
@@ -461,9 +451,6 @@ impl Engine {
         // cross-lane apply queue incapable of coalescing, so the retired queue/slot/spin layer is
         // deliberately absent.
         let mut apply_request = {
-            let mut rows = Vec::with_capacity(winners.len());
-            let mut stamps = Vec::with_capacity(winners.len());
-            let mut row_ids = Vec::with_capacity(winners.len());
             let mut tombstones: Vec<crate::engine_intent_lanes::LaneTombstone> = Vec::new();
             let mut updates: Vec<crate::engine_intent_lanes::LaneUpdate> = Vec::new();
             let mut expected_rows_affected = Vec::new();
@@ -471,29 +458,18 @@ impl Engine {
                 .first()
                 .map(|item| item.table.to_string())
                 .unwrap_or_default();
-            // U1/U2: split the wave — INSERT winners feed the merged append (rows/stamps/
-            // row_ids parallel, insert-dense); DELETE winners feed the tombstone pass; UPDATE
-            // winners feed the locate-tombstone-then-conditional-append pass. Inserts and updates
-            // draw contiguous allocator reservations from `row_id_base` in winners order via the
-            // SAME running offset the patch loop used. R3 stable identity means an update does not
-            // use that reservation for its replacement; it remains in v1 WAL solely so old logs
-            // and replay high-water reconstruction stay compatible.
+            // DELETE winners feed the tombstone pass; UPDATE winners feed the
+            // locate-tombstone-then-conditional-append pass. Updates draw contiguous legacy
+            // allocator reservations from `row_id_base` in winners order via the same running
+            // offset the patch loop used. R3 stable identity means an update does not use that
+            // reservation for its replacement; it remains in v1 WAL solely so old logs and replay
+            // high-water reconstruction stay compatible.
             // The request's seq range covers the WHOLE claimed block regardless of mix; canonical
             // apply and contiguous publication cover every claimed sequence before acknowledgement.
             let mut row_alloc_offset = 0u64;
             for (offset, item) in winners.iter_mut().enumerate() {
                 let seq = first_seq + offset as u64;
                 match item.op {
-                    LaneOpKind::Insert => {
-                        rows.push(std::mem::take(&mut item.values));
-                        stamps.push(seq);
-                        row_ids.push(
-                            row_id_base
-                                .checked_add(row_alloc_offset)
-                                .expect("claimed lane row-id block covers every winner"),
-                        );
-                        row_alloc_offset += 1;
-                    }
                     LaneOpKind::Delete => {
                         // WAL-FIRST: an UNRESOLVED by-key tombstone — the apply locates the
                         // visible target and writes the rows-affected cell (shared with the
@@ -538,9 +514,6 @@ impl Engine {
             }
             crate::engine_intent_lanes::ApplyRequest {
                 table: table_name,
-                rows,
-                row_ids,
-                stamps,
                 tombstones,
                 updates,
                 expected_rows_affected,
@@ -856,7 +829,6 @@ impl Engine {
             .stat_apply_launches
             .fetch_add(1, AtomicOrdering::Relaxed);
         let leader_started = Instant::now();
-        let applied_rows = request.stamps.len() as u64;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             struct LeaderGuard;
             impl Drop for LeaderGuard {
@@ -881,11 +853,6 @@ impl Engine {
                 });
         if failed {
             self.wedge_commit_path();
-        } else {
-            self.read_state
-                .residency
-                .device_authoritative_commits
-                .fetch_add(applied_rows, std::sync::atomic::Ordering::Relaxed);
         }
         lanes.stat_apply_ns.fetch_add(
             stat_start.elapsed().as_nanos() as u64,

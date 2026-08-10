@@ -12,7 +12,6 @@ use crate::engine_transaction_reset::StableRetryOr;
 mod canonical;
 mod control_plane;
 mod durability_failure;
-mod fixed_insert;
 mod lane;
 mod lane_apply;
 mod request;
@@ -21,6 +20,7 @@ mod wave;
 
 #[cfg(test)]
 pub(crate) use canonical::issue_test_only_typed_insert_post_wal_apply_permit;
+pub(crate) use canonical::issue_transaction_terminal_typed_insert_apply_permit;
 pub(crate) use canonical::TypedInsertPostWalApplyPermit;
 pub(crate) use durability_failure::CommitPathFailure;
 
@@ -166,6 +166,87 @@ pub(crate) fn wave_host_phase_timing_enabled() -> bool {
 }
 
 impl Engine {
+    /// Translate only the exceptional public identities that arrived after a sequence child had
+    /// already claimed their durable numeric slot. Normal callers retain their exact IDs.
+    pub(crate) fn resolve_public_transaction_id(&self, txn_id: TxnId) -> TxnId {
+        self.public_transaction_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&txn_id)
+            .copied()
+            .unwrap_or(txn_id)
+    }
+
+    /// Resolve a caller identity, allocating a durable surrogate for a compatibility collision
+    /// with an engine-owned sequence child or an earlier surrogate. The alias is retained so a
+    /// retry of the caller's request resolves to the same canonical terminal identity. All other
+    /// occupied durable IDs retain the normal fail-closed retry behavior at their terminal
+    /// admission checks.
+    pub(crate) fn resolve_or_allocate_public_transaction_id(
+        &self,
+        txn_id: TxnId,
+    ) -> Result<TxnId, TxnError> {
+        if let Some(effective_txn_id) = self
+            .public_transaction_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&txn_id)
+            .copied()
+        {
+            return Ok(effective_txn_id);
+        }
+
+        let commit = self.commit_state();
+        if !commit.transaction_status.contains_key(&txn_id) {
+            return Ok(txn_id);
+        }
+
+        let sequence_child_claim = self
+            .sequence_value_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&txn_id)
+            .is_some_and(|applied| applied.record.parent_txn_id != txn_id);
+        let surrogate_claim = self
+            .public_transaction_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|effective_txn_id| *effective_txn_id == txn_id);
+        if !sequence_child_claim && !surrogate_claim {
+            return Ok(txn_id);
+        }
+
+        let surrogate = self.allocate_unclaimed_transaction_id(&commit)?;
+        let mut aliases = self
+            .public_transaction_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(*aliases.entry(txn_id).or_insert(surrogate))
+    }
+
+    /// Mutate aliases while the caller owns the alias map and, when transitioning a snapshot,
+    /// the active-snapshot registry immediately afterwards.  That fixed lock order makes public
+    /// identity resolution and snapshot lookup one atomic observation.
+    pub(crate) fn complete_public_transaction_alias_in_map(
+        aliases: &mut HashMap<TxnId, TxnId>,
+        effective_txn_id: TxnId,
+        successor: Option<TxnId>,
+        terminal_is_durable: bool,
+    ) {
+        let public_ids = aliases
+            .iter()
+            .filter_map(|(public, effective)| (*effective == effective_txn_id).then_some(*public))
+            .collect::<Vec<_>>();
+        for public_id in public_ids {
+            if let Some(successor) = successor {
+                aliases.insert(public_id, successor);
+            } else if !terminal_is_durable {
+                aliases.remove(&public_id);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_wave_tail_handoff_hook(
         &self,
@@ -190,14 +271,13 @@ impl Engine {
             Some((self as *const Self as usize, reached, resume));
     }
 
-    /// Whether `text` is a DML statement (`INSERT`/`UPDATE`/`DELETE` on an existing base table whose
-    /// columns carry no `nextval` sequence default) that the **concurrent** commit path can execute
-    /// via off-lock prepare + the short commit critical section (write-half MVCC, Stage 4). Anything
-    /// else — DDL, KV, sequence-default INSERTs, transaction control, parse errors, unknown tables —
-    /// returns `false` and the caller routes it through the SERIALIZED `execute_text` under the
-    /// catalog latch. Conservative by construction: it never returns `true` for a statement the
-    /// concurrent path can't faithfully execute (a wrong "yes" only ever means a serialized fallback,
-    /// never a wrong result — but here a wrong "yes" would mis-route, so the checks are exact).
+    /// Whether `text` is an UPDATE or DELETE on an existing base table that the **concurrent**
+    /// commit path can execute via off-lock prepare plus the short commit critical section
+    /// (write-half MVCC, Stage 4). INSERT intentionally always returns `false`: every INSERT
+    /// ingress, including the public concurrent facade, enters the typed transaction overlay
+    /// rather than advertising eligibility for the displaced wave path. Other commands return
+    /// `false` as well. Conservative by construction: it never returns `true` for a statement
+    /// the concurrent path cannot faithfully execute.
     pub fn is_concurrent_dml(&self, text: &str) -> bool {
         let Ok(cmd) = parse_command(text) else {
             return false;
@@ -207,27 +287,15 @@ impl Engine {
 
     pub(crate) fn is_concurrent_dml_command(&self, cmd: &Command) -> bool {
         let table_name = match &cmd {
-            Command::Insert(insert) => &insert.table,
             Command::Update(update) => &update.table,
             Command::Delete(delete) => &delete.table,
             _ => return false,
         };
         // Lock-free concurrent-DML classify (Stage 2 — blocker #1): probe the pinned catalog snapshot.
         let catalog = self.catalog_snapshot();
-        let Some(table) = catalog.relational_catalog.get(table_name) else {
+        let Some(_table) = catalog.relational_catalog.get(table_name) else {
             return false;
         };
-        // INSERTs that evaluate a `nextval` column default mutate sequence state, which is not
-        // interior-mutable; route those through the serialized path (which applies the advance under
-        // `&mut self`). UPDATE/DELETE never touch sequences, so they are always eligible.
-        if matches!(cmd, Command::Insert(_)) {
-            let touches_sequence_default = table.columns.iter().any(|column| {
-                matches!(column.default, Some(ColumnDefault::SequenceNextVal { .. }))
-            });
-            if touches_sequence_default {
-                return false;
-            }
-        }
         true
     }
 
@@ -264,6 +332,22 @@ impl Engine {
         characteristics: TransactionCharacteristics,
     ) -> Arc<TransactionSnapshot> {
         self.capture_read_snapshot(boundary, false, characteristics)
+    }
+
+    /// Register a transaction's GC boundary without retaining its device/index generation before
+    /// the first data or catalog statement. The first statement replaces this shell with one full
+    /// pinned snapshot under the existing statement-refresh protocol, so a `BEGIN` followed by
+    /// `SET TRANSACTION`, rollback, or an idle connection cannot pay or hold the full GPU bundle.
+    fn capture_transaction_context_shell(
+        &self,
+        boundary: Index,
+        characteristics: TransactionCharacteristics,
+    ) -> Arc<TransactionSnapshot> {
+        let snapshot = self.capture_read_snapshot(boundary, true, characteristics);
+        snapshot
+            .data_snapshot_acquired
+            .store(false, AtomicOrdering::Release);
+        snapshot
     }
 
     /// Capture an autocommit statement generation. It has the same descriptor ownership guarantees
@@ -491,19 +575,63 @@ impl Engine {
             Some(expected) => pending.get(&txn_id) != Some(&expected),
             None => pending.contains_key(&txn_id),
         };
-        if commit.transaction_status.contains_key(&txn_id) || pending_rejected {
+        if pending_rejected {
             return Err(TxnError::AlreadyExists(txn_id));
         }
         drop(pending);
-        let snapshot = self.capture_transaction_snapshot(self.committed_seq(), characteristics);
+        let effective_txn_id = if commit.transaction_status.contains_key(&txn_id) {
+            // A typed sequence DEFAULT commits a durable child before its parent DML terminal.
+            // Compatibility callers may later use that child number as their own explicit
+            // transaction ID. Preserve the public identity by assigning a private surrogate;
+            // ordinary terminal/retry identities still fail closed as before.
+            let sequence_child_claim = self
+                .sequence_value_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&txn_id)
+                .is_some_and(|applied| applied.record.parent_txn_id != txn_id);
+            if !sequence_child_claim || allowed_pending.is_some() {
+                return Err(TxnError::AlreadyExists(txn_id));
+            }
+            self.begin_unclaimed_transaction(&mut commit)?
+        } else {
+            txn_id
+        };
+        #[cfg(feature = "probe-timing")]
+        let probe_snapshot_capture_started = std::time::Instant::now();
+        let snapshot =
+            self.capture_transaction_context_shell(self.committed_seq(), characteristics);
+        #[cfg(feature = "probe-timing")]
+        self.record_insert_probe_transaction_begin_snapshot_capture_nanos(
+            probe_snapshot_capture_started.elapsed().as_nanos() as u64,
+        );
         snapshot
             .program_owned
             .store(program_owned, AtomicOrdering::Release);
-        let txn = commit.txn_manager.begin_with_id(txn_id)?;
-        self.active_snapshots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .register_transaction(txn.id, snapshot);
+        let active_txn_id = if effective_txn_id == txn_id {
+            commit.txn_manager.begin_with_id(txn_id)?.id
+        } else {
+            // `begin_unclaimed_transaction` registered the surrogate while the same commit lock
+            // was held; use that exact identity for the active snapshot below.
+            effective_txn_id
+        };
+        if effective_txn_id == txn_id {
+            self.active_snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .register_transaction(active_txn_id, snapshot);
+        } else {
+            let mut aliases = self
+                .public_transaction_aliases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut active = self
+                .active_snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active.register_transaction(active_txn_id, snapshot);
+            aliases.insert(txn_id, active_txn_id);
+        }
         Ok(())
     }
 
@@ -546,6 +674,10 @@ impl Engine {
                 self.capture_transaction_snapshot(self.committed_seq(), characteristics),
             )
         });
+        let mut aliases = self
+            .public_transaction_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut active = self
             .active_snapshots
             .lock()
@@ -559,7 +691,14 @@ impl Engine {
         if let Some((next_id, next_snapshot)) = successor {
             active.register_transaction(next_id, next_snapshot);
         }
+        Self::complete_public_transaction_alias_in_map(
+            &mut aliases,
+            txn_id,
+            successor_id,
+            committed,
+        );
         drop(active);
+        drop(aliases);
         self.gc_transaction_created_by_regions();
         Ok(successor_id)
     }
@@ -583,20 +722,18 @@ impl Engine {
         Ok(())
     }
 
-    /// Off-lock prepare dispatch: run the pure `prepare_*` for a DML command against `snapshot`.
-    /// `insert_validation` = `Full` off-lock (the authoritative validation);
-    /// `ReResolveDeviceCovered` only from the sequencer's under-lock re-resolve (device history +
-    /// wave-local arbitration —
-    /// the coverage proof lives on [`InsertPrepareValidation`]).
+    /// Off-lock prepare dispatch for the generic UPDATE/DELETE wave. INSERT admission is consumed
+    /// by the transaction-overlay codec-5 route before this boundary.
     pub(crate) fn prepare_dml(
         &self,
         cmd: &Command,
         snapshot: DmlReadSnapshot,
-        insert_validation: InsertPrepareValidation,
     ) -> Result<WriteDelta, ExecuteError> {
         let delta = match cmd {
-            Command::Insert(insert) => {
-                self.prepare_insert(insert, snapshot, None, insert_validation)
+            Command::Insert(_) => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "generic concurrent wave cannot admit INSERT".to_string(),
+                )))
             }
             Command::Update(update) => self.prepare_update(update, snapshot),
             Command::Delete(delete) => self.prepare_delete(delete, snapshot),
@@ -607,83 +744,6 @@ impl Engine {
             }
         }?;
         Ok(delta)
-    }
-
-    /// DELTA-REUSE (B): is this off-lock-prepared delta safe to REUSE at the under-lock re-resolve
-    /// (re-key only) instead of re-preparing? An INSERT with no nextval advances (those route
-    /// through the serialized path) and no outbound FK. CHECK expressions are row-local and were
-    /// already validated off-lock; an FK depends on concurrently committed parent state and must
-    /// therefore re-run `prepare_insert` under the sequencer. The generation gate
-    /// (`ReResolveDeviceCovered`) is enforced at reuse time, so a post-prepare DDL (e.g. ADD FK)
-    /// still forces the Full path.
-    fn reresolve_reuse_eligible(
-        delta: &crate::write_path::WriteDelta,
-        catalog: &CatalogSnapshot,
-    ) -> bool {
-        let crate::write_path::PreparedMutation::Insert {
-            table,
-            seq_advances,
-            ..
-        } = &delta.mutation
-        else {
-            return false;
-        };
-        seq_advances.is_empty()
-            && catalog
-                .relational_catalog
-                .get(table)
-                .is_some_and(|table| table.foreign_keys.is_empty())
-    }
-
-    /// DELTA-REUSE (B): rebuild a reuse-eligible off-lock INSERT delta at `snapshot`'s
-    /// `next_row_id`, recomputing ONLY the per-row keys (the sole `next_row_id`-dependent output).
-    /// The coerced VALUES, the (value-derived) `write_set`, `rows_consumed`, and the empty
-    /// sequence state are input-deterministic, so under a matched catalog generation this equals a
-    /// fresh `prepare_insert` re-resolve — minus the re-coerce + not-null + write-set rebuild.
-    fn rekey_offlock_insert_delta(
-        delta: &crate::write_path::WriteDelta,
-        snapshot: DmlReadSnapshot,
-    ) -> Result<crate::write_path::WriteDelta, ExecuteError> {
-        let crate::write_path::PreparedMutation::Insert {
-            table,
-            inserted_rows,
-            seq_advances,
-        } = &delta.mutation
-        else {
-            unreachable!("reresolve_reuse_eligible gates this to inserts");
-        };
-        let rekeyed: Vec<(String, Vec<SqlValue>)> = inserted_rows
-            .iter()
-            .enumerate()
-            .map(|(offset, (_stale_key, values))| {
-                let offset = u64::try_from(offset).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(
-                        "re-keyed INSERT row-id offset exceeds u64".to_string(),
-                    ))
-                })?;
-                let row_id = snapshot.next_row_id.checked_add(offset).ok_or_else(|| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(
-                        "re-keyed INSERT row-id range overflows before WAL".to_string(),
-                    ))
-                })?;
-                Ok::<(String, Vec<SqlValue>), ExecuteError>((
-                    relational_row_key(table, row_id),
-                    values.clone(),
-                ))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(crate::write_path::WriteDelta {
-            write_set: delta.write_set.clone(),
-            read_snapshot: snapshot.commit_seq,
-            catalog_dependencies: delta.catalog_dependencies.clone(),
-            foreign_key_dependencies: delta.foreign_key_dependencies.clone(),
-            rows_consumed: delta.rows_consumed,
-            mutation: crate::write_path::PreparedMutation::Insert {
-                table: table.clone(),
-                inserted_rows: rekeyed,
-                seq_advances: seq_advances.clone(),
-            },
-        })
     }
 
     /// Enqueue one prepared concurrent DML commit into the deterministic commit WAVE and block
@@ -711,27 +771,17 @@ impl Engine {
         request: CanonicalRequest,
         write_set: WriteSet,
         read_snapshot: Index,
-        prepared_catalog_seq: Index,
         expected_catalog_version: Option<
             crate::engine_mutation_admission::CatalogVersionExpectation,
         >,
         offlock_prepared: Option<OfflockPreparedDml>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
-        #[cfg(any(test, debug_assertions))]
-        debug_assert!(offlock_prepared
-            .as_ref()
-            .is_none_or(|prepared| prepared.matches_request(&request)));
         let item = CommitWaveItem {
             txn_id,
             cmd,
             request,
-            prepared_catalog_seq,
             expected_catalog_version,
             offlock_prepared,
-            #[cfg(feature = "probe-timing")]
-            fixed_insert_typed: false,
-            binary_wal_template: None,
-            table_access: None,
             write_set,
             read_snapshot,
             outcome: Arc::new(CommitWaveDone::default()),
@@ -739,8 +789,7 @@ impl Engine {
         let outcome = self.enqueue_commit_wave_item(item)?;
         // Blocking client: become the sequencer or spin/park on our own outcome, running the
         // pipeline's pending tails as a fallback claimer (the classic per-statement blocking arm).
-        // (U1: the classic blocking APIs keep their `()` signature — rows-affected surfaces via
-        // the intent path; the count is dropped here, not fabricated.)
+        // Rows affected and RETURNING are carried through the common result surface.
         let rows_affected = if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
             result?
         } else {
@@ -752,69 +801,41 @@ impl Engine {
         })
     }
 
-    /// E2.2(c) — build a covered-INSERT wave item (the intent fast path's per-statement item),
-    /// carrying the reuse delta, integer conflict slots (already in `write_set`), and the
-    /// pre-encoded W5a binary template. Kept in this module so [`CommitWaveItem`]'s fields stay
-    /// private; the intent module supplies the pure-function inputs.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn make_covered_insert_wave_item(
+    #[cfg(test)]
+    /// Construct an ordinary classic queue item for queue/wedge/durability failure tests. This
+    /// fixture cannot carry a prepared INSERT delta or a pre-encoded INSERT WAL record.
+    pub(crate) fn make_test_commit_wave_item(
         &self,
         txn_id: u64,
         cmd: Command,
         request: CanonicalRequest,
         write_set: WriteSet,
         read_snapshot: Index,
-        prepared_catalog_seq: Index,
-        offlock_delta: Option<crate::write_path::WriteDelta>,
-        binary_wal_template: Option<(std::sync::Arc<[u8]>, u32)>,
     ) -> CommitWaveItem {
         CommitWaveItem {
             txn_id,
             cmd,
             request,
-            prepared_catalog_seq,
             expected_catalog_version: None,
-            offlock_prepared: offlock_delta
-                .map(|delta| OfflockPreparedDml::legacy(delta, read_snapshot)),
-            #[cfg(feature = "probe-timing")]
-            fixed_insert_typed: false,
-            binary_wal_template,
-            table_access: None,
+            offlock_prepared: None,
             write_set,
             read_snapshot,
             outcome: Arc::new(CommitWaveDone::default()),
         }
     }
 
-    /// E2.2(c) — enqueue a built item and BLOCK until it commits (the intent path's blocking arm,
-    /// identical wait machinery to [`Engine::commit_dml_concurrent`]).
-    pub(crate) fn commit_wave_item_blocking(
-        &self,
-        item: CommitWaveItem,
-    ) -> Result<(), ExecuteError> {
-        let outcome = self.enqueue_commit_wave_item(item)?;
-        if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
-            return result.map(|_| ());
-        }
-        self.await_commit_wave_outcome(&outcome).map(|_| ())
-    }
-
-    /// E2.2(c) — enqueue a built item WITHOUT blocking, returning its completion slot (the
-    /// driver-multiplexed submit path). The caller advances the pipeline via
-    /// [`Engine::drive_commit_wave`] and observes completion via [`CommitWaveOutcome::take_if_done`].
-    pub(crate) fn submit_commit_wave_item(
+    #[cfg(test)]
+    /// Enqueue a classic fixture without blocking so queue and failure tests can observe its
+    /// completion slot. Production callers enter through `commit_dml_concurrent`.
+    pub(crate) fn submit_test_commit_wave_item(
         &self,
         item: CommitWaveItem,
     ) -> Result<CommitWaveOutcome, ExecuteError> {
-        // Optimized lane intents enter via `build_lane_intent`; classic-shaped items use this
-        // queue. Both sequence through the canonical commit state and publication coordinator,
-        // so they may remain live concurrently.
         self.enqueue_commit_wave_item(item)
     }
 
-    /// Enqueue one already-built wave item (non-blocking). Returns its completion slot, or the
-    /// wedge error if the concurrent path is wedged pending recovery. The single shared push point
-    /// for the blocking commit arm and the E2.2(c) async submit path.
+    /// Enqueue one already-built classic wave item. Returns its completion slot, or the wedge error
+    /// if the concurrent path is wedged pending recovery.
     fn enqueue_commit_wave_item(
         &self,
         item: CommitWaveItem,
@@ -1261,21 +1282,9 @@ impl Engine {
         if let Some(last_committed_seq) = last_committed_seq {
             let mut commit = self.commit_state();
             commit.ledger.mark_published_through(last_committed_seq);
-            for receipt in std::mem::take(&mut tail.typed_ledger_receipts) {
-                commit
-                    .ledger
-                    .mark_published_visible(receipt, last_committed_seq);
-            }
         }
         for (position, _seq, rows) in &tail.committed {
             self.metrics.inc_commit();
-            #[cfg(feature = "probe-timing")]
-            if matches!(&tail.batch[*position].cmd, Command::Insert(_)) {
-                self.record_insert_probe_success(*rows);
-                if tail.batch[*position].fixed_insert_typed {
-                    self.record_insert_probe_fixed_insert_typed_commit();
-                }
-            }
             tail.batch[*position].set_outcome(Ok(*rows));
         }
         #[cfg(feature = "probe-timing")]
@@ -1506,7 +1515,49 @@ impl Engine {
         text: &str,
         timestamp_micros: u64,
     ) -> Result<(), ExecuteError> {
+        let txn_id = self
+            .resolve_or_allocate_public_transaction_id(txn_id)
+            .map_err(ExecuteError::Txn)?;
         let command = parse_command(text)?;
+        if matches!(&command, Command::Insert(_)) {
+            // The public compatibility API must not retain a serialized INSERT authority. An
+            // explicit transaction stages in its existing private generation; autocommit takes
+            // the same claimed overlay used by mutation admission and preserves the caller's
+            // supplied commit timestamp through its one canonical terminal.
+            self.observe_transaction_id(txn_id);
+            self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
+            self.legacy_lane_history_write_guard()
+                .map_err(ExecuteError::Engine)?;
+            if self.transaction_snapshot_handle(txn_id).is_some() {
+                return self
+                    .execute_prepared_dml_in_transaction_with_result(txn_id, command, None, false)
+                    .map(|_| ());
+            }
+            let (requests_published_sequence_default, route_catalog_version) =
+                self.insert_sequence_default_route(&command);
+            if requests_published_sequence_default {
+                return self
+                    .execute_sequence_default_autocommit_at_timestamp_micros(
+                        txn_id,
+                        command,
+                        route_catalog_version.map(
+                            crate::engine_mutation_admission::CatalogVersionExpectation::SequenceRoute,
+                        ),
+                        timestamp_micros,
+                    )
+                    .map(|_| ());
+            }
+            return self
+                .execute_autocommit_insert_as_one_statement_overlay(
+                    txn_id,
+                    command,
+                    CanonicalRequest::from_text(self, text).digest(),
+                    None,
+                    timestamp_micros,
+                    || {},
+                )
+                .map(|_| ());
+        }
         self.execute_parsed_text_at_timestamp_micros(txn_id, command, text, timestamp_micros, None)
     }
 
@@ -1625,6 +1676,14 @@ impl Engine {
                     .execute_parsed_dml_in_transaction_with_result(txn_id, cmd)
                     .map(|_| ());
             }
+            if matches!(&cmd, Command::CreateTable(_) | Command::CreateIndex(_)) {
+                return self.execute_catalog_in_transaction(
+                    txn_id,
+                    cmd,
+                    std::sync::Arc::<str>::from(text),
+                    expected_catalog_version,
+                );
+            }
             if !matches!(
                 &cmd,
                 Command::Begin { .. } | Command::Commit { .. } | Command::Rollback { .. }
@@ -1634,6 +1693,16 @@ impl Engine {
                         .to_string(),
                 )));
             }
+        }
+        // `execute_text` and mutation admission divert every live autocommit INSERT to the
+        // claimed typed-overlay terminal before reaching this compatibility dispatcher. Keep
+        // that boundary explicit: accepting it here would recreate the retired serialized
+        // INSERT claimant below, while explicit transactions above still use the typed overlay.
+        if matches!(&cmd, Command::Insert(_)) {
+            return Err(ExecuteError::Unsupported(
+                "direct parsed autocommit INSERT must enter typed transaction admission"
+                    .to_string(),
+            ));
         }
         let canonical_payload = Self::command_claims_canonical_mutation(&cmd)
             .then(|| std::sync::Arc::<[u8]>::from(text.as_bytes()));
@@ -1658,8 +1727,7 @@ impl Engine {
         // enter this sweep, and no device decline dispatches here.
         let representation_neutral = matches!(
             &cmd,
-            Command::Insert(_)
-                | Command::Update(_)
+            Command::Update(_)
                 | Command::Delete(_)
                 | Command::Select(_)
                 | Command::SelectLiteral(_)
@@ -1701,6 +1769,10 @@ impl Engine {
         }
 
         match cmd {
+            // The pre-dispatch guard above rejects live autocommit INSERT. This arm only makes
+            // that invariant explicit to the compiler; it has no encoder, apply, or publication
+            // behavior.
+            Command::Insert(_) => unreachable!("autocommit INSERT was rejected before fallback"),
             Command::SetKv { .. }
             | Command::DeleteKv { .. }
             | Command::CreateSchema(_)
@@ -1767,7 +1839,6 @@ impl Engine {
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
-            | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => {
                 self.preflight_unique_index_constraints(&cmd, txn_id)?;

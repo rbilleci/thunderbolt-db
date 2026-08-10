@@ -104,19 +104,6 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .drain(..),
             );
-            for request in lanes
-                .validate_queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .drain(..)
-            {
-                *request
-                    .slot
-                    .result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(None);
-                request.slot.done.store(true, AtomicOrdering::Release);
-            }
             for item in intents {
                 item.set_outcome(Err(failure.outcome_error()));
             }
@@ -193,21 +180,6 @@ impl Engine {
             };
             for item in resize_hold {
                 item.set_outcome(Err(ExecuteError::IndeterminateDurability(stranded.0)));
-            }
-            let requests = {
-                let mut requests = lanes
-                    .validate_queue
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                std::mem::take(&mut *requests)
-            };
-            for request in requests {
-                *request
-                    .slot
-                    .result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(None);
-                request.slot.done.store(true, AtomicOrdering::Release);
             }
         }
         self.commit_wave.cv.notify_all();
@@ -334,15 +306,12 @@ mod tests {
         super::super::CommitWaveOutcome,
     ) {
         let text = "INSERT INTO fixed_durability_fixture VALUES (1)";
-        let item = engine.make_covered_insert_wave_item(
+        let item = engine.make_test_commit_wave_item(
             txn_id,
             parse_command(text).expect("fixture insert parses"),
             CanonicalRequest::from_text(engine, text),
             WriteSet::default(),
             engine.committed_seq(),
-            engine.catalog_snapshot().commit_seq,
-            None,
-            None,
         );
         let outcome = Arc::clone(&item.outcome);
         (item, outcome)
@@ -377,7 +346,6 @@ mod tests {
             let tail = CommitWaveTail {
                 batch: vec![tail_item],
                 committed: Vec::new(),
-                typed_ledger_receipts: Vec::new(),
                 last_position: 1,
                 armed: true,
                 durability_fault: None,

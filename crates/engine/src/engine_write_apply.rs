@@ -149,12 +149,7 @@ impl Engine {
         // the version stamp exactly as before. The snapshot is taken immediately before prepare, so
         // `next_row_id` and the read visibility match what the in-line apply used.
         let snapshot = self.dml_read_snapshot(txn_id);
-        let delta = self.prepare_insert(
-            &insert,
-            snapshot,
-            profile.as_deref_mut(),
-            InsertPrepareValidation::Full,
-        )?;
+        let delta = self.prepare_insert(&insert, snapshot, profile.as_deref_mut())?;
         // Slice 1b-ii-c: surface the APPLIED rows (post-coercion / post-default, catalog order — the
         // actual stored images) for the commit path's in-place open-shard append, plus the delta's
         // write-set for SI ledger recording (C2). Captured BEFORE apply_delta_serialized consumes
@@ -338,17 +333,24 @@ impl Engine {
         text: &str,
         now: Instant,
     ) -> Result<(), ExecuteError> {
+        let txn_id = self.resolve_public_transaction_id(txn_id);
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         let cmd = parse_command(text)?;
+        if crate::engine_dml_concurrent::command_has_returning(&cmd) {
+            return Err(crate::engine_dml_concurrent::discarded_returning_error());
+        }
+        if matches!(&cmd, Command::Insert(_)) {
+            // INSERT has one typed transaction/WAL/publication authority. The historical queued
+            // compatibility surface remains for KV work, but it must not serialize a second
+            // relational INSERT path (including sequence-default parent handling).
+            return self.execute_text(txn_id, text);
+        }
         // This compatibility queue accepts caller-assigned identities. Observe the caller before
         // BEGIN/AND CHAIN or any immediate fallback can allocate an engine-owned successor, and
         // refuse reuse of an autocommit parent already claimed by a durable sequence outcome.
         self.observe_transaction_id(txn_id);
         self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
-        if crate::engine_dml_concurrent::command_has_returning(&cmd) {
-            return Err(crate::engine_dml_concurrent::discarded_returning_error());
-        }
         if let Command::TruncateTable(truncate) = &cmd {
             if self.transaction_snapshot_handle(txn_id).is_some() {
                 self.execute_truncate_in_transaction(txn_id, truncate.clone(), None)?;

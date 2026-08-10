@@ -114,6 +114,27 @@ impl Engine {
                 .contains_key(&table.oid)
     }
 
+    /// Feature-gated read-only evidence for named device-index publication. Callers use this only
+    /// for a fixture with exactly one named index; it never probes or builds a host index.
+    #[cfg(any(test, feature = "probe-timing"))]
+    pub fn relational_named_index_covered_rows(&self, table_name: &str) -> Option<usize> {
+        let coverage = self
+            .read_state
+            .residency
+            .named_index_coverage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rows = 0_usize;
+        let mut found = false;
+        for ((covered_table, _, _), (_, covered_rows)) in coverage.iter() {
+            if covered_table == table_name {
+                found = true;
+                rows = rows.checked_add(*covered_rows)?;
+            }
+        }
+        found.then_some(rows)
+    }
+
     /// Build/reuse every named primary and secondary index directly from one authoritative resident
     /// generation. Duplicate non-unique keys remain distinct candidate slots; typed equality and
     /// MVCC visibility are authoritative at probe time. No host row/index shadow is constructed.
@@ -202,6 +223,17 @@ impl Engine {
                 "resident index publication requires a non-empty shard set",
             ));
         }
+        let write001_empty_generation =
+            crate::engine_residency::write001_empty_foldable_index_enrollment(table)
+                && table_shards.len() == 1
+                && table_shards[0].shard_id == 0
+                && table_shards[0].row_start == 0
+                && table_shards[0].row_count == 0
+                && table_shards[0].capacity <= 1;
+        let write001_empty_shard =
+            crate::engine_residency::write001_empty_index_in_place_preallocation(table)
+                && write001_empty_generation
+                && table_shards[0].capacity == 1;
         if !replace_coverage
             && !self
                 .read_state
@@ -248,7 +280,7 @@ impl Engine {
         let gpu_id = gpu_id.ok_or_else(|| {
             publication_error("resident index publication requires at least one resident shard")
         })?;
-        if non_empty_shards == 0 {
+        if non_empty_shards == 0 && !write001_empty_generation {
             return Err(publication_error(
                 "resident index publication requires at least one indexed row",
             ));
@@ -288,7 +320,10 @@ impl Engine {
             let mut entry_rows = 0usize;
             let mut entry_bytes = 0_u64;
             let mut entry_shards = 0usize;
-            for shard in table_shards.iter().filter(|shard| shard.row_count != 0) {
+            for shard in table_shards
+                .iter()
+                .filter(|shard| shard.row_count != 0 || write001_empty_shard)
+            {
                 #[cfg(test)]
                 self.read_state
                     .residency
@@ -366,8 +401,10 @@ impl Engine {
                             gc_boundary,
                             deleted_by: shard.deleted_by_region.clone(),
                             duplicate_tolerant: !index.unique,
+                            allow_empty: write001_empty_shard && shard.row_count == 0,
                             apply_already_locked,
                             budget_already_locked,
+                            defer_cache_publication: false,
                         },
                     )
                     .map_err(|error| {

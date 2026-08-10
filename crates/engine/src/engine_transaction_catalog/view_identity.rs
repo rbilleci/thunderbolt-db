@@ -7,7 +7,9 @@ impl Engine {
     pub(crate) fn transaction_catalog_command_is_supported(command: &Command) -> bool {
         matches!(
             command,
-            Command::CreateTable(_)
+            Command::CreateDomain(_)
+                | Command::CreateTable(_)
+                | Command::AddForeignKey(_)
                 | Command::CreateView(_)
                 | Command::RenameView(_)
                 | Command::DropView(_)
@@ -25,6 +27,7 @@ impl Engine {
         &self,
         working: &mut DdlCatalogState,
         command: Command,
+        txn_id: TxnId,
     ) -> Result<(), EngineError> {
         // Every newly staged catalog command applies current semantics. The first admitted command
         // after a legacy prefix finalizes the one-way transition from recovery-only synthesized
@@ -32,7 +35,12 @@ impl Engine {
         // index-neutral transactions retain their byte-stable op10/12/14 framing.
         working.finalize_legacy_index_oid_migration()?;
         match command {
+            Command::CreateDomain(create) => self.apply_create_domain(working, create),
             Command::CreateTable(create) => self.apply_create_table(working, create),
+            Command::AddForeignKey(add) => {
+                let scoped = Self::catalog_snapshot_from_working(working, self.committed_seq());
+                self.apply_add_foreign_key_against_catalog(working, scoped.as_ref(), add, txn_id)
+            }
             Command::CreateView(create) => self.apply_create_view(working, create),
             Command::RenameView(rename) => self.apply_rename_view(working, rename),
             Command::DropView(drop) => self.apply_drop_view(working, drop),
@@ -354,6 +362,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // decoded envelope components are independently authenticated
     pub(crate) fn apply_transaction_catalog_envelope(
         &self,
         working: &mut DdlCatalogState,
@@ -362,6 +371,7 @@ impl Engine {
         record_seed: Index,
         commands: &[BinaryTransactionCatalogCommand],
         envelope: TransactionCatalogEnvelopeSlices<'_>,
+        codec5_catalog_sequence_reference_ordinals: bool,
     ) -> Result<(), EngineError> {
         let TransactionCatalogEnvelopeSlices {
             view_operations,
@@ -416,11 +426,19 @@ impl Engine {
                     .map(|target| target.oid)
             })
             .collect::<BTreeSet<_>>();
-        let sequence_reference_records = self.prepare_sequence_lifecycle_reference_replay(
+        let mut sequence_reference_records = self.prepare_sequence_lifecycle_reference_replay(
             working,
             sequence_value_references,
             &sequence_lifecycle_oids,
+            codec5_catalog_sequence_reference_ordinals,
         )?;
+        if codec5_catalog_sequence_reference_ordinals {
+            Self::rebind_codec5_catalog_sequence_replay_ordinals(
+                &mut sequence_reference_records,
+                sequence_value_references,
+                operation_order,
+            )?;
+        }
         let mut next_sequence_reference = 0usize;
         let legacy_lifecycle;
         let view_operations = if view_lifecycle_operations.is_empty() {
@@ -496,12 +514,13 @@ impl Engine {
             )?;
             let before = Self::catalog_snapshot_from_working(working, commit_seq);
             match &operation.command {
-                Command::CreateTable(_) => {
+                Command::CreateDomain(_) | Command::CreateTable(_) | Command::AddForeignKey(_) => {
                     if view_operations.get(next_view).is_some_and(|identity| {
                         usize::try_from(identity.command_index).ok() == Some(command_index)
                     }) {
                         return Err(EngineError::Durability(
-                            "ordered CREATE TABLE carries a stored-view identity".to_string(),
+                            "ordered table catalog operation carries a stored-view identity"
+                                .to_string(),
                         ));
                     }
                     if index_lifecycle_operations
@@ -511,7 +530,7 @@ impl Engine {
                         })
                     {
                         return Err(EngineError::Durability(
-                            "ordered CREATE TABLE carries an index identity".to_string(),
+                            "ordered table catalog operation carries an index identity".to_string(),
                         ));
                     }
                     if sequence_lifecycle_operations
@@ -521,7 +540,8 @@ impl Engine {
                         })
                     {
                         return Err(EngineError::Durability(
-                            "ordered CREATE TABLE carries a sequence identity".to_string(),
+                            "ordered table catalog operation carries a sequence identity"
+                                .to_string(),
                         ));
                     }
                 }
@@ -593,7 +613,11 @@ impl Engine {
             }
             self.with_apply_catalog(Some(Arc::clone(&before)), || {
                 if current_catalog_semantics {
-                    self.apply_transaction_catalog_command(working, operation.command.clone())
+                    self.apply_transaction_catalog_command(
+                        working,
+                        operation.command.clone(),
+                        commit_seq,
+                    )
                 } else {
                     self.apply_transaction_catalog_command_legacy_replay(
                         working,
@@ -725,6 +749,7 @@ impl Engine {
         commands: &[BinaryTransactionCatalogCommand],
         envelope: TransactionCatalogEnvelopeSlices<'_>,
         expected: &CatalogSnapshot,
+        codec5_catalog_sequence_reference_ordinals: bool,
     ) -> Result<(), ExecuteError> {
         let TransactionCatalogEnvelopeSlices {
             view_operations: _,
@@ -761,6 +786,7 @@ impl Engine {
             expected.commit_seq,
             commands,
             envelope,
+            codec5_catalog_sequence_reference_ordinals,
         )
         .map_err(ExecuteError::Engine)?;
         let reconstructed = Self::catalog_snapshot_from_working(&working, expected.commit_seq);

@@ -150,6 +150,7 @@ impl Engine {
             oid_state.finalize_legacy_index_oid_migration()?;
             oid_state.allocate_relational_class_oid("relational table OID allocation exhausted")?
         };
+        let stable_table_id = oid_state.allocate_stable_table_id()?;
         for sequence in &implicit_sequences {
             if legacy_replay.is_some() {
                 self.preflight_implicit_sequence_name_legacy_replay(sequence)?;
@@ -360,6 +361,7 @@ impl Engine {
             RelationalTable {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
                 name,
+                stable_table_id,
                 oid,
                 columns,
                 indexes,
@@ -1103,6 +1105,33 @@ impl Engine {
                 read_txn_id: self.committed_seq() as TxnId,
             },
         )?;
+        #[cfg(feature = "probe-timing")]
+        {
+            let non_null = rows
+                .iter()
+                .filter(|row| !matches!(row[column_idx], SqlValue::Null))
+                .count();
+            let violations = rows
+                .iter()
+                .filter(|row| {
+                    !crate::check_violation_expr::check_comparison_satisfies(
+                        &row[column_idx],
+                        add.filter.op,
+                        &literal,
+                    )
+                })
+                .count();
+            eprintln!(
+                "[probe] add_check_existing_rows table={} constraint={} rows={} non_null={} violations={} committed_seq={} device_authoritative={}",
+                table.name,
+                add.name,
+                rows.len(),
+                non_null,
+                violations,
+                self.committed_seq(),
+                self.table_device_authoritative(&table.name),
+            );
+        }
         for row in rows {
             // PG 3VL (same rule as the device DML CHECK verdict): an existing NULL value
             // makes the check UNKNOWN, which SATISFIES it — ADD CHECK must not reject over NULLs.
@@ -1129,6 +1158,15 @@ impl Engine {
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
+        self.preflight_add_foreign_key_against_catalog(cat.as_ref(), add, txn_id)
+    }
+
+    fn preflight_add_foreign_key_against_catalog(
+        &self,
+        cat: &CatalogSnapshot,
+        add: &AddForeignKey,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
         if add.table == add.referenced_table {
             return Err(EngineError::ApplyFailed(
                 "self-referential foreign keys are not supported".to_string(),
@@ -1206,6 +1244,27 @@ impl Engine {
                 referenced_column: add.referenced_column.clone(),
             },
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_add_foreign_key_against_catalog(
+        &self,
+        cat: &mut DdlCatalogState,
+        preflight_catalog: &CatalogSnapshot,
+        add: AddForeignKey,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        self.preflight_add_foreign_key_against_catalog(preflight_catalog, &add, txn_id)?;
+        let table = cat
+            .relational_catalog
+            .get_mut(&add.table)
+            .expect("foreign-key preflight retained its target table");
+        table.foreign_keys.push(RelationalForeignKey {
+            name: add.name,
+            column: add.column,
+            referenced_table: add.referenced_table,
+            referenced_column: add.referenced_column,
+        });
         Ok(())
     }
 
@@ -1539,7 +1598,10 @@ impl Engine {
         // future same-name table as device-authoritative.
         self.set_table_device_authoritative(&rename.old_name, false);
         self.set_table_device_authoritative(&rename.new_name, false);
-        // Read the rows to move out of the OLD partition's published generation.
+        // Read the rows to move out of the OLD partition's published generation.  A table rename
+        // changes the catalog/storage name, not the stable relational row identity.  Retaining
+        // that identity also keeps this catalog operation out of the one INSERT row allocator:
+        // codec-5 remains the only authority that advances the frontier for newly inserted rows.
         let mut moves = Vec::new();
         {
             let old_rows = self.read_state.mvcc.table_rows(&rename.old_name);
@@ -1549,14 +1611,22 @@ impl Engine {
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             while let Some(tuple) = cursor.next() {
                 if tuple.key.starts_with(&old_prefix) {
-                    moves.push((tuple.tuple_id, tuple.value.clone()));
+                    let row_id =
+                        crate::engine_residency::parse_relational_row_id(&tuple.key, &old_prefix)
+                            .ok_or_else(|| {
+                            EngineError::ApplyFailed(format!(
+                                "renamed relation row has an invalid stable identity: {}",
+                                tuple.key
+                            ))
+                        })?;
+                    moves.push((tuple.tuple_id, row_id, tuple.value.clone()));
                 }
             }
         }
 
         // Build the moved rows + their value-index for the NEW table (decoded against the renamed
-        // table's columns), reserving fresh global tuple ids and relational row ids — identical to
-        // the old in-line per-row bumps.
+        // table's columns). The MVCC storage tuple is new because this is a cross-partition move;
+        // the relational row identity embedded in the key is deliberately unchanged.
         table.name = rename.new_name.clone();
         for index in &mut table.indexes {
             index.table = rename.new_name.clone();
@@ -1568,11 +1638,9 @@ impl Engine {
         }
         let mut new_rows: Vec<(TupleId, String, String)> = Vec::with_capacity(moves.len());
         let mut new_value_index: BTreeMap<ColumnValueKey, Vec<String>> = BTreeMap::new();
-        let old_tuple_ids: Vec<TupleId> = moves.iter().map(|(tuple_id, _)| *tuple_id).collect();
-        for (_old_tuple_id, value) in &moves {
-            let row_id = self.read_state.mvcc.current_row_id();
-            self.read_state.mvcc.advance_row_id(1)?;
-            let new_key = relational_row_key(&rename.new_name, row_id);
+        let old_tuple_ids: Vec<TupleId> = moves.iter().map(|(tuple_id, _, _)| *tuple_id).collect();
+        for (_old_tuple_id, row_id, value) in &moves {
+            let new_key = relational_row_key(&rename.new_name, *row_id);
             let new_tuple_id = self.read_state.mvcc.reserve_tuple_id();
             let values = decode_relational_row(value, &table.columns)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;

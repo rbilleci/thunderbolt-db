@@ -7,37 +7,6 @@
 
 use super::*;
 
-pub(super) fn prediction(batch: &TypedInsertBatch) -> Result<HostRetentionGeometry, EngineError> {
-    if !batch.sequence_bindings.is_empty() || !batch.returning.is_empty() {
-        return Err(EngineError::Durability(
-            "typed INSERT resident-source retention prediction requires a supported effect shape"
-                .to_string(),
-        ));
-    }
-    let rows = batch.row_count as usize;
-    let mut geometry = HostRetentionGeometry::default();
-    append_table_and_dependencies(&mut geometry, &batch.table, &batch.dependencies)?;
-    for column in batch.columns.iter() {
-        if !(matches!(column.presence, TypedInsertColumnPresence::AllProvided)
-            && column.all_inputs_are_resolved(rows)
-            && is_live_resident_append_type(column.ty)
-            && column.values.rows_match(rows))
-        {
-            return Err(EngineError::Durability(
-                "typed INSERT resident-source retention prediction lost source eligibility"
-                    .to_string(),
-            ));
-        }
-        append_validity(&mut geometry, &column.validity)?;
-        append_values(&mut geometry, &column.values)?;
-    }
-    geometry.checked_add_backing_elements::<PreparedResidentAppendColumn>(
-        batch.columns.len(),
-        "typed INSERT resident source column box",
-    )?;
-    Ok(geometry)
-}
-
 pub(super) fn materialized_geometry(
     source: &PreparedResidentAppendSource,
 ) -> Result<HostRetentionGeometry, EngineError> {

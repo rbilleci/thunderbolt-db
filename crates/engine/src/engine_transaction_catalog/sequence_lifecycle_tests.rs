@@ -87,6 +87,21 @@ fn operation_payload(record: &gpu_db_wal::WalRecord) -> Arc<[u8]> {
     let envelope = gpu_db_wal::decode_canonical_record_payload(&record.payload)
         .unwrap()
         .unwrap();
+    if Engine::canonical_envelope_is_codec5(&envelope) {
+        // INSERT-bearing catalog transactions carry this pre-existing ordered envelope in S3;
+        // inspect that authority rather than treating an aggregate fragment as a legacy engine
+        // operation. Re-encoding is test-only and feeds the existing binary decoder below.
+        let catalog = crate::typed_insert_aggregate::decode_catalog_composition_for_test(
+            &envelope.header,
+            &envelope.fragments,
+        )
+        .unwrap()
+        .expect("codec-5 catalog transaction must retain its S3 ordered envelope");
+        return Arc::from(
+            try_encode_binary_transaction(&catalog)
+                .expect("codec-5 S3 catalog envelope must retain binary framing"),
+        );
+    }
     let operation = envelope
         .fragments
         .iter()
@@ -835,16 +850,34 @@ fn truncate_restart_identity_is_private_ordered_and_recoverable() {
 
     let records = engine.durable_wal_records();
     assert_eq!(records.len(), wal_before + 1);
-    let payload = operation_payload(records.last().unwrap());
-    let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
-        panic!("TRUNCATE RESTART transaction must decode");
-    };
-    assert_eq!(record.sequence_reset_operations.len(), 1);
-    assert_eq!(
-        record.sequence_advances_by_oid.get(&sequence_oid),
-        Some(&(1, true))
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&records.last().unwrap().payload)
+        .expect("decode TRUNCATE RESTART transaction")
+        .expect("TRUNCATE RESTART transaction uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "TRUNCATE RESTART must remain in the codec-5 INSERT authority"
     );
-    assert!(record.sequence_advances.is_empty());
+    let fragments = envelope
+        .fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let replay = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &envelope.header,
+        &envelope.outcome,
+        &fragments,
+    )
+    .expect("strictly close TRUNCATE RESTART codec-5 transaction")
+    .expect("TRUNCATE RESTART transaction selects semantics-v2 replay");
+    assert_eq!(
+        replay.metadata().stable_transaction_id,
+        records.last().unwrap().txn_id,
+        "the outer codec-5 identity follows the durable private-sequence child claims"
+    );
+    assert_eq!(replay.metadata().affected_rows, 1);
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
     assert_eq!(
@@ -854,6 +887,7 @@ fn truncate_restart_identity_is_private_ordered_and_recoverable() {
     let recovered_sequence = recovered
         .relational_catalog_sequence(sequence_name)
         .unwrap();
+    assert_eq!(recovered_sequence.oid, sequence_oid);
     assert_eq!(
         (recovered_sequence.last_value, recovered_sequence.is_called),
         (1, true)
@@ -972,10 +1006,6 @@ fn shadowed_restart_identity_remains_an_ordered_sequence_barrier() {
         )
         .unwrap();
     let sequence_name = "restart_barrier_owner_id_seq";
-    let sequence_oid = engine
-        .relational_catalog_sequence(sequence_name)
-        .unwrap()
-        .oid;
     let wal_before = engine.durable_wal_records().len();
 
     engine.execute_text(5_051, "BEGIN").unwrap();
@@ -1016,19 +1046,37 @@ fn shadowed_restart_identity_remains_an_ordered_sequence_barrier() {
 
     let records = engine.durable_wal_records();
     assert_eq!(records.len(), wal_before + 1);
-    let payload = operation_payload(records.last().unwrap());
-    let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
-        panic!("shadowed reset transaction must decode");
-    };
-    assert_eq!(record.operation_order.len(), 4);
-    assert_eq!(record.table_resets.len(), 1);
-    assert_eq!(record.table_resets[0].ordinal, 2);
-    assert_eq!(record.sequence_reset_operations.len(), 1);
-    assert_eq!(record.sequence_reset_operations[0].ordinal, 0);
-    assert_eq!(
-        record.sequence_advances_by_oid.get(&sequence_oid),
-        Some(&(2, true))
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&records.last().unwrap().payload)
+        .expect("decode reset-barrier transaction")
+        .expect("reset-barrier transaction uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "the ordered reset barrier must remain in the codec-5 INSERT authority"
     );
+    let fragments = envelope
+        .fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let replay = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &envelope.header,
+        &envelope.outcome,
+        &fragments,
+    )
+    .expect("strictly close reset-barrier codec-5 transaction")
+    .expect("reset-barrier transaction selects semantics-v2 replay");
+    let metadata = replay.metadata();
+    assert_eq!(
+        metadata.stable_transaction_id,
+        records.last().unwrap().txn_id
+    );
+    assert_eq!(metadata.statement_count, 2);
+    assert_eq!(metadata.affected_rows, 2);
+    assert!(metadata.resets_existing_rows);
+    assert_eq!(metadata.final_logical_row_count, 1);
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
     assert_eq!(
@@ -1041,6 +1089,66 @@ fn shadowed_restart_identity_remains_an_ordered_sequence_barrier() {
     assert_eq!(
         (recovered_sequence.last_value, recovered_sequence.is_called),
         (2, true)
+    );
+}
+
+#[test]
+fn unindexed_dense_reset_replaces_prior_resident_generation_live_and_replay() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            5_052,
+            "CREATE TABLE unindexed_reset_owner (id INT, note TEXT)",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            5_053,
+            "INSERT INTO unindexed_reset_owner VALUES (1, 'old-a'), (2, 'old-b')",
+        )
+        .unwrap();
+    let wal_before = engine.durable_wal_records().len();
+
+    engine.execute_text(5_054, "BEGIN").unwrap();
+    engine
+        .execute_text(5_054, "TRUNCATE unindexed_reset_owner")
+        .unwrap();
+    engine
+        .execute_text(
+            5_054,
+            "INSERT INTO unindexed_reset_owner VALUES (3, 'survivor')",
+        )
+        .unwrap();
+    engine.execute_text(5_054, "COMMIT").unwrap();
+
+    let select =
+        match parse_command("SELECT id, note FROM unindexed_reset_owner ORDER BY id").unwrap() {
+            Command::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+    let expected = vec![vec![
+        SqlValue::Int4(3),
+        SqlValue::Text("survivor".to_string()),
+    ]];
+    assert_eq!(
+        engine.execute_relational_select(&select).unwrap().rows,
+        expected
+    );
+
+    let records = engine.durable_wal_records();
+    assert_eq!(records.len(), wal_before + 1);
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&records.last().unwrap().payload)
+        .expect("decode unindexed reset transaction")
+        .expect("unindexed reset transaction uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "the unindexed reset must remain in the codec-5 INSERT authority"
+    );
+
+    let recovered = Engine::recover_from_durable_wal(&records).unwrap();
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        expected
     );
 }
 
@@ -1143,30 +1251,55 @@ fn dml_on_both_sides_of_rename_and_restart_binds_one_stable_sequence_oid() {
         wal_before + 3,
         "the two pre-RESTART defaults publish independently before the user envelope"
     );
-    let payload = operation_payload(records.last().unwrap());
-    let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
-        panic!("ordered sequence/DML transaction must decode");
-    };
-    assert_eq!(
-        record.sequence_advances_by_oid,
-        BTreeMap::from([(sequence_oid, (40, true))])
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&records.last().unwrap().payload)
+        .expect("decode ordered sequence transaction")
+        .expect("ordered sequence transaction uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "rename/restart DML must use the codec-5 INSERT authority"
     );
-    assert!(record.sequence_advances.is_empty());
+    let catalog_composition = crate::typed_insert_aggregate::decode_catalog_composition_for_test(
+        &envelope.header,
+        &envelope.fragments,
+    )
+    .expect("decode ordered sequence S3 composition")
+    .expect("rename/restart DML must retain its existing S3 catalog envelope");
     assert_eq!(
-        record.sequence_input_oids.len(),
-        1,
-        "only the post-RESTART private default belongs to sequence_advances_by_oid"
+        catalog_composition
+            .sequence_value_references
+            .iter()
+            .map(|reference| reference.statement_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 2],
+        "S3 must name the global INSERT operation ordinals for its independently durable pre-RESTART S5 receipts"
     );
-    assert!(record
-        .sequence_input_oids
-        .values()
-        .all(|oid| *oid == sequence_oid));
-    assert_eq!(record.sequence_value_references.len(), 2);
-    assert!(record
-        .sequence_value_references
+    assert!(matches!(
+        catalog_composition.operation_order.as_slice(),
+        [
+            BinaryTransactionOperationIdentity::Insert { .. },
+            BinaryTransactionOperationIdentity::Catalog { .. },
+            BinaryTransactionOperationIdentity::Insert { .. },
+            BinaryTransactionOperationIdentity::Catalog { .. },
+            BinaryTransactionOperationIdentity::Insert { .. },
+        ]
+    ));
+    let fragments = envelope
+        .fragments
         .iter()
-        .all(|reference| reference.sequence_oid == sequence_oid));
-    assert_eq!(record.sequence_lifecycle_operations.len(), 2);
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let replay = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &envelope.header,
+        &envelope.outcome,
+        &fragments,
+    )
+    .expect("strictly close ordered sequence codec-5 transaction")
+    .expect("ordered sequence transaction selects semantics-v2 replay");
+    assert_eq!(replay.metadata().stable_transaction_id, 5_055);
+    assert_eq!(replay.metadata().affected_rows, 3);
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
     assert_eq!(
@@ -1196,11 +1329,6 @@ fn restart_after_final_default_advance_is_a_durable_stable_oid_barrier() {
              (id INT DEFAULT nextval('restart_value_barrier'::regclass), note TEXT)",
         )
         .unwrap();
-    let sequence_oid = engine
-        .relational_catalog_sequence("restart_value_barrier")
-        .unwrap()
-        .oid;
-
     engine.execute_text(5_062, "BEGIN").unwrap();
     engine
         .execute_text(
@@ -1221,16 +1349,30 @@ fn restart_after_final_default_advance_is_a_durable_stable_oid_barrier() {
         .unwrap();
     assert_eq!((sequence.last_value, sequence.is_called), (23, false));
     let records = engine.durable_wal_records();
-    let payload = operation_payload(records.last().unwrap());
-    let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
-        panic!("restart barrier transaction must decode");
-    };
-    assert!(record.sequence_advances_by_oid.is_empty());
-    assert_eq!(record.sequence_value_references.len(), 1);
-    assert_eq!(
-        record.sequence_value_references[0].sequence_oid,
-        sequence_oid
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&records.last().unwrap().payload)
+        .expect("decode final-restart transaction")
+        .expect("final-restart transaction uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "the final RESTART must remain in the codec-5 INSERT authority"
     );
+    let fragments = envelope
+        .fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let replay = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &envelope.header,
+        &envelope.outcome,
+        &fragments,
+    )
+    .expect("strictly close final-restart codec-5 transaction")
+    .expect("final-restart transaction selects semantics-v2 replay");
+    assert_eq!(replay.metadata().stable_transaction_id, 5_062);
+    assert_eq!(replay.metadata().affected_rows, 1);
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
     let recovered_sequence = recovered

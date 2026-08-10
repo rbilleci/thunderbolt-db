@@ -8,7 +8,7 @@
 
 use gpu_db_types::EngineError;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{mem::MaybeUninit, sync::Arc};
 
 mod exact;
 mod generation_terminal;
@@ -651,10 +651,10 @@ pub struct CanonicalCatalogTail {
 
 /// An immutable canonical WAL record prepared from one successfully encoded envelope.
 ///
-/// Fields are private on purpose. The only construction path is
-/// [`EncodedCanonicalEnvelope::into_prepared_record`], which seals the exact record bytes and
-/// catalog-after tail from the same validated header. Live owners hand this value directly to
-/// [`crate::WalBuffer::append_canonical`].
+/// Fields are private on purpose. Construction paths either seal an allocating compatibility
+/// envelope or run the exact canonical encoder into caller-reserved buffers before sealing those
+/// bytes and the catalog-after tail from the same validated header. Live owners hand this value
+/// directly to [`crate::WalBuffer::append_canonical`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct PreparedCanonicalWalRecord {
     record: crate::WalRecord,
@@ -668,11 +668,12 @@ pub struct PreparedCanonicalWalRecord {
 /// Immutable authority for one exact-buffer canonical record.
 ///
 /// The packed bytes remain in the paired [`crate::WalRecord`] because replication owns that
-/// payload.  This value owns only the independently framed outer record used by `WalBuffer`,
-/// together with enough immutable evidence to reject a mismatched owner before it mutates a
-/// logical frontier.
+/// payload. This value retains an Arc-identical handle solely so later lifecycle transitions can
+/// prove that pairing in O(1), rather than rescanning a potentially large canonical payload after
+/// the constructor has already validated the outer record byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExactCanonicalRecordAuthority {
+    packed_payload: Arc<[u8]>,
     serialized_record: Arc<[u8]>,
     encoding: ExactCanonicalRecordEncoding,
     physical: CanonicalPhysicalRange,
@@ -680,6 +681,11 @@ pub(crate) struct ExactCanonicalRecordAuthority {
 }
 
 impl ExactCanonicalRecordAuthority {
+    /// Arc-identical packed payload paired with the exact outer record at construction.
+    pub(crate) fn packed_payload(&self) -> &Arc<[u8]> {
+        &self.packed_payload
+    }
+
     /// Exact v1 outer WAL bytes, including the 24-byte storage header and checksum.
     pub(crate) fn serialized_record(&self) -> &Arc<[u8]> {
         &self.serialized_record
@@ -707,6 +713,23 @@ impl PreparedCanonicalWalRecord {
     /// record rather than appending it to a live [`crate::WalBuffer`].
     pub fn into_wal_record(self) -> crate::WalRecord {
         self.record
+    }
+
+    /// Inspect the geometry and digests proven by the exact encoder. Compatibility records that
+    /// have not migrated to the exact typed lifecycle return `None`.
+    pub fn exact_encoding(&self) -> Option<ExactCanonicalRecordEncoding> {
+        self.exact
+            .as_ref()
+            .map(ExactCanonicalRecordAuthority::encoding)
+    }
+
+    /// Borrow the immutable outer WAL record emitted by the exact encoder. This read-only view is
+    /// intended for recovery/archive evidence and tests; live append transfers the whole prepared
+    /// authority into [`crate::WalBuffer`].
+    pub fn exact_serialized_record(&self) -> Option<&[u8]> {
+        self.exact
+            .as_ref()
+            .map(|authority| authority.serialized_record().as_ref())
     }
 
     /// Typed callers use this to prove that replication receives the precise packed bytes which
@@ -800,19 +823,119 @@ pub fn prepare_exact_canonical_wal_record(
         &mut serialized,
     )?;
     debug_assert_eq!(encoding.footprint, footprint);
-    let packed: Arc<[u8]> = packed.into();
-    let serialized: Arc<[u8]> = serialized.into();
+    seal_exact_canonical_wal_record(
+        txn_id,
+        physical,
+        header,
+        encoding,
+        packed.into_boxed_slice().into(),
+        serialized.into_boxed_slice().into(),
+    )
+}
+
+/// Encode and seal typed INSERT's exact canonical record into already-reserved authority buffers.
+///
+/// The engine may own canonical fragment bodies and reserve the two persistent output buffers,
+/// but it cannot manufacture WAL authority: this constructor revalidates every immutable input,
+/// fills both exact buffers exactly once, verifies their binding, and only then installs the
+/// private [`ExactCanonicalRecordAuthority`]. No caller-supplied digest or encoding metadata is
+/// trusted.
+pub fn prepare_exact_canonical_wal_record_from_borrowed_buffers(
+    txn_id: gpu_db_types::TxnId,
+    physical: CanonicalPhysicalRange,
+    header: CanonicalPreApplyHeader,
+    fragments: &[CanonicalFragmentRef<'_>],
+    outcome: CanonicalOutcome,
+    mut packed: Box<[u8]>,
+    mut serialized: Box<[u8]>,
+) -> Result<PreparedCanonicalWalRecord, EngineError> {
+    let encoding = encode_canonical_record_exact_from_borrowed(
+        txn_id,
+        physical,
+        &header,
+        fragments,
+        &outcome,
+        &mut packed,
+        &mut serialized,
+    )?;
+    seal_exact_canonical_wal_record(
+        txn_id,
+        physical,
+        header,
+        encoding,
+        packed.into(),
+        serialized.into(),
+    )
+}
+
+/// Encode and seal into uniquely-owned, uninitialized Arc allocations.
+///
+/// The typed envelope reserves these exact-sized authority allocations before proposal.  The
+/// encoder initializes every byte after its fallible validation has completed, so converting the
+/// allocations directly into immutable Arc authority avoids copying both large WAL buffers merely
+/// to add Arc reference-count storage at seal time.
+pub fn prepare_exact_canonical_wal_record_from_borrowed_uninit_arc_buffers(
+    txn_id: gpu_db_types::TxnId,
+    physical: CanonicalPhysicalRange,
+    header: CanonicalPreApplyHeader,
+    fragments: &[CanonicalFragmentRef<'_>],
+    outcome: CanonicalOutcome,
+    mut packed: Arc<[MaybeUninit<u8>]>,
+    mut serialized: Arc<[MaybeUninit<u8>]>,
+) -> Result<PreparedCanonicalWalRecord, EngineError> {
+    let encoding = {
+        let packed = Arc::get_mut(&mut packed).ok_or_else(|| {
+            durability("uninitialized exact packed authority must be uniquely owned")
+        })?;
+        let serialized = Arc::get_mut(&mut serialized).ok_or_else(|| {
+            durability("uninitialized exact serialized authority must be uniquely owned")
+        })?;
+        // SAFETY: these exact buffers are only exposed to this encoder while uniquely owned.
+        // The exact encoder initializes every byte after its validation phase; on an error the
+        // MaybeUninit allocations are simply dropped without ever being retyped as `u8`.
+        let packed = unsafe { &mut *(packed as *mut [MaybeUninit<u8>] as *mut [u8]) };
+        let serialized = unsafe { &mut *(serialized as *mut [MaybeUninit<u8>] as *mut [u8]) };
+        encode_canonical_record_exact_from_borrowed(
+            txn_id, physical, &header, fragments, &outcome, packed, serialized,
+        )?
+    };
+    // SAFETY: the exact encoder above wrote both complete, measured slices before returning
+    // success; their element type is byte-sized and has no drop invariant.
+    let packed = unsafe { Arc::from_raw(Arc::into_raw(packed) as *const [u8]) };
+    let serialized = unsafe { Arc::from_raw(Arc::into_raw(serialized) as *const [u8]) };
+    seal_exact_canonical_wal_record(txn_id, physical, header, encoding, packed, serialized)
+}
+
+fn seal_exact_canonical_wal_record(
+    txn_id: gpu_db_types::TxnId,
+    physical: CanonicalPhysicalRange,
+    header: CanonicalPreApplyHeader,
+    encoding: ExactCanonicalRecordEncoding,
+    packed: Arc<[u8]>,
+    serialized: Arc<[u8]>,
+) -> Result<PreparedCanonicalWalRecord, EngineError> {
+    #[cfg(feature = "probe-timing")]
+    let mut encoding = encoding;
+    #[cfg(feature = "probe-timing")]
+    let probe_seal_started = std::time::Instant::now();
     let payload_start = crate::WAL_RECORD_HEADER_LEN;
-    if serialized.get(payload_start..) != Some(packed.as_ref()) {
-        return Err(durability(
-            "exact serialized record payload diverged from packed replication payload",
-        ));
-    }
+    // The only callers reach this private seal after one of the exact encoders has filled the
+    // two caller-owned buffers.  That encoder writes the serialized payload exclusively via
+    // `copy_from_slice(packed_payload)`, after all fallible geometry/input validation has
+    // finished.  Re-scanning the complete payload here therefore repeated an already-closed
+    // byte binding on every committed write; retain it as a debug invariant without making the
+    // hot path perform a second full WAL-buffer traversal.
+    debug_assert_eq!(serialized.get(payload_start..), Some(packed.as_ref()));
     let tail = CanonicalCatalogTail {
         identity: header.identity,
         catalog_after_epoch: header.catalog_after_epoch,
         catalog_after_digest: header.catalog_after_digest,
     };
+    let packed_authority = Arc::clone(&packed);
+    #[cfg(feature = "probe-timing")]
+    {
+        encoding.probe_timing_nanos[4] = probe_seal_started.elapsed().as_nanos() as u64;
+    }
     Ok(PreparedCanonicalWalRecord {
         record: crate::WalRecord {
             txn_id,
@@ -820,6 +943,7 @@ pub fn prepare_exact_canonical_wal_record(
         },
         tail,
         exact: Some(ExactCanonicalRecordAuthority {
+            packed_payload: packed_authority,
             serialized_record: serialized,
             encoding,
             physical,

@@ -303,6 +303,139 @@ fn concurrent_copy_same_key_revalidates_before_wal_and_keeps_engine_writable() {
 }
 
 #[test]
+fn concurrent_distinct_copy_rows_publish_and_recover_every_acknowledged_row() {
+    let engine = Arc::new(Engine::new_local_test_engine());
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE copy_distinct_keys (id INT PRIMARY KEY, note INT)",
+        )
+        .unwrap();
+    let copy = gpu_db_sql::parse_copy_from_stdin(
+        "COPY copy_distinct_keys (id, note) FROM STDIN WITH (FORMAT csv)",
+    )
+    .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let wal_before = engine.durable_wal_records().len();
+
+    let writers =
+        [(100_u64, SqlValue::Null), (101_u64, SqlValue::Int4(0))].map(|(txn_id, note)| {
+            let engine = Arc::clone(&engine);
+            let copy = copy.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                engine.execute_relational_copy_rows_instrumented(
+                    txn_id,
+                    &copy,
+                    vec![vec![SqlValue::Int4(txn_id as i32), note]],
+                    move || {
+                        barrier.wait();
+                    },
+                )
+            })
+        });
+    for outcome in writers.map(|writer| writer.join().unwrap()) {
+        assert_eq!(outcome.unwrap().0, 1);
+    }
+    assert_eq!(engine.durable_wal_records().len(), wal_before + 2);
+
+    let Command::Select(select) =
+        parse_command("SELECT id, note FROM copy_distinct_keys ORDER BY id").unwrap()
+    else {
+        panic!("expected SELECT")
+    };
+    let expected = vec![
+        vec![SqlValue::Int4(100), SqlValue::Null],
+        vec![SqlValue::Int4(101), SqlValue::Int4(0)],
+    ];
+    assert_eq!(
+        engine.execute_relational_select(&select).unwrap().rows,
+        expected
+    );
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        expected
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn concurrent_gpu_copy_rows_publish_and_recover_every_acknowledged_row() {
+    let engine = Arc::new(Engine::new_local());
+    engine.set_shard_residency_enabled(true);
+    engine.set_shard_size_target(64);
+    engine.set_auto_admit_on_commit(true);
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE copy_gpu_distinct_keys (id INT PRIMARY KEY, note INT)",
+        )
+        .unwrap();
+    let seed = (0..128)
+        .map(|id| format!("({id}, {id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute_text(
+            2,
+            &format!("INSERT INTO copy_gpu_distinct_keys (id, note) VALUES {seed}"),
+        )
+        .unwrap();
+    let copy = gpu_db_sql::parse_copy_from_stdin(
+        "COPY copy_gpu_distinct_keys (id, note) FROM STDIN WITH (FORMAT csv)",
+    )
+    .unwrap();
+    for (txn_id, id, note) in [
+        (3_u64, 1_001_i32, SqlValue::Null),
+        (4_u64, 1_002_i32, SqlValue::Int4(0)),
+        (5_u64, 1_003_i32, SqlValue::Int4(7)),
+    ] {
+        assert_eq!(
+            engine
+                .execute_relational_copy_rows(txn_id, &copy, vec![vec![SqlValue::Int4(id), note]])
+                .unwrap(),
+            1
+        );
+    }
+    let writers = [
+        (100_u64, 1_004_i32, SqlValue::Null),
+        (101_u64, 1_005_i32, SqlValue::Int4(0)),
+    ]
+    .map(|(txn_id, id, note)| {
+        let engine = Arc::clone(&engine);
+        let copy = copy.clone();
+        std::thread::spawn(move || {
+            engine.execute_relational_copy_rows(txn_id, &copy, vec![vec![SqlValue::Int4(id), note]])
+        })
+    });
+    for outcome in writers.map(|writer| writer.join().unwrap()) {
+        assert_eq!(outcome.unwrap(), 1);
+    }
+
+    let Command::Select(select) =
+        parse_command("SELECT id, note FROM copy_gpu_distinct_keys ORDER BY id").unwrap()
+    else {
+        panic!("expected SELECT")
+    };
+    let expected = engine.execute_relational_select(&select).unwrap().rows;
+    assert_eq!(
+        expected.len(),
+        133,
+        "every acknowledged GPU COPY row is visible"
+    );
+    assert_eq!(
+        Engine::recover_from_durable_wal(&engine.durable_wal_records())
+            .unwrap()
+            .execute_relational_select(&select)
+            .unwrap()
+            .rows,
+        expected,
+        "live GPU publication and canonical recovery agree"
+    );
+}
+
+#[test]
 fn copy_admits_an_absent_device_generation_without_reentering_commit_lock() {
     let engine = Arc::new(Engine::new_local_test_engine());
     engine
@@ -566,9 +699,7 @@ fn relational_copy_ingests_null_marker_and_selects_back_null() {
 #[test]
 fn relational_copy_round_trips_all_column_types_and_null() {
     // M3 (doc 21) Track A.6: COPY into a table with int8/numeric/bool/date/timestamp/uuid columns
-    // round-trips every value AND a `\N` NULL per type through the COPY-to-engine bridge
-    // (render_sql_value_literal -> re-parsed INSERT -> store). Previously the render errored on any
-    // non-int4/text/Null column ("supports int4/text rows only").
+    // round-trips every value AND a `\N` NULL per type through the typed COPY-to-INSERT bridge.
     let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
@@ -619,10 +750,10 @@ fn relational_copy_round_trips_all_column_types_and_null() {
         "row 2 \\N -> NULL for every typed column"
     );
 
-    // Ingest through the engine (render_relational_insert -> render_sql_value_literal per cell).
+    // Ingest the already-typed programmatic cells through the common INSERT authority.
     assert_eq!(e.execute_relational_copy_rows(3, &copy, rows).unwrap(), 2);
 
-    // SELECT back: the render -> re-parse -> store round-trip preserves every value and every NULL.
+    // SELECT back: typed staging and storage preserve every value and every NULL.
     let select_row = |id: i32| {
         let Command::Select(select) = parse_command(&format!(
             "SELECT id, big, amt, flag, d, ts, u FROM tt WHERE id = {id}"
@@ -635,7 +766,7 @@ fn relational_copy_round_trips_all_column_types_and_null() {
     assert_eq!(
         select_row(1),
         vec![parsed_row1.clone()],
-        "row 1 round-trips through COPY render -> INSERT -> store (every type)"
+        "row 1 round-trips through typed COPY -> INSERT -> store (every type)"
     );
     assert_eq!(
         select_row(2),
@@ -643,10 +774,8 @@ fn relational_copy_round_trips_all_column_types_and_null() {
         "row 2 round-trips as all-NULL (a \\N per type)"
     );
 
-    // WAL-REPLAY round trip — the path this slice actually feeds. The COPY's WAL payload is the RENDERED
-    // INSERT (render_sql_value_literal per cell); recovery RE-PARSES it (parse_sql_value + coerce). So a
-    // persist+recover proves the rendered literal for every type re-parses to the identical stored value
-    // (the live apply uses the original typed row and would mask a wrong render).
+    // WAL-replay round trip proves the codec-5 typed envelope reproduces every value without a
+    // rendered INSERT or a replay-time SQL parse.
     let path = test_wal_path("copy_all_types_roundtrip");
     e.persist_durable_wal_to_file(&path).unwrap();
     let recovered = Engine::recover_from_durable_wal_file(&path).unwrap();
@@ -663,7 +792,7 @@ fn relational_copy_round_trips_all_column_types_and_null() {
     assert_eq!(
         recovered_row(1),
         vec![parsed_row1],
-        "WAL replay re-parses the rendered literals to the identical values (every type)"
+        "WAL replay restores the typed COPY values identically (every type)"
     );
     assert_eq!(
         recovered_row(2),

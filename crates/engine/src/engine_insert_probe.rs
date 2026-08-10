@@ -13,26 +13,13 @@ use super::Engine;
 ///
 /// This is a monotonic snapshot. Consumers that need a session result take two snapshots and call
 /// [`Self::delta_since`]. Durations are host-observed nanoseconds at named ownership seams; they
-/// are not a GPU-kernel event timeline and are intentionally not summed into a total.
+/// are not a GPU-kernel event timeline and are intentionally not summed into a total.  The one
+/// explicit exception is `typed_append_generation_kernel_event_nanos`, a separately named CUDA
+/// event span for the generation kernels only.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InsertProbeSnapshot {
     pub successful_insert_statements: u64,
     pub successful_insert_rows: u64,
-    /// Successfully published INSERT-001 typed fixed-width statements. Qualification requires
-    /// this to equal `successful_insert_statements` for its exact eligible workload.
-    pub fixed_insert_typed_commits: u64,
-    /// A sealed fixed candidate that restored the legacy wave before WAL.
-    pub fixed_insert_legacy_fallbacks: u64,
-    /// A device-authoritative typed preflight declined before WAL and returned retryable.
-    pub fixed_insert_retryable_declines: u64,
-    /// Qualified fixed candidates that entered the old general commit-validation/re-resolve path.
-    pub fixed_insert_legacy_commit_validation_reresolves: u64,
-    /// Legacy off-lock INSERT preparations that constructed a general `WriteDelta`.
-    pub legacy_insert_delta_builds: u64,
-    /// Predicted insert row keys materialized by those legacy preparations.
-    pub predicted_row_keys_materialized: u64,
-    /// Direct fixed-width carriers materialized without a `WriteDelta` or predicted row keys.
-    pub direct_fixed_insert_carriers: u64,
     /// GPU CHECK mask launches from the typed pre-queue row-local proof.
     pub row_local_check_launches: u64,
     /// One-u32 device terminal verdicts read for those typed CHECK masks.
@@ -52,6 +39,147 @@ pub struct InsertProbeSnapshot {
     pub facade_parse_bind_nanos: u64,
     pub engine_authorization_catalog_admission_nanos: u64,
     pub offlock_coercion_default_constraint_prepare_nanos: u64,
+    /// Full immutable publication capture used to create a transaction context.
+    pub transaction_begin_snapshot_capture_nanos: u64,
+    /// Full immutable publication capture used to establish a statement snapshot.
+    pub transaction_statement_snapshot_capture_nanos: u64,
+    /// Full immutable publication capture while the terminal owns the commit boundary.
+    pub transaction_commit_snapshot_capture_nanos: u64,
+    /// Commit boundaries that reused the statement's exact immutable publication without recapture.
+    pub transaction_commit_snapshot_reuse_count: u64,
+    /// Construction and upload of an immutable transaction-private typed INSERT shard.
+    pub transaction_private_overlay_materialize_nanos: u64,
+    /// One-statement autocommit typed staging, including canonical row/WAL-image formation.
+    pub transaction_statement_stage_nanos: u64,
+    /// Canonical typed-record sealing from the immutable typed semantic carrier. This is a
+    /// contained subphase of statement staging (or off-lock plan preparation), not an additive
+    /// service-time phase.
+    pub codec5_record_seal_nanos: u64,
+    /// Final typed-image sealing from the same immutable typed semantic carrier. This is a
+    /// contained subphase of statement staging (or off-lock plan preparation), not an additive
+    /// service-time phase.
+    pub codec5_final_image_seal_nanos: u64,
+    /// Move-only resident append-source materialization from catalog-order typed vectors. This
+    /// is a contained statement-stage subphase and remains type-neutral.
+    pub resident_append_source_materialize_nanos: u64,
+    /// Constructor-only validation of the immutable transaction-private typed payload. This
+    /// includes layout/statistics validation before the payload becomes staged state.
+    pub typed_stage_constructor_payload_validate_nanos: u64,
+    /// Constructor-only transient row decoding used solely to claim UNIQUE slots. It must be
+    /// zero for a table with no UNIQUE/primary-key slot to claim.
+    pub typed_stage_constructor_unique_slot_nanos: u64,
+    /// Hashing the just-validated immutable private payload to bind its later GPU upload.
+    pub typed_stage_constructor_payload_digest_nanos: u64,
+    /// Exact revalidation of that immutable payload before it becomes the private GPU shard.
+    /// This isolates work that should become a construction invariant rather than a second scan.
+    pub typed_overlay_payload_revalidate_nanos: u64,
+    /// Reservation, row-id serialization, and H2D allocation for the private staged shard.
+    pub typed_overlay_payload_upload_nanos: u64,
+    /// Admission-time codec-5 selection, including its temporary final-row materialization.
+    pub codec5_admission_select_materialize_nanos: u64,
+    /// Admission-time resource-geometry counting, including any row re-encoding performed only
+    /// to compute bounds.
+    pub codec5_admission_geometry_encode_nanos: u64,
+    /// Commit-time codec-5 selection, including final-row materialization from staged payloads.
+    pub codec5_terminal_select_materialize_nanos: u64,
+    /// Strict final-image decode and append-source reconstruction before GPU generation. Recovery
+    /// retains its independent decoder; this isolates the live owned-source duplication.
+    pub codec5_terminal_final_image_source_nanos: u64,
+    /// The complete claimed-autocommit terminal, from its commit boundary through publication.
+    /// This contains the canonical-apply subphase below and is not additive with it.
+    pub transaction_terminal_nanos: u64,
+    /// Commit-boundary validation, canonical record construction, and physical-plan compilation
+    /// before the first WAL proposal.
+    pub transaction_terminal_pre_wal_nanos: u64,
+    /// Build-only partition of the sole generic codec-5 operation before it reaches WAL. These
+    /// ownership seams are diagnostic only; they do not alter the single typed lifecycle.
+    pub codec5_operation_input_nanos: u64,
+    pub codec5_operation_table_prepare_nanos: u64,
+    pub codec5_operation_aggregate_nanos: u64,
+    pub codec5_operation_plan_compile_nanos: u64,
+    pub codec5_operation_finalize_nanos: u64,
+    /// Build-only phases of the already-closed codec-5 S7/envelope encoder. These remain
+    /// distinct from the retired `typed_append_*` writer counters, which must stay silent.
+    pub codec5_live_s7_build_nanos: u64,
+    /// Strict S2 model reconstruction inside the live S7 writer. This is contained in the S7
+    /// build interval and identifies whether a provenance-sealed feature-free closure warrants
+    /// a narrower no-model path; recovery always retains its full strict decoder.
+    pub codec5_live_s2_decode_nanos: u64,
+    pub codec5_live_aggregate_prepare_nanos: u64,
+    pub codec5_live_aggregate_encode_nanos: u64,
+    pub codec5_live_outer_reserve_nanos: u64,
+    pub codec5_live_outer_encode_nanos: u64,
+    pub codec5_live_outer_digest_nanos: u64,
+    pub codec5_live_outer_packed_encode_nanos: u64,
+    pub codec5_live_outer_checksum_nanos: u64,
+    pub codec5_live_outer_serialized_copy_nanos: u64,
+    pub codec5_live_outer_seal_nanos: u64,
+    /// Host-observed duration of the one generic device-resident typed-append generation call.
+    /// It includes descriptor serialization, H2D/D2H, launch, and synchronization; it is not a
+    /// CUDA-event kernel duration.
+    pub typed_append_generation_host_nanos: u64,
+    /// Preparation of the already-sealed columnar source's read-only generation view. This is
+    /// deliberately separate from descriptor encoding so a repeated source ownership scan is
+    /// never hidden inside transport attribution.
+    pub typed_append_generation_source_view_nanos: u64,
+    /// Exact pooled host/device/stream reservation for one generic generation. It contains no
+    /// row-value materialization or CUDA submission.
+    pub typed_append_generation_prepare_reserve_nanos: u64,
+    /// Descriptor fill plus the sole H2D/kernel/D2H submission, fence, and opaque proof decode.
+    /// Together with the two preceding fields this partitions the host generation call.
+    pub typed_append_generation_submit_complete_nanos: u64,
+    /// CUDA-event elapsed time for the five generic typed-append generation kernels.  It
+    /// excludes descriptor serialization, H2D/D2H, host proof materialization, and the covering
+    /// stream fence.  A zero value means CUDA event timing was unavailable for that sample.
+    pub typed_append_generation_kernel_event_nanos: u64,
+    /// Ordered CUDA-event spans for the generic generation's validation, cell commitment, row
+    /// commitment, tree reduction, and finalization kernels.  They partition the total kernel
+    /// event only when all five boundaries were successfully recorded.
+    pub typed_append_generation_validate_kernel_event_nanos: u64,
+    pub typed_append_generation_cells_kernel_event_nanos: u64,
+    pub typed_append_generation_rows_kernel_event_nanos: u64,
+    pub typed_append_generation_reduce_kernel_event_nanos: u64,
+    pub typed_append_generation_finalize_kernel_event_nanos: u64,
+    /// Generic typed-append canonical envelope construction interval.
+    pub typed_append_envelope_prepare_nanos: u64,
+    /// Generic typed-append canonical body/envelope construction.
+    pub typed_append_envelope_encode_nanos: u64,
+    /// Construction-closed writer phases: S7 materialization, aggregate root preparation,
+    /// aggregate body encode, outer-buffer reservation, and outer canonical encode.
+    pub typed_append_s7_build_nanos: u64,
+    pub typed_append_aggregate_prepare_nanos: u64,
+    pub typed_append_aggregate_body_encode_nanos: u64,
+    pub typed_append_outer_reserve_nanos: u64,
+    pub typed_append_outer_encode_nanos: u64,
+    /// Exact outer-encode attribution: canonical digest closure, packed-frame fill, bytewise
+    /// storage checksum, serialized payload copy, and immutable authority seal.
+    pub typed_append_outer_digest_nanos: u64,
+    pub typed_append_outer_packed_encode_nanos: u64,
+    pub typed_append_outer_checksum_nanos: u64,
+    pub typed_append_outer_serialized_copy_nanos: u64,
+    pub typed_append_outer_seal_nanos: u64,
+    /// Redundant retained close of live writer output. The construction-closed route records
+    /// zero; fresh recovery still uses the independent retained decoder.
+    pub typed_append_semantics_close_nanos: u64,
+    /// Generic pre-parent retention/allocator authority body construction.
+    pub typed_append_authority_prepare_nanos: u64,
+    /// Generic device-resident typed-append apply-plan compilation.
+    pub typed_append_device_plan_compile_nanos: u64,
+    /// Pre-parent authority commit/apply/publication before parent WAL reservation.
+    pub typed_append_authority_commit_nanos: u64,
+    /// Canonical proposal, WAL/status installation, and commit timestamp assignment.
+    pub transaction_terminal_wal_status_nanos: u64,
+    /// Transaction-lifetime release and post-publication maintenance after canonical apply.
+    pub transaction_terminal_post_canonical_finalize_nanos: u64,
+    /// Decode/coalesce of the canonical transaction record plus global GPU apply and publication.
+    pub transaction_canonical_apply_publish_nanos: u64,
+    /// The canonical terminal's state-machine apply plus binary transaction decode/coalesce.
+    /// This is contained within `transaction_canonical_apply_publish_nanos`.
+    pub transaction_canonical_record_apply_nanos: u64,
+    /// GPU residency and index publication from either the decoded canonical transaction outcome
+    /// or the exact live typed terminal's post-WAL physical append.
+    /// This is contained within `transaction_canonical_apply_publish_nanos`.
+    pub transaction_canonical_residency_publish_nanos: u64,
     pub commit_validation_reresolve_nanos: u64,
     pub canonical_wal_encode_append_claim_nanos: u64,
     pub durability_wait_nanos: u64,
@@ -167,7 +295,6 @@ pub struct InsertProbeConfig {
     /// The present product contract: `Off` remains compatibility syntax, not async acknowledgement.
     pub synchronous_commit_gate: &'static str,
     pub auto_admit_on_commit: bool,
-    pub binary_wal_records_enabled: bool,
     pub device_authoritative_commits: u64,
 }
 
@@ -196,6 +323,13 @@ impl InsertProbeSnapshot {
         let named_phase_nanos = delta!(facade_parse_bind_nanos)
             .saturating_add(delta!(engine_authorization_catalog_admission_nanos))
             .saturating_add(delta!(offlock_coercion_default_constraint_prepare_nanos))
+            .saturating_add(delta!(transaction_begin_snapshot_capture_nanos))
+            .saturating_add(delta!(transaction_statement_snapshot_capture_nanos))
+            .saturating_add(delta!(transaction_commit_snapshot_capture_nanos))
+            .saturating_add(delta!(transaction_private_overlay_materialize_nanos))
+            .saturating_add(delta!(transaction_statement_stage_nanos))
+            .saturating_add(delta!(transaction_terminal_nanos))
+            .saturating_add(delta!(transaction_canonical_apply_publish_nanos))
             .saturating_add(delta!(commit_validation_reresolve_nanos))
             .saturating_add(delta!(canonical_wal_encode_append_claim_nanos))
             .saturating_add(delta!(durability_wait_nanos))
@@ -205,15 +339,6 @@ impl InsertProbeSnapshot {
         Self {
             successful_insert_statements: delta!(successful_insert_statements),
             successful_insert_rows: delta!(successful_insert_rows),
-            fixed_insert_typed_commits: delta!(fixed_insert_typed_commits),
-            fixed_insert_legacy_fallbacks: delta!(fixed_insert_legacy_fallbacks),
-            fixed_insert_retryable_declines: delta!(fixed_insert_retryable_declines),
-            fixed_insert_legacy_commit_validation_reresolves: delta!(
-                fixed_insert_legacy_commit_validation_reresolves
-            ),
-            legacy_insert_delta_builds: delta!(legacy_insert_delta_builds),
-            predicted_row_keys_materialized: delta!(predicted_row_keys_materialized),
-            direct_fixed_insert_carriers: delta!(direct_fixed_insert_carriers),
             row_local_check_launches: delta!(row_local_check_launches),
             row_local_check_verdicts: delta!(row_local_check_verdicts),
             raw_request_digest_derivations: delta!(raw_request_digest_derivations),
@@ -226,6 +351,129 @@ impl InsertProbeSnapshot {
             ),
             offlock_coercion_default_constraint_prepare_nanos: delta!(
                 offlock_coercion_default_constraint_prepare_nanos
+            ),
+            transaction_begin_snapshot_capture_nanos: delta!(
+                transaction_begin_snapshot_capture_nanos
+            ),
+            transaction_statement_snapshot_capture_nanos: delta!(
+                transaction_statement_snapshot_capture_nanos
+            ),
+            transaction_commit_snapshot_capture_nanos: delta!(
+                transaction_commit_snapshot_capture_nanos
+            ),
+            transaction_commit_snapshot_reuse_count: delta!(
+                transaction_commit_snapshot_reuse_count
+            ),
+            transaction_private_overlay_materialize_nanos: delta!(
+                transaction_private_overlay_materialize_nanos
+            ),
+            transaction_statement_stage_nanos: delta!(transaction_statement_stage_nanos),
+            codec5_record_seal_nanos: delta!(codec5_record_seal_nanos),
+            codec5_final_image_seal_nanos: delta!(codec5_final_image_seal_nanos),
+            resident_append_source_materialize_nanos: delta!(
+                resident_append_source_materialize_nanos
+            ),
+            typed_stage_constructor_payload_validate_nanos: delta!(
+                typed_stage_constructor_payload_validate_nanos
+            ),
+            typed_stage_constructor_unique_slot_nanos: delta!(
+                typed_stage_constructor_unique_slot_nanos
+            ),
+            typed_stage_constructor_payload_digest_nanos: delta!(
+                typed_stage_constructor_payload_digest_nanos
+            ),
+            typed_overlay_payload_revalidate_nanos: delta!(typed_overlay_payload_revalidate_nanos),
+            typed_overlay_payload_upload_nanos: delta!(typed_overlay_payload_upload_nanos),
+            codec5_admission_select_materialize_nanos: delta!(
+                codec5_admission_select_materialize_nanos
+            ),
+            codec5_admission_geometry_encode_nanos: delta!(codec5_admission_geometry_encode_nanos),
+            codec5_terminal_select_materialize_nanos: delta!(
+                codec5_terminal_select_materialize_nanos
+            ),
+            codec5_terminal_final_image_source_nanos: delta!(
+                codec5_terminal_final_image_source_nanos
+            ),
+            transaction_terminal_nanos: delta!(transaction_terminal_nanos),
+            transaction_terminal_pre_wal_nanos: delta!(transaction_terminal_pre_wal_nanos),
+            codec5_operation_input_nanos: delta!(codec5_operation_input_nanos),
+            codec5_operation_table_prepare_nanos: delta!(codec5_operation_table_prepare_nanos),
+            codec5_operation_aggregate_nanos: delta!(codec5_operation_aggregate_nanos),
+            codec5_operation_plan_compile_nanos: delta!(codec5_operation_plan_compile_nanos),
+            codec5_operation_finalize_nanos: delta!(codec5_operation_finalize_nanos),
+            codec5_live_s7_build_nanos: delta!(codec5_live_s7_build_nanos),
+            codec5_live_s2_decode_nanos: delta!(codec5_live_s2_decode_nanos),
+            codec5_live_aggregate_prepare_nanos: delta!(codec5_live_aggregate_prepare_nanos),
+            codec5_live_aggregate_encode_nanos: delta!(codec5_live_aggregate_encode_nanos),
+            codec5_live_outer_reserve_nanos: delta!(codec5_live_outer_reserve_nanos),
+            codec5_live_outer_encode_nanos: delta!(codec5_live_outer_encode_nanos),
+            codec5_live_outer_digest_nanos: delta!(codec5_live_outer_digest_nanos),
+            codec5_live_outer_packed_encode_nanos: delta!(codec5_live_outer_packed_encode_nanos),
+            codec5_live_outer_checksum_nanos: delta!(codec5_live_outer_checksum_nanos),
+            codec5_live_outer_serialized_copy_nanos: delta!(
+                codec5_live_outer_serialized_copy_nanos
+            ),
+            codec5_live_outer_seal_nanos: delta!(codec5_live_outer_seal_nanos),
+            typed_append_generation_host_nanos: delta!(typed_append_generation_host_nanos),
+            typed_append_generation_source_view_nanos: delta!(
+                typed_append_generation_source_view_nanos
+            ),
+            typed_append_generation_prepare_reserve_nanos: delta!(
+                typed_append_generation_prepare_reserve_nanos
+            ),
+            typed_append_generation_submit_complete_nanos: delta!(
+                typed_append_generation_submit_complete_nanos
+            ),
+            typed_append_generation_kernel_event_nanos: delta!(
+                typed_append_generation_kernel_event_nanos
+            ),
+            typed_append_generation_validate_kernel_event_nanos: delta!(
+                typed_append_generation_validate_kernel_event_nanos
+            ),
+            typed_append_generation_cells_kernel_event_nanos: delta!(
+                typed_append_generation_cells_kernel_event_nanos
+            ),
+            typed_append_generation_rows_kernel_event_nanos: delta!(
+                typed_append_generation_rows_kernel_event_nanos
+            ),
+            typed_append_generation_reduce_kernel_event_nanos: delta!(
+                typed_append_generation_reduce_kernel_event_nanos
+            ),
+            typed_append_generation_finalize_kernel_event_nanos: delta!(
+                typed_append_generation_finalize_kernel_event_nanos
+            ),
+            typed_append_envelope_prepare_nanos: delta!(typed_append_envelope_prepare_nanos),
+            typed_append_envelope_encode_nanos: delta!(typed_append_envelope_encode_nanos),
+            typed_append_s7_build_nanos: delta!(typed_append_s7_build_nanos),
+            typed_append_aggregate_prepare_nanos: delta!(typed_append_aggregate_prepare_nanos),
+            typed_append_aggregate_body_encode_nanos: delta!(
+                typed_append_aggregate_body_encode_nanos
+            ),
+            typed_append_outer_reserve_nanos: delta!(typed_append_outer_reserve_nanos),
+            typed_append_outer_encode_nanos: delta!(typed_append_outer_encode_nanos),
+            typed_append_outer_digest_nanos: delta!(typed_append_outer_digest_nanos),
+            typed_append_outer_packed_encode_nanos: delta!(typed_append_outer_packed_encode_nanos),
+            typed_append_outer_checksum_nanos: delta!(typed_append_outer_checksum_nanos),
+            typed_append_outer_serialized_copy_nanos: delta!(
+                typed_append_outer_serialized_copy_nanos
+            ),
+            typed_append_outer_seal_nanos: delta!(typed_append_outer_seal_nanos),
+            typed_append_semantics_close_nanos: delta!(typed_append_semantics_close_nanos),
+            typed_append_authority_prepare_nanos: delta!(typed_append_authority_prepare_nanos),
+            typed_append_device_plan_compile_nanos: delta!(typed_append_device_plan_compile_nanos),
+            typed_append_authority_commit_nanos: delta!(typed_append_authority_commit_nanos),
+            transaction_terminal_wal_status_nanos: delta!(transaction_terminal_wal_status_nanos),
+            transaction_terminal_post_canonical_finalize_nanos: delta!(
+                transaction_terminal_post_canonical_finalize_nanos
+            ),
+            transaction_canonical_apply_publish_nanos: delta!(
+                transaction_canonical_apply_publish_nanos
+            ),
+            transaction_canonical_record_apply_nanos: delta!(
+                transaction_canonical_record_apply_nanos
+            ),
+            transaction_canonical_residency_publish_nanos: delta!(
+                transaction_canonical_residency_publish_nanos
             ),
             commit_validation_reresolve_nanos: delta!(commit_validation_reresolve_nanos),
             canonical_wal_encode_append_claim_nanos: delta!(
@@ -376,13 +624,6 @@ impl InsertProbeSnapshot {
 pub(crate) struct InsertProbeCounters {
     successful_insert_statements: AtomicU64,
     successful_insert_rows: AtomicU64,
-    fixed_insert_typed_commits: AtomicU64,
-    fixed_insert_legacy_fallbacks: AtomicU64,
-    fixed_insert_retryable_declines: AtomicU64,
-    fixed_insert_legacy_commit_validation_reresolves: AtomicU64,
-    legacy_insert_delta_builds: AtomicU64,
-    predicted_row_keys_materialized: AtomicU64,
-    direct_fixed_insert_carriers: AtomicU64,
     row_local_check_launches: AtomicU64,
     row_local_check_verdicts: AtomicU64,
     raw_request_digest_derivations: AtomicU64,
@@ -392,6 +633,73 @@ pub(crate) struct InsertProbeCounters {
     facade_parse_bind_nanos: AtomicU64,
     engine_authorization_catalog_admission_nanos: AtomicU64,
     offlock_coercion_default_constraint_prepare_nanos: AtomicU64,
+    transaction_begin_snapshot_capture_nanos: AtomicU64,
+    transaction_statement_snapshot_capture_nanos: AtomicU64,
+    transaction_commit_snapshot_capture_nanos: AtomicU64,
+    transaction_commit_snapshot_reuse_count: AtomicU64,
+    transaction_private_overlay_materialize_nanos: AtomicU64,
+    transaction_statement_stage_nanos: AtomicU64,
+    codec5_record_seal_nanos: AtomicU64,
+    codec5_final_image_seal_nanos: AtomicU64,
+    resident_append_source_materialize_nanos: AtomicU64,
+    typed_stage_constructor_payload_validate_nanos: AtomicU64,
+    typed_stage_constructor_unique_slot_nanos: AtomicU64,
+    typed_stage_constructor_payload_digest_nanos: AtomicU64,
+    typed_overlay_payload_revalidate_nanos: AtomicU64,
+    typed_overlay_payload_upload_nanos: AtomicU64,
+    codec5_admission_select_materialize_nanos: AtomicU64,
+    codec5_admission_geometry_encode_nanos: AtomicU64,
+    codec5_terminal_select_materialize_nanos: AtomicU64,
+    codec5_terminal_final_image_source_nanos: AtomicU64,
+    transaction_terminal_nanos: AtomicU64,
+    transaction_terminal_pre_wal_nanos: AtomicU64,
+    codec5_operation_input_nanos: AtomicU64,
+    codec5_operation_table_prepare_nanos: AtomicU64,
+    codec5_operation_aggregate_nanos: AtomicU64,
+    codec5_operation_plan_compile_nanos: AtomicU64,
+    codec5_operation_finalize_nanos: AtomicU64,
+    codec5_live_s7_build_nanos: AtomicU64,
+    codec5_live_s2_decode_nanos: AtomicU64,
+    codec5_live_aggregate_prepare_nanos: AtomicU64,
+    codec5_live_aggregate_encode_nanos: AtomicU64,
+    codec5_live_outer_reserve_nanos: AtomicU64,
+    codec5_live_outer_encode_nanos: AtomicU64,
+    codec5_live_outer_digest_nanos: AtomicU64,
+    codec5_live_outer_packed_encode_nanos: AtomicU64,
+    codec5_live_outer_checksum_nanos: AtomicU64,
+    codec5_live_outer_serialized_copy_nanos: AtomicU64,
+    codec5_live_outer_seal_nanos: AtomicU64,
+    typed_append_generation_host_nanos: AtomicU64,
+    typed_append_generation_source_view_nanos: AtomicU64,
+    typed_append_generation_prepare_reserve_nanos: AtomicU64,
+    typed_append_generation_submit_complete_nanos: AtomicU64,
+    typed_append_generation_kernel_event_nanos: AtomicU64,
+    typed_append_generation_validate_kernel_event_nanos: AtomicU64,
+    typed_append_generation_cells_kernel_event_nanos: AtomicU64,
+    typed_append_generation_rows_kernel_event_nanos: AtomicU64,
+    typed_append_generation_reduce_kernel_event_nanos: AtomicU64,
+    typed_append_generation_finalize_kernel_event_nanos: AtomicU64,
+    typed_append_envelope_prepare_nanos: AtomicU64,
+    typed_append_envelope_encode_nanos: AtomicU64,
+    typed_append_s7_build_nanos: AtomicU64,
+    typed_append_aggregate_prepare_nanos: AtomicU64,
+    typed_append_aggregate_body_encode_nanos: AtomicU64,
+    typed_append_outer_reserve_nanos: AtomicU64,
+    typed_append_outer_encode_nanos: AtomicU64,
+    typed_append_outer_digest_nanos: AtomicU64,
+    typed_append_outer_packed_encode_nanos: AtomicU64,
+    typed_append_outer_checksum_nanos: AtomicU64,
+    typed_append_outer_serialized_copy_nanos: AtomicU64,
+    typed_append_outer_seal_nanos: AtomicU64,
+    typed_append_semantics_close_nanos: AtomicU64,
+    typed_append_authority_prepare_nanos: AtomicU64,
+    typed_append_device_plan_compile_nanos: AtomicU64,
+    typed_append_authority_commit_nanos: AtomicU64,
+    transaction_terminal_wal_status_nanos: AtomicU64,
+    transaction_terminal_post_canonical_finalize_nanos: AtomicU64,
+    transaction_canonical_apply_publish_nanos: AtomicU64,
+    transaction_canonical_record_apply_nanos: AtomicU64,
+    transaction_canonical_residency_publish_nanos: AtomicU64,
     commit_validation_reresolve_nanos: AtomicU64,
     canonical_wal_encode_append_claim_nanos: AtomicU64,
     durability_wait_nanos: AtomicU64,
@@ -428,15 +736,6 @@ impl InsertProbeCounters {
         InsertProbeSnapshot {
             successful_insert_statements: load!(successful_insert_statements),
             successful_insert_rows: load!(successful_insert_rows),
-            fixed_insert_typed_commits: load!(fixed_insert_typed_commits),
-            fixed_insert_legacy_fallbacks: load!(fixed_insert_legacy_fallbacks),
-            fixed_insert_retryable_declines: load!(fixed_insert_retryable_declines),
-            fixed_insert_legacy_commit_validation_reresolves: load!(
-                fixed_insert_legacy_commit_validation_reresolves
-            ),
-            legacy_insert_delta_builds: load!(legacy_insert_delta_builds),
-            predicted_row_keys_materialized: load!(predicted_row_keys_materialized),
-            direct_fixed_insert_carriers: load!(direct_fixed_insert_carriers),
             row_local_check_launches: load!(row_local_check_launches),
             row_local_check_verdicts: load!(row_local_check_verdicts),
             raw_request_digest_derivations: load!(raw_request_digest_derivations),
@@ -451,6 +750,125 @@ impl InsertProbeCounters {
             ),
             offlock_coercion_default_constraint_prepare_nanos: load!(
                 offlock_coercion_default_constraint_prepare_nanos
+            ),
+            transaction_begin_snapshot_capture_nanos: load!(
+                transaction_begin_snapshot_capture_nanos
+            ),
+            transaction_statement_snapshot_capture_nanos: load!(
+                transaction_statement_snapshot_capture_nanos
+            ),
+            transaction_commit_snapshot_capture_nanos: load!(
+                transaction_commit_snapshot_capture_nanos
+            ),
+            transaction_commit_snapshot_reuse_count: load!(transaction_commit_snapshot_reuse_count),
+            transaction_private_overlay_materialize_nanos: load!(
+                transaction_private_overlay_materialize_nanos
+            ),
+            transaction_statement_stage_nanos: load!(transaction_statement_stage_nanos),
+            codec5_record_seal_nanos: load!(codec5_record_seal_nanos),
+            codec5_final_image_seal_nanos: load!(codec5_final_image_seal_nanos),
+            resident_append_source_materialize_nanos: load!(
+                resident_append_source_materialize_nanos
+            ),
+            typed_stage_constructor_payload_validate_nanos: load!(
+                typed_stage_constructor_payload_validate_nanos
+            ),
+            typed_stage_constructor_unique_slot_nanos: load!(
+                typed_stage_constructor_unique_slot_nanos
+            ),
+            typed_stage_constructor_payload_digest_nanos: load!(
+                typed_stage_constructor_payload_digest_nanos
+            ),
+            typed_overlay_payload_revalidate_nanos: load!(typed_overlay_payload_revalidate_nanos),
+            typed_overlay_payload_upload_nanos: load!(typed_overlay_payload_upload_nanos),
+            codec5_admission_select_materialize_nanos: load!(
+                codec5_admission_select_materialize_nanos
+            ),
+            codec5_admission_geometry_encode_nanos: load!(codec5_admission_geometry_encode_nanos),
+            codec5_terminal_select_materialize_nanos: load!(
+                codec5_terminal_select_materialize_nanos
+            ),
+            codec5_terminal_final_image_source_nanos: load!(
+                codec5_terminal_final_image_source_nanos
+            ),
+            transaction_terminal_nanos: load!(transaction_terminal_nanos),
+            transaction_terminal_pre_wal_nanos: load!(transaction_terminal_pre_wal_nanos),
+            codec5_operation_input_nanos: load!(codec5_operation_input_nanos),
+            codec5_operation_table_prepare_nanos: load!(codec5_operation_table_prepare_nanos),
+            codec5_operation_aggregate_nanos: load!(codec5_operation_aggregate_nanos),
+            codec5_operation_plan_compile_nanos: load!(codec5_operation_plan_compile_nanos),
+            codec5_operation_finalize_nanos: load!(codec5_operation_finalize_nanos),
+            codec5_live_s7_build_nanos: load!(codec5_live_s7_build_nanos),
+            codec5_live_s2_decode_nanos: load!(codec5_live_s2_decode_nanos),
+            codec5_live_aggregate_prepare_nanos: load!(codec5_live_aggregate_prepare_nanos),
+            codec5_live_aggregate_encode_nanos: load!(codec5_live_aggregate_encode_nanos),
+            codec5_live_outer_reserve_nanos: load!(codec5_live_outer_reserve_nanos),
+            codec5_live_outer_encode_nanos: load!(codec5_live_outer_encode_nanos),
+            codec5_live_outer_digest_nanos: load!(codec5_live_outer_digest_nanos),
+            codec5_live_outer_packed_encode_nanos: load!(codec5_live_outer_packed_encode_nanos),
+            codec5_live_outer_checksum_nanos: load!(codec5_live_outer_checksum_nanos),
+            codec5_live_outer_serialized_copy_nanos: load!(codec5_live_outer_serialized_copy_nanos),
+            codec5_live_outer_seal_nanos: load!(codec5_live_outer_seal_nanos),
+            typed_append_generation_host_nanos: load!(typed_append_generation_host_nanos),
+            typed_append_generation_source_view_nanos: load!(
+                typed_append_generation_source_view_nanos
+            ),
+            typed_append_generation_prepare_reserve_nanos: load!(
+                typed_append_generation_prepare_reserve_nanos
+            ),
+            typed_append_generation_submit_complete_nanos: load!(
+                typed_append_generation_submit_complete_nanos
+            ),
+            typed_append_generation_kernel_event_nanos: load!(
+                typed_append_generation_kernel_event_nanos
+            ),
+            typed_append_generation_validate_kernel_event_nanos: load!(
+                typed_append_generation_validate_kernel_event_nanos
+            ),
+            typed_append_generation_cells_kernel_event_nanos: load!(
+                typed_append_generation_cells_kernel_event_nanos
+            ),
+            typed_append_generation_rows_kernel_event_nanos: load!(
+                typed_append_generation_rows_kernel_event_nanos
+            ),
+            typed_append_generation_reduce_kernel_event_nanos: load!(
+                typed_append_generation_reduce_kernel_event_nanos
+            ),
+            typed_append_generation_finalize_kernel_event_nanos: load!(
+                typed_append_generation_finalize_kernel_event_nanos
+            ),
+            typed_append_envelope_prepare_nanos: load!(typed_append_envelope_prepare_nanos),
+            typed_append_envelope_encode_nanos: load!(typed_append_envelope_encode_nanos),
+            typed_append_s7_build_nanos: load!(typed_append_s7_build_nanos),
+            typed_append_aggregate_prepare_nanos: load!(typed_append_aggregate_prepare_nanos),
+            typed_append_aggregate_body_encode_nanos: load!(
+                typed_append_aggregate_body_encode_nanos
+            ),
+            typed_append_outer_reserve_nanos: load!(typed_append_outer_reserve_nanos),
+            typed_append_outer_encode_nanos: load!(typed_append_outer_encode_nanos),
+            typed_append_outer_digest_nanos: load!(typed_append_outer_digest_nanos),
+            typed_append_outer_packed_encode_nanos: load!(typed_append_outer_packed_encode_nanos),
+            typed_append_outer_checksum_nanos: load!(typed_append_outer_checksum_nanos),
+            typed_append_outer_serialized_copy_nanos: load!(
+                typed_append_outer_serialized_copy_nanos
+            ),
+            typed_append_outer_seal_nanos: load!(typed_append_outer_seal_nanos),
+            typed_append_semantics_close_nanos: load!(typed_append_semantics_close_nanos),
+            typed_append_authority_prepare_nanos: load!(typed_append_authority_prepare_nanos),
+            typed_append_device_plan_compile_nanos: load!(typed_append_device_plan_compile_nanos),
+            typed_append_authority_commit_nanos: load!(typed_append_authority_commit_nanos),
+            transaction_terminal_wal_status_nanos: load!(transaction_terminal_wal_status_nanos),
+            transaction_terminal_post_canonical_finalize_nanos: load!(
+                transaction_terminal_post_canonical_finalize_nanos
+            ),
+            transaction_canonical_apply_publish_nanos: load!(
+                transaction_canonical_apply_publish_nanos
+            ),
+            transaction_canonical_record_apply_nanos: load!(
+                transaction_canonical_record_apply_nanos
+            ),
+            transaction_canonical_residency_publish_nanos: load!(
+                transaction_canonical_residency_publish_nanos
             ),
             commit_validation_reresolve_nanos: load!(commit_validation_reresolve_nanos),
             canonical_wal_encode_append_claim_nanos: load!(canonical_wal_encode_append_claim_nanos),
@@ -494,38 +912,6 @@ impl InsertProbeCounters {
             .fetch_add(rows, Ordering::Relaxed);
     }
 
-    fn record_fixed_insert_typed_commit(&self) {
-        self.fixed_insert_typed_commits
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_fixed_insert_legacy_fallback(&self) {
-        self.fixed_insert_legacy_fallbacks
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_fixed_insert_retryable_decline(&self) {
-        self.fixed_insert_retryable_declines
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_fixed_insert_legacy_commit_validation_reresolve(&self) {
-        self.fixed_insert_legacy_commit_validation_reresolves
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_legacy_insert_delta_build(&self, predicted_row_keys: u64) {
-        self.legacy_insert_delta_builds
-            .fetch_add(1, Ordering::Relaxed);
-        self.predicted_row_keys_materialized
-            .fetch_add(predicted_row_keys, Ordering::Relaxed);
-    }
-
-    fn record_direct_fixed_insert_carrier(&self) {
-        self.direct_fixed_insert_carriers
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     fn record_row_local_check_launch(&self) {
         self.row_local_check_launches
             .fetch_add(1, Ordering::Relaxed);
@@ -552,11 +938,13 @@ impl InsertProbeCounters {
             .fetch_add(source_bytes, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn record_wave(&self, items: u64) {
         self.wave_count.fetch_add(1, Ordering::Relaxed);
         self.wave_item_count.fetch_add(items, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn record_peak(&self, host_bytes: u64, device_bytes_estimate: u64) {
         self.peak_host_statement_bytes
             .fetch_max(host_bytes, Ordering::Relaxed);
@@ -694,7 +1082,6 @@ impl Engine {
                 .map_or(0, |lanes| lanes.lane_count as u64),
             synchronous_commit_gate: "strict_rpo0",
             auto_admit_on_commit: self.auto_admit_on_commit_enabled(),
-            binary_wal_records_enabled: self.binary_wal_records_enabled(),
             device_authoritative_commits: self.device_authoritative_commits(),
         }
     }
@@ -714,22 +1101,305 @@ impl Engine {
         );
     }
 
-    pub(crate) fn record_insert_probe_offlock_prepare_nanos(&self, nanos: u64) {
+    pub(crate) fn record_insert_probe_transaction_begin_snapshot_capture_nanos(&self, nanos: u64) {
         InsertProbeCounters::add(
-            &self
-                .insert_probe
-                .offlock_coercion_default_constraint_prepare_nanos,
+            &self.insert_probe.transaction_begin_snapshot_capture_nanos,
             nanos,
         );
     }
 
-    pub(crate) fn record_insert_probe_commit_validation_reresolve_nanos(&self, nanos: u64) {
-        InsertProbeCounters::add(&self.insert_probe.commit_validation_reresolve_nanos, nanos);
+    pub(crate) fn record_insert_probe_transaction_statement_snapshot_capture_nanos(
+        &self,
+        nanos: u64,
+    ) {
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .transaction_statement_snapshot_capture_nanos,
+            nanos,
+        );
     }
 
-    pub(crate) fn record_insert_probe_canonical_wal_nanos(&self, nanos: u64) {
+    pub(crate) fn record_insert_probe_transaction_commit_snapshot_capture_nanos(&self, nanos: u64) {
         InsertProbeCounters::add(
-            &self.insert_probe.canonical_wal_encode_append_claim_nanos,
+            &self.insert_probe.transaction_commit_snapshot_capture_nanos,
+            nanos,
+        );
+    }
+
+    pub(crate) fn record_insert_probe_transaction_commit_snapshot_reuse(&self) {
+        self.insert_probe
+            .transaction_commit_snapshot_reuse_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_insert_probe_transaction_private_overlay_materialize_nanos(
+        &self,
+        nanos: u64,
+    ) {
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .transaction_private_overlay_materialize_nanos,
+            nanos,
+        );
+    }
+
+    pub(crate) fn record_insert_probe_transaction_statement_stage_nanos(&self, nanos: u64) {
+        InsertProbeCounters::add(&self.insert_probe.transaction_statement_stage_nanos, nanos);
+    }
+
+    pub(crate) fn record_insert_probe_codec5_seal_nanos(
+        &self,
+        record_nanos: u64,
+        final_image_nanos: u64,
+        resident_source_nanos: u64,
+    ) {
+        InsertProbeCounters::add(&self.insert_probe.codec5_record_seal_nanos, record_nanos);
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_final_image_seal_nanos,
+            final_image_nanos,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.resident_append_source_materialize_nanos,
+            resident_source_nanos,
+        );
+    }
+
+    /// Permanent ownership/revalidation partition for the one staged typed INSERT lifecycle.
+    /// These are non-additive named seams used to prove that a later optimization deletes
+    /// duplicate work rather than moving it behind another carrier or terminal.
+    pub(crate) fn record_insert_probe_staged_payload_nanos(&self, phases: [u64; 5]) {
+        let [constructor_validate, unique_slots, payload_digest, overlay_revalidate, overlay_upload] =
+            phases;
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .typed_stage_constructor_payload_validate_nanos,
+            constructor_validate,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.typed_stage_constructor_unique_slot_nanos,
+            unique_slots,
+        );
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .typed_stage_constructor_payload_digest_nanos,
+            payload_digest,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.typed_overlay_payload_revalidate_nanos,
+            overlay_revalidate,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.typed_overlay_payload_upload_nanos,
+            overlay_upload,
+        );
+    }
+
+    /// Permanent admission/terminal materialization partition for the one codec-5 lifecycle.
+    pub(crate) fn record_insert_probe_codec5_materialization_nanos(&self, phases: [u64; 4]) {
+        let [admission_select, admission_geometry, terminal_select, final_image_source] = phases;
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_admission_select_materialize_nanos,
+            admission_select,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_admission_geometry_encode_nanos,
+            admission_geometry,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_terminal_select_materialize_nanos,
+            terminal_select,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_terminal_final_image_source_nanos,
+            final_image_source,
+        );
+    }
+
+    pub(crate) fn record_insert_probe_transaction_terminal_nanos(&self, nanos: u64) {
+        InsertProbeCounters::add(&self.insert_probe.transaction_terminal_nanos, nanos);
+    }
+
+    pub(crate) fn record_insert_probe_transaction_terminal_pre_wal_nanos(&self, nanos: u64) {
+        InsertProbeCounters::add(&self.insert_probe.transaction_terminal_pre_wal_nanos, nanos);
+    }
+
+    /// Build-only phase partition for the existing generic codec-5 operation. The finalizer
+    /// still owns exactly one typed record, `DeviceInsertPlan`, WAL/status transition, and GPU
+    /// publication; this merely localizes the pre-WAL service-time gap.
+    pub(crate) fn record_insert_probe_codec5_operation_nanos(&self, phases: [u64; 5]) {
+        let [input, table_prepare, aggregate, plan_compile, finalize] = phases;
+        InsertProbeCounters::add(&self.insert_probe.codec5_operation_input_nanos, input);
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_operation_table_prepare_nanos,
+            table_prepare,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_operation_aggregate_nanos,
+            aggregate,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_operation_plan_compile_nanos,
+            plan_compile,
+        );
+        InsertProbeCounters::add(&self.insert_probe.codec5_operation_finalize_nanos, finalize);
+    }
+
+    /// Build-only timing for the one already-closed codec-5 aggregate/envelope encoder. It is
+    /// an attribution seam beneath the same record and never revives the retired writer path.
+    pub(crate) fn record_insert_probe_codec5_live_encoder_nanos(&self, phases: [u64; 11]) {
+        let [s7, s2_decode, aggregate_prepare, aggregate_encode, outer_reserve, outer_encode, digest, packed, checksum, serialized_copy, seal] =
+            phases;
+        InsertProbeCounters::add(&self.insert_probe.codec5_live_s7_build_nanos, s7);
+        InsertProbeCounters::add(&self.insert_probe.codec5_live_s2_decode_nanos, s2_decode);
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_live_aggregate_prepare_nanos,
+            aggregate_prepare,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_live_aggregate_encode_nanos,
+            aggregate_encode,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_live_outer_reserve_nanos,
+            outer_reserve,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_live_outer_encode_nanos,
+            outer_encode,
+        );
+        InsertProbeCounters::add(&self.insert_probe.codec5_live_outer_digest_nanos, digest);
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_live_outer_packed_encode_nanos,
+            packed,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_live_outer_checksum_nanos,
+            checksum,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.codec5_live_outer_serialized_copy_nanos,
+            serialized_copy,
+        );
+        InsertProbeCounters::add(&self.insert_probe.codec5_live_outer_seal_nanos, seal);
+    }
+
+    /// Build-only attribution for the sole generic typed-generation call.  The host interval
+    /// includes its ABI preparation, DMA, launch, synchronization, and proof decoding; CUDA
+    /// events isolate only the five generation kernels inside that same call.
+    pub(crate) fn record_insert_probe_typed_append_generation_nanos(
+        &self,
+        host_nanos: u64,
+        source_view_nanos: u64,
+        prepare_reserve_nanos: u64,
+        submit_complete_nanos: u64,
+        kernel_event_nanos: Option<u64>,
+        kernel_phase_event_nanos: Option<[u64; 5]>,
+    ) {
+        InsertProbeCounters::add(
+            &self.insert_probe.typed_append_generation_host_nanos,
+            host_nanos,
+        );
+        InsertProbeCounters::add(
+            &self.insert_probe.typed_append_generation_source_view_nanos,
+            source_view_nanos,
+        );
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .typed_append_generation_prepare_reserve_nanos,
+            prepare_reserve_nanos,
+        );
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .typed_append_generation_submit_complete_nanos,
+            submit_complete_nanos,
+        );
+        if let Some(kernel_nanos) = kernel_event_nanos {
+            InsertProbeCounters::add(
+                &self.insert_probe.typed_append_generation_kernel_event_nanos,
+                kernel_nanos,
+            );
+        }
+        if let Some([validate, cells, rows, reduce, finalize]) = kernel_phase_event_nanos {
+            InsertProbeCounters::add(
+                &self
+                    .insert_probe
+                    .typed_append_generation_validate_kernel_event_nanos,
+                validate,
+            );
+            InsertProbeCounters::add(
+                &self
+                    .insert_probe
+                    .typed_append_generation_cells_kernel_event_nanos,
+                cells,
+            );
+            InsertProbeCounters::add(
+                &self
+                    .insert_probe
+                    .typed_append_generation_rows_kernel_event_nanos,
+                rows,
+            );
+            InsertProbeCounters::add(
+                &self
+                    .insert_probe
+                    .typed_append_generation_reduce_kernel_event_nanos,
+                reduce,
+            );
+            InsertProbeCounters::add(
+                &self
+                    .insert_probe
+                    .typed_append_generation_finalize_kernel_event_nanos,
+                finalize,
+            );
+        }
+    }
+
+    pub(crate) fn record_insert_probe_transaction_terminal_wal_status_nanos(&self, nanos: u64) {
+        InsertProbeCounters::add(
+            &self.insert_probe.transaction_terminal_wal_status_nanos,
+            nanos,
+        );
+    }
+
+    pub(crate) fn record_insert_probe_transaction_terminal_post_canonical_finalize_nanos(
+        &self,
+        nanos: u64,
+    ) {
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .transaction_terminal_post_canonical_finalize_nanos,
+            nanos,
+        );
+    }
+
+    pub(crate) fn record_insert_probe_transaction_canonical_apply_publish_nanos(&self, nanos: u64) {
+        InsertProbeCounters::add(
+            &self.insert_probe.transaction_canonical_apply_publish_nanos,
+            nanos,
+        );
+    }
+
+    pub(crate) fn record_insert_probe_transaction_canonical_record_apply_nanos(&self, nanos: u64) {
+        InsertProbeCounters::add(
+            &self.insert_probe.transaction_canonical_record_apply_nanos,
+            nanos,
+        );
+    }
+
+    pub(crate) fn record_insert_probe_transaction_canonical_residency_publish_nanos(
+        &self,
+        nanos: u64,
+    ) {
+        InsertProbeCounters::add(
+            &self
+                .insert_probe
+                .transaction_canonical_residency_publish_nanos,
             nanos,
         );
     }
@@ -746,32 +1416,8 @@ impl Engine {
         InsertProbeCounters::add(&self.insert_probe.durability_job_wait_nanos, nanos);
     }
 
-    pub(crate) fn record_insert_probe_device_validate_nanos(&self, nanos: u64) {
-        InsertProbeCounters::add(&self.insert_probe.device_validate_nanos, nanos);
-    }
-
-    pub(crate) fn record_insert_probe_device_append_nanos(&self, nanos: u64) {
-        InsertProbeCounters::add(
-            &self.insert_probe.device_h2d_append_index_apply_nanos,
-            nanos,
-        );
-    }
-
     pub(crate) fn record_insert_probe_publication_status_ack_nanos(&self, nanos: u64) {
         InsertProbeCounters::add(&self.insert_probe.publication_status_ack_nanos, nanos);
-    }
-
-    pub(crate) fn record_insert_probe_wave(&self, items: u64) {
-        self.insert_probe.record_wave(items);
-    }
-
-    pub(crate) fn record_insert_probe_peak_statement(
-        &self,
-        host_bytes: u64,
-        device_bytes_estimate: u64,
-    ) {
-        self.insert_probe
-            .record_peak(host_bytes, device_bytes_estimate);
     }
 
     pub(crate) fn record_insert_probe_rollover_geometry(
@@ -787,32 +1433,6 @@ impl Engine {
 
     pub(crate) fn record_insert_probe_success(&self, rows: u64) {
         self.insert_probe.record_success(rows);
-    }
-
-    pub(crate) fn record_insert_probe_fixed_insert_typed_commit(&self) {
-        self.insert_probe.record_fixed_insert_typed_commit();
-    }
-
-    pub(crate) fn record_insert_probe_fixed_insert_legacy_fallback(&self) {
-        self.insert_probe.record_fixed_insert_legacy_fallback();
-    }
-
-    pub(crate) fn record_insert_probe_fixed_insert_retryable_decline(&self) {
-        self.insert_probe.record_fixed_insert_retryable_decline();
-    }
-
-    pub(crate) fn record_insert_probe_fixed_insert_legacy_commit_validation_reresolve(&self) {
-        self.insert_probe
-            .record_fixed_insert_legacy_commit_validation_reresolve();
-    }
-
-    pub(crate) fn record_insert_probe_legacy_insert_delta_build(&self, predicted_row_keys: u64) {
-        self.insert_probe
-            .record_legacy_insert_delta_build(predicted_row_keys);
-    }
-
-    pub(crate) fn record_insert_probe_direct_fixed_insert_carrier(&self) {
-        self.insert_probe.record_direct_fixed_insert_carrier();
     }
 
     pub(crate) fn record_insert_probe_row_local_check_launch(&self) {
@@ -870,12 +1490,6 @@ mod tests {
         InsertProbeCounters::add(&counters.durability_wait_nanos, 7);
         let before = counters.snapshot();
         counters.record_success(1_000);
-        counters.record_fixed_insert_typed_commit();
-        counters.record_fixed_insert_legacy_fallback();
-        counters.record_fixed_insert_retryable_decline();
-        counters.record_fixed_insert_legacy_commit_validation_reresolve();
-        counters.record_legacy_insert_delta_build(1_000);
-        counters.record_direct_fixed_insert_carrier();
         counters.record_successful_service_nanos(100);
         counters.record_successful_raw_simple_query_bytes(31_000);
         counters.record_raw_request_digest_derivation(30_998);
@@ -896,13 +1510,6 @@ mod tests {
 
         assert_eq!(delta.successful_insert_statements, 1);
         assert_eq!(delta.successful_insert_rows, 1_000);
-        assert_eq!(delta.fixed_insert_typed_commits, 1);
-        assert_eq!(delta.fixed_insert_legacy_fallbacks, 1);
-        assert_eq!(delta.fixed_insert_retryable_declines, 1);
-        assert_eq!(delta.fixed_insert_legacy_commit_validation_reresolves, 1);
-        assert_eq!(delta.legacy_insert_delta_builds, 1);
-        assert_eq!(delta.predicted_row_keys_materialized, 1_000);
-        assert_eq!(delta.direct_fixed_insert_carriers, 1);
         assert_eq!(delta.raw_request_digest_derivations, 1);
         assert_eq!(delta.raw_request_digest_derivation_bytes, 30_998);
         assert_eq!(delta.successful_insert_source_bytes, 31_000);

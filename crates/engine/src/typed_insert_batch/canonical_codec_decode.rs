@@ -3,8 +3,8 @@
 use super::sequence::{
     append_private_owner, append_private_predecessor, private_child_digest, private_outcome_digest,
     sequence_input_digest, validate_private_effect_state, validate_sequence_parent,
-    validate_sequence_request, PrivateChain, PrivateEffectEvidence, PrivateOwner,
-    PrivatePredecessor,
+    validate_sequence_request, PrivateChain, PrivateChainBoundary, PrivateEffectEvidence,
+    PrivateOwner, PrivatePredecessor,
 };
 use super::*;
 use crate::typed_insert_batch::sequence_defaults::effects::{
@@ -314,6 +314,116 @@ pub(super) fn decode(bytes: &[u8]) -> Result<DecodedTypedInsertRecord, EngineErr
     // not retained as a second authority. The private model is the sole decoded evidence.
     drop(canonical);
     Ok(DecodedTypedInsertRecord { model })
+}
+
+/// Close private sequence predecessors across the transaction-ordered statement records. A
+/// statement-local decoder may retain an outcome edge whose predecessor lives in an earlier
+/// record, but no such edge can leave this aggregate boundary unbound.
+pub(super) fn validate_transaction_private_sequence_chains(
+    records: &[DecodedTypedInsertRecord],
+) -> Result<(), EngineError> {
+    let mut chains = std::collections::BTreeMap::<u32, PrivateChain>::new();
+    for record in records {
+        let Some(parent) = record.model.effects.parent else {
+            continue;
+        };
+        for effect in &record.model.effects.effects {
+            let DecodedEffectKind::Private {
+                prior_last_value,
+                prior_is_called,
+                next_last_value,
+                next_is_called,
+                lifetime_origin,
+                owner,
+                predecessor,
+                input_digest,
+                chain,
+            } = effect.kind
+            else {
+                continue;
+            };
+            let request = effect.request.view();
+            let descriptor = effect.request.descriptor_digest;
+            let child = private_child_digest(
+                parent.view(),
+                request,
+                effect.request.absolute_expression_ordinal,
+                input_digest,
+                descriptor,
+                lifetime_origin,
+                (prior_last_value, prior_is_called),
+                predecessor,
+            )?;
+            let outcome = private_outcome_digest(
+                child,
+                owner,
+                effect.request.value,
+                (next_last_value, next_is_called),
+            )?;
+            let previous = match predecessor {
+                PrivatePredecessor::Lifecycle(_) => None,
+                PrivatePredecessor::Outcome(_) => chains.get(&effect.request.sequence_oid).copied(),
+            };
+            let next = validate_private_effect_state(
+                CanonicalSequenceEffectView {
+                    request,
+                    value: effect.request.value,
+                    kind: CanonicalSequenceEffectKindView::Private {
+                        parent: parent.view(),
+                        prior_last_value,
+                        prior_is_called,
+                        next_last_value,
+                        next_is_called,
+                        lifetime_origin,
+                        owner_kind: owner.kind,
+                        owner_statement_ordinal: owner.statement_ordinal,
+                        owner_statement_digest: owner.statement_digest,
+                        owner_creator_catalog_column_ordinal: owner.creator_catalog_column_ordinal,
+                        predecessor_tag: match predecessor {
+                            PrivatePredecessor::Lifecycle(_) => 1,
+                            PrivatePredecessor::Outcome(_) => 2,
+                        },
+                        predecessor_digest: match predecessor {
+                            PrivatePredecessor::Lifecycle(owner) => owner.statement_digest,
+                            PrivatePredecessor::Outcome(digest) => digest,
+                        },
+                        input_digest,
+                        descriptor_digest: descriptor,
+                        child_digest: child,
+                        outcome_digest: outcome,
+                    },
+                },
+                parent.view(),
+                effect.request.absolute_expression_ordinal,
+                descriptor,
+                PrivateEffectEvidence {
+                    prior_last_value,
+                    prior_is_called,
+                    next_last_value,
+                    next_is_called,
+                    lifetime_origin,
+                    owner,
+                    predecessor,
+                    input_digest,
+                    descriptor_digest: descriptor,
+                    child_digest: child,
+                    outcome_digest: outcome,
+                },
+                previous,
+                PrivateChainBoundary::Transaction,
+            )?;
+            if next.state != chain.state
+                || next.owner != chain.owner
+                || next.outcome != chain.outcome
+            {
+                return Err(codec_error(
+                    "private sequence transaction chain differs from its decoded record",
+                ));
+            }
+            chains.insert(effect.request.sequence_oid, next);
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -866,6 +976,7 @@ fn read_sequence_effects(
                         outcome_digest: outcome,
                     },
                     previous,
+                    PrivateChainBoundary::Statement,
                 )?;
                 DecodedEffectKind::Private {
                     prior_last_value,

@@ -427,6 +427,9 @@ pub(crate) enum TransactionOperation {
     // Keep new variants append-only: established discriminants feed large engine match tables,
     // and changing them has previously moved latency-sensitive linked code measurably.
     Catalog(Arc<StagedCatalogCommand>),
+    /// A consumed typed INSERT artifact.  Unlike `Row`, it owns no `WriteDelta`; its immutable
+    /// row images and catalog-order device payload are the exact transaction-private authority.
+    TypedInsert(Arc<crate::engine_transaction_delta::StagedTypedInsert>),
 }
 
 impl WriteDelta {
@@ -528,75 +531,6 @@ impl PreparedLedgerDelta {
     }
 }
 
-/// A pre-WAL capacity claim for one typed INSERT's stable ledger delta.  The
-/// only allocation here not already owned by `PreparedLedgerDelta` is the
-/// visibility cell; it is deliberately created before replication proposal.
-pub(crate) struct ReservedLedgerDelta {
-    delta: PreparedLedgerDelta,
-    visibility: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    owner_id: u64,
-    expected_commit_seq: Index,
-}
-
-/// Linear receipt carried from the post-WAL canonical claim through device
-/// apply to the publication tail.  Only reader-visible publication consumes
-/// it without a history lookup; a dropped receipt leaves its epoch pinned for
-/// recovery.
-#[must_use = "a claimed ledger receipt must be consumed after publication visibility"]
-pub(crate) struct LedgerClaimReceipt {
-    visibility: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    owner_id: u64,
-    commit_seq: Index,
-    drop_armed: bool,
-}
-
-impl Drop for LedgerClaimReceipt {
-    fn drop(&mut self) {
-        if self.drop_armed
-            && self.visibility.load(std::sync::atomic::Ordering::Acquire) != LEDGER_CLAIM_VISIBLE
-            && !std::thread::panicking()
-        {
-            panic!(
-                "commit-path invariant violation: claimed typed ledger receipt dropped before publication; restart recovery required"
-            );
-        }
-    }
-}
-
-impl LedgerClaimReceipt {
-    /// Tail failure has already wedged the engine and retained the pending
-    /// epoch for restart recovery.  Disarm only the receipt destructor so the
-    /// established fsync/publication error contract can return normally.
-    pub(crate) fn abandon_for_recovery(mut self) {
-        self.drop_armed = false;
-    }
-}
-
-const LEDGER_CLAIM_PENDING: u8 = 0;
-const LEDGER_CLAIM_VISIBLE: u8 = 1;
-
-/// Test-only authority for the canonical carrier's linearity unit tests.  It
-/// has no descriptor and therefore cannot exercise a production claim path.
-#[cfg(test)]
-pub(crate) fn issue_test_only_visible_ledger_claim_receipt() -> LedgerClaimReceipt {
-    LedgerClaimReceipt {
-        visibility: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LEDGER_CLAIM_VISIBLE)),
-        owner_id: 0,
-        commit_seq: 0,
-        drop_armed: true,
-    }
-}
-
-#[derive(Debug)]
-enum LedgerEpochState {
-    /// A live generic writer has reached canonical apply but is not yet
-    /// reader-visible.  Recovery deliberately uses this same state and its
-    /// normal publish path advances `mark_published_through` before service;
-    /// there is no bootstrap bypass that starts a mutable replay record visible.
-    AwaitingPublication,
-    Claimed(std::sync::Arc<std::sync::atomic::AtomicU8>),
-}
-
 #[derive(Debug)]
 struct LedgerEpochDescriptor {
     commit_seq: Index,
@@ -606,16 +540,14 @@ struct LedgerEpochDescriptor {
     unique_slots: Box<[std::sync::Arc<UniqueIndexSlotKey>]>,
     #[cfg(test)]
     unique_slots_i32: Box<[IntUniqueSlotKey]>,
-    state: LedgerEpochState,
 }
 
 /// The recent stable-identity ledger.  Production history is keyed only by
 /// catalog OID and `(table_oid, row_id)`; formatted names stay in legacy
 /// mutation carriers and never reach this owner.  Epochs retain the exact key
 /// vectors until the active-snapshot boundary permits pruning.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct RecentCommitsLedger {
-    owner_id: u64,
     published_through: Index,
     rows: std::collections::HashMap<StableRowWriteKey, Index>,
     tables: std::collections::HashMap<u32, Index>,
@@ -625,34 +557,6 @@ pub(crate) struct RecentCommitsLedger {
     /// Driverless parity twin for the allocation-free i32 slot projection.
     #[cfg(test)]
     unique_slots_i32: std::collections::HashMap<IntUniqueSlotKey, Index>,
-}
-
-impl Default for RecentCommitsLedger {
-    fn default() -> Self {
-        static NEXT_OWNER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let owner_id = NEXT_OWNER_ID
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |current| current.checked_add(1),
-            )
-            .expect("stable ledger owner-id space exhausted");
-        assert_ne!(
-            owner_id, 0,
-            "stable ledger owner IDs must never use the invalid zero value"
-        );
-        Self {
-            owner_id,
-            published_through: 0,
-            rows: std::collections::HashMap::new(),
-            tables: std::collections::HashMap::new(),
-            epochs: std::collections::VecDeque::new(),
-            #[cfg(test)]
-            unique_slots: std::collections::HashMap::new(),
-            #[cfg(test)]
-            unique_slots_i32: std::collections::HashMap::new(),
-        }
-    }
 }
 
 impl RecentCommitsLedger {
@@ -696,23 +600,6 @@ impl RecentCommitsLedger {
             self.unique_slots_i32
                 .get(key)
                 .is_some_and(|&seq| seq > read_snapshot)
-        })
-    }
-
-    /// Reserve all mutable slots and an epoch descriptor before the typed
-    /// canonical cut.  The returned object owns both the normalized keys and
-    /// the prebuilt visibility cell, so the claim path below cannot allocate.
-    pub(crate) fn reserve_typed_delta(
-        &mut self,
-        delta: PreparedLedgerDelta,
-        expected_commit_seq: Index,
-    ) -> Result<ReservedLedgerDelta, EngineError> {
-        self.reserve_delta_capacity(&delta)?;
-        Ok(ReservedLedgerDelta {
-            delta,
-            visibility: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LEDGER_CLAIM_PENDING)),
-            owner_id: self.owner_id,
-            expected_commit_seq,
         })
     }
 
@@ -772,93 +659,6 @@ impl RecentCommitsLedger {
         Ok(())
     }
 
-    /// Install a pre-reserved typed delta after WAL/status/timestamp.  No
-    /// allocation, re-encoding, name parsing, or alternate ledger path is
-    /// permitted here.
-    pub(crate) fn claim_typed_delta(
-        &mut self,
-        reserved: ReservedLedgerDelta,
-        commit_seq: Index,
-    ) -> LedgerClaimReceipt {
-        let ReservedLedgerDelta {
-            delta,
-            visibility,
-            owner_id,
-            expected_commit_seq,
-        } = reserved;
-        assert_eq!(
-            owner_id, self.owner_id,
-            "commit-path invariant violation: typed ledger reservation crossed engine ownership"
-        );
-        assert_eq!(
-            expected_commit_seq, commit_seq,
-            "commit-path invariant violation: typed ledger reservation commit sequence drifted"
-        );
-        for &table_oid in delta.table_oids.iter() {
-            self.tables.insert(table_oid, commit_seq);
-        }
-        for &row in delta.rows.iter() {
-            self.rows.insert(row, commit_seq);
-        }
-        #[cfg(test)]
-        for slot in delta.unique_slots.iter() {
-            self.unique_slots
-                .insert(std::sync::Arc::clone(slot), commit_seq);
-        }
-        #[cfg(test)]
-        for &slot in delta.unique_slots_i32.iter() {
-            self.unique_slots_i32.insert(slot, commit_seq);
-        }
-        self.epochs.push_back(LedgerEpochDescriptor {
-            commit_seq,
-            table_oids: delta.table_oids,
-            rows: delta.rows,
-            #[cfg(test)]
-            unique_slots: delta.unique_slots,
-            #[cfg(test)]
-            unique_slots_i32: delta.unique_slots_i32,
-            state: LedgerEpochState::Claimed(std::sync::Arc::clone(&visibility)),
-        });
-        LedgerClaimReceipt {
-            visibility,
-            owner_id,
-            commit_seq,
-            drop_armed: true,
-        }
-    }
-
-    /// Consume the receipt only after the typed commit is visible to the
-    /// publication coordinator.  The descriptor holds the same prebuilt cell,
-    /// so pruning only needs a constant-time load at the deque front and never
-    /// searches history.
-    pub(crate) fn mark_published_visible(
-        &mut self,
-        receipt: LedgerClaimReceipt,
-        publication_covered_seq: Index,
-    ) {
-        assert_eq!(
-            receipt.owner_id, self.owner_id,
-            "commit-path invariant violation: typed ledger receipt crossed engine ownership"
-        );
-        assert!(
-            receipt.commit_seq <= publication_covered_seq,
-            "commit-path invariant violation: typed ledger receipt became visible before publication coverage"
-        );
-        assert!(
-            self.published_through >= receipt.commit_seq,
-            "commit-path invariant violation: typed ledger receipt became visible before the ledger publication frontier"
-        );
-        receipt
-            .visibility
-            .compare_exchange(
-                LEDGER_CLAIM_PENDING,
-                LEDGER_CLAIM_VISIBLE,
-                std::sync::atomic::Ordering::Release,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .expect("commit-path invariant violation: typed ledger receipt was consumed twice");
-    }
-
     /// Advance the monotonic visibility frontier for every generic live record
     /// whose publication is now reader-visible.  This is a scalar high-water,
     /// not an O(history) claim lookup; recovery/bootstrap can call it with the
@@ -870,9 +670,8 @@ impl RecentCommitsLedger {
     /// Record a live generic/replay identity through the same stable-ID owner.
     /// It stays `AwaitingPublication` until the ordinary publication path calls
     /// [`Self::mark_published_through`]; replay does not have a visible-install
-    /// escape hatch. These routes retain their existing post-canonical
-    /// allocation debt; only typed INSERT is admitted with the pre-WAL
-    /// reservation proof above.
+    /// escape hatch. Codec-5 INSERT publication records its final stable footprint here through
+    /// the same visibility-frontier authority as UPDATE/DELETE and recovery.
     pub(crate) fn record(&mut self, write_set: &WriteSet, commit_seq: Index) {
         let delta = PreparedLedgerDelta::from_write_set(write_set).unwrap_or_else(|error| {
             panic!(
@@ -908,7 +707,6 @@ impl RecentCommitsLedger {
             unique_slots: delta.unique_slots,
             #[cfg(test)]
             unique_slots_i32: delta.unique_slots_i32,
-            state: LedgerEpochState::AwaitingPublication,
         });
     }
 
@@ -927,21 +725,10 @@ impl RecentCommitsLedger {
     /// Drop entries written at or before `boundary` (no active snapshot reads before it, so they can
     /// never win a future conflict). Keeps the ledger bounded by the active-snapshot window.
     pub(crate) fn prune_below(&mut self, boundary: Index) {
-        // Table roots are bounded by catalog identity reconciliation rather than
-        // time.  A claimed descriptor stays pinned until its publication
-        // receipt is consumed; a post-WAL apply panic therefore leaves the
-        // recovery wedge observable instead of silently pruning the claim.
+        // Table roots are bounded by catalog identity reconciliation rather than time. Epochs
+        // stay pinned until the scalar publication frontier covers them.
         while self.epochs.front().is_some_and(|epoch| {
-            epoch.commit_seq <= boundary
-                && match &epoch.state {
-                    LedgerEpochState::AwaitingPublication => {
-                        epoch.commit_seq <= self.published_through
-                    }
-                    LedgerEpochState::Claimed(visibility) => {
-                        visibility.load(std::sync::atomic::Ordering::Acquire)
-                            == LEDGER_CLAIM_VISIBLE
-                    }
-                }
+            epoch.commit_seq <= boundary && epoch.commit_seq <= self.published_through
         }) {
             let epoch = self
                 .epochs

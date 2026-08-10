@@ -25,6 +25,21 @@ fn operation_payload(record: &gpu_db_wal::WalRecord) -> Arc<[u8]> {
     Engine::decode_engine_operation(&operation.body).unwrap()
 }
 
+fn codec5_catalog_record(
+    durable: &gpu_db_wal::WalRecord,
+) -> (BinaryTransactionRecord, gpu_db_wal::CanonicalDigest) {
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&durable.payload)
+        .unwrap()
+        .unwrap();
+    let record = crate::typed_insert_aggregate::decode_catalog_composition_for_test(
+        &envelope.header,
+        &envelope.fragments,
+    )
+    .unwrap()
+    .expect("mixed view/INSERT codec-5 record must carry S3");
+    (record, envelope.header.request_digest)
+}
+
 #[test]
 fn transactional_view_rename_drop_recreate_is_private_ordered_and_recoverable() {
     let engine = Engine::new_local();
@@ -171,10 +186,7 @@ fn transactional_view_rename_drop_recreate_is_private_ordered_and_recoverable() 
     engine.submit_transaction(3_002, parsed("COMMIT")).unwrap();
     let records = engine.durable_wal_records();
     assert_eq!(records.len(), wal_before + 1);
-    let payload = operation_payload(records.last().unwrap());
-    let BinaryWalRecord::Transaction(record) = decode_binary_record(&payload).unwrap() else {
-        panic!("view lifecycle must use one typed transaction record");
-    };
+    let (record, request_digest) = codec5_catalog_record(records.last().unwrap());
     assert!(record.view_operations.is_empty());
     assert_eq!(record.view_lifecycle_operations.len(), 3);
     assert_eq!(
@@ -197,7 +209,7 @@ fn transactional_view_rename_drop_recreate_is_private_ordered_and_recoverable() 
         ]
     );
     assert!(record.table_identities.contains_key("lifecycle_source"));
-    assert_eq!(record.mutations.len(), 1);
+    assert!(record.mutations.is_empty());
     let rename = &record.view_lifecycle_operations[0].targets[0];
     assert_eq!(rename.target_before.as_ref().unwrap().oid, original.oid);
     assert_eq!(rename.target_after.as_ref().unwrap().oid, original.oid);
@@ -211,7 +223,6 @@ fn transactional_view_rename_drop_recreate_is_private_ordered_and_recoverable() 
     let create = &record.view_lifecycle_operations[2].targets[0];
     assert!(create.target_before.is_none());
     assert_eq!(create.target_after.as_ref().unwrap().oid, replacement.oid);
-    let request_digest = gpu_db_wal::canonical_request_digest(&payload);
     let (_, affected_rows) = engine
         .commit_state()
         .resolve_transaction_retry_digest_outcome(3_002, request_digest)

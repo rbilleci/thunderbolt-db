@@ -11,8 +11,9 @@ mod framing;
 use super::super::super::codec::DecodedAggregateFraming;
 use super::SemanticsV2S7HeaderIdentity;
 use crate::typed_insert_aggregate::{
-    AGGREGATE_FLAG_AUTOCOMMIT, AGGREGATE_FLAG_EXPLICIT, AGGREGATE_FLAG_PUBLISHED_SEQUENCE,
-    AGGREGATE_FLAG_RETAINED_RESPONSE,
+    AGGREGATE_FLAG_AUTOCOMMIT, AGGREGATE_FLAG_EXPLICIT, AGGREGATE_FLAG_PRIVATE_SEQUENCE,
+    AGGREGATE_FLAG_PUBLISHED_SEQUENCE, AGGREGATE_FLAG_RETAINED_RESPONSE,
+    OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH,
 };
 use crate::typed_insert_batch::{measure_decoded_typed_image_from_source, TypedImageReadAt};
 use crate::EngineError;
@@ -90,8 +91,16 @@ pub(super) fn measure(
         || scalar.table_block_count == 0
         || sections[0].entry_count != scalar.statement_count
         || sections[1].entry_count != scalar.statement_count
-        || sections[2].entry_count != 0
-        || sections[2].payload_bytes != 0
+        || if scalar.flags
+            & (crate::typed_insert_aggregate::AGGREGATE_FLAG_OPERATION_COMPOSITION
+                | crate::typed_insert_aggregate::AGGREGATE_FLAG_CATALOG)
+            != 0
+        {
+            sections[2].entry_count != 1
+                || !(20..=16 * 1024 * 1024).contains(&sections[2].payload_bytes)
+        } else {
+            sections[2].entry_count != 0 || sections[2].payload_bytes != 0
+        }
         || u64::from(sections[3].entry_count) != scalar.original_inserted_row_count
         || sections[5].entry_count != scalar.statement_count
         || sections[6].entry_count != 1
@@ -99,12 +108,14 @@ pub(super) fn measure(
         return Err(error("v2 aggregate scalar/section profile is invalid"));
     }
     let s2 = measure_s2(framing)?;
-    let s5_entry_count = measure_s5(
+    let s5 = measure_s5(
         framing,
         scalar.statement_count,
         scalar.original_inserted_row_count,
     )?;
-    if (scalar.flags & AGGREGATE_FLAG_PUBLISHED_SEQUENCE != 0) != (s5_entry_count != 0) {
+    if (scalar.flags & AGGREGATE_FLAG_PUBLISHED_SEQUENCE != 0) != (s5.published_count != 0)
+        || (scalar.flags & AGGREGATE_FLAG_PRIVATE_SEQUENCE != 0) != (s5.private_count != 0)
+    {
         return Err(error(
             "S5 entry presence does not close over the aggregate sequence flag",
         ));
@@ -145,7 +156,7 @@ pub(super) fn measure(
         s1_statement_count: scalar.statement_count,
         s2_record_count: scalar.statement_count,
         s4_disposition_count: scalar.original_inserted_row_count,
-        s5_effect_count: s5_entry_count,
+        s5_effect_count: s5.effect_count,
         s6_outcome_count: scalar.statement_count,
         s7_directory_counts: s7.directory_counts,
         s7_header: s7.header,
@@ -287,12 +298,29 @@ fn measure_s7(
         )?;
         reader.skip(directory_bytes[12])?;
         reader.skip(directory_bytes[13])?;
-        let request_digest = aggregate_request_digest(framing, &counts)?;
-        if request_digest != outer.request_digest
-            || request_digest != framing.status().request_digest
+        let historical_request_identity =
+            framing.outer_flags() & OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH != 0;
+        if historical_request_identity {
+            // Historical bit30-set aggregates never carried the caller's canonical request
+            // identity.  Preserve their frozen aggregate-derived closure exactly so a clear-bit
+            // generic record cannot relabel an old authority.
+            let request_digest = aggregate_request_digest(framing, &counts)?;
+            if request_digest != outer.request_digest
+                || request_digest != framing.status().request_digest
+            {
+                return Err(error(
+                    "historical v2 aggregate request identity does not close over outer/STATUS2",
+                ));
+            }
+        } else if outer.request_digest == [0; 32]
+            || outer.request_digest != framing.status().request_digest
         {
+            // Generic bit30-clear codec-5 records bind the normal CanonicalRequest text digest
+            // through the outer header and STATUS2.  S8, when present, independently echoes the
+            // outer digest in its fixed header; the typed statement/projection roots above still
+            // close the INSERT body itself.
             return Err(error(
-                "v2 aggregate request identity does not close over outer/STATUS2",
+                "generic v2 request identity does not close over outer/STATUS2",
             ));
         }
         Ok(S7Measure {
@@ -380,7 +408,87 @@ fn aggregate_request_digest(
             digest.update(&binding[38..40]);
         }
     }
+    let mut writer_count = 0_u32;
+    for disposition_ordinal in 0..counts[2] {
+        if final_writer_binding(framing, disposition_ordinal, counts)?.is_some() {
+            writer_count = writer_count
+                .checked_add(1)
+                .ok_or_else(|| error("v2 aggregate final-writer count overflows"))?;
+        }
+    }
+    if writer_count != 0 {
+        if mode != 2 {
+            return Err(error(
+                "v2 autocommit aggregate carries a later final writer",
+            ));
+        }
+        digest.update(b"FINALWRITERS1");
+        digest.update(writer_count.to_le_bytes());
+        for disposition_ordinal in 0..counts[2] {
+            if let Some((ordinal, statement_digest)) =
+                final_writer_binding(framing, disposition_ordinal, counts)?
+            {
+                digest.update(ordinal.to_le_bytes());
+                digest.update(statement_digest);
+            }
+        }
+    }
+    if scalar.flags
+        & (crate::typed_insert_aggregate::AGGREGATE_FLAG_OPERATION_COMPOSITION
+            | crate::typed_insert_aggregate::AGGREGATE_FLAG_CATALOG)
+        != 0
+    {
+        let catalog_bytes = framing.sections()[2].payload_bytes;
+        digest.update(b"CATALOG1");
+        digest.update(catalog_bytes.to_le_bytes());
+        framing.with_section_reader(2, |reader| {
+            let mut scratch = [0_u8; 4096];
+            while reader.remaining() != 0 {
+                let take = usize::try_from(reader.remaining().min(scratch.len() as u64))
+                    .map_err(|_| error("S3 catalog operation length is not addressable"))?;
+                reader.copy_exact(&mut scratch[..take])?;
+                digest.update(&scratch[..take]);
+            }
+            Ok(())
+        })?;
+    }
     Ok(digest.finalize().into())
+}
+
+fn final_writer_binding(
+    framing: &DecodedAggregateFraming<'_>,
+    disposition_ordinal: u32,
+    counts: &[u32; 12],
+) -> Result<Option<(u32, [u8; 32])>, EngineError> {
+    let disposition = s4_at(framing, disposition_ordinal, counts[2])?;
+    if disposition[16] == 2 && disposition[17] == 1 {
+        let digest = disposition[32..64]
+            .try_into()
+            .expect("fixed canceled-writer digest");
+        if digest == [0; 32] {
+            return Err(error("v2 aggregate canceled row has a zero writer digest"));
+        }
+        return Ok(Some((read_u32(&disposition, 28), digest)));
+    }
+    if disposition[16] != 1 {
+        return Ok(None);
+    }
+    let transition_ref = read_u32(&disposition, 24);
+    let transition = s7_fixed_at::<192>(framing, 7, transition_ref, counts[7], 192)?;
+    if transition[17] != 1 {
+        return Ok(None);
+    }
+    if read_u32(&transition, 20) != disposition_ordinal || transition[160..192] == [0; 32] {
+        return Err(error(
+            "v2 aggregate final writer does not bind its S4 disposition",
+        ));
+    }
+    Ok(Some((
+        read_u32(&transition, 48),
+        transition[160..192]
+            .try_into()
+            .expect("fixed final-writer digest"),
+    )))
 }
 
 #[derive(Clone, Copy)]
@@ -1092,6 +1200,8 @@ fn validate_transitions(
         let image_row = read_u32(&raw, 36);
         let effect_start = read_u32(&raw, 40);
         let effect_count = read_u32(&raw, 44);
+        let final_writer_statement = read_u32(&raw, 48);
+        let rewritten = raw[17] == 1;
         let table = s7_table_at(framing, table_ref)?;
         let s4 = s4_at(framing, source_s4, counts[2])?;
         if read_u32(&raw, 0) != ordinal
@@ -1099,7 +1209,8 @@ fn validate_transitions(
             || stable_row_id == 0
             || stable_row_id == u64::MAX
             || raw[16] != 1
-            || raw[17..20].iter().any(|byte| *byte != 0)
+            || !matches!(raw[17], 0 | 1)
+            || raw[18..20].iter().any(|byte| *byte != 0)
             || source_s4 >= counts[2]
             || source_statement >= counts[1]
             || image_ref != table_ref
@@ -1108,13 +1219,15 @@ fn validate_transitions(
                     .checked_sub(read_u32(&table, 88))
                     .ok_or_else(|| error("S7 transition ordinal precedes its table range"))?
             || effect_start != next_effect
-            || read_u32(&raw, 48) != source_statement
+            || (!rewritten
+                && (final_writer_statement != source_statement || raw[160..192] != [0; 32]))
+            || (rewritten
+                && (final_writer_statement <= source_statement || raw[160..192] == [0; 32]))
             || raw[52..64].iter().any(|byte| *byte != 0)
             || raw[64..96] != s4[32..64]
             || raw[96..128] == [0; 32]
             || raw[128..160]
                 != transition_digest(framing, &raw, effect_start, effect_count, counts[8])?
-            || raw[160..192].iter().any(|byte| *byte != 0)
             || read_u32(&s4, 0) != source_statement
             || read_u32(&s4, 4) != source_row
             || read_u64(&s4, 8) != stable_row_id
@@ -1249,6 +1362,14 @@ fn validate_index_descriptors(
         let unique_constraint = flags & (1 << 2) != 0;
         let maintained = flags & (1 << 3) != 0;
         let owner_is_target = owner_ref != ABSENT_U32;
+        let owner_is_initially_absent = owner_is_target
+            && owner_ref < counts[0]
+            && (read_u32(&s7_table_at(framing, owner_ref)?, 4) & 2 != 0);
+        // The only other zero index predecessor is an existing table's S3-proven CREATE INDEX.
+        // Pass-zero preserves the paired absence form; the retained codec closure binds it to
+        // the ordered S3 lifecycle identity before any replay artifact can escape.
+        let index_predecessor_is_absent =
+            owner_is_initially_absent || (read_u64(&raw, 352) == 0 && raw[240..272] == [0; 32]);
         if read_u32(&raw, 0) != ordinal
             || flags & !0xf != 0
             || (primary && !unique)
@@ -1273,16 +1394,21 @@ fn validate_index_descriptors(
             || key_count == 0
             || raw[48] != 1
             || raw[49..64].iter().any(|byte| *byte != 0)
-            || read_u64(&raw, 72) == 0
+            // The first table in a new database inherits catalog epoch zero. Its S7 table
+            // block already proves the exact absent predecessor; an owned first-generation
+            // descriptor must carry that same epoch rather than fabricating a catalog cut.
+            || (read_u64(&raw, 72) == 0 && !owner_is_initially_absent)
             || raw[80..176] == [0; 96]
-            || raw[208..336]
+            || (raw[208..240] == [0; 32] && !owner_is_initially_absent)
+            || (raw[240..272] == [0; 32] && !index_predecessor_is_absent)
+            || raw[272..336]
                 .chunks_exact(32)
                 .any(|digest| digest == [0; 32])
             || raw[340..344].iter().any(|byte| *byte != 0)
             || raw[368..384].iter().any(|byte| *byte != 0)
-            || read_u64(&raw, 344) == 0
+            || (read_u64(&raw, 344) == 0 && !owner_is_initially_absent)
             || read_u64(&raw, 344) == u64::MAX
-            || read_u64(&raw, 352) == 0
+            || (read_u64(&raw, 352) == 0 && !index_predecessor_is_absent)
             || read_u64(&raw, 352) == u64::MAX
             || read_u64(&raw, 360) == 0
             || read_u64(&raw, 360) == u64::MAX
@@ -1438,6 +1564,33 @@ fn validate_dependency_tokens(
         let floor = read_u64(&raw, 32);
         let key_effect = read_u32(&raw, 40);
         let descriptor = read_u32(&raw, 44);
+        // A transaction-created table has no public predecessor generation. Its target token
+        // and any maintained/unique descriptor it owns witness that same zero predecessor.
+        // Read the authoritative S7 table block rather than creating a second catalog lookup
+        // convention here; FK supporting indexes remain bound to their published parents.
+        let target_is_initially_absent = kind == 1
+            && table_ref < counts[0]
+            && (read_u32(&s7_table_at(framing, table_ref)?, 4) & 2 != 0);
+        let index_is_initially_absent = matches!(kind, 3 | 4) && descriptor < counts[5] && {
+            let index = s7_fixed_at::<384>(framing, 5, descriptor, counts[5], 384)?;
+            let owner_ref = read_u32(&index, 8);
+            owner_ref == table_ref
+                && (owner_ref < counts[0]
+                    && (read_u32(&s7_table_at(framing, owner_ref)?, 4) & 2 != 0)
+                    // An existing table's S3-authorized CREATE INDEX has the same paired-zero
+                    // predecessor form. The retained closure binds that exception to its exact
+                    // lifecycle identity before replay may consume this grammar.
+                    || (read_u64(&index, 352) == 0 && index[240..272] == [0; 32]))
+        };
+        // A domain introduced by the same ordered S3 catalog composition as an initially absent
+        // target table has no published predecessor either. Its catalog mutation remains the
+        // authoritative creation proof; this only admits its zero snapshot generation in the
+        // already-authenticated S7 dependency grammar.
+        let domain_is_initially_absent = kind == 7
+            && table_ref < counts[0]
+            && (read_u32(&s7_table_at(framing, table_ref)?, 4) & 2 != 0);
+        let absent_predecessor =
+            target_is_initially_absent || index_is_initially_absent || domain_is_initially_absent;
         let expected_access = match kind {
             1 | 3 => 3,
             2 | 4 | 5 | 6 | 9 | 10 | 11 => 2,
@@ -1448,7 +1601,7 @@ fn validate_dependency_tokens(
         let live_effect = flags & 1 != 0;
         let terminal = flags & 2 != 0;
         let descriptor_required = (3..=6).contains(&kind);
-        let base_root_zero = kind == 7;
+        let base_root_zero = kind == 7 || absent_predecessor;
         let schema_zero = kind == 8;
         if read_u32(&raw, 0) != ordinal
             || access != expected_access
@@ -1461,9 +1614,10 @@ fn validate_dependency_tokens(
             || (display_oid == 0 && !matches!(kind, 9 | 11))
             || display_oid > 0x7fff_ffff
             || table_ref >= counts[0]
-            || base_generation == 0
+            || (base_generation == 0 && !absent_predecessor)
             || base_generation == u64::MAX
-            || (kind == 8) != (floor == 0)
+            || (kind == 8 && floor != 0)
+            || (kind != 8 && !absent_predecessor && floor == 0)
             || read_u64(&raw, 48) != catalog_epoch
             || (live_effect
                 && (!matches!(kind, 4 | 6) || key_effect >= counts[8]))
@@ -1684,17 +1838,32 @@ fn published_sequence_dependency_identity(
     framing.with_section_reader(4, |reader| {
         while !reader.done() {
             let prefix = reader.exact::<52>()?;
+            let kind = prefix[8];
             let body_bytes = read_u32(&prefix, 16);
-            let body_digest: [u8; 32] = prefix[20..52].try_into().expect("fixed S5 body digest");
-            if body_bytes != crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES as u32 {
+            if kind != 1 {
+                reader.skip(u64::from(body_bytes))?;
+                continue;
+            }
+            let expected_reference_bytes = crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES as u32;
+            let expected_with_restart = expected_reference_bytes
+                + crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES as u32;
+            if body_bytes != expected_reference_bytes && body_bytes != expected_with_restart {
                 return Err(error("S5 published sequence body length drifted"));
             }
             let body = reader.exact::<{ crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES }>()?;
+            if body_bytes == expected_with_restart {
+                let tail = reader.exact::<{
+                    crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES
+                }>()?;
+                crate::typed_insert_aggregate::semantics_v2::sequence_terminal::decode(&tail)
+                    .map_err(|_| error("S5 terminal restart fails exact reread"))?;
+            }
             let reference = crate::decode_sequence_value_reference_exact(&body)
                 .map_err(|_| error("S5 published sequence body fails exact reread"))?;
+            let reference_body_digest = gpu_db_wal::canonical_request_digest(&body);
             if reference.transition_txn_id == expected_transition
                 && reference.sequence_oid == expected_sequence_oid
-                && body_digest == expected_body_digest
+                && reference_body_digest == expected_body_digest
             {
                 matches = matches
                     .checked_add(1)
@@ -1794,6 +1963,8 @@ fn validate_statement_resolutions(
             let projection_start = read_u32(&raw, 48);
             let projection_count = read_u32(&raw, 52);
             let flags = read_u32(&raw, 20);
+            let target_is_initially_absent =
+                read_u32(&s7_table_at(framing, read_u32(&raw, 16))?, 4) & 2 != 0;
             let s6_flags = u16::from_le_bytes(s6[10..12].try_into().expect("fixed S6 flags"));
             let outcome = gpu_db_wal::decode_canonical_outcome_exact(&s6[44..136])
                 .map_err(|_| error("S7 resolution S6 outcome is invalid"))?;
@@ -1818,8 +1989,9 @@ fn validate_statement_resolutions(
                 || read_u32(&raw, 60) != surviving_rows
                 || read_u64(&raw, 64) != affected_rows
                 || read_u64(&raw, 64) != outcome.affected_rows
-                || read_u64(&raw, 72) == 0
-                || read_u64(&raw, 72) >= commit_sequence
+                || (!target_is_initially_absent
+                    && (read_u64(&raw, 72) == 0 || read_u64(&raw, 72) >= commit_sequence))
+                || (target_is_initially_absent && read_u64(&raw, 72) > commit_sequence)
                 || read_u32(&raw, 80) != s2.bytes
                 || raw[96..128] != s1[16..48]
                 || raw[128..160] != s1[48..80]
@@ -1959,11 +2131,7 @@ fn validate_table_blocks_and_root(
 ) -> Result<(), EngineError> {
     let catalog_before_epoch = read_u64(header, 328);
     let catalog_after_epoch = read_u64(header, 336);
-    if catalog_before_epoch == 0
-        || catalog_before_epoch != catalog_after_epoch
-        || header[344..376] == [0; 32]
-        || header[344..376] != header[376..408]
-    {
+    if catalog_after_epoch == 0 || header[344..376] == [0; 32] || header[376..408] == [0; 32] {
         return Err(error("S7 catalog before/after echoes are invalid"));
     }
     let mut root = begin_v2_digest(b"gpu-db/write001/s7-root-descriptor/v2");
@@ -1975,9 +2143,14 @@ fn validate_table_blocks_and_root(
     let mut next_disposition = 0_u32;
     let mut next_transition = 0_u32;
     let mut next_key_effect = 0_u32;
+    let mut all_tables_are_initially_absent = true;
     for ordinal in 0..counts[0] {
         let raw = reader.exact::<384>()?;
         let table_ref = read_u32(&raw, 0);
+        let table_flags = read_u32(&raw, 4);
+        let resets_existing_rows = table_flags & 1 != 0;
+        let initial_table_absent = table_flags & 2 != 0;
+        all_tables_are_initially_absent &= initial_table_absent;
         let stable_table_id = read_u64(&raw, 8);
         let display_oid = read_u32(&raw, 16);
         let target_dependency = read_u32(&raw, 20);
@@ -1994,7 +2167,8 @@ fn validate_table_blocks_and_root(
         let key_effect_start = read_u32(&raw, 104);
         let key_effect_count = read_u32(&raw, 108);
         if table_ref != ordinal
-            || raw[4..8].iter().any(|byte| *byte != 0)
+            || table_flags & !3 != 0
+            || (initial_table_absent && resets_existing_rows)
             || stable_table_id == 0
             || stable_table_id == u64::MAX
             || prior_table_id.is_some_and(|prior| prior >= stable_table_id)
@@ -2002,7 +2176,8 @@ fn validate_table_blocks_and_root(
             || display_oid > 0x7fff_ffff
             || target_dependency >= counts[3]
             || read_u64(&raw, 24) != catalog_before_epoch
-            || data_generation_before == 0
+            || (!initial_table_absent && data_generation_before == 0)
+            || (initial_table_absent && data_generation_before != 0)
             || data_generation_before == u64::MAX
             || data_generation_after == 0
             || data_generation_after == u64::MAX
@@ -2016,7 +2191,10 @@ fn validate_table_blocks_and_root(
             || read_u32(&raw, 112) != table_ref
             || read_u32(&raw, 116) == 0
             || raw[120..128].iter().any(|byte| *byte != 0)
-            || raw[128..384]
+            || raw[128..160] == [0; 32]
+            || (!initial_table_absent && raw[160..192] == [0; 32])
+            || (initial_table_absent && raw[160..192] != [0; 32])
+            || raw[192..384]
                 .chunks_exact(32)
                 .any(|digest| digest == [0; 32])
         {
@@ -2026,10 +2204,15 @@ fn validate_table_blocks_and_root(
             .checked_sub(allocator_before)
             .ok_or_else(|| error("S7 table allocator range underflows"))?;
         if allocator_count != u64::from(disposition_count)
+            || (initial_table_absent && initial_rows != 0)
             || final_rows
-                != initial_rows
-                    .checked_add(u64::from(transition_count))
-                    .ok_or_else(|| error("S7 table final-row count overflows"))?
+                != if resets_existing_rows {
+                    u64::from(transition_count)
+                } else {
+                    initial_rows
+                        .checked_add(u64::from(transition_count))
+                        .ok_or_else(|| error("S7 table final-row count overflows"))?
+                }
             || (transition_count == 0
                 && (data_generation_after != data_generation_before
                     || raw[160..192] != raw[192..224]))
@@ -2051,6 +2234,7 @@ fn validate_table_blocks_and_root(
             .checked_add(key_effect_count)
             .ok_or_else(|| error("S7 table key-effect range overflows"))?;
         root.update(&raw[0..4]);
+        root.update(&raw[4..8]);
         root.update(&raw[8..16]);
         root.update(&raw[32..48]);
         root.update(&raw[160..224]);
@@ -2060,6 +2244,7 @@ fn validate_table_blocks_and_root(
     if next_disposition != counts[2]
         || next_transition != counts[7]
         || next_key_effect != counts[8]
+        || (catalog_before_epoch == 0 && !all_tables_are_initially_absent)
         || <[u8; 32]>::from(root.finalize()) != header[536..568]
     {
         return Err(error(

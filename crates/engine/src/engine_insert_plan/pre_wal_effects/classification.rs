@@ -7,6 +7,10 @@ use super::{
     baseline_drift, ExplicitCapture, InsertEffectParentIdentity, PreparedMutation,
     TransactionOperation,
 };
+use crate::typed_insert_batch::sequence_defaults::effects::{
+    PrivateSequencePlanningEvidence, SequenceDefaultBinding, SequenceDefaultBindings,
+    SequenceDefaultParentContext,
+};
 use crate::typed_insert_batch::{PreparedTypedInsert, SequenceDefaultRequestEffectShape};
 use crate::{
     command_is_sequence_lifecycle, sequence_descriptor_digest, sequence_value_input_digest,
@@ -14,7 +18,7 @@ use crate::{
     BinaryCatalogRelationKind, BinarySequenceValueOperation, CatalogSnapshot, Command,
     ExecuteError, SequenceValueInput,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 use super::receipt::{
@@ -22,19 +26,23 @@ use super::receipt::{
     SequenceOutputEvidence, SequenceReceiptBundle, SequenceSealBindingBundle,
     SequenceTransitionEvidence,
 };
-#[cfg(test)]
-use crate::typed_insert_batch::sequence_defaults::effects::{
-    PrivateSequencePlanningEvidence, SequenceDefaultBinding, SequenceDefaultBindings,
-    SequenceDefaultParentContext,
-};
-#[cfg(test)]
-use std::collections::BTreeSet;
+
+/// The live seal handoff retains only private sequence-chain metadata alongside the move-only
+/// binding bundle. Published transitions remain independently durable references.
+pub(super) struct LiveSequenceSealBindings {
+    pub(super) bindings: SequenceDefaultBindings,
+    pub(super) private_advances: Vec<crate::engine_transaction_delta::TypedPrivateSequenceAdvance>,
+}
 
 /// Compact, move-only planned effects. These digests are planning witnesses only; no field is a
 /// WAL record digest or a durable receipt.
 #[allow(dead_code)] // The terminal effect owner is deliberately deferred to the next PLAN slice.
 pub(super) struct PlannedSequenceEffects {
     parent: PlannedSequenceParent,
+    /// Exact private sequence cut captured before this statement advances any default. This is
+    /// required at terminal sealing because a statement may continue the authenticated outcome
+    /// of an earlier typed statement rather than start directly at a lifecycle command.
+    initial_private_states: Box<[(u32, PlannedPrivateState)]>,
     effects: Box<[PlannedSequenceEffect]>,
 }
 
@@ -126,7 +134,7 @@ struct PlannedPrivateState {
 struct FoldedSequence {
     effective_name: String,
     lifetime_origin: SequenceLifetimeOrigin,
-    latest_private: Option<((i64, bool), PrivateValueOwnerIdentity)>,
+    latest_private: Option<PlannedPrivateState>,
 }
 
 pub(super) fn classify_autocommit(
@@ -151,6 +159,7 @@ pub(super) fn classify_autocommit(
     }
     Ok(PlannedSequenceEffects {
         parent,
+        initial_private_states: Box::new([]),
         effects: effects.into(),
     })
 }
@@ -171,19 +180,13 @@ pub(super) fn classify_explicit(
 
     let mut planned_states = folded
         .iter()
-        .filter_map(|(oid, sequence)| {
-            sequence.latest_private.map(|(state, owner)| {
-                (
-                    *oid,
-                    PlannedPrivateState {
-                        state,
-                        owner,
-                        predecessor: PlannedPrivatePredecessor::Lifecycle(owner),
-                    },
-                )
-            })
-        })
+        .filter_map(|(oid, sequence)| sequence.latest_private.map(|state| (*oid, state)))
         .collect::<BTreeMap<_, _>>();
+    let initial_private_states = planned_states
+        .iter()
+        .map(|(oid, state)| (*oid, *state))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let mut effects = Vec::new();
     for request in prepared.effect_sequence_requests() {
         let target = planned_target(request, parent)?;
@@ -255,6 +258,7 @@ pub(super) fn classify_explicit(
     }
     Ok(PlannedSequenceEffects {
         parent,
+        initial_private_states,
         effects: effects.into(),
     })
 }
@@ -372,7 +376,100 @@ fn fold_operations(
             TransactionOperation::Row(staged) => {
                 fold_row_advances(staged, folded, names)?;
             }
+            TransactionOperation::TypedInsert(staged) => {
+                fold_typed_insert_advances(&staged.private_sequence_advances, folded)?;
+            }
         }
+    }
+    Ok(())
+}
+
+/// Fold immutable typed artifacts in statement order.  This owns the cross-statement private
+/// sequence witness: each advance must continue the prior artifact's outcome digest and state.
+fn fold_typed_insert_advances(
+    advances: &[crate::engine_transaction_delta::TypedPrivateSequenceAdvance],
+    folded: &mut BTreeMap<u32, FoldedSequence>,
+) -> Result<(), ExecuteError> {
+    for advance in advances {
+        let owner_kind = match advance.owner_kind {
+            1 => PrivateValueOwner::Create,
+            2 => PrivateValueOwner::Restart,
+            3 => PrivateValueOwner::TruncateRestart,
+            _ => {
+                return Err(baseline_drift(
+                    "typed INSERT private sequence owner kind is invalid",
+                ));
+            }
+        };
+        let lifetime_origin = match advance.lifetime_origin {
+            1 => SequenceLifetimeOrigin::Published,
+            2 => SequenceLifetimeOrigin::Private,
+            _ => {
+                return Err(baseline_drift(
+                    "typed INSERT private sequence lifetime origin is invalid",
+                ));
+            }
+        };
+        let owner = PrivateValueOwnerIdentity {
+            kind: owner_kind,
+            statement_ordinal: advance.owner_statement_ordinal,
+            statement_digest: advance.owner_statement_digest,
+            creator_catalog_column_ordinal: advance.owner_creator_catalog_column_ordinal,
+        };
+        if advance.sequence_oid == 0
+            || advance.sequence_name.is_empty()
+            || !advance.next_state.1
+            || advance.owner_statement_digest == [0; 32]
+            || advance.child_digest == [0; 32]
+            || advance.outcome_digest == [0; 32]
+            || !private_lifetime_owner_is_compatible(lifetime_origin, owner)
+        {
+            return Err(baseline_drift(
+                "typed INSERT private sequence advance lost stable provenance",
+            ));
+        }
+        let sequence = folded.get_mut(&advance.sequence_oid).ok_or_else(|| {
+            baseline_drift("typed INSERT private sequence advance left its stable-OID fold")
+        })?;
+        if sequence.effective_name != advance.sequence_name
+            || sequence.lifetime_origin != lifetime_origin
+        {
+            return Err(baseline_drift(
+                "typed INSERT private sequence advance changed its identity",
+            ));
+        }
+        let prior = sequence.latest_private.ok_or_else(|| {
+            baseline_drift(
+                "typed INSERT private sequence advance cannot speculate over a published sequence",
+            )
+        })?;
+        let predecessor_matches = match prior.predecessor {
+            PlannedPrivatePredecessor::Lifecycle(prior_owner) => {
+                advance.predecessor_tag == 1
+                    && advance.predecessor_digest == prior_owner.statement_digest
+                    && owner == prior_owner
+            }
+            PlannedPrivatePredecessor::PlannedOutcome(outcome_digest) => {
+                advance.predecessor_tag == 2
+                    && advance.predecessor_digest == outcome_digest
+                    && owner == prior.owner
+            }
+        };
+        let reachable_next = if prior.state.1 {
+            prior.state.0.checked_add(1) == Some(advance.next_state.0)
+        } else {
+            advance.next_state.0 == prior.state.0
+        };
+        if !predecessor_matches || !reachable_next {
+            return Err(baseline_drift(
+                "typed INSERT private sequence advance is not an exact continuation of its prior state",
+            ));
+        }
+        sequence.latest_private = Some(PlannedPrivateState {
+            state: advance.next_state,
+            owner,
+            predecessor: PlannedPrivatePredecessor::PlannedOutcome(advance.outcome_digest),
+        });
     }
     Ok(())
 }
@@ -632,21 +729,28 @@ fn fold_row_advances(
         let sequence = folded.get_mut(&oid).ok_or_else(|| {
             baseline_drift("row sequence advance names a dropped or unknown stable identity")
         })?;
-        let (prior_state, owner) = sequence.latest_private.ok_or_else(|| {
+        let prior = sequence.latest_private.ok_or_else(|| {
             baseline_drift("row sequence advance cannot speculate over a published sequence")
         })?;
         if !state.1
-            || if prior_state.1 {
-                state.0 <= prior_state.0
+            || if prior.state.1 {
+                state.0 <= prior.state.0
             } else {
-                state.0 < prior_state.0
+                state.0 < prior.state.0
             }
         {
             return Err(baseline_drift(
                 "row sequence advance is not reachable from its prior private state",
             ));
         }
-        sequence.latest_private = Some((*state, owner));
+        sequence.latest_private = Some(PlannedPrivateState {
+            state: *state,
+            owner: prior.owner,
+            // A legacy row mutation has no typed terminal outcome witness.  A subsequent
+            // typed statement must therefore anchor at the private lifecycle owner instead of
+            // pretending that it can chain from an unavailable typed outcome.
+            predecessor: PlannedPrivatePredecessor::Lifecycle(prior.owner),
+        });
     }
     Ok(())
 }
@@ -670,7 +774,11 @@ fn insert_private_sequence(
         FoldedSequence {
             effective_name,
             lifetime_origin: SequenceLifetimeOrigin::Private,
-            latest_private: Some((state, owner)),
+            latest_private: Some(PlannedPrivateState {
+                state,
+                owner,
+                predecessor: PlannedPrivatePredecessor::Lifecycle(owner),
+            }),
         },
     );
     Ok(())
@@ -717,7 +825,11 @@ fn set_private_state(
     let sequence = folded
         .get_mut(&oid)
         .ok_or_else(|| baseline_drift("private sequence state names an unknown stable identity"))?;
-    sequence.latest_private = Some((state, owner));
+    sequence.latest_private = Some(PlannedPrivateState {
+        state,
+        owner,
+        predecessor: PlannedPrivatePredecessor::Lifecycle(owner),
+    });
     Ok(())
 }
 
@@ -817,14 +929,14 @@ fn validate_final_private_states(
     }
     let expected_by_oid = folded
         .iter()
-        .filter_map(|(oid, sequence)| sequence.latest_private.map(|(state, _)| (*oid, state)))
+        .filter_map(|(oid, sequence)| sequence.latest_private.map(|state| (*oid, state.state)))
         .collect::<BTreeMap<_, _>>();
     let expected_by_name = folded
         .values()
         .filter_map(|sequence| {
             sequence
                 .latest_private
-                .map(|(state, _)| (sequence.effective_name.clone(), state))
+                .map(|state| (sequence.effective_name.clone(), state.state))
         })
         .collect::<BTreeMap<_, _>>();
     if expected_by_oid != captured.sequence_state_by_oid
@@ -928,7 +1040,11 @@ fn append_private_predecessor(body: &mut Vec<u8>, predecessor: PlannedPrivatePre
 }
 
 fn append_string(body: &mut Vec<u8>, value: &str) {
-    body.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    body.extend_from_slice(
+        &u32::try_from(value.len())
+            .expect("validated sequence identifier length fits canonical u32 framing")
+            .to_le_bytes(),
+    );
     body.extend_from_slice(value.as_bytes());
 }
 
@@ -963,7 +1079,11 @@ pub(super) fn build_seal_bindings_for_test(
     let mut published = receipts.published.into_vec().into_iter();
     let mut transition_ids = BTreeSet::new();
     let mut target_slots = BTreeSet::new();
-    let mut private_chains = BTreeMap::new();
+    let mut private_chains = planned
+        .initial_private_states
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
     let mut bindings = Vec::with_capacity(requests.len());
     let mut outputs = Vec::with_capacity(requests.len());
     for ((request, request_shape), effect) in requests
@@ -1087,18 +1207,166 @@ pub(super) fn build_seal_bindings_for_test(
     })
 }
 
-#[cfg(test)]
+/// Consume the live published receipts and classifier-derived private values into one exact
+/// typed seal bundle.  A receipt is matched by stable sequence identity plus its absolute
+/// expression position; request order remains the only materialization order.
+pub(super) fn build_live_seal_bindings(
+    prepared: &PreparedTypedInsert,
+    parent: &InsertEffectParentIdentity,
+    planned: &PlannedSequenceEffects,
+    published_references: &[crate::BinarySequenceValueReference],
+) -> Result<LiveSequenceSealBindings, ExecuteError> {
+    if planned.parent != planned_parent(parent) {
+        return Err(baseline_drift(
+            "live sequence seal parent differs from its classifier plan",
+        ));
+    }
+    let requests = prepared.sequence_requests();
+    if planned.effects.len() != requests.len() {
+        return Err(baseline_drift(
+            "live sequence seal effect count differs from typed request geometry",
+        ));
+    }
+    let binding_parent = SequenceDefaultParentContext::new(
+        parent.txn_id,
+        parent.autocommit,
+        parent.request_digest,
+        parent.statement_ordinal,
+        parent.expression_ordinal_base,
+    );
+    let mut published = BTreeMap::new();
+    for reference in published_references {
+        if !reference.default_expression
+            || reference.transition_txn_id == 0
+            || reference.parent_txn_id != parent.txn_id
+            || reference.statement_ordinal != parent.statement_ordinal.as_u32()
+            || published
+                .insert(
+                    (reference.sequence_oid, reference.expression_ordinal),
+                    reference,
+                )
+                .is_some()
+        {
+            return Err(baseline_drift(
+                "published sequence receipt has invalid or duplicate typed identity",
+            ));
+        }
+    }
+    let mut transition_ids = BTreeSet::new();
+    let mut target_slots = BTreeSet::new();
+    let mut private_chains = planned
+        .initial_private_states
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    let mut bindings = Vec::with_capacity(requests.len());
+    let mut private_advances = Vec::new();
+    for ((request, request_shape), effect) in requests
+        .iter()
+        .zip(prepared.effect_sequence_requests())
+        .zip(planned.effects.iter())
+    {
+        let expected_target = planned_target(request_shape, planned.parent)?;
+        let target = match effect {
+            PlannedSequenceEffect::Published { target } => target,
+            PlannedSequenceEffect::Private(effect) => &effect.target,
+        };
+        if *target != expected_target
+            || !target_slots.insert((target.sequence_oid, target.absolute_expression_ordinal))
+        {
+            return Err(baseline_drift(
+                "live sequence seal target or absolute expression order drifted",
+            ));
+        }
+        match effect {
+            PlannedSequenceEffect::Published { target } => {
+                let reference = published
+                    .remove(&(target.sequence_oid, target.absolute_expression_ordinal))
+                    .ok_or_else(|| {
+                        baseline_drift("live sequence seal is missing a published receipt")
+                    })?;
+                if !transition_ids.insert(reference.transition_txn_id)
+                    || reference.input_digest != target.input_digest
+                    || reference.table_oid != target.target_table_oid
+                    || reference.column_id != target.column_id
+                    || reference.staging_row_ordinal != target.row_ordinal
+                    || i32::try_from(reference.returned_value).is_err()
+                {
+                    return Err(baseline_drift(
+                        "published sequence receipt differs from its typed request",
+                    ));
+                }
+                bindings.push(SequenceDefaultBinding::published_exact(
+                    request.clone(),
+                    binding_parent.clone(),
+                    reference.returned_value,
+                    reference.transition_txn_id,
+                    reference.input_digest,
+                ));
+            }
+            PlannedSequenceEffect::Private(effect) => {
+                validate_private_effect_for_terminal(effect, planned.parent, &mut private_chains)?;
+                let planning = PrivateSequencePlanningEvidence::exact(
+                    lifetime_origin_tag(effect.lifetime_origin),
+                    private_owner_kind_tag(effect.prior_owner.kind),
+                    effect.prior_owner.statement_ordinal,
+                    effect.prior_owner.statement_digest,
+                    effect.prior_owner.creator_catalog_column_ordinal,
+                    predecessor_tag(effect.predecessor),
+                    predecessor_digest(effect.predecessor),
+                    effect.target.input_digest,
+                    effect.target.descriptor_digest,
+                    effect.planned_child_digest,
+                    effect.planned_outcome_digest,
+                );
+                bindings.push(SequenceDefaultBinding::private_exact(
+                    request.clone(),
+                    binding_parent.clone(),
+                    i64::from(effect.output_i32),
+                    effect.prior_state,
+                    effect.next_state,
+                    planning,
+                ));
+                private_advances.push(
+                    crate::engine_transaction_delta::TypedPrivateSequenceAdvance {
+                        sequence_name: effect.target.effective_name.to_string(),
+                        sequence_oid: effect.target.sequence_oid,
+                        next_state: effect.next_state,
+                        lifetime_origin: lifetime_origin_tag(effect.lifetime_origin),
+                        owner_kind: private_owner_kind_tag(effect.prior_owner.kind),
+                        owner_statement_ordinal: effect.prior_owner.statement_ordinal,
+                        owner_statement_digest: effect.prior_owner.statement_digest,
+                        owner_creator_catalog_column_ordinal: effect
+                            .prior_owner
+                            .creator_catalog_column_ordinal,
+                        predecessor_tag: predecessor_tag(effect.predecessor),
+                        predecessor_digest: predecessor_digest(effect.predecessor),
+                        child_digest: effect.planned_child_digest,
+                        outcome_digest: effect.planned_outcome_digest,
+                    },
+                );
+            }
+        }
+    }
+    if !published.is_empty() {
+        return Err(baseline_drift(
+            "live sequence seal has trailing published receipts",
+        ));
+    }
+    Ok(LiveSequenceSealBindings {
+        bindings: if bindings.is_empty() {
+            SequenceDefaultBindings::empty()
+        } else {
+            SequenceDefaultBindings::from_bindings(binding_parent, bindings)
+        },
+        private_advances,
+    })
+}
+
 fn validate_private_effect_for_terminal(
     effect: &PlannedPrivateSequenceEffect,
     parent: PlannedSequenceParent,
-    chains: &mut BTreeMap<
-        u32,
-        (
-            (i64, bool),
-            PrivateValueOwnerIdentity,
-            gpu_db_wal::CanonicalDigest,
-        ),
-    >,
+    chains: &mut BTreeMap<u32, PlannedPrivateState>,
 ) -> Result<(), ExecuteError> {
     if !private_lifetime_owner_is_compatible(effect.lifetime_origin, effect.prior_owner) {
         return Err(baseline_drift(
@@ -1138,32 +1406,31 @@ fn validate_private_effect_for_terminal(
             "private sequence seal state, descriptor, or child witness drifted",
         ));
     }
-    if let Some((prior_state, owner, outcome_digest)) = chains.get(&effect.target.sequence_oid) {
-        if effect.prior_state != *prior_state
-            || effect.prior_owner != *owner
-            || effect.predecessor != PlannedPrivatePredecessor::PlannedOutcome(*outcome_digest)
+    if let Some(prior) = chains.get(&effect.target.sequence_oid) {
+        if effect.prior_state != prior.state
+            || effect.prior_owner != prior.owner
+            || effect.predecessor != prior.predecessor
         {
             return Err(baseline_drift(
                 "private sequence seal chain predecessor or owner drifted",
             ));
         }
-    } else if effect.predecessor != PlannedPrivatePredecessor::Lifecycle(effect.prior_owner) {
+    } else {
         return Err(baseline_drift(
-            "private sequence seal initial predecessor is not its lifecycle owner",
+            "private sequence seal has no captured initial predecessor",
         ));
     }
     chains.insert(
         effect.target.sequence_oid,
-        (
-            effect.next_state,
-            effect.prior_owner,
-            effect.planned_outcome_digest,
-        ),
+        PlannedPrivateState {
+            state: effect.next_state,
+            owner: effect.prior_owner,
+            predecessor: PlannedPrivatePredecessor::PlannedOutcome(effect.planned_outcome_digest),
+        },
     );
     Ok(())
 }
 
-#[cfg(test)]
 fn private_lifetime_owner_is_compatible(
     lifetime_origin: SequenceLifetimeOrigin,
     owner: PrivateValueOwnerIdentity,
@@ -1185,11 +1452,18 @@ fn private_lifetime_owner_is_compatible(
     }
 }
 
-#[cfg(test)]
 fn lifetime_origin_tag(origin: SequenceLifetimeOrigin) -> u8 {
     match origin {
         SequenceLifetimeOrigin::Published => 1,
         SequenceLifetimeOrigin::Private => 2,
+    }
+}
+
+fn private_owner_kind_tag(kind: PrivateValueOwner) -> u8 {
+    match kind {
+        PrivateValueOwner::Create => 1,
+        PrivateValueOwner::Restart => 2,
+        PrivateValueOwner::TruncateRestart => 3,
     }
 }
 
@@ -1221,7 +1495,6 @@ fn private_predecessor_evidence(
     }
 }
 
-#[cfg(test)]
 fn predecessor_tag(predecessor: PlannedPrivatePredecessor) -> u8 {
     match predecessor {
         PlannedPrivatePredecessor::Lifecycle(_) => 1,
@@ -1229,7 +1502,6 @@ fn predecessor_tag(predecessor: PlannedPrivatePredecessor) -> u8 {
     }
 }
 
-#[cfg(test)]
 fn predecessor_digest(predecessor: PlannedPrivatePredecessor) -> gpu_db_wal::CanonicalDigest {
     match predecessor {
         PlannedPrivatePredecessor::Lifecycle(owner) => owner.statement_digest,

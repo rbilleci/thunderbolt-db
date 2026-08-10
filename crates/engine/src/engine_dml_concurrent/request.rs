@@ -42,6 +42,7 @@ impl Engine {
             crate::engine_mutation_admission::CatalogVersionExpectation,
         >,
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        let txn_id = self.resolve_public_transaction_id(txn_id);
         // This compatibility entry accepts caller-assigned identities. An ordinary sequence
         // default may claim its own transaction before the user DML record, so reserve the outer
         // identity in the shared allocator first.
@@ -61,6 +62,33 @@ impl Engine {
             }
             return self.execute_parsed_dml_in_transaction_with_result(txn_id, command);
         }
+        if matches!(&command, Command::Insert(_)) {
+            let (requests_published_sequence_default, route_catalog_version) =
+                self.insert_sequence_default_route(&command);
+            let catalog_expectation = expected_catalog_version.or_else(|| {
+                requests_published_sequence_default.then(|| {
+                    crate::engine_mutation_admission::CatalogVersionExpectation::SequenceRoute(
+                        route_catalog_version
+                            .expect("published sequence-default route reports its catalog cut"),
+                    )
+                })
+            });
+            if requests_published_sequence_default {
+                return self.execute_sequence_default_autocommit(
+                    txn_id,
+                    command,
+                    catalog_expectation,
+                );
+            }
+            return self.execute_autocommit_insert_as_one_statement_overlay(
+                txn_id,
+                command,
+                CanonicalRequest::from_text(self, text).digest(),
+                catalog_expectation,
+                current_timestamp_micros(),
+                || {},
+            );
+        }
         self.execute_parsed_dml_concurrent_instrumented_with_catalog(
             txn_id,
             command,
@@ -68,6 +96,145 @@ impl Engine {
             expected_catalog_version,
             || {},
         )
+    }
+
+    /// Every autocommit `INSERT` is one private overlay followed immediately by the existing
+    /// canonical transaction terminal. This deliberately reuses explicit staging, device result
+    /// materialization, rollback, WAL, apply, and publication rather than letting ordinary
+    /// autocommit and `RETURNING` own different INSERT lifecycles.
+    pub(crate) fn execute_autocommit_insert_as_one_statement_overlay<OnStaged>(
+        &self,
+        txn_id: u64,
+        command: Command,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        expectation: Option<crate::engine_mutation_admission::CatalogVersionExpectation>,
+        timestamp_micros: u64,
+        on_staged: OnStaged,
+    ) -> Result<DmlExecutionResult, ExecuteError>
+    where
+        OnStaged: FnOnce(),
+    {
+        if self.is_commit_path_poisoned() {
+            return Err(super::durability_failure::execute_error_from_engine(
+                self.commit_path_unavailable_error(),
+            ));
+        }
+        if let Some(rows_affected) =
+            self.resolve_stable_retry_before_table_access(txn_id, request_digest)?
+        {
+            if command_has_returning(&command) {
+                return Err(ExecuteError::Unsupported(
+                    "terminal retry of INSERT RETURNING is fail-closed until canonical status persists the returned frame"
+                        .to_string(),
+                ));
+            }
+            return Ok(DmlExecutionResult {
+                rows_affected,
+                returning: None,
+            });
+        }
+        if let Some(expectation) = expectation {
+            crate::engine_mutation_admission::validate_catalog_version_expectation(
+                expectation,
+                self.catalog_snapshot().commit_seq,
+            )?;
+        }
+        // Establish the complete target/FK device generation set before capturing the
+        // one-statement transaction snapshot. This is the same GPU-native admission boundary
+        // used by the concurrent DML route: a missing generation is uploaded under the canonical
+        // commit/catalog lock order, never reconstructed from host rows inside the private
+        // transaction or after WAL.
+        self.ensure_dml_device_generation(&command)?;
+        match self.reserve_pending_transaction_claim(txn_id, request_digest) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(ExecuteError::Indeterminate(format!(
+                    "autocommit INSERT transaction {txn_id} is pending in canonical mutation admission"
+                )));
+            }
+            Err(error) => return Err(ExecuteError::Engine(error)),
+        }
+        if let Err(begin_error) = self.begin_claimed_transaction_context(
+            txn_id,
+            TransactionCharacteristics::READ_COMMITTED_READ_WRITE,
+            request_digest,
+        ) {
+            self.release_pending_transaction_claim(txn_id, request_digest);
+            return match self.resolve_stable_retry_before_table_access(txn_id, request_digest) {
+                Ok(Some(rows_affected)) if !command_has_returning(&command) => Ok(DmlExecutionResult {
+                    rows_affected,
+                    returning: None,
+                }),
+                Ok(Some(_)) => Err(ExecuteError::Unsupported(
+                    "terminal retry of INSERT RETURNING is fail-closed until canonical status persists the returned frame"
+                        .to_string(),
+                )),
+                Ok(None) => Err(begin_error),
+                Err(retry_error) => Err(retry_error),
+            };
+        }
+        #[cfg(feature = "probe-timing")]
+        let probe_statement_stage_started = std::time::Instant::now();
+        let result = match self.execute_prepared_dml_in_transaction_with_result(
+            txn_id,
+            command,
+            expectation,
+            true,
+        ) {
+            Ok(result) => {
+                on_staged();
+                result
+            }
+            Err(statement_error) => match self.cancel_internal_transaction_context(txn_id) {
+                Ok(()) => {
+                    self.release_pending_transaction_claim(txn_id, request_digest);
+                    return Err(statement_error);
+                }
+                Err(cancel_error) => {
+                    return Err(ExecuteError::Indeterminate(format!(
+                        "autocommit INSERT failed before its private overlay could cancel: \
+                         statement error: {statement_error}; cancellation error: {cancel_error}"
+                    )));
+                }
+            },
+        };
+        #[cfg(feature = "probe-timing")]
+        self.record_insert_probe_transaction_statement_stage_nanos(
+            probe_statement_stage_started.elapsed().as_nanos() as u64,
+        );
+        #[cfg(feature = "probe-timing")]
+        let probe_terminal_started = std::time::Instant::now();
+        match self.commit_claimed_transaction_delta(txn_id, request_digest, timestamp_micros) {
+            Ok(()) => {
+                // This shared terminal also serves public `execute_text` INSERTs. Keep W1
+                // checkpoint rotation here, after the commit lock has been released, so neither
+                // typed autocommit ingress can retain an unbounded live WAL segment.
+                self.maybe_auto_checkpoint_wal();
+                #[cfg(feature = "probe-timing")]
+                self.record_insert_probe_transaction_terminal_nanos(
+                    probe_terminal_started.elapsed().as_nanos() as u64,
+                );
+                Ok(result)
+            }
+            Err(commit_error) => {
+                // A pre-WAL terminal rejection still owns only the internal overlay. Release it
+                // and its pending claim so the caller's stable request ID remains retryable. A
+                // wedged/post-durable terminal deliberately remains for restart recovery.
+                if !self.is_commit_path_poisoned()
+                    && self.transaction_snapshot_handle(txn_id).is_some()
+                {
+                    if let Err(cancel_error) = self.cancel_internal_transaction_context(txn_id) {
+                        return Err(ExecuteError::Indeterminate(format!(
+                            "autocommit INSERT commit rejected before durability but its private \
+                             overlay could not cancel: commit error: {commit_error}; cancellation \
+                             error: {cancel_error}"
+                        )));
+                    }
+                    self.release_pending_transaction_claim(txn_id, request_digest);
+                }
+                Err(commit_error)
+            }
+        }
     }
 
     /// Hooked unit-result compatibility API used by deterministic SI conflict tests.
@@ -116,6 +283,7 @@ impl Engine {
         >,
         on_prepared: impl FnOnce(),
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        let txn_id = self.resolve_public_transaction_id(txn_id);
         self.observe_transaction_id(txn_id);
         self.reject_nonstatement_sequence_autocommit_parent(txn_id)?;
         self.legacy_lane_history_write_guard()
@@ -131,11 +299,37 @@ impl Engine {
                     .to_string(),
             )));
         }
+        if matches!(&cmd, Command::Insert(_)) {
+            let (requests_published_sequence_default, route_catalog_version) =
+                self.insert_sequence_default_route(&cmd);
+            let catalog_expectation = expected_catalog_version.or_else(|| {
+                requests_published_sequence_default.then(|| {
+                    crate::engine_mutation_admission::CatalogVersionExpectation::SequenceRoute(
+                        route_catalog_version
+                            .expect("published sequence-default route reports its catalog cut"),
+                    )
+                })
+            });
+            if requests_published_sequence_default {
+                // The instrumented facade exposes only a test synchronization hook. Sequence
+                // defaults still take their dedicated parent lifecycle rather than a generic
+                // overlay; signal the hook at the equivalent admission boundary.
+                on_prepared();
+                return self.execute_sequence_default_autocommit(txn_id, cmd, catalog_expectation);
+            }
+            return self.execute_autocommit_insert_as_one_statement_overlay(
+                txn_id,
+                cmd,
+                CanonicalRequest::from_text(self, text).digest(),
+                catalog_expectation,
+                current_timestamp_micros(),
+                on_prepared,
+            );
+        }
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
         let table_name = match &cmd {
-            Command::Insert(insert) => insert.table.as_str(),
             Command::Update(update) => update.table.as_str(),
             Command::Delete(delete) => delete.table.as_str(),
             _ => {
@@ -176,11 +370,6 @@ impl Engine {
         let _snapshot_guard = transaction_snapshot
             .is_none()
             .then(|| self.register_active_snapshot(read_snapshot));
-        let pinned_catalog = transaction_snapshot.as_ref().map_or_else(
-            || self.catalog_snapshot(),
-            |snapshot| Arc::clone(&snapshot.catalog),
-        );
-        let prepared_catalog_seq = pinned_catalog.commit_seq;
         let snapshot = transaction_snapshot.as_ref().map_or_else(
             || self.dml_read_snapshot(read_snapshot),
             |generation| DmlReadSnapshot {
@@ -188,76 +377,34 @@ impl Engine {
                 next_row_id: generation.next_row_id,
             },
         );
-        #[cfg(feature = "probe-timing")]
-        let probe_insert = matches!(&cmd, Command::Insert(_));
-        #[cfg(feature = "probe-timing")]
-        let probe_prepare_started = probe_insert.then(Instant::now);
-        let direct_typed = if self.binary_wal_records_enabled() {
-            crate::typed_insert_batch::try_prepare_typed_insert_batch(
-                &cmd,
-                &pinned_catalog,
-                prepared_catalog_seq,
-                expected_catalog_version,
-            )?
-        } else {
-            None
-        };
-        let (write_set, offlock_prepared) = if let Some(batch) = direct_typed {
-            let prepared = OfflockPreparedDml::typed_insert(
-                batch,
-                self,
-                &pinned_catalog,
-                &request,
-                read_snapshot,
-            )
-            .map_err(ExecuteError::Engine)?;
-            let write_set = prepared.write_set().clone();
-            debug_assert_eq!(prepared.read_snapshot(), read_snapshot);
-            #[cfg(feature = "probe-timing")]
-            self.record_insert_probe_direct_fixed_insert_carrier();
-            (write_set, Some(prepared))
-        } else {
-            let prepared = {
-                const GENERATION_RETRIES: usize = 64;
-                let mut attempts = 0;
-                loop {
-                    let result = if let Some(generation) = transaction_snapshot.as_ref() {
-                        let _scope = self.enter_transaction_read(Arc::clone(generation));
-                        self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
-                    } else {
-                        self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
-                    };
-                    match result {
-                        Ok(prepared) => break prepared,
-                        Err(error)
-                            if attempts < GENERATION_RETRIES
-                                && is_device_prepare_verdict_unavailable(&error) =>
-                        {
-                            attempts += 1;
-                            self.ensure_dml_device_generation(&cmd)?;
-                            std::thread::yield_now();
-                        }
-                        Err(error) => return Err(error),
+        let prepared = {
+            const GENERATION_RETRIES: usize = 64;
+            let mut attempts = 0;
+            loop {
+                let result = if let Some(generation) = transaction_snapshot.as_ref() {
+                    let _scope = self.enter_transaction_read(Arc::clone(generation));
+                    self.prepare_dml(&cmd, snapshot)
+                } else {
+                    self.prepare_dml(&cmd, snapshot)
+                };
+                match result {
+                    Ok(prepared) => break prepared,
+                    Err(error)
+                        if attempts < GENERATION_RETRIES
+                            && is_device_prepare_verdict_unavailable(&error) =>
+                    {
+                        attempts += 1;
+                        self.ensure_dml_device_generation(&cmd)?;
+                        std::thread::yield_now();
                     }
+                    Err(error) => return Err(error),
                 }
-            };
-            #[cfg(feature = "probe-timing")]
-            if matches!(&cmd, Command::Insert(_)) {
-                self.record_insert_probe_legacy_insert_delta_build(prepared.rows_consumed);
             }
-            let prepared = OfflockPreparedDml::legacy(prepared, read_snapshot);
-            let write_set = prepared.write_set().clone();
-            debug_assert_eq!(prepared.read_snapshot(), read_snapshot);
-            (write_set, Some(prepared))
         };
-        #[cfg(feature = "probe-timing")]
-        if let Some(started) = probe_prepare_started {
-            self.record_insert_probe_offlock_prepare_nanos(started.elapsed().as_nanos() as u64);
-            self.record_insert_probe_peak_statement(
-                text.len() as u64,
-                insert_device_statement_bytes_estimate(&cmd),
-            );
-        }
+        let prepared = OfflockPreparedDml::legacy_update_or_delete(prepared, read_snapshot)
+            .map_err(ExecuteError::Engine)?;
+        let write_set = prepared.write_set().clone();
+        debug_assert_eq!(prepared.read_snapshot(), read_snapshot);
         on_prepared();
         self.commit_dml_concurrent(
             txn_id,
@@ -265,78 +412,8 @@ impl Engine {
             request,
             write_set,
             read_snapshot,
-            prepared_catalog_seq,
             expected_catalog_version,
-            offlock_prepared,
+            Some(prepared),
         )
-    }
-}
-
-/// Conservative logical payload estimate for the device append staging seam. This is deliberately
-/// labelled an estimate: its owner is the typed request before table-specific residency layout is
-/// selected, while the exact H2D/apply wall time is measured at the common wave flush seam.
-#[cfg(feature = "probe-timing")]
-fn insert_device_statement_bytes_estimate(command: &Command) -> u64 {
-    let Command::Insert(insert) = command else {
-        return 0;
-    };
-    insert
-        .rows
-        .iter()
-        .map(|row| {
-            let values = row.iter().fold(0_u64, |bytes, cell| {
-                bytes.saturating_add(match cell {
-                    InsertCell::Default { .. } => 0,
-                    InsertCell::Value { value, .. } => match value {
-                        // This estimator runs before semantic lowering. An unresolved parameter
-                        // cannot have staging bytes yet, just like an explicit DEFAULT request.
-                        SqlValue::Null | SqlValue::Parameter { .. } => 0,
-                        SqlValue::Bool(_) => 1,
-                        SqlValue::Int2(_) => 2,
-                        SqlValue::Int4(_) | SqlValue::Date(_) => 4,
-                        SqlValue::Int8(_) | SqlValue::Timestamp(_) => 8,
-                        SqlValue::Numeric(_) | SqlValue::Uuid(_) => 16,
-                        SqlValue::Text(text) => text.len() as u64,
-                    },
-                })
-            });
-            // The append seam retains row identity and MVCC birth metadata alongside values.
-            values.saturating_add(16)
-        })
-        .sum()
-}
-
-#[cfg(all(test, feature = "probe-timing"))]
-mod probe_timing_tests {
-    use super::*;
-
-    #[test]
-    fn insert_payload_estimate_keeps_default_and_unbound_parameter_at_zero_bytes() {
-        let command = Command::Insert(Insert {
-            table: "probe_cells".to_string(),
-            columns: vec![
-                "id".to_string(),
-                "defaulted".to_string(),
-                "parameter".to_string(),
-                "note".to_string(),
-                "nullable".to_string(),
-            ],
-            rows: vec![vec![
-                InsertCell::literal(SqlValue::Int4(7)),
-                InsertCell::sql_default(),
-                InsertCell::Value {
-                    value: SqlValue::Parameter {
-                        index: 1,
-                        cast: None,
-                    },
-                    provenance: gpu_db_sql::InsertValueProvenance::Parameter { index: 1 },
-                },
-                InsertCell::programmatic(SqlValue::Text("gpu".to_string())),
-                InsertCell::literal(SqlValue::Null),
-            ]],
-            returning: Vec::new(),
-        });
-
-        assert_eq!(insert_device_statement_bytes_estimate(&command), 16 + 4 + 3);
     }
 }

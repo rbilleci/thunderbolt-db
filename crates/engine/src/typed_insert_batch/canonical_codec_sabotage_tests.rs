@@ -7,10 +7,12 @@ fn baseline() -> Vec<u8> {
     encode(&prepared_batch()).expect("sabotage fixture encodes")
 }
 
+#[track_caller]
 fn reject(bytes: &[u8]) {
     assert!(decode(bytes).is_err(), "forged record unexpectedly decodes");
 }
 
+#[track_caller]
 fn reject_with(bytes: &[u8], expected: &str) {
     let Err(error) = decode(bytes) else {
         panic!("forged record unexpectedly decodes");
@@ -77,11 +79,7 @@ fn single_column_batch(
     prepare_typed_insert_semantics(&insert, &catalog, catalog.commit_seq, None)
         .expect("single-column fixture prepares")
         .expect("single-column fixture is current")
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("single-column fixture seals")
 }
 
@@ -373,11 +371,7 @@ fn bound_parameter_batch() -> TypedInsertBatch {
     prepare_typed_insert_semantics(insert, &catalog, catalog.commit_seq, None)
         .expect("bound fixture prepares")
         .expect("bound fixture is current")
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("bound fixture seals")
 }
 
@@ -702,14 +696,23 @@ fn canonical_codec_rejects_true_rehashed_sequence_geometry_and_mode_forgeries() 
 
     let private =
         encode(&super::sequence_tests::private_chain_batch()).expect("private fixture encodes");
-    for kind in [
-        decode::RehashedForgery::SequenceMixedMode,
+    let mixed_mode =
+        decode::rehashed_forgery_for_test(&private, decode::RehashedForgery::SequenceMixedMode)
+            .expect("private sequence mode forgery rehashes");
+    reject(&mixed_mode);
+
+    // Owner ordinals address the complete transaction operation program, while the parent ordinal
+    // addresses dense typed INSERTs. A statement-local record cannot order those domains. The
+    // codec-5 transaction selector performs that check against `staged.operation_ordinal` before
+    // admitting the aggregate, so the strict record decoder must retain this otherwise-canonical
+    // witness rather than comparing unrelated integers.
+    let transaction_ordered = decode::rehashed_forgery_for_test(
+        &private,
         decode::RehashedForgery::SequencePrivateOwnerFuture,
-    ] {
-        let forged = decode::rehashed_forgery_for_test(&private, kind)
-            .expect("private sequence law forgery rehashes");
-        reject(&forged);
-    }
+    )
+    .expect("private sequence transaction-order witness rehashes");
+    decode(&transaction_ordered)
+        .expect("statement-local decoder defers complete-program owner ordering");
     let autocommit_private = decode::rehashed_forgery_for_test(
         &private,
         decode::RehashedForgery::SequenceAutocommitPrivate,

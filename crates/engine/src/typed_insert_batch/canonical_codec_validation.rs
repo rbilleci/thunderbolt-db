@@ -181,7 +181,13 @@ pub(super) fn validate_sequence_section(
                 "autocommit sequence section has private effect",
             ));
         } else if let SequenceSectionKind::Private { owner, .. } = entry.kind {
-            if owner.statement_ordinal >= parent.statement_ordinal.as_u32() {
+            // The owner ordinal is in the complete transaction-operation program while the
+            // parent ordinal is codec-5's typed-INSERT-only S1 order, so their numeric values are
+            // not order-comparable here. The live aggregate binds the owner to an earlier catalog
+            // operation; this statement-local codec only rejects an absent or aliased owner.
+            if owner.statement_ordinal == u32::MAX
+                || owner.statement_digest == parent.request_digest
+            {
                 return Err(codec_error(
                     "private sequence owner is not before parent statement",
                 ));

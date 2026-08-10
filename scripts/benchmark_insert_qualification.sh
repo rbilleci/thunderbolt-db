@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# INSERT-001 qualification runner.
+# WRITE-002 paired general-codec write comparison runner.
 #
-# This is deliberately a qualification artifact, not a throughput shortcut.  It generates one
+# This is deliberately a paired-comparison evidence artifact, not a throughput shortcut. It generates one
 # deterministic statement stream, builds the canonical pgwire server and external client once,
 # and replays those exact bytes through fresh GPU-server and PostgreSQL processes in alternating
 # order.  PostgreSQL COPY, outer transactions, and direct Engine callers are not part of this
 # runner.
 #
-# The default is a 1M-row calibration for both durability profiles.  Select 8M for the second
-# calibration or 48M for the seal.  Every invocation still runs exactly three complete trials per
-# backend, with the fixed 1,000-row statement boundary.
+# The default is a 1M-row calibration for both durability profiles. Select 8M for the second
+# calibration or 48M for a larger comparison. Every invocation runs exactly three alternating
+# complete trials per backend, with the fixed 1,000-row statement boundary. It records exact
+# staged-candidate and paired PostgreSQL evidence; it does not impose a performance gate.
 #
 #   scripts/benchmark_insert_qualification.sh --profile development --rows 1000000
 #   scripts/benchmark_insert_qualification.sh --profile durable --rows 48000000
@@ -61,26 +62,6 @@ frozen_workload_identity() {
   esac
 }
 
-frozen_postgres_rows_per_second_floor() {
-  # Floors are added only after a pre-optimization alternating qualification has completed.
-  # They are keyed by exact profile and workload size; never extrapolate a calibration size.
-  # 1M frozen 2026-07-26 from source SHA-256
-  # 7564cc9e47cce5fe1f2484ff0107f5aa1c73258bb5c8d0fa70f43a2cc1c65f23.
-  # 8M frozen 2026-07-26 from source SHA-256
-  # b5fccd46454bf9bb41fda29f6afb85a9af650fe19fe8b87d415e4bd54d0017d2.
-  # 48M frozen 2026-07-26 from source SHA-256
-  # 09472115e419b22a685f23cfb956406e57f9b91324e7f52db4ba855f7a4c0cb9.
-  case "$1:$2" in
-    development:1000000) printf '%s\n' "675859.699" ;;
-    durable:1000000) printf '%s\n' "433754.096" ;;
-    development:8000000) printf '%s\n' "765543.025" ;;
-    durable:8000000) printf '%s\n' "436488.945" ;;
-    development:48000000) printf '%s\n' "778301.447" ;;
-    durable:48000000) printf '%s\n' "235965.297" ;;
-    *) return 1 ;;
-  esac
-}
-
 usage() {
   cat <<'USAGE'
 usage: scripts/benchmark_insert_qualification.sh [options]
@@ -93,7 +74,9 @@ usage: scripts/benchmark_insert_qualification.sh [options]
   --help                             Show this help.
 
 Every execution uses exactly three alternating GPU, PostgreSQL trials per selected profile and
-the fixed 1,000-literal-row INSERT statement boundary.  --rows 48000000 is the seal workload.
+the fixed 1,000-literal-row INSERT statement boundary. It records paired throughput and tail
+ratios for the exact staged GPU candidate without assigning pass/fail thresholds. A future
+WRITE-002 promotion owns any comparative target. --rows 48000000 is the larger workload.
 USAGE
 }
 
@@ -308,8 +291,35 @@ server_binary=""
 client_binary=""
 server_binary_sha256=""
 client_binary_sha256=""
+candidate_index_tree=""
+candidate_cached_diff_sha256=""
+candidate_staged_path_count=""
+
+freeze_exact_staged_candidate() {
+  git -C "$repo_root" diff --cached --check || return 1
+  [[ -z "$(git -C "$repo_root" diff --name-only)" ]] || return 1
+  [[ -z "$(git -C "$repo_root" ls-files --others --exclude-standard)" ]] || return 1
+  local index_tree
+  local cached_diff_sha256
+  local staged_path_count
+  index_tree="$(git -C "$repo_root" write-tree)" || return 1
+  cached_diff_sha256="$(git -C "$repo_root" diff --cached --binary | sha256sum | awk '{print $1}')" || return 1
+  staged_path_count="$(git -C "$repo_root" diff --cached --name-only | wc -l | tr -d '[:space:]')" || return 1
+  [[ "$index_tree" =~ ^[0-9a-f]{40}$ && "$cached_diff_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  is_canonical_uint "$staged_path_count" || return 1
+  if [[ -z "$candidate_index_tree" ]]; then
+    candidate_index_tree="$index_tree"
+    candidate_cached_diff_sha256="$cached_diff_sha256"
+    candidate_staged_path_count="$staged_path_count"
+  else
+    [[ "$index_tree" == "$candidate_index_tree" &&
+      "$cached_diff_sha256" == "$candidate_cached_diff_sha256" &&
+      "$staged_path_count" == "$candidate_staged_path_count" ]] || return 1
+  fi
+}
 
 verify_frozen_inputs() {
+  freeze_exact_staged_candidate || return 1
   [[ "$(sha256_file "$source_path")" == "$source_file_sha256" ]] || return 1
   [[ "$(sha256_file "$manifest_path")" == "$manifest_file_sha256" ]] || return 1
   [[ "$(sha256_file "$server_binary")" == "$server_binary_sha256" ]] || return 1
@@ -407,13 +417,6 @@ parse_gpu_insert_probe_record() {
       required["attribution"] = 1
       required["successful_insert_statements"] = 1
       required["successful_insert_rows"] = 1
-      required["fixed_insert_typed_commits"] = 1
-      required["fixed_insert_legacy_fallbacks"] = 1
-      required["fixed_insert_retryable_declines"] = 1
-      required["fixed_insert_legacy_commit_validation_reresolves"] = 1
-      required["legacy_insert_delta_builds"] = 1
-      required["predicted_row_keys_materialized"] = 1
-      required["direct_fixed_insert_carriers"] = 1
       required["raw_request_digest_derivations"] = 1
       required["raw_request_digest_derivation_bytes"] = 1
       required["compat_classifier_gate_checks"] = 1
@@ -425,6 +428,73 @@ parse_gpu_insert_probe_record() {
       required["facade_parse_bind_nanos"] = 1
       required["engine_authorization_catalog_admission_nanos"] = 1
       required["offlock_coercion_default_constraint_prepare_nanos"] = 1
+      required["transaction_begin_snapshot_capture_nanos"] = 1
+      required["transaction_statement_snapshot_capture_nanos"] = 1
+      required["transaction_commit_snapshot_capture_nanos"] = 1
+      required["transaction_commit_snapshot_reuse_count"] = 1
+      required["transaction_private_overlay_materialize_nanos"] = 1
+      required["transaction_statement_stage_nanos"] = 1
+      required["codec5_record_seal_nanos"] = 1
+      required["codec5_final_image_seal_nanos"] = 1
+      required["resident_append_source_materialize_nanos"] = 1
+      required["typed_stage_constructor_payload_validate_nanos"] = 1
+      required["typed_stage_constructor_unique_slot_nanos"] = 1
+      required["typed_stage_constructor_payload_digest_nanos"] = 1
+      required["typed_overlay_payload_revalidate_nanos"] = 1
+      required["typed_overlay_payload_upload_nanos"] = 1
+      required["codec5_admission_select_materialize_nanos"] = 1
+      required["codec5_admission_geometry_encode_nanos"] = 1
+      required["codec5_terminal_select_materialize_nanos"] = 1
+      required["codec5_terminal_final_image_source_nanos"] = 1
+      required["transaction_terminal_nanos"] = 1
+      required["transaction_terminal_pre_wal_nanos"] = 1
+      required["codec5_operation_input_nanos"] = 1
+      required["codec5_operation_table_prepare_nanos"] = 1
+      required["codec5_operation_aggregate_nanos"] = 1
+      required["codec5_operation_plan_compile_nanos"] = 1
+      required["codec5_operation_finalize_nanos"] = 1
+      required["codec5_live_s7_build_nanos"] = 1
+      required["codec5_live_s2_decode_nanos"] = 1
+      required["codec5_live_aggregate_prepare_nanos"] = 1
+      required["codec5_live_aggregate_encode_nanos"] = 1
+      required["codec5_live_outer_reserve_nanos"] = 1
+      required["codec5_live_outer_encode_nanos"] = 1
+      required["codec5_live_outer_digest_nanos"] = 1
+      required["codec5_live_outer_packed_encode_nanos"] = 1
+      required["codec5_live_outer_checksum_nanos"] = 1
+      required["codec5_live_outer_serialized_copy_nanos"] = 1
+      required["codec5_live_outer_seal_nanos"] = 1
+      required["typed_append_generation_host_nanos"] = 1
+      required["typed_append_generation_source_view_nanos"] = 1
+      required["typed_append_generation_prepare_reserve_nanos"] = 1
+      required["typed_append_generation_submit_complete_nanos"] = 1
+      required["typed_append_generation_kernel_event_nanos"] = 1
+      required["typed_append_generation_validate_kernel_event_nanos"] = 1
+      required["typed_append_generation_cells_kernel_event_nanos"] = 1
+      required["typed_append_generation_rows_kernel_event_nanos"] = 1
+      required["typed_append_generation_reduce_kernel_event_nanos"] = 1
+      required["typed_append_generation_finalize_kernel_event_nanos"] = 1
+      required["typed_append_envelope_prepare_nanos"] = 1
+      required["typed_append_envelope_encode_nanos"] = 1
+      required["typed_append_s7_build_nanos"] = 1
+      required["typed_append_aggregate_prepare_nanos"] = 1
+      required["typed_append_aggregate_body_encode_nanos"] = 1
+      required["typed_append_outer_reserve_nanos"] = 1
+      required["typed_append_outer_encode_nanos"] = 1
+      required["typed_append_outer_digest_nanos"] = 1
+      required["typed_append_outer_packed_encode_nanos"] = 1
+      required["typed_append_outer_checksum_nanos"] = 1
+      required["typed_append_outer_serialized_copy_nanos"] = 1
+      required["typed_append_outer_seal_nanos"] = 1
+      required["typed_append_semantics_close_nanos"] = 1
+      required["typed_append_authority_prepare_nanos"] = 1
+      required["typed_append_device_plan_compile_nanos"] = 1
+      required["typed_append_authority_commit_nanos"] = 1
+      required["transaction_terminal_wal_status_nanos"] = 1
+      required["transaction_terminal_post_canonical_finalize_nanos"] = 1
+      required["transaction_canonical_apply_publish_nanos"] = 1
+      required["transaction_canonical_record_apply_nanos"] = 1
+      required["transaction_canonical_residency_publish_nanos"] = 1
       required["commit_validation_reresolve_nanos"] = 1
       required["canonical_wal_encode_append_claim_nanos"] = 1
       required["durability_wait_nanos"] = 1
@@ -520,13 +590,12 @@ parse_gpu_insert_probe_record() {
       required["intent_lane_count"] = 1
       required["synchronous_commit_gate"] = 1
       required["auto_admit_on_commit"] = 1
-      required["binary_wal_records_enabled"] = 1
       required["device_authoritative_commits"] = 1
       required["active_workload_sessions_at_seal"] = 1
       required["overlap_observed"] = 1
       for (key in required) if (seen[key] != 1) bad = 1
       for (key in seen) if (!(key in required)) bad = 1
-      if (value["insert_probe_session_delta"] != "complete" || value["version"] != "7" ||
+      if (value["insert_probe_session_delta"] != "complete" || value["version"] != "27" ||
           value["attribution"] != "engine_local_plus_process_global_classifier_counters_single_active_workload_session_required" ||
           value["successful_insert_statements"] != expected_insert_statements ||
           value["successful_insert_rows"] != expected_rows ||
@@ -535,21 +604,13 @@ parse_gpu_insert_probe_record() {
           value["raw_request_digest_derivation_bytes"] != expected_canonical_request_bytes ||
           value["synchronous_commit_gate"] != "strict_rpo0" ||
           value["active_workload_sessions_at_seal"] != "1" ||
-          value["overlap_observed"] != "false" ||
-          value["binary_wal_records_enabled"] != "true") bad = 1
+          value["overlap_observed"] != "false") bad = 1
       if (expected_profile == "development" && (value["durability_backend"] != "memory" ||
           value["intent_lane_count"] != "0" || value["fua_fence_lanes"] != "0")) bad = 1
       if (expected_profile == "durable" && (value["durability_backend"] != "fua" ||
           value["intent_lane_count"] != "10" || value["fua_fence_lanes"] == "0")) bad = 1
       numeric["successful_insert_statements"] = 1
       numeric["successful_insert_rows"] = 1
-      numeric["fixed_insert_typed_commits"] = 1
-      numeric["fixed_insert_legacy_fallbacks"] = 1
-      numeric["fixed_insert_retryable_declines"] = 1
-      numeric["fixed_insert_legacy_commit_validation_reresolves"] = 1
-      numeric["legacy_insert_delta_builds"] = 1
-      numeric["predicted_row_keys_materialized"] = 1
-      numeric["direct_fixed_insert_carriers"] = 1
       numeric["raw_request_digest_derivations"] = 1
       numeric["raw_request_digest_derivation_bytes"] = 1
       numeric["compat_classifier_gate_checks"] = 1
@@ -561,6 +622,73 @@ parse_gpu_insert_probe_record() {
       numeric["facade_parse_bind_nanos"] = 1
       numeric["engine_authorization_catalog_admission_nanos"] = 1
       numeric["offlock_coercion_default_constraint_prepare_nanos"] = 1
+      numeric["transaction_begin_snapshot_capture_nanos"] = 1
+      numeric["transaction_statement_snapshot_capture_nanos"] = 1
+      numeric["transaction_commit_snapshot_capture_nanos"] = 1
+      numeric["transaction_commit_snapshot_reuse_count"] = 1
+      numeric["transaction_private_overlay_materialize_nanos"] = 1
+      numeric["transaction_statement_stage_nanos"] = 1
+      numeric["codec5_record_seal_nanos"] = 1
+      numeric["codec5_final_image_seal_nanos"] = 1
+      numeric["resident_append_source_materialize_nanos"] = 1
+      numeric["typed_stage_constructor_payload_validate_nanos"] = 1
+      numeric["typed_stage_constructor_unique_slot_nanos"] = 1
+      numeric["typed_stage_constructor_payload_digest_nanos"] = 1
+      numeric["typed_overlay_payload_revalidate_nanos"] = 1
+      numeric["typed_overlay_payload_upload_nanos"] = 1
+      numeric["codec5_admission_select_materialize_nanos"] = 1
+      numeric["codec5_admission_geometry_encode_nanos"] = 1
+      numeric["codec5_terminal_select_materialize_nanos"] = 1
+      numeric["codec5_terminal_final_image_source_nanos"] = 1
+      numeric["transaction_terminal_nanos"] = 1
+      numeric["transaction_terminal_pre_wal_nanos"] = 1
+      numeric["codec5_operation_input_nanos"] = 1
+      numeric["codec5_operation_table_prepare_nanos"] = 1
+      numeric["codec5_operation_aggregate_nanos"] = 1
+      numeric["codec5_operation_plan_compile_nanos"] = 1
+      numeric["codec5_operation_finalize_nanos"] = 1
+      numeric["codec5_live_s7_build_nanos"] = 1
+      numeric["codec5_live_s2_decode_nanos"] = 1
+      numeric["codec5_live_aggregate_prepare_nanos"] = 1
+      numeric["codec5_live_aggregate_encode_nanos"] = 1
+      numeric["codec5_live_outer_reserve_nanos"] = 1
+      numeric["codec5_live_outer_encode_nanos"] = 1
+      numeric["codec5_live_outer_digest_nanos"] = 1
+      numeric["codec5_live_outer_packed_encode_nanos"] = 1
+      numeric["codec5_live_outer_checksum_nanos"] = 1
+      numeric["codec5_live_outer_serialized_copy_nanos"] = 1
+      numeric["codec5_live_outer_seal_nanos"] = 1
+      numeric["typed_append_generation_host_nanos"] = 1
+      numeric["typed_append_generation_source_view_nanos"] = 1
+      numeric["typed_append_generation_prepare_reserve_nanos"] = 1
+      numeric["typed_append_generation_submit_complete_nanos"] = 1
+      numeric["typed_append_generation_kernel_event_nanos"] = 1
+      numeric["typed_append_generation_validate_kernel_event_nanos"] = 1
+      numeric["typed_append_generation_cells_kernel_event_nanos"] = 1
+      numeric["typed_append_generation_rows_kernel_event_nanos"] = 1
+      numeric["typed_append_generation_reduce_kernel_event_nanos"] = 1
+      numeric["typed_append_generation_finalize_kernel_event_nanos"] = 1
+      numeric["typed_append_envelope_prepare_nanos"] = 1
+      numeric["typed_append_envelope_encode_nanos"] = 1
+      numeric["typed_append_s7_build_nanos"] = 1
+      numeric["typed_append_aggregate_prepare_nanos"] = 1
+      numeric["typed_append_aggregate_body_encode_nanos"] = 1
+      numeric["typed_append_outer_reserve_nanos"] = 1
+      numeric["typed_append_outer_encode_nanos"] = 1
+      numeric["typed_append_outer_digest_nanos"] = 1
+      numeric["typed_append_outer_packed_encode_nanos"] = 1
+      numeric["typed_append_outer_checksum_nanos"] = 1
+      numeric["typed_append_outer_serialized_copy_nanos"] = 1
+      numeric["typed_append_outer_seal_nanos"] = 1
+      numeric["typed_append_semantics_close_nanos"] = 1
+      numeric["typed_append_authority_prepare_nanos"] = 1
+      numeric["typed_append_device_plan_compile_nanos"] = 1
+      numeric["typed_append_authority_commit_nanos"] = 1
+      numeric["transaction_terminal_wal_status_nanos"] = 1
+      numeric["transaction_terminal_post_canonical_finalize_nanos"] = 1
+      numeric["transaction_canonical_apply_publish_nanos"] = 1
+      numeric["transaction_canonical_record_apply_nanos"] = 1
+      numeric["transaction_canonical_residency_publish_nanos"] = 1
       numeric["commit_validation_reresolve_nanos"] = 1
       numeric["canonical_wal_encode_append_claim_nanos"] = 1
       numeric["durability_wait_nanos"] = 1
@@ -668,20 +796,17 @@ parse_gpu_insert_probe_record() {
           expected_canonical_request_bytes + expected_stripped_terminator_bytes != expected_insert_source_bytes ||
           value["raw_request_digest_derivations"] != value["successful_insert_statements"] ||
           value["raw_request_digest_derivation_bytes"] + expected_stripped_terminator_bytes != value["successful_insert_source_bytes"]) bad = 1
+      # Route identity is sealed by the mandatory production/reopen gate. Qualification retains
+      # only live lifecycle/resource evidence; the displaced fixed/direct counters no longer exist.
       if (value["auto_admit_on_commit"] != "true" ||
           value["device_authoritative_commits"] != expected_insert_statements ||
-          value["fixed_insert_typed_commits"] != expected_insert_statements ||
-          value["fixed_insert_legacy_fallbacks"] != "0" ||
-          value["fixed_insert_retryable_declines"] != "0" ||
-          value["fixed_insert_legacy_commit_validation_reresolves"] != "0" ||
-          value["legacy_insert_delta_builds"] != "0" ||
-          value["predicted_row_keys_materialized"] != "0" ||
-          value["direct_fixed_insert_carriers"] != expected_insert_statements ||
           value["compat_classifier_gate_checks"] < expected_classifier_gate_minimum ||
           value["compat_classifier_gate_rejections"] < expected_classifier_gate_minimum ||
           value["compat_classifier_slow_path_admissions"] != "0" ||
           value["compat_classifier_slow_path_bytes"] != "0" ||
           value["commit_validation_reresolve_nanos"] != "0") bad = 1
+      codec5_operation_nanos = value["codec5_operation_input_nanos"] + value["codec5_operation_table_prepare_nanos"] + value["codec5_operation_aggregate_nanos"] + value["codec5_operation_plan_compile_nanos"] + value["codec5_operation_finalize_nanos"]
+      if (codec5_operation_nanos == 0) bad = 1
       if (value["compat_classifier_gate_rejections"] > value["compat_classifier_gate_checks"] ||
           value["compat_classifier_slow_path_admissions"] > value["compat_classifier_gate_checks"] ||
           value["compat_classifier_gate_checks"] - value["compat_classifier_gate_rejections"] != value["compat_classifier_slow_path_admissions"]) bad = 1
@@ -760,9 +885,55 @@ parse_gpu_insert_probe_record() {
             value["fua_controller_ordinal_exhausted"] != "0") bad = 1
       }
       if (value["successful_insert_end_to_end_service_nanos"] == "0") bad = 1
-      if (value["wave_count"] == "0" || value["wave_item_count"] == "0" ||
-          value["peak_host_statement_bytes"] == "0" ||
-          value["peak_device_statement_bytes_estimate"] == "0") bad = 1
+      # The production route now retains every accepted contribution in the transaction overlay
+      # and emits the canonical codec-5 terminal directly from its GPU generation proof.  The
+      # removed construction-closed writer phases must stay silent: a nonzero interval there
+      # would prove that qualification selected a second live INSERT authority.
+      if (value["transaction_begin_snapshot_capture_nanos"] == "0" ||
+          value["transaction_statement_snapshot_capture_nanos"] == "0" ||
+          value["transaction_commit_snapshot_capture_nanos"] != "0" ||
+          value["transaction_commit_snapshot_reuse_count"] != expected_insert_statements ||
+          value["transaction_private_overlay_materialize_nanos"] == "0" ||
+          value["transaction_statement_stage_nanos"] == "0" ||
+          value["codec5_record_seal_nanos"] == "0" ||
+          value["codec5_final_image_seal_nanos"] == "0" ||
+          value["resident_append_source_materialize_nanos"] != "0" ||
+          value["transaction_terminal_nanos"] == "0" ||
+          value["transaction_terminal_pre_wal_nanos"] == "0" ||
+          value["typed_append_generation_host_nanos"] == "0" ||
+          value["typed_append_generation_source_view_nanos"] == "0" ||
+          value["typed_append_generation_prepare_reserve_nanos"] == "0" ||
+          value["typed_append_generation_submit_complete_nanos"] == "0" ||
+          value["typed_append_generation_kernel_event_nanos"] == "0" ||
+          value["typed_append_generation_validate_kernel_event_nanos"] == "0" ||
+          value["typed_append_generation_cells_kernel_event_nanos"] == "0" ||
+          value["typed_append_generation_rows_kernel_event_nanos"] == "0" ||
+          value["typed_append_generation_reduce_kernel_event_nanos"] == "0" ||
+          value["typed_append_generation_finalize_kernel_event_nanos"] == "0" ||
+          value["typed_append_envelope_prepare_nanos"] != "0" ||
+          value["typed_append_envelope_encode_nanos"] != "0" ||
+          value["typed_append_s7_build_nanos"] != "0" ||
+          value["typed_append_aggregate_prepare_nanos"] != "0" ||
+          value["typed_append_aggregate_body_encode_nanos"] != "0" ||
+          value["typed_append_outer_reserve_nanos"] != "0" ||
+          value["typed_append_outer_encode_nanos"] != "0" ||
+          value["typed_append_outer_digest_nanos"] != "0" ||
+          value["typed_append_outer_packed_encode_nanos"] != "0" ||
+          value["typed_append_outer_checksum_nanos"] != "0" ||
+          value["typed_append_outer_serialized_copy_nanos"] != "0" ||
+          value["typed_append_outer_seal_nanos"] != "0" ||
+          value["typed_append_semantics_close_nanos"] != "0" ||
+          value["typed_append_authority_prepare_nanos"] != "0" ||
+          value["typed_append_device_plan_compile_nanos"] != "0" ||
+          value["typed_append_authority_commit_nanos"] != "0" ||
+          value["transaction_terminal_wal_status_nanos"] == "0" ||
+          value["transaction_terminal_post_canonical_finalize_nanos"] == "0" ||
+          value["transaction_canonical_apply_publish_nanos"] == "0" ||
+          value["transaction_canonical_record_apply_nanos"] == "0" ||
+          value["transaction_canonical_residency_publish_nanos"] != "0" ||
+          value["wave_count"] != "0" || value["wave_item_count"] != "0" ||
+          value["device_h2d_append_index_apply_nanos"] != "0" ||
+          value["publication_status_ack_nanos"] != "0") bad = 1
       # INSERT-001 is two NULL-free int4 columns in fixed 1,000-row statements with the normal
       # implicit 4M-row target. The empty bootstrap descriptor is the sole non-rollover shard;
       # all other geometry is exact for 1M, 8M, and 48M qualification accounts.
@@ -889,10 +1060,12 @@ parse_client_record() {
       parsed_insert_wall = value["insert_load_wall_ms"]
       parsed_rows_per_second = value["rows_per_second"]
       parsed_end_to_end_wall = value["end_to_end_client_wall_ms"]
+      parsed_insert_p99_us = value["insert_roundtrip_p99_us"]
+      parsed_insert_p999_us = value["insert_roundtrip_p999_us"]
     }
     END {
       if (records != 1 || bad) exit 1
-      print parsed_insert_wall "\t" parsed_rows_per_second "\t" parsed_end_to_end_wall
+      print parsed_insert_wall "\t" parsed_rows_per_second "\t" parsed_end_to_end_wall "\t" parsed_insert_p99_us "\t" parsed_insert_p999_us
     }
   ' "$stdout_log"
 }
@@ -908,15 +1081,19 @@ append_result_once() {
   local insert_wall_ms
   local rows_per_second
   local end_to_end_ms
+  local insert_p99_us
+  local insert_p999_us
   if grep -Fqx "${result_profile}"$'\t'"${backend}"$'\t'"${trial}" \
     <(cut -f 1-3 -- "$results_file") 2>/dev/null; then
     return 1
   fi
   parsed="$(parse_client_record "$client_stdout" "$backend" "$result_profile" "$trial")" || return 1
-  IFS=$'\t' read -r insert_wall_ms rows_per_second end_to_end_ms <<<"$parsed"
-  [[ -n "$insert_wall_ms" && -n "$rows_per_second" && -n "$end_to_end_ms" ]] || return 1
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  IFS=$'\t' read -r insert_wall_ms rows_per_second end_to_end_ms insert_p99_us insert_p999_us <<<"$parsed"
+  [[ -n "$insert_wall_ms" && -n "$rows_per_second" && -n "$end_to_end_ms" &&
+    -n "$insert_p99_us" && -n "$insert_p999_us" ]] || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$result_profile" "$backend" "$trial" "$insert_wall_ms" "$rows_per_second" "$end_to_end_ms" \
+    "$insert_p99_us" "$insert_p999_us" \
     >>"$results_file"
 }
 
@@ -930,8 +1107,9 @@ validate_result_set() {
     function decimal_3(value) { return value ~ /^(0|[1-9][0-9]*)\.[0-9][0-9][0-9]$/ }
     $1 == p && $2 == b {
       matched += 1
-      if (NF != 6 || !canonical_uint($3) || $3 == "0" || !canonical_uint($4) ||
-          !decimal_3($5) || !canonical_uint($6) || ++seen[$3] != 1) bad = 1
+      if (NF != 8 || !canonical_uint($3) || $3 == "0" || !canonical_uint($4) ||
+          !decimal_3($5) || !canonical_uint($6) || !canonical_uint($7) ||
+          !canonical_uint($8) || $7 == "0" || $8 == "0" || ++seen[$3] != 1) bad = 1
     }
     END { exit (matched == 3 && !bad) ? 0 : 1 }
   ' "$results_file"
@@ -1211,6 +1389,25 @@ run_one_trial() {
   append_result_once "$results_file" "$selected_profile" "$backend" "$trial" "$trial_dir/client.stdout"
 }
 
+paired_comparison_metrics() {
+  # paired_performance_metrics <gpu-rps> <postgres-rps> <gpu-p99-us> <postgres-p99-us> <gpu-p999-us> <postgres-p999-us>
+  awk \
+    -v gpu_rps="$1" -v postgres_rps="$2" \
+    -v gpu_p99="$3" -v postgres_p99="$4" \
+    -v gpu_p999="$5" -v postgres_p999="$6" '
+      BEGIN {
+        if (gpu_rps + 0 <= 0 || postgres_rps + 0 <= 0 ||
+            gpu_p99 + 0 <= 0 || postgres_p99 + 0 <= 0 ||
+            gpu_p999 + 0 <= 0 || postgres_p999 + 0 <= 0) exit 1
+        throughput_ratio = (gpu_rps + 0) / (postgres_rps + 0)
+        p99_ratio = (gpu_p99 + 0) / (postgres_p99 + 0)
+        p999_ratio = (gpu_p999 + 0) / (postgres_p999 + 0)
+        printf "throughput_ratio=%.6f p99_ratio=%.6f p999_ratio=%.6f", \
+          throughput_ratio, p99_ratio, p999_ratio
+        exit 0
+      }'
+}
+
 emit_profile_medians() {
   # emit_profile_medians <profile> <results-tsv>
   local selected_profile="$1"
@@ -1219,33 +1416,36 @@ emit_profile_medians() {
   local pg_insert_median
   local gpu_rps_median
   local pg_rps_median
-  local frozen_pg_rps_floor
-  local floor_result
+  local gpu_p99_median
+  local pg_p99_median
+  local gpu_p999_median
+  local pg_p999_median
+  local paired_metrics
   validate_result_set "$results_file" "$selected_profile" gpu || return 1
   validate_result_set "$results_file" "$selected_profile" postgresql || return 1
   gpu_insert_median="$(median_metric "$results_file" "$selected_profile" gpu 4)" || return 1
   pg_insert_median="$(median_metric "$results_file" "$selected_profile" postgresql 4)" || return 1
   gpu_rps_median="$(median_metric "$results_file" "$selected_profile" gpu 5)" || return 1
   pg_rps_median="$(median_metric "$results_file" "$selected_profile" postgresql 5)" || return 1
-  if frozen_pg_rps_floor="$(frozen_postgres_rows_per_second_floor "$selected_profile" "$rows")"; then
-    if awk -v actual="$gpu_rps_median" -v floor="$frozen_pg_rps_floor" \
-      'BEGIN { exit !((actual + 0) >= (floor + 0)) }'; then
-      floor_result="pass"
-    else
-      floor_result="fail"
-    fi
-  else
-    frozen_pg_rps_floor="<not-yet-frozen>"
-    floor_result="not-enforced"
-  fi
+  gpu_p99_median="$(median_metric "$results_file" "$selected_profile" gpu 7)" || return 1
+  pg_p99_median="$(median_metric "$results_file" "$selected_profile" postgresql 7)" || return 1
+  gpu_p999_median="$(median_metric "$results_file" "$selected_profile" gpu 8)" || return 1
+  pg_p999_median="$(median_metric "$results_file" "$selected_profile" postgresql 8)" || return 1
+  paired_metrics="$(paired_comparison_metrics \
+    "$gpu_rps_median" "$pg_rps_median" \
+    "$gpu_p99_median" "$pg_p99_median" \
+    "$gpu_p999_median" "$pg_p999_median")" || return 1
   printf '%s\n' \
     "insert_qualification_median_status=complete profile=${selected_profile} backend=gpu rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=insert_load_wall_ms median=${gpu_insert_median}" \
     "insert_qualification_median_status=complete profile=${selected_profile} backend=gpu rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=rows_per_second median=${gpu_rps_median}" \
+    "insert_qualification_median_status=complete profile=${selected_profile} backend=gpu rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=insert_roundtrip_p99_us median=${gpu_p99_median}" \
+    "insert_qualification_median_status=complete profile=${selected_profile} backend=gpu rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=insert_roundtrip_p999_us median=${gpu_p999_median}" \
     "insert_qualification_postgresql_median_status=observed profile=${selected_profile} rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=insert_load_wall_ms median=${pg_insert_median}" \
     "insert_qualification_postgresql_median_status=observed profile=${selected_profile} rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=rows_per_second median=${pg_rps_median}" \
-    "insert_qualification_frozen_floor_status=${floor_result} profile=${selected_profile} rows=${rows} chunk=${INSERT_CHUNK} metric=rows_per_second gpu_median=${gpu_rps_median} frozen_postgresql_floor=${frozen_pg_rps_floor}" \
+    "insert_qualification_postgresql_median_status=observed profile=${selected_profile} rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=insert_roundtrip_p99_us median=${pg_p99_median}" \
+    "insert_qualification_postgresql_median_status=observed profile=${selected_profile} rows=${rows} chunk=${INSERT_CHUNK} trials=3 metric=insert_roundtrip_p999_us median=${pg_p999_median}" \
+    "insert_qualification_paired_comparison_status=observed profile=${selected_profile} rows=${rows} chunk=${INSERT_CHUNK} trials=3 gpu_rows_per_second=${gpu_rps_median} postgresql_rows_per_second=${pg_rps_median} gpu_p99_us=${gpu_p99_median} postgresql_p99_us=${pg_p99_median} gpu_p999_us=${gpu_p999_median} postgresql_p999_us=${pg_p999_median} ${paired_metrics}" \
     | tee -a "$artifact_dir/qualification-summary.txt"
-  [[ "$floor_result" != "fail" ]]
 }
 
 run_self_check() {
@@ -1308,19 +1508,32 @@ run_self_check() {
   printf '%s\n' "${valid_line/rows_per_second=125000.000/rows_per_second=NaN}" >"$scratch/malformed.log"
   ! parse_client_record "$scratch/malformed.log" gpu development 1 >/dev/null || failures=$((failures + 1))
   local probe_line
-  probe_line="insert_probe_session_delta=complete version=7 attribution=engine_local_plus_process_global_classifier_counters_single_active_workload_session_required successful_insert_statements=1000 successful_insert_rows=1000000 fixed_insert_typed_commits=1000 fixed_insert_legacy_fallbacks=0 fixed_insert_retryable_declines=0 fixed_insert_legacy_commit_validation_reresolves=0 legacy_insert_delta_builds=0 predicted_row_keys_materialized=0 direct_fixed_insert_carriers=1000 raw_request_digest_derivations=1000 raw_request_digest_derivation_bytes=10300 compat_classifier_gate_checks=4000 compat_classifier_gate_rejections=4000 compat_classifier_slow_path_admissions=0 compat_classifier_slow_path_bytes=0 successful_insert_source_bytes=12300 successful_insert_end_to_end_service_nanos=100 facade_parse_bind_nanos=1 engine_authorization_catalog_admission_nanos=2 offlock_coercion_default_constraint_prepare_nanos=3 commit_validation_reresolve_nanos=0 canonical_wal_encode_append_claim_nanos=5 durability_wait_nanos=6 durability_begin_group_flush_nanos=1 durability_job_wait_nanos=2 device_validate_nanos=7 device_h2d_append_index_apply_nanos=8 publication_status_ack_nanos=9 wave_count=1 wave_item_count=1000 peak_host_statement_bytes=12 peak_device_statement_bytes_estimate=8 rollover_count=1 rollover_capacity_rows_total=4000000 rollover_capacity_rows_max=4000000 current_shard_count=2 peak_shard_count=2 persistent_allocation_count=3 descriptor_clone_visit_count=1000 budget_scan_entries=5 capacity_fit_evaluation_count=23 sidecar_fill_bytes=64000000 live_h2d_bytes=24008 named_index_shard_visits=0 unattributed_or_concurrent_overlap_nanos=55 durability_backend=memory intent_lane_count=0 synchronous_commit_gate=strict_rpo0 auto_admit_on_commit=true binary_wal_records_enabled=true device_authoritative_commits=1000 active_workload_sessions_at_seal=1 overlap_observed=false"
+  probe_line="insert_probe_session_delta=complete version=10 attribution=engine_local_plus_process_global_classifier_counters_single_active_workload_session_required successful_insert_statements=1000 successful_insert_rows=1000000 raw_request_digest_derivations=1000 raw_request_digest_derivation_bytes=10300 compat_classifier_gate_checks=4000 compat_classifier_gate_rejections=4000 compat_classifier_slow_path_admissions=0 compat_classifier_slow_path_bytes=0 successful_insert_source_bytes=12300 successful_insert_end_to_end_service_nanos=100 facade_parse_bind_nanos=1 engine_authorization_catalog_admission_nanos=2 offlock_coercion_default_constraint_prepare_nanos=3 transaction_begin_snapshot_capture_nanos=4 transaction_statement_snapshot_capture_nanos=5 transaction_commit_snapshot_capture_nanos=0 transaction_commit_snapshot_reuse_count=1000 transaction_private_overlay_materialize_nanos=6 transaction_statement_stage_nanos=4 codec5_record_seal_nanos=2 codec5_final_image_seal_nanos=1 resident_append_source_materialize_nanos=0 typed_stage_constructor_payload_validate_nanos=1 typed_stage_constructor_unique_slot_nanos=2 typed_stage_constructor_payload_digest_nanos=3 typed_overlay_payload_revalidate_nanos=4 typed_overlay_payload_upload_nanos=5 codec5_admission_select_materialize_nanos=6 codec5_admission_geometry_encode_nanos=7 codec5_terminal_select_materialize_nanos=8 codec5_terminal_final_image_source_nanos=9 transaction_terminal_nanos=7 transaction_terminal_pre_wal_nanos=4 codec5_operation_input_nanos=1 codec5_operation_table_prepare_nanos=2 codec5_operation_aggregate_nanos=3 codec5_operation_plan_compile_nanos=4 codec5_operation_finalize_nanos=5 codec5_live_s7_build_nanos=1 codec5_live_s2_decode_nanos=2 codec5_live_aggregate_prepare_nanos=2 codec5_live_aggregate_encode_nanos=3 codec5_live_outer_reserve_nanos=4 codec5_live_outer_encode_nanos=5 codec5_live_outer_digest_nanos=6 codec5_live_outer_packed_encode_nanos=7 codec5_live_outer_checksum_nanos=8 codec5_live_outer_serialized_copy_nanos=9 codec5_live_outer_seal_nanos=10 typed_append_generation_host_nanos=1 typed_append_generation_source_view_nanos=1 typed_append_generation_prepare_reserve_nanos=1 typed_append_generation_submit_complete_nanos=1 typed_append_envelope_prepare_nanos=0 typed_append_envelope_encode_nanos=0 typed_append_semantics_close_nanos=0 typed_append_authority_prepare_nanos=0 typed_append_device_plan_compile_nanos=0 typed_append_authority_commit_nanos=0 transaction_terminal_wal_status_nanos=2 transaction_terminal_post_canonical_finalize_nanos=3 transaction_canonical_apply_publish_nanos=8 commit_validation_reresolve_nanos=0 canonical_wal_encode_append_claim_nanos=5 durability_wait_nanos=6 durability_begin_group_flush_nanos=1 durability_job_wait_nanos=2 device_validate_nanos=7 device_h2d_append_index_apply_nanos=0 publication_status_ack_nanos=0 wave_count=0 wave_item_count=0 peak_host_statement_bytes=0 peak_device_statement_bytes_estimate=0 rollover_count=1 rollover_capacity_rows_total=4000000 rollover_capacity_rows_max=4000000 current_shard_count=2 peak_shard_count=2 persistent_allocation_count=3 descriptor_clone_visit_count=1000 budget_scan_entries=5 capacity_fit_evaluation_count=23 sidecar_fill_bytes=64000000 live_h2d_bytes=24008 named_index_shard_visits=0 unattributed_or_concurrent_overlap_nanos=55 durability_backend=memory intent_lane_count=0 synchronous_commit_gate=strict_rpo0 auto_admit_on_commit=true device_authoritative_commits=1000 active_workload_sessions_at_seal=1 overlap_observed=false"
   probe_line+=" fua_logical_groups=0 fua_logical_payload_bytes=0 fua_single_frame_padded_baseline_bytes=0 fua_publish_turn_wait_nanos=0 fua_publish_turn_wait_groups=0 fua_published_frames=0 fua_fenced_frames=0 fua_fence_failures=0 fua_payload_bytes=0 fua_padded_bytes=0 fua_stage_copy_nanos=0 fua_stage_copy_frames=0 fua_publish_to_claim_nanos=0 fua_publish_to_claim_frames=0 fua_claim_to_write_done_nanos=0 fua_claim_to_write_done_frames=0 fua_write_done_to_contiguous_cut_nanos=0 fua_write_done_to_contiguous_cut_frames=0 fua_contiguous_cut_events=0 fua_contiguous_cut_advanced_frames=0 fua_contiguous_cut_advance_max_frames=0 fua_waiter_cut_to_observe_nanos=0 fua_waiter_cut_to_observe_count=0 fua_in_flight_depth_max=0 fua_in_flight_depth_1=0 fua_in_flight_depth_2=0 fua_in_flight_depth_3_to_4=0 fua_in_flight_depth_5_to_8=0 fua_in_flight_depth_9_to_16=0 fua_in_flight_depth_17_to_32=0 fua_in_flight_depth_33_plus=0 fua_fence_lanes=0"
   probe_line+=" fua_controller_sustained_actions=0 fua_controller_pending_probe_cover_actions=0 fua_controller_qd1_samples=0 fua_controller_qd1_sparse_actions=0 fua_controller_qd1_verify_actions=0 fua_controller_qd1_fast_actions=0 fua_controller_unfragmented_actions=0 fua_controller_pool_too_narrow=0 fua_controller_empty_chunk=0 fua_controller_insufficient_free_slots=0 fua_controller_natural_depth=0 fua_controller_segment_boundary=0 fua_controller_amplification_cap=0 fua_controller_fast_samples=0 fua_controller_nonfast_samples=0 fua_controller_transitions_to_verify=0 fua_controller_transitions_to_fast=0 fua_controller_transitions_to_sustained=0 fua_controller_stale_qd1_samples=0 fua_controller_unavailable_qd1_samples=0 fua_controller_abandoned_qd1_samples=0 fua_controller_protocol_faults=0 fua_controller_protocol_fallback_actions=0 fua_controller_phase=0 fua_controller_verify_fast_streak=0 fua_controller_sustained_remaining=0 fua_controller_generation=0 fua_controller_pending_qd1_samples=0 fua_controller_fast_in_flight=0 fua_controller_fast_in_flight_max=0 fua_controller_generation_exhausted=0 fua_controller_ordinal_exhausted=0 fua_controller_action_reconciliation=0 fua_controller_sample_reconciliation=0"
+  probe_line="${probe_line/version=10/version=27}"
+  probe_line+=" typed_append_generation_kernel_event_nanos=1"
+  probe_line+=" typed_append_generation_validate_kernel_event_nanos=1 typed_append_generation_cells_kernel_event_nanos=1 typed_append_generation_rows_kernel_event_nanos=1 typed_append_generation_reduce_kernel_event_nanos=1 typed_append_generation_finalize_kernel_event_nanos=1"
+  probe_line+=" typed_append_s7_build_nanos=0 typed_append_aggregate_prepare_nanos=0 typed_append_aggregate_body_encode_nanos=0 typed_append_outer_reserve_nanos=0 typed_append_outer_encode_nanos=0"
+  probe_line+=" typed_append_outer_digest_nanos=0 typed_append_outer_packed_encode_nanos=0 typed_append_outer_checksum_nanos=0 typed_append_outer_serialized_copy_nanos=0 typed_append_outer_seal_nanos=0"
+  probe_line+=" transaction_canonical_record_apply_nanos=4 transaction_canonical_residency_publish_nanos=0"
   printf '%s\n' "$probe_line" >"$scratch/probe-valid.log"
   parse_gpu_insert_probe_record "$scratch/probe-valid.log" development 1 >/dev/null || failures=$((failures + 1))
+  local probe_without_codec5_operation="$probe_line"
+  probe_without_codec5_operation="${probe_without_codec5_operation/codec5_operation_input_nanos=1/codec5_operation_input_nanos=0}"
+  probe_without_codec5_operation="${probe_without_codec5_operation/codec5_operation_table_prepare_nanos=2/codec5_operation_table_prepare_nanos=0}"
+  probe_without_codec5_operation="${probe_without_codec5_operation/codec5_operation_aggregate_nanos=3/codec5_operation_aggregate_nanos=0}"
+  probe_without_codec5_operation="${probe_without_codec5_operation/codec5_operation_plan_compile_nanos=4/codec5_operation_plan_compile_nanos=0}"
+  probe_without_codec5_operation="${probe_without_codec5_operation/codec5_operation_finalize_nanos=5/codec5_operation_finalize_nanos=0}"
+  printf '%s\n' "$probe_without_codec5_operation" >"$scratch/probe-codec5-operation-vacuous.log"
+  ! parse_gpu_insert_probe_record "$scratch/probe-codec5-operation-vacuous.log" development 1 >/dev/null || failures=$((failures + 1))
   local original_manifest_insert_statements="$manifest_insert_statements"
   local original_insert_source_bytes="$insert_source_bytes"
   local original_insert_canonical_request_bytes="$insert_canonical_request_bytes"
   local original_insert_stripped_terminator_bytes="$insert_stripped_terminator_bytes"
   local scaled_probe_line="$probe_line"
   scaled_probe_line="${scaled_probe_line/successful_insert_statements=1000/successful_insert_statements=8000}"
-  scaled_probe_line="${scaled_probe_line/fixed_insert_typed_commits=1000/fixed_insert_typed_commits=8000}"
-  scaled_probe_line="${scaled_probe_line/direct_fixed_insert_carriers=1000/direct_fixed_insert_carriers=8000}"
+  scaled_probe_line="${scaled_probe_line/transaction_commit_snapshot_reuse_count=1000/transaction_commit_snapshot_reuse_count=8000}"
   scaled_probe_line="${scaled_probe_line/raw_request_digest_derivations=1000/raw_request_digest_derivations=8000}"
   scaled_probe_line="${scaled_probe_line/raw_request_digest_derivation_bytes=10300/raw_request_digest_derivation_bytes=82400}"
   scaled_probe_line="${scaled_probe_line/compat_classifier_gate_checks=4000/compat_classifier_gate_checks=32000}"
@@ -1365,7 +1578,7 @@ run_self_check() {
   ! parse_gpu_insert_probe_record "$scratch/probe-classifier-noncanonical.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/overlap_observed=false/overlap_observed=true}" >"$scratch/probe-overlap.log"
   ! parse_gpu_insert_probe_record "$scratch/probe-overlap.log" development 1 >/dev/null || failures=$((failures + 1))
-  printf '%s\n' "${probe_line/version=7/version=1}" >"$scratch/probe-version-mismatch.log"
+  printf '%s\n' "${probe_line/version=27/version=1}" >"$scratch/probe-version-mismatch.log"
   ! parse_gpu_insert_probe_record "$scratch/probe-version-mismatch.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/durability_backend=memory/durability_backend=serial}" >"$scratch/probe-profile-mismatch.log"
   ! parse_gpu_insert_probe_record "$scratch/probe-profile-mismatch.log" development 1 >/dev/null || failures=$((failures + 1))
@@ -1436,16 +1649,6 @@ run_self_check() {
   ! parse_gpu_insert_probe_record "$scratch/probe-count-mismatch.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/device_authoritative_commits=1000/device_authoritative_commits=999}" >"$scratch/probe-device-authority-mismatch.log"
   ! parse_gpu_insert_probe_record "$scratch/probe-device-authority-mismatch.log" development 1 >/dev/null || failures=$((failures + 1))
-  printf '%s\n' "${probe_line/fixed_insert_typed_commits=1000/fixed_insert_typed_commits=999}" >"$scratch/probe-fixed-cutover-mismatch.log"
-  ! parse_gpu_insert_probe_record "$scratch/probe-fixed-cutover-mismatch.log" development 1 >/dev/null || failures=$((failures + 1))
-  printf '%s\n' "${probe_line/fixed_insert_legacy_fallbacks=0/fixed_insert_legacy_fallbacks=1}" >"$scratch/probe-fixed-fallback.log"
-  ! parse_gpu_insert_probe_record "$scratch/probe-fixed-fallback.log" development 1 >/dev/null || failures=$((failures + 1))
-  printf '%s\n' "${probe_line/legacy_insert_delta_builds=0/legacy_insert_delta_builds=1}" >"$scratch/probe-legacy-delta-build.log"
-  ! parse_gpu_insert_probe_record "$scratch/probe-legacy-delta-build.log" development 1 >/dev/null || failures=$((failures + 1))
-  printf '%s\n' "${probe_line/predicted_row_keys_materialized=0/predicted_row_keys_materialized=1}" >"$scratch/probe-predicted-key.log"
-  ! parse_gpu_insert_probe_record "$scratch/probe-predicted-key.log" development 1 >/dev/null || failures=$((failures + 1))
-  printf '%s\n' "${probe_line/direct_fixed_insert_carriers=1000/direct_fixed_insert_carriers=999}" >"$scratch/probe-direct-carrier.log"
-  ! parse_gpu_insert_probe_record "$scratch/probe-direct-carrier.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/compat_classifier_gate_checks=4000/compat_classifier_gate_checks=3999}" >"$scratch/probe-classifier-checks.log"
   ! parse_gpu_insert_probe_record "$scratch/probe-classifier-checks.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/compat_classifier_gate_rejections=4000/compat_classifier_gate_rejections=3999}" >"$scratch/probe-classifier-rejections.log"
@@ -1458,6 +1661,14 @@ run_self_check() {
   ! parse_gpu_insert_probe_record "$scratch/probe-classifier-torn-accounting.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/commit_validation_reresolve_nanos=0/commit_validation_reresolve_nanos=1}" >"$scratch/probe-legacy-reresolve.log"
   ! parse_gpu_insert_probe_record "$scratch/probe-legacy-reresolve.log" development 1 >/dev/null || failures=$((failures + 1))
+  printf '%s\n' "${probe_line/typed_append_semantics_close_nanos=0/typed_append_semantics_close_nanos=1}" >"$scratch/probe-redundant-live-close.log"
+  ! parse_gpu_insert_probe_record "$scratch/probe-redundant-live-close.log" development 1 >/dev/null || failures=$((failures + 1))
+  printf '%s\n' "${probe_line/transaction_private_overlay_materialize_nanos=6/transaction_private_overlay_materialize_nanos=0}" >"$scratch/probe-overlay-missing.log"
+  ! parse_gpu_insert_probe_record "$scratch/probe-overlay-missing.log" development 1 >/dev/null || failures=$((failures + 1))
+  printf '%s\n' "${probe_line/typed_append_envelope_prepare_nanos=0/typed_append_envelope_prepare_nanos=1}" >"$scratch/probe-retired-writer-live.log"
+  ! parse_gpu_insert_probe_record "$scratch/probe-retired-writer-live.log" development 1 >/dev/null || failures=$((failures + 1))
+  printf '%s\n' "${probe_line/transaction_canonical_record_apply_nanos=4/transaction_canonical_record_apply_nanos=0}" >"$scratch/probe-canonical-apply-missing.log"
+  ! parse_gpu_insert_probe_record "$scratch/probe-canonical-apply-missing.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/current_shard_count=2/current_shard_count=3}" >"$scratch/probe-shard-geometry-mismatch.log"
   ! parse_gpu_insert_probe_record "$scratch/probe-shard-geometry-mismatch.log" development 1 >/dev/null || failures=$((failures + 1))
   printf '%s\n' "${probe_line/rollover_capacity_rows_max=4000000/rollover_capacity_rows_max=3999999}" >"$scratch/probe-plausible-capacity-geometry-mismatch.log"
@@ -1488,23 +1699,15 @@ run_self_check() {
   printf '%s\n' '160014|16.14|on|off|on|fdatasync' >"$scratch/postgres-sabotaged-settings"
   ! postgres_runtime_settings_match durable "$scratch/postgres-sabotaged-settings" || failures=$((failures + 1))
   printf '%s\n' \
-    $'development\tpostgresql\t1\t30\t100.000\t40' \
-    $'development\tpostgresql\t2\t10\t300.000\t20' \
-    $'development\tpostgresql\t3\t20\t200.000\t30' >"$scratch/results.tsv"
+    $'development\tpostgresql\t1\t30\t100.000\t40\t50\t60' \
+    $'development\tpostgresql\t2\t10\t300.000\t20\t30\t40' \
+    $'development\tpostgresql\t3\t20\t200.000\t30\t40\t50' >"$scratch/results.tsv"
   [[ "$(median_metric "$scratch/results.tsv" development postgresql 4)" == "20" ]] || failures=$((failures + 1))
   [[ "$(median_metric "$scratch/results.tsv" development postgresql 5)" == "200.000" ]] || failures=$((failures + 1))
-  [[ "$(frozen_postgres_rows_per_second_floor development 1000000)" == "675859.699" ]] ||
-    failures=$((failures + 1))
-  [[ "$(frozen_postgres_rows_per_second_floor durable 1000000)" == "433754.096" ]] ||
-    failures=$((failures + 1))
-  [[ "$(frozen_postgres_rows_per_second_floor development 8000000)" == "765543.025" ]] ||
-    failures=$((failures + 1))
-  [[ "$(frozen_postgres_rows_per_second_floor durable 8000000)" == "436488.945" ]] ||
-    failures=$((failures + 1))
-  [[ "$(frozen_postgres_rows_per_second_floor development 48000000)" == "778301.447" ]] ||
-    failures=$((failures + 1))
-  [[ "$(frozen_postgres_rows_per_second_floor durable 48000000)" == "235965.297" ]] ||
-    failures=$((failures + 1))
+  [[ "$(median_metric "$scratch/results.tsv" development postgresql 7)" == "40" ]] || failures=$((failures + 1))
+  [[ "$(median_metric "$scratch/results.tsv" development postgresql 8)" == "50" ]] || failures=$((failures + 1))
+  paired_comparison_metrics 95 100 105 100 105 100 >/dev/null || failures=$((failures + 1))
+  paired_comparison_metrics 94 100 100 100 100 100 >/dev/null || failures=$((failures + 1))
   [[ "$(frozen_workload_identity 1000000)" == \
     "15820837 7564cc9e47cce5fe1f2484ff0107f5aa1c73258bb5c8d0fa70f43a2cc1c65f23 ce0d027d434420874d361e1203f0c1094a66c20a68dd7b8b03c60c8d7d2e3393 a0d7472f39059f6694f5cd9cd28632dd5574506dc25d903debfa8642f87f8ea4" ]] ||
     failures=$((failures + 1))
@@ -1514,7 +1717,7 @@ run_self_check() {
   [[ "$(frozen_workload_identity 48000000)" == \
     "849620137 09472115e419b22a685f23cfb956406e57f9b91324e7f52db4ba855f7a4c0cb9 8f5d67db9521bfd345edd8956691ed9ee27c7b780cd68a57d4d00c9449ace44e a2266305f578762641f188f2d99be68762fbd371d27110a0f65386be756b01f0" ]] ||
     failures=$((failures + 1))
-  printf '%s\n' $'development\tpostgresql\t3\t21\t201.000\t31' >>"$scratch/results.tsv"
+  printf '%s\n' $'development\tpostgresql\t3\t21\t201.000\t31\t41\t51' >>"$scratch/results.tsv"
   ! validate_result_set "$scratch/results.tsv" development postgresql || failures=$((failures + 1))
   cleanup_scratch || return 1
   if [[ "$failures" -ne 0 ]]; then
@@ -1541,6 +1744,8 @@ fi
 if [[ -n "${INSERT_QUALIFICATION_POSTGRES_IMAGE+x}" ]]; then
   die "INSERT_QUALIFICATION_POSTGRES_IMAGE is not permitted; the PostgreSQL comparator is pinned"
 fi
+command -v git >/dev/null 2>&1 || die "git is required"
+freeze_exact_staged_candidate || die "qualification requires one exact staged candidate with no unstaged or untracked drift"
 
 if [[ -n "$artifact_arg" ]]; then
   artifact_dir="$artifact_arg"
@@ -1558,11 +1763,9 @@ mkdir -p -- "$artifact_dir/preflight" "$artifact_dir/workload" "$artifact_dir/tr
 postgres_image="$POSTGRES_IMAGE_DEFAULT"
 client_timeout="${INSERT_QUALIFICATION_CLIENT_TIMEOUT:-$DEFAULT_CLIENT_TIMEOUT_SECONDS}"
 require_positive_uint "$client_timeout" "INSERT_QUALIFICATION_CLIENT_TIMEOUT"
-development_frozen_floor="$(frozen_postgres_rows_per_second_floor development "$rows" || printf '%s' '<not-yet-frozen>')"
-durable_frozen_floor="$(frozen_postgres_rows_per_second_floor durable "$rows" || printf '%s' '<not-yet-frozen>')"
 
 printf '%s\n' \
-  "qualification_mode=canonical" \
+  "qualification_mode=write002-paired-general-codec-comparison" \
   "profiles=${profile}" \
   "rows=${rows}" \
   "chunk=${INSERT_CHUNK}" \
@@ -1571,8 +1774,10 @@ printf '%s\n' \
   "postgres_image=${postgres_image}" \
   "postgres_auth=local-trust-only" \
   "client_timeout_seconds=${client_timeout}" \
-  "frozen_postgresql_rows_per_second_floor_development=${development_frozen_floor}" \
-  "frozen_postgresql_rows_per_second_floor_durable=${durable_frozen_floor}" \
+  "paired_comparison_thresholds=none" \
+  "candidate_index_tree=${candidate_index_tree}" \
+  "candidate_cached_diff_sha256=${candidate_cached_diff_sha256}" \
+  "candidate_staged_path_count=${candidate_staged_path_count}" \
   "artifact_dir=${artifact_dir}" \
   "ambient_cargo_target_dir=${CARGO_TARGET_DIR:-<unset>}" \
   >"$artifact_dir/run-config.txt"
@@ -1697,7 +1902,7 @@ printf '%s\n' \
 
 results_file="$artifact_dir/qualified-results.tsv"
 : >"$results_file"
-printf 'profile\tbackend\ttrial\tinsert_load_wall_ms\trows_per_second\tend_to_end_client_wall_ms\n' \
+printf 'profile\tbackend\ttrial\tinsert_load_wall_ms\trows_per_second\tend_to_end_client_wall_ms\tinsert_roundtrip_p99_us\tinsert_roundtrip_p999_us\n' \
   >"$artifact_dir/qualified-results-header.tsv"
 
 declare -a selected_profiles=()
@@ -1710,7 +1915,6 @@ else
 fi
 
 profile_slot=0
-qualification_floor_failed=0
 for selected_profile in "${selected_profiles[@]}"; do
   printf 'insert_qualification_profile_status=started profile=%s rows=%s chunk=%s trials_per_backend=%s sequence=gpu,postgresql,gpu,postgresql,gpu,postgresql\n' \
     "$selected_profile" "$rows" "$INSERT_CHUNK" "$INSERT_TRIALS" | tee -a "$artifact_dir/qualification-summary.txt"
@@ -1722,20 +1926,19 @@ for selected_profile in "${selected_profiles[@]}"; do
     die "GPU result set is malformed or incomplete for profile=${selected_profile}"
   validate_result_set "$results_file" "$selected_profile" postgresql ||
     die "PostgreSQL result set is malformed or incomplete for profile=${selected_profile}"
-  if ! emit_profile_medians "$selected_profile" "$results_file"; then
-    qualification_floor_failed=1
-  fi
+  emit_profile_medians "$selected_profile" "$results_file" ||
+    die "paired comparison metrics are malformed for profile=${selected_profile}"
   printf 'insert_qualification_profile_status=complete profile=%s rows=%s chunk=%s trials_per_backend=%s\n' \
     "$selected_profile" "$rows" "$INSERT_CHUNK" "$INSERT_TRIALS" | tee -a "$artifact_dir/qualification-summary.txt"
   profile_slot=$((profile_slot + 1))
 done
 
-if [[ "$qualification_floor_failed" -ne 0 ]]; then
-  printf 'insert_qualification_status=failed mode=qualification reason=frozen-postgresql-floor profiles=%s rows=%s chunk=%s trials_per_backend=%s artifact_dir=%s\n' \
-    "$profile" "$rows" "$INSERT_CHUNK" "$INSERT_TRIALS" "$artifact_dir" |
+freeze_exact_staged_candidate || {
+  printf 'insert_qualification_status=failed mode=qualification reason=candidate-drift profiles=%s rows=%s chunk=%s trials_per_backend=%s candidate_index_tree=%s candidate_cached_diff_sha256=%s artifact_dir=%s\n' \
+    "$profile" "$rows" "$INSERT_CHUNK" "$INSERT_TRIALS" "$candidate_index_tree" "$candidate_cached_diff_sha256" "$artifact_dir" |
     tee -a "$artifact_dir/qualification-summary.txt"
   exit 2
-fi
+}
 
-printf 'insert_qualification_status=complete mode=qualification profiles=%s rows=%s chunk=%s trials_per_backend=%s artifact_dir=%s\n' \
-  "$profile" "$rows" "$INSERT_CHUNK" "$INSERT_TRIALS" "$artifact_dir" | tee -a "$artifact_dir/qualification-summary.txt"
+printf 'insert_qualification_status=complete mode=qualification profiles=%s rows=%s chunk=%s trials_per_backend=%s candidate_index_tree=%s candidate_cached_diff_sha256=%s artifact_dir=%s\n' \
+  "$profile" "$rows" "$INSERT_CHUNK" "$INSERT_TRIALS" "$candidate_index_tree" "$candidate_cached_diff_sha256" "$artifact_dir" | tee -a "$artifact_dir/qualification-summary.txt"

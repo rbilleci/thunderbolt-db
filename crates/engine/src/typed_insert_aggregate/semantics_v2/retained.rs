@@ -12,7 +12,6 @@ mod catalog_validation;
 mod codec_closure;
 #[path = "retained/fill.rs"]
 mod fill;
-#[cfg(test)]
 #[path = "retained/generation_validation.rs"]
 mod generation_validation;
 #[path = "retained/graph.rs"]
@@ -26,6 +25,15 @@ mod reservation;
 mod retention_authority;
 #[path = "retained/sequence_validation.rs"]
 pub(super) mod sequence_validation;
+
+/// The exact three-owner handoff from a closed single-table S7 artifact into replay planning.
+/// It carries the existing resident source, private sequence publication and S3 catalog record;
+/// no new recovery carrier or authority is introduced here.
+pub(crate) type SemanticsV2RecoverySource = (
+    Option<crate::typed_insert_batch::PreparedResidentAppendSource>,
+    Box<[crate::engine_commit::LiveTypedPrivateSequencePublication]>,
+    Option<crate::wal_binary::BinaryTransactionRecord>,
+);
 
 /// Shared identity captured from the canonical outer/S7 framing before a model can leave raw
 /// proof. It owns no catalog or publication authority.
@@ -254,6 +262,514 @@ pub(super) struct AggregateReplayTxn<Phase> {
     phase: Phase,
 }
 
+/// Scalar identity proven by the retained v2 closure and consumed by the one recovery route.
+/// It intentionally contains no aggregate body, typed vectors, row matrix, or mutable plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SemanticsV2ReplayMetadata {
+    pub(crate) canonical_identity: gpu_db_wal::CanonicalIdentity,
+    pub(crate) leader_epoch: u64,
+    pub(crate) stable_transaction_id: u64,
+    pub(crate) request_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) autocommit: bool,
+    pub(crate) commit_sequence: u64,
+    pub(crate) catalog_epoch: u64,
+    pub(crate) catalog_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) statement_count: u32,
+    /// Historical one-statement codec-5 records bind this scalar into the generation ABI.
+    /// Composed generic transactions bind statement identity per transition instead and use
+    /// zero here so recovery cannot accidentally collapse them into one statement identity.
+    pub(crate) typed_statement_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) stable_table_id: u64,
+    pub(crate) display_oid: u32,
+    pub(crate) table_schema_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) data_generation_before: u64,
+    pub(crate) data_generation_after: u64,
+    pub(crate) row_allocator_before: u64,
+    pub(crate) row_allocator_high_water: u64,
+    pub(crate) initial_logical_row_count: u64,
+    pub(crate) final_logical_row_count: u64,
+    pub(crate) resets_existing_rows: bool,
+    /// This S7-authenticated flag distinguishes the sole first table generation from an
+    /// ordinary append with a missing predecessor during fresh recovery.
+    pub(crate) initial_table_absent: bool,
+    pub(crate) initial_table_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) final_table_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) initial_database_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) final_database_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) image_layout_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) image_content_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) affected_rows: u64,
+}
+
+/// One durable named-index generation carried from the strictly closed S7 graph into replay.
+/// These are catalog bindings and exact GPU predecessor/successor commitments only; they carry
+/// no host index contents, lookup structure, apply implementation, or publication capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SemanticsV2ReplayIndex {
+    pub(crate) stable_index_id: u64,
+    pub(crate) raw_catalog_ordinal: u32,
+    pub(crate) display_oid: u32,
+    pub(crate) name: Box<str>,
+    pub(crate) flags: u32,
+    pub(crate) null_equality_policy: u8,
+    pub(crate) base_generation: u64,
+    pub(crate) base_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) final_generation: u64,
+    pub(crate) final_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) key_columns: Box<[SemanticsV2ReplayIndexKey]>,
+    /// The typed S2 statements predate this index, so its durable catalog identity can only be
+    /// supplied by the already-reserved S3 CREATE INDEX target.  This is metadata for the one
+    /// replay artifact, not a second catalog or replay authority.
+    s3_created_on_existing_table: bool,
+}
+
+/// Ordered catalog key binding for [`SemanticsV2ReplayIndex`]. Values remain solely in the
+/// retained final typed image and are resolved by the shared runtime-generation source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SemanticsV2ReplayIndexKey {
+    pub(crate) key_ordinal: u32,
+    pub(crate) catalog_column_ordinal: u32,
+    pub(crate) stable_column_id: u32,
+    pub(crate) attnum: i16,
+    pub(crate) storage: [u8; 4],
+    pub(crate) declared_type_oid: u32,
+    pub(crate) signed_type_size: i16,
+    pub(crate) column_name_digest: gpu_db_wal::CanonicalDigest,
+}
+
+/// The one move-only v2 transaction result accepted by recovery after strict physical and
+/// semantic closure. Each table image can only be consumed into the existing resident append
+/// source, keeping recovery on the exact same type-neutral CUDA/apply representation as live
+/// INSERT while the outer owner preserves one transaction/WAL/publication boundary.
+pub(crate) struct SemanticsV2ReplayArtifact {
+    metadata: SemanticsV2ReplayMetadata,
+    tables: Box<[SemanticsV2ReplayTableArtifact]>,
+    private_sequence_publications: Box<[crate::engine_commit::LiveTypedPrivateSequencePublication]>,
+    /// A private sequence may be referenced on both sides of one transaction-local rename, or
+    /// have its final S2 effect before the final S3 rename. The already-decoded S3 envelope
+    /// proves the same stable-OID transition in either case; it is not a second sequence or
+    /// recovery authority.
+    private_sequence_name_changes: Box<[PrivateSequenceNameChange]>,
+    catalog_composition: Option<crate::wal_binary::BinaryTransactionRecord>,
+}
+
+struct PrivateSequenceNameChange {
+    sequence_oid: u32,
+    before_name: Box<str>,
+    after_name: Box<str>,
+}
+
+struct PrivateSequenceReplayPublications {
+    publications: Box<[crate::engine_commit::LiveTypedPrivateSequencePublication]>,
+    name_changes: Box<[PrivateSequenceNameChange]>,
+}
+
+pub(crate) struct SemanticsV2ReplayTableArtifact {
+    metadata: SemanticsV2ReplayMetadata,
+    table_ref: u32,
+    target_schema: Box<str>,
+    target_name: Box<str>,
+    indexes: Box<[SemanticsV2ReplayIndex]>,
+    row_sources: Box<[crate::engine_transaction_delta::TypedInsertRuntimeGenerationRowSource]>,
+    final_image: crate::typed_insert_batch::DecodedTypedImage,
+}
+
+impl SemanticsV2ReplayArtifact {
+    pub(super) fn with_catalog_composition(
+        mut self,
+        catalog_composition: Option<crate::wal_binary::BinaryTransactionRecord>,
+    ) -> Result<Self, crate::EngineError> {
+        // S2 normally carries the final effective sequence name. A terminal S3 RENAME has no
+        // following default-bearing S2 record, so recover that presentation binding from its
+        // exact stable-OID S3 identity before the common name-change proof below. This only
+        // retitles an existing S2-derived private publication; S3 still owns the catalog state,
+        // and there is no separate sequence/recovery/application path.
+        let mut name_changes = self.private_sequence_name_changes.into_vec();
+        if let Some(record) = catalog_composition.as_ref() {
+            for publication in self.private_sequence_publications.iter_mut() {
+                let matching_targets = record
+                    .sequence_lifecycle_operations
+                    .iter()
+                    .flat_map(|operation| operation.targets.iter())
+                    .filter(|target| {
+                        target.before_name == publication.name.as_ref()
+                            && target.after_name.as_deref().is_some_and(|after| {
+                                after != target.before_name && !after.is_empty()
+                            })
+                            && target
+                                .target_before
+                                .as_ref()
+                                .is_some_and(|before| before.oid == publication.sequence_oid)
+                            && target
+                                .target_after
+                                .as_ref()
+                                .is_some_and(|after| after.oid == publication.sequence_oid)
+                    })
+                    .collect::<Vec<_>>();
+                let Some(target) = matching_targets.first() else {
+                    continue;
+                };
+                if matching_targets.len() != 1 {
+                    return Err(replay_error(
+                        "private sequence publication has ambiguous S3 stable-OID rename",
+                    ));
+                }
+                let after_name = target
+                    .after_name
+                    .as_deref()
+                    .expect("filter requires an after name");
+                match name_changes
+                    .iter()
+                    .find(|change| change.sequence_oid == publication.sequence_oid)
+                {
+                    Some(change)
+                        if change.before_name.as_ref() != publication.name.as_ref()
+                            || change.after_name.as_ref() != after_name =>
+                    {
+                        return Err(replay_error(
+                            "private sequence publication has conflicting S2 and S3 rename bindings",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => name_changes.push(PrivateSequenceNameChange {
+                        sequence_oid: publication.sequence_oid,
+                        before_name: publication.name.clone(),
+                        after_name: after_name.into(),
+                    }),
+                }
+                publication.name = after_name.into();
+            }
+        }
+        self.private_sequence_name_changes = name_changes.into_boxed_slice();
+        for change in self.private_sequence_name_changes.iter() {
+            let proven = catalog_composition.as_ref().is_some_and(|record| {
+                record
+                    .sequence_lifecycle_operations
+                    .iter()
+                    .any(|operation| {
+                        operation.targets.iter().any(|target| {
+                            target.before_name == change.before_name.as_ref()
+                                && target.after_name.as_deref() == Some(change.after_name.as_ref())
+                                && target
+                                    .target_before
+                                    .as_ref()
+                                    .is_some_and(|before| before.oid == change.sequence_oid)
+                                && target
+                                    .target_after
+                                    .as_ref()
+                                    .is_some_and(|after| after.oid == change.sequence_oid)
+                        })
+                    })
+            });
+            if !proven {
+                return Err(replay_error(
+                    "private sequence binding rename is not closed by the S3 stable-OID transition",
+                ));
+            }
+        }
+        for table in self.tables.iter_mut() {
+            if table.metadata.initial_table_absent {
+                continue;
+            }
+            for index in table
+                .indexes
+                .iter_mut()
+                .filter(|index| index.base_generation == 0 && index.base_root == [0; 32])
+            {
+                let matching_targets = catalog_composition
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|record| record.index_lifecycle_operations.iter())
+                    .flat_map(|operation| operation.targets.iter())
+                    .filter(|target| {
+                        target.index_before.is_none()
+                            && target.table_before.as_ref().is_some_and(|table_before| {
+                                table_before.oid == table.metadata.display_oid
+                            })
+                            && target.table_after.as_ref().is_some_and(|table_after| {
+                                table_after.oid == table.metadata.display_oid
+                            })
+                            && target.index_after.as_ref().is_some_and(|index_after| {
+                                u64::from(index_after.oid) == index.stable_index_id
+                                    && index_after.table_oid == table.metadata.display_oid
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let [target] = matching_targets.as_slice() else {
+                    return Err(replay_error(
+                        "zero-based existing-table index is not closed by the S3 CREATE INDEX identity",
+                    ));
+                };
+                let Some(after_name) = target.after_name.as_deref() else {
+                    return Err(replay_error(
+                        "zero-based existing-table index S3 identity has no final name",
+                    ));
+                };
+                if index.s3_created_on_existing_table {
+                    if !index.name.is_empty() {
+                        return Err(replay_error(
+                            "S3-created existing-table index retained an unexpected S2 name",
+                        ));
+                    }
+                    index.name = after_name.into();
+                } else if after_name != index.name.as_ref() {
+                    return Err(replay_error(
+                        "zero-based existing-table index S3 identity differs from its retained S2 name",
+                    ));
+                }
+            }
+        }
+        self.catalog_composition = catalog_composition;
+        Ok(self)
+    }
+
+    pub(crate) fn metadata(&self) -> SemanticsV2ReplayMetadata {
+        self.metadata
+    }
+
+    pub(crate) fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    pub(crate) fn target_table_name(&self) -> &str {
+        self.tables
+            .first()
+            .expect("closed replay artifact has at least one table")
+            .target_table_name()
+    }
+
+    pub(crate) fn indexes(&self) -> &[SemanticsV2ReplayIndex] {
+        self.tables
+            .first()
+            .expect("closed replay artifact has at least one table")
+            .indexes()
+    }
+
+    pub(crate) fn row_sources(
+        &self,
+    ) -> &[crate::engine_transaction_delta::TypedInsertRuntimeGenerationRowSource] {
+        self.tables
+            .first()
+            .expect("closed replay artifact has at least one table")
+            .row_sources()
+    }
+
+    pub(crate) fn private_sequence_publications(
+        &self,
+    ) -> &[crate::engine_commit::LiveTypedPrivateSequencePublication] {
+        &self.private_sequence_publications
+    }
+
+    pub(crate) fn catalog_composition(
+        &self,
+    ) -> Option<&crate::wal_binary::BinaryTransactionRecord> {
+        self.catalog_composition.as_ref()
+    }
+
+    pub(crate) fn into_recovery_source(
+        self,
+        physical_table: &crate::RelationalTable,
+        final_table: &crate::RelationalTable,
+    ) -> Result<SemanticsV2RecoverySource, crate::EngineError> {
+        if self.tables.len() != 1 {
+            return Err(replay_error(
+                "plural replay artifact cannot be collapsed into one recovery source",
+            ));
+        }
+        let source = self
+            .tables
+            .into_vec()
+            .pop()
+            .expect("one checked replay table")
+            .into_recovery_source(physical_table, final_table)?;
+        Ok((
+            source,
+            self.private_sequence_publications,
+            self.catalog_composition,
+        ))
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Box<[SemanticsV2ReplayTableArtifact]>,
+        Box<[crate::engine_commit::LiveTypedPrivateSequencePublication]>,
+        Option<crate::wal_binary::BinaryTransactionRecord>,
+    ) {
+        (
+            self.tables,
+            self.private_sequence_publications,
+            self.catalog_composition,
+        )
+    }
+}
+
+impl SemanticsV2ReplayTableArtifact {
+    pub(crate) fn metadata(&self) -> SemanticsV2ReplayMetadata {
+        self.metadata
+    }
+
+    pub(crate) fn table_ref(&self) -> u32 {
+        self.table_ref
+    }
+
+    pub(crate) fn target_table_name(&self) -> &str {
+        self.target_name.as_ref()
+    }
+
+    pub(crate) fn indexes(&self) -> &[SemanticsV2ReplayIndex] {
+        &self.indexes
+    }
+
+    pub(crate) fn row_sources(
+        &self,
+    ) -> &[crate::engine_transaction_delta::TypedInsertRuntimeGenerationRowSource] {
+        &self.row_sources
+    }
+
+    /// Bind the closed image to the current catalog table before moving its sole vector owners
+    /// into the shared resident append source.  This is deliberately not a row-value conversion
+    /// and cannot manufacture a second replay representation.
+    pub(crate) fn into_recovery_source(
+        self,
+        physical_table: &crate::RelationalTable,
+        final_table: &crate::RelationalTable,
+    ) -> Result<Option<crate::typed_insert_batch::PreparedResidentAppendSource>, crate::EngineError>
+    {
+        let metadata = self.metadata;
+        let image_facts = self.final_image.facts();
+        let surviving_rows = u64::try_from(self.row_sources.len())
+            .map_err(|_| replay_error("recovery survivor count exceeds u64"))?;
+        let final_schema_digest = crate::engine_transaction_reset::table_schema_digest(final_table)
+            .map_err(|error| {
+                replay_error(&format!("catalog table schema digest failed: {error}"))
+            })?;
+        let physical_schema_digest = crate::engine_transaction_reset::table_schema_digest(
+            physical_table,
+        )
+        .map_err(|error| replay_error(&format!("physical table schema digest failed: {error}")))?;
+        let expected_final_logical_row_count = if metadata.resets_existing_rows {
+            surviving_rows
+        } else {
+            metadata
+                .initial_logical_row_count
+                .checked_add(surviving_rows)
+                .ok_or_else(|| replay_error("recovery logical row count overflows"))?
+        };
+        if final_table.schema.as_str() != self.target_schema.as_ref()
+            || final_table.name.as_str() != self.target_name.as_ref()
+            || final_table.stable_table_id != metadata.stable_table_id
+            || final_table.oid != metadata.display_oid
+            || final_schema_digest != metadata.table_schema_digest
+            || physical_table.schema != final_table.schema
+            || physical_table.name != final_table.name
+            || physical_table.stable_table_id != final_table.stable_table_id
+            || physical_table.oid != final_table.oid
+            || physical_table.columns.len() != final_table.columns.len()
+            || (!metadata.initial_table_absent && metadata.data_generation_before == 0)
+            || (metadata.initial_table_absent
+                && (metadata.data_generation_before != 0
+                    || metadata.initial_logical_row_count != 0
+                    || metadata.resets_existing_rows))
+            || metadata.row_allocator_before == 0
+            || metadata.row_allocator_high_water
+                != metadata
+                    .row_allocator_before
+                    .checked_add(metadata.affected_rows)
+                    .ok_or_else(|| replay_error("row allocator range overflows"))?
+            || metadata.final_logical_row_count != expected_final_logical_row_count
+            || (!metadata.initial_table_absent && metadata.initial_table_root == [0; 32])
+            || (metadata.initial_table_absent && metadata.initial_table_root != [0; 32])
+            || metadata.final_table_root == [0; 32]
+            || metadata.initial_database_root == [0; 32]
+            || metadata.final_database_root == [0; 32]
+            || surviving_rows > metadata.affected_rows
+            || (surviving_rows != 0
+                && (metadata.data_generation_after != metadata.commit_sequence
+                    || metadata.data_generation_after <= metadata.data_generation_before
+                    || metadata.initial_table_root == metadata.final_table_root
+                    || metadata.initial_database_root == metadata.final_database_root))
+            || (surviving_rows == 0
+                && (metadata.data_generation_after != metadata.data_generation_before
+                    || metadata.initial_table_root != metadata.final_table_root))
+            || image_facts.role != crate::typed_insert_batch::TypedImageRole::FinalTableImage
+            || u64::from(image_facts.rows) != surviving_rows
+            || usize::try_from(image_facts.columns).ok() != Some(final_table.columns.len())
+            || image_facts.layout_digest != metadata.image_layout_digest
+        {
+            return Err(replay_error(
+                "closed v2 aggregate does not bind the current recovery catalog/table generation",
+            ));
+        }
+        if surviving_rows == 0 {
+            if !self.indexes.is_empty() {
+                return Err(replay_error(
+                    "neutral closed v2 table retained an index publication authority",
+                ));
+            }
+            return Ok(None);
+        }
+        if self.indexes.len() != final_table.indexes.len()
+            || self.indexes.iter().any(|retained| {
+                let Some(catalog) = final_table
+                    .indexes
+                    .get(retained.raw_catalog_ordinal as usize)
+                else {
+                    return true;
+                };
+                catalog.oid == 0
+                    || u64::from(catalog.oid) != retained.stable_index_id
+                    || catalog.oid != retained.display_oid
+                    || catalog.name.as_str() != retained.name.as_ref()
+                    || retained.flags
+                        != (u32::from(catalog.unique)
+                            | (u32::from(catalog.primary_key) << 1)
+                            | (u32::from(catalog.unique_constraint) << 2)
+                            | (1 << 3))
+                    || retained.null_equality_policy != 1
+                    || retained.final_generation != metadata.data_generation_after
+                    || catalog.key_columns.len() != retained.key_columns.len()
+                    || retained
+                        .key_columns
+                        .iter()
+                        .enumerate()
+                        .any(|(ordinal, key)| {
+                            let Some(column) =
+                                final_table.columns.get(key.catalog_column_ordinal as usize)
+                            else {
+                                return true;
+                            };
+                            key.key_ordinal as usize != ordinal
+                                || catalog.key_columns.get(ordinal).map(String::as_str)
+                                    != Some(column.name.as_str())
+                                || key.stable_column_id != column.id
+                                || key.attnum != column.attnum
+                                || key.storage
+                                    != crate::typed_insert_batch::typed_image_sql_storage(column.ty)
+                                || key.declared_type_oid != column.type_oid
+                                || key.signed_type_size != column.type_size
+                                || crate::typed_insert_aggregate::write001_identifier_digest(
+                                    &column.name,
+                                )
+                                .ok()
+                                    != Some(key.column_name_digest)
+                        })
+            })
+        {
+            return Err(replay_error(
+                "closed v2 aggregate index bindings differ from the recovery catalog",
+            ));
+        }
+        crate::typed_insert_batch::PreparedResidentAppendSource::from_decoded_final_table_image(
+            self.final_image,
+            physical_table,
+            physical_schema_digest,
+            metadata.data_generation_before,
+        )
+        .map(Some)
+    }
+}
+
 /// Strict structural decode and typed fill have completed, but witness-free codec closure has
 /// not yet recomputed the retained relations.
 #[allow(dead_code)]
@@ -298,6 +814,21 @@ pub(super) struct GenerationPending<'retention, 'catalog, 'sequence> {
     allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'catalog>,
     allocator_assignment: catalog_validation::ValidatedAllocatorAssignment<'catalog>,
     sequence_index: sequence_validation::SemanticsV2DurableSequenceOutcomeIndexProof<'sequence>,
+    seal: PrivateSeal,
+}
+
+/// The generic generation builder has independently reproduced every S7 generation output.
+/// The borrowed retention/catalog/allocator/sequence authorities remain pinned until the caller
+/// consumes this owner into the single apply/publication handoff; no codec or host digest can
+/// manufacture this phase.
+#[allow(dead_code)]
+pub(super) struct GenerationValidated<'retention, 'catalog, 'sequence, C> {
+    authority: retention_authority::ValidatedRetentionAuthority<'retention>,
+    catalog: SemanticsV2CatalogWitness<'catalog>,
+    allocator_index: catalog_validation::SemanticsV2DurableAllocatorIndexProof<'catalog>,
+    allocator_assignment: catalog_validation::ValidatedAllocatorAssignment<'catalog>,
+    sequence_index: sequence_validation::SemanticsV2DurableSequenceOutcomeIndexProof<'sequence>,
+    generation: generation_validation::OwnedGenerationResult<C>,
     seal: PrivateSeal,
 }
 
@@ -389,8 +920,9 @@ impl AggregateReplayTxn<CodecQuarantined> {
     /// caller can retain a partially closed or externally advanceable graph.
     pub(super) fn close_codec(
         self,
+        catalog_composition: Option<&crate::wal_binary::BinaryTransactionRecord>,
     ) -> Result<AggregateReplayTxn<RetentionAuthorityPending>, crate::EngineError> {
-        codec_closure::validate(self.graph.identity, &self.graph.graph)?;
+        codec_closure::validate(self.graph.identity, &self.graph.graph, catalog_composition)?;
         Ok(AggregateReplayTxn {
             graph: self.graph,
             phase: RetentionAuthorityPending(PrivateSeal),
@@ -403,7 +935,7 @@ impl AggregateReplayTxn<CodecQuarantined> {
     pub(super) fn close_codec_for_test(
         self,
     ) -> Result<Q2CodecClosedSemanticsV2, crate::EngineError> {
-        let pending = self.close_codec()?;
+        let pending = self.close_codec(None)?;
         if !matches!(
             &pending.graph.graph.response,
             graph::RetainedResponseEnvelope::Empty(_)
@@ -448,6 +980,852 @@ impl AggregateReplayTxn<RetentionAuthorityPending> {
             },
         })
     }
+
+    /// Consume the closed retained graph into the first production recovery artifact.  The
+    /// current vertical is one table generation composed from one or more INSERT statements;
+    /// indexed, published-sequence, and logical-RETURNING breadth remains one statement until
+    /// those device closures are composed too. Published sequence receipts and logical
+    /// RETURNING projections have already been closed against S2/S4/S5/S6/S7; neither needs a
+    /// second replay action because sequence transitions are independently ordered durable
+    /// records and RETURNING is not table state. Transaction mode is already authenticated by
+    /// the aggregate flag and may be claimed autocommit or explicit COMMIT. Unsupported v2
+    /// breadth stays rejected rather than falling back through the legacy engine-operation
+    /// decoder.
+    pub(super) fn into_replay_artifact(
+        self,
+        catalog_composition: Option<&crate::wal_binary::BinaryTransactionRecord>,
+    ) -> Result<SemanticsV2ReplayArtifact, crate::EngineError> {
+        let AggregateReplayTxn { graph, phase: _ } = self;
+        let RetainedSemanticsV2Graph { identity, graph } = graph;
+        if graph.tables.len() > 1 {
+            return into_plural_replay_artifact(identity, graph);
+        }
+        let private_sequence_publications = private_sequence_publications_from_graph(&graph)?;
+        let statement_count = graph.statements.len();
+        if statement_count == 0
+            || graph.records.len() != statement_count
+            || graph.outcomes.len() != statement_count
+            || graph.tables.len() != 1
+            || graph.images.len() != 1
+            || graph.resolutions.len() != statement_count
+            || !matches!(graph.response, graph::RetainedResponseEnvelope::Empty(_))
+        {
+            return Err(replay_error(
+                "v2 aggregate is outside the one-table generic INSERT recovery vertical",
+            ));
+        }
+        let record = graph
+            .records
+            .first()
+            .expect("nonempty checked retained records");
+        let record_facts = record.facts();
+        let target = record.target_identity();
+        let target_schema: Box<str> = target.schema.into();
+        let target_name: Box<str> = target.name.into();
+        let table = graph.tables.first().expect("one checked retained table");
+        let total_rows = graph.records.iter().try_fold(0_u32, |total, record| {
+            total
+                .checked_add(record.facts().row_count)
+                .ok_or_else(|| replay_error("v2 aggregate row count overflows"))
+        })?;
+        let surviving_rows = u64::from(table.transition_count);
+        let expected_final_logical_row_count = if table.resets_existing_rows {
+            surviving_rows
+        } else {
+            table
+                .initial_logical_row_count
+                .checked_add(surviving_rows)
+                .ok_or_else(|| replay_error("v2 aggregate logical row count overflows"))?
+        };
+        let statements_are_exact = graph
+            .records
+            .iter()
+            .zip(&graph.statements)
+            .zip(&graph.resolutions)
+            .zip(&graph.outcomes)
+            .enumerate()
+            .all(|(ordinal, (((record, statement), resolution), outcome))| {
+                let facts = record.facts();
+                let target = record.target_identity();
+                facts.statement_ordinal.as_u32() as usize == ordinal
+                    && statement.statement_ordinal as usize == ordinal
+                    && resolution.statement_ordinal as usize == ordinal
+                    && outcome.statement_ordinal as usize == ordinal
+                    && facts.typed_statement_digest == statement.typed_statement_digest
+                    && facts.typed_statement_digest == resolution.typed_statement_digest
+                    && facts.typed_statement_digest == outcome.typed_statement_digest
+                    && facts.row_count != 0
+                    && facts.column_count == record_facts.column_count
+                    && target.schema == target_schema.as_ref()
+                    && target.name == target_name.as_ref()
+                    && facts.target.oid == table.display_oid
+                    && resolution.table_ref == 0
+                    && resolution.affected_row_count == u64::from(facts.row_count)
+                    && outcome.outcome.affected_rows == u64::from(facts.row_count)
+                    && outcome.outcome.kind == gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
+            });
+        // Codec closure has already proved the complete target-index and FK supporting-index
+        // descriptor/effect graph. Replay publishes only target-owned generations; immutable
+        // parent descriptors remain validation evidence and must not become apply authorities.
+        let target_indexes = graph
+            .indexes
+            .iter()
+            .filter(|index| index.owner_table_ref == 0)
+            .collect::<Vec<_>>();
+        let indexed_shape = target_indexes
+            .iter()
+            .all(|index| (1..=32).contains(&index.key_count));
+        if !statements_are_exact
+            || total_rows == 0
+            || record_facts.column_count == 0
+            || record_facts.target.oid != table.display_oid
+            || graph.records.last().is_none_or(|record| {
+                record.facts().target.schema_digest != table.schema_digest
+                    && !codec_closure::terminal_s3_sequence_rename_closes_table_schema(
+                        table,
+                        Some(record),
+                        catalog_composition,
+                    )
+            })
+            || table.disposition_count != total_rows
+            || table.transition_count > total_rows
+            || (table.transition_count != 0
+                && (table.data_generation_after != identity.commit_sequence
+                    || table.data_generation_after <= table.data_generation_before
+                    || table.final_table_root == table.initial_table_root
+                    || graph.header.final_database_root == identity.initial_database_root))
+            || (table.transition_count == 0
+                && (table.data_generation_after != table.data_generation_before
+                    || table.final_table_root != table.initial_table_root
+                    || graph.header.final_database_root != identity.initial_database_root))
+            || table.catalog_epoch != identity.catalog_epoch
+            || table.final_logical_row_count != expected_final_logical_row_count
+            || graph.header.final_database_root == [0; 32]
+            || !indexed_shape
+        {
+            return Err(replay_error(
+                "closed v2 aggregate retained facts do not form one generic INSERT replay artifact",
+            ));
+        }
+        let row_sources = graph
+            .transitions
+            .iter()
+            .enumerate()
+            .map(|(row, transition)| {
+                let row = u32::try_from(row)
+                    .map_err(|_| replay_error("v2 transition ordinal exceeds u32"))?;
+                let source_record = graph
+                    .records
+                    .get(transition.source_statement_ordinal as usize)
+                    .ok_or_else(|| replay_error("v2 transition source statement is absent"))?;
+                let source_disposition = graph
+                    .dispositions
+                    .get(transition.source_disposition_ref as usize)
+                    .ok_or_else(|| replay_error("v2 transition source disposition is absent"))?;
+                if transition.transition_ref != row
+                    || transition.table_ref != 0
+                    || transition.stable_row_id
+                        != table
+                            .row_allocator_before
+                            .checked_add(u64::from(row))
+                            .ok_or_else(|| replay_error("v2 transition row identity overflows"))?
+                    || transition.image_ref != 0
+                    || transition.image_row_ordinal != row
+                    || source_disposition.disposition != 1
+                    || source_disposition.transition_ref != transition.transition_ref
+                    || source_disposition.table_ref != transition.table_ref
+                    || source_disposition.stable_row_id != transition.stable_row_id
+                    || source_disposition.statement_ordinal != transition.source_statement_ordinal
+                    || source_disposition.source_row_ordinal != transition.source_row_ordinal
+                    || source_disposition.typed_statement_digest
+                        != transition.typed_statement_digest
+                    || (transition.final_writer_statement_digest == [0; 32]
+                        && transition.final_writer_statement_ordinal
+                            != transition.source_statement_ordinal)
+                    || (transition.final_writer_statement_digest != [0; 32]
+                        && transition.final_writer_statement_ordinal
+                            <= transition.source_statement_ordinal)
+                    || transition.source_row_ordinal >= source_record.facts().row_count
+                    || transition.typed_statement_digest
+                        != source_record.facts().typed_statement_digest
+                {
+                    return Err(replay_error(
+                        "v2 transition does not retain an exact composed statement-row source",
+                    ));
+                }
+                Ok(
+                    crate::engine_transaction_delta::TypedInsertRuntimeGenerationRowSource {
+                        stable_row_id: transition.stable_row_id,
+                        statement_ordinal: transition.source_statement_ordinal,
+                        source_row_ordinal: transition.source_row_ordinal,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, crate::EngineError>>()?
+            .into_boxed_slice();
+        if row_sources.len() != table.transition_count as usize {
+            return Err(replay_error(
+                "v2 transition sources do not exhaust the combined final image",
+            ));
+        }
+        let indexes = replay_indexes_for_table(&identity, &graph, table, 0, record)?;
+        let final_image = graph
+            .images
+            .into_iter()
+            .next()
+            .expect("one checked retained image");
+        let metadata = SemanticsV2ReplayMetadata {
+            canonical_identity: gpu_db_wal::CanonicalIdentity {
+                database_id: identity.database_id,
+                cluster_id: identity.cluster_id,
+                timeline_id: identity.timeline_id,
+                format_epoch: identity.format_epoch,
+            },
+            leader_epoch: identity.leader_epoch,
+            stable_transaction_id: identity.stable_transaction_id,
+            request_digest: identity.request_digest,
+            autocommit: identity.autocommit,
+            commit_sequence: identity.commit_sequence,
+            catalog_epoch: identity.catalog_epoch,
+            catalog_digest: identity.catalog_digest,
+            statement_count: u32::try_from(statement_count)
+                .map_err(|_| replay_error("v2 statement count exceeds u32"))?,
+            typed_statement_digest: if statement_count == 1 {
+                record_facts.typed_statement_digest
+            } else {
+                [0; 32]
+            },
+            stable_table_id: table.stable_table_id,
+            display_oid: table.display_oid,
+            table_schema_digest: table.schema_digest,
+            data_generation_before: table.data_generation_before,
+            data_generation_after: table.data_generation_after,
+            row_allocator_before: table.row_allocator_before,
+            row_allocator_high_water: table.row_allocator_high_water,
+            initial_logical_row_count: table.initial_logical_row_count,
+            final_logical_row_count: table.final_logical_row_count,
+            resets_existing_rows: table.resets_existing_rows,
+            initial_table_absent: table.initial_table_absent,
+            initial_table_root: table.initial_table_root,
+            final_table_root: table.final_table_root,
+            initial_database_root: identity.initial_database_root,
+            final_database_root: graph.header.final_database_root,
+            image_layout_digest: table.image_layout_digest,
+            image_content_digest: table.image_content_digest,
+            affected_rows: u64::from(total_rows),
+        };
+        Ok(SemanticsV2ReplayArtifact {
+            metadata,
+            tables: vec![SemanticsV2ReplayTableArtifact {
+                metadata,
+                table_ref: 0,
+                target_schema,
+                target_name,
+                indexes,
+                row_sources,
+                final_image,
+            }]
+            .into_boxed_slice(),
+            private_sequence_publications: private_sequence_publications.publications,
+            private_sequence_name_changes: private_sequence_publications.name_changes,
+            catalog_composition: None,
+        })
+    }
+}
+
+fn replay_indexes_for_table(
+    identity: &SemanticsV2BoundIdentity,
+    graph: &graph::ReservedSemanticsV2Graph,
+    table: &graph::RetainedTable,
+    table_ref: u32,
+    record: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+) -> Result<Box<[SemanticsV2ReplayIndex]>, crate::EngineError> {
+    let record_facts = record.facts();
+    let target_indexes = graph
+        .indexes
+        .iter()
+        .filter(|index| index.owner_table_ref == table_ref)
+        .collect::<Vec<_>>();
+    // The S7 table block is the existing authority for first-generation absence. A named
+    // index created with that table therefore has the paired zero predecessor consumed by the
+    // same replay action; published-table indexes still require an authenticated nonzero base.
+    let index_predecessor_is_absent = table.initial_table_absent;
+    target_indexes
+        .into_iter()
+        .enumerate()
+        .map(|(raw_catalog_ordinal, index)| {
+            let source = record
+                .indexes()
+                .find(|source| source.raw_ordinal == index.raw_catalog_ordinal);
+            // Rows inserted before a transaction-local CREATE INDEX have no S2 binding for
+            // that future index. S7 proves its paired-zero generation and S3 later supplies
+            // the exact catalog identity; all other index descriptors remain S2-backed.
+            let s3_created_on_existing_table = source.is_none()
+                && !index_predecessor_is_absent
+                && index.base_index_generation == 0
+                && index.base_index_root == [0; 32];
+            if source.is_none() && !s3_created_on_existing_table {
+                #[cfg(feature = "probe-timing")]
+                eprintln!(
+                    "[probe] codec5_replay_index_source_missing oid={} raw={} record_indexes={:?}",
+                    index.display_oid,
+                    index.raw_catalog_ordinal,
+                    record
+                        .indexes()
+                        .map(|source| (source.oid, source.raw_ordinal))
+                        .collect::<Vec<_>>(),
+                );
+                return Err(replay_error(
+                    "closed v2 aggregate index descriptor has no sealed S2 source",
+                ));
+            }
+            let keys = graph
+                .index_key_columns
+                .iter()
+                .filter(|key| key.index_ref == index.index_ref)
+                .map(|key| SemanticsV2ReplayIndexKey {
+                    key_ordinal: key.key_ordinal,
+                    catalog_column_ordinal: key.owner_catalog_column_ordinal,
+                    stable_column_id: key.stable_column_id,
+                    attnum: key.attnum,
+                    storage: key.storage,
+                    declared_type_oid: key.declared_type_oid,
+                    signed_type_size: key.signed_type_size,
+                    column_name_digest: key.column_name_digest,
+                })
+                .collect::<Vec<_>>();
+            let expected_flags = source.map_or(index.flags, |source| {
+                u32::from(source.unique)
+                    | (u32::from(source.primary_key) << 1)
+                    | (u32::from(source.unique_constraint) << 2)
+                    | (1 << 3)
+            });
+            let constraint_backed = source.map_or_else(
+                || index.flags & ((1 << 1) | (1 << 2)) != 0,
+                |source| source.primary_key || source.unique_constraint,
+            );
+            if index.owner_table_ref != table_ref
+                || usize::try_from(index.raw_catalog_ordinal).ok() != Some(raw_catalog_ordinal)
+                || index.stable_index_id == 0
+                || index.display_oid == 0
+                || index.stable_index_id != u64::from(index.display_oid)
+                || index.stable_constraint_id
+                    != if constraint_backed {
+                        index.stable_index_id
+                    } else {
+                        u64::MAX
+                    }
+                || index.constraint_display_oid
+                    != if constraint_backed {
+                        index.display_oid
+                    } else {
+                        0
+                    }
+                || index.constraint_name_digest
+                    != if constraint_backed {
+                        index.index_name_digest
+                    } else {
+                        [0; 32]
+                    }
+                || index.flags != expected_flags
+                || source.is_none()
+                    && (index.flags & !0b1111 != 0
+                        || index.flags & (1 << 3) == 0
+                        || index.flags & ((1 << 1) | (1 << 2)) != 0 && index.flags & 1 == 0)
+                || index.null_equality_policy != 1
+                || index.key_count == 0
+                || index.key_count > 32
+                || index.catalog_epoch != identity.catalog_epoch
+                || index.owner_stable_table_id != table.stable_table_id
+                || index.owner_display_oid != table.display_oid
+                || index.owner_schema_digest != table.schema_digest
+                || index.owner_table_base_root != table.initial_table_root
+                || (index.base_index_root == [0; 32]
+                    && !index_predecessor_is_absent
+                    && index.base_index_generation != 0)
+                || index.final_index_root == [0; 32]
+                || index.base_index_root == index.final_index_root
+                || index.owner_data_generation != table.data_generation_before
+                || (index.base_index_generation == 0
+                    && !index_predecessor_is_absent
+                    && index.base_index_root != [0; 32])
+                || index.base_index_generation > table.data_generation_before
+                || index.final_index_generation != table.data_generation_after
+                || keys.len() != index.key_count as usize
+                || keys.iter().enumerate().any(|(ordinal, key)| {
+                    key.key_ordinal as usize != ordinal
+                        || key.catalog_column_ordinal as usize >= record_facts.column_count as usize
+                })
+            {
+                return Err(replay_error(
+                    "closed v2 aggregate named-index generation exceeds the recovery vertical",
+                ));
+            }
+            Ok(SemanticsV2ReplayIndex {
+                stable_index_id: index.stable_index_id,
+                raw_catalog_ordinal: index.raw_catalog_ordinal,
+                display_oid: index.display_oid,
+                name: source.map_or_else(|| Box::from(""), |source| source.name.into()),
+                flags: index.flags,
+                null_equality_policy: index.null_equality_policy,
+                base_generation: index.base_index_generation,
+                base_root: index.base_index_root,
+                final_generation: index.final_index_generation,
+                final_root: index.final_index_root,
+                key_columns: keys.into_boxed_slice(),
+                s3_created_on_existing_table,
+            })
+        })
+        .collect::<Result<Vec<_>, crate::EngineError>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn into_plural_replay_artifact(
+    identity: SemanticsV2BoundIdentity,
+    graph: graph::ReservedSemanticsV2Graph,
+) -> Result<SemanticsV2ReplayArtifact, crate::EngineError> {
+    let private_sequence_publications = private_sequence_publications_from_graph(&graph)?;
+    let statement_count = graph.statements.len();
+    if statement_count == 0
+        || graph.tables.len() < 2
+        || graph.images.len() != graph.tables.len()
+        || graph.records.len() != statement_count
+        || graph.outcomes.len() != statement_count
+        || graph.resolutions.len() != statement_count
+        || !matches!(graph.response, graph::RetainedResponseEnvelope::Empty(_))
+    {
+        return Err(replay_error(
+            "plural v2 aggregate is outside the generic INSERT recovery vertical",
+        ));
+    }
+    let total_rows = graph.records.iter().try_fold(0_u64, |total, record| {
+        total
+            .checked_add(u64::from(record.facts().row_count))
+            .ok_or_else(|| replay_error("plural v2 aggregate row count overflows"))
+    })?;
+    if total_rows == 0 || graph.header.final_database_root == [0; 32] {
+        return Err(replay_error(
+            "plural v2 aggregate has no rows or final database root",
+        ));
+    }
+    for (ordinal, (((record, statement), resolution), outcome)) in graph
+        .records
+        .iter()
+        .zip(&graph.statements)
+        .zip(&graph.resolutions)
+        .zip(&graph.outcomes)
+        .enumerate()
+    {
+        let facts = record.facts();
+        let table = graph
+            .tables
+            .get(resolution.table_ref as usize)
+            .ok_or_else(|| replay_error("plural statement target table is absent"))?;
+        if facts.statement_ordinal.as_u32() as usize != ordinal
+            || statement.statement_ordinal as usize != ordinal
+            || resolution.statement_ordinal as usize != ordinal
+            || outcome.statement_ordinal as usize != ordinal
+            || resolution.record_ref as usize != ordinal
+            || resolution.outcome_ref as usize != ordinal
+            || facts.typed_statement_digest != statement.typed_statement_digest
+            || facts.typed_statement_digest != resolution.typed_statement_digest
+            || facts.typed_statement_digest != outcome.typed_statement_digest
+            || facts.row_count == 0
+            || facts.column_count == 0
+            || facts.target.oid != table.display_oid
+            || resolution.affected_row_count != u64::from(facts.row_count)
+            || outcome.outcome.affected_rows != u64::from(facts.row_count)
+            || outcome.outcome.kind != gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
+        {
+            return Err(replay_error(
+                "plural v2 statement directory is not an exact committed INSERT mapping",
+            ));
+        }
+    }
+
+    let canonical_identity = gpu_db_wal::CanonicalIdentity {
+        database_id: identity.database_id,
+        cluster_id: identity.cluster_id,
+        timeline_id: identity.timeline_id,
+        format_epoch: identity.format_epoch,
+    };
+    let mut pending_tables = Vec::with_capacity(graph.tables.len());
+    let mut allocator_intervals = Vec::with_capacity(graph.tables.len());
+    for (table_ref, table) in graph.tables.iter().enumerate() {
+        let table_ref = u32::try_from(table_ref)
+            .map_err(|_| replay_error("plural table reference exceeds u32"))?;
+        if table.table_ref != table_ref
+            || table.image_ref != table_ref
+            || table.catalog_epoch != identity.catalog_epoch
+            || (table.initial_table_root == [0; 32] && !table.initial_table_absent)
+            || table.final_table_root == [0; 32]
+        {
+            return Err(replay_error(
+                "plural v2 table block exceeds the generic recovery shape",
+            ));
+        }
+        let table_rows = graph
+            .resolutions
+            .iter()
+            .filter(|resolution| resolution.table_ref == table_ref)
+            .try_fold(0_u64, |rows, resolution| {
+                rows.checked_add(resolution.affected_row_count)
+                    .ok_or_else(|| replay_error("plural table row count overflows"))
+            })?;
+        let surviving_rows = u64::from(table.transition_count);
+        let expected_final_rows = if table.resets_existing_rows {
+            surviving_rows
+        } else {
+            table
+                .initial_logical_row_count
+                .checked_add(surviving_rows)
+                .ok_or_else(|| replay_error("plural table logical row count overflows"))?
+        };
+        let expected_allocator_high_water = table
+            .row_allocator_before
+            .checked_add(table_rows)
+            .ok_or_else(|| replay_error("plural table allocator interval overflows"))?;
+        if u64::from(table.disposition_count) != table_rows
+            || surviving_rows > table_rows
+            || table.final_logical_row_count != expected_final_rows
+            || table.row_allocator_high_water != expected_allocator_high_water
+            || (surviving_rows != 0
+                && (table.data_generation_after != identity.commit_sequence
+                    || table.data_generation_after <= table.data_generation_before
+                    || table.initial_table_root == table.final_table_root))
+            || (surviving_rows == 0
+                && (table.data_generation_after != table.data_generation_before
+                    || table.initial_table_root != table.final_table_root))
+        {
+            return Err(replay_error(
+                "plural table rows do not close their allocator and logical intervals",
+            ));
+        }
+        allocator_intervals.push((table.row_allocator_before, table.row_allocator_high_water));
+        let first_resolution = graph
+            .resolutions
+            .iter()
+            .find(|resolution| resolution.table_ref == table_ref)
+            .ok_or_else(|| replay_error("plural table has no source statement"))?;
+        let first_record = graph
+            .records
+            .get(first_resolution.record_ref as usize)
+            .ok_or_else(|| replay_error("plural table source record is absent"))?;
+        let first_target = first_record.target_identity();
+        if graph
+            .resolutions
+            .iter()
+            .filter(|resolution| resolution.table_ref == table_ref)
+            .any(|resolution| {
+                graph
+                    .records
+                    .get(resolution.record_ref as usize)
+                    .is_none_or(|record| {
+                        let target = record.target_identity();
+                        target.schema != first_target.schema
+                            || target.name != first_target.name
+                            || target.oid != table.display_oid
+                            || record.facts().column_count != table.catalog_column_count
+                    })
+            })
+        {
+            return Err(replay_error(
+                "plural table statements do not share one exact target shape",
+            ));
+        }
+        let indexes = if surviving_rows == 0 {
+            if graph
+                .indexes
+                .iter()
+                .any(|index| index.owner_table_ref == table_ref)
+            {
+                return Err(replay_error(
+                    "neutral plural table retained an index publication authority",
+                ));
+            }
+            Box::new([])
+        } else {
+            replay_indexes_for_table(&identity, &graph, table, table_ref, first_record)?
+        };
+        let transition_start = table.transition_start as usize;
+        let transition_end = transition_start
+            .checked_add(table.transition_count as usize)
+            .ok_or_else(|| replay_error("plural transition range overflows"))?;
+        let transitions = graph
+            .transitions
+            .get(transition_start..transition_end)
+            .ok_or_else(|| replay_error("plural table transition range is absent"))?;
+        let row_sources = transitions
+            .iter()
+            .enumerate()
+            .map(|(local_row, transition)| {
+                let local_row = u32::try_from(local_row)
+                    .map_err(|_| replay_error("plural table row ordinal exceeds u32"))?;
+                let transition_ref = table
+                    .transition_start
+                    .checked_add(local_row)
+                    .ok_or_else(|| replay_error("plural transition reference overflows"))?;
+                let stable_row_id = table
+                    .row_allocator_before
+                    .checked_add(u64::from(local_row))
+                    .ok_or_else(|| replay_error("plural stable row identity overflows"))?;
+                let source_record = graph
+                    .records
+                    .get(transition.source_statement_ordinal as usize)
+                    .ok_or_else(|| replay_error("plural transition source statement is absent"))?;
+                let source_resolution = graph
+                    .resolutions
+                    .get(transition.source_statement_ordinal as usize)
+                    .ok_or_else(|| replay_error("plural transition source resolution is absent"))?;
+                if transition.transition_ref != transition_ref
+                    || transition.table_ref != table_ref
+                    || transition.stable_row_id != stable_row_id
+                    || transition.image_ref != table_ref
+                    || transition.image_row_ordinal != local_row
+                    || (transition.final_writer_statement_digest == [0; 32]
+                        && transition.final_writer_statement_ordinal
+                            != transition.source_statement_ordinal)
+                    || (transition.final_writer_statement_digest != [0; 32]
+                        && transition.final_writer_statement_ordinal
+                            <= transition.source_statement_ordinal)
+                    || source_resolution.table_ref != table_ref
+                    || transition.source_row_ordinal >= source_record.facts().row_count
+                    || transition.typed_statement_digest
+                        != source_record.facts().typed_statement_digest
+                {
+                    return Err(replay_error(
+                        "plural transition does not retain its exact table-local row source",
+                    ));
+                }
+                Ok(
+                    crate::engine_transaction_delta::TypedInsertRuntimeGenerationRowSource {
+                        stable_row_id: transition.stable_row_id,
+                        statement_ordinal: transition.source_statement_ordinal,
+                        source_row_ordinal: transition.source_row_ordinal,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, crate::EngineError>>()?
+            .into_boxed_slice();
+        let metadata = SemanticsV2ReplayMetadata {
+            canonical_identity,
+            leader_epoch: identity.leader_epoch,
+            stable_transaction_id: identity.stable_transaction_id,
+            request_digest: identity.request_digest,
+            autocommit: identity.autocommit,
+            commit_sequence: identity.commit_sequence,
+            catalog_epoch: identity.catalog_epoch,
+            catalog_digest: identity.catalog_digest,
+            statement_count: u32::try_from(statement_count)
+                .map_err(|_| replay_error("plural statement count exceeds u32"))?,
+            typed_statement_digest: [0; 32],
+            stable_table_id: table.stable_table_id,
+            display_oid: table.display_oid,
+            table_schema_digest: table.schema_digest,
+            data_generation_before: table.data_generation_before,
+            data_generation_after: table.data_generation_after,
+            row_allocator_before: table.row_allocator_before,
+            row_allocator_high_water: table.row_allocator_high_water,
+            initial_logical_row_count: table.initial_logical_row_count,
+            final_logical_row_count: table.final_logical_row_count,
+            resets_existing_rows: table.resets_existing_rows,
+            initial_table_absent: table.initial_table_absent,
+            initial_table_root: table.initial_table_root,
+            final_table_root: table.final_table_root,
+            initial_database_root: identity.initial_database_root,
+            final_database_root: graph.header.final_database_root,
+            image_layout_digest: table.image_layout_digest,
+            image_content_digest: table.image_content_digest,
+            affected_rows: table_rows,
+        };
+        pending_tables.push((
+            metadata,
+            table_ref,
+            Box::<str>::from(first_target.schema),
+            Box::<str>::from(first_target.name),
+            indexes,
+            row_sources,
+        ));
+    }
+    allocator_intervals.sort_unstable_by_key(|interval| interval.0);
+    let global_allocator_before = allocator_intervals
+        .first()
+        .map(|interval| interval.0)
+        .ok_or_else(|| replay_error("plural allocator interval is absent"))?;
+    let mut global_allocator_high_water = global_allocator_before;
+    for (start, end) in allocator_intervals {
+        if start != global_allocator_high_water || end <= start {
+            return Err(replay_error(
+                "plural table allocator intervals do not form one exact transaction range",
+            ));
+        }
+        global_allocator_high_water = end;
+    }
+    if global_allocator_high_water
+        != global_allocator_before
+            .checked_add(total_rows)
+            .ok_or_else(|| replay_error("plural transaction allocator range overflows"))?
+    {
+        return Err(replay_error(
+            "plural allocator range does not equal the transaction row count",
+        ));
+    }
+    let mut tables = Vec::with_capacity(pending_tables.len());
+    for ((metadata, table_ref, target_schema, target_name, indexes, row_sources), final_image) in
+        pending_tables.into_iter().zip(graph.images)
+    {
+        tables.push(SemanticsV2ReplayTableArtifact {
+            metadata,
+            table_ref,
+            target_schema,
+            target_name,
+            indexes,
+            row_sources,
+            final_image,
+        });
+    }
+    let mut metadata = tables
+        .first()
+        .ok_or_else(|| replay_error("plural replay table artifact is absent"))?
+        .metadata;
+    metadata.row_allocator_before = global_allocator_before;
+    metadata.row_allocator_high_water = global_allocator_high_water;
+    metadata.affected_rows = total_rows;
+    Ok(SemanticsV2ReplayArtifact {
+        metadata,
+        tables: tables.into_boxed_slice(),
+        private_sequence_publications: private_sequence_publications.publications,
+        private_sequence_name_changes: private_sequence_publications.name_changes,
+        catalog_composition: None,
+    })
+}
+
+fn private_sequence_publications_from_graph(
+    graph: &graph::ReservedSemanticsV2Graph,
+) -> Result<PrivateSequenceReplayPublications, crate::EngineError> {
+    let mut final_states = std::collections::BTreeMap::<u32, (Box<str>, i64, bool)>::new();
+    let mut name_changes = std::collections::BTreeMap::<u32, (Box<str>, Box<str>)>::new();
+    for record in &graph.records {
+        for source in record.sequence_effects() {
+            if !matches!(
+                source.kind,
+                crate::typed_insert_batch::DecodedSequenceEffectKindFacts::Private { .. }
+            ) {
+                continue;
+            }
+            let mut bindings = record
+                .sequence_bindings()
+                .filter(|binding| binding.effect_ordinal == source.request.effect_ordinal);
+            let binding = bindings.next().ok_or_else(|| {
+                replay_error("private sequence replay effect has no strict S2 binding")
+            })?;
+            if bindings.next().is_some() || binding.request != source.request {
+                return Err(replay_error(
+                    "private sequence replay effect has a noncanonical S2 binding",
+                ));
+            }
+            record_private_sequence_final_state(
+                &mut final_states,
+                &mut name_changes,
+                source.request.sequence_oid,
+                binding.effective_name,
+                source.resolved_value,
+                true,
+            )?;
+        }
+    }
+    for effect in &graph.sequence_effects {
+        let Some(restart) = effect.terminal_restart else {
+            continue;
+        };
+        let record = graph
+            .records
+            .get(effect.statement_ordinal as usize)
+            .ok_or_else(|| replay_error("terminal sequence restart has no S2 record"))?;
+        let source = record
+            .sequence_effects()
+            .find(|source| source.request.effect_ordinal == effect.effect_ordinal)
+            .ok_or_else(|| replay_error("terminal sequence restart has no S2 source"))?;
+        let binding = record
+            .sequence_bindings()
+            .find(|binding| binding.effect_ordinal == effect.effect_ordinal)
+            .ok_or_else(|| replay_error("terminal sequence restart has no S2 binding"))?;
+        if restart.sequence_oid != source.request.sequence_oid
+            || restart.descriptor_digest != binding.descriptor_digest
+        {
+            return Err(replay_error(
+                "terminal sequence restart changed its stable S2 identity",
+            ));
+        }
+        record_private_sequence_final_state(
+            &mut final_states,
+            &mut name_changes,
+            restart.sequence_oid,
+            binding.effective_name,
+            restart.last_value,
+            false,
+        )?;
+    }
+    Ok(PrivateSequenceReplayPublications {
+        publications: final_states
+            .into_iter()
+            .map(|(sequence_oid, (name, last_value, is_called))| {
+                crate::engine_commit::LiveTypedPrivateSequencePublication {
+                    name,
+                    sequence_oid,
+                    last_value,
+                    is_called,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        name_changes: name_changes
+            .into_iter()
+            .map(
+                |(sequence_oid, (before_name, after_name))| PrivateSequenceNameChange {
+                    sequence_oid,
+                    before_name,
+                    after_name,
+                },
+            )
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    })
+}
+
+fn record_private_sequence_final_state(
+    final_states: &mut std::collections::BTreeMap<u32, (Box<str>, i64, bool)>,
+    name_changes: &mut std::collections::BTreeMap<u32, (Box<str>, Box<str>)>,
+    sequence_oid: u32,
+    name: &str,
+    last_value: i64,
+    is_called: bool,
+) -> Result<(), crate::EngineError> {
+    let next_name: Box<str> = name.into();
+    if let Some((current_name, _, _)) = final_states.get(&sequence_oid) {
+        if current_name.as_ref() != next_name.as_ref() {
+            match name_changes.entry(sequence_oid) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((current_name.clone(), next_name.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().1.as_ref() == next_name.as_ref() => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(replay_error(
+                        "private sequence replay effect has more than one stable-OID rename",
+                    ));
+                }
+            }
+        }
+    }
+    final_states.insert(sequence_oid, (next_name, last_value, is_called));
+    Ok(())
+}
+
+fn replay_error(message: &str) -> crate::EngineError {
+    crate::EngineError::Durability(format!(
+        "typed INSERT aggregate semantics-v2 replay: {message}"
+    ))
 }
 
 impl<'retention> AggregateReplayTxn<CatalogAllocatorPending<'retention>> {
@@ -500,6 +1878,49 @@ impl<'retention, 'catalog> AggregateReplayTxn<DurableSequencePending<'retention,
                 allocator_index: self.phase.allocator_index,
                 allocator_assignment: self.phase.allocator_assignment,
                 sequence_index,
+                seal: PrivateSeal,
+            },
+        })
+    }
+}
+
+impl<'retention, 'catalog, 'sequence>
+    AggregateReplayTxn<GenerationPending<'retention, 'catalog, 'sequence>>
+{
+    /// Consume the fully witness-bound replay owner through the sole neutral generation builder.
+    /// Builder reservation is the final fallible operation before launch; every launched path
+    /// subsequently proves quiescence or parks all backing in the pre-reserved quarantine.
+    #[allow(dead_code)]
+    pub(self) fn validate_generation<B>(
+        self,
+        builder: B,
+        quarantine_registry: &generation_validation::GenerationQuarantineRegistry<
+            B::Candidate,
+            B::Work,
+        >,
+    ) -> Result<
+        AggregateReplayTxn<GenerationValidated<'retention, 'catalog, 'sequence, B::Candidate>>,
+        crate::EngineError,
+    >
+    where
+        B: generation_validation::SemanticsV2ReservedGenerationBuilder,
+    {
+        let AggregateReplayTxn { graph, phase } = self;
+        let generation = generation_validation::validate_reserved_graph(
+            &graph,
+            &phase.catalog,
+            builder,
+            quarantine_registry,
+        )?;
+        Ok(AggregateReplayTxn {
+            graph,
+            phase: GenerationValidated {
+                authority: phase.authority,
+                catalog: phase.catalog,
+                allocator_index: phase.allocator_index,
+                allocator_assignment: phase.allocator_assignment,
+                sequence_index: phase.sequence_index,
+                generation,
                 seal: PrivateSeal,
             },
         })
@@ -836,14 +2257,20 @@ impl<'a> GenerationPendingSemanticsV2<'a> {
 /// This is the first phase only: it deliberately cannot inspect, store, or accept a generation
 /// result. The complete graph validator consumes this proof before it constructs the pending
 /// owner and hands that owner to the sealed generation-builder interface.
-#[allow(dead_code)]
-pub(super) fn validate_catalog_allocator_witness_identity(
+fn validate_catalog_allocator_witness_identity(
     identity: SemanticsV2BoundIdentity,
+    graph: &graph::ReservedSemanticsV2Graph,
     witness: &SemanticsV2CatalogAllocatorWitness<'_>,
 ) -> Result<(), crate::EngineError> {
     let catalog = &witness.catalog;
+    // The sole fresh-catalog exception is already authenticated by S7: every target must be the
+    // transaction's initially absent table.  Any append/reset/table mix still requires a
+    // nonzero catalog predecessor, so this does not create a second bootstrap or recovery path.
+    let genesis_first_table = identity.catalog_epoch == 0
+        && !graph.tables.is_empty()
+        && graph.tables.iter().all(|table| table.initial_table_absent);
     if identity.database_id == [0; 16]
-        || identity.catalog_epoch == 0
+        || (identity.catalog_epoch == 0 && !genesis_first_table)
         || identity.catalog_digest == [0; 32]
         || identity.cluster_id == [0; 16]
         || identity.timeline_id == [0; 16]
@@ -990,11 +2417,7 @@ mod replay_shell_source_guards {
             );
         }
         let catalog_module = ["#[path = \"", "retained/catalog_validation.rs\"]"].concat();
-        let generation_module = [
-            "#[cfg(test)]\n#[path = \"",
-            "retained/generation_validation.rs\"]",
-        ]
-        .concat();
+        let generation_module = ["#[path = \"", "retained/generation_validation.rs\"]"].concat();
         let q2_struct = [
             "#[cfg(test)]\npub(super) struct ",
             "Q2CodecClosedSemanticsV2",
@@ -1392,12 +2815,12 @@ mod generation_lifecycle_tests {
         let retention_pending =
             super::super::fill_canonical_semantics_v2_for_test(&outer, &outcome, &fragments)
                 .expect("checked-in minimal abort fixture fills retained owners")
-                .close_codec()
+                .close_codec(None)
                 .expect("checked-in minimal abort fixture closes codec witnesses");
         let live_retention_pending =
             super::super::fill_canonical_semantics_v2_for_test(&outer, &outcome, &fragments)
                 .expect("checked-in minimal abort fixture fills retained owners")
-                .close_codec()
+                .close_codec(None)
                 .expect("checked-in minimal abort fixture closes codec witnesses");
         let closed =
             super::super::fill_canonical_semantics_v2_for_test(&outer, &outcome, &fragments)

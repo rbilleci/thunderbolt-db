@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::engine_mutation_admission::validate_prepared_catalog_version;
+use crate::engine_transaction_reset::table_access_dependency_identities;
 
 mod index_identity;
 mod index_owner_generation;
@@ -72,7 +73,7 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         if !Self::transaction_catalog_command_is_supported(&command) {
             return Err(ExecuteError::Unsupported(
-                "transactional catalog staging currently supports CREATE TABLE, stored-view lifecycle, index lifecycle, and sequence lifecycle commands only"
+                "transactional catalog staging currently supports CREATE DOMAIN, CREATE TABLE, FOREIGN KEY, stored-view lifecycle, index lifecycle, and sequence lifecycle commands only"
                     .to_string(),
             ));
         }
@@ -137,7 +138,9 @@ impl Engine {
                     .iter()
                     .filter_map(|operation| match operation {
                         TransactionOperation::Catalog(staged) => Some(staged.as_ref().clone()),
-                        TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
+                        TransactionOperation::Row(_)
+                        | TransactionOperation::TableReset(_)
+                        | TransactionOperation::TypedInsert(_) => None,
                     })
                     .collect::<Vec<_>>(),
                 delta.catalog_overlay.clone(),
@@ -210,6 +213,24 @@ impl Engine {
                 .collect::<BTreeSet<_>>();
             snapshot.table_access.acquire_exclusive(identities)?;
         }
+        if let Command::AddForeignKey(add) = &command {
+            let access_catalog = prior_overlay
+                .as_deref()
+                .unwrap_or(snapshot.catalog.as_ref());
+            let mut identities = BTreeMap::new();
+            for table_name in [&add.table, &add.referenced_table] {
+                if let Some(table) = access_catalog.relational_catalog.get(table_name) {
+                    identities.extend(table_access_dependency_identities(
+                        &access_catalog.relational_catalog,
+                        table,
+                    )?);
+                }
+            }
+            self.acquire_transaction_write_table_access_identities(snapshot, &identities)?;
+            snapshot
+                .table_access
+                .acquire_exclusive(identities.values().copied())?;
+        }
 
         // Validation works on a private clone. The exact published base must still match the
         // statement snapshot; otherwise retryable serialization wins before any private state is
@@ -254,15 +275,23 @@ impl Engine {
                     })
                     .collect::<Vec<_>>(),
                 TransactionOperation::Row(_) => Vec::new(),
+                TransactionOperation::TypedInsert(_) => Vec::new(),
             })
             .collect::<BTreeSet<_>>();
-        let sequence_reference_records = self
+        let mut sequence_reference_records = self
             .prepare_sequence_lifecycle_reference_replay(
                 &mut working,
                 &sequence_value_references,
                 &sequence_lifecycle_oids,
+                false,
             )
             .map_err(ExecuteError::Engine)?;
+        Self::rebind_private_typed_sequence_replay_ordinals(
+            &mut sequence_reference_records,
+            &sequence_value_references,
+            &prior_operations,
+        )
+        .map_err(ExecuteError::Engine)?;
         let mut next_sequence_reference = 0usize;
         for (ordinal, operation) in prior_operations.iter().enumerate() {
             Self::apply_sequence_lifecycle_references_through(
@@ -303,7 +332,7 @@ impl Engine {
                     .map_err(ExecuteError::Engine)?;
             }
             self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
-                self.apply_transaction_catalog_command(&mut working, staged.command.clone())
+                self.apply_transaction_catalog_command(&mut working, staged.command.clone(), txn_id)
             })
             .map_err(ExecuteError::Engine)?;
             if let Some(identity) = &staged.view_identity {
@@ -358,7 +387,7 @@ impl Engine {
         let scoped = Self::catalog_snapshot_from_working(&working, snapshot.catalog.commit_seq);
         let index_epoch_before = working.index_oid_epoch_current;
         self.with_apply_catalog(Some(Arc::clone(&scoped)), || {
-            self.apply_transaction_catalog_command(&mut working, command.clone())
+            self.apply_transaction_catalog_command(&mut working, command.clone(), txn_id)
         })
         .map_err(ExecuteError::Engine)?;
         let index_epoch_transition = !index_epoch_before && working.index_oid_epoch_current;

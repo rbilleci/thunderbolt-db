@@ -359,9 +359,26 @@ pub(super) fn validate_private_effect(
     chains: &mut BTreeMap<u32, PrivateChain>,
 ) -> Result<(), EngineError> {
     let prior = chains.get(&view.request.sequence_oid).copied();
-    let next = validate_private_effect_state(view, parent, absolute, descriptor, evidence, prior)?;
+    let next = validate_private_effect_state(
+        view,
+        parent,
+        absolute,
+        descriptor,
+        evidence,
+        prior,
+        PrivateChainBoundary::Statement,
+    )?;
     chains.insert(view.request.sequence_oid, next);
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrivateChainBoundary {
+    /// A canonical statement may begin after a private effect from an earlier statement in the
+    /// same transaction. The aggregate validator must bind that external outcome exactly.
+    Statement,
+    /// No unbound outcome predecessor may enter the transaction aggregate.
+    Transaction,
 }
 
 pub(super) fn validate_private_effect_state(
@@ -371,6 +388,7 @@ pub(super) fn validate_private_effect_state(
     descriptor: gpu_db_wal::CanonicalDigest,
     evidence: PrivateEffectEvidence,
     previous: Option<PrivateChain>,
+    boundary: PrivateChainBoundary,
 ) -> Result<PrivateChain, EngineError> {
     let expected = if evidence.prior_is_called {
         evidence.prior_last_value.checked_add(1)
@@ -398,11 +416,16 @@ pub(super) fn validate_private_effect_state(
         {
             return Err(codec_error("private sequence predecessor chain drifted"));
         }
-    } else if !matches!(evidence.predecessor, PrivatePredecessor::Lifecycle(owner) if owner == evidence.owner)
-    {
-        return Err(codec_error(
-            "first private sequence effect lacks lifecycle predecessor",
-        ));
+    } else {
+        match evidence.predecessor {
+            PrivatePredecessor::Lifecycle(owner) if owner == evidence.owner => {}
+            PrivatePredecessor::Outcome(_) if boundary == PrivateChainBoundary::Statement => {}
+            _ => {
+                return Err(codec_error(
+                    "first private sequence effect lacks lifecycle predecessor",
+                ));
+            }
+        }
     }
     let child = private_child_digest(
         parent,

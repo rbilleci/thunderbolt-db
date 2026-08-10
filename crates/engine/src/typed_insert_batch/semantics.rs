@@ -17,6 +17,10 @@ pub(crate) struct PreparedTypedInsert {
     typed_statement_digest: gpu_db_wal::CanonicalDigest,
     returning: returning::BoundInsertReturning,
     sequence_requests: sequence_defaults::SequenceDefaultRequests,
+    /// Established bootstrap SQL policy: an omitted/DEFAULT cell for a column with no declared
+    /// default is not a live INSERT.  Capture this while semantic inputs and catalog defaults are
+    /// adjacent so later physical routes consume one scalar proof instead of rescanning rows.
+    missing_required_input: bool,
 }
 
 /// Immutable target identity retained by typed semantic preparation for a future effect owner.
@@ -57,14 +61,6 @@ impl PreparedTypedInsert {
         &self,
     ) -> Result<gpu_db_wal::CanonicalDigest, EngineError> {
         canonical_codec::returning_layout_digest(&self.returning)
-    }
-
-    pub(super) fn has_returning(&self) -> bool {
-        !self.returning.is_empty()
-    }
-
-    pub(super) fn has_sequence_requests(&self) -> bool {
-        !self.sequence_requests.is_empty()
     }
 
     /// Scalar target identity for the inert pre-WAL effect handoff. This borrows no value vector
@@ -113,7 +109,6 @@ impl PreparedTypedInsert {
         &self.returning
     }
 
-    #[cfg(test)]
     pub(crate) fn sequence_requests(&self) -> &[sequence_defaults::SequenceDefaultRequest] {
         self.sequence_requests.requests()
     }
@@ -141,8 +136,6 @@ impl PreparedTypedInsert {
     pub(crate) fn seal(
         mut self,
         sequence_bindings: sequence_defaults::SequenceDefaultBindings,
-        proof_only_indexed_constraints: bool,
-        foreign_key_proof_only: bool,
     ) -> Result<TypedInsertBatch, ExecuteError> {
         let rows =
             usize::try_from(self.row_count).expect("u32 always fits usize on supported hosts");
@@ -164,10 +157,6 @@ impl PreparedTypedInsert {
             )
             .into());
         }
-        #[cfg(not(test))]
-        let _ = proof_only_indexed_constraints;
-        #[cfg(not(test))]
-        let _ = foreign_key_proof_only;
         Ok(TypedInsertBatch {
             table: self.table,
             statement_ordinal: self.statement_ordinal,
@@ -179,10 +168,7 @@ impl PreparedTypedInsert {
             typed_statement_digest: self.typed_statement_digest,
             returning: self.returning,
             sequence_bindings,
-            #[cfg(test)]
-            proof_only_indexed_constraints,
-            #[cfg(test)]
-            foreign_key_proof_only,
+            missing_required_input: self.missing_required_input,
         })
     }
 }
@@ -261,22 +247,6 @@ pub(super) fn resolve_pre_semantic_insert<'a>(
     Ok(Some(semantics))
 }
 
-/// Does the shared resolved IR request any stateful sequence default?  This is a physical-route
-/// question only: no scalar value has been evaluated or synthesized at this boundary.
-pub(super) fn requests_sequence_default(semantics: &ResolvedInsertSemantics<'_>) -> bool {
-    semantics.columns.iter().any(|column| {
-        matches!(
-            column.column.default,
-            Some(ColumnDefault::SequenceNextVal { .. })
-        ) && column.cells.iter().any(|cell| {
-            matches!(
-                cell.input,
-                ResolvedInsertInput::Omitted | ResolvedInsertInput::ExplicitDefault { .. }
-            )
-        })
-    })
-}
-
 pub(super) fn prepare_resolved_typed_insert_semantics(
     semantics: ResolvedInsertSemantics<'_>,
     catalog: &CatalogSnapshot,
@@ -285,6 +255,25 @@ pub(super) fn prepare_resolved_typed_insert_semantics(
     let table = semantics.table;
     let row_count = semantics.row_count;
     let rows = usize::try_from(row_count).expect("u32 always fits usize on supported hosts");
+    let primary_key_columns = table
+        .indexes
+        .iter()
+        .filter(|index| index.primary_key)
+        .flat_map(|index| index.key_columns.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let missing_required_input = semantics.columns.iter().any(|semantic_column| {
+        semantic_column.column.default.is_none()
+            // PRIMARY KEY omission materializes NULL and is owned by the ordinary 23502
+            // constraint arbitration.  Do not replace that higher-precedence diagnostic with
+            // the nullable bootstrap-column policy below.
+            && !primary_key_columns.contains(semantic_column.column.name.as_str())
+            && semantic_column.cells.iter().any(|cell| {
+                matches!(
+                    cell.input,
+                    ResolvedInsertInput::Omitted | ResolvedInsertInput::ExplicitDefault { .. }
+                )
+            })
+    });
     let domain_dependencies = collect_domain_dependencies(table, catalog)?;
     let domain_ordinals = domain_dependencies
         .iter()
@@ -413,6 +402,7 @@ pub(super) fn prepare_resolved_typed_insert_semantics(
         table: TypedInsertBatchTable {
             schema: Arc::from(table.schema.as_str()),
             name: Arc::from(table.name.as_str()),
+            stable_table_id: table.stable_table_id,
             oid: table.oid,
             schema_digest,
             prepared_catalog_seq,
@@ -426,6 +416,7 @@ pub(super) fn prepare_resolved_typed_insert_semantics(
         typed_statement_digest,
         returning,
         sequence_requests,
+        missing_required_input,
     })
 }
 

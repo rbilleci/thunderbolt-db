@@ -127,14 +127,30 @@ fn statement_sequence_root(
         let mut prefix = [0_u8; 52];
         prefix[..4].copy_from_slice(&entry.statement_ordinal.to_le_bytes());
         prefix[4..8].copy_from_slice(&entry.effect_ordinal.to_le_bytes());
-        prefix[8] = 1;
         prefix[9] = entry.flags;
         prefix[12..16].copy_from_slice(&entry.disposition_ref.to_le_bytes());
-        prefix[16..20]
-            .copy_from_slice(&(crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES as u32).to_le_bytes());
         prefix[20..52].copy_from_slice(&entry.body_digest);
-        let mut body = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
-        crate::encode_sequence_value_reference_into_exact(&entry.reference, &mut body)?;
+        let mut body = Vec::new();
+        if let Some(reference) = entry.reference.as_ref() {
+            prefix[8] = 1;
+            let mut reference_body = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
+            crate::encode_sequence_value_reference_into_exact(reference, &mut reference_body)?;
+            body.extend_from_slice(&reference_body);
+        } else {
+            prefix[8] = 2;
+        }
+        if let Some(tail) = entry.terminal_restart {
+            body.extend_from_slice(
+                &crate::typed_insert_aggregate::semantics_v2::sequence_terminal::encode_retained(
+                    tail,
+                ),
+            );
+        }
+        prefix[16..20].copy_from_slice(
+            &u32::try_from(body.len())
+                .map_err(|_| error("overlay S5 body exceeds u32"))?
+                .to_le_bytes(),
+        );
         digest.update(prefix);
         digest.update(body);
     }
@@ -279,6 +295,10 @@ fn root_descriptor(graph: &ReservedSemanticsV2Graph) -> Result<[u8; 32], EngineE
             return Err(error("root descriptor table order is invalid"));
         }
         digest.update(table.table_ref.to_le_bytes());
+        digest.update(
+            (u32::from(table.resets_existing_rows) | (u32::from(table.initial_table_absent) << 1))
+                .to_le_bytes(),
+        );
         digest.update(table.stable_table_id.to_le_bytes());
         digest.update(table.data_generation_before.to_le_bytes());
         digest.update(table.data_generation_after.to_le_bytes());
@@ -292,6 +312,10 @@ fn root_descriptor(graph: &ReservedSemanticsV2Graph) -> Result<[u8; 32], EngineE
 fn table_bytes_before_manifest(table: &RetainedTable) -> [u8; 352] {
     let mut raw = [0_u8; 352];
     raw[..4].copy_from_slice(&table.table_ref.to_le_bytes());
+    raw[4..8].copy_from_slice(
+        &(u32::from(table.resets_existing_rows) | (u32::from(table.initial_table_absent) << 1))
+            .to_le_bytes(),
+    );
     raw[8..16].copy_from_slice(&table.stable_table_id.to_le_bytes());
     raw[16..20].copy_from_slice(&table.display_oid.to_le_bytes());
     raw[20..24].copy_from_slice(&table.target_dependency_ref.to_le_bytes());
@@ -345,6 +369,12 @@ fn s4_bytes(
     raw[16] = entry.disposition;
     raw[20..24].copy_from_slice(&entry.table_ref.to_le_bytes());
     raw[24..28].copy_from_slice(&entry.transition_ref.to_le_bytes());
-    raw[32..64].copy_from_slice(&entry.typed_statement_digest);
+    if entry.final_writer_statement_digest == [0; 32] {
+        raw[32..64].copy_from_slice(&entry.typed_statement_digest);
+    } else {
+        raw[17] = 1;
+        raw[28..32].copy_from_slice(&entry.final_writer_statement_ordinal.to_le_bytes());
+        raw[32..64].copy_from_slice(&entry.final_writer_statement_digest);
+    }
     raw
 }

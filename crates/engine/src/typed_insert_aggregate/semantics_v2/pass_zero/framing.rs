@@ -25,14 +25,22 @@ pub(super) fn validate_s7_header_roots(
     {
         return Err(error("S7 root identity or digest is zero"));
     }
+    let has_catalog =
+        framing.header_scalars().flags & crate::typed_insert_aggregate::AGGREGATE_FLAG_CATALOG != 0;
+    let catalog_boundary_is_exact = if has_catalog {
+        outer.catalog_after_epoch == outer.catalog_before_epoch.checked_add(1).unwrap_or(0)
+            && outer.catalog_after_digest != outer.catalog_before_digest
+    } else {
+        outer.catalog_after_epoch == outer.catalog_before_epoch
+            && outer.catalog_after_digest == outer.catalog_before_digest
+    };
     if read_u64(header, 328) != outer.catalog_before_epoch
         || read_u64(header, 336) != outer.catalog_after_epoch
         || header[344..376] != outer.catalog_before_digest
         || header[376..408] != outer.catalog_after_digest
-        || outer.catalog_before_epoch != outer.catalog_after_epoch
-        || outer.catalog_before_digest != outer.catalog_after_digest
-        || outer.catalog_before_epoch == 0
+        || !catalog_boundary_is_exact
         || outer.catalog_before_digest == [0; 32]
+        || outer.catalog_after_digest == [0; 32]
     {
         return Err(error(
             "S7 catalog echoes do not equal the immutable outer header",

@@ -29,6 +29,7 @@ fn autocommit_view<'a>(
     payloads: &'a [Vec<u8>; AGGREGATE_SECTION_COUNT],
 ) -> TypedInsertAggregateView<'a> {
     TypedInsertAggregateView {
+        semantics: crate::typed_insert_aggregate::TypedInsertAggregateSemantics::V1,
         flags: AGGREGATE_FLAG_AUTOCOMMIT,
         outer_flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
         stable_transaction_id: TXN_ID,

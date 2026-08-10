@@ -67,11 +67,13 @@ pub use canonical::{
     encode_canonical_outcome_into_exact, encode_canonical_record_exact_from_borrowed,
     encode_canonical_record_exact_into, measure_canonical_exact_buffers,
     measure_canonical_exact_buffers_from_fragments, pack_canonical_record_payload,
-    prepare_exact_canonical_wal_record, CanonicalCatalogTail, CanonicalDigest, CanonicalEnvelope,
-    CanonicalFragment, CanonicalFragmentKind, CanonicalFragmentRef, CanonicalIdentity,
-    CanonicalIsolation, CanonicalOutcome, CanonicalOutcomeKind, CanonicalPhysicalRange,
-    CanonicalPreApplyHeader, CanonicalWalFootprint, EncodedCanonicalEnvelope,
-    ExactCanonicalRecordEncoding, PreparedCanonicalWalRecord, CANONICAL_OUTCOME_BYTES,
+    prepare_exact_canonical_wal_record, prepare_exact_canonical_wal_record_from_borrowed_buffers,
+    prepare_exact_canonical_wal_record_from_borrowed_uninit_arc_buffers, CanonicalCatalogTail,
+    CanonicalDigest, CanonicalEnvelope, CanonicalFragment, CanonicalFragmentKind,
+    CanonicalFragmentRef, CanonicalIdentity, CanonicalIsolation, CanonicalOutcome,
+    CanonicalOutcomeKind, CanonicalPhysicalRange, CanonicalPreApplyHeader, CanonicalWalFootprint,
+    EncodedCanonicalEnvelope, ExactCanonicalRecordEncoding, PreparedCanonicalWalRecord,
+    CANONICAL_OUTCOME_BYTES,
 };
 
 mod identity;

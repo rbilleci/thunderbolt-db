@@ -4,6 +4,7 @@ const ENTRY_COUNTS: [u32; AGGREGATE_SECTION_COUNT] = [1, 1, 0, 1, 0, 1, 1, 0];
 
 fn view<'a>(payloads: &'a [Vec<u8>; AGGREGATE_SECTION_COUNT]) -> TypedInsertAggregateView<'a> {
     TypedInsertAggregateView {
+        semantics: TypedInsertAggregateSemantics::V1,
         flags: AGGREGATE_FLAG_AUTOCOMMIT,
         outer_flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
         stable_transaction_id: 41,
@@ -43,9 +44,12 @@ fn encode_fixture(
 ) -> EncodedTypedInsertAggregateBodies {
     let view = view(payloads);
     let layout = view.measure().expect("fixture layout");
-    let roots = typed_insert_aggregate_status_roots(&view, &layout).expect("fixture status roots");
+    let prepared =
+        prepare_typed_insert_aggregate_encoding(view, layout).expect("fixture aggregate proof");
+    let roots = prepared.roots();
     let reserved = reserve_typed_insert_aggregate_bodies(layout).expect("reserve exact bodies");
-    encode_typed_insert_aggregate_bodies(&view, &status(roots), reserved)
+    prepared
+        .encode(&status(roots), reserved)
         .expect("encode exact bodies")
 }
 

@@ -84,7 +84,9 @@ pub(super) fn validate(
 ) -> Result<(), crate::EngineError> {
     validate_complete_index(identity, proof)?;
     for effect in &graph.sequence_effects {
-        validate_effect(identity, graph, proof, effect)?;
+        if effect.reference.is_some() {
+            validate_effect(identity, graph, proof, effect)?;
+        }
     }
     Ok(())
 }
@@ -163,6 +165,9 @@ fn validate_effect(
     proof: &SemanticsV2DurableSequenceOutcomeIndexProof<'_>,
     effect: &super::graph::RetainedSequenceEffect,
 ) -> Result<(), crate::EngineError> {
+    let reference = effect.reference.as_ref().ok_or_else(|| {
+        sequence_error("private S5 sequence effect has no durable published outcome")
+    })?;
     let record = one_record_for_statement(graph, effect.statement_ordinal)?;
     let statement = one_statement_for_ordinal(graph, effect.statement_ordinal)?;
     let source = one_sequence_source(record, effect.effect_ordinal)?;
@@ -193,22 +198,22 @@ fn validate_effect(
             "S5 durable-sequence proof encountered a non-published S2 source",
         ));
     };
-    let expected_overwritten = disposition.disposition != 1;
+    let expected_overwritten = effect.flags & 2 != 0;
     require(
-        effect.reference.transition_txn_id == transition_txn_id
-            && effect.reference.parent_txn_id == identity.stable_transaction_id
-            && effect.reference.parent_txn_id == parent.txn_id
-            && effect.reference.statement_ordinal == effect.statement_ordinal
-            && effect.reference.statement_ordinal == parent.statement_ordinal.as_u32()
-            && effect.reference.expression_ordinal == source.request.absolute_expression_ordinal
-            && effect.reference.sequence_oid == source.request.sequence_oid
-            && effect.reference.returned_value == returned_value
-            && effect.reference.input_digest == input_digest
-            && effect.reference.default_expression
-            && effect.reference.table_oid == source.request.target_table_oid
-            && effect.reference.column_id == source.request.column_id
-            && effect.reference.row_id == disposition.stable_row_id
-            && effect.reference.final_value_overwritten == expected_overwritten
+        reference.transition_txn_id == transition_txn_id
+            && reference.parent_txn_id == identity.stable_transaction_id
+            && reference.parent_txn_id == parent.txn_id
+            && reference.statement_ordinal == effect.statement_ordinal
+            && reference.statement_ordinal == parent.statement_ordinal.as_u32()
+            && reference.expression_ordinal == source.request.absolute_expression_ordinal
+            && reference.sequence_oid == source.request.sequence_oid
+            && reference.returned_value == returned_value
+            && reference.input_digest == input_digest
+            && reference.default_expression
+            && reference.table_oid == source.request.target_table_oid
+            && reference.column_id == source.request.column_id
+            && reference.row_id == disposition.stable_row_id
+            && reference.final_value_overwritten == expected_overwritten
             && disposition.statement_ordinal == effect.statement_ordinal
             && disposition.source_row_ordinal == source.request.row_ordinal
             && resolution.table_ref == disposition.table_ref
@@ -220,7 +225,7 @@ fn validate_effect(
         "S5 published sequence effect does not retain its exact S1/S2/S4/S7 identity",
     )?;
 
-    let outcome = lookup_outcome(proof.snapshot, effect.reference.transition_txn_id)?;
+    let outcome = lookup_outcome(proof.snapshot, reference.transition_txn_id)?;
     let recomputed_input = matches!(
         outcome.operation,
         crate::BinarySequenceValueOperation::Default
@@ -236,8 +241,8 @@ fn validate_effect(
         )
     });
     require(
-        outcome.lookup_transition_txn_id == effect.reference.transition_txn_id
-            && outcome.transition_txn_id == effect.reference.transition_txn_id
+        outcome.lookup_transition_txn_id == reference.transition_txn_id
+            && outcome.transition_txn_id == reference.transition_txn_id
             && outcome.database_id == identity.database_id
             && outcome.timeline_id == identity.timeline_id
             && outcome.applied_commit_sequence < identity.commit_sequence
@@ -246,14 +251,14 @@ fn validate_effect(
             && outcome.applied_commit_sequence < proof.snapshot.published_next_commit_sequence
             && outcome.applied_commit_sequence
                 <= proof.checkpoint_pin.retained_through_commit_sequence
-            && outcome.sequence_oid == effect.reference.sequence_oid
+            && outcome.sequence_oid == reference.sequence_oid
             && outcome.parent_txn_id == parent.txn_id
             && outcome.parent_autocommit == parent.autocommit
             && outcome.parent_request_digest == parent.request_digest
             && outcome.statement_ordinal == parent.statement_ordinal.as_u32()
             && outcome.expression_ordinal == source.request.absolute_expression_ordinal
-            && outcome.returned_value == effect.reference.returned_value
-            && outcome.input_digest == effect.reference.input_digest
+            && outcome.returned_value == reference.returned_value
+            && outcome.input_digest == reference.input_digest
             && outcome.source_name == binding.source_name
             && matches!(
                 outcome.operation,

@@ -181,57 +181,6 @@ fn recent_commits_ledger_integer_slot_conflict_and_cross_path() {
 }
 
 #[test]
-fn typed_ledger_claim_is_prepared_before_wal_and_pinned_until_publication() {
-    let mut ledger = RecentCommitsLedger::default();
-    let mut write_set = WriteSet::default();
-    write_set.tables.insert("typed_t".to_string());
-    write_set.table_oids.push(71);
-    write_set.rows.push(RowWriteKey {
-        table: "typed_t".to_string(),
-        row_key: "rel/typed_t/00000000000000000009".to_string(),
-    });
-    write_set.stable_rows.push(StableRowWriteKey {
-        table_oid: 71,
-        row_id: 9,
-    });
-    write_set.unique_slots.push(UniqueIndexSlotKey {
-        table: "typed_t".to_string(),
-        column: "id".to_string(),
-        value: "9".to_string(),
-    });
-    write_set
-        .unique_slots_i32
-        .push((pack_unique_slot_id(71, 1), 9));
-
-    let prepared = PreparedLedgerDelta::from_write_set(&write_set).unwrap();
-    let reserved = ledger.reserve_typed_delta(prepared, 12).unwrap();
-    assert_eq!(
-        ledger.table_root_index(71),
-        0,
-        "reservation has no live effect"
-    );
-
-    let receipt = ledger.claim_typed_delta(reserved, 12);
-    assert_eq!(ledger.table_root_index(71), 12);
-    assert!(ledger.conflicts(&write_set, 11));
-    ledger.prune_below(12);
-    assert!(
-        ledger.conflicts(&write_set, 11),
-        "a post-WAL typed claim remains pinned until publication coverage consumes its receipt"
-    );
-
-    ledger.mark_published_through(12);
-    ledger.mark_published_visible(receipt, 12);
-    ledger.prune_below(12);
-    assert!(!ledger.conflicts(&write_set, 11));
-    assert_eq!(
-        ledger.table_root_index(71),
-        12,
-        "roots are catalog-bounded high-water"
-    );
-}
-
-#[test]
 fn prepared_ledger_delta_rejects_partial_stable_identity_projection() {
     let mut missing_table_oid = WriteSet::default();
     missing_table_oid
@@ -258,42 +207,6 @@ fn prepared_ledger_delta_rejects_partial_stable_identity_projection() {
 }
 
 #[test]
-fn typed_ledger_reservation_rejects_sequence_drift_and_cross_owner_without_mutation() {
-    let write_set = stable_write_set(93, 7);
-
-    let mut sequence_ledger = RecentCommitsLedger::default();
-    let reservation = sequence_ledger
-        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 31)
-        .unwrap();
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sequence_ledger.claim_typed_delta(reservation, 32)
-        }))
-        .is_err(),
-        "a post-WAL claim must fail closed if its expected sequence drifted"
-    );
-    assert_eq!(sequence_ledger.table_root_index(93), 0);
-    assert!(!sequence_ledger.conflicts(&write_set, 0));
-
-    let mut reservation_owner = RecentCommitsLedger::default();
-    let mut other_owner = RecentCommitsLedger::default();
-    let reservation = reservation_owner
-        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 33)
-        .unwrap();
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            other_owner.claim_typed_delta(reservation, 33)
-        }))
-        .is_err(),
-        "a reservation must never cross stable-ledger ownership"
-    );
-    assert_eq!(reservation_owner.table_root_index(93), 0);
-    assert_eq!(other_owner.table_root_index(93), 0);
-    assert!(!reservation_owner.conflicts(&write_set, 0));
-    assert!(!other_owner.conflicts(&write_set, 0));
-}
-
-#[test]
 fn generic_ledger_epoch_waits_for_the_publication_frontier_before_pruning() {
     let write_set = stable_write_set(94, 8);
     let mut ledger = RecentCommitsLedger::default();
@@ -310,38 +223,8 @@ fn generic_ledger_epoch_waits_for_the_publication_frontier_before_pruning() {
 }
 
 #[test]
-fn typed_ledger_orphan_panics_and_explicit_abandon_keeps_the_epoch_pinned() {
-    let write_set = stable_write_set(95, 9);
-
-    let mut orphaned = RecentCommitsLedger::default();
-    let receipt = orphaned
-        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 51)
-        .map(|reservation| orphaned.claim_typed_delta(reservation, 51))
-        .unwrap();
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(receipt))).is_err(),
-        "an unconsumed post-WAL receipt must turn into a recovery-visible invariant failure"
-    );
-    orphaned.prune_below(51);
-    assert!(orphaned.conflicts(&write_set, 0));
-
-    let mut abandoned = RecentCommitsLedger::default();
-    let receipt = abandoned
-        .reserve_typed_delta(PreparedLedgerDelta::from_write_set(&write_set).unwrap(), 52)
-        .map(|reservation| abandoned.claim_typed_delta(reservation, 52))
-        .unwrap();
-    receipt.abandon_for_recovery();
-    abandoned.prune_below(52);
-    assert!(
-        abandoned.conflicts(&write_set, 0),
-        "the explicit error-path abandon suppresses only the destructor; the epoch remains pinned"
-    );
-}
-
-#[test]
 fn every_live_ledger_record_family_has_a_publication_frontier() {
     let canonical = include_str!("../engine_dml_concurrent/canonical.rs");
-    let sharded_wave = include_str!("../engine_dml_concurrent/wave.rs");
     let lane = include_str!("../engine_dml_concurrent/lane.rs");
     let serial = include_str!("../engine_commit.rs");
     let shared_tail = include_str!("../engine_dml_concurrent.rs");
@@ -354,13 +237,6 @@ fn every_live_ledger_record_family_has_a_publication_frontier() {
         "the generic canonical wave record must use the shared publication tail"
     );
     assert_eq!(
-        sharded_wave
-            .matches("commit.ledger.record(&batch[position].write_set, commit_seq);")
-            .count(),
-        1,
-        "the sharded covered-INSERT record must use the shared publication tail"
-    );
-    assert_eq!(
         lane.matches("commit.ledger.record(&write_set, commit_seq);")
             .count(),
         1,
@@ -369,7 +245,7 @@ fn every_live_ledger_record_family_has_a_publication_frontier() {
     assert_eq!(
         serial.matches("commit.ledger.record(").count(),
         2,
-        "the two serial/recovery record families must stay enumerated"
+        "the codec-5 transaction terminal and the historical serial/recovery family must stay enumerated"
     );
     assert_eq!(
         shared_tail
@@ -377,13 +253,6 @@ fn every_live_ledger_record_family_has_a_publication_frontier() {
             .count(),
         1,
         "canonical and sharded waves advance their shared generic frontier before receipt release"
-    );
-    assert_eq!(
-        shared_tail
-            .matches(".mark_published_visible(receipt, last_committed_seq);")
-            .count(),
-        1,
-        "typed claims become pruneable only at the same shared publication tail"
     );
     assert_eq!(
         lane.matches(".mark_published_through(last_seq);").count(),
@@ -479,20 +348,21 @@ fn active_snapshots_track_oldest_boundary() {
 }
 
 #[test]
-fn concurrent_dml_classification_routes_sequence_inserts_to_serialized_path() {
-    // `is_concurrent_dml` gates which statements take the off-lock concurrent path vs the
-    // serialized catalog-latch path (write-half MVCC, Stage 4).
+fn concurrent_dml_classification_leaves_all_inserts_for_the_typed_overlay() {
+    // `is_concurrent_dml` now advertises only the off-lock UPDATE/DELETE path. All INSERT
+    // ingress is admitted by the typed transaction overlay, including callers of the public
+    // concurrent facade.
     let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE plain (id INT, v INT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE serial_t (id SERIAL, v TEXT)")
         .unwrap();
 
-    // Plain INSERT/UPDATE/DELETE on a base table → concurrent.
-    assert!(e.is_concurrent_dml("INSERT INTO plain (id, v) VALUES (1, 2)"));
+    // Plain INSERT no longer selects the displaced concurrent wave; UPDATE/DELETE do.
+    assert!(!e.is_concurrent_dml("INSERT INTO plain (id, v) VALUES (1, 2)"));
     assert!(e.is_concurrent_dml("UPDATE plain SET v = 3 WHERE id = 1"));
     assert!(e.is_concurrent_dml("DELETE FROM plain WHERE id = 1"));
-    // An INSERT that consumes a nextval default → serialized (sequence mutation needs &mut self).
+    // Sequence-default INSERTs use the same typed overlay after S5 materialization.
     assert!(!e.is_concurrent_dml("INSERT INTO serial_t (v) VALUES ('x')"));
     // UPDATE/DELETE never touch sequences → still concurrent even on the SERIAL table.
     assert!(e.is_concurrent_dml("UPDATE serial_t SET v = 'y' WHERE id = 1"));
@@ -1122,6 +992,220 @@ fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[test]
+fn private_unique_suffix_survives_a_concurrent_open_shard_publication() {
+    // A READ COMMITTED statement may retain the public open-shard descriptor while another
+    // writer later advances that allocation in place. The immediate UNIQUE check below must
+    // prove only this transaction's two private typed shards; COMMIT will rebase and prove the
+    // public prefix under the canonical cut. The pause is immediately before that eager proof,
+    // making the former stale-header failure deterministic instead of relying on wave timing.
+    let engine = std::sync::Arc::new(Engine::new_local());
+    engine
+        .execute_text(
+            71_000,
+            "CREATE TABLE private_unique_race (id INT UNIQUE, v INT)",
+        )
+        .unwrap();
+    engine
+        .execute_text(71_001, "INSERT INTO private_unique_race VALUES (1, 10)")
+        .unwrap();
+
+    engine.execute_text(71_010, "BEGIN").unwrap();
+    engine
+        .execute_text(71_010, "INSERT INTO private_unique_race VALUES (3, 30)")
+        .unwrap();
+
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    engine.set_index_validation_pause_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let staged = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || {
+            engine.execute_text(71_010, "INSERT INTO private_unique_race VALUES (4, 40)")
+        })
+    };
+    reached.wait();
+
+    engine
+        .execute_dml_concurrent(71_020, "INSERT INTO private_unique_race VALUES (2, 20)")
+        .unwrap();
+    resume.wait();
+    staged
+        .join()
+        .expect("private typed statement thread completes")
+        .expect("private unique suffix does not inspect the concurrent public header");
+    engine.execute_text(71_010, "COMMIT").unwrap();
+
+    assert_eq!(
+        engine
+            .execute_relational_select_text("SELECT id, v FROM private_unique_race ORDER BY id",)
+            .unwrap()
+            .rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+            vec![SqlValue::Int4(3), SqlValue::Int4(30)],
+            vec![SqlValue::Int4(4), SqlValue::Int4(40)],
+        ]
+    );
+}
+
+#[test]
+fn private_create_index_and_typed_insert_share_the_codec5_reopen_lifecycle() {
+    // This is a single production-reachable transaction: the first named-index generation for a
+    // private table must be catalog-ordered S3 state, while its rows remain in the one typed
+    // overlay until the ordinary codec-5 terminal. There is no resolved INSERT fallback.
+    let live = Engine::new_local_test_engine();
+    let txn_id = 71_100;
+    for sql in [
+        "BEGIN",
+        "CREATE TABLE private_index_codec5 (id INT, v INT)",
+        "CREATE UNIQUE INDEX private_index_codec5_id ON private_index_codec5 (id)",
+        "INSERT INTO private_index_codec5 VALUES (1, 10), (2, 20)",
+        "COMMIT",
+    ] {
+        live.execute_text(txn_id, sql).unwrap();
+    }
+
+    let select = "SELECT id, v FROM private_index_codec5 ORDER BY id";
+    let expected = vec![
+        vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+        vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+    ];
+    assert_eq!(
+        live.execute_relational_select_text(select).unwrap().rows,
+        expected
+    );
+    assert!(live
+        .relational_catalog_table("private_index_codec5")
+        .unwrap()
+        .indexes
+        .iter()
+        .any(|index| index.name == "private_index_codec5_id"));
+
+    let durable = live.durable_wal_records();
+    assert_eq!(
+        durable.len(),
+        1,
+        "the private table, named index, and typed rows share one terminal record"
+    );
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&durable[0].payload)
+        .unwrap()
+        .expect("the private index transaction uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "the private named-index shape must not use a resolved INSERT record"
+    );
+
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    assert_eq!(
+        recovered
+            .execute_relational_select_text(select)
+            .unwrap()
+            .rows,
+        expected
+    );
+    assert!(recovered
+        .relational_catalog_table("private_index_codec5")
+        .unwrap()
+        .indexes
+        .iter()
+        .any(|index| index.name == "private_index_codec5_id"));
+}
+
+/// Historical codec-5 catalog S3 records predate the additive OPERATION_COMPOSITION marker.
+/// Re-encode a production-shaped catalog-plus-typed-INSERT record with that old flag profile,
+/// then recover it from scratch. This keeps the compatibility decoder exercised without letting
+/// the current live writer select a retired profile.
+#[test]
+fn historical_catalog_only_s3_codec5_record_replays_through_current_decoder() {
+    let live = Engine::new_local_test_engine();
+    let txn_id = 71_101;
+    for sql in [
+        "BEGIN",
+        "CREATE TABLE legacy_catalog_s3 (id INT, v INT)",
+        "CREATE UNIQUE INDEX legacy_catalog_s3_id ON legacy_catalog_s3 (id)",
+        "INSERT INTO legacy_catalog_s3 VALUES (1, 10), (2, 20)",
+        "COMMIT",
+    ] {
+        live.execute_text(txn_id, sql).unwrap();
+    }
+    let expected = vec![
+        vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+        vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+    ];
+    let durable = live.durable_wal_records();
+    assert_eq!(durable.len(), 1);
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&durable[0].payload)
+        .unwrap()
+        .expect("production-shaped source is canonical codec-5 WAL");
+    assert!(Engine::canonical_envelope_is_codec5(&envelope));
+
+    let (historical_header, historical_outcome, historical_fragments) =
+        crate::typed_insert_aggregate::reencode_legacy_catalog_marker_for_test(
+            &envelope.header,
+            &envelope.outcome,
+            &envelope.fragments,
+        )
+        .expect("current catalog S3 re-encodes as the historical CATALOG-only profile");
+    const OUTER_CONTENT_CATALOG: u32 = 1 << 1;
+    const OUTER_CONTENT_OPERATION_COMPOSITION: u32 = 1 << 7;
+    assert_ne!(
+        historical_header.flags & OUTER_CONTENT_CATALOG,
+        0,
+        "historical profile retains the catalog boundary marker",
+    );
+    assert_eq!(
+        historical_header.flags & OUTER_CONTENT_OPERATION_COMPOSITION,
+        0,
+        "historical profile must not depend on the newer operation marker",
+    );
+    let decoded_s3 = crate::typed_insert_aggregate::decode_catalog_composition_for_test(
+        &historical_header,
+        &historical_fragments,
+    )
+    .expect("historical CATALOG-only S3 decodes")
+    .expect("historical CATALOG-only S3 retains its ordered composition");
+    assert!(
+        !decoded_s3.catalog_commands.is_empty(),
+        "historical S3 must retain the catalog operation for the shared replay applier",
+    );
+
+    let historical = gpu_db_wal::encode_canonical_envelope(
+        envelope.physical,
+        &historical_header,
+        &historical_fragments,
+        &historical_outcome,
+    )
+    .and_then(|encoded| gpu_db_wal::pack_canonical_record_payload(&encoded))
+    .expect("historical CATALOG-only aggregate repacks as canonical WAL");
+    let recovered = Engine::recover_from_durable_wal(&[gpu_db_wal::WalRecord {
+        txn_id: durable[0].txn_id,
+        payload: std::sync::Arc::from(historical),
+    }])
+    .expect("current recovery accepts the historical CATALOG-only codec-5 record");
+    assert_eq!(
+        recovered
+            .execute_relational_select_text("SELECT id, v FROM legacy_catalog_s3 ORDER BY id")
+            .unwrap()
+            .rows,
+        expected,
+        "historical catalog-only S3 recovery has the same typed rows",
+    );
+    assert!(
+        recovered
+            .relational_catalog_table("legacy_catalog_s3")
+            .unwrap()
+            .indexes
+            .iter()
+            .any(|index| index.name == "legacy_catalog_s3_id"),
+        "historical catalog-only S3 recovery retains the named index",
+    );
+}
+
 /// R3-004 — device validators cover:
 /// unique (self-value-keeping update must NOT self-conflict; cross-row duplicate must; NULLs ARE
 /// duplicates in this engine), CHECK on the new image, OUTBOUND FK (update to a missing/present
@@ -1345,17 +1429,14 @@ fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_driver
         .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
         .unwrap();
     let text = "INSERT INTO t VALUES (1)";
-    let item = e.make_covered_insert_wave_item(
+    let item = e.make_test_commit_wave_item(
         2,
         parse_command(text).unwrap(),
         crate::engine_dml_concurrent::CanonicalRequest::from_text(&e, text),
         WriteSet::default(),
         e.committed_seq(),
-        e.catalog_snapshot().commit_seq,
-        None,
-        None,
     );
-    let outcome = e.submit_commit_wave_item(item).unwrap();
+    let outcome = e.submit_test_commit_wave_item(item).unwrap();
 
     e.wedge_commit_path();
     let queued = outcome

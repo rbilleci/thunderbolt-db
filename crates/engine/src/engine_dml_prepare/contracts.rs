@@ -249,38 +249,3 @@ pub(crate) fn dml_filter_groups_to_device_predicate(
     }
     dnf
 }
-
-/// Device-history coverage: how much constraint validation `prepare_insert` runs. `Full` everywhere EXCEPT
-/// the wave sequencer's under-lock RE-RESOLVE, where unique/CHECK re-validation of an FK-FREE
-/// table is PROVABLY REDUNDANT — the coverage argument, verified against the sequencer:
-///  - a dup committed at C <= S (the item's read snapshot): the OFF-LOCK prepare validated
-///    against every row visible at S and errored the statement before it ever enqueued;
-///  - a dup committed in (S, commit] — INCLUDING an earlier item of the SAME wave: the
-///    exact device history plus wave-local conflict check runs BEFORE the re-resolve and aborts with a retryable
-///    serialization conflict; the item's registered snapshot guard pins version reclamation <= S,
-///    so no physical history it needs can vanish mid-flight;
-///  - a WITHIN-STATEMENT dup (VALUES (1),(1)): deterministic on the statement text — the
-///    off-lock prepare's in-batch check already rejected it;
-///  - CHECK constraints are row-local and deterministic on the values: same verdict as the
-///    off-lock pass.
-///
-/// FK re-validation is NOT covered by unique-key device history, so FK-bearing tables always
-/// validate fully. PK NOT-NULL (O(new), pure) runs unconditionally as cheap defense.
-///
-/// PRECONDITION (audit 3b1be580): the skip is granted ONLY while the catalog generation
-/// still matches the off-lock prepare's (`CommitWaveItem::prepared_catalog_seq`) — a
-/// constraint-adding DDL (ADD UNIQUE/CHECK) committing in (S, wave] is absent from the item's
-/// off-lock key projection, so an unguarded skip silently bypassed it (sabotage-verified by
-/// `wave_insert_prepared_before_add_check_is_revalidated`). Any DDL bumps the stamp -> Full.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InsertPrepareValidation {
-    Full,
-    /// Off-lock preparation for an item that is guaranteed to enter the classic commit-wave
-    /// sequencer. Eligible single-row unique checks may be deferred to its batched device locate.
-    WaveOffLock,
-    /// Wave-time fallback after a batched device needle could not bind or a locate declined. This
-    /// performs the full validator ladder but MUST NOT re-enter wave deferral, which would turn the
-    /// fallback into a no-op (notably for nullable UNIQUE inputs).
-    WaveFallbackFull,
-    ReResolveDeviceCovered,
-}

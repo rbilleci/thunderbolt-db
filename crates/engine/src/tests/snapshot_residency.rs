@@ -209,6 +209,14 @@ fn residency_invalidation_scope_narrows_dml_and_falls_back_on_unknown() {
         Engine::residency_invalidation_scope(&[entry(1, "CREATE TABLE d (id INT)")]),
         Some(BTreeSet::from(["d".to_string()]))
     );
+    // Sequence lifecycle is control-plane-only. It can affect a future DEFAULT, but it must not
+    // acquire authority to rebuild or invalidate unrelated resident table generations.
+    let create_sequence = entry(1, "CREATE SEQUENCE seq");
+    assert_eq!(
+        Engine::residency_invalidation_scope(std::slice::from_ref(&create_sequence)),
+        Some(BTreeSet::new())
+    );
+    assert!(!Engine::entry_requires_relational_repair(&create_sequence));
     // an unscoped command anywhere in the batch -> conservative global (None)
     assert_eq!(
         Engine::residency_invalidation_scope(&[

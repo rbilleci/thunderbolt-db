@@ -87,10 +87,14 @@ Add accepted exceptions to the table below. An exception records a current archi
 any proposed remediation belongs in `PLAN.md`. Re-review an exception when the file grows by 30%, gains a new
 responsibility, changes its public boundary, or reaches the stated trigger.
 
-There are currently no accepted exceptions. The former `crates/sql/src/lib.rs` exception became unnecessary when
-the size limits increased by 50% on 2026-07-29; its completed historical disposition remains in `PLAN.md` and
-`STATUS.md`. Under the comment-excluded count, `crates/engine/src/engine_expr.rs` likewise remains within the
-preferred production envelope without an exception.
+| File | Current count | Accepted reason and re-review trigger |
+|---|---:|---|
+| `crates/engine/src/engine_transaction_delta/codec5_operation.rs` | 3,166 physical / 3,010 policy-counted lines | The file owns the one canonical codec-5 operation transition: catalog composition, final identity resolution, pre-WAL resource/index preparation, operation construction, and the paired timing closure. These steps share move-only exact-generation inputs and one failure boundary; splitting now would either duplicate authority or widen the transaction-delta internals. Re-review before a new operation family, a public-boundary change, or 30% growth; the accepted current write-engine checkpoint retains this exception. |
+
+The former `crates/sql/src/lib.rs` exception became unnecessary when the size limits increased by 50% on
+2026-07-29; its completed historical disposition remains in `PLAN.md` and `STATUS.md`. Under the
+comment-excluded count, `crates/engine/src/engine_expr.rs` likewise remains within the preferred production
+envelope without an exception.
 
 ## Candidate inventory command
 

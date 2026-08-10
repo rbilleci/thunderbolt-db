@@ -135,6 +135,7 @@ fn rehash_root_descriptor(s7: &mut [u8]) {
     for table_ref in 0..u32_at(s7, 40) as usize {
         let table = table_at + table_ref * 384;
         hash.update(&s7[table..table + 4]);
+        hash.update(&s7[table + 4..table + 8]);
         hash.update(&s7[table + 8..table + 16]);
         hash.update(&s7[table + 32..table + 48]);
         hash.update(&s7[table + 160..table + 224]);

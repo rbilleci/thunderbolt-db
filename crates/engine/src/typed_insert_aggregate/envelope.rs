@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::EngineError;
+use std::{mem::MaybeUninit, sync::Arc};
 
 /// Exact caller-owned WAL buffers after capacity admission but before they carry record authority.
 ///
@@ -12,8 +13,8 @@ pub(crate) struct ReservedTypedInsertCanonicalEnvelope {
     physical: gpu_db_wal::CanonicalPhysicalRange,
     header: gpu_db_wal::CanonicalPreApplyHeader,
     outcome: gpu_db_wal::CanonicalOutcome,
-    packed_payload: Box<[u8]>,
-    serialized_record: Box<[u8]>,
+    packed_payload: Arc<[MaybeUninit<u8>]>,
+    serialized_record: Arc<[MaybeUninit<u8>]>,
 }
 
 /// Fully root-closed codec-5 aggregate plus its exact immutable outer WAL bytes.
@@ -22,9 +23,7 @@ pub(crate) struct EncodedTypedInsertCanonicalEnvelope {
     physical: gpu_db_wal::CanonicalPhysicalRange,
     header: gpu_db_wal::CanonicalPreApplyHeader,
     outcome: gpu_db_wal::CanonicalOutcome,
-    encoding: gpu_db_wal::ExactCanonicalRecordEncoding,
-    packed_payload: Box<[u8]>,
-    serialized_record: Box<[u8]>,
+    prepared: gpu_db_wal::PreparedCanonicalWalRecord,
 }
 
 impl ReservedTypedInsertCanonicalEnvelope {
@@ -55,15 +54,28 @@ impl EncodedTypedInsertCanonicalEnvelope {
     }
 
     pub(crate) fn encoding(&self) -> gpu_db_wal::ExactCanonicalRecordEncoding {
-        self.encoding
+        self.prepared
+            .exact_encoding()
+            .expect("codec-5 envelope always owns exact WAL authority")
     }
 
     pub(crate) fn packed_payload(&self) -> &[u8] {
-        &self.packed_payload
+        &self.prepared.as_wal_record().payload
+    }
+
+    pub(crate) fn prepared_payload_authority(&self) -> &std::sync::Arc<[u8]> {
+        &self.prepared.as_wal_record().payload
     }
 
     pub(crate) fn serialized_record(&self) -> &[u8] {
-        &self.serialized_record
+        self.prepared
+            .exact_serialized_record()
+            .expect("codec-5 envelope always owns exact WAL authority")
+    }
+
+    /// Consume the codec-5 envelope into the sole typed WAL/control-plane authority.
+    pub(crate) fn into_prepared_record(self) -> gpu_db_wal::PreparedCanonicalWalRecord {
+        self.prepared
     }
 }
 
@@ -94,31 +106,36 @@ pub(crate) fn reserve_typed_insert_canonical_envelope(
         physical,
         header,
         outcome,
-        packed_payload: zeroed_box(packed_len),
-        serialized_record: zeroed_box(serialized_len),
+        // The exact encoder initializes the complete measured ranges before it returns success.
+        // Reserving Arc-shaped storage now makes those bytes their final immutable authority at
+        // seal time rather than copying two full WAL records from temporary Box allocations.
+        packed_payload: Arc::<[u8]>::new_uninit_slice(packed_len),
+        serialized_record: Arc::<[u8]>::new_uninit_slice(serialized_len),
     })
 }
 
 /// Fill both reserved outer buffers and consume them into immutable record authority.
 pub(crate) fn encode_reserved_typed_insert_canonical_envelope(
-    mut reserved: ReservedTypedInsertCanonicalEnvelope,
+    reserved: ReservedTypedInsertCanonicalEnvelope,
 ) -> Result<EncodedTypedInsertCanonicalEnvelope, EngineError> {
-    validate_outer_binding(
-        &reserved.bodies,
-        reserved.physical,
-        &reserved.header,
-        &reserved.outcome,
-    )?;
+    // `ReservedTypedInsertCanonicalEnvelope` is move-only, its fields are private, and its only
+    // production constructor closes this binding before it allocates the exact buffers.  Encoding
+    // therefore consumes the already validated authority rather than comparing the same scalar
+    // identities a second time.  The WAL constructor below still validates and seals the bytes it
+    // receives into the immutable exact record.
     let refs = reserved.bodies.canonical_fragment_refs();
-    let encoding = gpu_db_wal::encode_canonical_record_exact_from_borrowed(
+    let prepared = gpu_db_wal::prepare_exact_canonical_wal_record_from_borrowed_uninit_arc_buffers(
         reserved.header.stable_transaction_id,
         reserved.physical,
-        &reserved.header,
+        reserved.header.clone(),
         refs.as_slice(),
-        &reserved.outcome,
-        &mut reserved.packed_payload,
-        &mut reserved.serialized_record,
+        reserved.outcome.clone(),
+        reserved.packed_payload,
+        reserved.serialized_record,
     )?;
+    let encoding = prepared
+        .exact_encoding()
+        .expect("borrowed-buffer WAL preparation returns exact authority");
     if encoding.footprint != reserved.bodies.layout().wal {
         return Err(error(
             "encoded outer WAL footprint drifted from reservation",
@@ -129,9 +146,7 @@ pub(crate) fn encode_reserved_typed_insert_canonical_envelope(
         physical: reserved.physical,
         header: reserved.header,
         outcome: reserved.outcome,
-        encoding,
-        packed_payload: reserved.packed_payload,
-        serialized_record: reserved.serialized_record,
+        prepared,
     })
 }
 
@@ -143,15 +158,11 @@ fn validate_outer_binding(
 ) -> Result<(), EngineError> {
     let measure = &bodies.layout().measure;
     let status = bodies.status();
-    let expected_affected_rows = if measure.flags & AGGREGATE_FLAG_AUTOCOMMIT != 0 {
-        // Autocommit carries exactly one INSERT statement. Its terminal retry/status outcome is
-        // the rows that statement inserted, not the cardinality of its statement list.
-        measure.original_inserted_row_count
-    } else {
-        // An explicit aggregate can compose several statement outcomes into fewer surviving
-        // physical changes, so its enclosing terminal outcome binds the final transition count.
-        measure.final_row_transition_count
-    };
+    // The terminal outcome binds the logical rows accepted by the INSERT statements, not the
+    // number of physical rows that survive later statements in the same transaction. In
+    // particular, INSERT followed by DELETE has one affected INSERT row and zero final-row
+    // transitions. S7 separately authenticates the surviving transition cardinality.
+    let expected_affected_rows = measure.original_inserted_row_count;
     let outcome_rows_are_valid = match outcome.kind {
         gpu_db_wal::CanonicalOutcomeKind::CommitSuccess => {
             outcome.affected_rows == expected_affected_rows
@@ -182,15 +193,6 @@ fn validate_outer_binding(
         ));
     }
     Ok(())
-}
-
-fn zeroed_box(len: usize) -> Box<[u8]> {
-    let mut bytes = Box::<[u8]>::new_uninit_slice(len);
-    for byte in bytes.iter_mut() {
-        byte.write(0);
-    }
-    // SAFETY: every u8 slot is initialized above.
-    unsafe { bytes.assume_init() }
 }
 
 fn error(message: &str) -> EngineError {

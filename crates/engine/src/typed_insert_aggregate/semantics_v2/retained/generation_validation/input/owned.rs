@@ -127,6 +127,7 @@ struct NeutralTable {
     row_allocator_high_water: u64,
     initial_logical_row_count: u64,
     final_logical_row_count: u64,
+    resets_existing_rows: bool,
     image_layout_digest: CanonicalDigest,
     image_content_digest: CanonicalDigest,
     row_start: u32,
@@ -210,7 +211,7 @@ mod views;
 
 /// Fixed output owners are allocated before launch and are only visible through the builder's
 /// private writer.  A slot tracks missing, duplicate, and extra writes without allocating.
-pub(in super::super) struct ReservedGenerationOutputs {
+pub(in super::super::super) struct ReservedGenerationOutputs {
     pub(in super::super) header: GenerationOutputHeader,
     pub(in super::super) tables: Vec<GenerationOutputTable>,
     pub(in super::super) indexes: Vec<GenerationOutputIndex>,
@@ -672,6 +673,10 @@ impl<C, W> ReservedGenerationLaunch<C, W> {
         &mut self.outputs
     }
 
+    pub(in super::super) fn candidate_mut(&mut self) -> &mut C {
+        &mut self.candidate
+    }
+
     pub(in super::super) fn into_parts(
         self,
     ) -> (
@@ -786,6 +791,7 @@ impl SealedGenerationInput {
             digest.update(table.row_allocator_high_water.to_le_bytes());
             digest.update(table.initial_logical_row_count.to_le_bytes());
             digest.update(table.final_logical_row_count.to_le_bytes());
+            digest.update([u8::from(table.resets_existing_rows)]);
 
             let rows = sealed_range(&self.rows, table.row_start, table.row_count)?;
             digest.update(count_u32(rows.len(), "sealed generation row count")?.to_le_bytes());
@@ -1210,6 +1216,7 @@ pub(in super::super) fn reserve_and_fill<C, W>(
             row_allocator_high_water: table.row_allocator_high_water,
             initial_logical_row_count: table.initial_logical_row_count,
             final_logical_row_count: table.final_logical_row_count,
+            resets_existing_rows: table.resets_existing_rows,
             image_layout_digest: table.image_layout_digest,
             image_content_digest: table.image_content_digest,
             row_start,
@@ -1914,6 +1921,7 @@ pub(in super::super) fn test_launch<C, W>(
         row_allocator_high_water: 1,
         initial_logical_row_count: 0,
         final_logical_row_count: 0,
+        resets_existing_rows: false,
         image_layout_digest: [2; 32],
         image_content_digest: [3; 32],
         row_start: 0,

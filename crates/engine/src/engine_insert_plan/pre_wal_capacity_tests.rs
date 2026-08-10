@@ -174,6 +174,7 @@ fn aggregate_shape() -> AggregateTypedInsertShape {
         payload_bytes: 160,
     };
     let layout = TypedInsertAggregateMeasure {
+        semantics: crate::typed_insert_aggregate::TypedInsertAggregateSemantics::V1,
         flags: AGGREGATE_FLAG_EXPLICIT,
         outer_flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
         stable_transaction_id: 5,

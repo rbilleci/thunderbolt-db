@@ -23,8 +23,15 @@ pub(super) struct ShardDeviceIndexBuild<'a> {
     pub(super) gc_boundary: Index,
     pub(super) deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
     pub(super) duplicate_tolerant: bool,
+    /// Only the WRITE-001 empty compound-index predecessor may retain a zero-row directory.
+    /// Ordinary point reads continue to decline zero-row index construction.
+    pub(super) allow_empty: bool,
     pub(super) apply_already_locked: bool,
     pub(super) budget_already_locked: bool,
+    /// The codec-5 pre-WAL manifest may build an S3-created index over an immutable public
+    /// shard, but it must retain the resulting directory privately until the common post-WAL
+    /// manifest swap.  Ordinary retained reads always publish their cache result immediately.
+    pub(super) defer_cache_publication: bool,
 }
 
 impl Engine {
@@ -244,8 +251,10 @@ impl Engine {
                         gc_boundary,
                         deleted_by: shard.deleted_by_region.clone(),
                         duplicate_tolerant: false,
+                        allow_empty: false,
                         apply_already_locked: false,
                         budget_already_locked: false,
+                        defer_cache_publication: false,
                     },
                 )
                 .ok()
@@ -381,8 +390,10 @@ impl Engine {
             gc_boundary,
             deleted_by,
             duplicate_tolerant,
+            allow_empty,
             apply_already_locked,
             budget_already_locked,
+            defer_cache_publication,
         } = build;
         let ShardDeviceIndexKey {
             key_id,
@@ -612,7 +623,88 @@ impl Engine {
                 .fetch_max(row_count as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let row_count_u64 = row_count as u64;
-        if row_count == 0 || row_count_u64 >= u32::MAX as u64 {
+        if row_count == 0 {
+            if !allow_empty || build_capacity_rows != 1 {
+                return Ok(None);
+            }
+            let table_size =
+                crate::engine_residency::resident_shard_index_table_size(1, build_capacity_rows)
+                    .ok_or(gpu_db_execution::CudaRuntimeProbeError::InvalidInputLength(
+                        1,
+                    ))?;
+            let table_mask = (table_size - 1) as u32;
+            let hash_shift = 32 - table_size.trailing_zeros();
+            let index_bytes =
+                gpu_db_execution::resident_index_allocated_bytes(table_mask, build_capacity_rows)
+                    .ok_or(gpu_db_execution::CudaRuntimeProbeError::InvalidInputLength(
+                    1,
+                ))?;
+            let _budget_allocation = (!budget_already_locked).then(|| {
+                self.read_state
+                    .residency
+                    .budget_allocation_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            let runtime = self.cuda_driver_probe_runtime();
+            let gpu_id = build_memory.metadata().gpu_id;
+            if self
+                .relational_residency_budget_bytes(gpu_id)
+                .is_some_and(|budget| {
+                    self.relational_resident_bytes_for_gpu(gpu_id)
+                        .saturating_add(index_bytes)
+                        > budget
+                })
+            {
+                return Ok(None);
+            }
+            let device_index = Arc::new(runtime.retain_device_memory_zeroed(gpu_id, index_bytes)?);
+            let entry = CachedShardPkDeviceIndex {
+                resident_device_ptr: device_ptr,
+                row_count: 0,
+                published_row_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                gc_boundary,
+                duplicate_tolerant,
+                has_postings: false,
+                published_has_postings: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                _resident_guard: Arc::clone(&build_memory),
+                device_index: Some(Arc::clone(&device_index)),
+                table_mask,
+                hash_shift,
+            };
+            if defer_cache_publication {
+                return Ok(Some((device_index, table_mask, hash_shift, 0, false)));
+            }
+            let _route_publish = self
+                .read_state
+                .residency
+                .sharded_point_route_publish_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let payload_is_current = self
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&(table_name.to_string(), shard_id))
+                .is_some_and(|current| Arc::ptr_eq(&current, &build_memory));
+            if !payload_is_current {
+                return Ok(None);
+            }
+            let mut cache = self
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cache.contains_key(&cache_key) {
+                self.read_state
+                    .residency
+                    .purge_table_point_routes_under_publish_lock(table_name);
+            }
+            cache.insert(cache_key, entry);
+            return Ok(Some((device_index, table_mask, hash_shift, 0, false)));
+        }
+        if row_count_u64 >= u32::MAX as u64 {
             return Ok(None);
         }
         // Every key shape is described uniformly. One fixed one-word column is the raw ABI; wider,
@@ -757,6 +849,9 @@ impl Engine {
             table_mask,
             hash_shift,
         };
+        if defer_cache_publication {
+            return Ok(result);
+        }
         #[cfg(test)]
         self.run_shard_pk_index_pre_publish_hook();
         {
@@ -822,6 +917,122 @@ impl Engine {
             cache.insert(cache_key, entry);
         }
         Ok(result)
+    }
+
+    /// Build (or retain a semantically compatible existing) GPU directory for an S3-created
+    /// index over a public immutable shard without touching the live cache.  The caller carries
+    /// this entry into `PreparedTableIndexManifest`, whose one post-WAL swap makes it visible
+    /// together with the final catalog index enrollment.
+    pub(crate) fn prepare_s3_created_index_manifest_entry(
+        &self,
+        table: &RelationalTable,
+        index: &crate::relational_model::RelationalIndex,
+        ordinal: usize,
+        shard: &RelationalResidentShard,
+        gc_boundary: Index,
+    ) -> Result<crate::engine_residency::prepared_table_index_manifest::PreparedExistingShardIndexManifestEntry, ExecuteError>{
+        let positions = crate::engine_residency::index_key_column_positions(table, index)
+            .ok_or_else(|| {
+                ExecuteError::Serialization("S3-created index lost a key column".to_string())
+            })?;
+        let key_id = crate::engine_residency::index_probe_key_id(table, index, ordinal)
+            .ok_or_else(|| {
+                ExecuteError::Serialization("S3-created index has no device key id".to_string())
+            })?;
+        let offsets = positions
+            .iter()
+            .map(|&position| shard_fixed_width_key_offset(shard, table, position))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ExecuteError::Serialization(
+                    "S3-created index has no resident key section".to_string(),
+                )
+            })?;
+        let blob_offsets = positions
+            .iter()
+            .map(|&position| shard_key_column_blob_offset(shard, table, position))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ExecuteError::Serialization(
+                    "S3-created index has no resident text layout".to_string(),
+                )
+            })?;
+        let blob_lens = positions
+            .iter()
+            .map(|&position| shard_key_column_blob_len(shard, table, position))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ExecuteError::Serialization(
+                    "S3-created index has an invalid resident text extent".to_string(),
+                )
+            })?;
+        let validity_offsets = positions
+            .iter()
+            .map(|&position| shard_key_column_validity_offset(shard, table, position))
+            .collect::<Option<Vec<Option<u64>>>>()
+            .ok_or_else(|| {
+                ExecuteError::Serialization(
+                    "S3-created index has no resident validity section".to_string(),
+                )
+            })?;
+        let payload = shard.device_memory.clone().ok_or_else(|| {
+            ExecuteError::Serialization(
+                "S3-created index predecessor has no resident payload".to_string(),
+            )
+        })?;
+        if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &payload) {
+            return Err(ExecuteError::Serialization(
+                "S3-created index predecessor payload is no longer authoritative".to_string(),
+            ));
+        }
+        let (memory, table_mask, hash_shift, indexed_rows, has_postings) = self
+            .ensure_shard_pk_device_index(
+                table,
+                &table.name,
+                shard.shard_id,
+                &payload,
+                ShardDeviceIndexBuild {
+                    key: ShardDeviceIndexKey {
+                        key_id,
+                        positions: &positions,
+                        offsets: &offsets,
+                        blob_offsets: &blob_offsets,
+                        blob_lens: &blob_lens,
+                        validity_offsets: &validity_offsets,
+                    },
+                    row_count: shard.row_count,
+                    capacity_rows: shard.capacity as u64,
+                    gc_boundary,
+                    deleted_by: shard.deleted_by_region.clone(),
+                    duplicate_tolerant: !index.unique,
+                    allow_empty: false,
+                    apply_already_locked: true,
+                    budget_already_locked: true,
+                    defer_cache_publication: true,
+                },
+            )
+            .map_err(|error| {
+                ExecuteError::Serialization(format!("S3-created index GPU build failed: {error}"))
+            })?
+            .ok_or_else(|| {
+                ExecuteError::Serialization("S3-created index GPU build declined".to_string())
+            })?;
+        if indexed_rows < shard.row_count {
+            return Err(ExecuteError::Serialization(
+                "S3-created index directory does not cover its public predecessor".to_string(),
+            ));
+        }
+        Ok(crate::engine_residency::prepared_table_index_manifest::PreparedExistingShardIndexManifestEntry {
+            shard_id: shard.shard_id,
+            key_id,
+            payload,
+            row_count: shard.row_count,
+            memory,
+            table_mask,
+            hash_shift,
+            duplicate_tolerant: !index.unique,
+            has_postings,
+        })
     }
 
     /// Sub-slice 8 (GPU-native probe): the FULLY-GPU batched cross-shard point-lookup — the charter-faithful
@@ -1100,8 +1311,10 @@ impl Engine {
                             gc_boundary: read_boundary,
                             deleted_by: shard.deleted_by_region.clone(),
                             duplicate_tolerant: false,
+                            allow_empty: false,
                             apply_already_locked: false,
                             budget_already_locked: false,
+                            defer_cache_publication: false,
                         },
                     )
                     .map_err(|err| {

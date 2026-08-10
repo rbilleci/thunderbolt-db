@@ -128,7 +128,6 @@ pub use engine_dml_intent::{
     CoveredDeleteRoute, CoveredInsertRoute, CoveredUpdateRoute, IntentTicket, SynchronousCommit,
 };
 mod engine_dml_prepare;
-pub(crate) use engine_dml_prepare::InsertPrepareValidation;
 mod engine_expr;
 mod engine_expr_ir;
 mod engine_introspection;
@@ -173,11 +172,37 @@ use table_access::{TableAccessLease, TableAccessRegistry};
 mod engine_data_generation;
 mod engine_wal_archive;
 mod engine_write_apply;
+mod engine_write_authority;
 
 #[derive(Debug, Default)]
 pub struct KvStateMachine {
     pub applied: Vec<Vec<u8>>,
     pub kv: BTreeMap<String, String>,
+}
+
+impl KvStateMachine {
+    /// Record one codec-5 semantics-v2 entry whose complete canonical and device effects were
+    /// authenticated before the post-WAL live apply.  This is intentionally not a decoder: WAL
+    /// recovery must keep routing through [`ReplicatedStateMachine::apply`] until it owns the
+    /// semantics-v2 replay authority.
+    pub(crate) fn record_prevalidated_semantics_v2_codec5(
+        &mut self,
+        entry: &LogEntry,
+    ) -> Result<(), EngineError> {
+        // `gpu_db_wal` keeps this framing tag private.  The live marker therefore proves only the
+        // outer canonical container here; the terminal has already authenticated the codec-5
+        // semantic body and exact payload digest.  In particular, never let a legacy binary
+        // transaction record use this decoder-free state-machine path.
+        const CANONICAL_RECORD_MAGIC: &[u8] = b"GPUDBCANREC1\0\0\0\0";
+        if !entry.payload.starts_with(CANONICAL_RECORD_MAGIC) {
+            return Err(EngineError::ApplyFailed(
+                "prevalidated semantics-v2 codec-5 live apply requires a canonical WAL payload"
+                    .to_string(),
+            ));
+        }
+        self.applied.push(entry.payload.to_vec());
+        Ok(())
+    }
 }
 
 impl ReplicatedStateMachine for KvStateMachine {
@@ -531,6 +556,10 @@ pub struct Engine {
     /// this shared registry only closes the admission-to-WAL interval and is removed on either
     /// clean rejection or terminal installation.
     pending_transaction_claims: Arc<Mutex<HashMap<TxnId, gpu_db_wal::CanonicalDigest>>>,
+    /// Compatibility transaction identities that collided with an engine-owned sequence child.
+    /// The protocol continues to use the caller's identity while the active private generation
+    /// and durable transaction status use an allocator-reserved surrogate.
+    public_transaction_aliases: Arc<Mutex<HashMap<TxnId, TxnId>>>,
     /// One allocator shared by facade-owned user envelopes and engine-owned ordinary sequence
     /// transitions. A transition can therefore publish outside an active user transaction without
     /// inventing a second transaction-id namespace.
@@ -548,10 +577,6 @@ pub struct Engine {
     /// per instance prevents parallel engines from stealing one another's one-shot failure.
     #[cfg(test)]
     fail_next_transaction_post_durable_apply: AtomicBool,
-    /// One-shot fixed INSERT cutover fault after canonical status/ledger and before device apply.
-    /// It proves the serial-wave guard wedges rather than attempting a legacy re-application.
-    #[cfg(test)]
-    fail_next_fixed_insert_post_wal_apply: AtomicBool,
     /// One-shot deterministic seam after WAL durability and private-generation retirement but
     /// before canonical apply, used to prove publication credit cannot be stolen by another
     /// allocator in that exact window.
@@ -668,9 +693,6 @@ pub struct Engine {
     /// grows as bounded shards to billions of rows. Caps the admit headroom + sizes a rollover shard.
     /// Default 4M (seals in ~3ms, ~250 shards/1B per the admit-scaling measurement); settable small in
     /// tests. Interior-mutable.
-    /// W5a: covered inserts log RESOLVED BINARY WAL records (decode+install replay) instead of
-    /// SQL text. Default OFF until the replay-differential burn-in flips it.
-    binary_wal_records_enabled: std::sync::atomic::AtomicBool,
     /// TYPE-COVERAGE track 2 slice 2: sharded admission includes i64-SECTION columns
     /// (Int8/Timestamp) alongside the i32 sections — the first non-i32 shard section.
     /// DEFAULT ON (the 2026-07-03 flip). Kill switch -> int8-bearing tables admit
@@ -725,6 +747,10 @@ struct DdlCatalogState {
     /// Sole `pg_class.oid` allocation authority for tables, indexes, views, sequences, and every
     /// other relation-shaped catalog object.
     relational_next_oid: u32,
+    /// Sole allocation authority for engine-stable table identities. This counter advances only
+    /// for tables and is intentionally independent of `relational_next_oid`, whose values belong
+    /// to the PostgreSQL display-OID domain and are shared by every relation-shaped object.
+    relational_next_table_id: u64,
     /// Recovery-only cursor for stable identities synthesized for pre-PRODUCT-001 indexes.  It is
     /// initialized above every low-range OID the complete historical prefix can allocate, starts at
     /// 20,000 for ordinary databases, and is retired into `relational_next_oid` at the first
@@ -741,6 +767,7 @@ struct DdlCatalogState {
 
 const FIRST_LEGACY_RECOVERY_INDEX_OID: u32 = 20_000;
 const MAX_CATALOG_OID: u32 = i32::MAX as u32;
+const FIRST_USER_TABLE_ID: u64 = 1;
 
 /// Exact `pg_class`-style relation kind for the shared public-schema name authority. Domains and
 /// functions live in distinct PostgreSQL namespaces; table-backed indexes do not.
@@ -785,6 +812,25 @@ fn resolve_pg_class_relation_kind(
 }
 
 impl DdlCatalogState {
+    fn allocate_stable_table_id(&mut self) -> Result<u64, EngineError> {
+        let stable_table_id = self.relational_next_table_id;
+        if stable_table_id == 0
+            || stable_table_id == u64::MAX
+            || self
+                .relational_catalog
+                .values()
+                .any(|table| table.stable_table_id == stable_table_id)
+        {
+            return Err(EngineError::ApplyFailed(
+                "stable table identity allocation exhausted".to_string(),
+            ));
+        }
+        self.relational_next_table_id = stable_table_id.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("stable table identity allocation exhausted".to_string())
+        })?;
+        Ok(stable_table_id)
+    }
+
     fn pg_class_relation_kind(
         &self,
         name: &str,
@@ -1002,6 +1048,10 @@ struct CommitState {
     /// Non-pruned terminal claim index. The canonical WAL envelope is the durable authority; this
     /// map is its live/recovered lookup index for exact same-id retry resolution.
     transaction_status: HashMap<TxnId, DurableTransactionStatus>,
+    /// Authenticated pending/terminal WRITE-001 claim heads and exact allocator markers. Canonical
+    /// WAL remains authority; this is the sole bounded live/recovery projection used to validate
+    /// a codec-5 parent without reconstructing allocation assignments.
+    write_authority: crate::engine_write_authority::DurableWriteAuthorityIndex,
     /// Mutation generation for move-only typed canonical status-slot reservations.  The typed
     /// path binds its one reserved HashMap slot to this generation so an intervening legacy or
     /// recovery status write cannot leave a stale credit usable.
@@ -1187,12 +1237,12 @@ impl CommitState {
 }
 
 impl Engine {
-    /// Allocate an explicit-transaction identity that is unclaimed by every durable or accepted
-    /// strategy. Facade requests and engine-owned sequence transitions reserve from the same
-    /// checked allocator, so a chained successor cannot steal an identity already handed to an
-    /// in-flight facade request. Callers hold the commit lock, so terminal status, active
-    /// transactions, and the shared pending registry are observed as one admission boundary.
-    fn begin_unclaimed_transaction(&self, commit: &mut CommitState) -> Result<TxnId, TxnError> {
+    /// Allocate an identity that is unclaimed by every durable, active, or accepted strategy.
+    /// Facade requests and engine-owned sequence transitions reserve from the same checked
+    /// allocator, so a compatibility surrogate cannot steal an identity already handed to an
+    /// in-flight request. Callers hold the commit lock, making the status, active-transaction,
+    /// and pending-claim observations one admission boundary.
+    fn allocate_unclaimed_transaction_id(&self, commit: &CommitState) -> Result<TxnId, TxnError> {
         loop {
             let txn_id = self.allocate_transaction_id()?;
             let pending = self
@@ -1204,9 +1254,16 @@ impl Engine {
                 || commit.txn_manager.state(txn_id).is_some();
             drop(pending);
             if !claimed {
-                return commit.txn_manager.begin_with_id(txn_id).map(|txn| txn.id);
+                return Ok(txn_id);
             }
         }
+    }
+
+    /// Allocate and register an explicit-transaction identity that is unclaimed by every durable
+    /// or accepted strategy.
+    fn begin_unclaimed_transaction(&self, commit: &mut CommitState) -> Result<TxnId, TxnError> {
+        let txn_id = self.allocate_unclaimed_transaction_id(commit)?;
+        commit.txn_manager.begin_with_id(txn_id).map(|txn| txn.id)
     }
 
     /// Cancel an `AND CHAIN` successor that was registered before the parent reached its terminal

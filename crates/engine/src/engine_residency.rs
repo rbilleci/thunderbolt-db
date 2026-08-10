@@ -25,6 +25,49 @@ pub(crate) fn resident_shard_index_table_size(
     (table_size <= (1_u64 << 30)).then_some(table_size)
 }
 
+/// Can an empty table enroll all of its maintained named indexes in the WRITE-001 GPU authority?
+///
+/// The empty predecessor has no keys to materialize, so eligibility is determined by the same
+/// canonical GPU key-fold capability used by later physical builds. Keeping this predicate shared
+/// by logical-root enrollment, residency admission, and first-append planning prevents either the
+/// old two-INT4 canary or a one-index cap from becoming a hidden shape-specific write authority.
+pub(crate) fn write001_empty_foldable_index_enrollment(table: &RelationalTable) -> bool {
+    !table.columns.is_empty()
+        && !table.indexes.is_empty()
+        && table.indexes.iter().all(|index| {
+            (!index.primary_key || index.unique)
+                && (!index.unique_constraint || index.unique)
+                && !index.key_columns.is_empty()
+                && index_all_key_columns_foldable(table, index)
+        })
+}
+
+/// Does the empty enrollment also support the one-slot capacity-padded predecessor consumed by an
+/// indexed fixed-width first append? The later physical strategy remains source-driven: null-free
+/// i32 families may append in place, while wider fixed-width families consume this predecessor via
+/// the existing fixed-rollover branch. Variable-width TEXT retains the zero-capacity predecessor
+/// used by the dense rollover branch.
+pub(crate) fn write001_empty_index_in_place_preallocation(table: &RelationalTable) -> bool {
+    write001_empty_foldable_index_enrollment(table)
+        && table
+            .columns
+            .iter()
+            .all(|column| column.ty != SqlType::Text)
+}
+
+/// The exact empty predecessor directories reserve the same one-row physical horizon that the
+/// indexed CUDA plan consumes on its first append. Keeping this distinct from the ordinary
+/// zero-row estimator avoids silently allocating named-index memory for broad empty relations.
+pub(crate) fn estimated_write001_empty_index_bytes(
+    table: &RelationalTable,
+    capacity: usize,
+) -> Option<u64> {
+    if !write001_empty_index_in_place_preallocation(table) || capacity != 1 {
+        return None;
+    }
+    estimated_named_index_bytes_for_shard(table, 1, capacity)
+}
+
 /// Exact retained bytes for every distinct named-index key id on one shard. The sizing mirrors
 /// `ensure_shard_pk_device_index`: a directory at the full physical append horizon plus one posting
 /// link per physical row. Shared key ids are charged once because publication reuses their allocation.
@@ -67,20 +110,17 @@ mod admission;
 mod append_source;
 /// Typed INSERT device-plan compilation and physical residency adaptation.
 mod fixed_insert;
-/// In-place physical reservation ingredients for the unreachable indexed handoff.
+/// In-place physical reservation ingredients consumed by the production indexed handoff.
 pub(crate) mod index_delta;
 /// Zero-CUDA generation/cache preview consumed by the indexed in-place reservation.
 mod index_delta_preview;
-#[cfg(test)]
-mod index_delta_preview_tests;
-/// Fixed-rollover physical reservation ingredients for the unreachable indexed handoff.
+/// Rollover physical reservation ingredients consumed by the production indexed handoff.
 pub(crate) mod index_rollover;
 /// One sealed forecast-to-materialization boundary for indexed physical preparation.
 mod indexed_forecast;
-/// Private physical resources for the still-unreachable indexed INSERT handoff.
-///
-/// This compiles with production so its move-only lifetime and abandonment behavior cannot
-/// silently diverge.  It is not a live strategy selector, WAL carrier, or publisher.
+/// One move-only indexed INSERT reservation selected by the common device-plan compiler.
+/// It owns no WAL encoder or transaction terminal; the generic codec-5 finalizer remains the
+/// only caller allowed to claim WAL and consume it.
 mod indexed_reservation;
 /// Vacuum, serialized rehydration, and device-gather ownership.
 mod maintenance;
@@ -92,7 +132,7 @@ mod payload;
 mod policy;
 /// Prepared, branch-neutral indexed table publication capability.  Its constructors remain
 /// test-only until WRITE-001 opens the one live `DeviceInsertPlan` handoff.
-mod prepared_table_index_manifest;
+pub(crate) mod prepared_table_index_manifest;
 #[cfg(test)]
 pub(crate) use prepared_table_index_manifest::allocation_test_support::assert_no_thread_allocations;
 /// Fit-aware fixed-width rollover planning and private device construction ownership.
@@ -104,7 +144,8 @@ mod transient;
 
 #[allow(unused_imports)] // some sealed apply errors are asserted only by focused tests
 pub(crate) use fixed_insert::{
-    DeviceInsertPlan, DeviceInsertPlanApplyError, DeviceInsertPlanPrepareError, DeviceInsertRowIds,
+    DeviceInsertPlan, DeviceInsertPlanApplyError, DeviceInsertPlanManifestPredecessor,
+    DeviceInsertPlanPrepareError, DeviceInsertRowIds,
 };
 pub(crate) use payload::{
     build_relational_device_payload, build_relational_device_payload_with_capacity,

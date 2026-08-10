@@ -882,6 +882,11 @@ impl Engine {
         &self,
         txn_id: TxnId,
     ) -> Option<Arc<TransactionSnapshot>> {
+        let aliases = self
+            .public_transaction_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let txn_id = aliases.get(&txn_id).copied().unwrap_or(txn_id);
         self.active_snapshots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -966,7 +971,9 @@ impl Engine {
                     .iter()
                     .filter_map(|operation| match operation {
                         TransactionOperation::TableReset(reset) => Some(reset.table.clone()),
-                        TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
+                        TransactionOperation::Catalog(_)
+                        | TransactionOperation::Row(_)
+                        | TransactionOperation::TypedInsert(_) => None,
                     })
                     .collect::<BTreeSet<_>>();
                 if fenced.is_empty() && reset_tables.is_empty() {

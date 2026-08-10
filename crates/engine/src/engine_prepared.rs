@@ -282,6 +282,8 @@ fn prepared_view_table(
         Ok(RelationalTable {
             schema: view.schema.clone(),
             name: view.name.clone(),
+            // A view has a display OID but owns no table data generation.
+            stable_table_id: 0,
             oid: view.oid,
             columns,
             indexes: Vec::new(),

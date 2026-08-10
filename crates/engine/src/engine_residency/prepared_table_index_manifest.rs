@@ -13,13 +13,11 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-#[cfg(test)]
 use crate::engine_state::POINT_INDEX_MUTATION_POISON;
 use crate::engine_state::{
     NamedIndexCoverage, PreparedPointIndexMutationGuard, ReadState, ResidencyReadState,
     TablePointSlot, TerminalNamedIndexPublicationGuard,
 };
-#[cfg(test)]
 use crate::engine_transaction_reset::table_schema_digest;
 use crate::relational_model::{RelationalIndex, RelationalTable};
 use crate::resident_storage::{
@@ -72,7 +70,6 @@ struct PreparedTablePointMutation {
 }
 
 impl PreparedTablePointMutation {
-    #[cfg(test)]
     fn prepare(
         residency: &ResidencyReadState,
         read_state: &ReadState,
@@ -185,9 +182,22 @@ struct PreparedShardCellWitness {
 }
 
 impl PreparedShardCellMap {
-    #[cfg(test)]
-    fn capture(map: &ShardResidentDeviceMemoryMap) -> Self {
-        let expected = map.cells.load_full();
+    fn capture(
+        map: &ShardResidentDeviceMemoryMap,
+        successor: Option<((String, u32), Arc<CudaResidentDeviceMemory>)>,
+    ) -> Result<Self, PreparedTableIndexManifestError> {
+        Self::capture_from_expected(map.cells.load_full(), successor, None)
+    }
+
+    /// Build the next side-cell root from an already-prepared predecessor. This is used only when
+    /// two indexed rollovers share one transaction: the second manifest must expect the exact
+    /// private root that the first manifest will install, rather than recapturing the still-live
+    /// root and becoming stale immediately after the first publication.
+    fn capture_from_expected(
+        expected: Arc<ShardCellMap>,
+        successor: Option<((String, u32), Arc<CudaResidentDeviceMemory>)>,
+        retire_table: Option<&str>,
+    ) -> Result<Self, PreparedTableIndexManifestError> {
         let mut cells = Vec::with_capacity(expected.len());
         for (key, cell) in expected.iter() {
             let generation = cell.load();
@@ -198,11 +208,28 @@ impl PreparedShardCellMap {
                 payload: generation.get().clone(),
             });
         }
-        Self {
-            successor: Arc::new((*expected).clone()),
+        let mut successor_root = (*expected).clone();
+        if let Some(table) = retire_table {
+            successor_root.retain(|(candidate, _), _| candidate != table);
+        }
+        if let Some((key, memory)) = successor {
+            // A compact repair can retire shard N and retain its cell as a None tombstone for
+            // readers that pinned the old generation. A later rollover may safely reuse N by
+            // replacing that tombstoned cell in the prebuilt successor root. A live owner at the
+            // same key remains a genuine collision and must decline before WAL.
+            if successor_root
+                .get(&key)
+                .is_some_and(|cell| cell.load().get().is_some())
+            {
+                return Err(PreparedTableIndexManifestError::SideCellsStale);
+            }
+            successor_root.insert(key, Arc::new(crate::SnapshotCell::new(Some(memory))));
+        }
+        Ok(Self {
+            successor: Arc::new(successor_root),
             expected,
             cells: cells.into_boxed_slice(),
-        }
+        })
     }
 
     fn is_current(&self, map: &ShardResidentDeviceMemoryMap) -> bool {
@@ -251,6 +278,15 @@ struct PreparedShardCellPublications {
     row_id: PreparedShardCellMap,
 }
 
+/// Allocation-complete side-cell roots exported by one prepared manifest for the next manifest in
+/// the same transaction. It is intentionally data-only: it cannot arm or publish anything.
+struct PreparedShardCellPredecessor {
+    payload: Arc<ShardCellMap>,
+    deleted_by: Arc<ShardCellMap>,
+    created_by: Arc<ShardCellMap>,
+    row_id: Arc<ShardCellMap>,
+}
+
 /// All four side-cell roots displaced by a descriptor-last finalization.
 struct RetiredShardCellPublications {
     payload: RetiredShardCellMapRoots,
@@ -260,13 +296,65 @@ struct RetiredShardCellPublications {
 }
 
 impl PreparedShardCellPublications {
+    #[allow(clippy::too_many_arguments)] // captures five independently-owned side-cell roots
+    fn capture_rollover(
+        residency: &ResidencyReadState,
+        predecessor: Option<&PreparedShardCellPredecessor>,
+        table: &str,
+        shard_id: u32,
+        payload: Arc<CudaResidentDeviceMemory>,
+        created_by: Arc<CudaResidentDeviceMemory>,
+        row_id: Option<Arc<CudaResidentDeviceMemory>>,
+        resets_existing_rows: bool,
+    ) -> Result<Self, PreparedTableIndexManifestError> {
+        let key = || (table.to_string(), shard_id);
+        let expected_payload = predecessor
+            .map(|roots| Arc::clone(&roots.payload))
+            .unwrap_or_else(|| residency.shard_device_memory.cells.load_full());
+        let expected_deleted_by = predecessor
+            .map(|roots| Arc::clone(&roots.deleted_by))
+            .unwrap_or_else(|| residency.shard_deleted_by_memory.cells.load_full());
+        let expected_created_by = predecessor
+            .map(|roots| Arc::clone(&roots.created_by))
+            .unwrap_or_else(|| residency.shard_created_by_memory.cells.load_full());
+        let expected_row_id = predecessor
+            .map(|roots| Arc::clone(&roots.row_id))
+            .unwrap_or_else(|| residency.shard_row_id_memory.cells.load_full());
+        Ok(Self {
+            payload: PreparedShardCellMap::capture_from_expected(
+                expected_payload,
+                Some((key(), payload)),
+                resets_existing_rows.then_some(table),
+            )?,
+            deleted_by: PreparedShardCellMap::capture_from_expected(
+                expected_deleted_by,
+                None,
+                resets_existing_rows.then_some(table),
+            )?,
+            created_by: PreparedShardCellMap::capture_from_expected(
+                expected_created_by,
+                Some((key(), created_by)),
+                resets_existing_rows.then_some(table),
+            )?,
+            row_id: PreparedShardCellMap::capture_from_expected(
+                expected_row_id,
+                row_id.map(|memory| (key(), memory)),
+                resets_existing_rows.then_some(table),
+            )?,
+        })
+    }
+
     #[cfg(test)]
     fn capture(residency: &ResidencyReadState) -> Self {
         Self {
-            payload: PreparedShardCellMap::capture(&residency.shard_device_memory),
-            deleted_by: PreparedShardCellMap::capture(&residency.shard_deleted_by_memory),
-            created_by: PreparedShardCellMap::capture(&residency.shard_created_by_memory),
-            row_id: PreparedShardCellMap::capture(&residency.shard_row_id_memory),
+            payload: PreparedShardCellMap::capture(&residency.shard_device_memory, None)
+                .expect("unchanged payload cell capture cannot conflict"),
+            deleted_by: PreparedShardCellMap::capture(&residency.shard_deleted_by_memory, None)
+                .expect("unchanged deleted-by cell capture cannot conflict"),
+            created_by: PreparedShardCellMap::capture(&residency.shard_created_by_memory, None)
+                .expect("unchanged created-by cell capture cannot conflict"),
+            row_id: PreparedShardCellMap::capture(&residency.shard_row_id_memory, None)
+                .expect("unchanged row-id cell capture cannot conflict"),
         }
     }
 
@@ -298,7 +386,7 @@ struct PreparedTableIndexManifestPostWalPermit(());
 /// A branch-neutral, complete successor for all state an indexed table mutation must linearize.
 /// There is deliberately no production builder or call site; the sole consumer below is the
 /// intended live publication authority once `DeviceInsertPlan` owns the actual branch resources.
-struct PreparedTableIndexManifest<'a> {
+pub(super) struct PreparedTableIndexManifest<'a> {
     point: PreparedTablePointMutation,
     expected_shards: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
     successor_shards: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
@@ -315,14 +403,27 @@ struct PreparedTableIndexManifest<'a> {
     /// Future conversion consumes the reservation's allocation owner.  Holding the existing
     /// budget serialization guard now prevents a map-finalizer preparation from racing a sidecar
     /// allocation/replacement before the live carrier takes over this exact lifetime.
-    budget_guard: std::sync::MutexGuard<'a, ()>,
+    budget_guard: Option<std::sync::MutexGuard<'a, ()>>,
     /// Acquired before the budget guard and retained until point poisoning/completion has fenced
     /// every descriptor/side-cell authority.  Fields drop in declaration order, so it releases
     /// after `budget_guard` and before the lifecycle owner.
-    mutation_guard: std::sync::MutexGuard<'a, ()>,
+    mutation_guard: Option<std::sync::MutexGuard<'a, ()>>,
     /// Last on purpose: global acquisition is lifecycle → mutation → budget, and both success
     /// and abandonment release in the inverse order budget → mutation → lifecycle.
-    lifecycle: TerminalNamedIndexPublicationGuard<'a>,
+    lifecycle: Option<TerminalNamedIndexPublicationGuard<'a>>,
+}
+
+/// Opaque transaction-local predecessor for another indexed rollover manifest. This captures
+/// only roots that are already owned by a validated prepared manifest; it has no terminal guard,
+/// CUDA capability, WAL authority, or publication method. Consuming it makes the next manifest's
+/// exact expected state equal to the prior manifest's private successor state.
+pub(super) struct PreparedIndexedRolloverManifestPredecessor {
+    shards: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    side_cells: PreparedShardCellPredecessor,
+    index_cache: ShardPkIndexCache,
+    coverage: NamedIndexCoverage,
+    complete: NamedIndexComplete,
+    enrollment: NamedIndexEnrollment,
 }
 
 /// Atomic tail values must be frozen independently of their shared Arc identities.  A successor
@@ -334,9 +435,35 @@ struct PreparedIndexCacheTailWitness {
     published_has_postings: bool,
 }
 
+/// One already-built physical index for the private rollover shard. The manifest consumes these
+/// allocations while preparing its successor cache root; no cache entry is constructed after WAL.
+pub(super) struct PreparedRolloverIndexManifestEntry {
+    pub(super) key_id: usize,
+    pub(super) memory: Arc<CudaResidentDeviceMemory>,
+    pub(super) table_mask: u32,
+    pub(super) hash_shift: u32,
+    pub(super) duplicate_tolerant: bool,
+    pub(super) has_postings: bool,
+}
+
+/// A privately built S3-created named-index directory over one already-public shard.  The
+/// directory and its resident payload guard are retained by the transaction plan; this value is
+/// consumed only while assembling the one post-WAL manifest successor.
+pub(crate) struct PreparedExistingShardIndexManifestEntry {
+    pub(crate) shard_id: u32,
+    pub(crate) key_id: usize,
+    pub(crate) payload: Arc<CudaResidentDeviceMemory>,
+    pub(crate) row_count: usize,
+    pub(crate) memory: Arc<CudaResidentDeviceMemory>,
+    pub(crate) table_mask: u32,
+    pub(crate) hash_shift: u32,
+    pub(crate) duplicate_tolerant: bool,
+    pub(crate) has_postings: bool,
+}
+
 /// Terminal owner after the exact point epoch has transitioned even→odd.  Dropping this before a
 /// physical-completion seal is fail-closed through the armed point/lifecycle guards.
-struct ArmedTableIndexManifest<'a> {
+pub(super) struct ArmedTableIndexManifest<'a> {
     manifest: PreparedTableIndexManifest<'a>,
 }
 
@@ -369,6 +496,344 @@ fn capture_index_cache_tail_witnesses(
 }
 
 impl<'a> PreparedTableIndexManifest<'a> {
+    /// Prebuild the complete successor authority for one fixed-width indexed rollover. The
+    /// caller already owns the common transaction lifecycle plus the append reservation's
+    /// mutation and budget guards; this owner therefore captures no competing guard or terminal.
+    /// An S3-created index can name its public predecessor separately: the composed table then
+    /// supplies only the successor enrollment and coverage installed after WAL.
+    #[allow(clippy::too_many_arguments)] // explicit pre-WAL ownership and currentness witnesses
+    pub(super) fn prepare_indexed_rollover(
+        residency: &'a ResidencyReadState,
+        read_state: &ReadState,
+        table: &RelationalTable,
+        public_table: Option<&RelationalTable>,
+        mut new_shard: RelationalResidentShard,
+        index_entries: Box<[PreparedRolloverIndexManifestEntry]>,
+        prefix_entries: Box<[PreparedExistingShardIndexManifestEntry]>,
+        retired_key_ids: Vec<usize>,
+        gc_boundary: u64,
+        expected_epoch: &Arc<std::sync::atomic::AtomicU64>,
+        expected_even: u64,
+        predecessor_manifest: Option<PreparedIndexedRolloverManifestPredecessor>,
+        resets_existing_rows: bool,
+    ) -> Result<Self, PreparedTableIndexManifestError> {
+        let public_table = public_table.unwrap_or(table);
+        if public_table.name != table.name
+            || public_table.oid != table.oid
+            || public_table.stable_table_id != table.stable_table_id
+        {
+            return Err(PreparedTableIndexManifestError::CatalogOrSlotStale);
+        }
+        let point = PreparedTablePointMutation::prepare(residency, read_state, public_table)?;
+        if !Arc::ptr_eq(&point.epoch, expected_epoch)
+            || point.expected_even != expected_even
+            || index_entries.is_empty()
+        {
+            return Err(PreparedTableIndexManifestError::EpochStale);
+        }
+        let _descriptor = residency
+            .descriptor_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _route = residency
+            .sharded_point_route_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index_cache = residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let coverage = residency
+            .named_index_coverage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let complete = residency
+            .named_index_coverage_complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let enrollment = residency
+            .named_index_publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let public_index_state_is_current = if public_table.indexes.is_empty() {
+            !enrollment.contains_key(&public_table.oid)
+                && !complete.contains_key(&public_table.name)
+        } else {
+            enrollment.get(&public_table.oid) == Some(&public_table.indexes)
+                && complete
+                    .get(&public_table.name)
+                    .is_some_and(|(oid, indexes)| {
+                        *oid == public_table.oid && indexes == &public_table.indexes
+                    })
+        };
+        if !point.target_is_current_under_publish_lock(residency, read_state)
+            || !public_index_state_is_current
+        {
+            return Err(PreparedTableIndexManifestError::IndexStateStale);
+        }
+
+        let chained = predecessor_manifest.is_some();
+        let (
+            expected_shards,
+            predecessor_side_cells,
+            expected_index_cache,
+            expected_coverage,
+            expected_complete,
+            expected_enrollment,
+        ) = match predecessor_manifest {
+            Some(predecessor) => (
+                predecessor.shards,
+                Some(predecessor.side_cells),
+                predecessor.index_cache,
+                predecessor.coverage,
+                predecessor.complete,
+                predecessor.enrollment,
+            ),
+            None => (
+                residency.shards.load_full(),
+                None,
+                clone_index_cache_for_prepared_successor(&index_cache),
+                coverage.clone(),
+                complete.clone(),
+                enrollment.clone(),
+            ),
+        };
+        let expected_public_index_state_is_current = if public_table.indexes.is_empty() {
+            !expected_enrollment.contains_key(&public_table.oid)
+                && !expected_complete.contains_key(&public_table.name)
+        } else {
+            expected_enrollment.get(&public_table.oid) == Some(&public_table.indexes)
+                && expected_complete
+                    .get(&public_table.name)
+                    .is_some_and(|(oid, indexes)| {
+                        *oid == public_table.oid && indexes == &public_table.indexes
+                    })
+        };
+        if !expected_public_index_state_is_current {
+            return Err(PreparedTableIndexManifestError::IndexStateStale);
+        }
+        let current_table_shards = expected_shards
+            .get(&table.name)
+            .ok_or(PreparedTableIndexManifestError::DescriptorStale)?;
+        let predecessor = current_table_shards
+            .last()
+            .ok_or(PreparedTableIndexManifestError::DescriptorStale)?;
+        if predecessor.shard_id.checked_add(1) != Some(new_shard.shard_id)
+            || if resets_existing_rows {
+                new_shard.row_start != 0
+            } else {
+                predecessor.row_start.checked_add(predecessor.row_count)
+                    != Some(new_shard.row_start)
+            }
+            || new_shard.row_count == 0
+            || new_shard.device_memory.is_none()
+            || new_shard.created_by_region.is_none()
+        {
+            return Err(PreparedTableIndexManifestError::DescriptorStale);
+        }
+        let next_generation = Arc::new(());
+        let mut next_shards = (*expected_shards).clone();
+        let next_table_shards = next_shards
+            .get_mut(&table.name)
+            .ok_or(PreparedTableIndexManifestError::DescriptorStale)?;
+        if resets_existing_rows {
+            next_table_shards.clear();
+        } else {
+            for shard in next_table_shards.iter_mut() {
+                shard.point_route_generation = Arc::clone(&next_generation);
+            }
+        }
+        new_shard.point_route_generation = next_generation;
+        let payload = Arc::clone(
+            new_shard
+                .device_memory
+                .as_ref()
+                .ok_or(PreparedTableIndexManifestError::DescriptorStale)?,
+        );
+        let created_by = Arc::clone(
+            new_shard
+                .created_by_region
+                .as_ref()
+                .ok_or(PreparedTableIndexManifestError::DescriptorStale)?,
+        );
+        let row_id = new_shard.row_id_region.as_ref().map(Arc::clone);
+        let shard_id = new_shard.shard_id;
+        let row_count = new_shard.row_count;
+        next_table_shards.push(new_shard);
+        let side_cells = PreparedShardCellPublications::capture_rollover(
+            residency,
+            predecessor_side_cells.as_ref(),
+            &table.name,
+            shard_id,
+            Arc::clone(&payload),
+            created_by,
+            row_id,
+            resets_existing_rows,
+        )?;
+
+        let mut successor_index_cache =
+            clone_index_cache_for_prepared_successor(&expected_index_cache);
+        let index_cache_tail_witnesses = capture_index_cache_tail_witnesses(&expected_index_cache);
+        let mut successor_coverage = expected_coverage.clone();
+        if resets_existing_rows {
+            successor_index_cache.retain(|(name, _, _), _| name != &table.name);
+            successor_coverage.retain(|(name, _, _), _| name != &table.name);
+        } else if !retired_key_ids.is_empty() {
+            successor_index_cache.retain(|(name, _, key_id), _| {
+                name != &table.name || !retired_key_ids.contains(key_id)
+            });
+            successor_coverage.retain(|(name, _, key_id), _| {
+                name != &table.name || !retired_key_ids.contains(key_id)
+            });
+        }
+        for entry in prefix_entries {
+            let predecessor_is_exact = expected_shards
+                .get(&table.name)
+                .and_then(|shards| {
+                    shards.iter().find(|shard| {
+                        shard.shard_id == entry.shard_id
+                            && shard.row_count == entry.row_count
+                            && shard
+                                .device_memory
+                                .as_ref()
+                                .is_some_and(|memory| Arc::ptr_eq(memory, &entry.payload))
+                    })
+                })
+                .is_some();
+            let key = (table.name.clone(), entry.shard_id, entry.key_id);
+            if !predecessor_is_exact
+                || entry.memory.device_ptr() == 0
+                || entry.memory.device_ptr() == entry.payload.device_ptr()
+            {
+                return Err(PreparedTableIndexManifestError::IndexStateStale);
+            }
+            if successor_index_cache.contains_key(&key) || successor_coverage.contains_key(&key) {
+                // A pre-existing raw-key directory is semantically identical only when it covers
+                // this exact immutable payload. It stays in the successor map; the new catalog
+                // index enrollment may share it rather than allocating a duplicate directory.
+                if !expected_index_cache.get(&key).is_some_and(|existing| {
+                    existing.resident_device_ptr == entry.payload.device_ptr()
+                        && existing.row_count >= entry.row_count
+                        && existing
+                            .device_index
+                            .as_ref()
+                            .is_some_and(|memory| Arc::ptr_eq(memory, &entry.memory))
+                }) || !expected_coverage.get(&key).is_some_and(|(pointer, rows)| {
+                    *pointer == entry.payload.device_ptr() && *rows >= entry.row_count
+                }) {
+                    return Err(PreparedTableIndexManifestError::IndexStateStale);
+                }
+                continue;
+            }
+            successor_coverage.insert(key.clone(), (entry.payload.device_ptr(), entry.row_count));
+            successor_index_cache.insert(
+                key,
+                CachedShardPkDeviceIndex {
+                    resident_device_ptr: entry.payload.device_ptr(),
+                    row_count: entry.row_count,
+                    published_row_count: Arc::new(std::sync::atomic::AtomicUsize::new(
+                        entry.row_count,
+                    )),
+                    gc_boundary,
+                    duplicate_tolerant: entry.duplicate_tolerant,
+                    has_postings: entry.has_postings,
+                    published_has_postings: Arc::new(std::sync::atomic::AtomicBool::new(
+                        entry.has_postings,
+                    )),
+                    _resident_guard: entry.payload,
+                    device_index: Some(entry.memory),
+                    table_mask: entry.table_mask,
+                    hash_shift: entry.hash_shift,
+                },
+            );
+        }
+        for entry in index_entries {
+            let key = (table.name.clone(), shard_id, entry.key_id);
+            if successor_index_cache.contains_key(&key)
+                || successor_coverage.contains_key(&key)
+                || entry.memory.device_ptr() == 0
+                || entry.memory.device_ptr() == payload.device_ptr()
+            {
+                return Err(PreparedTableIndexManifestError::IndexStateStale);
+            }
+            successor_coverage.insert(key.clone(), (payload.device_ptr(), row_count));
+            successor_index_cache.insert(
+                key,
+                CachedShardPkDeviceIndex {
+                    resident_device_ptr: payload.device_ptr(),
+                    row_count,
+                    published_row_count: Arc::new(std::sync::atomic::AtomicUsize::new(row_count)),
+                    gc_boundary,
+                    duplicate_tolerant: entry.duplicate_tolerant,
+                    has_postings: entry.has_postings,
+                    published_has_postings: Arc::new(std::sync::atomic::AtomicBool::new(
+                        entry.has_postings,
+                    )),
+                    _resident_guard: Arc::clone(&payload),
+                    device_index: Some(entry.memory),
+                    table_mask: entry.table_mask,
+                    hash_shift: entry.hash_shift,
+                },
+            );
+        }
+        let mut successor_complete = expected_complete.clone();
+        successor_complete.insert(table.name.clone(), (table.oid, table.indexes.clone()));
+        let mut successor_enrollment = expected_enrollment.clone();
+        successor_enrollment.insert(table.oid, table.indexes.clone());
+        drop(enrollment);
+        drop(complete);
+        drop(coverage);
+        drop(index_cache);
+        drop(_route);
+        drop(_descriptor);
+        let manifest = Self {
+            point,
+            expected_shards,
+            successor_shards: Arc::new(next_shards),
+            side_cells,
+            expected_index_cache,
+            successor_index_cache,
+            index_cache_tail_witnesses,
+            expected_coverage,
+            successor_coverage,
+            expected_complete,
+            successor_complete,
+            expected_enrollment,
+            successor_enrollment,
+            budget_guard: None,
+            mutation_guard: None,
+            lifecycle: None,
+        };
+        // The first manifest proves its roots against the live residency authority. A chained
+        // manifest instead carries an unforgeable snapshot of that validated manifest's private
+        // successors; its exact terminal currentness check will run after the predecessor swaps
+        // those roots into the sole live authority.
+        if !chained {
+            manifest.validate_pre_wal(residency, read_state)?;
+        }
+        Ok(manifest)
+    }
+
+    /// Snapshot the already-built successor roots for the next rollover in this same transaction.
+    /// Map values retain the exact Arc/atomic identities that publication will install.
+    pub(super) fn indexed_rollover_successor_predecessor(
+        &self,
+    ) -> PreparedIndexedRolloverManifestPredecessor {
+        PreparedIndexedRolloverManifestPredecessor {
+            shards: Arc::clone(&self.successor_shards),
+            side_cells: PreparedShardCellPredecessor {
+                payload: Arc::clone(&self.side_cells.payload.successor),
+                deleted_by: Arc::clone(&self.side_cells.deleted_by.successor),
+                created_by: Arc::clone(&self.side_cells.created_by.successor),
+                row_id: Arc::clone(&self.side_cells.row_id.successor),
+            },
+            index_cache: clone_index_cache_for_prepared_successor(&self.successor_index_cache),
+            coverage: self.successor_coverage.clone(),
+            complete: self.successor_complete.clone(),
+            enrollment: self.successor_enrollment.clone(),
+        }
+    }
+
     /// Prebuild every persistent root while the table is still pre-terminal.  Locking follows the
     /// consuming order so the captured roots form one real residency authority, not a detached
     /// model.  Every allocation (map clone, retoken, and lifecycle protected-set) occurs here.
@@ -458,9 +923,9 @@ impl<'a> PreparedTableIndexManifest<'a> {
             successor_complete,
             expected_enrollment,
             successor_enrollment,
-            budget_guard,
-            mutation_guard,
-            lifecycle,
+            budget_guard: Some(budget_guard),
+            mutation_guard: Some(mutation_guard),
+            lifecycle: Some(lifecycle),
         })
     }
 
@@ -552,7 +1017,6 @@ impl<'a> PreparedTableIndexManifest<'a> {
 
     /// Clean pre-terminal validation.  It uses the same real locks/currentness checks as the
     /// consuming publisher but neither arms terminal guards nor mutates any authority.
-    #[cfg(test)]
     fn validate_pre_wal(
         &self,
         residency: &ResidencyReadState,
@@ -599,10 +1063,18 @@ impl<'a> PreparedTableIndexManifest<'a> {
         mut self,
         _permit: PreparedTableIndexManifestPostWalPermit,
     ) -> Result<ArmedTableIndexManifest<'a>, PreparedTableIndexManifestError> {
-        self.lifecycle.arm_post_wal();
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            lifecycle.arm_post_wal();
+        }
         self.point.arm_terminal();
         self.point.start_terminal()?;
         Ok(ArmedTableIndexManifest { manifest: self })
+    }
+
+    pub(super) fn arm_post_wal_for_indexed_rollover(
+        self,
+    ) -> Result<ArmedTableIndexManifest<'a>, PreparedTableIndexManifestError> {
+        self.arm_post_wal(PreparedTableIndexManifestPostWalPermit(()))
     }
 }
 
@@ -623,6 +1095,19 @@ struct PreparedTableIndexManifestGeometry {
 }
 
 impl<'a> ArmedTableIndexManifest<'a> {
+    pub(super) fn publish_after_physical_completion(
+        self,
+        residency: &ResidencyReadState,
+        read_state: &ReadState,
+    ) -> Result<(), PreparedTableIndexManifestError> {
+        residency.publish_completed_table_index_manifest(
+            read_state,
+            CompletedPhysicalTableIndexManifest {
+                manifest: self.manifest,
+            },
+        )
+    }
+
     /// Test-only completion mint.  It cannot stand in for CUDA execution; it only lets focused
     /// tests exercise the production-compiled terminal map finalizer and its failure behavior.
     #[cfg(test)]
@@ -709,7 +1194,9 @@ impl ResidencyReadState {
         completed: CompletedPhysicalTableIndexManifest<'_>,
     ) -> Result<(), PreparedTableIndexManifestError> {
         let mut manifest = completed.manifest;
-        manifest.lifecycle.enter_final_publication();
+        if let Some(lifecycle) = manifest.lifecycle.as_mut() {
+            lifecycle.enter_final_publication();
+        }
 
         let _descriptor = self
             .descriptor_publish_lock
@@ -797,7 +1284,9 @@ impl ResidencyReadState {
         // is consumed while both local guards remain held; now release in strict reverse order.
         drop(budget_guard);
         drop(mutation_guard);
-        lifecycle.complete_success();
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.complete_success();
+        }
         drop(retired);
         Ok(())
     }

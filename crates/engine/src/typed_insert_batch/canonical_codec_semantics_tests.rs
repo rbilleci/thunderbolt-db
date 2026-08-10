@@ -10,11 +10,7 @@ fn seal(
     prepare_typed_insert_semantics(insert, catalog, prepared_catalog_seq, None)
         .expect("semantic fixture preparation succeeds")
         .expect("semantic fixture is current")
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("semantic fixture seals")
 }
 

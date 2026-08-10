@@ -181,7 +181,7 @@ fn retained_device_view_uses_one_generation_atomic_entry_during_replacement() {
 }
 
 #[test]
-fn queued_text_mutation_owns_guard_until_terminal_flush() {
+fn typed_insert_compatibility_surface_uses_the_immediate_terminal_and_releases_its_guard() {
     let mut engine = Engine::with_batching(8, Duration::from_secs(60));
     engine
         .execute_text(1, "CREATE TABLE queued_guard (id INT, value INT)")
@@ -190,23 +190,13 @@ fn queued_text_mutation_owns_guard_until_terminal_flush() {
     engine
         .enqueue_set_text(2, "INSERT INTO queued_guard VALUES (1, 10)", Instant::now())
         .unwrap();
-    assert_eq!(engine.batcher().len(), 1, "fixture must remain deferred");
+    assert_eq!(
+        engine.batcher().len(),
+        0,
+        "INSERT compatibility ingress must not retain a second queued write authority"
+    );
 
     let reset = engine.table_access.lease();
-    assert!(matches!(
-        reset.acquire_exclusive([oid]),
-        Err(ExecuteError::Serialization(_))
-    ));
-    engine.simulate_next_wal_flush_failure();
-    engine
-        .flush_admin()
-        .expect_err("clean pre-durable failure requeues the guarded item");
-    assert_eq!(engine.batcher().len(), 1);
-    assert!(matches!(
-        reset.acquire_exclusive([oid]),
-        Err(ExecuteError::Serialization(_))
-    ));
-    engine.flush_admin().unwrap();
     reset.acquire_exclusive([oid]).unwrap();
 }
 
@@ -393,7 +383,7 @@ fn raced_table_access_failure_rechecks_new_terminal_identity() {
 }
 
 #[test]
-fn raw_binary_rows_derive_atomic_dependency_guards() {
+fn raw_binary_inserts_are_rejected_before_dependency_guards() {
     let engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE binary_a (id INT, value INT)")
@@ -444,7 +434,7 @@ fn raw_binary_rows_derive_atomic_dependency_guards() {
     assert!(
         error
             .to_string()
-            .contains("incompatible retained access guard"),
+            .contains("must enter typed transaction admission"),
         "{error}"
     );
     assert_eq!(engine.durable_wal_records().len(), durable_before);

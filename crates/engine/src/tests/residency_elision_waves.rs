@@ -149,13 +149,8 @@ fn wave_batch_concurrent_dup_race_single_winner() {
     );
 }
 
-/// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
-/// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
-/// hook), so BOTH pass the off-lock validation and device history plus wave-local arbitration is
-/// the ONLY guard left — the under-lock re-resolve deliberately skips the redundant unique
-/// pass on FK-free tables (`InsertPrepareValidation::ReResolveDeviceCovered`). Exactly one
-/// must win; sabotaging the wave arbitration makes BOTH land and this test FAIL
-/// (verified — the stochastic dup-race test above cannot certify this window).
+/// The deterministic same-snapshot duplicate race: two codec-5 writers INSERT the same PK and
+/// barrier after typed preparation but before the transaction terminal. Exactly one may win.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn constrained_elision_same_snapshot_dup_insert_single_winner() {

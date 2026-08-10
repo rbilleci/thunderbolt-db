@@ -340,7 +340,14 @@ impl Engine {
                 .read_resident_u64_column(shard.count_header_byte_offset, 1)
                 .map_err(|_| stale())?;
             if header.as_slice() != [row_count] {
-                return Err(stale());
+                // A READ COMMITTED transaction can retain this descriptor while a concurrent
+                // writer advances its public open allocation in place. Keep that distinct from
+                // every other torn-authority condition: statement staging may defer only this
+                // narrow observation to the canonical commit-cut revalidation.
+                return Err(ExecuteError::Serialization(format!(
+                    "relation \"{}\" has transaction-pinned GPU shard count-header drift",
+                    table.name
+                )));
             }
 
             let sidecar_bytes = capacity.checked_mul(8).ok_or_else(stale)?;
@@ -577,7 +584,84 @@ impl Engine {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let authority = self.transaction_unique_index_authority(snapshot, table)?;
+        self.validate_transaction_unique_index_members_device(
+            snapshot,
+            table,
+            &create.name,
+            &members,
+            None,
+        )
+    }
+
+    /// Check only the transaction-private typed-INSERT shard suffix for an immediate constraint
+    /// error.  The public-prefix shards intentionally stay out of this statement-time proof:
+    /// their open allocation may be advanced by a concurrent writer after this transaction's
+    /// READ COMMITTED snapshot.  The canonical terminal refreshes under the commit boundary and
+    /// remains the sole authority for prefix-vs-newly-committed history.
+    pub(crate) fn validate_transaction_private_typed_unique_indexes_device(
+        &self,
+        snapshot: &Arc<TransactionSnapshot>,
+        table: &RelationalTable,
+        private_shards: &[RelationalResidentShard],
+    ) -> Result<(), ExecuteError> {
+        if private_shards.is_empty() {
+            return Ok(());
+        }
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            let members = index
+                .key_columns
+                .iter()
+                .map(|name| {
+                    table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, column)| &column.name == name)
+                        .map(|(idx, column)| (idx, column.ty))
+                        .ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::Durability(format!(
+                                "unique index \"{}\" references missing column \"{name}\"",
+                                index.name
+                            )))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.validate_transaction_unique_index_members_device(
+                snapshot,
+                table,
+                &index.name,
+                &members,
+                Some(private_shards),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Prove an existing UNIQUE/PRIMARY KEY index against the complete transaction-private GPU
+    /// generation.  This is deliberately shared by transactional CREATE INDEX and COMMIT: a
+    /// statement-local typed batch can prove itself before WAL, but multiple private shards from
+    /// separate statements must be grouped together before publication.
+    fn validate_transaction_unique_index_members_device(
+        &self,
+        snapshot: &Arc<TransactionSnapshot>,
+        table: &RelationalTable,
+        index_name: &str,
+        members: &[(usize, SqlType)],
+        hot_shard_suffix: Option<&[RelationalResidentShard]>,
+    ) -> Result<(), ExecuteError> {
+        #[cfg(test)]
+        self.run_index_validation_pause_hook();
+        let authority = match hot_shard_suffix {
+            Some(shards) => TransactionUniqueIndexAuthority::Hot {
+                rows: self.validate_transaction_hot_index_authority(
+                    table,
+                    shards,
+                    snapshot.boundary,
+                )?,
+                shards: shards.to_vec(),
+            },
+            None => self.transaction_unique_index_authority(snapshot, table)?,
+        };
         let private_rows = authority.rows();
         if private_rows < 2 {
             return Ok(());
@@ -635,8 +719,6 @@ impl Engine {
             (_, None) => u64::MAX,
         };
         let _allocation_scope = gpu_db_execution::CudaAllocationScope::with_budget(scratch_limit);
-        #[cfg(test)]
-        self.run_index_validation_pause_hook();
         let outcome = match authority {
             TransactionUniqueIndexAuthority::Cold { cold, .. } => {
                 let total_rows = usize::try_from(private_rows).map_err(|_| {
@@ -662,7 +744,7 @@ impl Engine {
                     cold: &cold,
                     boundary: snapshot.boundary,
                     predicate: &predicate,
-                    members: &members,
+                    members,
                     gpu_id,
                     host_staging_limit: usize::try_from(scratch_limit)
                         .unwrap_or(usize::MAX)
@@ -691,7 +773,7 @@ impl Engine {
                 if duplicate {
                     Err(ExecuteError::Engine(EngineError::UniqueViolation(format!(
                         "duplicate key value violates unique index \"{}\"",
-                        create.name
+                        index_name
                     ))))
                 } else {
                     Ok(())
@@ -705,13 +787,13 @@ impl Engine {
                     shards,
                 )?;
                 self.transaction_unique_index_source_has_duplicate(
-                    table, &unified, &predicate, &members,
+                    table, &unified, &predicate, members,
                 )
                 .and_then(|duplicate| {
                     if duplicate {
                         Err(ExecuteError::Engine(EngineError::UniqueViolation(format!(
                             "duplicate key value violates unique index \"{}\"",
-                            create.name
+                            index_name
                         ))))
                     } else {
                         Ok(())
@@ -731,6 +813,50 @@ impl Engine {
                 std::sync::atomic::Ordering::Relaxed,
             );
         outcome
+    }
+
+    /// Revalidate final existing unique indexes for surviving typed-insert tables. The selected
+    /// authority is the transaction-pinned private shard generation, so this catches duplicate
+    /// typed batches staged by distinct statements without decoding row images or staging a host
+    /// relation back to the device. Legacy-only transactions keep their established validator and
+    /// do not pay this typed-proof catalog walk.
+    pub(crate) fn validate_transaction_final_typed_unique_indexes_device(
+        &self,
+        snapshot: &Arc<TransactionSnapshot>,
+        catalog: &CatalogSnapshot,
+        typed_tables: &BTreeSet<String>,
+    ) -> Result<(), ExecuteError> {
+        for table_name in typed_tables {
+            let table = required_table(catalog, table_name)?;
+            for index in table.indexes.iter().filter(|index| index.unique) {
+                let members = index
+                    .key_columns
+                    .iter()
+                    .map(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, column)| &column.name == name)
+                            .map(|(idx, column)| (idx, column.ty))
+                            .ok_or_else(|| {
+                                ExecuteError::Engine(EngineError::Durability(format!(
+                                    "unique index \"{}\" references missing column \"{name}\"",
+                                    index.name
+                                )))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.validate_transaction_unique_index_members_device(
+                    snapshot,
+                    table,
+                    &index.name,
+                    &members,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn transaction_cold_index_windows_have_duplicate(

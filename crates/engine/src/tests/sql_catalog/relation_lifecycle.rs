@@ -1067,11 +1067,13 @@ fn foreign_key_null_is_satisfied_pg_semantics() {
     e.execute_text(5, "INSERT INTO c (id, pid) VALUES (10, NULL)")
         .unwrap();
     // A real missing key still rejects.
-    assert!(e
+    let missing_parent = e
         .execute_text(6, "INSERT INTO c VALUES (11, 999)")
-        .unwrap_err()
-        .to_string()
-        .contains("foreign key"));
+        .unwrap_err();
+    assert!(
+        missing_parent.to_string().contains("foreign key"),
+        "unexpected missing-parent verdict: {missing_parent}"
+    );
     e.execute_text(7, "INSERT INTO c VALUES (12, 1)").unwrap();
     // UPDATE a valid fk to NULL passes.
     e.execute_text(8, "UPDATE c SET pid = NULL WHERE id = 12")
@@ -1104,7 +1106,10 @@ fn relational_foreign_keys_enforce_and_replay_from_wal() {
         .execute_text(6, "INSERT INTO orders (id, customer_id) VALUES (11, 99)")
         .unwrap_err()
         .to_string();
-    assert!(invalid_insert.contains("violates foreign key constraint"));
+    assert!(
+        invalid_insert.contains("violates foreign key constraint"),
+        "unexpected child INSERT verdict: {invalid_insert}"
+    );
     let invalid_child_update = e
         .execute_text(7, "UPDATE orders SET customer_id = 99 WHERE id = 10")
         .unwrap_err()

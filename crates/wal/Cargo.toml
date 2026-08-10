@@ -12,3 +12,8 @@ gpu_db_types = { path = "../types" }
 gpu_db_write_conveyor = { path = "../write_conveyor" }
 libc = "0.2"
 sha2 = "0.10"
+
+[features]
+# Build-only attribution for the exact typed-record encoder. The engine qualification probe
+# forwards this feature; ordinary WAL builds retain no clocks or timing fields.
+probe-timing = []

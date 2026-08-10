@@ -91,6 +91,8 @@ fn fill_tables(
             &mut graph.tables,
             RetainedTable {
                 table_ref: u32_at(&raw, 0),
+                resets_existing_rows: u32_at(&raw, 4) & 1 != 0,
+                initial_table_absent: u32_at(&raw, 4) & 2 != 0,
                 stable_table_id: u64_at(&raw, 8),
                 display_oid: u32_at(&raw, 16),
                 target_dependency_ref: u32_at(&raw, 20),
@@ -339,6 +341,7 @@ fn fill_transitions(
                 key_effect_start: u32_at(&raw, 40),
                 key_effect_count: u32_at(&raw, 44),
                 final_writer_statement_ordinal: u32_at(&raw, 48),
+                final_writer_statement_digest: digest_at(&raw, 160),
                 typed_statement_digest: digest_at(&raw, 64),
                 final_row_digest: digest_at(&raw, 96),
                 transition_digest: digest_at(&raw, 128),

@@ -222,6 +222,37 @@ pub(crate) struct BinaryTransactionRecord {
     pub(crate) mutations: Vec<BinaryTransactionMutation>,
 }
 
+impl BinaryTransactionRecord {
+    /// Test fixture seed for an otherwise empty S3 catalog composition. Production composition
+    /// now starts from the resolved pre-existing-row operation so it cannot accidentally mint a
+    /// second empty authority.
+    #[cfg(test)]
+    pub(crate) fn catalog_composition_seed() -> Self {
+        Self {
+            catalog_epoch: BinaryTransactionCatalogEpoch::Legacy,
+            allocator_high_water: 0,
+            catalog_commands: Vec::new(),
+            created_table_identities: BTreeMap::new(),
+            created_table_index_identities: BTreeMap::new(),
+            catalog_output: None,
+            view_operations: Vec::new(),
+            view_lifecycle_operations: Vec::new(),
+            index_lifecycle_operations: Vec::new(),
+            sequence_lifecycle_operations: Vec::new(),
+            sequence_reset_operations: Vec::new(),
+            sequence_advances_by_oid: BTreeMap::new(),
+            operation_order: Vec::new(),
+            statement_digests: Vec::new(),
+            sequence_input_oids: BTreeMap::new(),
+            sequence_value_references: Vec::new(),
+            table_resets: Vec::new(),
+            sequence_advances: BTreeMap::new(),
+            table_identities: BTreeMap::new(),
+            mutations: Vec::new(),
+        }
+    }
+}
+
 /// A decoded binary WAL record of any op (the tag dispatch for apply/replay consumers).
 // Keep the transaction record inline: live apply and replay immediately move it into the sole
 // transaction consumer, while boxing would add an allocation to every explicit transaction only

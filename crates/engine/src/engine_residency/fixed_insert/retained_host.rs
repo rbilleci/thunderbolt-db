@@ -112,6 +112,13 @@ impl PreparedOpenShardIdentity {
             && descriptor_bool_layouts_match(table, self.capacity, &self.bool_layouts)
     }
 
+    /// An in-place append has no validity-write channel. Once an open shard owns a nullable
+    /// bitmap, even an all-valid incoming batch must publish a successor shard: untouched
+    /// headroom bits are zero and would otherwise make the appended values read back as NULL.
+    pub(super) fn supports_in_place_append(&self) -> bool {
+        self.null_layouts.is_empty()
+    }
+
     pub(super) fn append_host_retention(
         &self,
         report: &mut HostRetentionReport,

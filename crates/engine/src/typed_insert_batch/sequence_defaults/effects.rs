@@ -15,8 +15,7 @@ pub(crate) struct SequenceDefaultParentContext {
 }
 
 impl SequenceDefaultParentContext {
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    pub(crate) fn new(
         parent_txn_id: TxnId,
         parent_autocommit: bool,
         parent_request_digest: gpu_db_wal::CanonicalDigest,
@@ -32,7 +31,24 @@ impl SequenceDefaultParentContext {
         }
     }
 
-    fn expression_ordinal(&self, request: &SequenceDefaultRequest) -> Option<u32> {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        parent_txn_id: TxnId,
+        parent_autocommit: bool,
+        parent_request_digest: gpu_db_wal::CanonicalDigest,
+        statement_ordinal: InsertStatementOrdinal,
+        expression_ordinal_base: u32,
+    ) -> Self {
+        Self::new(
+            parent_txn_id,
+            parent_autocommit,
+            parent_request_digest,
+            statement_ordinal,
+            expression_ordinal_base,
+        )
+    }
+
+    pub(super) fn expression_ordinal(&self, request: &SequenceDefaultRequest) -> Option<u32> {
         self.expression_ordinal_base
             .checked_add(request.expression_ordinal)
     }
@@ -169,10 +185,9 @@ pub(crate) struct CanonicalSequenceEffectView<'a> {
     pub(crate) kind: CanonicalSequenceEffectKindView,
 }
 
-#[cfg(test)]
 impl PrivateSequencePlanningEvidence {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn exact_for_test(
+    pub(crate) fn exact(
         lifetime_origin: u8,
         owner_kind: u8,
         owner_statement_ordinal: u32,
@@ -198,6 +213,36 @@ impl PrivateSequencePlanningEvidence {
             child_digest,
             outcome_digest,
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exact_for_test(
+        lifetime_origin: u8,
+        owner_kind: u8,
+        owner_statement_ordinal: u32,
+        owner_statement_digest: gpu_db_wal::CanonicalDigest,
+        owner_creator_catalog_column_ordinal: Option<u32>,
+        predecessor_tag: u8,
+        predecessor_digest: gpu_db_wal::CanonicalDigest,
+        input_digest: gpu_db_wal::CanonicalDigest,
+        descriptor_digest: gpu_db_wal::CanonicalDigest,
+        child_digest: gpu_db_wal::CanonicalDigest,
+        outcome_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Self {
+        Self::exact(
+            lifetime_origin,
+            owner_kind,
+            owner_statement_ordinal,
+            owner_statement_digest,
+            owner_creator_catalog_column_ordinal,
+            predecessor_tag,
+            predecessor_digest,
+            input_digest,
+            descriptor_digest,
+            child_digest,
+            outcome_digest,
+        )
     }
 }
 
@@ -271,10 +316,9 @@ impl SequenceDefaultBinding {
         }
     }
 
-    /// Test-only exact construction for the inert WRITE-001 terminal. Unlike the older semantic
-    /// fixtures below, this constructor does not derive an input digest or transition identity.
-    #[cfg(test)]
-    pub(crate) fn published_exact_for_test(
+    /// Construct an exact receipt from a transition already published by the sequence owner.
+    /// This never derives a value, digest, or transition identity.
+    pub(crate) fn published_exact(
         request: SequenceDefaultRequest,
         parent: SequenceDefaultParentContext,
         value: i64,
@@ -302,10 +346,22 @@ impl SequenceDefaultBinding {
         }
     }
 
-    /// Test-only exact private construction for the inert WRITE-001 terminal. Every scalar comes
-    /// from the stable-OID classifier; this constructor never synthesizes predecessor state.
+    /// Test spelling retained for the inert terminal fixtures. Production callers use the
+    /// explicitly named receipt constructor above.
     #[cfg(test)]
-    pub(crate) fn private_exact_for_test(
+    pub(crate) fn published_exact_for_test(
+        request: SequenceDefaultRequest,
+        parent: SequenceDefaultParentContext,
+        value: i64,
+        transition_txn_id: TxnId,
+        input_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Self {
+        Self::published_exact(request, parent, value, transition_txn_id, input_digest)
+    }
+
+    /// Construct a private sequence receipt from the stable-OID classifier. Every scalar must be
+    /// supplied by that classifier; this method never synthesizes predecessor state.
+    pub(crate) fn private_exact(
         request: SequenceDefaultRequest,
         parent: SequenceDefaultParentContext,
         value: i64,
@@ -345,6 +401,18 @@ impl SequenceDefaultBinding {
             request,
             value,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn private_exact_for_test(
+        request: SequenceDefaultRequest,
+        parent: SequenceDefaultParentContext,
+        value: i64,
+        prior_state: (i64, bool),
+        next_state: (i64, bool),
+        planning: PrivateSequencePlanningEvidence,
+    ) -> Self {
+        Self::private_exact(request, parent, value, prior_state, next_state, planning)
     }
 
     #[cfg(test)]
@@ -563,7 +631,6 @@ impl SequenceDefaultBindings {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn from_bindings(
         parent: SequenceDefaultParentContext,
         bindings: Vec<SequenceDefaultBinding>,

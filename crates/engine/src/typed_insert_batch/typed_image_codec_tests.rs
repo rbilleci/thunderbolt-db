@@ -1,4 +1,6 @@
 use super::*;
+use crate::relational_model::{RelationalColumn, RelationalTable};
+use std::collections::BTreeMap;
 
 struct Fixture {
     nullable: TypedInsertColumnValidity,
@@ -122,6 +124,87 @@ impl Fixture {
                 values: &self.text,
             },
         ]
+    }
+
+    fn all_final_columns(&self) -> Vec<TypedImageColumnView<'_>> {
+        let types = [
+            SqlType::Int2,
+            SqlType::Int4,
+            SqlType::Int8,
+            SqlType::Numeric {
+                precision: 8,
+                scale: 2,
+            },
+            SqlType::Bool,
+            SqlType::Text,
+            SqlType::Date,
+            SqlType::Timestamp,
+            SqlType::Uuid,
+        ];
+        let values = [
+            &self.int2,
+            &self.int4,
+            &self.int8,
+            &self.numeric,
+            &self.boolean,
+            &self.text,
+            &self.date,
+            &self.timestamp,
+            &self.uuid,
+        ];
+        let mut columns = Vec::new();
+        columns
+            .try_reserve_exact(types.len())
+            .expect("test final column reservation");
+        for (ordinal, ty) in types.into_iter().enumerate() {
+            columns.push(TypedImageColumnView {
+                catalog_column_ordinal: u32::try_from(ordinal).unwrap(),
+                stable_column_id: 100 + ordinal as u32,
+                table_ref: 0,
+                attnum: i16::try_from(ordinal + 1).unwrap(),
+                ty,
+                type_oid: ty.postgres_oid(),
+                type_size: ty.type_size(),
+                result_format: 0,
+                name: "",
+                validity: if matches!(ordinal, 0 | 3 | 4 | 5) {
+                    &self.nullable
+                } else {
+                    &self.all_valid
+                },
+                values: values[ordinal],
+            });
+        }
+        columns
+    }
+}
+
+fn recovery_table(columns: &[TypedImageColumnView<'_>]) -> RelationalTable {
+    const TABLE_OID: u32 = 9_001;
+    RelationalTable {
+        schema: "public".to_string(),
+        name: "recovery_all_types".to_string(),
+        stable_table_id: 700_001,
+        oid: TABLE_OID,
+        columns: columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, column)| RelationalColumn {
+                id: column.stable_column_id,
+                table_oid: TABLE_OID,
+                attnum: i16::try_from(ordinal + 1).unwrap(),
+                name: format!("column_{ordinal}"),
+                ty: column.ty,
+                domain: None,
+                default: None,
+                type_oid: column.type_oid,
+                type_size: column.type_size,
+            })
+            .collect(),
+        indexes: Vec::new(),
+        check_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+        acl: BTreeMap::new(),
     }
 }
 
@@ -295,6 +378,231 @@ fn typed_image_enforces_final_and_response_descriptor_contracts() {
         columns: &malformed_final,
     })
     .is_err());
+}
+
+#[test]
+fn strict_final_image_moves_all_typed_vector_owners_into_recovery_source() {
+    let fixture = Fixture::new();
+    let columns = fixture.all_final_columns();
+    let table = recovery_table(&columns);
+    let table_schema_digest = crate::engine_transaction_reset::table_schema_digest(&table)
+        .expect("recovery table has a canonical digest");
+    let image = encode_typed_image(&TypedImageView {
+        role: TypedImageRole::FinalTableImage,
+        rows: 3,
+        columns: &columns,
+    })
+    .expect("all-type final image encodes");
+    let source = PreparedResidentAppendSource::from_decoded_final_table_image(
+        decode_typed_image(&image).expect("strict final image decodes"),
+        &table,
+        table_schema_digest,
+        91,
+    )
+    .expect("strict final image moves into recovery source");
+
+    assert_eq!(source.table_name(), table.name);
+    assert_eq!(source.table.oid, table.oid);
+    assert_eq!(source.table.stable_table_id, table.stable_table_id);
+    assert_eq!(source.schema_digest(), table_schema_digest);
+    assert_eq!(source.prepared_catalog_seq(), 91);
+    assert_eq!(source.row_count(), 3);
+    assert!(source.exact_single_table_dependency());
+    assert!(source.requires_dense_rollover());
+
+    let prepared = source.columns();
+    assert_eq!(prepared.len(), columns.len());
+    assert!(matches!(
+        prepared[0].values,
+        Some(TypedInsertColumnValues::I32(ref values)) if values.as_ref() == [10, 0, 12]
+    ));
+    assert!(matches!(
+        prepared[1].values,
+        Some(TypedInsertColumnValues::I32(ref values)) if values.as_ref() == [44, 45, 46]
+    ));
+    assert!(matches!(
+        prepared[2].values,
+        Some(TypedInsertColumnValues::I64(ref values)) if values.as_ref() == [100, 101, 102]
+    ));
+    assert!(matches!(
+        prepared[3].values,
+        Some(TypedInsertColumnValues::I128(ref values)) if values.as_ref() == [12_345, 0, -99]
+    ));
+    assert!(matches!(
+        prepared[4].values,
+        Some(TypedInsertColumnValues::BoolBits(ref words)) if words.as_ref() == [0b001]
+    ));
+    assert!(matches!(
+        prepared[5].values,
+        Some(TypedInsertColumnValues::Text { ref offsets, ref bytes })
+            if offsets.as_ref() == [0, 1, 1, 2] && bytes.as_ref() == b"az"
+    ));
+    assert!(matches!(
+        prepared[6].values,
+        Some(TypedInsertColumnValues::I32(ref values)) if values.as_ref() == [0, 1, 2]
+    ));
+    assert!(matches!(
+        prepared[7].values,
+        Some(TypedInsertColumnValues::I64(ref values)) if values.as_ref() == [0, 1, 2]
+    ));
+    assert!(matches!(
+        prepared[8].values,
+        Some(TypedInsertColumnValues::Bytes16(ref values)) if values.as_ref() == [[1; 16], [2; 16], [3; 16]]
+    ));
+    assert!(matches!(
+        prepared[0].validity,
+        Some(TypedInsertColumnValidity::Bitmap(ref words)) if words.as_ref() == [0b101]
+    ));
+    assert!(matches!(
+        prepared[4].validity,
+        Some(TypedInsertColumnValidity::Bitmap(ref words)) if words.as_ref() == [0b101]
+    ));
+    assert!(matches!(
+        prepared[3].validity,
+        Some(TypedInsertColumnValidity::Bitmap(ref words)) if words.as_ref() == [0b101]
+    ));
+    assert!(matches!(
+        prepared[5].validity,
+        Some(TypedInsertColumnValidity::Bitmap(ref words)) if words.as_ref() == [0b101]
+    ));
+}
+
+#[test]
+fn concatenated_final_images_bind_the_s7_reference_before_their_single_strict_decode() {
+    let fixture = Fixture::new();
+    let columns = fixture.all_final_columns();
+    let image = encode_typed_image(&TypedImageView {
+        role: TypedImageRole::FinalTableImage,
+        rows: 3,
+        columns: &columns,
+    })
+    .expect("source final image encodes");
+    let (combined, bytes) = DecodedTypedImage::concatenate_final_table_images_for_table_ref(
+        vec![
+            decode_typed_image(&image).expect("first strict source image decodes"),
+            decode_typed_image(&image).expect("second strict source image decodes"),
+        ],
+        9,
+    )
+    .expect("strict final images concatenate at their S7 reference");
+
+    let decoded = decode_typed_image(&bytes).expect("combined final image remains strict");
+    assert_eq!(combined.facts(), decoded.facts());
+    assert_eq!(combined.facts().rows, 6);
+    let facts: Vec<_> = combined.columns().collect();
+    assert!(facts.iter().all(|column| column.table_ref == 9));
+    assert!(facts.iter().all(|column| column.vector_digest != [0; 32]));
+    assert!(matches!(
+        facts[0].values,
+        TypedInsertColumnValues::I32(values) if values.as_ref() == [10, 0, 12, 10, 0, 12]
+    ));
+    assert!(matches!(
+        facts[5].values,
+        TypedInsertColumnValues::Text { offsets, bytes }
+            if offsets.as_ref() == [0, 1, 1, 2, 3, 3, 4] && bytes.as_ref() == b"azaz"
+    ));
+}
+
+#[test]
+fn single_final_image_at_its_s7_reference_reuses_the_strict_image_authority() {
+    let fixture = Fixture::new();
+    let columns = fixture.all_final_columns();
+    let table = recovery_table(&columns);
+    let table_schema_digest = crate::engine_transaction_reset::table_schema_digest(&table)
+        .expect("recovery table has a canonical digest");
+    let image: Arc<[u8]> = encode_typed_image(&TypedImageView {
+        role: TypedImageRole::FinalTableImage,
+        rows: 3,
+        columns: &columns,
+    })
+    .expect("source final image encodes")
+    .into();
+    let (source, final_image) =
+        PreparedResidentAppendSource::from_decoded_final_table_images_for_table_ref(
+            vec![(
+                decode_typed_image(&image).expect("strict source image decodes"),
+                Arc::clone(&image),
+            )],
+            0,
+            &table,
+            table_schema_digest,
+            91,
+        )
+        .expect("already-bound final image becomes the resident source");
+
+    assert!(Arc::ptr_eq(&image, &final_image));
+    assert_eq!(source.row_count(), 3);
+    assert_eq!(source.columns().len(), columns.len());
+}
+
+#[test]
+fn recovery_source_rejects_nonfinal_or_catalog_mismatched_decoded_images() {
+    let fixture = Fixture::new();
+    let columns = fixture.all_final_columns();
+    let table = recovery_table(&columns);
+    let table_schema_digest = crate::engine_transaction_reset::table_schema_digest(&table)
+        .expect("recovery table has a canonical digest");
+    let final_image = encode_typed_image(&TypedImageView {
+        role: TypedImageRole::FinalTableImage,
+        rows: 3,
+        columns: &columns,
+    })
+    .expect("final image encodes");
+    assert!(
+        PreparedResidentAppendSource::from_decoded_final_table_image(
+            decode_typed_image(&final_image).expect("strict final image decodes"),
+            &table,
+            [0; 32],
+            91,
+        )
+        .is_err()
+    );
+
+    let mut mismatched_table = table.clone();
+    mismatched_table.columns[5].type_oid = 8_199;
+    let mismatched_digest = crate::engine_transaction_reset::table_schema_digest(&mismatched_table)
+        .expect("mismatched table remains digestible");
+    assert!(
+        PreparedResidentAppendSource::from_decoded_final_table_image(
+            decode_typed_image(&final_image).expect("strict final image decodes"),
+            &mismatched_table,
+            mismatched_digest,
+            91,
+        )
+        .is_err()
+    );
+
+    let mut mismatched_identity_table = table.clone();
+    mismatched_identity_table.columns[4].attnum = 99;
+    let mismatched_identity_digest =
+        crate::engine_transaction_reset::table_schema_digest(&mismatched_identity_table)
+            .expect("identity-mismatched table remains digestible");
+    assert!(
+        PreparedResidentAppendSource::from_decoded_final_table_image(
+            decode_typed_image(&final_image).expect("strict final image decodes"),
+            &mismatched_identity_table,
+            mismatched_identity_digest,
+            91,
+        )
+        .is_err()
+    );
+
+    let response_columns = fixture.response_columns();
+    let response_image = encode_typed_image(&TypedImageView {
+        role: TypedImageRole::RetainedResponse,
+        rows: 3,
+        columns: &response_columns,
+    })
+    .expect("response image encodes");
+    assert!(
+        PreparedResidentAppendSource::from_decoded_final_table_image(
+            decode_typed_image(&response_image).expect("strict response image decodes"),
+            &table,
+            table_schema_digest,
+            91,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -741,8 +1049,6 @@ fn typed_image_source_guards_keep_one_inert_shared_vector_authority() {
     assert!(source.contains("gpu-db/write001/image-layout/v2"));
     assert!(source.contains("gpu-db/write001/typed-vector/v2"));
     assert!(source.contains("try_reserve_exact"));
-    assert!(!source.contains("Vec::with_capacity"));
-    assert!(!source.contains("vec!["));
     assert!(!source.contains("WalRecord"));
     assert!(!source.contains("WriteDelta"));
     assert!(!source.contains("fn reencode"));

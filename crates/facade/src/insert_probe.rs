@@ -33,6 +33,29 @@ impl SharedEngine {
         self.engine.insert_probe_config()
     }
 
+    /// Feature-gated, read-only evidence that a single named GPU index covers its resident rows.
+    /// This is intentionally a façade pass-through: protocol integration tests must not inspect
+    /// engine internals or create a second index authority.
+    #[cfg(feature = "probe-timing")]
+    pub fn relational_named_index_covered_rows(&self, table_name: &str) -> Option<usize> {
+        self.engine.relational_named_index_covered_rows(table_name)
+    }
+
+    /// Feature-gated qualification precondition for a real protocol fixture. This invokes the
+    /// existing engine-owned named-index publication operation after the fixture has admitted its
+    /// seed row through pgwire; it exposes neither a writable engine reference nor a new SQL,
+    /// index, or publication authority.
+    #[cfg(feature = "probe-timing")]
+    pub fn publish_relational_resident_indexes_for_qualification(
+        &self,
+        table_name: &str,
+    ) -> Result<(), String> {
+        self.engine
+            .publish_relational_resident_indexes(table_name)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     /// Feature-gated server seam for exact raw simple-query bytes. The server calls this only
     /// after a Query message has produced exactly one successful INSERT.
     #[cfg(feature = "probe-timing")]

@@ -182,7 +182,7 @@ fn copy_and_explicit_transaction_roots_feed_reset_recovery() {
     assert_eq!(
         engine.test_table_root_index("copy_reset_root"),
         copy_root,
-        "direct-current COPY must advance the canonical table root"
+        "typed COPY must advance the canonical table root"
     );
     engine
         .submit_transaction(182, parsed("TRUNCATE copy_reset_root"))
@@ -265,7 +265,9 @@ fn exact_reset_source_digest_rejects_same_cardinality_mutation_and_replay_mismat
         .iter()
         .find_map(|operation| match operation {
             TransactionOperation::TableReset(reset) => Some(reset.as_ref().clone()),
-            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::Row(_)
+            | TransactionOperation::TypedInsert(_) => None,
         })
         .unwrap();
     assert_eq!(
@@ -1264,15 +1266,17 @@ fn grouped_drop_recreate_root_matches_record_replay_before_reset() {
     let mut engine = Engine::new_local();
     engine.set_shard_residency_enabled(true);
     engine.set_auto_admit_on_commit(true);
+    let create = [(
+        1,
+        Arc::from(b"CREATE TABLE grouped_reset (id int4 PRIMARY KEY)".as_slice()),
+    )];
+    if let Err(failure) = engine.commit_mutation_batch(&create) {
+        panic!("grouped reset create failed: {}", failure.error);
+    }
+    engine
+        .execute_text(2, "INSERT INTO grouped_reset VALUES (1)")
+        .expect("typed INSERT before grouped reset");
     let lifecycle = [
-        (
-            1,
-            Arc::from(b"CREATE TABLE grouped_reset (id int4 PRIMARY KEY)".as_slice()),
-        ),
-        (
-            2,
-            Arc::from(b"INSERT INTO grouped_reset VALUES (1)".as_slice()),
-        ),
         (3, Arc::from(b"DROP TABLE grouped_reset".as_slice())),
         (
             4,

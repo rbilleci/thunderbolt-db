@@ -55,3 +55,7 @@ bigdecimal = "0.4"
 # device-route facts without introducing another listener or product submission boundary.
 gpu_db_engine = { path = "../engine" }
 gpu_db_execution = { path = "../execution" }
+# The WRITE-001 pgwire convergence gate reads the segment emitted by the real served engine after
+# closing it.  This checks durable route identity at the protocol boundary without exposing an
+# engine-internal test accessor through the facade.
+gpu_db_wal = { path = "../wal" }

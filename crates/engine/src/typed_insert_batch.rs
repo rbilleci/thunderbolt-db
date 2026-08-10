@@ -11,9 +11,8 @@ use crate::insert_semantic_ir::InsertSourceOrdinal;
 use crate::insert_semantic_ir::{
     InsertStatementOrdinal, ResolvedInsertInput, ResolvedInsertSemantics,
 };
-use crate::rel_exec_helpers::{append_relational_cell, coerce_insert_value, RelationalCellRef};
+use crate::rel_exec_helpers::coerce_insert_value;
 
-mod builder;
 mod canonical_codec;
 // Shared, inert typed-vector/image authority for future codec-5 final-table images and
 // retained responses.  It deliberately owns no WAL, replay, result, or publication path.
@@ -40,7 +39,8 @@ pub(crate) use canonical_codec::{
 #[allow(unused_imports)] // Production-compiled inert codec-5 S7 reader; no live caller exists.
 pub(crate) use typed_image_codec::{
     copy_typed_image_after_measure, decode_typed_image, decode_typed_image_after_measure,
-    measure_decoded_typed_image, measure_decoded_typed_image_from_source, DecodedTypedImage,
+    encode_final_table_image_from_resolved_rows, measure_decoded_typed_image,
+    measure_decoded_typed_image_from_source, typed_image_sql_storage, DecodedTypedImage,
     DecodedTypedImageColumnFacts, TypedImageDecodeMeasure, TypedImageReadAt, TypedImageRole,
 };
 #[cfg(test)]
@@ -53,13 +53,10 @@ mod returning;
 mod semantics;
 pub(crate) mod sequence_defaults;
 pub(crate) use constraint_source::TypedInsertConstraintDeviceSource;
-#[cfg(test)]
-pub(crate) use constraint_source::{
-    constraint_source_upload_count, reset_constraint_source_upload_count,
-};
 pub(crate) use resident_source::{
     PreparedResidentAppendColumn, PreparedResidentAppendSource, PreparedResidentDensePayload,
     PreparedResidentFixedBoolUpload, PreparedResidentFixedChunk, PreparedResidentFixedChunkOwners,
+    PreparedResidentRuntimeGenerationView,
 };
 #[allow(unused_imports)] // Re-exported for the next production-compiled effect-plan handoff.
 pub(crate) use returning::{InsertReturningEffectShape, ReturningProjectionEffectIdentity};
@@ -121,6 +118,13 @@ pub(crate) fn decode_canonical_typed_insert_record(
     canonical_codec::decode(bytes)
 }
 
+/// Bind private sequence outcome predecessors across the transaction-ordered canonical records.
+pub(crate) fn validate_canonical_typed_insert_private_sequence_chains(
+    records: &[DecodedTypedInsertRecord],
+) -> Result<(), EngineError> {
+    canonical_codec::validate_transaction_private_sequence_chains(records)
+}
+
 /// Test-only fixture bridge for aggregate S2 materialization.  Production code has no raw
 /// canonical-record encoder facade; the codec-5 source-owner tests use this solely to construct
 /// a strict record that the same model-owning decoder then consumes.
@@ -174,20 +178,6 @@ pub(crate) fn reencode_decoded_typed_image_for_test(
     })
 }
 
-/// Test-only bridge to the canonical private sequence-chain fixture. The aggregate S5 tests use
-/// this exact existing codec fixture rather than inventing a second private-effect encoder.
-#[cfg(test)]
-pub(crate) fn private_sequence_chain_record_for_test(
-    statement_ordinal: InsertStatementOrdinal,
-    parent_txn_id: TxnId,
-) -> Result<Vec<u8>, EngineError> {
-    let batch = canonical_codec::sequence_tests::private_chain_batch_for_test(
-        statement_ordinal,
-        parent_txn_id,
-    );
-    canonical_codec::encode(&batch)
-}
-
 /// Bind legacy INSERT RETURNING before default lowering without constructing a result frame.
 ///
 /// The resident-append adapter declines RETURNING before semantic lowering, but the legacy
@@ -207,6 +197,7 @@ pub(crate) fn validate_legacy_insert_returning(
 struct TypedInsertBatchTable {
     schema: Arc<str>,
     name: Arc<str>,
+    stable_table_id: u64,
     oid: u32,
     schema_digest: gpu_db_wal::CanonicalDigest,
     prepared_catalog_seq: Index,
@@ -509,42 +500,6 @@ impl TypedInsertCanonicalCatalog {
     }
 }
 
-/// A private builder may decline a shape before any batch, WAL, or device plan exists.  This keeps
-/// future feature work explicit rather than silently reinterpreting an unsupported input.
-#[derive(Debug, PartialEq, Eq)]
-enum TypedInsertDeferred {
-    CatalogGeneration,
-    Constraints,
-    /// Semantic lowering succeeded, but the current resident-append compiler deliberately has
-    /// no physical owner for this shape yet.  In particular, RETURNING and stateful sequence
-    /// defaults are kept as prepared semantic data rather than reclassified as parse failures.
-    PhysicalUnsupported,
-}
-
-#[allow(clippy::large_enum_variant)]
-enum TypedInsertBuildResult {
-    Ready(TypedInsertBatch),
-    Deferred(TypedInsertDeferred),
-}
-
-/// The general builder has one final-shaped representation. The direct capability exists only to
-/// preserve the device compiler's fixed-width eligibility; it is not another semantic
-/// builder or a second SQL interpretation authority.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TypedInsertBuildCapability {
-    ResidentAppend,
-    #[cfg(test)]
-    SemanticOnly,
-    /// Exercises the real pre-WAL composite proof for indexed tables without widening the
-    /// production resident-append eligibility gate.
-    #[cfg(test)]
-    ProofOnly,
-    /// Exercises the inert current-generation FK proof without widening either live or indexed
-    /// proof-only eligibility.
-    #[cfg(test)]
-    ForeignKeyProofOnly,
-}
-
 impl TypedInsertColumnValues {
     fn zeroed(ty: SqlType, rows: usize) -> Result<Self, EngineError> {
         let words = bitmap_words(rows)?;
@@ -719,13 +674,6 @@ impl TypedInsertColumn {
             && self.values.as_i32().is_some()
     }
 
-    fn is_resident_append_vector(&self, row_count: usize) -> bool {
-        matches!(self.presence, TypedInsertColumnPresence::AllProvided)
-            && self.all_inputs_are_resolved(row_count)
-            && is_live_resident_append_type(self.ty)
-            && self.values.rows_match(row_count)
-    }
-
     #[cfg(test)]
     fn all_inputs_are_provided(&self, rows: usize) -> bool {
         self.input_states.len() == rows
@@ -816,141 +764,6 @@ impl TypedInsertColumn {
                     }
                 })
     }
-
-    /// Constant-time local safety check for one WAL-template cell. The full vector relationship
-    /// was established at seal time; re-walking all rows here would make row encoding quadratic.
-    fn row_invariants_hold(&self, row: usize, rows: usize) -> bool {
-        self.values.rows_match(rows)
-            && self.validity.shape_is_exact(rows)
-            && self.presence.shape_is_exact(rows)
-            && self.default_resolution.shape_is_exact(rows)
-            && self.input_states.len() == rows
-            && self.input_provenance.len() == rows
-            && row < rows
-            && self
-                .input_states
-                .get(row)
-                .zip(self.input_provenance.get(row))
-                .is_some_and(|(state, provenance)| match state {
-                    TypedInsertInputState::Provided | TypedInsertInputState::ProvidedNull => {
-                        matches!(
-                            provenance,
-                            TypedInsertInputProvenance::Literal
-                                | TypedInsertInputProvenance::BoundParameter { .. }
-                                | TypedInsertInputProvenance::ProgrammaticValue
-                        ) && self.source_column_ordinal.is_some()
-                            && self.presence.is_provided(row)
-                            && !self.default_resolution.was_defaulted(row)
-                            && (self.validity.is_valid(row)
-                                == (*state == TypedInsertInputState::Provided))
-                    }
-                    TypedInsertInputState::Omitted => {
-                        *provenance == TypedInsertInputProvenance::Omitted
-                            && self.source_column_ordinal.is_none()
-                            && self.presence.is_provided(row)
-                            && self.default_resolution.was_defaulted(row)
-                    }
-                    TypedInsertInputState::ExplicitDefault => {
-                        matches!(
-                            provenance,
-                            TypedInsertInputProvenance::SqlDefault
-                                | TypedInsertInputProvenance::ProgrammaticDefault
-                        ) && self.source_column_ordinal.is_some()
-                            && self.presence.is_provided(row)
-                            && self.default_resolution.was_defaulted(row)
-                    }
-                })
-    }
-
-    #[cfg(test)]
-    fn full_invariant_scan_count(&self) -> usize {
-        self.full_invariant_scans
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn append_relational_cell(
-        &self,
-        row: usize,
-        rows: usize,
-        out: &mut Vec<u8>,
-    ) -> Result<(), EngineError> {
-        if !self.row_invariants_hold(row, rows) {
-            return Err(EngineError::Durability(
-                "sealed typed INSERT column invariants are invalid".to_string(),
-            ));
-        }
-        match self.input_states[row] {
-            TypedInsertInputState::Omitted | TypedInsertInputState::ExplicitDefault
-                if !self.default_resolution.was_defaulted(row) =>
-            {
-                return Err(EngineError::Durability(
-                    "unresolved INSERT default state cannot enter a scalar WAL template"
-                        .to_string(),
-                ));
-            }
-            TypedInsertInputState::Provided
-            | TypedInsertInputState::ProvidedNull
-            | TypedInsertInputState::Omitted
-            | TypedInsertInputState::ExplicitDefault => {}
-        }
-        if !self.validity.is_valid(row) {
-            append_relational_cell(out, RelationalCellRef::Null);
-            return Ok(());
-        }
-        let cell = match (&self.values, self.ty) {
-            (TypedInsertColumnValues::I32(values), SqlType::Int2) => {
-                RelationalCellRef::Int2(i16::try_from(values[row]).map_err(|_| {
-                    EngineError::Durability("typed int2 vector is out of range".to_string())
-                })?)
-            }
-            (TypedInsertColumnValues::I32(values), SqlType::Int4) => {
-                RelationalCellRef::Int4(values[row])
-            }
-            (TypedInsertColumnValues::I32(values), SqlType::Date) => {
-                RelationalCellRef::Date(values[row])
-            }
-            (TypedInsertColumnValues::I64(values), SqlType::Int8) => {
-                RelationalCellRef::Int8(values[row])
-            }
-            (TypedInsertColumnValues::I64(values), SqlType::Timestamp) => {
-                RelationalCellRef::Timestamp(values[row])
-            }
-            (TypedInsertColumnValues::I128(values), SqlType::Numeric { scale, .. }) => {
-                RelationalCellRef::Numeric {
-                    mantissa: values[row],
-                    scale,
-                }
-            }
-            (TypedInsertColumnValues::Bytes16(values), SqlType::Uuid) => {
-                RelationalCellRef::Uuid(&values[row])
-            }
-            (TypedInsertColumnValues::BoolBits(words), SqlType::Bool) => {
-                RelationalCellRef::Bool(bit_is_set(words, row))
-            }
-            (TypedInsertColumnValues::Text { offsets, bytes }, SqlType::Text) => {
-                let start = usize::try_from(offsets[row]).map_err(|_| {
-                    EngineError::Durability("typed INSERT text start offset overflows".to_string())
-                })?;
-                let end = usize::try_from(offsets[row + 1]).map_err(|_| {
-                    EngineError::Durability("typed INSERT text end offset overflows".to_string())
-                })?;
-                let value = std::str::from_utf8(bytes.get(start..end).ok_or_else(|| {
-                    EngineError::Durability("typed INSERT text offsets are invalid".to_string())
-                })?)
-                .map_err(|_| {
-                    EngineError::Durability("typed INSERT text is not UTF-8".to_string())
-                })?;
-                RelationalCellRef::Text(value)
-            }
-            _ => {
-                return Err(EngineError::Durability(
-                    "typed INSERT column type and vector arm disagree".to_string(),
-                ));
-            }
-        };
-        append_relational_cell(out, cell);
-        Ok(())
-    }
 }
 
 /// The one sealed semantic authority for an already-authoritative off-lock INSERT preparation.
@@ -974,24 +787,141 @@ pub(crate) struct TypedInsertBatch {
     /// exact bindings here keeps future typed WAL ownership explicit rather than reconstructing
     /// them from materialized scalar vectors.
     sequence_bindings: Box<[sequence_defaults::SequenceDefaultBinding]>,
-    /// The indexed resident-key path remains a test-only proof seam.  Keeping the marker on the
-    /// sealed carrier prevents the live ResidentAppend builder from accidentally taking an
-    /// indexed pre-WAL branch merely because a later catalog acquired an index.
-    #[cfg(test)]
-    proof_only_indexed_constraints: bool,
-    #[cfg(test)]
-    foreign_key_proof_only: bool,
+    /// Scalar seal-time proof for the established bootstrap requirement that every column
+    /// lacking a declared default be supplied.  This is semantic and type-independent; physical
+    /// fixed/dense choices must never reinterpret the materialized NULL placeholder as allowed.
+    missing_required_input: bool,
+}
+
+/// Canonical codec-5 logical sources sealed from the one typed semantic batch before physical
+/// staging consumes its vectors. Explicit-transaction rebases may share these immutable bytes,
+/// but neither source can be reconstructed from row strings or a device layout.
+#[derive(Clone)]
+pub(crate) struct SealedTypedInsertCodec5Sources {
+    record: Arc<[u8]>,
+    final_image: Arc<[u8]>,
+    /// The original sealed semantic batch established that this S2 has no RETURNING, sequence,
+    /// domain, index, or FK closure. The live writer may use this scalar ordinal/row geometry
+    /// only while it still borrows this exact immutable owner; recovery always performs the
+    /// strict record decode.
+    feature_free_live_statement: Option<(u32, u32)>,
+    #[cfg(feature = "probe-timing")]
+    record_seal_nanos: u64,
+    #[cfg(feature = "probe-timing")]
+    final_image_seal_nanos: u64,
+    #[cfg(feature = "probe-timing")]
+    resident_append_source_materialize_nanos: u64,
+}
+
+impl SealedTypedInsertCodec5Sources {
+    pub(crate) fn record(&self) -> &[u8] {
+        &self.record
+    }
+
+    pub(crate) fn final_image(&self) -> &[u8] {
+        &self.final_image
+    }
+
+    /// Retain the already strict-sealed image only when it is also the transaction's final S7
+    /// image. The caller cannot mutate or reinterpret these bytes; this avoids manufacturing a
+    /// duplicate image when the deterministic table reference is already bound.
+    pub(crate) fn final_image_authority(&self) -> Arc<[u8]> {
+        Arc::clone(&self.final_image)
+    }
+
+    /// Return row geometry only when the immutable feature-free S2 owner was sealed for this
+    /// exact typed-statement ordinal. This exposes no row values, catalog binding, or mutation
+    /// carrier.
+    pub(crate) fn feature_free_live_row_count_for(&self, expected_ordinal: u32) -> Option<u32> {
+        self.feature_free_live_statement
+            .and_then(|(ordinal, rows)| (ordinal == expected_ordinal).then_some(rows))
+    }
+
+    #[cfg(feature = "probe-timing")]
+    pub(crate) fn probe_seal_nanos(&self) -> (u64, u64, u64) {
+        (
+            self.record_seal_nanos,
+            self.final_image_seal_nanos,
+            self.resident_append_source_materialize_nanos,
+        )
+    }
 }
 
 impl TypedInsertBatch {
-    #[cfg(test)]
-    pub(crate) fn is_proof_only_indexed_constraints(&self) -> bool {
-        self.proof_only_indexed_constraints
+    /// Seal S2 and its catalog-order final image directly from this semantic authority. This is
+    /// deliberately the last logical encoding step before an `into_transaction_*` method moves
+    /// the same vectors into physical ownership.
+    pub(crate) fn seal_codec5_sources(
+        &self,
+    ) -> Result<SealedTypedInsertCodec5Sources, EngineError> {
+        #[cfg(feature = "probe-timing")]
+        let record_started = std::time::Instant::now();
+        let record: Arc<[u8]> = canonical_codec::encode(self)?.into();
+        #[cfg(feature = "probe-timing")]
+        let record_seal_nanos = record_started.elapsed().as_nanos() as u64;
+        let columns = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(
+                |(ordinal, column)| typed_image_codec::TypedImageColumnView {
+                    catalog_column_ordinal: u32::try_from(ordinal)
+                        .expect("canonical typed INSERT bounds its column count"),
+                    stable_column_id: column.column_id,
+                    table_ref: 0,
+                    attnum: column.attnum,
+                    ty: column.ty,
+                    type_oid: column.type_oid,
+                    type_size: column.type_size,
+                    result_format: 0,
+                    // Final-table images bind columns by catalog ordinal/stable identity. Names
+                    // belong only to retained response projections in the frozen image grammar.
+                    name: "",
+                    validity: &column.validity,
+                    values: &column.values,
+                },
+            )
+            .collect::<Vec<_>>();
+        #[cfg(feature = "probe-timing")]
+        let final_image_started = std::time::Instant::now();
+        let final_image: Arc<[u8]> =
+            typed_image_codec::encode_typed_image(&typed_image_codec::TypedImageView {
+                role: typed_image_codec::TypedImageRole::FinalTableImage,
+                rows: self.row_count,
+                columns: &columns,
+            })?
+            .into();
+        #[cfg(feature = "probe-timing")]
+        let final_image_seal_nanos = final_image_started.elapsed().as_nanos() as u64;
+        let feature_free_live_statement = (self.domain_dependencies.is_empty()
+            && self.canonical_catalog.indexes.is_empty()
+            && self.canonical_catalog.foreign_keys.is_empty()
+            && self.sequence_bindings.is_empty()
+            && self.returning.effect_shape().column_count() == 0)
+            .then_some((self.statement_ordinal.as_u32(), self.row_count));
+        Ok(SealedTypedInsertCodec5Sources {
+            record,
+            final_image,
+            feature_free_live_statement,
+            #[cfg(feature = "probe-timing")]
+            record_seal_nanos,
+            #[cfg(feature = "probe-timing")]
+            final_image_seal_nanos,
+            #[cfg(feature = "probe-timing")]
+            resident_append_source_materialize_nanos: 0,
+        })
     }
-    #[cfg(test)]
-    pub(crate) fn is_foreign_key_proof_only(&self) -> bool {
-        self.foreign_key_proof_only
+
+    pub(crate) fn validate_live_required_input_policy(&self) -> Result<(), EngineError> {
+        if self.missing_required_input {
+            return Err(EngineError::ApplyFailed(
+                "INSERT must provide every column without a default in the bootstrap relational subset"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
+
     #[cfg(test)]
     fn value_bytes(&self) -> usize {
         self.columns
@@ -1025,33 +955,321 @@ impl TypedInsertBatch {
         Ok(report)
     }
 
-    /// Predict the exact host retention geometry of the resident source before its move-only
-    /// materialization. The source's new outer column box is included as one future backing
-    /// allocation; semantic-only vectors deliberately are not.
-    #[allow(dead_code)] // Compared by the materialized reservation owner next.
-    pub(crate) fn resident_append_source_host_retention_prediction(
-        &self,
-    ) -> Result<HostRetentionGeometry, EngineError> {
-        resident_source_retention::prediction(self)
-    }
-
-    pub(super) fn binary_insert_template(
-        &self,
-    ) -> Result<crate::wal_binary::PreparedBinaryInsertTemplate, EngineError> {
-        crate::wal_binary::PreparedBinaryInsertTemplate::from_sealed_batch(self)
-    }
-
-    pub(crate) fn binary_insert_template_table_name(&self) -> &str {
-        &self.table.name
-    }
-
-    /// Stable catalog identity carried into the sole live typed INSERT plan.
-    pub(crate) fn table_oid(&self) -> u32 {
-        self.table.oid
-    }
-
     pub(crate) fn binary_insert_template_row_count(&self) -> u32 {
         self.row_count
+    }
+
+    /// Whether this sealed batch can enter the fixed-width explicit-transaction typed vertical.
+    /// This is a structural scope check, not a second semantic evaluator: the consuming method
+    /// below rechecks every fact before it creates a private generation owner.
+    pub(crate) fn supports_transaction_private_fixed_stage(&self, table: &RelationalTable) -> bool {
+        self.table.name.as_ref() == table.name
+            && self.table.stable_table_id == table.stable_table_id
+            && self.table.oid == table.oid
+            && self.row_count != 0
+            && table.columns.len() == self.columns.len()
+            && table
+                .columns
+                .iter()
+                .zip(self.columns.iter())
+                .all(|(live, column)| {
+                    fixed_transaction_private_type(live.ty)
+                        && live.id == column.column_id
+                        && live.attnum == column.attnum
+                        && column.ty == live.ty
+                        && column.validity.shape_is_exact(self.row_count as usize)
+                        // Scalar and sequence-backed DEFAULT/omitted cells have already been
+                        // materialized into this catalog-order vector by the semantic seal.
+                        && column.all_inputs_are_resolved(self.row_count as usize)
+                        && fixed_transaction_private_values(&column.values, live.ty)
+                })
+    }
+
+    /// Consume the semantic batch into the immutable explicit-transaction INSERT artifact.
+    ///
+    /// The artifact retains the sealed codec-5 sources and one type-grouped private GPU payload.
+    /// It cannot expose or recreate a `TypedInsertBatch`, row-string mirror, `WriteDelta`, parsed
+    /// SQL, or a host row matrix after this point.
+    pub(crate) fn into_transaction_private_fixed_stage(
+        self,
+        table: &RelationalTable,
+        statement_digest: gpu_db_wal::CanonicalDigest,
+        read_snapshot: Index,
+        next_row_id: u64,
+    ) -> Result<crate::engine_transaction_delta::StagedTypedInsert, ExecuteError> {
+        if !self.supports_transaction_private_fixed_stage(table)
+            || crate::engine_transaction_reset::table_schema_digest(table)?
+                != self.table.schema_digest
+        {
+            return Err(ExecuteError::Unsupported(
+                "typed transaction INSERT currently requires a fixed-width relation".to_string(),
+            ));
+        }
+        let codec5_sources = self.seal_codec5_sources().map_err(ExecuteError::Engine)?;
+        let rows = usize::try_from(self.row_count).expect("u32 typed INSERT rows fit usize");
+        let fixed_payload_bytes = transaction_private_fixed_payload_bytes(table, rows)?;
+        let null_bitmap_bytes = self
+            .columns
+            .iter()
+            .filter_map(|column| column.validity.bitmap_words())
+            .try_fold(0_usize, |total, words| {
+                total
+                    .checked_add(
+                        words
+                            .len()
+                            .checked_mul(std::mem::size_of::<u32>())
+                            .ok_or_else(transaction_private_fixed_geometry_error)?,
+                    )
+                    .ok_or_else(transaction_private_fixed_geometry_error)
+            })?;
+        let payload_bytes = fixed_payload_bytes
+            .checked_add(null_bitmap_bytes)
+            .ok_or_else(transaction_private_fixed_geometry_error)?;
+        let mut payload = Vec::with_capacity(payload_bytes);
+        payload.extend_from_slice(
+            &u64::try_from(rows)
+                .expect("typed INSERT rows fit u64")
+                .to_le_bytes(),
+        );
+        let mut stats = Vec::new();
+        for group in 0..3 {
+            for (live, column) in table.columns.iter().zip(self.columns.iter()) {
+                match (group, live.ty, &column.values) {
+                    (
+                        0,
+                        SqlType::Int2 | SqlType::Int4 | SqlType::Date,
+                        TypedInsertColumnValues::I32(values),
+                    ) => {
+                        if values.len() != rows {
+                            return Err(transaction_private_fixed_geometry_error());
+                        }
+                        let mut min = i32::MAX;
+                        let mut max = i32::MIN;
+                        for (row, value) in values.iter().copied().enumerate() {
+                            if column.validity.is_valid(row) {
+                                min = min.min(value);
+                                max = max.max(value);
+                            }
+                            payload.extend_from_slice(&value.to_le_bytes());
+                        }
+                        stats.push(ResidentDeviceInt4ColumnStats {
+                            name: live.name.clone(),
+                            min,
+                            max,
+                        });
+                    }
+                    (
+                        1,
+                        SqlType::Int8 | SqlType::Timestamp,
+                        TypedInsertColumnValues::I64(values),
+                    ) => {
+                        if values.len() != rows {
+                            return Err(transaction_private_fixed_geometry_error());
+                        }
+                        for value in values {
+                            payload.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                    (2, SqlType::Numeric { .. }, TypedInsertColumnValues::I128(values)) => {
+                        if values.len() != rows {
+                            return Err(transaction_private_fixed_geometry_error());
+                        }
+                        for value in values {
+                            payload.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                    (2, SqlType::Uuid, TypedInsertColumnValues::Bytes16(values)) => {
+                        if values.len() != rows {
+                            return Err(transaction_private_fixed_geometry_error());
+                        }
+                        for value in values {
+                            payload.extend_from_slice(value);
+                        }
+                    }
+                    (0, ty, _) if !matches!(ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date) => {}
+                    (1, ty, _) if !matches!(ty, SqlType::Int8 | SqlType::Timestamp) => {}
+                    (2, ty, _) if !matches!(ty, SqlType::Numeric { .. } | SqlType::Uuid) => {}
+                    _ => return Err(transaction_private_fixed_geometry_error()),
+                }
+            }
+        }
+        let mut null_layouts = Vec::new();
+        for (live, column) in table.columns.iter().zip(self.columns.iter()) {
+            let Some(words) = column.validity.bitmap_words() else {
+                continue;
+            };
+            let bitmap_byte_offset = u64::try_from(payload.len()).map_err(|_| {
+                ExecuteError::Unsupported(
+                    "typed transaction INSERT NULL bitmap offset exceeds u64".to_string(),
+                )
+            })?;
+            for word in words {
+                payload.extend_from_slice(&word.to_le_bytes());
+            }
+            null_layouts.push(ResidentDeviceNullBitmapLayout {
+                name: live.name.clone(),
+                bitmap_byte_offset,
+            });
+        }
+        if payload.len() != payload_bytes {
+            return Err(transaction_private_fixed_geometry_error());
+        }
+        let mut provisional_row_ids = Vec::with_capacity(rows);
+        for offset in 0..rows {
+            provisional_row_ids.push(
+                next_row_id
+                    .checked_add(u64::try_from(offset).expect("row offset fits u64"))
+                    .ok_or_else(|| {
+                        ExecuteError::Unsupported(
+                            "transaction provisional row identity space exhausted".to_string(),
+                        )
+                    })?,
+            );
+        }
+        crate::engine_transaction_delta::StagedTypedInsert::new(
+            statement_digest,
+            self.typed_statement_digest,
+            self.statement_ordinal.as_u32(),
+            table,
+            self.table.schema_digest,
+            self.table.prepared_catalog_seq,
+            read_snapshot,
+            Arc::from(provisional_row_ids),
+            Arc::from(payload),
+            Arc::from(stats),
+            Arc::from(null_layouts),
+            codec5_sources,
+        )
+        .map_err(ExecuteError::Engine)
+    }
+
+    /// Consume a sealed BOOL- or TEXT-bearing batch into the same explicit-transaction artifact as the
+    /// fixed-width strategy. The dense resident encoder is the sole physical layout authority
+    /// for offsets, byte blobs, bool/NULL bitmaps, and catalog-order sections; this method only
+    /// binds that already-columnar payload to the transaction's canonical row images.
+    pub(crate) fn supports_transaction_private_dense_variable_stage(
+        &self,
+        table: &RelationalTable,
+    ) -> bool {
+        self.table.name.as_ref() == table.name
+            && self.table.stable_table_id == table.stable_table_id
+            && self.table.oid == table.oid
+            && self.row_count != 0
+            && table.columns.len() == self.columns.len()
+            && table
+                .columns
+                .iter()
+                .zip(self.columns.iter())
+                .all(|(live, column)| {
+                    (matches!(live.ty, SqlType::Bool | SqlType::Text)
+                        || fixed_transaction_private_type(live.ty))
+                        && live.id == column.column_id
+                        && live.attnum == column.attnum
+                        && column.ty == live.ty
+                        && column.validity.shape_is_exact(self.row_count as usize)
+                        && column.all_inputs_are_resolved(self.row_count as usize)
+                        && dense_variable_transaction_private_values(
+                            &column.values,
+                            live.ty,
+                            self.row_count as usize,
+                        )
+                })
+            && table
+                .columns
+                .iter()
+                .any(|column| matches!(column.ty, SqlType::Bool | SqlType::Text))
+    }
+
+    /// BOOL and TEXT use a dense, immutable private shard because packed bitmaps and offsets/blobs
+    /// have no appendable headroom. It remains the same consumed typed batch, WAL binding,
+    /// and GPU publication route as the fixed-width stage.
+    pub(crate) fn into_transaction_private_dense_variable_stage(
+        self,
+        table: &RelationalTable,
+        statement_digest: gpu_db_wal::CanonicalDigest,
+        read_snapshot: Index,
+        next_row_id: u64,
+    ) -> Result<crate::engine_transaction_delta::StagedTypedInsert, ExecuteError> {
+        if !self.supports_transaction_private_dense_variable_stage(table)
+            || crate::engine_transaction_reset::table_schema_digest(table)?
+                != self.table.schema_digest
+        {
+            return Err(ExecuteError::Unsupported(
+                "typed transaction INSERT variable payload is not eligible for dense staging"
+                    .to_string(),
+            ));
+        }
+        let codec5_sources = self.seal_codec5_sources().map_err(ExecuteError::Engine)?;
+        let rows = usize::try_from(self.row_count).expect("typed INSERT rows fit usize");
+        let TypedInsertBatch {
+            table: batch_table,
+            row_count,
+            columns,
+            dependencies,
+            typed_statement_digest,
+            statement_ordinal,
+            ..
+        } = self;
+        let columns = columns
+            .into_vec()
+            .into_iter()
+            .map(|column| PreparedResidentAppendColumn {
+                column_id: column.column_id,
+                attnum: column.attnum,
+                ty: column.ty,
+                type_oid: column.type_oid,
+                type_size: column.type_size,
+                validity: Some(column.validity),
+                values: Some(column.values),
+            })
+            .collect::<Vec<_>>();
+        let runtime_value_bytes = resident_source::runtime_generation_value_bytes(rows, &columns)?;
+        let mut source = PreparedResidentAppendSource {
+            table: batch_table,
+            row_count,
+            columns: columns.into(),
+            runtime_value_bytes,
+            dependencies,
+            requires_dense_rollover: true,
+        };
+        let mut dense = source.checked_dense_payload(table)?;
+        let mut payload = dense.take_pre_wal_upload().ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "typed transaction INSERT dense payload was consumed before staging".to_string(),
+            ))
+        })?;
+        let descriptor = dense.into_descriptor_parts();
+        payload[..descriptor.final_count_header.len()]
+            .copy_from_slice(&descriptor.final_count_header);
+        let mut provisional_row_ids = Vec::with_capacity(rows);
+        for offset in 0..rows {
+            provisional_row_ids.push(
+                next_row_id
+                    .checked_add(u64::try_from(offset).expect("row offset fits u64"))
+                    .ok_or_else(|| {
+                        ExecuteError::Unsupported(
+                            "transaction provisional row identity space exhausted".to_string(),
+                        )
+                    })?,
+            );
+        }
+        crate::engine_transaction_delta::StagedTypedInsert::new_dense(
+            statement_digest,
+            typed_statement_digest,
+            statement_ordinal.as_u32(),
+            table,
+            source.schema_digest(),
+            source.prepared_catalog_seq(),
+            read_snapshot,
+            Arc::from(provisional_row_ids),
+            Arc::from(payload),
+            Arc::from(descriptor.int4_stats),
+            Arc::from(descriptor.null_layouts),
+            Arc::from(descriptor.bool_layouts),
+            Arc::from(descriptor.text_layouts),
+            codec5_sources,
+        )
+        .map_err(ExecuteError::Engine)
     }
 
     /// Borrow the sealed catalog-order vectors as one short-lived physical device relation for a
@@ -1099,13 +1317,6 @@ impl TypedInsertBatch {
         )
     }
 
-    /// Domain bindings are semantic metadata, not resident physical dependencies. Move them to
-    /// the prepared device plan with the vectors so the plan can revalidate them at the commit
-    /// gate without exposing a host-side domain constraint path.
-    pub(crate) fn take_domain_dependencies(&mut self) -> Box<[TypedInsertDomainBinding]> {
-        std::mem::take(&mut self.domain_dependencies)
-    }
-
     /// Revalidate metadata-only domain type bindings while the prepared plan still owns the
     /// sealed target proof. Domain predicates remain unsupported; this proves only that the
     /// domain name/OID/base type and every participating table column still mean what preparation
@@ -1138,123 +1349,41 @@ impl TypedInsertBatch {
         })
     }
 
-    pub(crate) fn matches_resident_append_insert(
+    /// The explicit-transaction fixed stage consumes the batch rather than a prepared plan, so
+    /// it revalidates the sealed domain witness while the batch still owns it. Its exact prepared
+    /// catalog generation is then rechecked at COMMIT, preventing this metadata-only binding
+    /// from drifting after consumption.
+    pub(crate) fn domain_dependencies_match_current_catalog(
         &self,
-        expected_write_set: &WriteSet,
         catalog: &CatalogSnapshot,
-        prepared_catalog_seq: Index,
     ) -> bool {
-        self.statement_ordinal == InsertStatementOrdinal::FIRST
-            && self.table.prepared_catalog_seq == prepared_catalog_seq
-            && catalog.commit_seq == prepared_catalog_seq
-            && self.row_count != 0
-            && !self.columns.is_empty()
-            && expected_write_set.tables.len() == 1
-            && expected_write_set.tables.contains(self.table.name.as_ref())
-            && expected_write_set.rows.is_empty()
-            && expected_write_set.unique_slots.is_empty()
-            && expected_write_set.unique_slots_i32.is_empty()
-            && self.exact_dependencies_match(catalog)
-            && catalog
-                .relational_catalog
-                .get(self.table.name.as_ref())
-                .is_some_and(|table| {
-                    table.oid == self.table.oid
-                        && crate::engine_transaction_reset::table_schema_digest(table).ok()
-                            == Some(self.table.schema_digest)
-                        && table.columns.len() == self.columns.len()
-                        && self
-                            .columns
-                            .iter()
-                            .zip(&table.columns)
-                            .all(|(column, live)| {
-                                column.column_id == live.id
-                                    && column.attnum == live.attnum
-                                    && column.is_resident_append_vector(self.row_count as usize)
-                                    && column.ty == live.ty
-                                    && column.type_oid == live.type_oid
-                                    && column.type_size == live.type_size
-                            })
-                })
+        self.domain_dependencies_match(&self.domain_dependencies, catalog)
     }
 
-    fn exact_dependencies_match(&self, catalog: &CatalogSnapshot) -> bool {
-        self.dependencies.len() == 1
-            && self.dependencies[0].name == self.table.name
-            && self.dependencies[0].oid == self.table.oid
-            && self.dependencies[0].schema_digest == self.table.schema_digest
-            && catalog
-                .relational_catalog
-                .get(self.dependencies[0].name.as_ref())
-                .is_some_and(|table| {
-                    table.oid == self.dependencies[0].oid
-                        && crate::engine_transaction_reset::table_schema_digest(table).ok()
-                            == Some(self.dependencies[0].schema_digest)
-                })
-    }
-
-    /// Append one canonical v1 row directly from typed vectors. This does not reconstruct a
-    /// row-major `SqlValue` matrix; the sealed column vectors remain the only values authority.
-    pub(crate) fn append_binary_insert_template_row(
-        &self,
-        row: usize,
-        out: &mut Vec<u8>,
-    ) -> Result<(), EngineError> {
-        if self.columns.is_empty() || row >= self.row_count as usize {
-            return Err(EngineError::Durability(
-                "sealed typed INSERT batch row is out of bounds".to_string(),
-            ));
-        }
-        for (position, column) in self.columns.iter().enumerate() {
-            if position != 0 {
-                out.push(b'|');
-            }
-            column.append_relational_cell(row, self.row_count as usize, out)?;
-        }
-        Ok(())
-    }
-
-    /// Consume the semantic batch into the only physical compiler input. The retained source
-    /// preserves NULL validity and text offset/blob vectors; physical plan selection decides
-    /// whether those vectors require a dense rollover or can use the fixed-width in-place arm.
-    pub(crate) fn into_resident_append_source(self) -> Option<PreparedResidentAppendSource> {
-        // Stateful sequence effects have no live resident-append/WAL owner.  Semantic lowering
-        // may seal them for a future typed route, but this existing compiler must stay closed.
-        if !self.sequence_bindings.is_empty() || !self.returning.is_empty() {
-            return None;
-        }
-        let rows = self.row_count as usize;
-        let requires_dense_rollover = self
-            .columns
-            .iter()
-            .any(|column| column.ty == SqlType::Text || !column.validity.is_all_valid());
-        let columns = self
-            .columns
-            .into_vec()
-            .into_iter()
-            .map(|column| {
-                (matches!(column.presence, TypedInsertColumnPresence::AllProvided)
-                    && column.all_inputs_are_resolved(rows)
-                    && is_live_resident_append_type(column.ty)
-                    && column.values.rows_match(rows))
-                .then_some(PreparedResidentAppendColumn {
-                    column_id: column.column_id,
-                    attnum: column.attnum,
-                    ty: column.ty,
-                    type_oid: column.type_oid,
-                    type_size: column.type_size,
-                    validity: Some(column.validity),
-                    values: Some(column.values),
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(PreparedResidentAppendSource {
-            table: self.table,
-            row_count: self.row_count,
-            columns: columns.into(),
-            dependencies: self.dependencies,
-            requires_dense_rollover,
-        })
+    /// Test-only bridge for physical-plan unit tests. It deliberately crosses the codec-5 final
+    /// image boundary used by live COMMIT/replay; no test may revive the deleted direct batch to
+    /// resident-source conversion.
+    #[cfg(test)]
+    pub(crate) fn into_codec5_resident_append_source_for_test(
+        self,
+        catalog: &CatalogSnapshot,
+    ) -> Result<PreparedResidentAppendSource, EngineError> {
+        let table = catalog
+            .relational_catalog
+            .get(self.table.name.as_ref())
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", self.table.name))
+            })?;
+        let table_schema_digest = self.table.schema_digest;
+        let prepared_catalog_seq = self.table.prepared_catalog_seq;
+        let sources = self.seal_codec5_sources()?;
+        let image = decode_typed_image(sources.final_image())?;
+        PreparedResidentAppendSource::from_decoded_final_table_image(
+            image,
+            table,
+            table_schema_digest,
+            prepared_catalog_seq,
+        )
     }
 }
 
@@ -1271,6 +1400,82 @@ fn is_live_resident_append_type(ty: SqlType) -> bool {
             | SqlType::Bool
             | SqlType::Text
     )
+}
+
+fn fixed_transaction_private_type(ty: SqlType) -> bool {
+    matches!(
+        ty,
+        SqlType::Int2
+            | SqlType::Int4
+            | SqlType::Date
+            | SqlType::Int8
+            | SqlType::Timestamp
+            | SqlType::Numeric { .. }
+            | SqlType::Uuid
+    )
+}
+
+fn fixed_transaction_private_values(values: &TypedInsertColumnValues, ty: SqlType) -> bool {
+    matches!(
+        (values, ty),
+        (
+            TypedInsertColumnValues::I32(_),
+            SqlType::Int2 | SqlType::Int4 | SqlType::Date
+        ) | (
+            TypedInsertColumnValues::I64(_),
+            SqlType::Int8 | SqlType::Timestamp
+        ) | (TypedInsertColumnValues::I128(_), SqlType::Numeric { .. })
+            | (TypedInsertColumnValues::Bytes16(_), SqlType::Uuid)
+    )
+}
+
+fn dense_variable_transaction_private_values(
+    values: &TypedInsertColumnValues,
+    ty: SqlType,
+    rows: usize,
+) -> bool {
+    fixed_transaction_private_values(values, ty)
+        || matches!(
+            (values, ty),
+            (TypedInsertColumnValues::Text { offsets, bytes }, SqlType::Text)
+                if offsets.len() == rows + 1
+                    && offsets.first() == Some(&0)
+                    && offsets.last().copied() == Some(bytes.len() as u64)
+                    && offsets.windows(2).all(|window| window[0] <= window[1])
+        )
+        || matches!(
+            (values, ty),
+            (TypedInsertColumnValues::BoolBits(words), SqlType::Bool)
+                if bitmap_shape_is_exact(words, rows)
+        )
+}
+
+fn transaction_private_fixed_payload_bytes(
+    table: &RelationalTable,
+    rows: usize,
+) -> Result<usize, ExecuteError> {
+    let mut bytes = std::mem::size_of::<u64>();
+    for column in &table.columns {
+        let width = match column.ty {
+            SqlType::Int2 | SqlType::Int4 | SqlType::Date => std::mem::size_of::<i32>(),
+            SqlType::Int8 | SqlType::Timestamp => std::mem::size_of::<i64>(),
+            SqlType::Numeric { .. } | SqlType::Uuid => 16,
+            SqlType::Bool | SqlType::Text => return Err(transaction_private_fixed_geometry_error()),
+        };
+        bytes = bytes
+            .checked_add(
+                rows.checked_mul(width)
+                    .ok_or_else(transaction_private_fixed_geometry_error)?,
+            )
+            .ok_or_else(transaction_private_fixed_geometry_error)?;
+    }
+    Ok(bytes)
+}
+
+fn transaction_private_fixed_geometry_error() -> ExecuteError {
+    ExecuteError::Engine(EngineError::ApplyFailed(
+        "typed transaction INSERT fixed-width payload geometry drifted".to_string(),
+    ))
 }
 
 fn checked_chunk_capacity(rows: usize, width: usize) -> Result<usize, ExecuteError> {
@@ -1456,7 +1661,7 @@ impl PreparedResidentAppendSource {
         &self.table.name
     }
 
-    pub(crate) fn table_oid(&self) -> u32 {
+    pub(crate) const fn table_oid(&self) -> u32 {
         self.table.oid
     }
 
@@ -1470,6 +1675,52 @@ impl PreparedResidentAppendSource {
 
     pub(crate) fn row_count(&self) -> usize {
         self.row_count as usize
+    }
+
+    pub(crate) fn prepare_runtime_generation_view<'a>(
+        &'a self,
+        row_sources: &'a [crate::engine_transaction_delta::TypedInsertRuntimeGenerationRowSource],
+    ) -> Result<PreparedResidentRuntimeGenerationView<'a>, EngineError> {
+        let rows = self.row_count();
+        if rows == 0
+            || row_sources.len() != rows
+            || row_sources.iter().enumerate().any(|(row, source)| {
+                usize::try_from(source.source_row_ordinal).ok().is_none()
+                    || source.stable_row_id == 0
+                    || source.stable_row_id == u64::MAX
+                    || (row != 0 && source.stable_row_id <= row_sources[row - 1].stable_row_id)
+                    || source.statement_ordinal == u32::MAX
+                    || (row != 0
+                        && source.statement_ordinal < row_sources[row - 1].statement_ordinal)
+            })
+            || self.table.stable_table_id == 0
+            || self.table.stable_table_id == u64::MAX
+            || self.columns.is_empty()
+            || self.columns.len() > u32::MAX as usize
+        {
+            return Err(EngineError::Durability(
+                "typed INSERT runtime generation source has invalid identity geometry".to_string(),
+            ));
+        }
+        let cells = rows.checked_mul(self.columns.len()).ok_or_else(|| {
+            EngineError::Durability(
+                "typed INSERT runtime generation cell count overflows".to_string(),
+            )
+        })?;
+        Ok(PreparedResidentRuntimeGenerationView {
+            source: self,
+            geometry: gpu_db_execution::RuntimeTypedInsertGenerationGeometry {
+                rows,
+                cells,
+                value_bytes: self.runtime_value_bytes,
+                indexes: 0,
+                index_keys: 0,
+                index_effects: 0,
+                index_effect_components: 0,
+            },
+            first_row_id: row_sources[0].stable_row_id,
+            row_sources,
+        })
     }
 
     /// Every host backing allocation held by the materialized resident source. This is separate
@@ -1526,6 +1777,15 @@ impl PreparedResidentAppendSource {
 
     pub(crate) fn requires_dense_rollover(&self) -> bool {
         self.requires_dense_rollover
+    }
+
+    /// A relation first introduced by a transaction has no public fixed-width predecessor to
+    /// append to. Its sole codec-5 device plan therefore uses the existing dense first-generation
+    /// layout even when the sealed vectors happen to be NULL-free and fixed-width. This changes
+    /// only the physical reservation chosen by that first-table plan; the sealed vectors remain
+    /// the single values authority.
+    pub(crate) fn require_dense_first_generation(&mut self) {
+        self.requires_dense_rollover = true;
     }
 
     #[cfg(test)]
@@ -1889,12 +2149,81 @@ impl PreparedResidentAppendColumn {
             _ => None,
         }
     }
+
+    /// Visit the canonical resident index-fold words for one non-NULL fixed-width cell without
+    /// rebuilding a `SqlValue` or allocating a temporary word vector. The byte order exactly
+    /// matches `engine_residency::sql_value_key_words` and the device compound-fold kernel.
+    pub(crate) fn try_for_each_fixed_index_key_word(
+        &self,
+        row: usize,
+        mut visit: impl FnMut(i32),
+    ) -> bool {
+        if self
+            .validity
+            .as_ref()
+            .is_none_or(|validity| !validity.is_valid(row))
+        {
+            return false;
+        }
+        match (self.values.as_ref(), self.ty) {
+            (Some(TypedInsertColumnValues::I32(values)), SqlType::Int2)
+            | (Some(TypedInsertColumnValues::I32(values)), SqlType::Int4)
+            | (Some(TypedInsertColumnValues::I32(values)), SqlType::Date) => {
+                values.get(row).copied().is_some_and(|value| {
+                    visit(value);
+                    true
+                })
+            }
+            (Some(TypedInsertColumnValues::I64(values)), SqlType::Int8)
+            | (Some(TypedInsertColumnValues::I64(values)), SqlType::Timestamp) => {
+                values.get(row).copied().is_some_and(|value| {
+                    let bits = value as u64;
+                    visit(bits as u32 as i32);
+                    visit((bits >> 32) as u32 as i32);
+                    true
+                })
+            }
+            (Some(TypedInsertColumnValues::I128(values)), SqlType::Numeric { .. }) => {
+                values.get(row).copied().is_some_and(|value| {
+                    let bits = value as u128;
+                    for shift in [0, 32, 64, 96] {
+                        visit((bits >> shift) as u32 as i32);
+                    }
+                    true
+                })
+            }
+            (Some(TypedInsertColumnValues::Bytes16(values)), SqlType::Uuid) => {
+                values.get(row).is_some_and(|value| {
+                    for bytes in value.chunks_exact(4) {
+                        visit(i32::from_le_bytes(
+                            bytes.try_into().expect("UUID word has four bytes"),
+                        ));
+                    }
+                    true
+                })
+            }
+            (Some(TypedInsertColumnValues::BoolBits(words)), SqlType::Bool) => {
+                if row / 32 >= words.len() {
+                    false
+                } else {
+                    visit(i32::from(bit_is_set(words, row)));
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn has_validity_bitmap(&self) -> bool {
+        matches!(self.validity, Some(TypedInsertColumnValidity::Bitmap(_)))
+    }
 }
 
-/// The live route consumes the one shared semantic builder, then compiles fixed-width vectors or
-/// a sealed dense nullable/text rollover. Reordered full column lists have already been bound
-/// into catalog order here; neither physical branch creates another publisher.
-pub(super) fn try_prepare_typed_insert_batch(
+/// Test-only convenience for physical-plan unit tests that require an already sealed batch.
+/// Production constructs this carrier only through `PreparedInsertEffectPlan`; this helper owns
+/// no route selection and refuses sequence effects because those require an explicit binding.
+#[cfg(test)]
+pub(super) fn seal_typed_insert_batch_for_test(
     command: &Command,
     catalog: &CatalogSnapshot,
     prepared_catalog_seq: Index,
@@ -1903,67 +2232,22 @@ pub(super) fn try_prepare_typed_insert_batch(
     let Command::Insert(insert) = command else {
         return Ok(None);
     };
-    match builder::build(
+    let Some(prepared) = prepare_typed_insert_semantics_at(
         insert,
         catalog,
         prepared_catalog_seq,
         expected_catalog_version,
-        TypedInsertBuildCapability::ResidentAppend,
-    )? {
-        TypedInsertBuildResult::Ready(batch) => Ok(Some(batch)),
-        TypedInsertBuildResult::Deferred(reason) => {
-            let _ = reason;
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(test)]
-pub(super) fn try_prepare_typed_insert_batch_proof_only(
-    command: &Command,
-    catalog: &CatalogSnapshot,
-    prepared_catalog_seq: Index,
-) -> Result<Option<TypedInsertBatch>, ExecuteError> {
-    let Command::Insert(insert) = command else {
+        InsertStatementOrdinal::FIRST,
+    )?
+    else {
         return Ok(None);
     };
-    match builder::build(
-        insert,
-        catalog,
-        prepared_catalog_seq,
-        None,
-        TypedInsertBuildCapability::ProofOnly,
-    )? {
-        TypedInsertBuildResult::Ready(batch) => Ok(Some(batch)),
-        TypedInsertBuildResult::Deferred(reason) => {
-            let _ = reason;
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(test)]
-pub(super) fn try_prepare_typed_insert_batch_foreign_key_proof_only(
-    command: &Command,
-    catalog: &CatalogSnapshot,
-    prepared_catalog_seq: Index,
-) -> Result<Option<TypedInsertBatch>, ExecuteError> {
-    let Command::Insert(insert) = command else {
+    if !prepared.sequence_requests().is_empty() {
         return Ok(None);
-    };
-    match builder::build(
-        insert,
-        catalog,
-        prepared_catalog_seq,
-        None,
-        TypedInsertBuildCapability::ForeignKeyProofOnly,
-    )? {
-        TypedInsertBuildResult::Ready(batch) => Ok(Some(batch)),
-        TypedInsertBuildResult::Deferred(reason) => {
-            let _ = reason;
-            Ok(None)
-        }
     }
+    prepared
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
+        .map(Some)
 }
 
 #[cfg(test)]

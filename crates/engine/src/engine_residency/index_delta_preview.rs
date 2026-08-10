@@ -1,11 +1,11 @@
-//! Zero-CUDA preflight for the unreachable indexed in-place INSERT reservation.
+//! Zero-CUDA preflight for the indexed in-place INSERT reservation.
 //!
 //! This owner pins every generation, cache, and descriptor witness needed by the allocating
 //! index-delta tail.  It deliberately has no CUDA allocation, launch, cache publication, WAL,
 //! or mutation surface: a later owner must consume and revalidate this preview before it may
 //! reserve either append-sidecar or pooled index-preparation resources.
 
-#![allow(dead_code)] // private preflight is compiled before the live reservation handoff opens
+#![allow(dead_code)] // also owns inspection-only evidence for the deferred rollover branch
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,7 +22,9 @@ use crate::engine_insert_plan::{
 };
 use crate::engine_state::TransactionNamedIndexPublicationGuard;
 use crate::relational_model::RelationalTable;
-use crate::typed_insert_batch::{PreparedResidentAppendSource, TypedInsertBatch};
+use crate::typed_insert_batch::PreparedResidentAppendSource;
+#[cfg(test)]
+use crate::typed_insert_batch::TypedInsertBatch;
 use crate::{Engine, ExecuteError, Index, RelationalResidentShard};
 use gpu_db_execution::{
     resident_index_allocated_bytes, resident_typed_indexes_insert_preparation_bytes,
@@ -610,6 +612,8 @@ impl<'a> IndexedInPlacePreview<'a> {
         engine: &'a Engine,
         table: &RelationalTable,
         permit: crate::engine_insert_plan::IndexedPhysicalMaterializationPermit,
+        preheld_budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
     ) -> Result<PreviewPreparedParts<'a>, ExecuteError> {
         self.revalidate(engine, table)?;
         let preview_host_retention = self.host_retention_geometry()?;
@@ -651,6 +655,8 @@ impl<'a> IndexedInPlacePreview<'a> {
                 mutation_gate,
                 logical.preparation_bytes(),
                 permit,
+                preheld_budget_allocation,
+                prior_reserved_bytes,
             )
             .map_err(|_| decline("indexed in-place preview append reservation declined"))?;
         let (append_shard, append_base, append_catalog) =
@@ -740,29 +746,17 @@ impl PreviewPreparedParts<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare<'a>(
+pub(super) fn prepare_from_resident_source<'a>(
     engine: &'a Engine,
     table: &RelationalTable,
     predecessor_boundary: Index,
-    batch: TypedInsertBatch,
+    source: PreparedResidentAppendSource,
     row_ids: super::DeviceInsertRowIds,
     key_proof: BatchKeyConstraintProof,
     validation: ResidentKeyValidationSeal,
     mutation_gate: MutexGuard<'a, ()>,
     named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
-    _commit_proof: &MutexGuard<'_, crate::CommitState>,
 ) -> Result<IndexedInPlacePreview<'a>, ExecuteError> {
-    let source_retention_prediction = batch
-        .resident_append_source_host_retention_prediction()
-        .map_err(|_| decline("indexed in-place preview source retention prediction declined"))?;
-    let source = batch
-        .into_resident_append_source()
-        .ok_or_else(|| decline("indexed in-place preview lost its resident append source"))?;
-    if source_retention_prediction != source.host_retention_geometry()? {
-        return Err(decline(
-            "indexed in-place preview source retention materialization drifted",
-        ));
-    }
     // The current physical reservation owns one prepared fused i32 payload/sidecar pass.  Mixed
     // fixed widths, NULL-bearing inputs, and text must decline here, before any physical index
     // or append-side resource crosses the pre-WAL boundary.
@@ -1013,6 +1007,39 @@ pub(super) fn prepare<'a>(
     Ok(preview)
 }
 
+/// Test-only adapter retaining the former typed-batch inspection seam.  Production owns a
+/// decoded, sealed resident source in the common codec-5 finalizer and reaches
+/// [`prepare_from_resident_source`] directly.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare<'a>(
+    engine: &'a Engine,
+    table: &RelationalTable,
+    predecessor_boundary: Index,
+    batch: TypedInsertBatch,
+    row_ids: super::DeviceInsertRowIds,
+    key_proof: BatchKeyConstraintProof,
+    validation: ResidentKeyValidationSeal,
+    mutation_gate: MutexGuard<'a, ()>,
+    named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
+    _commit_proof: &MutexGuard<'_, crate::CommitState>,
+) -> Result<IndexedInPlacePreview<'a>, ExecuteError> {
+    let source = batch
+        .into_codec5_resident_append_source_for_test(&engine.catalog_snapshot())
+        .map_err(|_| decline("indexed in-place preview lost its codec-5 resident source"))?;
+    prepare_from_resident_source(
+        engine,
+        table,
+        predecessor_boundary,
+        source,
+        row_ids,
+        key_proof,
+        validation,
+        mutation_gate,
+        named_index_lifecycle,
+    )
+}
+
 /// Test-only inspection stops before the append compiler, allocation scope, and typed-index
 /// preparation. Only a scalar report crosses this boundary; resource Arcs remain private.
 #[cfg(test)]
@@ -1126,7 +1153,7 @@ fn bind_physical_indexes(
     original_read_snapshot: Index,
 ) -> Result<(Vec<CudaResidentTypedIndexInsert>, Vec<PhysicalIndexBinding>), ExecuteError> {
     let source_ptr = source_payload.device_ptr();
-    let horizon = expected_index_horizon(open)?;
+    let horizon = expected_index_horizon(table, open)?;
     let route_publish = engine
         .read_state
         .residency
@@ -1188,9 +1215,22 @@ fn bind_physical_indexes(
         }
         let cache_key = (table.name.clone(), open.shard_id, logical_binding.key_id);
         let covered = coverage.get(&cache_key) == Some(&(source_ptr, base_row));
-        let entry = cache
-            .get(&cache_key)
-            .ok_or_else(|| decline("indexed in-place preview has no enrolled physical index"))?;
+        let Some(entry) = cache.get(&cache_key) else {
+            #[cfg(feature = "probe-timing")]
+            eprintln!(
+                "[probe] indexed_in_place_missing table={} raw_ordinal={} key_id={} shard={} base_row={} cache_entries={} coverage_entries={}",
+                table.name,
+                logical_binding.raw_ordinal,
+                logical_binding.key_id,
+                open.shard_id,
+                base_row,
+                cache.keys().filter(|(name, _, _)| name == &table.name).count(),
+                coverage.keys().filter(|(name, _, _)| name == &table.name).count(),
+            );
+            return Err(decline(
+                "indexed in-place preview has no enrolled physical index",
+            ));
+        };
         let device_index = entry
             .device_index
             .as_ref()
@@ -1272,7 +1312,7 @@ fn validate_physical_bindings(
         return Err(decline("indexed in-place preview physical count drifted"));
     }
     let source_ptr = source_payload.device_ptr();
-    let horizon = expected_index_horizon(open)?;
+    let horizon = expected_index_horizon(table, open)?;
     let route_publish = engine
         .read_state
         .residency
@@ -1404,15 +1444,30 @@ struct IndexHorizon {
     allocated_bytes: u64,
 }
 
-fn expected_index_horizon(open: &RelationalResidentShard) -> Result<IndexHorizon, ExecuteError> {
+fn expected_index_horizon(
+    table: &RelationalTable,
+    open: &RelationalResidentShard,
+) -> Result<IndexHorizon, ExecuteError> {
     let rows = u64::try_from(open.row_count)
         .map_err(|_| decline("indexed in-place preview row count overflows"))?;
     let capacity = u64::try_from(open.capacity)
         .map_err(|_| decline("indexed in-place preview capacity overflows"))?;
-    let table_size = crate::engine_residency::resident_shard_index_table_size(rows, capacity)
-        .ok_or_else(|| decline("indexed in-place preview has no index horizon geometry"))?;
+    // Ordinary empty shards retain the global estimator's fail-closed geometry. A WRITE-001
+    // foldable-index predecessor is already capacity-backed and named-index-enrolled; model its
+    // first appended row as the local horizon.
+    let horizon_rows = if rows == 0
+        && capacity == 1
+        && crate::engine_residency::write001_empty_index_in_place_preallocation(table)
+    {
+        1
+    } else {
+        rows
+    };
+    let table_size =
+        crate::engine_residency::resident_shard_index_table_size(horizon_rows, capacity)
+            .ok_or_else(|| decline("indexed in-place preview has no index horizon geometry"))?;
     let table_mask = (table_size - 1) as u32;
-    let allocated_bytes = resident_index_allocated_bytes(table_mask, capacity.max(rows))
+    let allocated_bytes = resident_index_allocated_bytes(table_mask, capacity.max(horizon_rows))
         .ok_or_else(|| decline("indexed in-place preview index allocation geometry overflows"))?;
     Ok(IndexHorizon {
         table_mask,

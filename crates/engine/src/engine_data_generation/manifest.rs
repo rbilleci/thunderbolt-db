@@ -16,6 +16,7 @@ use super::digest::{
 use super::DataGenerationError;
 
 const RADIX_DEPTH: u8 = 64;
+const RADIX_DEPTH_USIZE: usize = RADIX_DEPTH as usize;
 
 #[cfg(test)]
 std::thread_local! {
@@ -37,7 +38,7 @@ pub(super) fn hot_path_node_visits_for_test() -> usize {
     RADIX_NODE_VISITS.with(Cell::get)
 }
 
-pub(super) trait RadixKey: Copy + Eq {
+pub(crate) trait RadixKey: Copy + Eq {
     fn bits(self) -> u64;
 }
 
@@ -59,7 +60,13 @@ impl RadixKey for StableTransactionId {
     }
 }
 
-pub(super) trait RadixLeafValue: Clone {
+impl RadixKey for u64 {
+    fn bits(self) -> u64 {
+        self
+    }
+}
+
+pub(crate) trait RadixLeafValue: Clone {
     fn same_commitment(&self, other: &Self) -> bool;
 }
 
@@ -120,14 +127,14 @@ struct GpuRadixEmptyRoot<R> {
 /// private to this module so a future GPU-completion adapter is the sole source; tests use the
 /// cfg(test) synthetic constructor below.
 #[derive(Clone, Debug)]
-pub(super) struct GpuRadixEmptyRoots<R> {
+pub(crate) struct GpuRadixEmptyRoots<R> {
     roots: Vec<GpuRadixEmptyRoot<R>>,
 }
 
 impl<R: Copy + Eq> GpuRadixEmptyRoots<R> {
     /// The sealed GPU root-completion handoff is the only production route that can create this
     /// depth-bound set.  Tests retain their explicit synthetic constructor below.
-    pub(super) fn from_verified_depths(roots: Vec<(u8, R)>) -> Result<Self, DataGenerationError> {
+    pub(crate) fn from_verified_depths(roots: Vec<(u8, R)>) -> Result<Self, DataGenerationError> {
         let result = Self {
             roots: roots
                 .into_iter()
@@ -138,7 +145,7 @@ impl<R: Copy + Eq> GpuRadixEmptyRoots<R> {
         Ok(result)
     }
 
-    pub(super) fn validate_shape(&self) -> Result<(), DataGenerationError> {
+    pub(crate) fn validate_shape(&self) -> Result<(), DataGenerationError> {
         if self.roots.len() != usize::from(RADIX_DEPTH) + 1 {
             return Err(DataGenerationError::GpuCompletionMismatch(
                 "empty radix roots",
@@ -162,8 +169,12 @@ impl<R: Copy + Eq> GpuRadixEmptyRoots<R> {
         Ok(())
     }
 
+    pub(crate) fn roots(&self) -> impl ExactSizeIterator<Item = R> + '_ {
+        self.roots.iter().map(|completed| completed.root)
+    }
+
     #[cfg(test)]
-    pub(super) fn synthetic_for_test(roots: Vec<(u8, R)>) -> Self {
+    pub(crate) fn synthetic_for_test(roots: Vec<(u8, R)>) -> Self {
         Self {
             roots: roots
                 .into_iter()
@@ -173,7 +184,105 @@ impl<R: Copy + Eq> GpuRadixEmptyRoots<R> {
     }
 }
 
+/// One GPU-authenticated radix path expressed only as roots.  Unlike the older completion
+/// carrier, this witness deliberately contains no subtree counts: the host derives counts from
+/// the retained persistent tree while it relinks the one changed path.
 #[derive(Clone, Debug)]
+pub(crate) struct GpuRadixRootPath<R> {
+    pub(crate) leaf_root: R,
+    /// Ordered root-to-leaf-parent, depths zero through 63.
+    pub(crate) nodes: [R; RADIX_DEPTH_USIZE],
+}
+
+/// One complete GPU-authenticated COW transition for a fixed radix map.  The canonical empty
+/// roots are included on every completion so a later operation cannot silently cross map
+/// domains.  The host checks the initial path against the retained map, derives only subtree
+/// counts, and installs the GPU-provided final roots while retaining all unchanged `Arc`s.
+#[derive(Clone, Debug)]
+pub(crate) struct GpuRadixMapTransition<R> {
+    pub(crate) empty_roots: GpuRadixEmptyRoots<R>,
+    pub(crate) initial: GpuRadixRootPath<R>,
+    pub(crate) final_path: GpuRadixRootPath<R>,
+}
+
+/// An already-published immutable map witness retained solely so the next GPU submission can
+/// reuse, rather than rederive, its predecessor.  It contains no successor root and performs no
+/// hashing: publication still verifies the carried initial path and accepts only the new
+/// device-produced final path.
+#[derive(Clone, Debug)]
+pub(crate) struct FixedRadixMapPredecessorWitness<R> {
+    pub(crate) empty_roots: [R; RADIX_DEPTH_USIZE + 1],
+    pub(crate) initial_leaf_root: R,
+    pub(crate) initial_path_roots: [R; RADIX_DEPTH_USIZE],
+    pub(crate) sibling_roots: [R; RADIX_DEPTH_USIZE],
+}
+
+impl<R: Copy + Eq> GpuRadixMapTransition<R> {
+    pub(crate) fn new(
+        empty_roots: GpuRadixEmptyRoots<R>,
+        initial_leaf_root: R,
+        initial_path_roots: [R; RADIX_DEPTH_USIZE],
+        final_leaf_root: R,
+        final_path_roots: [R; RADIX_DEPTH_USIZE],
+    ) -> Result<Self, DataGenerationError> {
+        empty_roots.validate_shape()?;
+        Ok(Self {
+            empty_roots,
+            initial: GpuRadixRootPath {
+                leaf_root: initial_leaf_root,
+                nodes: initial_path_roots,
+            },
+            final_path: GpuRadixRootPath {
+                leaf_root: final_leaf_root,
+                nodes: final_path_roots,
+            },
+        })
+    }
+}
+
+trait RadixPathWitness<R> {
+    fn leaf_root(&self) -> R;
+    fn node_root(&self, depth: u8) -> R;
+    fn validate_subtree_count(&self, depth: u8, count: u64) -> Result<(), DataGenerationError>;
+}
+
+impl<R: Copy> RadixPathWitness<R> for GpuRadixPathCompletion<R> {
+    fn leaf_root(&self) -> R {
+        self.leaf_root
+    }
+
+    fn node_root(&self, depth: u8) -> R {
+        self.nodes[usize::from(depth)].root
+    }
+
+    fn validate_subtree_count(&self, depth: u8, count: u64) -> Result<(), DataGenerationError> {
+        if self.nodes[usize::from(depth)].subtree_count == count {
+            Ok(())
+        } else {
+            Err(DataGenerationError::GpuCompletionMismatch(
+                "radix path count",
+            ))
+        }
+    }
+}
+
+impl<R: Copy> RadixPathWitness<R> for GpuRadixRootPath<R> {
+    fn leaf_root(&self) -> R {
+        self.leaf_root
+    }
+
+    fn node_root(&self, depth: u8) -> R {
+        self.nodes[usize::from(depth)]
+    }
+
+    fn validate_subtree_count(&self, _depth: u8, _count: u64) -> Result<(), DataGenerationError> {
+        // Counts are intentionally host-derived from retained child counts for the root-only
+        // GPU witness.  The GPU owns roots, not a host-trusted count side channel.
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum FixedRadixNode<K, R, V> {
     Empty {
         depth: u8,
@@ -290,32 +399,39 @@ impl<K: RadixKey, R: Copy + Eq, V: RadixLeafValue> FixedRadixNode<K, R, V> {
         }
     }
 
-    fn substitute(
+    fn substitute<W: RadixPathWitness<R>>(
         &self,
         key: K,
         depth: u8,
         after: &Option<V>,
-        completion: &GpuRadixPathCompletion<R>,
+        completion: &W,
         empty_roots: &[R],
     ) -> Result<Arc<Self>, DataGenerationError> {
         #[cfg(test)]
         record_hot_path_node_visit();
         if depth == RADIX_DEPTH {
             return Ok(match after {
-                Some(value) => Arc::new(Self::Leaf {
-                    key,
-                    root: completion.leaf_root,
-                    value: value.clone(),
-                }),
+                Some(value) => {
+                    if completion.leaf_root() == empty_roots[usize::from(RADIX_DEPTH)] {
+                        return Err(DataGenerationError::GpuCompletionMismatch(
+                            "nonempty radix leaf root",
+                        ));
+                    }
+                    Arc::new(Self::Leaf {
+                        key,
+                        root: completion.leaf_root(),
+                        value: value.clone(),
+                    })
+                }
                 None => {
-                    if completion.leaf_root != empty_roots[usize::from(RADIX_DEPTH)] {
+                    if completion.leaf_root() != empty_roots[usize::from(RADIX_DEPTH)] {
                         return Err(DataGenerationError::GpuCompletionMismatch(
                             "empty radix leaf root",
                         ));
                     }
                     Arc::new(Self::Empty {
                         depth,
-                        root: completion.leaf_root,
+                        root: completion.leaf_root(),
                     })
                 }
             });
@@ -353,43 +469,182 @@ impl<K: RadixKey, R: Copy + Eq, V: RadixLeafValue> FixedRadixNode<K, R, V> {
             .count()
             .checked_add(right.count())
             .ok_or(DataGenerationError::CountOverflow)?;
-        let completion_node = &completion.nodes[usize::from(depth)];
-        if completion_node.subtree_count != subtree_count {
-            return Err(DataGenerationError::GpuCompletionMismatch(
-                "radix path count",
-            ));
-        }
+        completion.validate_subtree_count(depth, subtree_count)?;
+        let completion_root = completion.node_root(depth);
         if subtree_count == 0 {
-            if completion_node.root != empty_roots[usize::from(depth)] {
+            if completion_root != empty_roots[usize::from(depth)] {
                 return Err(DataGenerationError::GpuCompletionMismatch(
                     "empty radix node root",
                 ));
             }
             Ok(Arc::new(Self::Empty {
                 depth,
-                root: completion_node.root,
+                root: completion_root,
             }))
         } else {
+            if completion_root == empty_roots[usize::from(depth)] {
+                return Err(DataGenerationError::GpuCompletionMismatch(
+                    "nonempty radix node root",
+                ));
+            }
             Ok(Arc::new(Self::Branch {
                 depth,
-                root: completion_node.root,
+                root: completion_root,
                 subtree_count,
                 left,
                 right,
             }))
         }
     }
+
+    fn validate_initial_path(
+        &self,
+        key: K,
+        depth: u8,
+        initial: &GpuRadixRootPath<R>,
+        empty_roots: &[R],
+    ) -> Result<(), DataGenerationError> {
+        #[cfg(test)]
+        record_hot_path_node_visit();
+        if depth == RADIX_DEPTH {
+            return if self.root() == initial.leaf_root {
+                Ok(())
+            } else {
+                Err(DataGenerationError::GpuCompletionMismatch(
+                    "radix initial leaf root",
+                ))
+            };
+        }
+        if self.root() != initial.nodes[usize::from(depth)] {
+            return Err(DataGenerationError::GpuCompletionMismatch(
+                "radix initial path root",
+            ));
+        }
+        match self {
+            Self::Empty {
+                depth: empty_depth,
+                root,
+            } => {
+                if *empty_depth != depth || *root != empty_roots[usize::from(depth)] {
+                    return Err(DataGenerationError::Invalid("radix empty-node depth"));
+                }
+                for remaining_depth in depth + 1..RADIX_DEPTH {
+                    if initial.nodes[usize::from(remaining_depth)]
+                        != empty_roots[usize::from(remaining_depth)]
+                    {
+                        return Err(DataGenerationError::GpuCompletionMismatch(
+                            "radix initial empty path root",
+                        ));
+                    }
+                }
+                if initial.leaf_root != empty_roots[usize::from(RADIX_DEPTH)] {
+                    return Err(DataGenerationError::GpuCompletionMismatch(
+                        "radix initial empty leaf root",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Branch { left, right, .. } => {
+                let bit = (key.bits() >> (63 - depth)) & 1;
+                if bit == 0 {
+                    left.validate_initial_path(key, depth + 1, initial, empty_roots)
+                } else {
+                    right.validate_initial_path(key, depth + 1, initial, empty_roots)
+                }
+            }
+            Self::Leaf { .. } => Err(DataGenerationError::Invalid("radix leaf before depth 64")),
+        }
+    }
+
+    fn collect_sibling_roots(
+        &self,
+        key: K,
+        depth: u8,
+        empty_roots: &[R],
+        siblings: &mut Vec<R>,
+    ) -> Result<(), DataGenerationError> {
+        #[cfg(test)]
+        record_hot_path_node_visit();
+        if depth == RADIX_DEPTH {
+            return Ok(());
+        }
+        match self {
+            Self::Empty {
+                depth: empty_depth,
+                root,
+            } => {
+                if *empty_depth != depth || *root != empty_roots[usize::from(depth)] {
+                    return Err(DataGenerationError::Invalid("radix empty-node depth"));
+                }
+                for remaining_depth in depth..RADIX_DEPTH {
+                    siblings.push(empty_roots[usize::from(remaining_depth + 1)]);
+                }
+                Ok(())
+            }
+            Self::Branch { left, right, .. } => {
+                let bit = (key.bits() >> (63 - depth)) & 1;
+                if bit == 0 {
+                    siblings.push(right.root());
+                    left.collect_sibling_roots(key, depth + 1, empty_roots, siblings)
+                } else {
+                    siblings.push(left.root());
+                    right.collect_sibling_roots(key, depth + 1, empty_roots, siblings)
+                }
+            }
+            Self::Leaf { .. } => Err(DataGenerationError::Invalid("radix leaf before depth 64")),
+        }
+    }
+
+    fn collect_path_roots(
+        &self,
+        key: K,
+        depth: u8,
+        empty_roots: &[R],
+        path: &mut Vec<R>,
+    ) -> Result<(), DataGenerationError> {
+        #[cfg(test)]
+        record_hot_path_node_visit();
+        if depth == RADIX_DEPTH {
+            path.push(self.root());
+            return Ok(());
+        }
+        match self {
+            Self::Empty {
+                depth: empty_depth,
+                root,
+            } => {
+                if *empty_depth != depth || *root != empty_roots[usize::from(depth)] {
+                    return Err(DataGenerationError::Invalid("radix empty-node depth"));
+                }
+                path.extend(
+                    empty_roots[usize::from(depth)..=RADIX_DEPTH_USIZE]
+                        .iter()
+                        .copied(),
+                );
+                Ok(())
+            }
+            Self::Branch { left, right, .. } => {
+                path.push(self.root());
+                if ((key.bits() >> (63 - depth)) & 1) == 0 {
+                    left.collect_path_roots(key, depth + 1, empty_roots, path)
+                } else {
+                    right.collect_path_roots(key, depth + 1, empty_roots, path)
+                }
+            }
+            Self::Leaf { .. } => Err(DataGenerationError::Invalid("radix leaf before depth 64")),
+        }
+    }
 }
 
 /// A persistent, uncompressed 64-bit MSB-first radix tree. It performs no hash computation.
-#[derive(Clone, Debug)]
-pub(super) struct FixedRadixMap<K, R, V> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FixedRadixMap<K, R, V> {
     root: Arc<FixedRadixNode<K, R, V>>,
     empty_roots: Arc<[R]>,
 }
 
 impl<K: RadixKey, R: Copy + Eq, V: RadixLeafValue> FixedRadixMap<K, R, V> {
-    pub(super) fn empty(empty_roots: GpuRadixEmptyRoots<R>) -> Result<Self, DataGenerationError> {
+    pub(crate) fn empty(empty_roots: GpuRadixEmptyRoots<R>) -> Result<Self, DataGenerationError> {
         empty_roots.validate_shape()?;
         let empty_roots: Arc<[R]> = empty_roots
             .roots
@@ -406,23 +661,23 @@ impl<K: RadixKey, R: Copy + Eq, V: RadixLeafValue> FixedRadixMap<K, R, V> {
         })
     }
 
-    pub(super) fn root(&self) -> R {
+    pub(crate) fn root(&self) -> R {
         self.root.root()
     }
 
-    pub(super) fn count(&self) -> u64 {
+    pub(crate) fn count(&self) -> u64 {
         self.root.count()
     }
 
-    pub(super) fn get(&self, key: K) -> Option<&V> {
+    pub(crate) fn get(&self, key: K) -> Option<&V> {
         self.root.get(key, 0)
     }
 
-    pub(super) fn validate(&self) -> Result<(), DataGenerationError> {
+    pub(crate) fn validate(&self) -> Result<(), DataGenerationError> {
         self.root.validate(0, 0, &self.empty_roots).map(|_| ())
     }
 
-    pub(super) fn validate_values(
+    pub(crate) fn validate_values(
         &self,
         validate: impl FnMut(K, &V) -> Result<(), DataGenerationError>,
     ) -> Result<(), DataGenerationError> {
@@ -446,6 +701,91 @@ impl<K: RadixKey, R: Copy + Eq, V: RadixLeafValue> FixedRadixMap<K, R, V> {
         let root = self
             .root
             .substitute(key, 0, &after, completion, &self.empty_roots)?;
+        Ok(Self {
+            root,
+            empty_roots: Arc::clone(&self.empty_roots),
+        })
+    }
+
+    /// Returns the exact sibling roots for one leaf path, ordered depth zero through 63.  This
+    /// has a fixed 64-node bound and never computes a host commitment; it only exposes roots
+    /// retained by the immutable map for the GPU's next COW validation.
+    pub(crate) fn sibling_roots(
+        &self,
+        key: K,
+    ) -> Result<[R; RADIX_DEPTH_USIZE], DataGenerationError> {
+        let mut siblings = Vec::with_capacity(RADIX_DEPTH_USIZE);
+        self.root
+            .collect_sibling_roots(key, 0, &self.empty_roots, &mut siblings)?;
+        siblings
+            .try_into()
+            .map_err(|_| DataGenerationError::Invalid("fixed radix sibling-root witness length"))
+    }
+
+    /// Return the exact retained predecessor witness for one GPU COW substitution.  Unlike a
+    /// completion, this cannot introduce a root: it is a copy of immutable roots that the
+    /// previous device publication already authenticated.
+    pub(crate) fn predecessor_witness(
+        &self,
+        key: K,
+    ) -> Result<FixedRadixMapPredecessorWitness<R>, DataGenerationError> {
+        let empty_roots = self
+            .empty_roots
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| DataGenerationError::Invalid("fixed radix empty-root witness length"))?;
+        let sibling_roots = self.sibling_roots(key)?;
+        let mut path = Vec::with_capacity(RADIX_DEPTH_USIZE + 1);
+        self.root
+            .collect_path_roots(key, 0, &self.empty_roots, &mut path)?;
+        let path: [R; RADIX_DEPTH_USIZE + 1] = path.try_into().map_err(|_| {
+            DataGenerationError::Invalid("fixed radix predecessor-path witness length")
+        })?;
+        let initial_leaf_root = path[RADIX_DEPTH_USIZE];
+        let initial_path_roots = path[..RADIX_DEPTH_USIZE].try_into().map_err(|_| {
+            DataGenerationError::Invalid("fixed radix predecessor-node witness length")
+        })?;
+        Ok(FixedRadixMapPredecessorWitness {
+            empty_roots,
+            initial_leaf_root,
+            initial_path_roots,
+            sibling_roots,
+        })
+    }
+
+    /// Substitute one leaf from a root-only GPU completion.  The submitted empty roots must
+    /// match this map's exact canonical domain; the initial root path must match the retained
+    /// predecessor; and the final path is relinked with host-derived subtree counts only.
+    pub(crate) fn substitute_gpu_completed(
+        &self,
+        key: K,
+        expected_before: Option<&V>,
+        after: Option<V>,
+        transition: &GpuRadixMapTransition<R>,
+    ) -> Result<Self, DataGenerationError> {
+        transition.empty_roots.validate_shape()?;
+        if self
+            .empty_roots
+            .iter()
+            .copied()
+            .ne(transition.empty_roots.roots())
+        {
+            return Err(DataGenerationError::GpuCompletionMismatch(
+                "radix empty-root domain",
+            ));
+        }
+        match (self.get(key), expected_before) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) if actual.same_commitment(expected) => {}
+            _ => return Err(DataGenerationError::PredecessorMismatch("radix leaf")),
+        }
+        self.root
+            .validate_initial_path(key, 0, &transition.initial, &self.empty_roots)?;
+        let root =
+            self.root
+                .substitute(key, 0, &after, &transition.final_path, &self.empty_roots)?;
         Ok(Self {
             root,
             empty_roots: Arc::clone(&self.empty_roots),

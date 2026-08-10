@@ -1,4 +1,4 @@
-//! Exact published-sequence S2/S4/S5/S7 closure without catalog witnesses.
+//! Exact published/private sequence S2/S4/S5/S7 closure without catalog witnesses.
 
 use super::dependencies::qualified_name_digest;
 use super::error;
@@ -17,8 +17,60 @@ pub(super) fn validate(
     graph: &ReservedSemanticsV2Graph,
 ) -> Result<(), EngineError> {
     validate_s5_sources(identity, graph)?;
-    validate_s2_published_inventory(graph)?;
+    validate_terminal_restarts(identity, graph)?;
+    validate_s2_sequence_inventory(graph)?;
     validate_token_and_use_bijections(graph)
+}
+
+fn validate_terminal_restarts(
+    identity: SemanticsV2BoundIdentity,
+    graph: &ReservedSemanticsV2Graph,
+) -> Result<(), EngineError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (effect_index, effect) in graph.sequence_effects.iter().enumerate() {
+        let Some(tail) = effect.terminal_restart else {
+            continue;
+        };
+        crate::typed_insert_aggregate::semantics_v2::sequence_terminal::validate(
+            identity.request_digest,
+            tail,
+        )?;
+        let record = graph
+            .records
+            .get(effect.statement_ordinal as usize)
+            .ok_or_else(|| error("terminal sequence restart has no S2 record"))?;
+        let source = one_sequence_effect(record, effect.effect_ordinal)?;
+        let binding = record
+            .sequence_bindings()
+            .find(|binding| binding.effect_ordinal == effect.effect_ordinal)
+            .ok_or_else(|| error("terminal sequence restart has no S2 binding"))?;
+        if tail.sequence_oid != source.request.sequence_oid
+            || tail.descriptor_digest != binding.descriptor_digest
+            || tail.owner_operation_ordinal <= effect.statement_ordinal
+            || !seen.insert(tail.sequence_oid)
+            || graph.sequence_effects[effect_index + 1..]
+                .iter()
+                .any(|later| sequence_oid(graph, later).ok() == Some(tail.sequence_oid))
+        {
+            return Err(error(
+                "terminal sequence restart does not close the final S2-owned effect",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sequence_oid(
+    graph: &ReservedSemanticsV2Graph,
+    effect: &crate::typed_insert_aggregate::semantics_v2::retained::graph::RetainedSequenceEffect,
+) -> Result<u32, EngineError> {
+    let record = graph
+        .records
+        .get(effect.statement_ordinal as usize)
+        .ok_or_else(|| error("S5 sequence effect has no S2 record"))?;
+    Ok(one_sequence_effect(record, effect.effect_ordinal)?
+        .request
+        .sequence_oid)
 }
 
 fn validate_s5_sources(
@@ -47,32 +99,8 @@ fn validate_s5_sources(
             .dispositions
             .get(effect.disposition_ref as usize)
             .ok_or_else(|| error("S5 sequence effect disposition is absent"))?;
-        let (transition_txn_id, input_digest, returned_value) = match source.kind {
-            DecodedSequenceEffectKindFacts::Published {
-                transition_txn_id,
-                input_digest,
-                returned_value,
-            } => (transition_txn_id, input_digest, returned_value),
-            DecodedSequenceEffectKindFacts::Private { .. } => {
-                return Err(error("S5 may retain only a published S2 sequence effect"));
-            }
-        };
-        let reference = &effect.reference;
-        let expected_overwritten = disposition.disposition != SURVIVES;
-        if effect.flags != (1 | if expected_overwritten { 2 } else { 0 })
-            || reference.parent_txn_id != identity.stable_transaction_id
-            || reference.transition_txn_id != transition_txn_id
-            || reference.transition_txn_id <= prior_transition
-            || reference.input_digest != input_digest
-            || reference.returned_value != returned_value
-            || !reference.default_expression
-            || reference.final_value_overwritten != expected_overwritten
-            || reference.statement_ordinal != effect.statement_ordinal
-            || reference.expression_ordinal != source.request.absolute_expression_ordinal
-            || reference.sequence_oid != source.request.sequence_oid
-            || reference.table_oid != source.request.target_table_oid
-            || reference.column_id != source.request.column_id
-            || reference.row_id != disposition.stable_row_id
+        let expected_overwritten = effect.flags & 2 != 0;
+        if !matches!(effect.flags, 1 | 3)
             || disposition.statement_ordinal != effect.statement_ordinal
             || disposition.source_row_ordinal != source.request.row_ordinal
             || parent.txn_id != identity.stable_transaction_id
@@ -83,7 +111,7 @@ fn validate_s5_sources(
             || binding.request != source.request
         {
             return Err(error(
-                "S5 published sequence effect does not close its S2/S4 identity",
+                "S5 sequence effect does not close its S2/S4 identity",
             ));
         }
         let target = record.target_identity();
@@ -100,30 +128,94 @@ fn validate_s5_sources(
                 "S5 sequence request does not close its target-column source",
             ));
         }
-        if !expected_overwritten {
-            if graph
-                .transitions
-                .get(disposition.transition_ref as usize)
-                .is_none()
-            {
-                return Err(error("surviving sequence source has no final transition"));
+        let returned_value = match (source.kind, effect.reference.as_ref()) {
+            (
+                DecodedSequenceEffectKindFacts::Published {
+                    transition_txn_id,
+                    input_digest,
+                    returned_value,
+                },
+                Some(reference),
+            ) => {
+                if reference.parent_txn_id != identity.stable_transaction_id
+                    || reference.transition_txn_id != transition_txn_id
+                    || reference.transition_txn_id <= prior_transition
+                    || reference.input_digest != input_digest
+                    || reference.returned_value != returned_value
+                    || !reference.default_expression
+                    || reference.final_value_overwritten != expected_overwritten
+                    || reference.statement_ordinal != effect.statement_ordinal
+                    || reference.expression_ordinal != source.request.absolute_expression_ordinal
+                    || reference.sequence_oid != source.request.sequence_oid
+                    || reference.table_oid != source.request.target_table_oid
+                    || reference.column_id != source.request.column_id
+                    || reference.row_id != disposition.stable_row_id
+                    || effect.reference_body_digest == [0; 32]
+                {
+                    return Err(error(
+                        "S5 published sequence effect does not close its durable receipt",
+                    ));
+                }
+                prior_transition = reference.transition_txn_id;
+                returned_value
             }
-            let (valid, source_value) = record.column_value_at(
-                source.request.catalog_column_ordinal,
-                source.request.row_ordinal,
-            )?;
-            if !valid || !sequence_source_value_matches_returned(source_value, returned_value) {
+            (DecodedSequenceEffectKindFacts::Private { .. }, None) => {
+                if effect.reference_body_digest != [0; 32]
+                    || (effect.terminal_restart.is_none() && effect.body_digest != [0; 32])
+                    || (effect.terminal_restart.is_some() && effect.body_digest == [0; 32])
+                {
+                    return Err(error("S5 private sequence effect retained an invalid body"));
+                }
+                source.resolved_value
+            }
+            _ => {
                 return Err(error(
-                    "published sequence return value differs from S2/final image",
+                    "S5 sequence effect kind does not match its S2 ownership",
                 ));
             }
+        };
+        let (valid, source_value) = record.column_value_at(
+            source.request.catalog_column_ordinal,
+            source.request.row_ordinal,
+        )?;
+        if !valid || !sequence_source_value_matches_returned(source_value, returned_value) {
+            return Err(error("sequence return value differs from its S2 source"));
         }
-        prior_transition = reference.transition_txn_id;
+        if disposition.disposition == SURVIVES {
+            let transition = graph
+                .transitions
+                .get(disposition.transition_ref as usize)
+                .ok_or_else(|| error("surviving sequence source has no final transition"))?;
+            let image = graph
+                .images
+                .get(transition.image_ref as usize)
+                .ok_or_else(|| error("surviving sequence source has no final image"))?;
+            let column = image
+                .columns()
+                .nth(source.request.catalog_column_ordinal as usize)
+                .ok_or_else(|| error("surviving sequence source column left the final image"))?;
+            let expected = i32::try_from(returned_value)
+                .map_err(|_| error("sequence return value exceeds its final int4 image"))?
+                .to_le_bytes();
+            let final_value_matches = column
+                .with_logical_cell_at(transition.image_row_ordinal as usize, |is_null, bytes| {
+                    !is_null && bytes == expected
+                })?;
+            if final_value_matches == expected_overwritten {
+                return Err(error(
+                    "sequence overwrite flag differs from the retained final image",
+                ));
+            }
+        } else if !expected_overwritten {
+            return Err(error(
+                "non-surviving sequence source is not marked overwritten",
+            ));
+        }
     }
     Ok(())
 }
 
-fn validate_s2_published_inventory(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> {
+fn validate_s2_sequence_inventory(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> {
     for record in &graph.records {
         let statement = record.facts().statement_ordinal.as_u32();
         for source in record.sequence_effects() {
@@ -135,16 +227,10 @@ fn validate_s2_published_inventory(graph: &ReservedSemanticsV2Graph) -> Result<(
                         && effect.effect_ordinal == source.request.effect_ordinal
                 })
                 .count();
-            match source.kind {
-                DecodedSequenceEffectKindFacts::Published { .. } if count != 1 => {
-                    return Err(error(
-                        "published S2 sequence source does not biject an S5 effect",
-                    ));
-                }
-                DecodedSequenceEffectKindFacts::Private { .. } if count != 0 => {
-                    return Err(error("private S2 sequence source leaked into published S5"));
-                }
-                _ => {}
+            if count != 1 {
+                return Err(error(
+                    "S2 sequence source does not biject exactly one S5 effect",
+                ));
             }
         }
     }
@@ -153,15 +239,18 @@ fn validate_s2_published_inventory(graph: &ReservedSemanticsV2Graph) -> Result<(
 
 fn validate_token_and_use_bijections(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> {
     for effect in &graph.sequence_effects {
+        let Some(reference) = effect.reference.as_ref() else {
+            continue;
+        };
         let name_digest = effective_name_digest(graph, effect)?;
         let token_count = graph
             .dependencies
             .iter()
             .filter(|token| {
                 token.kind == PUBLISHED_SEQUENCE
-                    && token.display_oid == effect.reference.sequence_oid
-                    && token.base_generation == effect.reference.transition_txn_id
-                    && token.base_root == effect.body_digest
+                    && token.display_oid == reference.sequence_oid
+                    && token.base_generation == reference.transition_txn_id
+                    && token.base_root == effect.reference_body_digest
                     && token.name_digest == name_digest
             })
             .count();
@@ -179,9 +268,12 @@ fn validate_token_and_use_bijections(graph: &ReservedSemanticsV2Graph) -> Result
         let mut effect_count = 0_usize;
         let mut use_count = 0_usize;
         for effect in &graph.sequence_effects {
-            if effect.reference.sequence_oid != token.display_oid
-                || effect.reference.transition_txn_id != token.base_generation
-                || effect.body_digest != token.base_root
+            let Some(reference) = effect.reference.as_ref() else {
+                continue;
+            };
+            if reference.sequence_oid != token.display_oid
+                || reference.transition_txn_id != token.base_generation
+                || effect.reference_body_digest != token.base_root
                 || effective_name_digest(graph, effect)? != token.name_digest
             {
                 continue;

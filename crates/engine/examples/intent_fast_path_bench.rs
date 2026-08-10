@@ -71,7 +71,6 @@ fn build_engine(segment: &std::path::Path) -> Result<Engine, Box<dyn Error>> {
     let e = Engine::with_durable_wal_segment(segment);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")?;
     e.set_auto_admit_on_commit(true);
-    e.set_binary_wal_records_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     // GPU_DB_BENCH_SHARD_TARGET: pre-size the open shard (rows) to control
     // rollover frequency in-run (rollovers serialize under the apply path and,
@@ -639,10 +638,9 @@ fn run_arm(
                         patch as f64 / lw as f64 / 1e3,
                     );
                 }
-                if let Some((vbusy, vlaunch, abusy, alaunch)) = engine.intent_lane_leader_stats() {
+                if let Some((abusy, alaunch)) = engine.intent_lane_apply_leader_stats() {
                     eprintln!(
-                        "    [leaders: validate busy {:.2}s over {vlaunch} launches  apply busy {:.2}s over {alaunch} launches]",
-                        vbusy as f64 / 1e9,
+                        "    [apply leader: busy {:.2}s over {alaunch} launches]",
                         abusy as f64 / 1e9,
                     );
                 }

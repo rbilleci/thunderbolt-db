@@ -22,6 +22,24 @@ use gpu_db_sql::{Select, SqlType};
 use gpu_db_types::EngineError;
 use std::sync::Arc;
 
+// This one-shot, thread-local fault is deliberately positioned after terminal device-result
+// materialization. It exercises ownership recovery at the exact D2H frame boundary without
+// inventing a production fallback or a separate result path.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_DEVICE_RESULT_FRAME_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_device_result_frame_read_for_test() {
+    FAIL_NEXT_DEVICE_RESULT_FRAME_READ.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn take_fail_next_device_result_frame_read_for_test() -> bool {
+    FAIL_NEXT_DEVICE_RESULT_FRAME_READ.with(|fault| fault.replace(false))
+}
+
 fn result_error(message: impl Into<String>) -> ExecuteError {
     ExecuteError::Engine(EngineError::ApplyFailed(message.into()))
 }
@@ -386,6 +404,12 @@ pub(super) fn execute_device_result_select(
     let terminal = memory
         .materialize_join_coordinates(&coordinates, &specs)
         .map_err(map_err)?;
+    #[cfg(test)]
+    if take_fail_next_device_result_frame_read_for_test() {
+        return Err(result_error(
+            "test-only device result frame read fault after terminal materialization",
+        ));
+    }
     let frame = terminal.read_result_frame().map_err(map_err)?;
     let rows = engine.decode_materialized_result_frame(&frame, &bound.selected_columns)?;
     Ok(RelationalSelectResult {

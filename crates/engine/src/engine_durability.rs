@@ -7,6 +7,7 @@ use super::engine_canonical_operation::{
 use super::*;
 
 mod canonical_envelope;
+mod canonical_records;
 
 const TRANSACTION_STATUS_MAGIC: &[u8; 12] = b"GPUDBSTATUS1";
 const CANONICAL_TRANSACTION_CLAIM_STATUS_BYTES: usize = TRANSACTION_STATUS_MAGIC.len()
@@ -31,6 +32,58 @@ const ENGINE_TYPED_COMMAND_VERSION_LEGACY: u8 = 1;
 const ENGINE_TYPED_COMMAND_VERSION_CURRENT: u8 = 2;
 static CANONICAL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[allow(clippy::large_enum_variant)] // replay retains the validated S7 artifact without a second owner/allocation
+enum PreparedDurableReplayRecord {
+    EngineOperation(WalRecord),
+    WriteAuthority,
+    SemanticsV2TypedInsert {
+        artifact: crate::typed_insert_aggregate::SemanticsV2ReplayArtifact,
+        protocol: SemanticsV2ReplayProtocol,
+    },
+}
+
+/// Bit 30 is an authenticated wire-level ownership discriminator, not a heuristic based on
+/// whether a partial historical control prefix happened to be restored. The retired writer set
+/// it on every production three-record terminal; the generic one-record writer clears it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SemanticsV2ReplayProtocol {
+    HistoricalWriteAuthority,
+    GenericOneRecord,
+}
+
+/// Preflight the clear-bit codec-5 allocator authority before a recovery candidate can retain a
+/// source, launch generation, or mutate a device plan.  Bit 30 selected this protocol already;
+/// absence of markers is therefore a required fact, not a historical-chain inference.
+fn validate_generic_codec5_replay_preflight(
+    write_authority: &crate::engine_write_authority::DurableWriteAuthorityIndex,
+    stable_transaction_id: TxnId,
+    row_allocator_before: u64,
+    row_allocator_high_water: u64,
+    affected_rows: u64,
+    simulated_allocator_high_water: u64,
+) -> Result<u64, EngineError> {
+    if write_authority.has_any_parent_marker(stable_transaction_id) {
+        return Err(EngineError::Durability(format!(
+            "generic one-record codec-5 transaction {stable_transaction_id} has retired claim or allocator markers",
+        )));
+    }
+    if row_allocator_before != simulated_allocator_high_water
+        || row_allocator_high_water
+            != row_allocator_before
+                .checked_add(affected_rows)
+                .ok_or_else(|| {
+                    EngineError::Durability(
+                        "generic codec-5 replay allocator range overflows".to_string(),
+                    )
+                })?
+    {
+        return Err(EngineError::Durability(format!(
+            "generic one-record codec-5 transaction {stable_transaction_id} allocator range is not the exact replay frontier",
+        )));
+    }
+    Ok(row_allocator_high_water)
+}
+
 impl Engine {
     fn canonical_genesis_catalog_digest(
         identity: gpu_db_wal::CanonicalIdentity,
@@ -44,7 +97,7 @@ impl Engine {
         gpu_db_wal::canonical_request_digest(&body)
     }
 
-    fn canonical_catalog_transition(
+    pub(crate) fn canonical_catalog_transition(
         before: gpu_db_wal::CanonicalDigest,
         kind: gpu_db_wal::CanonicalFragmentKind,
         operation_body: &[u8],
@@ -153,20 +206,28 @@ impl Engine {
         }
     }
 
-    fn recovery_scan_payload(record: &WalRecord) -> Result<Arc<[u8]>, EngineError> {
+    fn recovery_scan_payload(record: &WalRecord) -> Result<Option<Arc<[u8]>>, EngineError> {
         if let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)? {
+            // Codec-5 has its own strict retained recovery owner. The historical index-OID
+            // preflight must neither decode it as a legacy engine operation nor allocate a
+            // throwaway typed image; the actual replay preparation below closes it once.
+            if crate::engine_write_authority::decode_write_authority_envelope(&envelope)?.is_some()
+                || Self::canonical_envelope_is_codec5(&envelope)
+            {
+                return Ok(None);
+            }
             let operation = envelope.fragments.first().ok_or_else(|| {
                 EngineError::Durability(format!(
                     "canonical WAL record {} has no operation fragment",
                     record.txn_id
                 ))
             })?;
-            return Self::decode_engine_operation(&operation.body);
+            return Self::decode_engine_operation(&operation.body).map(Some);
         }
         if record.payload.first() == Some(&WAL_BINARY_TAG)
             || record.payload.first() == Some(&ENGINE_TYPED_COMMAND_TAG)
         {
-            return Ok(Arc::clone(&record.payload));
+            return Ok(Some(Arc::clone(&record.payload)));
         }
         let command = Self::decode_engine_command(&record.payload)?.ok_or_else(|| {
             EngineError::Durability(format!(
@@ -174,7 +235,18 @@ impl Engine {
                 record.txn_id
             ))
         })?;
-        Self::encode_replay_typed_command(&command, ENGINE_TYPED_COMMAND_VERSION_LEGACY)
+        Self::encode_replay_typed_command(&command, ENGINE_TYPED_COMMAND_VERSION_LEGACY).map(Some)
+    }
+
+    pub(crate) fn canonical_envelope_is_codec5(envelope: &gpu_db_wal::CanonicalEnvelope) -> bool {
+        envelope
+            .fragments
+            .first()
+            .is_some_and(|fragment| {
+                fragment.kind == gpu_db_wal::CanonicalFragmentKind::RowMutation
+                    && fragment.body.get(8)
+                        == Some(&crate::typed_insert_aggregate::ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE)
+            })
     }
 
     fn legacy_catalog_oid_allocations(command: &Command) -> Result<u32, EngineError> {
@@ -235,7 +307,9 @@ impl Engine {
         let mut low_oid_high_water = FIRST_USER_RELATION_OID;
         let mut has_legacy_prefix = false;
         for record in records {
-            let payload = Self::recovery_scan_payload(record)?;
+            let Some(payload) = Self::recovery_scan_payload(record)? else {
+                continue;
+            };
             if payload.first() == Some(&WAL_BINARY_TAG) {
                 let BinaryWalRecord::Transaction(transaction) = decode_binary_record(&payload)?
                 else {
@@ -653,365 +727,12 @@ impl Engine {
         }
     }
 
-    pub(crate) fn canonical_wal_record(
-        commit: &mut CommitState,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        Self::canonical_wal_record_with_commit_request_digest(
-            commit,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            gpu_db_wal::canonical_request_digest(payload),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn canonical_wal_record_with_isolation_and_request_digest(
-        commit: &mut CommitState,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        isolation: gpu_db_wal::CanonicalIsolation,
-        request_digest: gpu_db_wal::CanonicalDigest,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
-            commit.canonical_identity,
-            commit.wal.canonical_catalog_tail()?,
-        )?;
-        Self::canonical_wal_record_with_boundary_and_optional_outcome_isolation(
-            commit.canonical_identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            request_digest,
-            gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
-            None,
-            isolation,
-        )
-    }
-
-    pub(crate) fn canonical_affected_rows(payload: &[u8]) -> Result<u64, EngineError> {
-        if payload.first() == Some(&WAL_BINARY_TAG) {
-            match decode_binary_record(payload)? {
-                crate::wal_binary::BinaryWalRecord::Insert(record) => Ok(record.rows.len() as u64),
-                crate::wal_binary::BinaryWalRecord::Transaction(record) => {
-                    Ok(record.mutations.len() as u64)
-                }
-                crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_) => Ok(0),
-                crate::wal_binary::BinaryWalRecord::DeleteByKey(_)
-                | crate::wal_binary::BinaryWalRecord::UpdateByKey(_) => {
-                    Err(EngineError::Durability(
-                        "unresolved by-key WAL requires an exact GPU outcome marker".to_string(),
-                    ))
-                }
-            }
-        } else {
-            match Self::decode_engine_command(payload)?.ok_or_else(|| {
-                EngineError::Durability("canonical WAL command has no typed operation".to_string())
-            })? {
-                Command::Insert(insert) => Ok(insert.rows.len() as u64),
-                Command::Delete(_) | Command::Update(_) => Err(EngineError::Durability(
-                    "unresolved text UPDATE/DELETE requires an exact outcome marker".to_string(),
-                )),
-                _ => Ok(0),
-            }
-        }
-    }
-
-    fn canonical_table_block_count(
-        payload: &[u8],
-        operation_kind: gpu_db_wal::CanonicalFragmentKind,
-    ) -> Result<u32, EngineError> {
-        if payload.first() == Some(&WAL_BINARY_TAG) {
-            if let crate::wal_binary::BinaryWalRecord::Transaction(record) =
-                decode_binary_record(payload)?
-            {
-                // Opcodes 4--9 predate the ordered statement vector and their acknowledged
-                // canonical envelopes counted only reset/mutation output tables. Preserve that
-                // exact header interpretation for upgrade replay. Opcodes 10/11 always decode a
-                // non-empty operation order and additionally cover catalog-only/private tables.
-                let ordered = !record.operation_order.is_empty();
-                let tables = record
-                    .catalog_commands
-                    .iter()
-                    .filter_map(|operation| match &operation.command {
-                        Command::CreateTable(create) if ordered => Some(create.table.as_str()),
-                        _ => None,
-                    })
-                    .chain(record.operation_order.iter().filter_map(|operation| {
-                        if ordered {
-                            operation.table()
-                        } else {
-                            None
-                        }
-                    }))
-                    .chain(record.table_resets.iter().map(|reset| reset.table.as_str()))
-                    .chain(record.mutations.iter().map(|mutation| match mutation {
-                        crate::wal_binary::BinaryTransactionMutation::Insert { table, .. }
-                        | crate::wal_binary::BinaryTransactionMutation::Update { table, .. }
-                        | crate::wal_binary::BinaryTransactionMutation::Delete { table, .. } => {
-                            table.as_str()
-                        }
-                    }))
-                    .collect::<BTreeSet<_>>();
-                return u32::try_from(tables.len()).map_err(|_| {
-                    EngineError::Durability(
-                        "canonical transaction table-block count exceeds u32".to_string(),
-                    )
-                });
-            }
-        }
-        Ok(u32::from(matches!(
-            operation_kind,
-            gpu_db_wal::CanonicalFragmentKind::RowMutation
-                | gpu_db_wal::CanonicalFragmentKind::TableReset
-                | gpu_db_wal::CanonicalFragmentKind::TableRewrite
-        )))
-    }
-
-    pub(crate) fn canonical_wal_record_with_commit_request_digest(
-        commit: &mut CommitState,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        request_digest: gpu_db_wal::CanonicalDigest,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
-            commit.canonical_identity,
-            commit.wal.canonical_catalog_tail()?,
-        )?;
-        Self::canonical_wal_record_with_boundary_and_request_digest(
-            commit.canonical_identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            request_digest,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn canonical_wal_record_with_boundary_and_request_digest(
-        identity: gpu_db_wal::CanonicalIdentity,
-        catalog_epoch: u64,
-        catalog_digest: gpu_db_wal::CanonicalDigest,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        request_digest: gpu_db_wal::CanonicalDigest,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        Self::canonical_wal_record_with_boundary_and_optional_outcome_isolation(
-            identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            request_digest,
-            gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
-            None,
-            gpu_db_wal::CanonicalIsolation::ReadCommitted,
-        )
-    }
-
-    /// Resolve the exact deterministic outcome for the serialized path while its commit lock is
-    /// held and before sequence/WAL assignment. The returned delta is intentionally discarded:
-    /// apply re-runs against the same protected committed boundary, and recovery compares that
-    /// result with this durable marker. A route that cannot be resolved here is refused pre-WAL.
-    pub(crate) fn canonical_serialized_outcome(
-        &self,
-        payload: &[u8],
-        commit_seq: Index,
-    ) -> Result<(gpu_db_wal::CanonicalOutcomeKind, u64), EngineError> {
-        let rows = if payload.first() == Some(&WAL_BINARY_TAG) {
-            match decode_binary_record(payload)? {
-                crate::wal_binary::BinaryWalRecord::Insert(record) => record.rows.len() as u64,
-                crate::wal_binary::BinaryWalRecord::Transaction(record) => {
-                    record.mutations.len() as u64
-                }
-                crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_) => 0,
-                crate::wal_binary::BinaryWalRecord::DeleteByKey(_)
-                | crate::wal_binary::BinaryWalRecord::UpdateByKey(_) => {
-                    return Err(EngineError::Durability(
-                        "serialized by-key WAL requires an applied GPU outcome".to_string(),
-                    ));
-                }
-            }
-        } else {
-            let Some(command) = Self::decode_engine_command(payload)? else {
-                return Err(EngineError::Durability(
-                    "serialized canonical operation is not decodable".to_string(),
-                ));
-            };
-            let snapshot = DmlReadSnapshot {
-                commit_seq,
-                next_row_id: self.read_state.mvcc.current_row_id(),
-            };
-            match command {
-                Command::Insert(insert) => self
-                    .prepare_insert(&insert, snapshot, None, InsertPrepareValidation::Full)?
-                    .rows_affected(),
-                Command::Delete(delete) => self.prepare_delete(&delete, snapshot)?.rows_affected(),
-                Command::Update(update) => self.prepare_update(&update, snapshot)?.rows_affected(),
-                _ => 0,
-            }
-        };
-        Ok((
-            if rows == 0
-                && matches!(
-                    Self::decode_engine_command(payload)?,
-                    Some(Command::Insert(_) | Command::Delete(_) | Command::Update(_))
-                )
-            {
-                gpu_db_wal::CanonicalOutcomeKind::CommitNoOp
-            } else {
-                gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
-            },
-            rows,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn canonical_wal_record_with_commit_outcome(
-        commit: &mut CommitState,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        request_digest: gpu_db_wal::CanonicalDigest,
-        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
-        affected_rows: u64,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
-            commit.canonical_identity,
-            commit.wal.canonical_catalog_tail()?,
-        )?;
-        Self::canonical_wal_record_with_boundary_and_outcome(
-            commit.canonical_identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            request_digest,
-            outcome_kind,
-            affected_rows,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn canonical_wal_record_with_boundary_and_outcome(
-        identity: gpu_db_wal::CanonicalIdentity,
-        catalog_epoch: u64,
-        catalog_digest: gpu_db_wal::CanonicalDigest,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        request_digest: gpu_db_wal::CanonicalDigest,
-        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
-        affected_rows: u64,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        Self::canonical_wal_record_with_boundary_and_outcome_isolation(
-            identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            request_digest,
-            outcome_kind,
-            affected_rows,
-            gpu_db_wal::CanonicalIsolation::ReadCommitted,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn canonical_wal_record_with_boundary_and_outcome_isolation(
-        identity: gpu_db_wal::CanonicalIdentity,
-        catalog_epoch: u64,
-        catalog_digest: gpu_db_wal::CanonicalDigest,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        request_digest: gpu_db_wal::CanonicalDigest,
-        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
-        affected_rows: u64,
-        isolation: gpu_db_wal::CanonicalIsolation,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        Self::canonical_wal_record_with_boundary_and_optional_outcome_isolation(
-            identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            payload,
-            request_digest,
-            outcome_kind,
-            Some(affected_rows),
-            isolation,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn canonical_wal_record_with_boundary_and_optional_outcome_isolation(
-        identity: gpu_db_wal::CanonicalIdentity,
-        catalog_epoch: u64,
-        catalog_digest: gpu_db_wal::CanonicalDigest,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        payload: &Arc<[u8]>,
-        request_digest: gpu_db_wal::CanonicalDigest,
-        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
-        outcome_rows: Option<u64>,
-        isolation: gpu_db_wal::CanonicalIsolation,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        if outcome_kind == gpu_db_wal::CanonicalOutcomeKind::AbortError {
-            return Err(EngineError::Durability(
-                "committed engine WAL cannot be encoded with an abort outcome".to_string(),
-            ));
-        }
-        let operation = SealedCanonicalOperation::from_live_payload(payload, txn_id)?;
-        Self::canonical_wal_record_from_sealed_operation(
-            identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            operation,
-            request_digest,
-            outcome_kind,
-            outcome_rows,
-            isolation,
-        )
-    }
-
     /// Validate every canonical authority before replaying any mutation. Legacy records are
     /// accepted only as an upgrade prefix; the first canonical record binds database lineage.
-    pub(crate) fn prepare_durable_records_for_replay(
+    fn prepare_durable_records_for_replay(
         &self,
         records: &[WalRecord],
-    ) -> Result<Vec<WalRecord>, EngineError> {
+    ) -> Result<Vec<PreparedDurableReplayRecord>, EngineError> {
         let mut lineage = None;
         let mut commit = self.commit_state();
         let mut expected_commit_seq = commit.repl.peek_next_index();
@@ -1026,6 +747,8 @@ impl Engine {
         // admitted. This makes the one-way migration barrier span checkpoint/serial/lane chunks,
         // without treating a lineage-only identity anchor as evidence that canonical WAL exists.
         let mut canonical_seen = commit.canonical_replay_seen;
+        let mut write_authority = commit.write_authority.clone();
+        let mut simulated_allocator_high_water = self.read_state.mvcc.current_row_id();
         let mut transaction_claims: HashMap<_, _> = commit
             .transaction_status
             .iter()
@@ -1080,10 +803,10 @@ impl Engine {
                         ENGINE_TYPED_COMMAND_VERSION_LEGACY,
                     )?
                 };
-                replay.push(WalRecord {
+                replay.push(PreparedDurableReplayRecord::EngineOperation(WalRecord {
                     txn_id: record.txn_id,
                     payload,
-                });
+                }));
                 expected_commit_seq = expected_commit_seq.checked_add(1).ok_or_else(|| {
                     EngineError::Durability(
                         "WAL commit sequence overflow during recovery".to_string(),
@@ -1119,6 +842,159 @@ impl Engine {
                     "canonical WAL commit sequence overflow during recovery".to_string(),
                 )
             })?;
+            if let Some(authority) =
+                crate::engine_write_authority::decode_write_authority_envelope(&envelope)?
+            {
+                let (catalog_identity, catalog_before_epoch, catalog_before_digest) =
+                    expected_catalog.unwrap_or_else(|| {
+                        (
+                            envelope.header.identity,
+                            0,
+                            Self::canonical_genesis_catalog_digest(envelope.header.identity),
+                        )
+                    });
+                if catalog_identity != envelope.header.identity
+                    || envelope.header.catalog_before_epoch != catalog_before_epoch
+                    || envelope.header.catalog_before_digest != catalog_before_digest
+                    || envelope.header.catalog_after_epoch != catalog_before_epoch
+                    || envelope.header.catalog_after_digest != catalog_before_digest
+                {
+                    return Err(EngineError::Durability(format!(
+                        "canonical write-authority catalog boundary mismatch for transaction {}",
+                        record.txn_id
+                    )));
+                }
+                if let Some(high_water) = write_authority.apply(
+                    envelope.header.commit_seq,
+                    authority,
+                    simulated_allocator_high_water,
+                )? {
+                    simulated_allocator_high_water = high_water;
+                }
+                replay.push(PreparedDurableReplayRecord::WriteAuthority);
+                continue;
+            }
+            if Self::canonical_envelope_is_codec5(&envelope) {
+                let fragments = envelope
+                    .fragments
+                    .iter()
+                    .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+                        kind: fragment.kind,
+                        body: &fragment.body,
+                    })
+                    .collect::<Vec<_>>();
+                let artifact = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+                    &envelope.header,
+                    &envelope.outcome,
+                    &fragments,
+                )?
+                .ok_or_else(|| {
+                    EngineError::Durability(
+                        "codec-5 canonical WAL does not select supported semantics-v2 replay"
+                            .to_string(),
+                    )
+                })?;
+                let metadata = artifact.metadata();
+                let table_count = u32::try_from(artifact.table_count()).map_err(|_| {
+                    EngineError::Durability("codec-5 replay table count exceeds u32".to_string())
+                })?;
+                let (catalog_identity, catalog_before_epoch, catalog_before_digest) =
+                    expected_catalog.unwrap_or_else(|| {
+                        (
+                            envelope.header.identity,
+                            0,
+                            Self::canonical_genesis_catalog_digest(envelope.header.identity),
+                        )
+                    });
+                let composition_changes_catalog = artifact
+                    .catalog_composition()
+                    .is_some_and(|composition| !composition.catalog_commands.is_empty());
+                let catalog_after_epoch = if composition_changes_catalog {
+                    catalog_before_epoch.checked_add(1).ok_or_else(|| {
+                        EngineError::Durability(
+                            "codec-5 catalog epoch overflow during recovery".to_string(),
+                        )
+                    })?
+                } else {
+                    catalog_before_epoch
+                };
+                let catalog_after_digest = if composition_changes_catalog {
+                    envelope.header.catalog_after_digest
+                } else {
+                    catalog_before_digest
+                };
+                if metadata.canonical_identity != envelope.header.identity
+                    || metadata.leader_epoch != envelope.header.leader_epoch
+                    || metadata.stable_transaction_id != record.txn_id
+                    || metadata.request_digest != envelope.header.request_digest
+                    || metadata.commit_sequence != envelope.header.commit_seq
+                    || metadata.catalog_epoch != catalog_before_epoch
+                    || metadata.catalog_digest != catalog_before_digest
+                    || catalog_identity != envelope.header.identity
+                    || envelope.header.catalog_before_epoch != catalog_before_epoch
+                    || envelope.header.catalog_before_digest != catalog_before_digest
+                    || envelope.header.catalog_after_epoch != catalog_after_epoch
+                    || envelope.header.catalog_after_digest != catalog_after_digest
+                    || envelope.header.table_block_count != table_count
+                    || envelope.header.allocator_high_water != 0
+                    || envelope.outcome.affected_rows != metadata.affected_rows
+                {
+                    return Err(EngineError::Durability(format!(
+                        "codec-5 canonical WAL catalog or generation identity mismatch for transaction {}",
+                        record.txn_id
+                    )));
+                }
+                if transaction_claims
+                    .insert(record.txn_id, envelope.header.request_digest)
+                    .is_some()
+                {
+                    return Err(EngineError::Durability(format!(
+                        "canonical WAL repeats terminal transaction claim {}",
+                        record.txn_id
+                    )));
+                }
+                let protocol = if envelope.header.flags
+                    & crate::typed_insert_aggregate::OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH
+                    != 0
+                {
+                    if !metadata.autocommit || metadata.statement_count != 1 {
+                        return Err(EngineError::Durability(format!(
+                            "historical codec-5 writer record {} cannot claim explicit or composed transaction mode",
+                            record.txn_id
+                        )));
+                    }
+                    write_authority.validate_historical_codec5_parent(
+                        record.txn_id,
+                        metadata.request_digest,
+                        metadata.commit_sequence,
+                        metadata.typed_statement_digest,
+                        metadata.row_allocator_before,
+                        metadata.row_allocator_high_water,
+                        metadata.affected_rows,
+                    )?;
+                    SemanticsV2ReplayProtocol::HistoricalWriteAuthority
+                } else {
+                    simulated_allocator_high_water = validate_generic_codec5_replay_preflight(
+                        &write_authority,
+                        record.txn_id,
+                        metadata.row_allocator_before,
+                        metadata.row_allocator_high_water,
+                        metadata.affected_rows,
+                        simulated_allocator_high_water,
+                    )?;
+                    SemanticsV2ReplayProtocol::GenericOneRecord
+                };
+                expected_catalog = Some((
+                    envelope.header.identity,
+                    catalog_after_epoch,
+                    catalog_after_digest,
+                ));
+                replay.push(PreparedDurableReplayRecord::SemanticsV2TypedInsert {
+                    artifact,
+                    protocol,
+                });
+                continue;
+            }
             if transaction_claims
                 .insert(record.txn_id, envelope.header.request_digest)
                 .is_some()
@@ -1220,10 +1096,10 @@ impl Engine {
                 catalog_after_epoch,
                 catalog_after_digest,
             ));
-            replay.push(WalRecord {
+            replay.push(PreparedDurableReplayRecord::EngineOperation(WalRecord {
                 txn_id: record.txn_id,
                 payload,
-            });
+            }));
         }
         if let Some(identity) = lineage {
             let mut commit = self.commit_state();
@@ -1247,6 +1123,33 @@ impl Engine {
         let mut outcomes = Vec::with_capacity(records.len());
         for record in records {
             if let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)? {
+                if crate::engine_write_authority::decode_write_authority_envelope(&envelope)?
+                    .is_some()
+                {
+                    outcomes.push(None);
+                    continue;
+                }
+                if Self::canonical_envelope_is_codec5(&envelope) {
+                    claims.push((
+                        record.txn_id,
+                        DurableTransactionStatus {
+                            request_digest: envelope.header.request_digest,
+                            outcome: DurableTransactionOutcome::Committed {
+                                commit_seq: envelope.header.commit_seq,
+                                affected_rows: envelope.outcome.affected_rows,
+                            },
+                        },
+                    ));
+                    // Preparation below owns the strict retained decode.  This pre-scan merely
+                    // records the outer status without routing the aggregate through GPUDBOP1.
+                    outcomes.push(Some((
+                        envelope.header.commit_seq,
+                        envelope.outcome,
+                        false,
+                        envelope.header.allocator_high_water,
+                    )));
+                    continue;
+                }
                 claims.push((
                     record.txn_id,
                     DurableTransactionStatus {
@@ -1280,7 +1183,20 @@ impl Engine {
         }
         let replay = self.prepare_durable_records_for_replay(records)?;
         for ((durable_record, record), authority) in records.iter().zip(replay).zip(outcomes) {
-            self.replay_validated_durable_record(durable_record, record)?;
+            match record {
+                PreparedDurableReplayRecord::EngineOperation(record) => {
+                    self.replay_validated_durable_record(durable_record, record)?
+                }
+                PreparedDurableReplayRecord::WriteAuthority => {
+                    self.replay_validated_write_authority_control(durable_record)?
+                }
+                PreparedDurableReplayRecord::SemanticsV2TypedInsert { artifact, protocol } => self
+                    .replay_validated_semantics_v2_typed_insert(
+                        durable_record,
+                        artifact,
+                        protocol,
+                    )?,
+            }
             let Some((commit_seq, expected, marker_kind_from_rows, allocator_high_water)) =
                 authority
             else {
@@ -1405,12 +1321,1617 @@ impl Engine {
         self.metrics.inc_commit();
         Ok(())
     }
+
+    fn replay_validated_write_authority_control(
+        &self,
+        durable_record: &WalRecord,
+    ) -> Result<(), EngineError> {
+        let mut commit = self.commit_state();
+        let expected = commit.repl.peek_next_index();
+        let token = commit.repl.propose(Arc::clone(&durable_record.payload))?;
+        if token.index != expected {
+            return Err(EngineError::Durability(format!(
+                "write-authority recovery sequencer assigned {}, expected {expected}",
+                token.index
+            )));
+        }
+        commit.wal.append(durable_record.clone());
+        commit.wal.flush_all()?;
+        commit
+            .repl
+            .wait_committed(token, Duration::from_millis(0))?;
+        self.apply_and_publish_write_authority_control(
+            &mut commit,
+            durable_record.txn_id,
+            token.index,
+        )?;
+        Ok(())
+    }
+
+    /// Replay a closed plural codec-5 transaction through the same per-table generic GPU
+    /// generator and shared physical reservation used by live commit, while retaining one WAL,
+    /// allocator, apply, and root-publication boundary for the transaction.
+    fn replay_validated_plural_semantics_v2_typed_insert(
+        &self,
+        durable_record: &WalRecord,
+        artifact: crate::typed_insert_aggregate::SemanticsV2ReplayArtifact,
+        protocol: SemanticsV2ReplayProtocol,
+    ) -> Result<(), EngineError> {
+        if protocol != SemanticsV2ReplayProtocol::GenericOneRecord {
+            return Err(EngineError::Durability(
+                "historical codec-5 replay cannot claim a plural transaction".to_string(),
+            ));
+        }
+        let transaction_metadata = artifact.metadata();
+        let row_count = u32::try_from(transaction_metadata.affected_rows).map_err(|_| {
+            EngineError::Durability("plural codec-5 recovery rows exceed u32".to_string())
+        })?;
+        let proposed = crate::wal_binary::ProposedRowIdRange::new(
+            transaction_metadata.row_allocator_before,
+            row_count,
+        )?;
+        if proposed.allocator_high_water() != transaction_metadata.row_allocator_high_water
+            || self.read_state.mvcc.current_row_id() != transaction_metadata.row_allocator_before
+        {
+            return Err(EngineError::Durability(
+                "plural codec-5 recovery allocator predecessor or range drifted".to_string(),
+            ));
+        }
+
+        struct PreparedPluralReplayTable {
+            table: crate::RelationalTable,
+            metadata: crate::typed_insert_aggregate::SemanticsV2ReplayMetadata,
+            source: Option<crate::typed_insert_batch::PreparedResidentAppendSource>,
+            generation: Option<crate::engine_transaction_delta::TypedInsertRuntimeGenerationOutput>,
+            indexed: bool,
+        }
+
+        let catalog = self.catalog_snapshot();
+        let original_roots = self.read_state.typed_generation_roots.load_full();
+        let mut evolving_roots = Arc::clone(&original_roots);
+        let mut root_publication: Option<crate::engine_commit::LiveTypedGenerationRootPublication> =
+            None;
+        let (table_artifacts, private_sequence_publications, catalog_composition) =
+            artifact.into_parts();
+        let mut projected_catalog = self.ddl_catalog().clone();
+        if let Some(composition) = catalog_composition
+            .as_ref()
+            .filter(|composition| !composition.catalog_commands.is_empty())
+        {
+            self.apply_codec5_catalog_composition(
+                &mut projected_catalog,
+                transaction_metadata.commit_sequence,
+                composition,
+            )?;
+        }
+        let mut prior_sequence_oid = None;
+        for publication in private_sequence_publications.iter() {
+            if prior_sequence_oid.is_some_and(|prior| prior >= publication.sequence_oid) {
+                return Err(EngineError::Durability(
+                    "plural codec-5 recovery private sequence publications are not in unique stable-OID order"
+                        .to_string(),
+                ));
+            }
+            self.apply_codec5_private_sequence_name_binding(&mut projected_catalog, publication)?;
+            prior_sequence_oid = Some(publication.sequence_oid);
+        }
+        let table_count = table_artifacts.len();
+        let mut prepared_tables = Vec::with_capacity(table_count);
+        for (table_ordinal, table_artifact) in table_artifacts.into_vec().into_iter().enumerate() {
+            let table_ref = u32::try_from(table_ordinal).map_err(|_| {
+                EngineError::Durability("plural codec-5 table ordinal exceeds u32".to_string())
+            })?;
+            if table_artifact.table_ref() != table_ref {
+                return Err(EngineError::Durability(
+                    "plural codec-5 recovery table order or index breadth drifted".to_string(),
+                ));
+            }
+            let metadata = table_artifact.metadata();
+            let replay_indexes = table_artifact.indexes().to_vec();
+            let final_table = projected_catalog
+                .relational_catalog
+                .get(table_artifact.target_table_name())
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "plural codec-5 recovery postimage lacks relation \"{}\"",
+                        table_artifact.target_table_name()
+                    ))
+                })?;
+            // S3 establishes the transaction-private catalog postimage before the sole
+            // codec-5 terminal publishes it.  A transaction-created table consequently has
+            // no public relational or GPU predecessor; its authenticated postimage supplies
+            // the physical shape for the same GPU CREATE generation used by live commit.
+            let public_table = catalog
+                .relational_catalog
+                .get(table_artifact.target_table_name())
+                .cloned();
+            let table = match (metadata.initial_table_absent, public_table) {
+                (true, None) => final_table.clone(),
+                (true, Some(_)) => {
+                    return Err(EngineError::Durability(
+                        "plural codec-5 recovery CREATE target already has a public predecessor"
+                            .to_string(),
+                    ));
+                }
+                (false, Some(table)) => table,
+                (false, None) => {
+                    return Err(EngineError::Durability(format!(
+                        "plural codec-5 recovery targets unknown relation \"{}\"",
+                        table_artifact.target_table_name()
+                    )));
+                }
+            };
+            let replay_row_sources = table_artifact.row_sources().to_vec();
+            let source = table_artifact.into_recovery_source(&table, &final_table)?;
+            let table_rows = u32::try_from(metadata.affected_rows).map_err(|_| {
+                EngineError::Durability("plural codec-5 table row count exceeds u32".to_string())
+            })?;
+            let surviving_rows = u32::try_from(replay_row_sources.len()).map_err(|_| {
+                EngineError::Durability(
+                    "plural codec-5 table survivor count exceeds u32".to_string(),
+                )
+            })?;
+            let table_range = crate::wal_binary::ProposedRowIdRange::new(
+                metadata.row_allocator_before,
+                table_rows,
+            )?;
+            if table_range.allocator_high_water() != metadata.row_allocator_high_water {
+                return Err(EngineError::Durability(
+                    "plural codec-5 table allocator interval drifted".to_string(),
+                ));
+            }
+            let predecessor = match (
+                metadata.initial_table_absent,
+                evolving_roots.table(table.stable_table_id),
+            ) {
+                (true, None) => crate::engine_state::TypedTableGenerationRoot {
+                    data_generation: 0,
+                    table_root: [0; 32],
+                    logical_row_count: 0,
+                },
+                (true, Some(_)) => {
+                    return Err(EngineError::Durability(
+                        "plural codec-5 recovery CREATE target already has a GPU predecessor"
+                            .to_string(),
+                    ));
+                }
+                (false, Some(predecessor)) => predecessor,
+                (false, None) => {
+                    return Err(EngineError::Durability(
+                        "plural codec-5 recovery has no GPU-authenticated INSERT predecessor"
+                            .to_string(),
+                    ));
+                }
+            };
+            let predecessor_database_root = evolving_roots.database_root;
+            if predecessor.data_generation != metadata.data_generation_before
+                || predecessor.table_root != metadata.initial_table_root
+                || predecessor.logical_row_count != metadata.initial_logical_row_count
+                || (!metadata.initial_table_absent && predecessor_database_root.is_none())
+            {
+                return Err(EngineError::Durability(
+                    "plural codec-5 recovery table predecessor differs from durable S7".to_string(),
+                ));
+            }
+            if source.is_none() {
+                if surviving_rows != 0 || !replay_indexes.is_empty() {
+                    return Err(EngineError::Durability(
+                        "neutral plural codec-5 table retained physical generation work"
+                            .to_string(),
+                    ));
+                }
+                prepared_tables.push(PreparedPluralReplayTable {
+                    table,
+                    metadata,
+                    source: None,
+                    generation: None,
+                    indexed: false,
+                });
+                continue;
+            }
+            let source = source.expect("nonneutral replay table has a resident source");
+            let catalog_index_count = table.indexes.len();
+            if catalog_index_count != replay_indexes.len() {
+                return Err(EngineError::Durability(
+                    "plural codec-5 recovery index inventory differs from the current catalog"
+                        .to_string(),
+                ));
+            }
+            let mut runtime_indexes = Vec::with_capacity(replay_indexes.len());
+            let mut predecessor_index_roots = Vec::with_capacity(replay_indexes.len());
+            let mut successor_index_roots = Vec::with_capacity(replay_indexes.len());
+            let mut key_start = 0_u32;
+            let mut effect_start = 0_u32;
+            for retained in &replay_indexes {
+                let catalog_index = table
+                    .indexes
+                    .iter()
+                    .find(|index| u64::from(index.oid) == retained.stable_index_id)
+                    .ok_or_else(|| {
+                        EngineError::Durability(format!(
+                            "plural codec-5 recovery index {} is absent from the current catalog",
+                            retained.stable_index_id
+                        ))
+                    })?;
+                let predecessor_index = match (
+                    metadata.initial_table_absent,
+                    evolving_roots
+                        .table_index_root(metadata.stable_table_id, retained.stable_index_id),
+                ) {
+                    (true, None) => crate::engine_state::TypedIndexGenerationRoot {
+                        stable_index_id: retained.stable_index_id,
+                        index_generation: 0,
+                        index_root: [0; 32],
+                    },
+                    (true, Some(_)) => {
+                        return Err(EngineError::Durability(
+                            "plural codec-5 recovery CREATE index already has a GPU predecessor"
+                                .to_string(),
+                        ));
+                    }
+                    (false, Some(predecessor)) => predecessor,
+                    (false, None) => {
+                        return Err(EngineError::Durability(format!(
+                            "plural codec-5 recovery has no GPU-authenticated predecessor for index {}",
+                            retained.stable_index_id
+                        )));
+                    }
+                };
+                if catalog_index.name != retained.name.as_ref()
+                    || predecessor_index.index_generation != retained.base_generation
+                    || predecessor_index.index_root != retained.base_root
+                    || retained.final_generation != metadata.data_generation_after
+                    || retained.final_root == [0; 32]
+                    || retained.final_root == retained.base_root
+                {
+                    return Err(EngineError::Durability(
+                        "plural codec-5 recovery durable index roots differ from the published predecessor"
+                            .to_string(),
+                    ));
+                }
+                let key_columns = retained
+                    .key_columns
+                    .iter()
+                    .map(
+                        |key| gpu_db_execution::RuntimeTypedInsertGenerationIndexKeyColumn {
+                            key_ordinal: key.key_ordinal,
+                            catalog_column_ordinal: key.catalog_column_ordinal,
+                            stable_column_id: key.stable_column_id,
+                            attnum: key.attnum,
+                            storage: key.storage,
+                            declared_type_oid: key.declared_type_oid,
+                            signed_type_size: key.signed_type_size,
+                            column_name_digest: key.column_name_digest,
+                        },
+                    )
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let key_count = u32::try_from(key_columns.len()).map_err(|_| {
+                    EngineError::Durability(
+                        "plural codec-5 recovery index key count exceeds u32".to_string(),
+                    )
+                })?;
+                runtime_indexes.push(
+                    crate::engine_transaction_delta::TypedInsertRuntimeGenerationIndexInput {
+                        descriptor: gpu_db_execution::RuntimeTypedInsertGenerationIndex {
+                            stable_index_id: retained.stable_index_id,
+                            raw_catalog_index_ordinal: retained.raw_catalog_ordinal,
+                            index_flags: retained.flags,
+                            null_equality_policy: retained.null_equality_policy,
+                            base_generation: retained.base_generation,
+                            base_root: retained.base_root,
+                            key_start,
+                            key_count,
+                            effect_start,
+                            effect_count: surviving_rows,
+                        },
+                        key_columns,
+                    },
+                );
+                key_start = key_start.checked_add(key_count).ok_or_else(|| {
+                    EngineError::Durability(
+                        "plural codec-5 recovery index key range overflows".to_string(),
+                    )
+                })?;
+                effect_start = effect_start.checked_add(surviving_rows).ok_or_else(|| {
+                    EngineError::Durability(
+                        "plural codec-5 recovery index effect range overflows".to_string(),
+                    )
+                })?;
+                if !metadata.initial_table_absent {
+                    predecessor_index_roots.push(predecessor_index);
+                }
+                successor_index_roots.push(crate::engine_state::TypedIndexGenerationRoot {
+                    stable_index_id: retained.stable_index_id,
+                    index_generation: retained.final_generation,
+                    index_root: retained.final_root,
+                });
+            }
+            let table_map_predecessor = match predecessor_database_root {
+                Some(initial_database_root) => {
+                    evolving_roots
+                        .retained_table_map_predecessor(table.stable_table_id, initial_database_root)?
+                        .ok_or_else(|| {
+                            EngineError::Durability(
+                                "plural codec-5 recovery has no retained table-map witness"
+                                    .to_string(),
+                            )
+                        })?
+                }
+                None if metadata.initial_table_absent => {
+                    gpu_db_execution::RuntimeTypedInsertGenerationTableMapPredecessor::UninitializedEmptyDatabase
+                }
+                None => {
+                    return Err(EngineError::Durability(
+                        "plural codec-5 recovery has no GPU-authenticated database predecessor"
+                            .to_string(),
+                    ));
+                }
+            };
+            let generation = self.run_typed_insert_runtime_generation(
+                crate::engine_transaction_delta::TypedInsertRuntimeGenerationInput {
+                    source: &source,
+                    row_allocator_before: metadata.row_allocator_before,
+                    first_row_id: metadata.row_allocator_before,
+                    row_sources: &replay_row_sources,
+                    database_id: transaction_metadata.canonical_identity.database_id,
+                    catalog_epoch: transaction_metadata.catalog_epoch,
+                    catalog_digest: transaction_metadata.catalog_digest,
+                    stable_transaction_id: transaction_metadata.stable_transaction_id,
+                    commit_sequence: transaction_metadata.commit_sequence,
+                    typed_statement_digest: [0; 32],
+                    action: if metadata.initial_table_absent {
+                        gpu_db_execution::RuntimeTypedInsertGenerationTableAction::CreateWithRowSet
+                    } else if metadata.resets_existing_rows {
+                        gpu_db_execution::RuntimeTypedInsertGenerationTableAction::ResetThenRowSetInsert
+                    } else {
+                        gpu_db_execution::RuntimeTypedInsertGenerationTableAction::RowSetInsert
+                    },
+                    table_map_predecessor,
+                    stable_table_id: metadata.stable_table_id,
+                    write001_final_image_ref: table_ref,
+                    // The GPU derives the first CREATE generation at commit sequence while S7
+                    // retains the real absent predecessor (zero generation/root).
+                    base_data_generation: if metadata.initial_table_absent {
+                        transaction_metadata.commit_sequence
+                    } else {
+                        predecessor.data_generation
+                    },
+                    base_table_root: predecessor.table_root,
+                    row_allocator_high_water: metadata.row_allocator_high_water,
+                    initial_logical_row_count: predecessor.logical_row_count,
+                    final_logical_row_count: metadata.final_logical_row_count,
+                    image_layout_digest: metadata.image_layout_digest,
+                    image_content_digest: metadata.image_content_digest,
+                    indexes: &runtime_indexes,
+                },
+            )?;
+            if generation.initial_table_root != metadata.initial_table_root
+                || generation.final_table_root != metadata.final_table_root
+                || predecessor_database_root
+                    .is_some_and(|root| generation.initial_database_root != root)
+            {
+                return Err(EngineError::Durability(
+                    "plural codec-5 recovery CUDA commitments differ from durable S7 roots"
+                        .to_string(),
+                ));
+            }
+            let mut generated_index_roots = vec![
+                gpu_db_execution::RuntimeTypedInsertGenerationIndexRoot {
+                    stable_index_id: 0,
+                    initial_generation: 0,
+                    initial_root: [0; 32],
+                    final_generation: 0,
+                    final_root: [0; 32],
+                };
+                replay_indexes.len()
+            ];
+            generation
+                .logical_completion
+                .copy_index_generation_roots_into(&mut generated_index_roots)
+                .map_err(|_| {
+                    EngineError::Durability(
+                        "plural codec-5 recovery GPU index-root cardinality drifted".to_string(),
+                    )
+                })?;
+            if generated_index_roots
+                .iter()
+                .zip(&replay_indexes)
+                .any(|(generated, retained)| {
+                    generated.stable_index_id != retained.stable_index_id
+                        || generated.initial_generation != retained.base_generation
+                        || generated.initial_root != retained.base_root
+                        || generated.final_generation != retained.final_generation
+                        || generated.final_root != retained.final_root
+                })
+            {
+                return Err(EngineError::Durability(
+                    "plural codec-5 recovery CUDA index commitments differ from durable S7 roots"
+                        .to_string(),
+                ));
+            }
+            let mut shape_roots = vec![[0; 32]; table.columns.len()];
+            let mut column_roots = vec![[0; 32]; table.columns.len()];
+            generation
+                .logical_completion
+                .copy_column_roots_into(&mut shape_roots, &mut column_roots)
+                .map_err(|_| {
+                    EngineError::Durability(
+                        "plural codec-5 recovery GPU column-root cardinality drifted".to_string(),
+                    )
+                })?;
+            let successor_columns = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(ordinal, column)| {
+                    Ok(crate::engine_state::TypedColumnGenerationRoot {
+                        catalog_column_ordinal: u32::try_from(ordinal).map_err(|_| {
+                            EngineError::Durability(
+                                "plural codec-5 column ordinal exceeds u32".to_string(),
+                            )
+                        })?,
+                        stable_column_id: column.id,
+                        attnum: column.attnum,
+                        column_shape_root: shape_roots[ordinal],
+                        column_root: column_roots[ordinal],
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?;
+            root_publication = Some(match root_publication {
+                None => crate::engine_commit::LiveTypedGenerationRootPublication::
+                    from_exact_gpu_completed_table_map_predecessor(
+                        Arc::clone(&original_roots),
+                        table.stable_table_id,
+                        (!metadata.initial_table_absent).then_some(predecessor),
+                        metadata.resets_existing_rows,
+                        predecessor_database_root,
+                        crate::engine_state::TypedTableGenerationRoot {
+                            data_generation: metadata.data_generation_after,
+                            table_root: metadata.final_table_root,
+                            logical_row_count: metadata.final_logical_row_count,
+                        },
+                        &successor_columns,
+                        &predecessor_index_roots,
+                        &successor_index_roots,
+                        generation.final_database_root,
+                        &generation.table_map_completion,
+                    )?,
+                Some(publication) => publication
+                    .then_exact_gpu_completed_table_map_predecessor(
+                        table.stable_table_id,
+                        (!metadata.initial_table_absent).then_some(predecessor),
+                        metadata.resets_existing_rows,
+                        crate::engine_state::TypedTableGenerationRoot {
+                            data_generation: metadata.data_generation_after,
+                            table_root: metadata.final_table_root,
+                            logical_row_count: metadata.final_logical_row_count,
+                        },
+                        &successor_columns,
+                        &predecessor_index_roots,
+                        &successor_index_roots,
+                        generation.final_database_root,
+                        &generation.table_map_completion,
+                    )?,
+            });
+            evolving_roots = root_publication
+                .as_ref()
+                .expect("plural recovery publication was just built")
+                .private_candidate();
+            prepared_tables.push(PreparedPluralReplayTable {
+                table,
+                metadata,
+                source: Some(source),
+                generation: Some(generation),
+                indexed: !replay_indexes.is_empty(),
+            });
+        }
+
+        if evolving_roots.database_root != Some(transaction_metadata.final_database_root) {
+            return Err(EngineError::Durability(
+                "plural codec-5 recovery table-map successor differs from durable S7".to_string(),
+            ));
+        }
+
+        let mut compile_order = prepared_tables
+            .iter()
+            .enumerate()
+            .filter_map(|(index, prepared)| prepared.source.is_some().then_some(index))
+            .collect::<Vec<_>>();
+        compile_order.sort_by_key(|index| {
+            let prepared = &prepared_tables[*index];
+            let requires_rollover = !prepared.metadata.initial_table_absent
+                && self.transaction_terminal_typed_insert_requires_rollover(
+                    prepared
+                        .source
+                        .as_ref()
+                        .expect("plural recovery source remains before plan compilation"),
+                    prepared.metadata.resets_existing_rows,
+                );
+            (!prepared.indexed || !requires_rollover, !prepared.indexed)
+        });
+        let indexed_table_count = prepared_tables
+            .iter()
+            .filter(|prepared| prepared.indexed)
+            .count();
+        let mut remaining_indexed_rollovers = compile_order
+            .iter()
+            .filter(|index| {
+                let prepared = &prepared_tables[**index];
+                !prepared.metadata.initial_table_absent
+                    && prepared.indexed
+                    && self.transaction_terminal_typed_insert_requires_rollover(
+                        prepared
+                            .source
+                            .as_ref()
+                            .expect("plural recovery source remains before plan compilation"),
+                        prepared.metadata.resets_existing_rows,
+                    )
+            })
+            .count();
+        let mut named_index_lifecycle = (indexed_table_count != 0).then(|| {
+            self.read_state
+                .residency
+                .begin_transaction_named_index_publication(
+                    prepared_tables
+                        .iter()
+                        .filter(|prepared| prepared.source.is_some())
+                        .map(|prepared| prepared.table.name.clone())
+                        .collect(),
+                )
+        });
+        let plan_count = compile_order.len();
+        let mut plans = Vec::with_capacity(plan_count);
+        let mut shared_gate = None;
+        let mut shared_budget_guard = None;
+        let mut manifest_predecessor = None;
+        let mut prior_reserved_bytes = 0_u64;
+        let mut remaining_indexed_tables = indexed_table_count;
+        for (position, table_index) in compile_order.into_iter().enumerate() {
+            let prepared = &mut prepared_tables[table_index];
+            let current_is_indexed_rollover = !prepared.metadata.initial_table_absent
+                && prepared.indexed
+                && self.transaction_terminal_typed_insert_requires_rollover(
+                    prepared
+                        .source
+                        .as_ref()
+                        .expect("plural recovery source remains before plan compilation"),
+                    prepared.metadata.resets_existing_rows,
+                );
+            if prepared.indexed {
+                remaining_indexed_tables = remaining_indexed_tables.saturating_sub(1);
+            }
+            let source = prepared
+                .source
+                .take()
+                .expect("plural recovery source is consumed by one device plan");
+            let surviving_rows = u64::try_from(source.row_count()).map_err(|_| {
+                EngineError::Durability(
+                    "plural codec-5 recovery source row count exceeds u64".to_string(),
+                )
+            })?;
+            let surviving_high_water = prepared
+                .metadata
+                .row_allocator_before
+                .checked_add(surviving_rows)
+                .ok_or_else(|| {
+                    EngineError::Durability(
+                        "plural codec-5 recovery survivor row-id range overflows".to_string(),
+                    )
+                })?;
+            let ids = (prepared.metadata.row_allocator_before..surviving_high_water)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let mut plan = if prepared.metadata.initial_table_absent {
+                let lifecycle = prepared.indexed.then(|| {
+                    named_index_lifecycle
+                        .take()
+                        .expect("indexed transaction-created plural replay retains one lifecycle")
+                });
+                if let Some(gate) = shared_gate.take() {
+                    self.compile_transaction_created_table_typed_insert_device_plan_with_gate(
+                        &prepared.table,
+                        source,
+                        crate::engine_residency::DeviceInsertRowIds::exact(ids),
+                        transaction_metadata.commit_sequence,
+                        lifecycle,
+                        gate,
+                        shared_budget_guard.take(),
+                        prior_reserved_bytes,
+                    )
+                } else {
+                    if shared_budget_guard.is_some() || prior_reserved_bytes != 0 {
+                        return Err(EngineError::Durability(
+                            "plural codec-5 recovery lost the shared reservation before a transaction-created table"
+                                .to_string(),
+                        ));
+                    }
+                    self.compile_transaction_created_table_typed_insert_device_plan(
+                        &prepared.table,
+                        source,
+                        crate::engine_residency::DeviceInsertRowIds::exact(ids),
+                        transaction_metadata.commit_sequence,
+                        lifecycle,
+                    )
+                }
+            } else if prepared.indexed {
+                let lifecycle = named_index_lifecycle
+                    .take()
+                    .expect("indexed plural replay retains one transaction lifecycle");
+                if let Some(gate) = shared_gate.take() {
+                    self.compile_transaction_terminal_indexed_typed_insert_device_plan_with_gate(
+                        &prepared.table,
+                        source,
+                        crate::engine_residency::DeviceInsertRowIds::exact(ids),
+                        lifecycle,
+                        transaction_metadata.commit_sequence,
+                        prepared.metadata.resets_existing_rows,
+                        gate,
+                        shared_budget_guard.take(),
+                        prior_reserved_bytes,
+                        manifest_predecessor.take(),
+                    )
+                } else {
+                    self.compile_transaction_terminal_indexed_typed_insert_device_plan(
+                        &prepared.table,
+                        source,
+                        crate::engine_residency::DeviceInsertRowIds::exact(ids),
+                        lifecycle,
+                        transaction_metadata.commit_sequence,
+                        prepared.metadata.resets_existing_rows,
+                    )
+                }
+            } else if let Some(gate) = shared_gate.take() {
+                self.compile_transaction_terminal_typed_insert_device_plan_with_gate(
+                    source,
+                    crate::engine_residency::DeviceInsertRowIds::exact(ids),
+                    transaction_metadata.commit_sequence,
+                    prepared.metadata.resets_existing_rows,
+                    gate,
+                    shared_budget_guard.take(),
+                    prior_reserved_bytes,
+                )
+            } else {
+                self.compile_transaction_terminal_typed_insert_device_plan(
+                    source,
+                    crate::engine_residency::DeviceInsertRowIds::exact(ids),
+                    transaction_metadata.commit_sequence,
+                    prepared.metadata.resets_existing_rows,
+                )
+            }
+            .map_err(|error| {
+                EngineError::Durability(format!(
+                    "plural codec-5 recovery device plan compilation failed: {error:?}"
+                ))
+            })?;
+            if current_is_indexed_rollover {
+                remaining_indexed_rollovers = remaining_indexed_rollovers.saturating_sub(1);
+                if remaining_indexed_rollovers != 0 {
+                    manifest_predecessor = plan.indexed_rollover_manifest_successor_predecessor();
+                    if manifest_predecessor.is_none() {
+                        return Err(EngineError::Durability(
+                            "plural codec-5 recovery rollover plan lost its prepared manifest successor"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            if prepared.indexed && remaining_indexed_tables != 0 {
+                named_index_lifecycle = plan.take_named_index_publication_guard();
+                if named_index_lifecycle.is_none() {
+                    return Err(EngineError::Durability(
+                        "plural codec-5 recovery plan lost the shared named-index lifecycle"
+                            .to_string(),
+                    ));
+                }
+            }
+            if position + 1 != plan_count {
+                shared_gate = plan.take_transaction_terminal_unindexed_device_apply_guard();
+                if shared_gate.is_none() {
+                    return Err(EngineError::Durability(
+                        "plural codec-5 recovery plan lost the shared mutation gate".to_string(),
+                    ));
+                }
+                if let Some((guard, reserved_bytes)) =
+                    plan.take_transaction_terminal_unindexed_budget_guard()
+                {
+                    prior_reserved_bytes = prior_reserved_bytes
+                        .checked_add(reserved_bytes)
+                        .ok_or_else(|| {
+                            EngineError::Durability(
+                                "plural codec-5 recovery reserved-byte charge overflows"
+                                    .to_string(),
+                            )
+                        })?;
+                    shared_budget_guard = Some(guard);
+                }
+            }
+            plans.push(plan);
+        }
+
+        let mut commit = self.commit_state();
+        let expected_index = commit.repl.peek_next_index();
+        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+            commit.canonical_identity,
+            commit.wal.canonical_catalog_tail()?,
+        )?;
+        if durable_record.txn_id != transaction_metadata.stable_transaction_id
+            || transaction_metadata.canonical_identity != commit.canonical_identity
+            || transaction_metadata.commit_sequence != expected_index
+            || transaction_metadata.catalog_epoch != catalog_epoch
+            || transaction_metadata.catalog_digest != catalog_digest
+            || transaction_metadata.request_digest == [0; 32]
+        {
+            return Err(EngineError::Durability(
+                "plural codec-5 recovery parent identity differs from its durable predecessor"
+                    .to_string(),
+            ));
+        }
+        let token = commit.repl.propose(Arc::clone(&durable_record.payload))?;
+        if token.index != expected_index {
+            return Err(EngineError::Durability(format!(
+                "plural codec-5 recovery sequencer assigned {}, expected {expected_index}",
+                token.index
+            )));
+        }
+        commit.wal.append(durable_record.clone());
+        commit.wal.flush_all()?;
+        commit
+            .repl
+            .wait_committed(token, Duration::from_millis(0))?;
+        let mut named_index_publication = plans
+            .iter_mut()
+            .find_map(|plan| plan.take_named_index_publication_guard());
+        if let Some(lifecycle) = named_index_publication.as_mut() {
+            lifecycle.enter_final_publication();
+        }
+        let _publication_owner = named_index_publication
+            .as_ref()
+            .map(|_| crate::engine_state::TransactionNamedIndexPublicationOwnerGuard::enter());
+        let timestamp_micros =
+            current_timestamp_micros().max(commit.max_commit_timestamp_micros.saturating_add(1));
+        commit.record_commit_timestamp(durable_record.txn_id, timestamp_micros);
+        for plan in plans {
+            let permit =
+                crate::engine_dml_concurrent::issue_transaction_terminal_typed_insert_apply_permit(
+                    token.index,
+                );
+            plan.apply_after_transaction_wal_claim(self, permit)
+                .map_err(|error| {
+                    EngineError::Durability(format!(
+                        "plural codec-5 recovery device apply failed after durable WAL: {error:?}"
+                    ))
+                })?;
+        }
+        self.read_state
+            .mvcc
+            .consume_proposed_row_id_range(proposed)
+            .map_err(|error| {
+                EngineError::Durability(format!(
+                    "plural codec-5 replay allocator consumption drifted after device apply: {error}"
+                ))
+            })?;
+        let mut write_set = WriteSet::default();
+        for prepared in &prepared_tables {
+            write_set.add_table(&prepared.table);
+        }
+        let table_names = prepared_tables
+            .iter()
+            .map(|prepared| prepared.table.name.clone())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let witness = crate::engine_commit::LiveTypedTransactionApply {
+            txn_id: transaction_metadata.stable_transaction_id,
+            expected_index: token.index,
+            payload_authority: crate::engine_commit::LiveTypedPayloadAuthority::Digest(
+                gpu_db_wal::canonical_request_digest(&durable_record.payload),
+            ),
+            payload_len: durable_record.payload.len(),
+            tables: table_names,
+            allocator_high_water: transaction_metadata.row_allocator_high_water,
+            allocator_already_consumed: true,
+            affected_rows: transaction_metadata.affected_rows,
+            write_set,
+            private_sequence_publications,
+            catalog_composition,
+            parent_authority: None,
+        };
+        self.apply_and_publish_committed_with_recovered_semantics_v2_codec5_transaction(
+            &mut commit,
+            transaction_metadata.stable_transaction_id,
+            token.index,
+            witness,
+            root_publication,
+        )?;
+        let _generation_authority = prepared_tables
+            .into_iter()
+            .filter_map(|prepared| prepared.generation)
+            .collect::<Vec<_>>();
+        self.metrics.inc_commit();
+        Ok(())
+    }
+
+    /// Recover one fully closed codec-5 aggregate through the same typed resident source,
+    /// generic CUDA generation, device append, and root publication cut as a live INSERT. Bit 30
+    /// retains the historical claim/lease owner; clear bit runs the one-record allocator cut and
+    /// has no write-authority parent. This method neither decodes a legacy GPUDBOP1 operation nor
+    /// rebuilds host relational rows.
+    fn replay_validated_semantics_v2_typed_insert(
+        &self,
+        durable_record: &WalRecord,
+        artifact: crate::typed_insert_aggregate::SemanticsV2ReplayArtifact,
+        protocol: SemanticsV2ReplayProtocol,
+    ) -> Result<(), EngineError> {
+        if artifact.table_count() > 1 {
+            return self.replay_validated_plural_semantics_v2_typed_insert(
+                durable_record,
+                artifact,
+                protocol,
+            );
+        }
+        let metadata = artifact.metadata();
+        let mut projected_catalog = self.ddl_catalog().clone();
+        if let Some(composition) = artifact
+            .catalog_composition()
+            .filter(|composition| !composition.catalog_commands.is_empty())
+        {
+            self.apply_codec5_catalog_composition(
+                &mut projected_catalog,
+                metadata.commit_sequence,
+                composition,
+            )?;
+        }
+        let mut prior_sequence_oid = None;
+        for publication in artifact.private_sequence_publications() {
+            if prior_sequence_oid.is_some_and(|prior| prior >= publication.sequence_oid) {
+                return Err(EngineError::Durability(
+                    "codec-5 recovery private sequence publications are not in unique stable-OID order"
+                        .to_string(),
+                ));
+            }
+            self.apply_codec5_private_sequence_name_binding(&mut projected_catalog, publication)?;
+            prior_sequence_oid = Some(publication.sequence_oid);
+        }
+        let final_table = projected_catalog
+            .relational_catalog
+            .get(artifact.target_table_name())
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "codec-5 recovery postimage lacks relation \"{}\"",
+                    artifact.target_table_name()
+                ))
+            })?;
+        // S3 first establishes the transaction's final catalog image, but that image must not
+        // become public before the shared codec-5 terminal.  A first table generation therefore
+        // borrows this authenticated postimage as its physical shape while proving that no
+        // public table/root predecessor exists.
+        let public_table = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(artifact.target_table_name())
+            .cloned();
+        let table = match (metadata.initial_table_absent, public_table) {
+            (true, None) => final_table.clone(),
+            (true, Some(_)) => {
+                return Err(EngineError::Durability(
+                    "codec-5 recovery CREATE target already has a public predecessor".to_string(),
+                ));
+            }
+            (false, Some(table)) => table,
+            (false, None) => {
+                return Err(EngineError::Durability(format!(
+                    "codec-5 recovery targets unknown relation \"{}\"",
+                    artifact.target_table_name()
+                )));
+            }
+        };
+        let replay_indexes = artifact.indexes().to_vec();
+        let replay_row_sources = artifact.row_sources().to_vec();
+        let (source, private_sequence_publications, catalog_composition) =
+            artifact.into_recovery_source(&table, &final_table)?;
+        // A paired-zero descriptor over an already-published table is legal only for the
+        // S3 CREATE INDEX closure decoded above.  Keep that identity set explicit through the
+        // existing GPU generation/root/publication lifecycle; it is not a second recovery path.
+        let created_index_ids = replay_indexes
+            .iter()
+            .filter(|index| {
+                !metadata.initial_table_absent
+                    && index.base_generation == 0
+                    && index.base_root == [0; 32]
+            })
+            .map(|index| index.stable_index_id)
+            .collect::<Vec<_>>();
+        if created_index_ids.iter().enumerate().any(|(ordinal, id)| {
+            *id == 0 || *id == u64::MAX || ordinal != 0 && created_index_ids[ordinal - 1] >= *id
+        }) || (metadata.resets_existing_rows && !created_index_ids.is_empty())
+        {
+            return Err(EngineError::Durability(
+                "codec-5 recovery S3-created index identities are not an exact append-only proof"
+                    .to_string(),
+            ));
+        }
+        let mut s3_retired_index_candidates = catalog_composition
+            .as_ref()
+            .into_iter()
+            .flat_map(|record| record.index_lifecycle_operations.iter())
+            .flat_map(|operation| operation.targets.iter())
+            .filter_map(|target| {
+                match (
+                    target.table_before.as_ref(),
+                    target.table_after.as_ref(),
+                    target.index_before.as_ref(),
+                    target.index_after.as_ref(),
+                ) {
+                    (Some(table_before), Some(table_after), Some(index_before), None)
+                        if table_before.oid == metadata.display_oid
+                            && table_after.oid == metadata.display_oid
+                            && index_before.table_oid == metadata.display_oid
+                            && table
+                                .indexes
+                                .iter()
+                                .any(|index| index.oid == index_before.oid) =>
+                    {
+                        Some(u64::from(index_before.oid))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        s3_retired_index_candidates.sort_unstable();
+        if s3_retired_index_candidates
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(EngineError::Durability(
+                "codec-5 recovery S3 repeats a retired index identity".to_string(),
+            ));
+        }
+        let row_count = u32::try_from(metadata.affected_rows).map_err(|_| {
+            EngineError::Durability("codec-5 recovery affected rows exceed u32".to_string())
+        })?;
+        let surviving_row_count = u32::try_from(replay_row_sources.len()).map_err(|_| {
+            EngineError::Durability("codec-5 recovery survivor count exceeds u32".to_string())
+        })?;
+        let proposed =
+            crate::wal_binary::ProposedRowIdRange::new(metadata.row_allocator_before, row_count)?;
+        if proposed.allocator_high_water() != metadata.row_allocator_high_water {
+            return Err(EngineError::Durability(
+                "codec-5 recovery allocator range differs from the retained aggregate".to_string(),
+            ));
+        }
+        let surviving_high_water = metadata
+            .row_allocator_before
+            .checked_add(u64::from(surviving_row_count))
+            .ok_or_else(|| {
+                EngineError::Durability(
+                    "codec-5 recovery survivor row-id range overflows".to_string(),
+                )
+            })?;
+        let exact_row_ids = (metadata.row_allocator_before..surviving_high_water)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let expected_roots = self.read_state.typed_generation_roots.load_full();
+        let predecessor = match (
+            metadata.initial_table_absent,
+            expected_roots.table(table.stable_table_id),
+        ) {
+            (true, None) => crate::engine_state::TypedTableGenerationRoot {
+                data_generation: 0,
+                table_root: [0; 32],
+                logical_row_count: 0,
+            },
+            (true, Some(_)) => {
+                return Err(EngineError::Durability(
+                    "codec-5 recovery CREATE target already has a GPU predecessor".to_string(),
+                ));
+            }
+            (false, Some(predecessor)) => predecessor,
+            (false, None) => {
+                return Err(EngineError::Durability(
+                    "codec-5 recovery has no GPU-authenticated INSERT predecessor".to_string(),
+                ));
+            }
+        };
+        let predecessor_database_root = expected_roots.database_root;
+        if predecessor.data_generation != metadata.data_generation_before
+            || predecessor.table_root != metadata.initial_table_root
+            || predecessor.logical_row_count != metadata.initial_logical_row_count
+            || predecessor_database_root.is_some_and(|root| root != metadata.initial_database_root)
+            || (!metadata.initial_table_absent && predecessor_database_root.is_none())
+        {
+            return Err(EngineError::Durability(
+                "codec-5 recovery durable predecessor roots differ from CREATE publication"
+                    .to_string(),
+            ));
+        }
+        let retired_predecessor_index_ids = expected_roots
+            .table_index_roots(metadata.stable_table_id)
+            .filter(|root| {
+                final_table
+                    .indexes
+                    .iter()
+                    .all(|index| u64::from(index.oid) != root.stable_index_id)
+            })
+            .map(|root| root.stable_index_id)
+            .collect::<Vec<_>>();
+        if retired_predecessor_index_ids
+            .iter()
+            .any(|id| s3_retired_index_candidates.binary_search(id).is_err())
+            || (metadata.resets_existing_rows
+                && (!created_index_ids.is_empty() || !retired_predecessor_index_ids.is_empty()))
+        {
+            return Err(EngineError::Durability(
+                "codec-5 recovery index roots differ outside the S3 transition proof".to_string(),
+            ));
+        }
+        let has_s3_index_transition =
+            !created_index_ids.is_empty() || !s3_retired_index_candidates.is_empty();
+        let generation_table = if has_s3_index_transition {
+            &final_table
+        } else {
+            &table
+        };
+        if replay_indexes.len() != generation_table.indexes.len()
+            || generation_table.indexes.iter().any(|catalog_index| {
+                replay_indexes
+                    .iter()
+                    .filter(|retained| retained.stable_index_id == u64::from(catalog_index.oid))
+                    .count()
+                    != 1
+            })
+        {
+            return Err(EngineError::Durability(
+                "codec-5 recovery index inventory differs from the S3-authenticated catalog postimage"
+                    .to_string(),
+            ));
+        }
+        if protocol == SemanticsV2ReplayProtocol::GenericOneRecord
+            && self.read_state.mvcc.current_row_id() != metadata.row_allocator_before
+        {
+            return Err(EngineError::Durability(
+                "generic one-record codec-5 allocator predecessor differs from replay frontier"
+                    .to_string(),
+            ));
+        }
+        let (mut plan, root_publication, generation) = if let Some(source) = source {
+            let table_map_predecessor = match predecessor_database_root {
+                Some(initial_database_root) => {
+                    expected_roots
+                        .retained_table_map_predecessor(metadata.stable_table_id, initial_database_root)?
+                        .ok_or_else(|| {
+                            EngineError::Durability(
+                                "codec-5 recovery has no retained table-map witness"
+                                    .to_string(),
+                            )
+                        })?
+                }
+                None if metadata.initial_table_absent => {
+                    gpu_db_execution::RuntimeTypedInsertGenerationTableMapPredecessor::UninitializedEmptyDatabase
+                }
+                None => {
+                    return Err(EngineError::Durability(
+                        "codec-5 recovery has no GPU-authenticated database predecessor"
+                            .to_string(),
+                    ));
+                }
+            };
+            let mut runtime_indexes = Vec::with_capacity(replay_indexes.len());
+            let publication_predecessor_index_roots = if metadata.initial_table_absent {
+                Vec::new()
+            } else {
+                expected_roots
+                    .table_index_roots(metadata.stable_table_id)
+                    .collect::<Vec<_>>()
+            };
+            let mut successor_index_roots = Vec::with_capacity(replay_indexes.len());
+            let mut key_start = 0_u32;
+            let mut effect_start = 0_u32;
+            for retained in &replay_indexes {
+                let (catalog_index_ordinal, catalog_index) = generation_table
+                    .indexes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, index)| u64::from(index.oid) == retained.stable_index_id)
+                    .ok_or_else(|| {
+                        EngineError::Durability(format!(
+                            "codec-5 recovery index {} is absent from the authenticated catalog postimage",
+                            retained.stable_index_id
+                        ))
+                    })?;
+                let catalog_flags = u32::from(catalog_index.unique)
+                    | (u32::from(catalog_index.primary_key) << 1)
+                    | (u32::from(catalog_index.unique_constraint) << 2)
+                    | (1 << 3);
+                let catalog_keys_match = catalog_index
+                    .key_columns
+                    .iter()
+                    .enumerate()
+                    .zip(retained.key_columns.iter())
+                    .try_fold(true, |matches, ((key_ordinal, key_name), retained_key)| {
+                        let Some((catalog_column_ordinal, column)) = generation_table
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, column)| column.name == *key_name)
+                        else {
+                            return Ok(false);
+                        };
+                        let column_name_digest =
+                            crate::typed_insert_aggregate::write001_identifier_digest(
+                                &column.name,
+                            )?;
+                        Ok(matches
+                            && retained_key.key_ordinal == key_ordinal as u32
+                            && retained_key.catalog_column_ordinal == catalog_column_ordinal as u32
+                            && retained_key.stable_column_id == column.id
+                            && retained_key.attnum == column.attnum
+                            && retained_key.storage
+                                == crate::typed_insert_batch::typed_image_sql_storage(column.ty)
+                            && retained_key.declared_type_oid == column.type_oid
+                            && retained_key.signed_type_size == column.type_size
+                            && retained_key.column_name_digest == column_name_digest)
+                    })?;
+                if retained.raw_catalog_ordinal != catalog_index_ordinal as u32
+                    || catalog_index.name != retained.name.as_ref()
+                    || catalog_flags != retained.flags
+                    || catalog_index.key_columns.len() != retained.key_columns.len()
+                    || !catalog_keys_match
+                {
+                    return Err(EngineError::Durability(
+                        "codec-5 recovery retained index descriptor differs from the authenticated catalog postimage"
+                            .to_string(),
+                    ));
+                }
+                let created_on_existing_table = created_index_ids
+                    .binary_search(&retained.stable_index_id)
+                    .is_ok();
+                let predecessor_index = match (
+                    metadata.initial_table_absent,
+                    expected_roots
+                        .table_index_root(metadata.stable_table_id, retained.stable_index_id),
+                ) {
+                    (true, None) => crate::engine_state::TypedIndexGenerationRoot {
+                        stable_index_id: retained.stable_index_id,
+                        index_generation: 0,
+                        index_root: [0; 32],
+                    },
+                    (true, Some(_)) => {
+                        return Err(EngineError::Durability(
+                            "codec-5 recovery CREATE index already has a GPU predecessor"
+                                .to_string(),
+                        ));
+                    }
+                    (false, Some(predecessor)) => predecessor,
+                    (false, None) if created_on_existing_table => {
+                        crate::engine_state::TypedIndexGenerationRoot {
+                            stable_index_id: retained.stable_index_id,
+                            index_generation: 0,
+                            index_root: [0; 32],
+                        }
+                    }
+                    (false, None) => {
+                        return Err(EngineError::Durability(format!(
+                            "codec-5 recovery has no GPU-authenticated predecessor for index {}",
+                            retained.stable_index_id
+                        )));
+                    }
+                };
+                if predecessor_index.index_generation != retained.base_generation
+                    || predecessor_index.index_root != retained.base_root
+                    || retained.final_generation != metadata.data_generation_after
+                    || retained.final_root == [0; 32]
+                    || retained.final_root == retained.base_root
+                {
+                    return Err(EngineError::Durability(
+                    "codec-5 recovery durable index roots differ from the published predecessor"
+                        .to_string(),
+                ));
+                }
+                let key_columns = retained
+                    .key_columns
+                    .iter()
+                    .map(
+                        |key| gpu_db_execution::RuntimeTypedInsertGenerationIndexKeyColumn {
+                            key_ordinal: key.key_ordinal,
+                            catalog_column_ordinal: key.catalog_column_ordinal,
+                            stable_column_id: key.stable_column_id,
+                            attnum: key.attnum,
+                            storage: key.storage,
+                            declared_type_oid: key.declared_type_oid,
+                            signed_type_size: key.signed_type_size,
+                            column_name_digest: key.column_name_digest,
+                        },
+                    )
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let key_count = u32::try_from(key_columns.len()).map_err(|_| {
+                    EngineError::Durability(
+                        "codec-5 recovery index key count exceeds u32".to_string(),
+                    )
+                })?;
+                runtime_indexes.push(
+                    crate::engine_transaction_delta::TypedInsertRuntimeGenerationIndexInput {
+                        descriptor: gpu_db_execution::RuntimeTypedInsertGenerationIndex {
+                            stable_index_id: retained.stable_index_id,
+                            raw_catalog_index_ordinal: retained.raw_catalog_ordinal,
+                            index_flags: retained.flags,
+                            null_equality_policy: retained.null_equality_policy,
+                            base_generation: retained.base_generation,
+                            base_root: retained.base_root,
+                            key_start,
+                            key_count,
+                            effect_start,
+                            effect_count: surviving_row_count,
+                        },
+                        key_columns,
+                    },
+                );
+                key_start = key_start.checked_add(key_count).ok_or_else(|| {
+                    EngineError::Durability(
+                        "codec-5 recovery index key range overflows".to_string(),
+                    )
+                })?;
+                effect_start = effect_start
+                    .checked_add(surviving_row_count)
+                    .ok_or_else(|| {
+                        EngineError::Durability(
+                            "codec-5 recovery index effect range overflows".to_string(),
+                        )
+                    })?;
+                successor_index_roots.push(crate::engine_state::TypedIndexGenerationRoot {
+                    stable_index_id: retained.stable_index_id,
+                    index_generation: retained.final_generation,
+                    index_root: retained.final_root,
+                });
+            }
+            let generation = self.run_typed_insert_runtime_generation(
+            crate::engine_transaction_delta::TypedInsertRuntimeGenerationInput {
+                source: &source,
+                row_allocator_before: metadata.row_allocator_before,
+                first_row_id: metadata.row_allocator_before,
+                row_sources: &replay_row_sources,
+                database_id: metadata.canonical_identity.database_id,
+                catalog_epoch: metadata.catalog_epoch,
+                catalog_digest: metadata.catalog_digest,
+                stable_transaction_id: metadata.stable_transaction_id,
+                commit_sequence: metadata.commit_sequence,
+                typed_statement_digest: metadata.typed_statement_digest,
+                action: if metadata.initial_table_absent {
+                    gpu_db_execution::RuntimeTypedInsertGenerationTableAction::CreateWithRowSet
+                } else if metadata.resets_existing_rows {
+                    gpu_db_execution::RuntimeTypedInsertGenerationTableAction::ResetThenRowSetInsert
+                } else if !created_index_ids.is_empty() {
+                    gpu_db_execution::RuntimeTypedInsertGenerationTableAction::CreateIndexThenRowSetInsert
+                } else {
+                    gpu_db_execution::RuntimeTypedInsertGenerationTableAction::RowSetInsert
+                },
+                table_map_predecessor,
+                stable_table_id: metadata.stable_table_id,
+                write001_final_image_ref: 0,
+                // CUDA derives the first table root at commit sequence while S7 retains the
+                // true zero predecessor for replay closure.
+                base_data_generation: if metadata.initial_table_absent {
+                    metadata.commit_sequence
+                } else {
+                    predecessor.data_generation
+                },
+                base_table_root: predecessor.table_root,
+                row_allocator_high_water: metadata.row_allocator_high_water,
+                initial_logical_row_count: predecessor.logical_row_count,
+                final_logical_row_count: metadata.final_logical_row_count,
+                image_layout_digest: metadata.image_layout_digest,
+                image_content_digest: metadata.image_content_digest,
+                indexes: &runtime_indexes,
+            },
+        )?;
+            if generation.initial_table_root != metadata.initial_table_root
+                || generation.final_table_root != metadata.final_table_root
+                || generation.initial_database_root != metadata.initial_database_root
+                || generation.final_database_root != metadata.final_database_root
+            {
+                return Err(EngineError::Durability(
+                    "codec-5 recovery CUDA commitments differ from durable S7 roots".to_string(),
+                ));
+            }
+            let mut generated_index_roots = vec![
+            gpu_db_execution::RuntimeTypedInsertGenerationIndexRoot {
+                stable_index_id: 0,
+                initial_generation: 0,
+                initial_root: [0; 32],
+                final_generation: 0,
+                final_root: [0; 32],
+            };
+            replay_indexes.len()
+        ];
+            generation
+                .logical_completion
+                .copy_index_generation_roots_into(&mut generated_index_roots)
+                .map_err(|_| {
+                    EngineError::Durability(
+                        "codec-5 recovery GPU index-root cardinality drifted".to_string(),
+                    )
+                })?;
+            if generated_index_roots
+                .iter()
+                .zip(&replay_indexes)
+                .any(|(generated, retained)| {
+                    generated.stable_index_id != retained.stable_index_id
+                        || generated.initial_generation != retained.base_generation
+                        || generated.initial_root != retained.base_root
+                        || generated.final_generation != retained.final_generation
+                        || generated.final_root != retained.final_root
+                })
+            {
+                return Err(EngineError::Durability(
+                    "codec-5 recovery CUDA index commitments differ from durable S7 roots"
+                        .to_string(),
+                ));
+            }
+            let mut shape_roots = vec![[0; 32]; table.columns.len()];
+            let mut column_roots = vec![[0; 32]; table.columns.len()];
+            generation
+                .logical_completion
+                .copy_column_roots_into(&mut shape_roots, &mut column_roots)
+                .map_err(|_| {
+                    EngineError::Durability(
+                        "codec-5 recovery GPU column-root cardinality drifted".to_string(),
+                    )
+                })?;
+            let successor_columns = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(ordinal, column)| {
+                    Ok(crate::engine_state::TypedColumnGenerationRoot {
+                        catalog_column_ordinal: u32::try_from(ordinal).map_err(|_| {
+                            EngineError::Durability(
+                                "codec-5 recovery column ordinal exceeds u32".to_string(),
+                            )
+                        })?,
+                        stable_column_id: column.id,
+                        attnum: column.attnum,
+                        column_shape_root: shape_roots[ordinal],
+                        column_root: column_roots[ordinal],
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?;
+            let root_publication = crate::engine_commit::LiveTypedGenerationRootPublication::
+            from_exact_gpu_completed_table_map_predecessor_with_created_indexes(
+                expected_roots,
+                metadata.stable_table_id,
+                (!metadata.initial_table_absent).then_some(predecessor),
+                metadata.resets_existing_rows,
+                predecessor_database_root,
+                crate::engine_state::TypedTableGenerationRoot {
+                    data_generation: metadata.data_generation_after,
+                    table_root: metadata.final_table_root,
+                    logical_row_count: metadata.final_logical_row_count,
+                },
+                &successor_columns,
+                &publication_predecessor_index_roots,
+                &successor_index_roots,
+                metadata.final_database_root,
+                &generation.table_map_completion,
+                &created_index_ids,
+                &retired_predecessor_index_ids,
+            )?;
+            let plan = if metadata.initial_table_absent {
+                self.compile_transaction_created_table_typed_insert_device_plan(
+                    &table,
+                    source,
+                    crate::engine_residency::DeviceInsertRowIds::exact(exact_row_ids),
+                    metadata.commit_sequence,
+                    (!replay_indexes.is_empty()).then(|| {
+                        self.read_state
+                            .residency
+                            .begin_transaction_named_index_publication(
+                                std::collections::BTreeSet::from([table.name.clone()]),
+                            )
+                    }),
+                )
+            } else if replay_indexes.is_empty() {
+                self.compile_transaction_terminal_typed_insert_device_plan(
+                    source,
+                    crate::engine_residency::DeviceInsertRowIds::exact(exact_row_ids),
+                    metadata.commit_sequence,
+                    metadata.resets_existing_rows,
+                )
+            } else {
+                let lifecycle = self
+                    .read_state
+                    .residency
+                    .begin_transaction_named_index_publication(std::collections::BTreeSet::from([
+                        table.name.clone(),
+                    ]));
+                if !has_s3_index_transition {
+                    self.compile_transaction_terminal_indexed_typed_insert_device_plan(
+                        &table,
+                        source,
+                        crate::engine_residency::DeviceInsertRowIds::exact(exact_row_ids),
+                        lifecycle,
+                        metadata.commit_sequence,
+                        metadata.resets_existing_rows,
+                    )
+                } else {
+                    self.compile_transaction_terminal_s3_created_index_typed_insert_device_plan(
+                        &final_table,
+                        &table,
+                        &created_index_ids,
+                        &s3_retired_index_candidates,
+                        source,
+                        crate::engine_residency::DeviceInsertRowIds::exact(exact_row_ids),
+                        lifecycle,
+                        metadata.commit_sequence,
+                    )
+                }
+            }
+            .map_err(|error| {
+                EngineError::Durability(format!(
+                    "codec-5 recovery device plan compilation failed: {error:?}"
+                ))
+            })?;
+            (Some(plan), Some(root_publication), Some(generation))
+        } else {
+            if !replay_indexes.is_empty() || !replay_row_sources.is_empty() {
+                return Err(EngineError::Durability(
+                    "neutral codec-5 recovery retained physical generation work".to_string(),
+                ));
+            }
+            (None, None, None)
+        };
+
+        let mut commit = self.commit_state();
+        let expected_index = commit.repl.peek_next_index();
+        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+            commit.canonical_identity,
+            commit.wal.canonical_catalog_tail()?,
+        )?;
+        if durable_record.txn_id != metadata.stable_transaction_id
+            || metadata.canonical_identity != commit.canonical_identity
+            || metadata.commit_sequence != expected_index
+            || metadata.catalog_epoch != catalog_epoch
+            || metadata.catalog_digest != catalog_digest
+            || metadata.request_digest == [0; 32]
+        {
+            return Err(EngineError::Durability(
+                "codec-5 recovery parent identity differs from its durable predecessor".to_string(),
+            ));
+        }
+        let token = commit.repl.propose(Arc::clone(&durable_record.payload))?;
+        if token.index != expected_index {
+            return Err(EngineError::Durability(format!(
+                "codec-5 recovery sequencer assigned {}, expected {expected_index}",
+                token.index
+            )));
+        }
+        commit.wal.append(durable_record.clone());
+        commit.wal.flush_all()?;
+        commit
+            .repl
+            .wait_committed(token, Duration::from_millis(0))?;
+        let mut named_index_publication = plan
+            .as_mut()
+            .and_then(|plan| plan.take_named_index_publication_guard());
+        if let Some(lifecycle) = named_index_publication.as_mut() {
+            lifecycle.enter_final_publication();
+        }
+        let _publication_owner = named_index_publication
+            .as_ref()
+            .map(|_| crate::engine_state::TransactionNamedIndexPublicationOwnerGuard::enter());
+        let timestamp_micros =
+            current_timestamp_micros().max(commit.max_commit_timestamp_micros.saturating_add(1));
+        commit.record_commit_timestamp(durable_record.txn_id, timestamp_micros);
+        if let Some(plan) = plan {
+            let permit =
+                crate::engine_dml_concurrent::issue_transaction_terminal_typed_insert_apply_permit(
+                    token.index,
+                );
+            plan.apply_after_transaction_wal_claim(self, permit)
+                .map_err(|error| {
+                    EngineError::Durability(format!(
+                        "codec-5 recovery device apply failed after durable WAL: {error:?}"
+                    ))
+                })?;
+        }
+        let allocator_already_consumed = protocol == SemanticsV2ReplayProtocol::GenericOneRecord;
+        if allocator_already_consumed {
+            self.read_state
+                .mvcc
+                .consume_proposed_row_id_range(proposed)
+                .map_err(|error| {
+                    EngineError::Durability(format!(
+                        "generic one-record codec-5 replay allocator consumption drifted after device apply: {error}"
+                    ))
+                })?;
+        }
+        let mut write_set = WriteSet::default();
+        write_set.add_table(&table);
+        let witness = crate::engine_commit::LiveTypedTransactionApply {
+            txn_id: metadata.stable_transaction_id,
+            expected_index: token.index,
+            payload_authority: crate::engine_commit::LiveTypedPayloadAuthority::Digest(
+                gpu_db_wal::canonical_request_digest(&durable_record.payload),
+            ),
+            payload_len: durable_record.payload.len(),
+            tables: Box::new([table.name.clone()]),
+            allocator_high_water: metadata.row_allocator_high_water,
+            allocator_already_consumed,
+            affected_rows: metadata.affected_rows,
+            write_set,
+            private_sequence_publications,
+            catalog_composition,
+            parent_authority: (protocol == SemanticsV2ReplayProtocol::HistoricalWriteAuthority)
+                .then_some(crate::engine_commit::LiveTypedParentAuthority {
+                    request_digest: metadata.request_digest,
+                    autocommit: true,
+                    typed_statement_digests: Box::new([metadata.typed_statement_digest]),
+                }),
+        };
+        self.apply_and_publish_committed_with_recovered_semantics_v2_codec5_transaction(
+            &mut commit,
+            metadata.stable_transaction_id,
+            token.index,
+            witness,
+            root_publication,
+        )?;
+        if let Some(lifecycle) = named_index_publication {
+            lifecycle.complete();
+        }
+        let _generation_authority =
+            generation.map(|generation| (generation.commitments, generation.logical_completion));
+        self.metrics.inc_commit();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine_transaction_reset::table_schema_digest;
+
+    #[test]
+    fn clear_bit_codec5_preflight_rejects_parent_markers_and_frontier_drift() {
+        let identity = Engine::fresh_canonical_identity();
+        let mut markers = crate::engine_write_authority::DurableWriteAuthorityIndex::default();
+        markers
+            .apply(
+                7,
+                crate::engine_write_authority::DecodedWriteAuthority::RetentionClaim(
+                    crate::engine_write_authority::CanonicalRetentionClaim {
+                        identity,
+                        leader_epoch: 1,
+                        parent_stable_transaction_id: 41,
+                        parent_request_digest: [3; 32],
+                        parent_autocommit: true,
+                        statement_digests: Box::new([[4; 32]]),
+                        eligible_statement_bits: Box::new([0]),
+                        candidate_deadline: 0,
+                    },
+                ),
+                0,
+            )
+            .expect("well-formed retained marker enters the recovery index");
+        let marker = validate_generic_codec5_replay_preflight(&markers, 41, 0, 1, 1, 0)
+            .expect_err("clear-bit codec-5 must reject any parent marker");
+        assert!(marker
+            .to_string()
+            .contains("retired claim or allocator markers"));
+
+        let frontier = validate_generic_codec5_replay_preflight(
+            &crate::engine_write_authority::DurableWriteAuthorityIndex::default(),
+            42,
+            2,
+            3,
+            1,
+            0,
+        )
+        .expect_err("clear-bit codec-5 must require the exact simulated allocator frontier");
+        assert!(frontier
+            .to_string()
+            .contains("allocator range is not the exact replay frontier"));
+    }
 
     #[test]
     fn transaction_claim_status_length_helper_matches_real_encoder() {
@@ -1827,8 +3348,11 @@ mod tests {
     fn canonical_allocator_high_water_is_checked_and_monotonic_on_replay() {
         let values = vec![SqlValue::Int4(7)];
         let payload: Arc<[u8]> = Arc::from(
-            try_encode_binary_insert("allocator_t", &[(u64::MAX - 1, values.as_slice())])
-                .expect("encodable boundary row"),
+            encode_historical_binary_insert_fixture(
+                "allocator_t",
+                &[(u64::MAX - 1, values.as_slice())],
+            )
+            .expect("encodable boundary row"),
         );
         let identity = Engine::fresh_canonical_identity();
         let record = Engine::canonical_wal_record_with_boundary_and_request_digest(
@@ -1848,8 +3372,11 @@ mod tests {
         assert_eq!(envelope.header.allocator_high_water, u64::MAX);
 
         let invalid: Arc<[u8]> = Arc::from(
-            try_encode_binary_insert("allocator_t", &[(u64::MAX, values.as_slice())])
-                .expect("binary framing can represent the sentinel for rejection"),
+            encode_historical_binary_insert_fixture(
+                "allocator_t",
+                &[(u64::MAX, values.as_slice())],
+            )
+            .expect("binary framing can represent the sentinel for rejection"),
         );
         let error = Engine::canonical_wal_record_with_boundary_and_request_digest(
             identity,

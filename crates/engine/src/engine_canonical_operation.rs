@@ -6,17 +6,6 @@
 
 use super::*;
 
-// Codec-5 will consume this only once S3 is complete.  Keep the inert semantic reader compiled
-// and explicitly non-live without making it an engine-operation authority prematurely.
-#[allow(dead_code)]
-mod strict_non_insert;
-#[allow(unused_imports)]
-pub(crate) use strict_non_insert::{
-    decode_current_non_insert_canonical_operation, CurrentNonInsertCanonicalOperation,
-    CurrentNonInsertCanonicalOperationFacts, CurrentNonInsertExplicitSequenceFacts,
-    CurrentNonInsertSemanticClass,
-};
-
 pub(super) const ENGINE_OPERATION_MAGIC: &[u8; 8] = b"GPUDBOP1";
 pub(super) const ENGINE_OPERATION_CODEC_RESOLVED_BINARY: u8 = 2;
 pub(super) const ENGINE_OPERATION_CODEC_TYPED_COMMAND_V2: u8 = 4;
@@ -55,26 +44,6 @@ pub(super) struct SealedCanonicalOperation {
     affected_rows_default: AffectedRowsDefault,
 }
 
-/// The canonical operation and the original move-only row-id proposal that produced it.
-///
-/// Canonical framing consumes this wrapper and passes the unchanged proof onward to the later
-/// allocator/apply owner; it never rebuilds a range from the operation header's scalar metadata.
-pub(super) struct SealedCanonicalBoundInsert {
-    operation: SealedCanonicalOperation,
-    proposed_range: crate::wal_binary::ProposedRowIdRange,
-}
-
-impl SealedCanonicalBoundInsert {
-    pub(super) fn into_operation_and_proposed_range(
-        self,
-    ) -> (
-        SealedCanonicalOperation,
-        crate::wal_binary::ProposedRowIdRange,
-    ) {
-        (self.operation, self.proposed_range)
-    }
-}
-
 impl SealedCanonicalOperation {
     pub(super) fn from_live_payload(payload: &[u8], txn_id: TxnId) -> Result<Self, EngineError> {
         if payload.first() == Some(&WAL_BINARY_TAG) {
@@ -84,29 +53,84 @@ impl SealedCanonicalOperation {
         Self::from_typed_command(payload)
     }
 
-    /// Consume a sealed fixed-width INSERT binding without re-decoding its already-matched v1
-    /// payload. `BoundBinaryInsert` has no raw constructor: its operation body, row count, and
-    /// allocator high-water were patched from one checked proposal in lock-step.
-    pub(super) fn from_bound_binary_insert(
-        bound: crate::wal_binary::BoundBinaryInsert,
-    ) -> Result<SealedCanonicalBoundInsert, EngineError> {
-        let (body, proposed_range) = bound.into_operation_body_and_proposed_range();
-        let count = proposed_range.count();
-        let allocator_high_water = proposed_range.allocator_high_water();
-        if count == 0 || allocator_high_water <= u64::from(count) {
+    /// Seal a just-built transaction record without sending its newly encoded bytes through the
+    /// historical binary decoder. The live terminal still validates the exact metadata that the
+    /// decoder would derive; recovery remains the sole reader of the encoded transaction bytes.
+    pub(super) fn from_live_binary_transaction(
+        payload: &[u8],
+        record: &crate::wal_binary::BinaryTransactionRecord,
+        txn_id: TxnId,
+    ) -> Result<Self, EngineError> {
+        if record.sequence_value_references.iter().any(|reference| {
+            reference.parent_txn_id != txn_id || reference.transition_txn_id == txn_id
+        }) {
             return Err(EngineError::Durability(
-                "bound binary INSERT has invalid row-id high-water".to_string(),
+                "sequence-reference parent does not match canonical transaction identity"
+                    .to_string(),
             ));
         }
-        Ok(SealedCanonicalBoundInsert {
-            operation: Self {
-                body,
-                kind: gpu_db_wal::CanonicalFragmentKind::RowMutation,
-                table_block_count: 1,
-                allocator_high_water,
-                affected_rows_default: AffectedRowsDefault::Known(u64::from(count)),
-            },
-            proposed_range,
+        let allocator_high_water = record
+            .mutations
+            .iter()
+            .map(|mutation| match mutation {
+                BinaryTransactionMutation::Insert { row_id, .. }
+                | BinaryTransactionMutation::Update { row_id, .. }
+                | BinaryTransactionMutation::Delete { row_id, .. } => {
+                    row_id.checked_add(1).ok_or_else(|| {
+                        EngineError::Durability(
+                            "canonical WAL references the reserved maximum row identity"
+                                .to_string(),
+                        )
+                    })
+                }
+            })
+            .try_fold(record.allocator_high_water, |high, next| {
+                next.map(|next| high.max(next))
+            })?;
+        let kind = if !record.catalog_commands.is_empty() {
+            gpu_db_wal::CanonicalFragmentKind::CatalogMutation
+        } else if !record.table_resets.is_empty() {
+            gpu_db_wal::CanonicalFragmentKind::TableReset
+        } else {
+            gpu_db_wal::CanonicalFragmentKind::RowMutation
+        };
+        let ordered = !record.operation_order.is_empty();
+        let tables = record
+            .catalog_commands
+            .iter()
+            .filter_map(|operation| match &operation.command {
+                Command::CreateTable(create) if ordered => Some(create.table.as_str()),
+                _ => None,
+            })
+            .chain(
+                record
+                    .operation_order
+                    .iter()
+                    .filter_map(|operation| ordered.then(|| operation.table()).flatten()),
+            )
+            .chain(record.table_resets.iter().map(|reset| reset.table.as_str()))
+            .chain(record.mutations.iter().map(|mutation| match mutation {
+                BinaryTransactionMutation::Insert { table, .. }
+                | BinaryTransactionMutation::Update { table, .. }
+                | BinaryTransactionMutation::Delete { table, .. } => table.as_str(),
+            }))
+            .collect::<BTreeSet<_>>();
+        let table_block_count = u32::try_from(tables.len()).map_err(|_| {
+            EngineError::Durability(
+                "canonical transaction table-block count exceeds u32".to_string(),
+            )
+        })?;
+        let affected_rows = u64::try_from(record.mutations.len()).map_err(|_| {
+            EngineError::Durability(
+                "transaction mutation count exceeds canonical affected-row framing".to_string(),
+            )
+        })?;
+        Ok(Self {
+            body: encode_operation_body(ENGINE_OPERATION_CODEC_RESOLVED_BINARY, payload)?,
+            kind,
+            table_block_count,
+            allocator_high_water,
+            affected_rows_default: AffectedRowsDefault::Known(affected_rows),
         })
     }
 
@@ -530,7 +554,7 @@ mod tests {
             (11, row_values[1].as_slice()),
         ];
         let insert: Arc<[u8]> =
-            Arc::from(try_encode_binary_insert("sealed_insert", &rows).unwrap());
+            Arc::from(encode_historical_binary_insert_fixture("sealed_insert", &rows).unwrap());
         let identity = identity();
         let catalog_digest = [0x44; 32];
         let request_digest = [0x55; 32];
@@ -699,7 +723,8 @@ mod tests {
 
         let values = [SqlValue::Int4(1)];
         let insert: Arc<[u8]> = Arc::from(
-            try_encode_binary_insert("sealed_outcome", &[(1, values.as_slice())]).unwrap(),
+            encode_historical_binary_insert_fixture("sealed_outcome", &[(1, values.as_slice())])
+                .unwrap(),
         );
         let error = Engine::canonical_wal_record_with_boundary_and_outcome(
             identity(),

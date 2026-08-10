@@ -1231,33 +1231,22 @@ fn relational_sql_gpu_bridge_report_summarizes_gpu_only_execution() {
 }
 
 #[test]
-fn relational_sql_cuda_probe_reuses_cached_unavailable_snapshot_and_fails_loud() {
-    let mut e = Engine::new_local_test_engine();
+fn gpu_native_create_with_cached_unavailable_cuda_fails_closed_and_wedges() {
+    let e = Engine::new_local_test_engine();
     let _ = e
         .cached_cuda_probe_runtime
         .set(CudaDriverRuntime::unavailable());
-    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
-        .unwrap();
-
-    let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
-        panic!("expected SELECT plan");
-    };
     let fallback_before = e.metrics().snapshot().fallback_total;
     let first = e
-        .evaluate_relational_select_specification_with_cuda_driver(&select)
+        .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap_err();
     let second = e
-        .evaluate_relational_select_specification_with_cuda_driver(&select)
+        .execute_text(2, "CREATE TABLE other_people (id INT, name TEXT)")
         .unwrap_err();
 
-    for error in [first, second] {
-        assert!(
-            error
-                .to_string()
-                .contains("has no retained resident device memory"),
-            "unexpected error: {error}"
-        );
-    }
+    assert!(first.to_string().contains("DriverLibraryUnavailable"));
+    assert!(second.to_string().contains("commit path is wedged"));
+    assert_eq!(e.visible_up_to(), 0);
     assert_eq!(e.metrics().snapshot().fallback_total, fallback_before);
     assert_eq!(
         e.cached_cuda_probe_runtime.get().unwrap().snapshot(),

@@ -154,6 +154,7 @@ impl Engine {
             relational_default_table_acl: cat.relational_default_table_acl.clone(),
             relational_comments: cat.relational_comments.clone(),
             relational_next_oid: cat.relational_next_oid,
+            relational_next_table_id: cat.relational_next_table_id,
             index_oid_epoch_current: cat.index_oid_epoch_current,
             legacy_recovery_index_oids_assigned: cat.legacy_recovery_index_oids_assigned,
             legacy_recovery_next_index_oid: cat.legacy_recovery_next_index_oid,

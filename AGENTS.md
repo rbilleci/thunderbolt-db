@@ -116,15 +116,32 @@ standard and the affected subsystem.
   optional advisory reviews run during implementation. Freeze once after the complete functional matrix passes,
   then run the required independent adversarial audit and applicable full card. A valid audit finding reopens that
   same candidate; it does not create a new accepted sub-milestone.
-- For an explicitly time-boxed milestone, `PLAN.md` must carry elapsed-time checkpoints and a production-reachability
-  stop-loss. Ninety minutes without a newly passing production end-to-end assertion or removal of a superseded live
-  branch requires stopping helper expansion and returning to the shortest failing vertical route.
+- Do not invent a milestone wall-clock schedule unless the user explicitly requests one. Use a
+  production-reachability stop-loss instead: before adding or extending an abstraction, name the failing end-to-end
+  assertion it closes and connect its production caller in the same integrated candidate. Ninety minutes without a
+  newly passing production assertion or removal of a superseded live branch stops helper expansion and returns work
+  to the shortest failing vertical route; it does not create a smaller milestone.
+- For a convergence or replacement milestone, route generality means both value breadth and transaction/table shape
+  breadth. A physical strategy may vary beneath the accepted plan boundary, but a required SQL shape may not select
+  a second semantic carrier, terminal, WAL encoder/version, allocator, replay path, status/apply tail, or publication
+  authority. Broad behavior passing through a legacy route while a narrow canonical canary passes is not progress.
+- Cut over and delete together. When a production acceptance shape moves to the replacement route, remove its old
+  constructor, selector, counter, encoder, apply/recovery behavior, and publication branch in the same candidate.
+  No migration change may increase the number of live product authorities.
+- Functional convergence and old-path deletion precede throughput optimization. Do not tune a shape-special canary,
+  weaken or specialize the qualification workload, run an acceptance audit/full card, or record acceptance while
+  required shapes still use a superseded route.
 - Parallel agents are encouraged only as lanes inside the same milestone candidate. Give them disjoint ownership
   such as live cutover, durability/recovery, and acceptance evidence; integrate at least every 90 minutes. Do not
   assign separate agents to invent or accept the next micro-boundary.
 - New prerequisite milestones, wire-format versions, or generalized authorities may be added only when an existing
   milestone acceptance test fails for their absence and the current design cannot satisfy it. Record that evidence
   in the existing PLAN item; do not grow a prerequisite chain from architecture preference alone.
+- Local WIP commits and recoverable snapshots are allowed to keep a large integrated candidate reviewable; they are
+  not acceptance evidence, PLAN progress, or authorization to push or merge. Before freeze, every intended candidate
+  file must be tracked and staged, unrelated changes excluded, unstaged/untracked drift eliminated, generated sources
+  synchronized, the superseded-route inventory repeated, and required source-size dispositions recorded. Only that
+  exact frozen tree may receive the independent audit or canonical benchmark card.
 
 Quality attaches to the exact accepted milestone candidate, not to repeated full-card runs on intermediate repairs.
 Use this order once per complete PLAN milestone:
@@ -137,7 +154,7 @@ Use this order once per complete PLAN milestone:
    it is never acceptance evidence.
 3. Freeze the candidate, then delegate the independent read-only adversarial audit to the project-scoped
    `acceptance_auditor` custom agent defined in `.codex/agents/acceptance-auditor.toml`. That agent is pinned to
-   GPT-5.6 Sol with max reasoning; do not silently substitute another model or reasoning level. If that configuration
+   GPT-5.6 Terra with xhigh reasoning; do not silently substitute another model or reasoning level. If that configuration
    is unavailable, stop before acceptance and report the blocker. Audit implementation, focused gates, and sabotage
    evidence, and repair/re-audit findings before paying for the full card. A canonical full run permits staged
    changes but rejects unstaged or untracked files, builds an exported snapshot of the exact staged tree, and

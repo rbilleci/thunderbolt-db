@@ -137,12 +137,28 @@ impl Engine {
             }
             Ok(())
         })?;
-        let tables: Vec<String> = self
-            .catalog_snapshot()
-            .relational_catalog
-            .keys()
-            .cloned()
-            .collect();
+        let catalog = self.catalog_snapshot();
+        // The enrollment map owns ephemeral GPU allocations, so it is intentionally absent from
+        // WAL. Its source of truth is instead the recovered catalog: every surviving declared
+        // index must be rebuilt together with the final resident generation before recovery makes
+        // that generation readable. Seed it before admission so the existing GPU publication path
+        // reserves, builds, and linearizes complete coverage; do not reconstruct a host index.
+        {
+            let mut publications = self
+                .read_state
+                .residency
+                .named_index_publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for table in catalog
+                .relational_catalog
+                .values()
+                .filter(|table| !table.indexes.is_empty())
+            {
+                publications.insert(table.oid, table.indexes.clone());
+            }
+        }
+        let tables: Vec<String> = catalog.relational_catalog.keys().cloned().collect();
         for table in tables {
             let sealed_capture_target = self
                 .catalog_snapshot()
@@ -192,6 +208,65 @@ impl Engine {
             }
             self.populate_relational_residency_snapshot_shared(&table)
                 .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        }
+        // Some replayed mutations already leave their final shard generation live, so the loop
+        // above deliberately avoids re-admitting them. Reconcile those generations too: recovery
+        // cannot treat the transient enrollment map as durable authority, but it must restore the
+        // GPU indexes declared by the recovered catalog before readers can use the generation.
+        for table in catalog
+            .relational_catalog
+            .values()
+            .filter(|table| !table.indexes.is_empty())
+        {
+            if self.table_chunk_authoritative(&table.name).is_some() {
+                continue;
+            }
+            let Some(shards) = self.read_residency_shards().get(&table.name).cloned() else {
+                continue;
+            };
+            if shards.iter().all(|shard| shard.row_count == 0) {
+                let write001_empty_predecessor =
+                    crate::engine_residency::write001_empty_index_in_place_preallocation(table)
+                        && shards.len() == 1
+                        && shards[0].shard_id == 0
+                        && shards[0].row_start == 0
+                        && shards[0].capacity == 1;
+                if write001_empty_predecessor {
+                    // Admission already created the bounded one-slot GPU predecessor. Recovery
+                    // must retain/rebuild its physical empty directory just as live CREATE does;
+                    // marking coverage complete after purging it makes the first retry select
+                    // codec-5 and then fail because no enrolled device index exists.
+                    self.publish_relational_resident_indexes_for_generation(
+                        table,
+                        &shards,
+                        self.committed_seq(),
+                        false,
+                        false,
+                        true,
+                    )
+                    .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+                } else {
+                    self.read_state
+                        .residency
+                        .purge_shard_pk_index_for_table_during_transaction(&table.name);
+                    self.read_state
+                        .residency
+                        .named_index_coverage_complete
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(table.name.clone(), (table.oid, table.indexes.clone()));
+                }
+                continue;
+            }
+            self.publish_relational_resident_indexes_for_generation(
+                table,
+                &shards,
+                self.committed_seq(),
+                false,
+                false,
+                true,
+            )
+            .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
         }
         // The sealed V1 object is intentionally constructed only after the ordinary canonical
         // replay/admission path has completed.  It consumes the shard owners captured directly
@@ -511,6 +586,7 @@ impl Engine {
                 canonical_lineage_bound: false,
                 canonical_replay_seen: false,
                 transaction_status: HashMap::new(),
+                write_authority: Default::default(),
                 transaction_status_reservation_generation: 0,
                 last_applied_outcome: None,
                 repl: LocalReplicator::leader(),
@@ -524,13 +600,12 @@ impl Engine {
             }),
             commit_publication: Default::default(),
             pending_transaction_claims: Arc::new(Mutex::new(HashMap::new())),
+            public_transaction_aliases: Arc::new(Mutex::new(HashMap::new())),
             transaction_id_allocator: Arc::new(AtomicU64::new(1)),
             sequence_value_outcomes: Mutex::new(HashMap::new()),
             commit_path_wedged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_transaction_post_durable_apply: AtomicBool::new(false),
-            #[cfg(test)]
-            fail_next_fixed_insert_post_wal_apply: AtomicBool::new(false),
             #[cfg(test)]
             transaction_post_durable_hook: Mutex::new(None),
             active_snapshots: std::sync::Arc::new(Mutex::new(ActiveSnapshots::default())),
@@ -562,6 +637,7 @@ impl Engine {
                 relational_comments: BTreeMap::new(),
                 relational_resident_cache: RelationalResidentCache::default(),
                 relational_next_oid: FIRST_USER_RELATION_OID,
+                relational_next_table_id: FIRST_USER_TABLE_ID,
                 legacy_recovery_next_index_oid: FIRST_LEGACY_RECOVERY_INDEX_OID,
                 legacy_recovery_index_oids_assigned: false,
                 legacy_recovery_floor_prepared: false,
@@ -610,10 +686,6 @@ impl Engine {
             // rehydrating decline -> a dead slot re-tombstoned, the live version leaked) is
             // FIXED by re-pinning the view at every post-rehydration fallback — pinned by the
             // SV6 concurrent hammer, which now runs elided BY DEFAULT.
-            // INSERT-001: resolved binary WAL is product-default for every construction path
-            // through `with_planner_config` (local, durable, and recovery/reopen). The setter is
-            // retained solely as an explicit compatibility/parity kill switch.
-            binary_wal_records_enabled: std::sync::atomic::AtomicBool::new(true),
             // THE CONSTRAINED-ELISION FLIP (user-authorized 2026-07-03): unique/PK'd
             auto_vacuum_enabled: std::sync::atomic::AtomicBool::new(true),
             // THE i64-SECTION FLIP (user-authorized 2026-07-03): Int8/Timestamp columns ride

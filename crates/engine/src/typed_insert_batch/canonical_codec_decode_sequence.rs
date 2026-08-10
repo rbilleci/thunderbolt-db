@@ -121,7 +121,12 @@ pub(super) fn validate_decoded_sequence_section(
                         "autocommit sequence section has private effect",
                     ));
                 }
-                if owner.statement_ordinal >= parent.statement_ordinal.as_u32() {
+                // These ordinals have different domains: the owner addresses the complete
+                // transaction program and the parent addresses dense typed INSERTs. Aggregate
+                // admission proves ordering; the local decoder proves presence and non-aliasing.
+                if owner.statement_ordinal == u32::MAX
+                    || owner.statement_digest == parent.request_digest
+                {
                     return Err(codec_error(
                         "private sequence owner is not before parent statement",
                     ));

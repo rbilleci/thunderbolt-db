@@ -72,7 +72,7 @@ impl Engine {
 
     pub(crate) fn maintain_transaction_index_lifecycle_residency(
         &self,
-        cat: &DdlCatalogState,
+        cat: &mut DdlCatalogState,
         tables: &BTreeSet<String>,
         publish_index: Index,
     ) -> Result<BTreeSet<String>, EngineError> {
@@ -80,16 +80,20 @@ impl Engine {
         let resident_shards = self.read_residency_shards();
         let cold_chunks = self.read_streaming_cold_chunks();
         for table_name in tables {
-            let table = cat.relational_catalog.get(table_name).ok_or_else(|| {
-                EngineError::Durability(format!(
-                    "transaction index lifecycle lost owner relation \"{table_name}\""
-                ))
-            })?;
+            let table = cat
+                .relational_catalog
+                .get(table_name)
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "transaction index lifecycle lost owner relation \"{table_name}\""
+                    ))
+                })?
+                .clone();
             let without_resident_shards = resident_shards
                 .get(table_name)
                 .is_none_or(|shards| shards.is_empty());
             let exact_zero_row_generation = without_resident_shards
-                && self.zero_row_resident_generation_boundary(table).is_some();
+                && self.zero_row_resident_generation_boundary(&table).is_some();
             let device_authoritative = self.table_device_authoritative(table_name);
             if device_authoritative && without_resident_shards && !exact_zero_row_generation {
                 return Err(EngineError::ApplyFailed(format!(
@@ -101,7 +105,57 @@ impl Engine {
                 && without_resident_shards;
             if self.table_chunk_authoritative(table_name).is_some() || cold_without_resident_shards
             {
-                self.publish_transaction_cold_index_enrollment(table);
+                self.publish_transaction_cold_index_enrollment(&table);
+                maintained.insert(table_name.clone());
+                continue;
+            }
+            let write001_empty_predecessor =
+                crate::engine_residency::write001_empty_index_in_place_preallocation(&table)
+                    && (exact_zero_row_generation
+                        || resident_shards.get(table_name).is_some_and(|shards| {
+                            shards.len() == 1
+                                && shards[0].shard_id == 0
+                                && shards[0].row_start == 0
+                                && shards[0].row_count == 0
+                                && shards[0].capacity <= 1
+                        }));
+            if write001_empty_predecessor {
+                // Preserve the established named-index enrollment marker before asking the
+                // ordinary admission owner to replace the zero-capacity descriptor.  Admission
+                // allocates the one-slot shard and its device index as one budgeted replacement;
+                // the following INSERT then consumes that same cache through IndexedInPlace.
+                let prior_publication = self
+                    .read_state
+                    .residency
+                    .named_index_publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(table.oid, table.indexes.clone());
+                if let Err(error) = self.populate_relational_residency_snapshot_inner_with_boundary(
+                    cat,
+                    table_name,
+                    self.planner.default_gpu_id(),
+                    Some(publish_index),
+                ) {
+                    let mut publications = self
+                        .read_state
+                        .residency
+                        .named_index_publications
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match prior_publication {
+                        Some(previous) => {
+                            publications.insert(table.oid, previous);
+                        }
+                        None => {
+                            publications.remove(&table.oid);
+                        }
+                    }
+                    return Err(EngineError::ApplyFailed(format!(
+                        "transaction index owner \"{table_name}\" could not prepare the WRITE-001 empty GPU index predecessor: {error}"
+                    )));
+                }
+                self.set_table_device_authoritative(table_name, true);
                 maintained.insert(table_name.clone());
                 continue;
             }
@@ -190,7 +244,7 @@ impl Engine {
                     .insert(table.oid, table.indexes.clone());
             } else {
                 self.publish_relational_resident_indexes_for_generation(
-                    table,
+                    &table,
                     &shards,
                     publish_index,
                     true,
@@ -203,7 +257,7 @@ impl Engine {
                     .iter()
                     .enumerate()
                     .filter_map(|(ordinal, index)| {
-                        crate::engine_residency::index_probe_key_id(table, index, ordinal)
+                        crate::engine_residency::index_probe_key_id(&table, index, ordinal)
                     })
                     .collect::<BTreeSet<_>>();
                 self.read_state
@@ -1069,6 +1123,7 @@ impl Engine {
                 sequence_input_oids: &sequence_input_oids,
                 sequence_value_references: &sequence_value_references,
             },
+            false,
         )?;
         let next_catalog_snapshot =
             Self::catalog_snapshot_from_working(&next_catalog, entry.index.saturating_sub(1));
@@ -1711,7 +1766,8 @@ impl Engine {
         // row publication remains private to the enclosing commit until its one visibility join.
         *cat = next_catalog;
         let mut applied = Vec::with_capacity(validated_resets.len() + decoded.len());
-        let mut device_authoritative_commits = validated_resets.len() as u64;
+        let reset_device_authoritative_commits = validated_resets.len() as u64;
+        let mut device_authoritative_tables = BTreeSet::new();
         let mut class_skips = 0u64;
 
         for reset in validated_resets {
@@ -1733,7 +1789,7 @@ impl Engine {
                 class_skips = class_skips.saturating_add(1);
             } else {
                 self.set_table_device_authoritative(&table_name, true);
-                device_authoritative_commits = device_authoritative_commits.saturating_add(1);
+                device_authoritative_tables.insert(table_name.clone());
             }
             match mutation {
                 DecodedTransactionMutation::Insert { row_id, row, .. } => {
@@ -1818,7 +1874,12 @@ impl Engine {
         self.read_state
             .residency
             .device_authoritative_commits
-            .fetch_add(device_authoritative_commits, AtomicOrdering::Relaxed);
+            .fetch_add(
+                reset_device_authoritative_commits.saturating_add(
+                    u64::try_from(device_authoritative_tables.len()).unwrap_or(u64::MAX),
+                ),
+                AtomicOrdering::Relaxed,
+            );
         self.read_state
             .residency
             .chunk_class_device_commits

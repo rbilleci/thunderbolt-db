@@ -3,7 +3,7 @@ use super::*;
 fn prepare(engine: &Engine, sql: &str) -> TypedInsertBatch {
     let command = parse_command(sql).expect("test INSERT parses");
     let catalog = engine.catalog_snapshot();
-    try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq, None)
+    seal_typed_insert_batch_for_test(&command, &catalog, catalog.commit_seq, None)
         .expect("default lowering has no semantic error")
         .expect("literal and absent defaults are directly eligible")
 }
@@ -101,17 +101,6 @@ fn literal_absent_and_explicit_defaults_rebuild_mixed_text_bool_rows_in_catalog_
         matches!(column.presence, TypedInsertColumnPresence::AllProvided)
             && column.all_inputs_are_resolved(3)
     }));
-
-    let mut encoded = Vec::new();
-    batch
-        .append_binary_insert_template_row(0, &mut encoded)
-        .unwrap();
-    assert_eq!(encoded, b"i:1|t:|b:t|null");
-    encoded.clear();
-    batch
-        .append_binary_insert_template_row(1, &mut encoded)
-        .unwrap();
-    assert_eq!(encoded, b"i:2|null|b:t|null");
 }
 
 #[test]
@@ -166,7 +155,7 @@ fn sequence_default_is_deferred_only_when_requested_and_all_supplied_rows_are_ty
         parse_command("INSERT INTO sequence_defaults (payload, id) VALUES (10, 7), (11, 8)")
             .unwrap();
     assert!(
-        try_prepare_typed_insert_batch(&supplied, &catalog, catalog.commit_seq, None)
+        seal_typed_insert_batch_for_test(&supplied, &catalog, catalog.commit_seq, None)
             .unwrap()
             .is_some()
     );
@@ -177,7 +166,7 @@ fn sequence_default_is_deferred_only_when_requested_and_all_supplied_rows_are_ty
 
     let requested = parse_command("INSERT INTO sequence_defaults (payload) VALUES (12)").unwrap();
     assert!(
-        try_prepare_typed_insert_batch(&requested, &catalog, catalog.commit_seq, None)
+        seal_typed_insert_batch_for_test(&requested, &catalog, catalog.commit_seq, None)
             .unwrap()
             .is_none()
     );
@@ -201,20 +190,20 @@ fn resident_append_returning_defers_before_scalar_default_lowering() {
     let catalog = engine.catalog_snapshot();
 
     assert!(
-        try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq, None)
+        seal_typed_insert_batch_for_test(&command, &catalog, catalog.commit_seq, None)
             .unwrap()
-            .is_none(),
-        "the live resident-append adapter must defer RETURNING before default lowering"
+            .is_some(),
+        "the canonical typed route must retain RETURNING while lowering scalar defaults"
     );
     assert_eq!(
         crate::column_default::scalar_default_evaluation_count("value"),
-        0,
-        "the deferred live adapter must not evaluate a scalar default the legacy route owns"
+        1,
+        "the canonical typed route owns one scalar broadcast evaluation"
     );
 }
 
 #[test]
-fn resident_append_sequence_decline_precedes_scalar_default_lowering() {
+fn resident_append_sequence_effect_handoff_follows_scalar_default_lowering() {
     let engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE SEQUENCE sequence_gate_seq")
@@ -231,28 +220,24 @@ fn resident_append_sequence_decline_precedes_scalar_default_lowering() {
     let catalog = engine.catalog_snapshot();
 
     assert!(
-        try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq, None)
+        seal_typed_insert_batch_for_test(&command, &catalog, catalog.commit_seq, None)
             .unwrap()
             .is_none(),
-        "a requested sequence default has no resident-append effect owner"
+        "the receipt-free helper must hand requested sequence defaults to the canonical effect owner"
     );
     assert_eq!(
         crate::column_default::scalar_default_evaluation_count("scalar_value"),
-        0,
-        "the declined live adapter must not evaluate an unrelated scalar default"
+        1,
+        "the canonical typed route owns the unrelated scalar default exactly once"
     );
 
+    crate::column_default::reset_scalar_default_evaluation_count("scalar_value");
     let supplied_sequence =
         parse_command("INSERT INTO sequence_scalar_gate (serial_value) VALUES (17)").unwrap();
     assert!(
-        try_prepare_typed_insert_batch(
-            &supplied_sequence,
-            &catalog,
-            catalog.commit_seq,
-            None,
-        )
-        .unwrap()
-        .is_some(),
+        seal_typed_insert_batch_for_test(&supplied_sequence, &catalog, catalog.commit_seq, None,)
+            .unwrap()
+            .is_some(),
         "a supplied sequence column must not over-decline solely because another scalar default is omitted"
     );
     assert_eq!(

@@ -234,6 +234,8 @@ fn validates_identity(
 fn table(table_ref: u32, stable_table_id: u64, before: u64, high_water: u64) -> RetainedTable {
     RetainedTable {
         table_ref,
+        resets_existing_rows: false,
+        initial_table_absent: false,
         stable_table_id,
         display_oid: table_ref + 1,
         target_dependency_ref: u32::MAX,

@@ -579,26 +579,22 @@ impl OpaqueRuntimeGenerationRebuildProof {
             empty_roots: self.slots[abi::SLOT_TABLE_MAP_EMPTY..=abi::SLOT_TABLE_MAP_EMPTY + 64]
                 .iter()
                 .copied()
-                .map(OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot)
+                .map(OpaqueCudaSha256Digest::from_fixed_runtime_slot)
                 .collect(),
-            leaf_root: OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot(
+            leaf_root: OpaqueCudaSha256Digest::from_fixed_runtime_slot(
                 self.slots[abi::SLOT_TABLE_MAP_LEAF],
             ),
             path_roots: self.slots[abi::SLOT_TABLE_MAP_PATH..=abi::SLOT_TABLE_MAP_PATH + 63]
                 .iter()
                 .copied()
-                .map(OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot)
+                .map(OpaqueCudaSha256Digest::from_fixed_runtime_slot)
                 .collect(),
         };
         Ok(consume(
             self.attempt,
-            OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot(
-                self.slots[abi::SLOT_TABLE_ROOT],
-            ),
+            OpaqueCudaSha256Digest::from_fixed_runtime_slot(self.slots[abi::SLOT_TABLE_ROOT]),
             table_map,
-            OpaqueCudaSha256Digest::from_runtime_generation_rebuild_slot(
-                self.slots[abi::SLOT_DATABASE_ROOT],
-            ),
+            OpaqueCudaSha256Digest::from_fixed_runtime_slot(self.slots[abi::SLOT_DATABASE_ROOT]),
         ))
     }
 }

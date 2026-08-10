@@ -169,13 +169,28 @@ impl<'a> PreparedIndexedPhysicalForecast<'a> {
         permit: IndexedPhysicalMaterializationPermit,
     ) -> Result<PreparedIndexedPhysicalReservation<'a>, ExecuteError> {
         match self.branch {
-            PreparedIndexedPhysicalForecastBranch::InPlace(preview) => {
-                super::index_delta::prepare(engine, table, preview, expected_commit_seq, permit)
-                    .map(PreparedIndexedPhysicalReservation::in_place)
-            }
+            PreparedIndexedPhysicalForecastBranch::InPlace(preview) => super::index_delta::prepare(
+                engine,
+                table,
+                preview,
+                expected_commit_seq,
+                permit,
+                None,
+                0,
+            )
+            .map(PreparedIndexedPhysicalReservation::in_place),
             PreparedIndexedPhysicalForecastBranch::FixedRollover(preview) => {
-                super::index_rollover::materialize(engine, table, preview, permit)
-                    .map(PreparedIndexedPhysicalReservation::fixed_rollover)
+                super::index_rollover::materialize(
+                    engine,
+                    table,
+                    preview,
+                    expected_commit_seq,
+                    permit,
+                    None,
+                    0,
+                    None,
+                )
+                .map(PreparedIndexedPhysicalReservation::fixed_rollover)
             }
         }
     }
@@ -211,7 +226,7 @@ mod tests {
     fn indexed_materialization_requires_the_engine_insert_plan_permit() {
         let plan = include_str!("../engine_insert_plan.rs");
         assert!(plan.contains("struct IndexedPhysicalMaterializationPermit"));
-        assert!(plan.contains("fn issue_test_indexed_physical_materialization_permit"));
+        assert!(plan.contains("fn issue_codec5_terminal_indexed_physical_materialization_permit"));
         let fixed = include_str!("fixed_insert.rs");
         assert!(fixed.contains("_permit: IndexedPhysicalMaterializationPermit"));
         let in_place = include_str!("index_delta.rs");

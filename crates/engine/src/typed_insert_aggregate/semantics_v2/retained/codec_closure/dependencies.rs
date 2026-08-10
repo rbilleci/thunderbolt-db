@@ -32,8 +32,11 @@ const NOT_NULL_GUARD_ROLE: u16 = 9;
 const CHECK_GUARD_ROLE: u16 = 10;
 const DOMAIN_CONSTRAINT_GUARD_ROLE: u16 = 11;
 
-pub(super) fn validate(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> {
-    validate_table_targets(graph)?;
+pub(super) fn validate(
+    graph: &ReservedSemanticsV2Graph,
+    catalog_composition: Option<&crate::wal_binary::BinaryTransactionRecord>,
+) -> Result<(), EngineError> {
+    validate_table_targets(graph, catalog_composition)?;
     validate_tokens(graph)?;
     validate_uses(graph)?;
     validate_terminal_binding(graph)
@@ -44,6 +47,33 @@ fn validate_tokens(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> 
     for (ordinal, token) in graph.dependencies.iter().enumerate() {
         let descriptor = descriptor_for(graph, token)?;
         let effect = effect_for(graph, token)?;
+        // A zero root/generation is admissible only for a transaction-created table or an index
+        // owned by that table. The existing S7 table block and descriptor jointly prove that
+        // fact; no recovery-time catalog convention is introduced.
+        let target_is_initially_absent = token.kind == TARGET_TABLE
+            && graph
+                .tables
+                .get(token.target_table_ref as usize)
+                .is_some_and(|table| table.initial_table_absent);
+        let index_is_initially_absent = matches!(token.kind, MAINTAINED_INDEX | UNIQUE_KEY_GUARD)
+            && descriptor.is_some_and(|index| {
+                index.owner_table_ref == token.target_table_ref
+                    && ((index.base_index_generation == 0 && index.base_index_root == [0; 32])
+                        || graph
+                            .tables
+                            .get(index.owner_table_ref as usize)
+                            .is_some_and(|table| table.initial_table_absent))
+            });
+        // The catalog-only S3 record proves a transaction-private domain's creation. When the
+        // target table is likewise transaction-created it has no published catalog predecessor,
+        // so its domain dependency may retain the same zero snapshot generation.
+        let domain_is_initially_absent = token.kind == DOMAIN
+            && graph
+                .tables
+                .get(token.target_table_ref as usize)
+                .is_some_and(|table| table.initial_table_absent);
+        let absent_predecessor =
+            target_is_initially_absent || index_is_initially_absent || domain_is_initially_absent;
         if token.dependency_ref != ordinal as u32
             || token.access != required_access(token.kind)
             || token.flags & !3 != 0
@@ -54,16 +84,17 @@ fn validate_tokens(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> 
                 && !matches!(token.kind, NOT_NULL_GUARD | DOMAIN_CONSTRAINT_GUARD))
             || token.display_oid > 0x7fff_ffff
             || token.target_table_ref as usize >= graph.tables.len()
-            || token.base_generation == 0
+            || (token.base_generation == 0 && !absent_predecessor)
             || token.base_generation == u64::MAX
             || token.catalog_epoch != graph.header.catalog_before_epoch
-            || token.catalog_epoch != graph.header.catalog_after_epoch
-            || (token.kind == PUBLISHED_SEQUENCE) != (token.snapshot_floor == 0)
-            || (token.kind != PUBLISHED_SEQUENCE && token.snapshot_floor == 0)
+            || (token.kind == PUBLISHED_SEQUENCE && token.snapshot_floor != 0)
+            || (token.kind != PUBLISHED_SEQUENCE
+                && !absent_predecessor
+                && token.snapshot_floor == 0)
             || token.schema_digest == [0; 32] && token.kind != PUBLISHED_SEQUENCE
             || token.schema_digest != [0; 32] && token.kind == PUBLISHED_SEQUENCE
-            || token.base_root == [0; 32] && token.kind != DOMAIN
-            || token.base_root != [0; 32] && token.kind == DOMAIN
+            || (token.base_root == [0; 32] && token.kind != DOMAIN && !absent_predecessor)
+            || (token.base_root != [0; 32] && token.kind == DOMAIN)
             || token.name_digest == [0; 32]
             || token.identity_digest == [0; 32]
             || token.token_digest == [0; 32]
@@ -90,12 +121,33 @@ fn validate_tokens(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> 
             ));
         }
         if let Some(index) = descriptor {
+            // An FK may reference a parent table created earlier in this same transaction.  That
+            // parent has one S7 index descriptor (the table's own descriptor); its absent base
+            // is not a usable provider.  The FK token therefore pins the descriptor's already
+            // authenticated final index successor.  This is still the exact same descriptor and
+            // stable identity, not a second descriptor or a recovery-only FK path.
+            let initial_parent_successor =
+                matches!(token.kind, FOREIGN_PARENT_INDEX | FOREIGN_KEY_GUARD)
+                    && graph
+                        .tables
+                        .get(index.owner_table_ref as usize)
+                        .is_some_and(|table| table.initial_table_absent);
+            let expected_index_generation = if initial_parent_successor {
+                index.final_index_generation
+            } else {
+                index.base_index_generation
+            };
+            let expected_index_root = if initial_parent_successor {
+                index.final_index_root
+            } else {
+                index.base_index_root
+            };
             if token.stable_object_id != index.stable_index_id
                 || token.display_oid != index.display_oid
                 || token.catalog_epoch != index.catalog_epoch
-                || token.base_generation != index.base_index_generation
+                || token.base_generation != expected_index_generation
                 || token.schema_digest != index.owner_schema_digest
-                || token.base_root != index.base_index_root
+                || token.base_root != expected_index_root
                 || token.name_digest != index.index_name_digest
             {
                 return Err(error(
@@ -202,7 +254,10 @@ fn validate_tokens(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> 
     Ok(())
 }
 
-fn validate_table_targets(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> {
+fn validate_table_targets(
+    graph: &ReservedSemanticsV2Graph,
+    catalog_composition: Option<&crate::wal_binary::BinaryTransactionRecord>,
+) -> Result<(), EngineError> {
     for (table_ref, table) in graph.tables.iter().enumerate() {
         let token = graph
             .dependencies
@@ -220,6 +275,8 @@ fn validate_table_targets(graph: &ReservedSemanticsV2Graph) -> Result<(), Engine
             return Err(error("target-table token does not close its table block"));
         }
         let mut source_count = 0_u32;
+        let mut prior_record: Option<&crate::typed_insert_batch::DecodedTypedInsertRecord> = None;
+        let mut final_schema_digest = None;
         for resolution in graph
             .resolutions
             .iter()
@@ -231,17 +288,39 @@ fn validate_table_targets(graph: &ReservedSemanticsV2Graph) -> Result<(), Engine
                 .ok_or_else(|| error("target-table S2 record is absent"))?;
             let target = record.target_identity();
             if target.oid != table.display_oid
-                || target.schema_digest != table.schema_digest
                 || token.name_digest != qualified_name_digest(target.schema, target.name)
             {
                 return Err(error("table block and resolved S2 target diverge"));
             }
+            if let Some(prior) = prior_record {
+                if prior.target_identity().schema_digest != target.schema_digest
+                    && !same_oid_sequence_name_transition(prior, record)
+                    && !same_oid_s3_created_index_transition(graph, table_ref as u32, prior, record)
+                {
+                    return Err(error(
+                        "S2 target schema changed without an ordered stable-OID sequence rename witness",
+                    ));
+                }
+            }
+            prior_record = Some(record);
+            final_schema_digest = Some(target.schema_digest);
             source_count = source_count
                 .checked_add(1)
                 .ok_or_else(|| error("target-table source count overflows"))?;
         }
         if source_count == 0 {
             return Err(error("table block has no resolved S2 target"));
+        }
+        if final_schema_digest != Some(table.schema_digest)
+            && !terminal_s3_sequence_rename_closes_table_schema(
+                table,
+                prior_record,
+                catalog_composition,
+            )
+        {
+            return Err(error(
+                "table block does not close the final statement-time S2 target",
+            ));
         }
         for other in graph.tables.iter().take(table_ref) {
             if other.target_dependency_ref == table.target_dependency_ref
@@ -255,6 +334,137 @@ fn validate_table_targets(graph: &ReservedSemanticsV2Graph) -> Result<(), Engine
         }
     }
     Ok(())
+}
+
+/// A terminal S3 sequence rename changes a dependent table's schema after the last S2 INSERT.
+/// It can close that delta only with one exact old-name S2 private effect, stable sequence OID,
+/// and before/after default-column table digests. The S3 record remains the sole catalog owner.
+pub(super) fn terminal_s3_sequence_rename_closes_table_schema(
+    table: &crate::typed_insert_aggregate::semantics_v2::retained::graph::RetainedTable,
+    final_record: Option<&crate::typed_insert_batch::DecodedTypedInsertRecord>,
+    catalog_composition: Option<&crate::wal_binary::BinaryTransactionRecord>,
+) -> bool {
+    let (Some(final_record), Some(composition)) = (final_record, catalog_composition) else {
+        return false;
+    };
+    let final_s2_schema = final_record.target_identity().schema_digest;
+    if final_s2_schema == table.schema_digest {
+        return false;
+    }
+    final_record.sequence_bindings().any(|binding| {
+        let private_effect = final_record.sequence_effects().any(|effect| {
+            effect.request.effect_ordinal == binding.effect_ordinal
+                && matches!(
+                    effect.kind,
+                    crate::typed_insert_batch::DecodedSequenceEffectKindFacts::Private { .. }
+                )
+        });
+        if !private_effect {
+            return false;
+        }
+        let mut matched_ordinal = None;
+        for operation in &composition.sequence_lifecycle_operations {
+            let is_exact_rename = composition
+                .catalog_commands
+                .get(operation.command_index as usize)
+                .is_some_and(|command| {
+                    command.ordinal == operation.ordinal
+                        && matches!(
+                            &command.command,
+                            gpu_db_sql::Command::RenameSequence(rename)
+                                if rename.old_name == binding.effective_name
+                                    && rename.new_name != binding.effective_name
+                        )
+                });
+            if !is_exact_rename {
+                continue;
+            }
+            for target in &operation.targets {
+                let closes_table_schema = target.before_name == binding.effective_name
+                    && target
+                        .after_name
+                        .as_deref()
+                        .is_some_and(|after| !after.is_empty() && after != binding.effective_name)
+                    && target
+                        .target_before
+                        .as_ref()
+                        .is_some_and(|before| before.oid == binding.request.sequence_oid)
+                    && target
+                        .target_after
+                        .as_ref()
+                        .is_some_and(|after| after.oid == binding.request.sequence_oid)
+                    && target.dependencies_before.iter().any(|(key, before)| {
+                        target.dependencies_after.get(key).is_some_and(|after| {
+                            before.column_id == after.column_id
+                                && before.table.oid == table.display_oid
+                                && before.table.digest == final_s2_schema
+                                && after.table.oid == table.display_oid
+                                && after.table.digest == table.schema_digest
+                        })
+                    });
+                if closes_table_schema && matched_ordinal.replace(operation.ordinal).is_some() {
+                    return false;
+                }
+            }
+        }
+        let Some(matched_ordinal) = matched_ordinal else {
+            return false;
+        };
+        !composition
+            .sequence_lifecycle_operations
+            .iter()
+            .any(|operation| {
+                operation.ordinal > matched_ordinal
+                    && operation.targets.iter().any(|target| {
+                        target
+                            .target_before
+                            .as_ref()
+                            .is_some_and(|before| before.oid == binding.request.sequence_oid)
+                            || target
+                                .target_after
+                                .as_ref()
+                                .is_some_and(|after| after.oid == binding.request.sequence_oid)
+                    })
+            })
+    })
+}
+
+fn same_oid_sequence_name_transition(
+    before: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+    after: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+) -> bool {
+    let before = before
+        .sequence_bindings()
+        .map(|binding| (binding.request.sequence_oid, binding.effective_name))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    after.sequence_bindings().any(|binding| {
+        before
+            .get(&binding.request.sequence_oid)
+            .is_some_and(|name| *name != binding.effective_name)
+    })
+}
+
+/// An existing table's ordered S3 CREATE INDEX changes the statement-time target schema digest
+/// between adjacent S2 records.  The paired-zero S7 descriptor is later bound to its exact S3
+/// lifecycle identity; here we only recognize the corresponding absent→present S2 directory
+/// transition, preserving the one statement-time catalog authority.
+fn same_oid_s3_created_index_transition(
+    graph: &ReservedSemanticsV2Graph,
+    table_ref: u32,
+    before: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+    after: &crate::typed_insert_batch::DecodedTypedInsertRecord,
+) -> bool {
+    graph.indexes.iter().any(|descriptor| {
+        descriptor.owner_table_ref == table_ref
+            && descriptor.base_index_generation == 0
+            && descriptor.base_index_root == [0; 32]
+            && !before
+                .indexes()
+                .any(|source| source.oid == descriptor.display_oid)
+            && after
+                .indexes()
+                .any(|source| source.oid == descriptor.display_oid)
+    })
 }
 
 fn validate_uses(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineError> {
@@ -451,10 +661,27 @@ fn validate_use_source(
         MAINTAINED_INDEX_ROLE | UNIQUE_KEY_ROLE => {
             let descriptor = descriptor_for(graph, token)?
                 .ok_or_else(|| error("target-index use has no descriptor"))?;
-            let source = record
+            let Some(source) = record
                 .indexes()
                 .find(|source| source.raw_ordinal == usage.source_ordinal)
-                .ok_or_else(|| error("target-index use has no S2 index source"))?;
+            else {
+                // Pre-CREATE statements intentionally cannot name the new index. Its paired
+                // zero base is admitted only after the retained S3 closure has authenticated
+                // the terminal index source, so this is not a second dependency authority.
+                if descriptor.base_index_generation == 0 && descriptor.base_index_root == [0; 32] {
+                    return Ok(());
+                }
+                return Err(error("target-index use has no S2 index source"));
+            };
+            let paired_zero_s3_created_at_reused_ordinal = descriptor.base_index_generation == 0
+                && descriptor.base_index_root == [0; 32]
+                && descriptor.display_oid != source.oid;
+            if paired_zero_s3_created_at_reused_ordinal {
+                // An ordered DROP/CREATE may reuse the retiring index's final catalog ordinal.
+                // The old S2 source must not be mistaken for the new paired-zero descriptor;
+                // its identity is instead closed by the existing retained S3 CREATE proof.
+                return Ok(());
+            }
             if !descriptor_matches_s2_index(graph, record, descriptor, source)?
                 || !descriptor_keys_match_s2_index(graph, record, descriptor, source)?
                 || (usage.role == MAINTAINED_INDEX_ROLE && descriptor.flags & 8 == 0)
@@ -494,6 +721,21 @@ fn validate_use_source(
                     "foreign-index token does not close its exact S2 FK source",
                 ));
             }
+            // A transaction-created parent is represented by the table's one initial S7
+            // descriptor, whose owner fields correctly retain the absent predecessor.  Its child
+            // FK, however, can only be satisfied by the parent's final table/index successor.
+            // Compare that FK parent use to the existing table block's final commitment; published
+            // parents retain the descriptor's ordinary base commitment.
+            let initial_parent = graph
+                .tables
+                .get(descriptor.owner_table_ref as usize)
+                .filter(|table| table.initial_table_absent);
+            let expected_parent_generation = initial_parent
+                .map(|table| table.data_generation_after)
+                .unwrap_or(descriptor.owner_data_generation);
+            let expected_parent_root = initial_parent
+                .map(|table| table.final_table_root)
+                .unwrap_or(descriptor.owner_table_base_root);
             let parent_matches = graph
                 .dependency_uses
                 .iter()
@@ -509,8 +751,8 @@ fn validate_use_source(
                                     && parent.stable_object_id == descriptor.owner_stable_table_id
                                     && parent.display_oid == descriptor.owner_display_oid
                                     && parent.schema_digest == descriptor.owner_schema_digest
-                                    && parent.base_generation == descriptor.owner_data_generation
-                                    && parent.base_root == descriptor.owner_table_base_root
+                                    && parent.base_generation == expected_parent_generation
+                                    && parent.base_root == expected_parent_root
                                     && parent.name_digest == descriptor.owner_name_digest
                             })
                 })
@@ -539,11 +781,13 @@ fn validate_use_source(
                 .sequence_effects
                 .iter()
                 .filter(|effect| {
-                    effect.statement_ordinal == usage.statement_ordinal
-                        && effect.effect_ordinal == usage.source_ordinal
-                        && effect.reference.transition_txn_id == token.base_generation
-                        && effect.reference.sequence_oid == token.display_oid
-                        && effect.body_digest == token.base_root
+                    effect.reference.as_ref().is_some_and(|reference| {
+                        effect.statement_ordinal == usage.statement_ordinal
+                            && effect.effect_ordinal == usage.source_ordinal
+                            && reference.transition_txn_id == token.base_generation
+                            && reference.sequence_oid == token.display_oid
+                            && effect.reference_body_digest == token.base_root
+                    })
                 })
                 .count();
             if source != 1 {
@@ -1042,10 +1286,17 @@ pub(super) fn descriptor_matches_s2_index(
             .ok_or_else(|| error("S2 index owner dependency is absent"))?;
         (parent.oid, parent.schema, parent.name, parent.schema_digest)
     };
-    let owner_table_ref = owner_table_ref(graph, owner.0, owner.1, owner.2, owner.3)?;
+    let owner_table_ref = owner_table_ref(graph, record, owner.0, owner.1, owner.2, owner.3)?;
+    // S2 preserves its statement-time catalog binding while S7 names the final composed table.
+    // A transaction-created table, or a pre-CREATE statement on a published table with a
+    // paired-zero S3-created index, may therefore retain the same stable table identity across
+    // a schema digest change. The latter bridge is limited to the existing S3 descriptor proof.
+    let owner_schema_digest = owner_table_ref
+        .and_then(|table_ref| graph.tables.get(table_ref as usize))
+        .map_or(owner.3, |table| table.schema_digest);
     if source.table_name != owner.2
         || descriptor.owner_display_oid != owner.0
-        || descriptor.owner_schema_digest != owner.3
+        || descriptor.owner_schema_digest != owner_schema_digest
         || descriptor.owner_name_digest != qualified_name_digest(owner.1, owner.2)
         || descriptor.index_name_digest != qualified_name_digest(owner.1, source.name)
         || descriptor.raw_catalog_ordinal != source.raw_ordinal
@@ -1133,6 +1384,7 @@ pub(super) fn descriptor_keys_match_foreign_key(
 
 fn owner_table_ref(
     graph: &ReservedSemanticsV2Graph,
+    record: &crate::typed_insert_batch::DecodedTypedInsertRecord,
     owner_display_oid: u32,
     schema: &str,
     name: &str,
@@ -1145,15 +1397,24 @@ fn owner_table_ref(
             .dependencies
             .get(table.target_dependency_ref as usize)
             .ok_or_else(|| error("index owner table target dependency is absent"))?;
+        let table_ref_u32 =
+            u32::try_from(table_ref).map_err(|_| error("index owner table ref exceeds u32"))?;
+        let s3_created_index_schema_bridge = graph.indexes.iter().any(|descriptor| {
+            descriptor.owner_table_ref == table_ref_u32
+                && descriptor.base_index_generation == 0
+                && descriptor.base_index_root == [0; 32]
+                && !record
+                    .indexes()
+                    .any(|source| source.oid == descriptor.display_oid)
+        });
         if table.display_oid == owner_display_oid
-            && table.schema_digest == schema_digest
             && target.name_digest == name_digest
+            && (table.schema_digest == schema_digest
+                || table.initial_table_absent
+                || s3_created_index_schema_bridge)
+            && matched.replace(table_ref_u32).is_some()
         {
-            let table_ref =
-                u32::try_from(table_ref).map_err(|_| error("index owner table ref exceeds u32"))?;
-            if matched.replace(table_ref).is_some() {
-                return Err(error("S7 table blocks ambiguously name an index owner"));
-            }
+            return Err(error("S7 table blocks ambiguously name an index owner"));
         }
     }
     Ok(matched)
@@ -1305,15 +1566,18 @@ fn published_sequence_identity(
     let mut bytes = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
     let mut body_digest = [0_u8; 32];
     for effect in &graph.sequence_effects {
-        if effect.reference.transition_txn_id == token.base_generation
-            && effect.reference.sequence_oid == token.display_oid
-            && effect.body_digest == token.base_root
+        let Some(reference) = effect.reference.as_ref() else {
+            continue;
+        };
+        if reference.transition_txn_id == token.base_generation
+            && reference.sequence_oid == token.display_oid
+            && effect.reference_body_digest == token.base_root
         {
             match_count = match_count
                 .checked_add(1)
                 .ok_or_else(|| error("sequence token match count overflows"))?;
-            crate::encode_sequence_value_reference_into_exact(&effect.reference, &mut bytes)?;
-            body_digest = effect.body_digest;
+            crate::encode_sequence_value_reference_into_exact(reference, &mut bytes)?;
+            body_digest = effect.reference_body_digest;
         }
     }
     if match_count != 1 {

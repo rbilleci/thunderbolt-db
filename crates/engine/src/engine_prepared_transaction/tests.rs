@@ -1101,9 +1101,9 @@ fn prepared_commit_time_constraint_rejection_does_not_claim_row_ids() {
         .is_empty());
 }
 
-/// A serial classic wave that reaches the canonical cut before a prepared transaction commits
-/// must reload the allocator only after acquiring that cut. Otherwise the wave can reuse the
-/// prepared insert's device-native row identity when it resumes.
+/// An autocommit transaction terminal that reaches the canonical cut before a prepared
+/// transaction commits must reload the allocator only after acquiring that cut. Otherwise it can
+/// reuse the prepared insert's device-native row identity when it resumes.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn prepared_commit_and_serial_classic_wave_share_fresh_row_id_basis() {
@@ -1118,7 +1118,7 @@ fn prepared_commit_and_serial_classic_wave_share_fresh_row_id_basis() {
     let allocator_before = engine.read_state.mvcc.current_row_id();
     let reached = Arc::new(std::sync::Barrier::new(2));
     let resume = Arc::new(std::sync::Barrier::new(2));
-    engine.set_serial_pre_commit_lock_hook(Arc::clone(&reached), Arc::clone(&resume));
+    engine.set_transaction_terminal_pre_commit_lock_hook(Arc::clone(&reached), Arc::clone(&resume));
 
     let (prepared_result, classic_result) = std::thread::scope(|scope| {
         let classic = scope.spawn(|| {

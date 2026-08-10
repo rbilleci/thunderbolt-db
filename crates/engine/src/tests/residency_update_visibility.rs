@@ -1747,6 +1747,12 @@ fn sv6_created_by_region_released_on_readmit_and_drop() {
         !table_has_any_created_by_cell(&e, "accounts"),
         "re-admit must release the stale created_by region (wrong-results + leak guard)"
     );
+    assert!(
+        e.read_residency_shards()["accounts"]
+            .iter()
+            .all(|shard| shard.created_by_region.is_some() || shard.max_created_by == 0),
+        "an all-visible re-admission must clear the creation high-water with its sidecar"
+    );
     // Reads after the re-admit are the plain all-live scan (no phantom hiding).
     let rows = e
         .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")

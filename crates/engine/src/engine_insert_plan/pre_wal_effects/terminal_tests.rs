@@ -292,6 +292,55 @@ fn inert_terminal_explicit_private_restart_chain_is_derived_and_side_effect_free
     ));
 }
 
+/// The live seal uses the same stable-OID classifier as the inert terminal, but retains the
+/// private advance with the consumed typed artifact so COMMIT can encode its final sequence
+/// state without reopening a legacy `WriteDelta` path.
+#[test]
+fn live_explicit_private_restart_seal_retains_ordered_typed_advances() {
+    const TXN: TxnId = 99_002_001;
+    let engine = Engine::new_local();
+    engine.execute_text(TXN, "BEGIN").unwrap();
+    create_sequence_and_table(
+        &engine,
+        TXN,
+        "live_private_restart",
+        "live_private_restart_table",
+    );
+    stage(
+        &engine,
+        TXN,
+        "ALTER SEQUENCE live_private_restart RESTART WITH 40",
+    );
+    let plan = super::super::PreparedInsertEffectPlan::prepare_explicit_for_test(
+        &engine,
+        TXN,
+        &parsed_insert(
+            "INSERT INTO live_private_restart_table (id, payload) \
+             VALUES (DEFAULT, 1), (DEFAULT, 2)",
+        ),
+    )
+    .unwrap();
+    let sealed = plan.seal_live_explicit(&[]).unwrap();
+    assert_eq!(sealed.private_sequence_advances.len(), 2);
+    assert!(sealed
+        .private_sequence_advances
+        .iter()
+        .all(|advance| advance.next_state.1));
+    assert_eq!(
+        sealed
+            .private_sequence_advances
+            .iter()
+            .map(|advance| advance.next_state.0)
+            .collect::<Vec<_>>(),
+        [40, 41]
+    );
+    assert_eq!(
+        sealed.private_sequence_advances[1].predecessor_tag, 2,
+        "the second DEFAULT must retain the first typed private outcome"
+    );
+    drop(sealed.batch);
+}
+
 #[test]
 fn inert_terminal_mixes_caller_published_receipts_with_private_plan_values() {
     const TXN: TxnId = 99_003;
@@ -354,7 +403,14 @@ fn inert_terminal_preserves_nonzero_expression_base_and_sparse_local_slots() {
         let statement_lock = Arc::clone(&snapshot.statement_lock);
         let _statement_guard = statement_lock.lock().unwrap();
         let mut delta = snapshot.delta.lock().unwrap();
-        let statement_ordinal = u32::try_from(delta.operations.len()).unwrap();
+        let statement_ordinal = u32::try_from(
+            delta
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, TransactionOperation::TypedInsert(_)))
+                .count(),
+        )
+        .unwrap();
         delta
             .sequence_value_references
             .push(synthetic_sequence_reference(statement_ordinal, 0));

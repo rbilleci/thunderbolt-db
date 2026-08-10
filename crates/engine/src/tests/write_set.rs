@@ -94,7 +94,6 @@ fn prepare_dml_does_not_mutate_engine_state() {
             &parse_insert("INSERT INTO t (id, label) VALUES (4, 'd')"),
             snapshot,
             None,
-            InsertPrepareValidation::Full,
         )
         .unwrap();
     assert_eq!(
@@ -168,7 +167,6 @@ fn prepare_insert_with_sequence_default_is_pure_and_advances_on_apply() {
             &parse_insert("INSERT INTO s (v) VALUES ('x'), ('y')"),
             snapshot,
             None,
-            InsertPrepareValidation::Full,
         )
         .unwrap();
     assert_eq!(
@@ -247,7 +245,6 @@ fn prepare_insert_failing_preflight_advances_nothing() {
         &parse_insert("INSERT INTO p (code) VALUES (100)"),
         next_commit_snapshot(&e),
         None,
-        InsertPrepareValidation::Full,
     );
     assert!(err.is_err(), "duplicate unique value must fail preflight");
     assert_eq!(
@@ -278,7 +275,6 @@ fn insert_write_set_is_independent_of_retired_host_apply() {
             &parse_insert("INSERT INTO t (id, label) VALUES (2, 'b'), (3, 'c')"),
             snapshot,
             None,
-            InsertPrepareValidation::Full,
         )
         .unwrap();
     // The conflict write-set carries NO insert row keys (BUG-1 fix) and (no unique index here) no
@@ -314,9 +310,7 @@ fn insert_write_set_records_unique_slots_but_not_row_keys() {
     let insert = parse_insert("INSERT INTO u (id, label) VALUES (7, 'g')");
     ensure_insert_device_generation(&e, &insert);
     let snapshot = next_commit_snapshot(&e);
-    let delta = e
-        .prepare_insert(&insert, snapshot, None, InsertPrepareValidation::Full)
-        .unwrap();
+    let delta = e.prepare_insert(&insert, snapshot, None).unwrap();
     assert!(
         delta.write_set.rows.is_empty(),
         "INSERT must contribute NO row keys to the conflict write-set"
@@ -425,9 +419,7 @@ fn write_set_records_unique_index_slots_for_unique_insert() {
     let insert = parse_insert("INSERT INTO u (id, label) VALUES (7, 'a'), (8, 'b')");
     ensure_insert_device_generation(&e, &insert);
     let snapshot = next_commit_snapshot(&e);
-    let delta = e
-        .prepare_insert(&insert, snapshot, None, InsertPrepareValidation::Full)
-        .unwrap();
+    let delta = e.prepare_insert(&insert, snapshot, None).unwrap();
 
     let slots: BTreeSet<(String, String, String)> = delta
         .write_set
@@ -523,12 +515,7 @@ fn serialized_unique_insert_records_its_unique_slot_into_the_si_ledger() {
     let stale_snapshot = e.visible_up_to();
     let _snapshot_guard = e.register_active_snapshot(stale_snapshot);
     let stale_delta = e
-        .prepare_insert(
-            &stale_insert,
-            e.dml_read_snapshot(stale_snapshot),
-            None,
-            InsertPrepareValidation::Full,
-        )
+        .prepare_insert(&stale_insert, e.dml_read_snapshot(stale_snapshot), None)
         .unwrap();
 
     // A serialized INSERT claims unique slot id=7 after the concurrent txn's snapshot.

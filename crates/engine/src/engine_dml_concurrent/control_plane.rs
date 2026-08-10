@@ -2,9 +2,10 @@
 //!
 //! This module receives the prebuilt exact canonical record owner and reserves the four live
 //! collection owners that the typed serial canonical path mutates: local replication entries,
-//! canonical WAL records, terminal transaction status, and commit timestamps. The separate
-//! `ReservedLedgerDelta` owns typed ledger capacity before this reservation is acquired. It does
-//! not own bounded serial/FUA group arenas, wave containers, publication, or result responses.
+//! canonical WAL records, terminal transaction status, and commit timestamps. Conflict-ledger
+//! recording remains in the shared committed-transaction publisher; this reservation does not
+//! mint a separate typed ledger claim. It does not own bounded serial/FUA group arenas, wave
+//! containers, publication, or result responses.
 
 use super::CommitState;
 use crate::{DurableTransactionOutcome, DurableTransactionStatus, EngineError, Index, TxnId};
@@ -21,7 +22,7 @@ use std::sync::Arc;
 /// is moved into its exact mutation method. Dropping an unconsumed bundle is harmless: capacity
 /// remains available, but no logical frontier has changed.
 #[must_use = "a typed canonical control-plane reservation must be consumed or abandoned before WAL"]
-pub(super) struct TypedCanonicalControlPlaneReservation {
+pub(crate) struct TypedCanonicalControlPlaneReservation {
     expected_owner_id: u64,
     txn_id: TxnId,
     expected_commit_seq: Index,
@@ -192,7 +193,7 @@ impl CommitState {
     /// through `&mut self`; failure occurs before proposal, logical WAL append, status/timestamp
     /// insertion, ledger mutation, or device apply. It excludes only bounded group arenas,
     /// publication, result, and wave owners.
-    pub(super) fn reserve_typed_canonical_control_plane(
+    pub(crate) fn reserve_typed_canonical_control_plane(
         &mut self,
         txn_id: TxnId,
         expected_commit_seq: Index,
@@ -274,7 +275,7 @@ impl TypedCanonicalControlPlaneReservation {
         Ok(())
     }
 
-    pub(super) fn propose(&mut self, commit: &mut CommitState) -> Result<CommitToken, EngineError> {
+    pub(crate) fn propose(&mut self, commit: &mut CommitState) -> Result<CommitToken, EngineError> {
         self.validate_owner_and_sequence(commit)?;
         let payload = self
             .wal
@@ -301,7 +302,7 @@ impl TypedCanonicalControlPlaneReservation {
         Ok(token)
     }
 
-    pub(super) fn append_canonical(&mut self, commit: &mut CommitState) -> Result<(), EngineError> {
+    pub(crate) fn append_canonical(&mut self, commit: &mut CommitState) -> Result<(), EngineError> {
         if commit.control_plane_reservation_owner_id != self.expected_owner_id {
             return Err(EngineError::Durability(
                 "typed canonical WAL credit belongs to another commit state".to_string(),
@@ -326,7 +327,7 @@ impl TypedCanonicalControlPlaneReservation {
 
     /// Restore the exact tentative record and all its WAL frontiers before the final claim.
     /// The replication frontier is restored by the canonical owner immediately alongside this.
-    pub(super) fn rollback_tentative_wal_after_pre_durable_failure(
+    pub(crate) fn rollback_tentative_wal_after_pre_durable_failure(
         &mut self,
         commit: &mut CommitState,
     ) {
@@ -341,7 +342,7 @@ impl TypedCanonicalControlPlaneReservation {
 
     /// The final rollbackable step is complete once the timestamp is recorded.  This makes the
     /// exact tail flushable and intentionally consumes the only generic rollback carrier.
-    pub(super) fn claim_tentative_wal_after_final_rollbackable_step(
+    pub(crate) fn claim_tentative_wal_after_final_rollbackable_step(
         &mut self,
         commit: &mut CommitState,
     ) -> usize {
@@ -355,7 +356,7 @@ impl TypedCanonicalControlPlaneReservation {
             .expect("commit-path invariant violation: typed exact WAL claim drifted after proposal")
     }
 
-    pub(super) fn record_transaction_status(
+    pub(crate) fn record_transaction_status(
         &mut self,
         commit: &mut CommitState,
         request_digest: CanonicalDigest,
@@ -413,7 +414,7 @@ impl TypedCanonicalControlPlaneReservation {
         Ok(())
     }
 
-    pub(super) fn record_commit_timestamp(
+    pub(crate) fn record_commit_timestamp(
         &mut self,
         commit: &mut CommitState,
         timestamp_micros: u64,
@@ -464,7 +465,7 @@ impl TypedCanonicalControlPlaneReservation {
     /// This is deliberately narrower than a generic status delete: retry identity is durable
     /// authority once retained, so an unexpected key/value mismatch is a fail-stop invariant
     /// violation rather than permission to erase somebody else's terminal claim.
-    pub(super) fn rollback_inserted_status_after_pre_durable_failure(
+    pub(crate) fn rollback_inserted_status_after_pre_durable_failure(
         &mut self,
         commit: &mut CommitState,
         request_digest: CanonicalDigest,

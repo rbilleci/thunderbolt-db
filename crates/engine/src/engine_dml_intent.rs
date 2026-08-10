@@ -1,11 +1,10 @@
 //! E2.1 — the covered-INSERT INTENT fast path (GPU-native write dataplane).
 //!
-//! The classic concurrent-DML path pays SQL text (`parse_command`) plus the pure
-//! off-lock `prepare_insert` (catalog bind, per-value coercion, constraint
-//! dispatch) for EVERY statement, even for the flagship OLTP shape: a prepared,
-//! covered, single-row INSERT into an elided (device-authoritative) PK'd int4
-//! table. For that shape everything the prepare computes is a pure function of
-//! (route, params):
+//! A covered route avoids reparsing SQL text for the flagship OLTP shape: a prepared,
+//! single-row INSERT into a device-authoritative PK'd int4 table. The route lowers its typed
+//! parameters directly to the ordinary INSERT AST, then enters the same one-statement transaction
+//! overlay and codec-5 terminal as every other INSERT ingress. It owns no WAL codec, row allocator,
+//! validation verdict, device apply, publication, or retry lifecycle of its own.
 //!
 //! - values are `Int4(param)` (identity coercion; never NULL, so the PK
 //!   not-null gate passes by construction);
@@ -14,22 +13,15 @@
 //! - the value-index map is EMPTY (elided tables skip the host value index);
 //! - the write-set is exactly the unique slots of the row's key columns.
 //!
-//! So a prepared ROUTE ([`CoveredInsertRoute`]) captures the shape checks once,
-//! and each intent execution builds the wave item DIRECTLY — no parse, no
-//! `prepare_insert` — and rides the UNMODIFIED commit-wave machinery: the
-//! sequencer's batched device PK validation, the delta-reuse re-key, the W5a
-//! binary WAL record (the whole wave enters one canonical WAL append), the
-//! wave-batched device open-shard append (one HtoD + created_by /
-//! row-id stamps + device PK-index insert per flush), and the pipelined
-//! completion tail (ack = canonical durability + device apply + contiguous publication).
+//! The route therefore remains an ingress optimization, not a second write authority. Its public
+//! ticket API is currently completed inline and returned pre-resolved while WRITE-001 removes the
+//! displaced wave writer. Restoring asynchronous submission requires an async adapter around the
+//! common transaction terminal, never revival of the old INSERT wave lifecycle.
 //!
-//! SAFETY ENVELOPE: eligibility is re-checked at EXECUTE time against the live
-//! catalog generation. Any drift (DDL, de-elision, table dropped) falls back to
-//! the classic `execute_dml_concurrent` path over the synthesized SQL text —
-//! the intent path never introduces a validation skip the classic deferral
-//! doesn't already have, and the synthesized text keeps the WAL replayable on
-//! every fallback arm (the sequencer's binary-encode fallback writes
-//! `item.payload` verbatim).
+//! SAFETY ENVELOPE: the prepared route constrains its parameter arity, while ordinary transaction
+//! staging rebinds the lowered AST against the live catalog. DDL drift therefore fails or executes
+//! with exactly the same semantics as the equivalent SQL INSERT; no route-local proof can skip the
+//! common constraint or generation validation.
 
 use super::*;
 use crate::engine_transaction_reset::StableRetryOr;
@@ -50,9 +42,9 @@ pub enum SynchronousCommit {
 
 /// A prepared covered-INSERT route: the immutable per-statement shape checks,
 /// captured once so per-intent execution is allocation-lean and validation is
-/// O(1). Obtain via [`Engine::prepare_covered_insert_route`]; invalidated by
-/// any DDL (execution falls back to the classic path and the caller should
-/// re-prepare).
+/// O(1). Obtain via [`Engine::prepare_covered_insert_route`]. Every execution is rebound by the
+/// ordinary transaction-overlay INSERT path; DDL drift therefore either follows that same path
+/// with its current semantics or is rejected, and never selects a route-local fallback writer.
 #[derive(Debug, Clone)]
 pub struct CoveredInsertRoute {
     table: String,
@@ -63,8 +55,8 @@ pub struct CoveredInsertRoute {
     /// a mismatch means a DDL committed since — the shape proof is stale.
     catalog_seq: Index,
     column_count: usize,
-    /// `"INSERT INTO <table> VALUES ("` — the synthesized-SQL prefix for the
-    /// WAL-fallback payload and the classic-path fallback.
+    /// `"INSERT INTO <table> VALUES ("` — the synthesized logical-request prefix used for
+    /// the ordinary terminal's retry identity. It is never a WAL payload or alternate writer.
     sql_prefix: String,
     /// E2.2(a) — the INTEGER conflict slots this route's inserts claim, precomputed once:
     /// `(packed_slot_id, column_index)` for every unique i32 index (all of them, since the
@@ -74,10 +66,6 @@ pub struct CoveredInsertRoute {
     /// the classic path (see [`crate::write_path::add_unique_slots`]), so cross-path SI conflicts
     /// against the same slot are exact.
     unique_i32_slots: Vec<(u64, usize)>,
-    /// E2.2(b) — the fixed byte offset of the single row's `u64` row id inside the pre-encoded
-    /// W5a binary WAL record for this route's table: `3 (tag/ver/op) + 2 (table_len) +
-    /// table_len + 4 (row_count)`. The sequencer patches 8 bytes here with the wave-assigned id.
-    binary_row_id_offset: u32,
 }
 
 impl CoveredInsertRoute {
@@ -89,8 +77,9 @@ impl CoveredInsertRoute {
         self.column_count
     }
 
-    /// Synthesize the canonical SQL text for `params` (the classic-path /
-    /// WAL-record fallback payload; parse round-trips to the same `Insert`).
+    /// Synthesize the canonical logical request for `params`. The request binds retry identity
+    /// and diagnostics; the lowered [`Command::Insert`] enters the ordinary transaction overlay
+    /// without reparsing this string or materializing a fallback WAL payload.
     fn synthesize_text(&self, params: &[i32]) -> String {
         use std::fmt::Write as _;
         // prefix + per-param worst case "-2147483648, " + ")"
@@ -195,7 +184,7 @@ impl Engine {
     ///   table ELIDED (device-authoritative), FK/CHECK-free, no inbound FK,
     ///   at least one unique index and every unique index on an i32 column,
     ///   with the device write-locate + wave-batch flags enabled;
-    /// - binary WAL records enabled (covered inserts log W5a row-op records).
+    /// - canonical binary WAL records (covered inserts log W5a row-op records).
     ///
     /// Elision is entered lazily (first successful wave-batched device append
     /// with elision enabled), so warm the table with a few classic inserts
@@ -236,9 +225,6 @@ impl Engine {
             return Err(route_err(
                 "column defaults are not intent-coverable (an intent provides every column)",
             ));
-        }
-        if !self.binary_wal_records_enabled() {
-            return Err(route_err("binary WAL records are disabled"));
         }
         if !self.insert_unique_wave_batchable(&catalog, table) {
             // Route preparation may be the first device-residency touch after startup. When the
@@ -300,10 +286,6 @@ impl Engine {
                     })
             })
             .collect();
-        // E2.2(b): the W5a single-row record lays out the row id at a fixed offset after the
-        // header (tag/ver/op) + table-len prefix + row-count. Encoding uses the bare `table.name`
-        // (the delta mutation's table string), matching the sequencer's binary-record input.
-        let binary_row_id_offset = (3 + 2 + table.name.len() + 4) as u32;
         Ok(CoveredInsertRoute {
             table: table.name.clone(),
             table_oid: table.oid,
@@ -312,7 +294,6 @@ impl Engine {
             sql_prefix: format!("INSERT INTO {} VALUES (", table.name),
             table_arc: std::sync::Arc::from(table_name),
             unique_i32_slots,
-            binary_row_id_offset,
         })
     }
 
@@ -322,12 +303,11 @@ impl Engine {
     /// [`Engine::execute_dml_concurrent`] — duplicate keys raise the same
     /// 23505 `ApplyFailed`, SI conflicts the same retryable `Serialization` —
     /// but the hot path skips SQL parse and `prepare_insert` entirely and
-    /// enqueues the wave item directly. Returns once the canonical transaction
-    /// is durable, device-applied, and contiguously published.
+    /// lowers the typed parameters directly to the ordinary INSERT AST. Returns once the canonical
+    /// transaction is durable, device-applied, and contiguously published.
     ///
-    /// On any eligibility drift (DDL since the route's prepare, de-elision,
-    /// column-count mismatch against a re-created table) this transparently
-    /// falls back to the classic text path, which re-validates everything.
+    /// Eligibility and catalog drift are revalidated by ordinary transaction staging; the route
+    /// owns no fallback writer.
     pub fn execute_covered_insert_intent(
         &self,
         txn_id: u64,
@@ -336,104 +316,17 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         self.check_intent_params(route, params)?;
         let logical_request = route.synthesize_text(params);
-        let request =
-            crate::engine_dml_concurrent::CanonicalRequest::from_text(self, &logical_request);
-        let table_access = match self.acquire_autocommit_table_access_after_retry(
-            &route.table,
+        self.execute_parsed_dml_concurrent_with_result(
             txn_id,
-            request.digest(),
-        )? {
-            StableRetryOr::Terminal(_) => return Ok(()),
-            StableRetryOr::Fresh(access) => access,
-        };
-        // Pin + register the read snapshot exactly like the classic off-lock
-        // prepare (the guard holds the MVCC GC boundary; conflicts() validates
-        // against this snapshot).
-        let read_snapshot = self.committed_seq();
-        let snapshot_guard = self.register_active_snapshot(read_snapshot);
-        match self.build_covered_insert_intent(
-            txn_id,
-            route,
-            params,
+            lower_covered_insert_command(route, params),
             &logical_request,
-            request,
-            read_snapshot,
-        ) {
-            IntentBuild::Item(mut item) => {
-                item.table_access = Some(table_access);
-                self.commit_wave_item_blocking(item)
-            }
-            IntentBuild::Fallback(text) => {
-                drop(snapshot_guard);
-                self.execute_dml_concurrent(txn_id, &text)
-            }
-        }
+        )
+        .map(|_| ())
     }
 
-    /// E2.2(c) — SUBMIT a covered-INSERT intent WITHOUT blocking, returning an [`IntentTicket`].
-    /// A driver thread advances the pipeline via [`Engine::drive_commit_wave`] and reaps the
-    /// ticket with [`Engine::poll_intent`]; N drivers thereby carry M logical clients with no
-    /// per-commit thread park/wake. The read snapshot stays registered (GC/prune boundary) until
-    /// the ticket is polled to completion or dropped (the ticket owns the release: Drop is the
-    /// audit-F2 safety net, so an abandoned ticket cannot pin the GC/prune boundary forever).
-    ///
-    /// On eligibility drift the classic text path is run INLINE (rare) and the ticket returns its
-    /// resolved outcome on the first poll — the async surface never silently skips a validation.
-    /// E2.5b-2 lean build: everything the lane pump needs, nothing more — no
-    /// SQL text, no row-key String, no delta/AST clones, no residency set.
-    /// `None` = eligibility drift (caller falls back to the classic path).
-    fn build_lane_intent(
-        &self,
-        txn_id: u64,
-        route: &CoveredInsertRoute,
-        params: &[i32],
-        request_digest: [u8; 32],
-        read_snapshot: Index,
-    ) -> Option<crate::engine_dml_concurrent::LaneIntent> {
-        let catalog = self.catalog_snapshot();
-        let prepared_catalog_seq = catalog.commit_seq;
-        let table = catalog.relational_catalog.get(&route.table)?;
-        let eligible = prepared_catalog_seq == route.catalog_seq
-            && self.binary_wal_records_enabled()
-            && route.unique_i32_slots.len() == 1
-            && table.columns.len() == route.column_count
-            && self.insert_unique_wave_batchable(&catalog, table);
-        if !eligible {
-            return None;
-        }
-        let values: Vec<SqlValue> = params.iter().map(|&param| SqlValue::Int4(param)).collect();
-        let (slot_id, column_idx) = route.unique_i32_slots[0];
-        let (template, row_id_offset) =
-            crate::wal_binary::try_encode_binary_insert(&route.table, &[(0u64, values.as_slice())])
-                .map(|bytes| {
-                    (
-                        std::sync::Arc::<[u8]>::from(bytes.as_slice()),
-                        route.binary_row_id_offset,
-                    )
-                })?;
-        Some(crate::engine_dml_concurrent::LaneIntent {
-            op: crate::engine_dml_concurrent::LaneOpKind::Insert,
-            txn_id,
-            slot: (slot_id, params[column_idx]),
-            read_snapshot,
-            prepared_catalog_seq,
-            filter_idx: column_idx as u32,
-            row_id_offset,
-            table: std::sync::Arc::clone(&route.table_arc),
-            table_oid: route.table_oid,
-            template,
-            values,
-            outcome: crate::engine_dml_concurrent::new_pending_outcome(),
-            table_access: None,
-            request_digest,
-            transaction_claims: None,
-            outstanding: None,
-            rows_affected: 1,
-            rows_affected_cell: None,
-        })
-    }
-
-    /// Submit with the ENGINE-DEFAULT commit mode (see [`SynchronousCommit`]).
+    /// Submit a covered INSERT and return a ticket. During WRITE-001 convergence the sole
+    /// transaction terminal completes inline and the returned ticket is pre-resolved; callers keep
+    /// the same polling API without retaining the displaced async INSERT writer.
     pub fn submit_covered_insert_intent(
         &self,
         txn_id: u64,
@@ -445,8 +338,7 @@ impl Engine {
 
     /// Submit with an EXPLICIT per-statement commit mode — the PostgreSQL
     /// `SET LOCAL synchronous_commit` analog (see [`SynchronousCommit`] for
-    /// the exact durability contract of each mode). Non-lanes engines ignore
-    /// `Off` and stay strict (the classic path always acks durable).
+    /// the exact durability contract of each mode). Both modes remain strict and durable.
     pub fn submit_covered_insert_intent_with_commit(
         &self,
         txn_id: u64,
@@ -456,114 +348,18 @@ impl Engine {
     ) -> Result<IntentTicket, ExecuteError> {
         self.check_intent_params(route, params)?;
         let logical_request = route.synthesize_text(params);
-        let request =
-            crate::engine_dml_concurrent::CanonicalRequest::from_text(self, &logical_request);
-        let table_access = match self.acquire_autocommit_table_access_after_retry(
-            &route.table,
-            txn_id,
-            request.digest(),
-        )? {
-            StableRetryOr::Terminal(affected_rows) => {
-                return Ok(IntentTicket {
-                    outcome: None,
-                    snapshot_hold: None,
-                    resolved: Some(Ok(affected_rows)),
-                });
-            }
-            StableRetryOr::Fresh(access) => access,
-        };
-        // LEAN LANE PATH: in lanes mode, build the compact LaneIntent and push
-        // straight to its PK lane — CommitWaveItem is never constructed here.
-        if let Some(lanes) = &self.intent_lanes {
-            let read_snapshot = self.committed_seq();
-            std::mem::forget(self.register_active_snapshot(read_snapshot));
-            let snapshot_hold =
-                Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-            if let Some(mut intent) =
-                self.build_lane_intent(txn_id, route, params, request.digest(), read_snapshot)
-            {
-                intent.table_access = Some(table_access);
-                let retry = match self.claim_lane_intent(&mut intent) {
-                    Ok(retry) => retry,
-                    Err(error) => {
-                        self.deregister_active_snapshot(read_snapshot);
-                        return Err(error);
-                    }
-                };
-                if let Some(affected_rows) = retry {
-                    self.deregister_active_snapshot(read_snapshot);
-                    return Ok(IntentTicket {
-                        outcome: None,
-                        snapshot_hold: None,
-                        resolved: Some(Ok(affected_rows)),
-                    });
-                }
-                let outcome = std::sync::Arc::clone(&intent.outcome);
-                // Single lane-ingress point: `submit_lane_intent` carries the
-                // resize-barrier Dekker protocol (count-then-check, hold-queue
-                // divert with strand guard, post-barrier snapshot refresh on
-                // re-route) — see the CRITICAL-audit notes there.
-                self.submit_lane_intent(lanes, intent);
-                return Ok(IntentTicket {
-                    outcome: Some(outcome),
-                    snapshot_hold,
-                    resolved: None,
-                });
-            }
-            // eligibility drift: classic inline fallback (rare). A covered INSERT is
-            // single-row by shape, so a successful classic run affected exactly 1 row.
-            let resolved = self
-                .execute_dml_concurrent(txn_id, &logical_request)
-                .map(|()| 1);
-            self.deregister_active_snapshot(read_snapshot);
-            return Ok(IntentTicket {
-                outcome: None,
-                snapshot_hold: None,
-                resolved: Some(resolved),
-            });
-        }
-        let read_snapshot = self.committed_seq();
-        // Register WITHOUT the RAII guard — the ticket takes an OWNED hold on the registry, so
-        // the boundary is released by the completing poll or the ticket's Drop (audit F2), never
-        // leaked by a dropped-unpolled ticket.
-        std::mem::forget(self.register_active_snapshot(read_snapshot));
-        let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-        match self.build_covered_insert_intent(
-            txn_id,
-            route,
-            params,
-            &logical_request,
-            request,
-            read_snapshot,
-        ) {
-            IntentBuild::Item(mut item) => {
-                item.table_access = Some(table_access);
-                let outcome = match self.submit_commit_wave_item(item) {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        // Enqueue refused (wedged): release the boundary and surface the error.
-                        self.deregister_active_snapshot(read_snapshot);
-                        return Err(err);
-                    }
-                };
-                Ok(IntentTicket {
-                    outcome: Some(outcome),
-                    snapshot_hold,
-                    resolved: None,
-                })
-            }
-            IntentBuild::Fallback(text) => {
-                // Rare drift: run the classic path inline, release the boundary, return a
-                // pre-resolved ticket (poll yields the result once; single-row by shape).
-                let resolved = self.execute_dml_concurrent(txn_id, &text).map(|()| 1);
-                self.deregister_active_snapshot(read_snapshot);
-                Ok(IntentTicket {
-                    outcome: None,
-                    snapshot_hold: None,
-                    resolved: Some(resolved),
-                })
-            }
-        }
+        let resolved = self
+            .execute_parsed_dml_concurrent_with_result(
+                txn_id,
+                lower_covered_insert_command(route, params),
+                &logical_request,
+            )
+            .map(|result| result.rows_affected);
+        Ok(IntentTicket {
+            outcome: None,
+            snapshot_hold: None,
+            resolved: Some(resolved),
+        })
     }
 
     /// U1: prepare a covered-DELETE route for `table` — the by-PK delete twin of
@@ -729,7 +525,6 @@ impl Engine {
         let prepared_catalog_seq = catalog.commit_seq;
         let table = catalog.relational_catalog.get(&route.table)?;
         let eligible = prepared_catalog_seq == route.catalog_seq
-            && self.binary_wal_records_enabled()
             && self.insert_unique_wave_batchable(&catalog, table);
         if !eligible {
             return None;
@@ -950,7 +745,6 @@ impl Engine {
         let prepared_catalog_seq = catalog.commit_seq;
         let table = catalog.relational_catalog.get(&route.table)?;
         let eligible = prepared_catalog_seq == route.catalog_seq
-            && self.binary_wal_records_enabled()
             && table.columns.len() == route.column_count
             && self.insert_unique_wave_batchable(&catalog, table);
         if !eligible {
@@ -1085,115 +879,23 @@ impl Engine {
         }
         Ok(())
     }
-
-    /// Build the wave item for a covered-INSERT intent (shared by the blocking + async arms), or
-    /// fall back to synthesized SQL text on eligibility drift. The pure-function equivalent of
-    /// parse + `prepare_insert` for this shape: identity coercion, PK not-null vacuous for i32
-    /// params, unique check wave-deferred + integer-slotted (a), value index elided-empty, and the
-    /// W5a binary record PRE-ENCODED with a placeholder row id (b).
-    fn build_covered_insert_intent(
-        &self,
-        txn_id: u64,
-        route: &CoveredInsertRoute,
-        params: &[i32],
-        logical_request: &str,
-        request: crate::engine_dml_concurrent::CanonicalRequest,
-        read_snapshot: Index,
-    ) -> IntentBuild {
-        // Re-derive eligibility against the LIVE catalog generation. The gate must match what the
-        // wave sequencer will re-derive under the same generation stamp: a stale route (DDL) or a
-        // de-elided table falls back to the classic path — never a validation skip.
-        let catalog = self.catalog_snapshot();
-        let prepared_catalog_seq = catalog.commit_seq;
-        let table = catalog.relational_catalog.get(&route.table);
-        let eligible = prepared_catalog_seq == route.catalog_seq
-            && self.binary_wal_records_enabled()
-            && table.is_some_and(|table| {
-                table.columns.len() == route.column_count
-                    // COMPOUND KEYS: a table that became compound-keyed (DDL) drops off the fused
-                    // intent path to the classic covered path (see prepare_covered_insert_route).
-                    && !table.indexes.iter().any(|index| {
-                        index.unique && crate::engine_residency::index_is_compound(index)
-                    })
-                    && self.insert_unique_wave_batchable(&catalog, table)
-            });
-        if !eligible {
-            return IntentBuild::Fallback(logical_request.to_string());
-        }
-        let table = table.expect("eligible covered INSERT retained its catalog table");
-
-        let values: Vec<SqlValue> = params.iter().map(|&param| SqlValue::Int4(param)).collect();
-        // E2.2(a): build the ALLOCATION-FREE integer conflict slots from the route's precomputed
-        // (slot_id, column_index) list — no String format, no (table, column) clone.
-        let mut write_set = WriteSet::default();
-        write_set.add_table(table);
-        for &(slot_id, column_idx) in &route.unique_i32_slots {
-            write_set
-                .unique_slots_i32
-                .push((slot_id, params[column_idx]));
-        }
-        let snapshot = self.dml_read_snapshot(read_snapshot);
-        let row_key = relational_row_key(&route.table, snapshot.next_row_id);
-        let delta = WriteDelta {
-            write_set: write_set.clone(),
-            read_snapshot,
-            catalog_dependencies: BTreeMap::from([(route.table.clone(), table.clone())]),
-            foreign_key_dependencies: BTreeSet::new(),
-            rows_consumed: 1,
-            mutation: PreparedMutation::Insert {
-                table: route.table.clone(),
-                inserted_rows: vec![(row_key, values.clone())],
-                seq_advances: BTreeMap::new(),
-            },
-        };
-        // The Insert AST is the wave's validation currency (batched device locate needles; the
-        // Full re-prepare on mid-wave catalog drift) — empty column list = catalog order.
-        let cmd = Command::Insert(Insert {
-            table: route.table.clone(),
-            columns: Vec::new(),
-            rows: vec![values
-                .clone()
-                .into_iter()
-                .map(InsertCell::programmatic)
-                .collect()],
-            returning: Vec::new(),
-        });
-        // E2.2(b): pre-encode the W5a binary record with a PLACEHOLDER row id (0). The sequencer
-        // patches the real id at `binary_row_id_offset`. Encoding is a pure function of the row
-        // image, so this runs OFF the sequencer. `None` (width-exceeding; never for this shape)
-        // leaves the sequencer's per-item encode path in charge.
-        let binary_wal_template =
-            crate::wal_binary::try_encode_binary_insert(&route.table, &[(0u64, values.as_slice())])
-                .map(|bytes| {
-                    (
-                        std::sync::Arc::<[u8]>::from(bytes.as_slice()),
-                        route.binary_row_id_offset,
-                    )
-                });
-        // WAL fallback payload: the sequencer logs the W5a BINARY record for this reuse-eligible
-        // delta; the text payload is written verbatim only on its fallback arms (catalog drift
-        // mid-wave, binary encode decline), so it must stay valid replayable SQL.
-        IntentBuild::Item(self.make_covered_insert_wave_item(
-            txn_id,
-            cmd,
-            request,
-            write_set,
-            read_snapshot,
-            prepared_catalog_seq,
-            Some(delta),
-            binary_wal_template,
-        ))
-    }
 }
 
-/// The outcome of [`Engine::build_covered_insert_intent`]: a ready-to-enqueue wave item, or a
-/// synthesized-SQL fallback for the classic path (eligibility drift).
-// Keep the ready item inline: this is the latency-oriented write-intent path, and boxing every
-// successful intent would add an allocation solely to shrink the rare fallback representation.
-#[allow(clippy::large_enum_variant)]
-enum IntentBuild {
-    Item(crate::engine_dml_concurrent::CommitWaveItem),
-    Fallback(String),
+/// Lower a prepared route without reparsing SQL. Live catalog binding, constraints, defaults,
+/// unique/FK verdicts, allocator ownership, WAL, GPU apply, and publication remain wholly owned by
+/// the ordinary transaction-overlay INSERT terminal.
+fn lower_covered_insert_command(route: &CoveredInsertRoute, params: &[i32]) -> Command {
+    Command::Insert(Insert {
+        table: route.table.clone(),
+        columns: Vec::new(),
+        rows: vec![params
+            .iter()
+            .copied()
+            .map(SqlValue::Int4)
+            .map(InsertCell::programmatic)
+            .collect()],
+        returning: Vec::new(),
+    })
 }
 
 /// E2.2(c) — a handle to a submitted covered-INSERT intent. Poll it with [`Engine::poll_intent`];
@@ -1228,5 +930,64 @@ impl IntentTicket {
 impl Drop for IntentTicket {
     fn drop(&mut self) {
         self.release_snapshot();
+    }
+}
+
+#[cfg(test)]
+mod typed_insert_ingress_tests {
+    use super::*;
+
+    #[test]
+    fn covered_insert_route_uses_codec5_transaction_overlay_and_fresh_replay() {
+        let engine = Engine::new_local_test_engine();
+        engine
+            .execute_text(
+                91_100,
+                "CREATE TABLE typed_intent_route (id int4 PRIMARY KEY, value int4)",
+            )
+            .expect("fixture table creates");
+        engine.set_auto_admit_on_commit(true);
+        engine.set_device_write_locate_wave_batch_enabled(true);
+        let route = engine
+            .prepare_covered_insert_route("typed_intent_route")
+            .expect("device-authoritative int4 route prepares");
+        engine
+            .execute_covered_insert_intent(91_101, &route, &[7, 70])
+            .expect("covered ingress commits through the common terminal");
+
+        let durable = engine.durable_wal_records();
+        let envelope = gpu_db_wal::decode_canonical_record_payload(
+            &durable.last().expect("covered INSERT WAL record").payload,
+        )
+        .unwrap()
+        .expect("covered INSERT uses one canonical envelope");
+        let row_mutation = envelope
+            .fragments
+            .iter()
+            .find(|fragment| fragment.kind == gpu_db_wal::CanonicalFragmentKind::RowMutation)
+            .expect("covered INSERT has one row-mutation fragment");
+        assert_eq!(
+            row_mutation.body.get(8),
+            Some(&crate::typed_insert_aggregate::ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE)
+        );
+        assert_eq!(
+            row_mutation.body.get(76..92),
+            Some(&b"GPUDBTXNAGG1\0\0\0\0"[..])
+        );
+
+        let recovered = Engine::recover_from_durable_wal(&durable).expect("fresh replay succeeds");
+        assert_eq!(
+            recovered
+                .read_state
+                .typed_generation_roots
+                .load_full()
+                .as_ref(),
+            engine
+                .read_state
+                .typed_generation_roots
+                .load_full()
+                .as_ref(),
+            "covered ingress and fresh replay share the exact typed generation lineage"
+        );
     }
 }

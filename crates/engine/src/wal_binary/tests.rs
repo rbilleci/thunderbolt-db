@@ -13,7 +13,7 @@ fn w5a_binary_insert_round_trips() {
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
         .collect();
-    let payload = try_encode_binary_insert("public_t", &rows).unwrap();
+    let payload = encode_historical_binary_insert_fixture("public_t", &rows).unwrap();
     assert!(is_binary_wal_record(&payload));
     assert!(
         std::str::from_utf8(&payload).is_err(),
@@ -28,7 +28,8 @@ fn w5a_binary_insert_round_trips() {
 
 #[test]
 fn w5a_truncated_and_skewed_records_fail_loudly() {
-    let payload = try_encode_binary_insert("t", &[(1, &[SqlValue::Int4(5)])]).unwrap();
+    let payload =
+        encode_historical_binary_insert_fixture("t", &[(1, &[SqlValue::Int4(5)])]).unwrap();
     assert!(decode_binary_insert(&payload[..payload.len() - 1]).is_err());
     let mut skewed = payload.clone();
     skewed[1] = 99; // version
@@ -882,7 +883,7 @@ fn sequence_lifecycle_opcode_requires_a_lifecycle_or_reset_owner() {
     assert!(
         error
             .to_string()
-            .contains("requires a lifecycle or reset identity"),
+            .contains("requires a lifecycle, reset, or generated-sequence owner"),
         "{error}"
     );
 }

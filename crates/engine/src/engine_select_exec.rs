@@ -468,6 +468,8 @@ impl Engine {
             let table = RelationalTable {
                 schema: view.schema,
                 name: view.name,
+                // A materialized-view scan is exposed through a transient row relation here.
+                stable_table_id: 0,
                 oid: view.oid,
                 columns: view.columns,
                 indexes: Vec::new(),
@@ -680,6 +682,60 @@ impl Engine {
             Some(&source),
             None,
         )
+    }
+
+    /// Project an explicit transaction typed INSERT from the just-built private shard. The shard
+    /// carries the already-reserved device payload and its byte-identical single-buffer descriptor,
+    /// so this is a normal GPU projection over the statement's exact final vectors—not a decoded
+    /// host row matrix or a second source upload.
+    pub(crate) fn project_typed_insert_returning_from_private_shard(
+        &self,
+        table: &RelationalTable,
+        returning: &[String],
+        shard: &RelationalResidentShard,
+        read_snapshot: Index,
+    ) -> Result<Option<RelationalSelectResult>, ExecuteError> {
+        if returning.is_empty() {
+            return Ok(None);
+        }
+        let device_memory = shard.device_memory.clone().ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "typed transaction INSERT RETURNING private shard lost device memory".to_string(),
+            ))
+        })?;
+        let select = Select {
+            table: table.name.clone(),
+            public_only: false,
+            distinct: false,
+            projection: SelectProjection::Columns(returning.to_vec()),
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let bound = bind_relational_select(table, &select)?;
+        let source = ResidentExecSource {
+            descriptor: Arc::new(self.resident_snapshot_for_shard(shard, table)),
+            device_memory,
+            row_count: u64::try_from(shard.row_count).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed transaction INSERT RETURNING row count exceeds u64".to_string(),
+                ))
+            })?,
+        };
+        self.execute_resident_grouped_via_general_with_binding(
+            &select,
+            table,
+            bound,
+            read_snapshot,
+            Some(&source),
+            None,
+        )
+        .map(Some)
     }
 
     /// Project a DML statement's final resolved row images through the general GPU result path.
@@ -1069,6 +1125,7 @@ fn typed_scalar_table(
     RelationalTable {
         schema,
         name: relation_name,
+        stable_table_id: 0,
         oid: relation_oid,
         columns: vec![column],
         indexes: Vec::new(),

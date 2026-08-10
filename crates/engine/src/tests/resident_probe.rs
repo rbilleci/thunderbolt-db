@@ -313,152 +313,25 @@ fn resident_snapshot_budget_keeps_wal_and_pressure_invalidation_semantics() {
 }
 
 #[test]
-fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() {
-    let mut e = Engine::new_local_test_engine();
+fn gpu_native_empty_create_fails_before_visibility_when_cuda_is_unavailable() {
+    let e = Engine::new_local_test_engine();
     let _ = e
         .cached_cuda_probe_runtime
         .set(CudaDriverRuntime::unavailable());
-    e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
-        .unwrap();
-
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
-    assert_eq!(snapshot.device_memory_proof, None);
-    assert_eq!(e.read_state.residency.device_memory.len(), 0);
-
-    let status = e.status_snapshot();
-    assert_eq!(
-        status
-            .relational_residency
-            .table("events")
-            .unwrap()
-            .device_memory_proof,
-        None
+    let error = e
+        .execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("DriverLibraryUnavailable"),
+        "unexpected unavailable-CUDA CREATE error: {error}"
     );
-
-    let Command::Select(select) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
-        unreachable!()
-    };
-    let err = e.execute_resident_plan(&select).unwrap_err().to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    let Command::Select(filtered_select) =
-        parse_command("SELECT COUNT(*) FROM events WHERE id = 1").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_resident_plan(&filtered_select)
+    assert_eq!(e.visible_up_to(), 0);
+    assert_eq!(e.read_state.residency.device_memory.len(), 0);
+    assert!(e
+        .ensure_commit_path_available()
         .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    // (text_prefix_like_count is no longer a probe -- S10a routed it to the `&Select`->general bridge;
-    // its device-memory guard is the bridge's, covered by the bridge-routed shapes' tests.)
-
-    let Command::Select(membership_select) =
-        parse_command("SELECT COUNT(*) FROM events WHERE id IN (1, 2)").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_relational_membership_count_with_resident_device_memory_probe(&membership_select)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    let Command::Select(range_select) =
-        parse_command("SELECT COUNT(*) FROM events WHERE id >= 1").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_resident_plan(&range_select)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    let Command::Select(sum_select) = parse_command("SELECT SUM(id) FROM events").unwrap() else {
-        unreachable!()
-    };
-    let err = e
-        .execute_resident_plan(&sum_select)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    let Command::Select(avg_select) = parse_command("SELECT AVG(id) FROM events").unwrap() else {
-        unreachable!()
-    };
-    let err = e
-        .execute_resident_plan(&avg_select)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    let Command::Select(filtered_avg_select) =
-        parse_command("SELECT AVG(id) FROM events WHERE id >= 1").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_resident_plan(&filtered_avg_select)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    // S8: grouped aggregates run via the `&Select`->general bridge (the resident-probe grouped methods
-    // were retired); with no retained device memory it errors cleanly, like the other resident paths.
-    let Command::Select(grouped_sum_select) =
-        parse_command("SELECT id, SUM(id) FROM events GROUP BY id").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_resident_grouped_via_general(&grouped_sum_select, None, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    // S10a: the int4 projection shapes now run via the `&Select`->general bridge (the legacy
-    // resident-probe projection methods were retired); with no retained device memory it errors cleanly.
-    let Command::Select(projection_select) =
-        parse_command("SELECT id FROM events WHERE id >= 1").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_resident_grouped_via_general(&projection_select, None, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    let Command::Select(ordered_projection_select) =
-        parse_command("SELECT id FROM events WHERE id >= 1 ORDER BY id DESC LIMIT 1").unwrap()
-    else {
-        unreachable!()
-    };
-    // S10a: the ordered projection now runs via the `&Select`->general bridge (the legacy
-    // resident-probe ordered method was retired); with no retained device memory it errors cleanly,
-    // like the grouped bridge above.
-    let err = e
-        .execute_resident_grouped_via_general(&ordered_projection_select, None, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
-
-    let Command::Select(distinct_projection_select) =
-        parse_command("SELECT DISTINCT id FROM events ORDER BY id").unwrap()
-    else {
-        unreachable!()
-    };
-    // S10b: SELECT DISTINCT now runs via the `&Select`->general DISTINCT bridge (the legacy
-    // resident-probe distinct methods were retired); with no retained device memory it errors cleanly,
-    // like the grouped/ordered bridges above.
-    let err = e
-        .execute_resident_distinct_via_general(&distinct_projection_select, None, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
+        .to_string()
+        .contains("commit path is wedged"));
 }
 
 #[test]

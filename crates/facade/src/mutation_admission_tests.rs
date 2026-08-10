@@ -60,7 +60,7 @@ fn compatibility_reads_stay_outside_mutation_admission() {
 }
 
 #[test]
-fn nonconcurrent_returning_remains_unsupported_and_pre_effect() {
+fn unresolved_insert_returning_fails_before_sequence_or_wal_claim() {
     let shared = SharedEngine::new();
     let mut session = shared.open_session();
     let (visible_before, wal_before) = {
@@ -73,11 +73,8 @@ fn nonconcurrent_returning_remains_unsupported_and_pre_effect() {
         "INSERT INTO missing VALUES (1) RETURNING id",
     )
     .unwrap_err();
-    assert_eq!(error.category, ErrorCategory::Unsupported);
-    assert_eq!(
-        error.message,
-        "DML RETURNING requires the GPU-native concurrent mutation path"
-    );
+    assert_eq!(error.category, ErrorCategory::UndefinedRelation);
+    assert_eq!(error.message, "relation does not exist");
     let engine = shared.read_engine().unwrap();
     assert_eq!(engine.visible_up_to(), visible_before);
     assert_eq!(engine.durable_wal_records().len(), wal_before);
@@ -207,6 +204,158 @@ fn typed_copy_uses_canonical_admission_and_explicit_transaction_publication() {
         panic!("observer SELECT must return rows outcome")
     };
     assert_eq!(rows, vec![vec![DbValue::Text(String::new())]]);
+}
+
+/// Retain protocol COPY target proofs across a concurrent pair while the table is device resident.
+/// This is the facade-level counterpart to the pgwire lifetime hazard: every acknowledged COPY
+/// must remain visible after the pair completes, including a NULL in an unreferenced column.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn concurrent_gpu_copy_targets_retain_every_acknowledged_row() {
+    let engine = Engine::new_local();
+    engine.set_shard_residency_enabled(true);
+    engine.set_shard_size_target(64);
+    engine.set_shard_index_probe_enabled(true);
+    engine.set_shard_batched_point_read_enabled(true);
+    engine.set_auto_admit_on_commit(true);
+    let shared = Arc::new(SharedEngine::from_engine(engine));
+    let mut setup = shared.open_session();
+    submit_text(
+        &shared,
+        &mut setup,
+        "CREATE TABLE facade_copy_hazard (id INT PRIMARY KEY, note INT)",
+    )
+    .unwrap();
+    let seed = (0..128)
+        .map(|id| format!("({id}, {id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    submit_text(
+        &shared,
+        &mut setup,
+        &format!("INSERT INTO facade_copy_hazard (id, note) VALUES {seed}"),
+    )
+    .unwrap();
+
+    let copy = CopyFromStdin {
+        table: "facade_copy_hazard".to_string(),
+        columns: Some(vec!["id".to_string(), "note".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+    for (id, note) in [
+        (1_001, DbValue::Null),
+        (1_002, DbValue::Int4(0)),
+        (1_003, DbValue::Int4(7)),
+    ] {
+        let QueryOutcome::CopyIn { target } = shared
+            .submit(&mut setup, SubmissionRequest::CopyFromStart(&copy))
+            .into_immediate()
+            .unwrap()
+        else {
+            panic!("COPY start must return a target proof")
+        };
+        assert!(matches!(
+            shared
+                .submit(
+                    &mut setup,
+                    SubmissionRequest::CopyFrom {
+                        target: &target,
+                        rows: vec![vec![DbValue::Int4(id), note]],
+                    },
+                )
+                .into_immediate()
+                .unwrap(),
+            QueryOutcome::Command {
+                tag: CommandTag::Copy,
+                rows_affected: Some(1),
+            }
+        ));
+    }
+
+    let mut left_session = shared.open_session();
+    let QueryOutcome::CopyIn {
+        target: left_target,
+    } = shared
+        .submit(&mut left_session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("left COPY start must return a target proof")
+    };
+    let mut right_session = shared.open_session();
+    let QueryOutcome::CopyIn {
+        target: right_target,
+    } = shared
+        .submit(&mut right_session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("right COPY start must return a target proof")
+    };
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        let left_shared = Arc::clone(&shared);
+        let left_barrier = Arc::clone(&barrier);
+        scope.spawn(move || {
+            left_barrier.wait();
+            assert!(matches!(
+                left_shared
+                    .submit(
+                        &mut left_session,
+                        SubmissionRequest::CopyFrom {
+                            target: &left_target,
+                            rows: vec![vec![DbValue::Int4(1_004), DbValue::Null]],
+                        },
+                    )
+                    .into_immediate()
+                    .unwrap(),
+                QueryOutcome::Command {
+                    tag: CommandTag::Copy,
+                    rows_affected: Some(1),
+                }
+            ));
+        });
+        let right_shared = Arc::clone(&shared);
+        let right_barrier = Arc::clone(&barrier);
+        scope.spawn(move || {
+            right_barrier.wait();
+            assert!(matches!(
+                right_shared
+                    .submit(
+                        &mut right_session,
+                        SubmissionRequest::CopyFrom {
+                            target: &right_target,
+                            rows: vec![vec![DbValue::Int4(1_005), DbValue::Int4(0)]],
+                        },
+                    )
+                    .into_immediate()
+                    .unwrap(),
+                QueryOutcome::Command {
+                    tag: CommandTag::Copy,
+                    rows_affected: Some(1),
+                }
+            ));
+        });
+    });
+
+    let QueryOutcome::Rows { rows, .. } = submit_text(
+        &shared,
+        &mut setup,
+        "SELECT id, note FROM facade_copy_hazard WHERE id >= 1001 ORDER BY id",
+    )
+    .unwrap() else {
+        panic!("COPY rows must remain queryable")
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![DbValue::Int4(1_001), DbValue::Null],
+            vec![DbValue::Int4(1_002), DbValue::Int4(0)],
+            vec![DbValue::Int4(1_003), DbValue::Int4(7)],
+            vec![DbValue::Int4(1_004), DbValue::Null],
+            vec![DbValue::Int4(1_005), DbValue::Int4(0)],
+        ]
+    );
 }
 
 #[test]

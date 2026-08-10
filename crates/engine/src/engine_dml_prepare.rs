@@ -16,7 +16,6 @@ pub(crate) use unique_conflict::RESIDENT_EXACT_KEY_FULL_SCAN_PROBES;
 use contracts::device_eq_scan_literal;
 pub(crate) use contracts::{
     dml_filter_groups_to_device_predicate, AppliedInsert, DmlResolvedMatch, DmlResolvedUpdate,
-    InsertPrepareValidation,
 };
 
 impl Engine {
@@ -58,7 +57,6 @@ impl Engine {
         insert: &Insert,
         snapshot: DmlReadSnapshot,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
-        validation: InsertPrepareValidation,
     ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
         // Lock-free concurrent-DML path (Stage 2 — blocker #1): PIN ONE catalog generation and
@@ -208,24 +206,6 @@ impl Engine {
         let has_constraints = table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()
             || !table.foreign_keys.is_empty();
-        // The under-lock re-resolve skips the redundant unique/CHECK pass on FK-free tables: exact
-        // device version history plus wave-local arbitration is the commit-time guard (see
-        // [`InsertPrepareValidation`] for the coverage proof).
-        let device_covered = validation == InsertPrepareValidation::ReResolveDeviceCovered
-            && table.foreign_keys.is_empty();
-        // M1 design B (wave-time batched validation): eligible INSERTs DEFER the PK-unique check
-        // to the wave sequencer (one batched device locate for the whole wave). The off-lock
-        // prepare here skips it; the sequencer re-validates via `wave_batch_validate_unique`
-        // (SHARED eligibility `insert_unique_wave_batchable` -> no bypass). PK not-null already
-        // ran above; eligible tables have only unique indexes (no CHECK/FK), so the whole
-        // constraint pass is deferred. Off the wave path (serialized apply, Full validation)
-        // this is never set -> unchanged.
-        // Scoped to SINGLE-ROW inserts: a multi-row insert's in-statement dup (two rows, same PK)
-        // is caught by the off-lock `seen` set but NOT by a pre-wave device locate, so multi-row
-        // keeps the off-lock path. The bench + common OLTP shape is single-row.
-        let wave_deferred = validation == InsertPrepareValidation::WaveOffLock
-            && insert.rows.len() == 1
-            && self.insert_unique_wave_batchable(&catalog, table);
         // P5-2 (S-E.P5, the KEYED-CLASS lift): a CHUNK-AUTHORITATIVE keyed table validates
         // uniqueness ON-DEVICE. The reclaimed tuple store is not a relational authority, so a
         // device verdict is the sole admission decision: probe the per-chunk key indexes and
@@ -246,27 +226,22 @@ impl Engine {
                 }
             }
         }
-        if device_covered || wave_deferred {
-            // fall through to encode: PK not-null ran; uniqueness is device-history-covered or
-            // deferred to the wave batch (B).
-        } else {
-            if has_constraints {
-                let validate_started = Instant::now();
-                self.validate_dml_constraints_via_device(
-                    &catalog,
-                    table,
-                    &new_rows,
-                    &[],
-                    &BTreeSet::new(),
-                    StorageVisibility {
-                        read_txn_id: txn_id,
-                    },
-                )?;
-                if let Some(profile) = profile.as_mut() {
-                    // The index-driven pass validates all three dimensions in one call; its cost
-                    // lands in the unique bucket (the first the scan path would have charged).
-                    profile.unique_preflight_micros += validate_started.elapsed().as_micros();
-                }
+        if has_constraints {
+            let validate_started = Instant::now();
+            self.validate_dml_constraints_via_device(
+                &catalog,
+                table,
+                &new_rows,
+                &[],
+                &BTreeSet::new(),
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?;
+            if let Some(profile) = profile.as_mut() {
+                // The index-driven pass validates all three dimensions in one call; its cost
+                // lands in the unique bucket (the first the scan path would have charged).
+                profile.unique_preflight_micros += validate_started.elapsed().as_micros();
             }
         }
 

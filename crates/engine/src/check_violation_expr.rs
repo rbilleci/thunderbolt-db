@@ -522,6 +522,7 @@ mod tests {
         RelationalTable {
             schema: "public".to_string(),
             name: "checks".to_string(),
+            stable_table_id: 1,
             oid: 1,
             columns: vec![crate::RelationalColumn {
                 id: 1,

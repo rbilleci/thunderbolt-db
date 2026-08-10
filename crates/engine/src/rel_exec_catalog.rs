@@ -147,6 +147,7 @@ pub(crate) fn catalog_relation_table(
     RelationalTable {
         schema: schema.to_string(),
         name: name.to_string(),
+        stable_table_id: 0,
         oid: 0,
         columns,
         indexes: Vec::new(),

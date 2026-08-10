@@ -30,7 +30,6 @@ fn main() {
         let e = Engine::with_durable_wal_segment(&path);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         if binary {
-            e.set_binary_wal_records_enabled(true);
             for i in 0..rows {
                 e.execute_dml_concurrent(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 1)"))
                     .unwrap();

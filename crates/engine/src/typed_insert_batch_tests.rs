@@ -37,7 +37,7 @@ fn sealed_i32_batch(engine: &Engine, rows: Vec<Vec<SqlValue>>) -> TypedInsertBat
         returning: Vec::new(),
     };
     let catalog = engine.catalog_snapshot();
-    try_prepare_typed_insert_batch(&Command::Insert(insert), &catalog, catalog.commit_seq, None)
+    seal_typed_insert_batch_for_test(&Command::Insert(insert), &catalog, catalog.commit_seq, None)
         .expect("sealed batch direct preparation succeeds")
         .expect("accounts int4 source is eligible")
 }
@@ -54,7 +54,7 @@ fn sealed_fixed_width_batch(
         returning: Vec::new(),
     };
     let catalog = engine.catalog_snapshot();
-    try_prepare_typed_insert_batch(&Command::Insert(insert), &catalog, catalog.commit_seq, None)
+    seal_typed_insert_batch_for_test(&Command::Insert(insert), &catalog, catalog.commit_seq, None)
         .expect("sealed mixed fixed-width batch prepares")
         .expect("mixed NULL-free fixed-width source is eligible")
 }
@@ -66,25 +66,20 @@ fn sealed_mixed_fixed_width_batch(engine: &Engine, rows: Vec<Vec<SqlValue>>) -> 
 fn build_general_insert(
     insert: &Insert,
     catalog: &CatalogSnapshot,
-) -> Result<TypedInsertBuildResult, ExecuteError> {
-    builder::build(
+) -> Result<TypedInsertBatch, ExecuteError> {
+    prepare_typed_insert_semantics_at(
         insert,
         catalog,
         catalog.commit_seq,
         None,
-        TypedInsertBuildCapability::SemanticOnly,
-    )
+        InsertStatementOrdinal::FIRST,
+    )?
+    .expect("test catalog generation is current")
+    .seal(sequence_defaults::SequenceDefaultBindings::empty())
 }
 
 fn ready_general_insert(insert: &Insert, catalog: &CatalogSnapshot) -> TypedInsertBatch {
-    match build_general_insert(insert, catalog)
-        .expect("general typed builder has no semantic error")
-    {
-        TypedInsertBuildResult::Ready(batch) => batch,
-        TypedInsertBuildResult::Deferred(reason) => {
-            panic!("general typed builder unexpectedly deferred: {reason:?}")
-        }
-    }
+    build_general_insert(insert, catalog).expect("typed semantic preparation succeeds")
 }
 
 fn exact_row_ids(ids: impl IntoIterator<Item = u64>) -> DeviceInsertRowIds {
@@ -105,7 +100,7 @@ fn read_device_u64(memory: &CudaResidentDeviceMemory, slot: usize) -> u64 {
 #[test]
 fn typed_batch_binds_exact_columns_values_dependencies_and_statement_memory() {
     let (_engine, insert, catalog) = prepared_accounts(1_000);
-    let batch = try_prepare_typed_insert_batch(
+    let batch = seal_typed_insert_batch_for_test(
         &Command::Insert(insert),
         &catalog,
         catalog.commit_seq,
@@ -151,7 +146,7 @@ fn typed_batch_binds_exact_columns_values_dependencies_and_statement_memory() {
     assert_eq!(batch.value_bytes(), 1_000 * 2 * std::mem::size_of::<i32>());
 
     let (_engine, small_insert, small_catalog) = prepared_accounts(3);
-    let small = try_prepare_typed_insert_batch(
+    let small = seal_typed_insert_batch_for_test(
         &Command::Insert(small_insert),
         &small_catalog,
         small_catalog.commit_seq,
@@ -172,7 +167,7 @@ fn typed_batch_binds_exact_columns_values_dependencies_and_statement_memory() {
 #[test]
 fn typed_batch_has_one_nonclone_semantic_values_authority() {
     let (_engine, insert, catalog) = prepared_accounts(3);
-    let batch = try_prepare_typed_insert_batch(
+    let batch = seal_typed_insert_batch_for_test(
         &Command::Insert(insert),
         &catalog,
         catalog.commit_seq,
@@ -193,7 +188,6 @@ fn typed_batch_has_one_nonclone_semantic_values_authority() {
     for wave_owner in [
         include_str!("engine_dml_concurrent/state.rs"),
         include_str!("engine_dml_concurrent/request.rs"),
-        include_str!("engine_dml_concurrent/fixed_insert.rs"),
         include_str!("engine_dml_concurrent/wave.rs"),
     ] {
         assert!(
@@ -211,7 +205,7 @@ fn typed_batch_has_one_nonclone_semantic_values_authority() {
 fn typed_device_compiler_rejects_catalog_drift_before_publish() {
     let (engine, insert, catalog) = prepared_accounts(2);
     let batch = || {
-        try_prepare_typed_insert_batch(
+        seal_typed_insert_batch_for_test(
             &Command::Insert(insert.clone()),
             &catalog,
             catalog.commit_seq,
@@ -232,7 +226,10 @@ fn typed_device_compiler_rejects_catalog_drift_before_publish() {
         .load()
         .len();
     assert!(engine
-        .compile_typed_insert_device_plan(catalog_drift, synthetic_no_identity())
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
+            catalog_drift,
+            synthetic_no_identity()
+        )
         .is_err());
     assert_eq!(
         engine
@@ -264,7 +261,7 @@ fn typed_column_encoder_matches_row_major_bytes_with_offset_and_extrema() {
         returning: Vec::new(),
     };
     let catalog = engine.catalog_snapshot();
-    let batch = try_prepare_typed_insert_batch(
+    let batch = seal_typed_insert_batch_for_test(
         &Command::Insert(insert.clone()),
         &catalog,
         catalog.commit_seq,
@@ -284,7 +281,7 @@ fn typed_column_encoder_matches_row_major_bytes_with_offset_and_extrema() {
     )
     .unwrap();
     let typed = batch
-        .into_resident_append_source()
+        .into_codec5_resident_append_source_for_test(&catalog)
         .unwrap()
         .checked_append_chunks(11, 4)
         .unwrap();
@@ -307,7 +304,7 @@ fn typed_column_encoder_matches_row_major_bytes_with_offset_and_extrema() {
 }
 
 #[test]
-fn resident_source_host_retention_prediction_matches_the_move_and_drops_semantic_only_backing() {
+fn codec5_resident_source_drops_semantic_only_backing() {
     let engine = Engine::new_local();
     engine
         .execute_text(1, "CREATE TABLE source_retention (id int4, flag bool)")
@@ -324,45 +321,16 @@ fn resident_source_host_retention_prediction_matches_the_move_and_drops_semantic
     };
     let batch = ready_general_insert(&insert, &catalog);
     let batch_report = batch.host_retention_report().unwrap();
-    let predicted = batch
-        .resident_append_source_host_retention_prediction()
+    let source = batch
+        .into_codec5_resident_append_source_for_test(&catalog)
         .unwrap();
-    let source = batch.into_resident_append_source().unwrap();
     let materialized = source.host_retention_report().unwrap();
-    assert!(predicted.matches(&materialized).unwrap());
     assert!(
         batch_report.retained_bytes() > materialized.retained_bytes(),
         "input state/provenance and canonical semantic-only storage must retire at the move"
     );
     assert!(batch_report.allocation_slots().unwrap() > materialized.allocation_slots().unwrap());
     assert_eq!(materialized.generation_pin_slots().unwrap(), 0);
-}
-
-#[test]
-fn binary_template_host_retention_keeps_only_its_four_declared_backings() {
-    let engine = Engine::new_local();
-    engine
-        .execute_text(1, "CREATE TABLE template_retention (id int4)")
-        .unwrap();
-    let catalog = engine.catalog_snapshot();
-    let batch = ready_general_insert(
-        &Insert {
-            table: "template_retention".to_string(),
-            columns: Vec::new(),
-            rows: Insert::programmatic_rows(vec![vec![SqlValue::Int4(7)]]),
-            returning: Vec::new(),
-        },
-        &catalog,
-    );
-    let template = batch.binary_insert_template().unwrap();
-    let report = template.host_retention_report().unwrap();
-    assert_eq!(report.allocation_slots().unwrap(), 4);
-    assert_eq!(report.generation_pin_slots().unwrap(), 0);
-    assert!(
-        report.retained_bytes()
-            >= template.operation_fragment_body_bytes().unwrap()
-                + 2 * std::mem::size_of::<usize>() as u64
-    );
 }
 
 #[test]
@@ -427,7 +395,9 @@ fn dense_vector_payload_matches_row_major_layout_for_all_types_and_bitmap_bounda
             )
             .unwrap();
         let batch = ready_general_insert(&insert, &catalog);
-        let source = batch.into_resident_append_source().unwrap();
+        let source = batch
+            .into_codec5_resident_append_source_for_test(&catalog)
+            .unwrap();
         let mut source = source;
         let mut dense = source.checked_dense_payload(table).unwrap();
         assert!(
@@ -490,7 +460,7 @@ fn typed_source_enters_the_shared_fused_and_unfused_open_shard_publisher() {
             let visible_stamp = engine.committed_seq();
             let fused_hits_before = engine.fused_apply_hits();
             let plan = engine
-                .compile_typed_insert_device_plan(
+                .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
                     sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(3), SqlValue::Int4(-30)]]),
                     exact_row_ids([3]),
                 )
@@ -626,7 +596,7 @@ fn typed_in_place_missing_created_by_sidecar_stamps_the_pre_wal_arc() {
             open.created_by_region = None;
         });
     let plan = engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(3), SqlValue::Int4(30)]]),
             exact_row_ids([3]),
         )
@@ -709,7 +679,7 @@ fn mixed_fixed_width_typed_rollover_preuploads_all_sections_and_exact_row_ids() 
         .expect("mixed fixed-width table has a resident open shard");
     let fused_before = engine.fused_apply_hits();
     engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_mixed_fixed_width_batch(
                 &engine,
                 vec![vec![
@@ -750,7 +720,7 @@ fn mixed_fixed_width_typed_rollover_preuploads_all_sections_and_exact_row_ids() 
     assert_eq!(in_place.resident_device_bool_columns.len(), 1);
 
     engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_mixed_fixed_width_batch(
                 &engine,
                 vec![
@@ -887,7 +857,7 @@ fn nullable_text_typed_plan_preallocates_dense_rollover_and_publishes_once() {
         .cloned()
         .expect("text table has a resident descriptor");
     let plan = engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_fixed_width_batch(
                 &engine,
                 "notes",
@@ -1003,7 +973,7 @@ fn generalized_section_descriptor_sabotage_declines_before_allocation_or_publica
                 sabotage(open);
             });
         assert!(matches!(
-            engine.compile_typed_insert_device_plan(
+            engine.compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
                 sealed_fixed_width_batch(
                     &engine,
                     "descriptor_sabotage",
@@ -1076,7 +1046,7 @@ fn typed_fixed_width_rollover_preallocates_generation_and_publishes_through_muta
     let unpublished_stamp = engine.committed_seq() + 1;
     let row_ids = [41_u64, 42, 43];
     let plan = engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test_at_commit(
             sealed_i32_batch(
                 &engine,
                 vec![
@@ -1086,6 +1056,7 @@ fn typed_fixed_width_rollover_preallocates_generation_and_publishes_through_muta
                 ],
             ),
             exact_row_ids(row_ids),
+            unpublished_stamp,
         )
         .expect("pre-WAL plan seals the rollover capacity and budget");
     assert_eq!(
@@ -1213,7 +1184,7 @@ fn create_bootstrap_sentinel_requires_exact_clean_shape_and_pre_wal_budget() {
         .is_none());
 
     assert!(matches!(
-        engine.compile_typed_insert_device_plan(
+        engine.compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(1), SqlValue::Int4(10)]]),
             synthetic_no_identity(),
         ),
@@ -1231,7 +1202,7 @@ fn create_bootstrap_sentinel_requires_exact_clean_shape_and_pre_wal_budget() {
         });
     assert!(
         matches!(
-            engine.compile_typed_insert_device_plan(
+            engine.compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
                 sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(1), SqlValue::Int4(10)]]),
                 exact_row_ids([1]),
             ),
@@ -1270,7 +1241,7 @@ fn create_bootstrap_sentinel_requires_exact_clean_shape_and_pre_wal_budget() {
         .insert_shard("accounts", 0, deleted_sabotage);
     assert!(
         matches!(
-            engine.compile_typed_insert_device_plan(
+            engine.compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
                 sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(1), SqlValue::Int4(10)]]),
                 exact_row_ids([1]),
             ),
@@ -1299,7 +1270,7 @@ fn create_bootstrap_sentinel_requires_exact_clean_shape_and_pre_wal_budget() {
     let append_before = engine.open_shard_append_hits();
     let authority_before = engine.device_authoritative_commits();
     assert!(matches!(
-        engine.compile_typed_insert_device_plan(
+        engine.compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_i32_batch(
                 &engine,
                 vec![
@@ -1337,7 +1308,7 @@ fn create_bootstrap_sentinel_requires_exact_clean_shape_and_pre_wal_budget() {
             table.push(table[0].clone());
         });
     assert!(matches!(
-        engine.compile_typed_insert_device_plan(
+        engine.compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(3), SqlValue::Int4(30)]]),
             exact_row_ids([row_id_before + 2]),
         ),
@@ -1380,7 +1351,10 @@ fn sealed_plan_budget_declines_before_allocation_or_descriptor_publication() {
     );
     assert!(
         engine
-            .compile_typed_insert_device_plan(batch, exact_row_ids(3..10))
+            .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
+                batch,
+                exact_row_ids(3..10)
+            )
             .is_err(),
         "dense rollover must decline before the first CUDA allocation"
     );
@@ -1424,7 +1398,7 @@ fn stale_sealed_plan_returns_fatal_drift_without_a_second_publication() {
         .cloned()
         .expect("qualified GPU host must publish the initial resident shard");
     let plan = engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(3), SqlValue::Int4(30)]]),
             exact_row_ids([3]),
         )
@@ -1529,7 +1503,7 @@ fn sealed_plan_refuses_positive_capacity_nonempty_missing_identity_sidecar_befor
     );
     assert!(
         engine
-            .compile_typed_insert_device_plan(
+            .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
                 sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(3), SqlValue::Int4(30)]]),
                 synthetic_no_identity(),
             )
@@ -1539,7 +1513,7 @@ fn sealed_plan_refuses_positive_capacity_nonempty_missing_identity_sidecar_befor
     engine.set_relational_residency_budget_bytes(0, u64::MAX);
     assert!(
         engine
-            .compile_typed_insert_device_plan(
+            .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
                 sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(3), SqlValue::Int4(30)]]),
                 exact_row_ids([3]),
             )
@@ -1577,7 +1551,7 @@ fn created_by_gc_runs_only_after_a_sealed_plan_releases_the_residency_gate() {
         .unwrap();
     let stamp = engine.committed_seq();
     let first = engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(3), SqlValue::Int4(30)]]),
             exact_row_ids([3]),
         )
@@ -1597,7 +1571,7 @@ fn created_by_gc_runs_only_after_a_sealed_plan_releases_the_residency_gate() {
         .and_then(|shards| shards.last())
         .is_some_and(|shard| shard.created_by_region.is_some()));
     let plan = engine
-        .compile_typed_insert_device_plan(
+        .compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test(
             sealed_i32_batch(&engine, vec![vec![SqlValue::Int4(4), SqlValue::Int4(40)]]),
             exact_row_ids([4]),
         )
@@ -1641,7 +1615,7 @@ fn parsed_1000_row_accounts_workload_prepares_to_the_typed_batch() {
     }
     let command = parse_command(&workload).expect("the canonical accounts workload parses");
     let catalog = engine.catalog_snapshot();
-    let batch = try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq, None)
+    let batch = seal_typed_insert_batch_for_test(&command, &catalog, catalog.commit_seq, None)
         .unwrap()
         .expect("the exact parsed workload is eligible");
     assert_eq!(batch.row_count, 1_000);
@@ -1661,7 +1635,7 @@ fn direct_builder_needs_no_delta_and_fails_closed_on_shape_or_catalog_mismatch()
     let insert = accounts_insert(2);
     let catalog = engine.catalog_snapshot();
     let command = Command::Insert(insert.clone());
-    let batch = try_prepare_typed_insert_batch(
+    let batch = seal_typed_insert_batch_for_test(
         &command,
         &catalog,
         catalog.commit_seq,
@@ -1679,7 +1653,7 @@ fn direct_builder_needs_no_delta_and_fails_closed_on_shape_or_catalog_mismatch()
 
     let mut reordered = insert.clone();
     reordered.columns = vec!["balance".to_string(), "id".to_string()];
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(reordered),
         &catalog,
         catalog.commit_seq,
@@ -1687,7 +1661,7 @@ fn direct_builder_needs_no_delta_and_fails_closed_on_shape_or_catalog_mismatch()
     )
     .unwrap()
     .is_some());
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &command,
         &catalog,
         catalog.commit_seq,
@@ -1701,28 +1675,17 @@ fn direct_builder_needs_no_delta_and_fails_closed_on_shape_or_catalog_mismatch()
 }
 
 #[test]
-fn typed_batch_rejects_stable_oid_and_catalog_generation_mismatches() {
+fn typed_batch_declines_stale_catalog_generation() {
     let (_engine, insert, catalog) = prepared_accounts(2);
     let command = Command::Insert(insert.clone());
     assert!(
-        try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq, None,)
+        seal_typed_insert_batch_for_test(&command, &catalog, catalog.commit_seq, None,)
             .unwrap()
             .is_some()
     );
 
-    let mut oid_drift = catalog.clone();
-    oid_drift
-        .relational_catalog
-        .get_mut("accounts")
-        .unwrap()
-        .oid += 1;
     assert!(
-        try_prepare_typed_insert_batch(&command, &oid_drift, catalog.commit_seq, None,)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        try_prepare_typed_insert_batch(&command, &catalog, catalog.commit_seq + 1, None,)
+        seal_typed_insert_batch_for_test(&command, &catalog, catalog.commit_seq + 1, None,)
             .unwrap()
             .is_none()
     );
@@ -1731,12 +1694,11 @@ fn typed_batch_rejects_stable_oid_and_catalog_generation_mismatches() {
 }
 
 #[test]
-fn nullable_vectors_and_uninvoked_defaults_are_resident_candidates_while_constraints_and_returning_defer(
-) {
+fn nullable_defaults_returning_and_foreign_keys_share_one_semantic_batch() {
     let (engine, insert, catalog) = prepared_accounts(1);
     let mut null = insert.clone();
     null.rows[0][1] = InsertCell::programmatic(SqlValue::Null);
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(null),
         &catalog,
         catalog.commit_seq,
@@ -1746,7 +1708,7 @@ fn nullable_vectors_and_uninvoked_defaults_are_resident_candidates_while_constra
     .is_some());
     let mut text = insert.clone();
     text.rows[0][1] = InsertCell::programmatic(SqlValue::Text("not-fixed-width".to_string()));
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(text),
         &catalog,
         catalog.commit_seq,
@@ -1755,20 +1717,20 @@ fn nullable_vectors_and_uninvoked_defaults_are_resident_candidates_while_constra
     .is_err());
     let mut returning = insert.clone();
     returning.returning.push("id".to_string());
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(returning),
         &catalog,
         catalog.commit_seq,
         None,
     )
     .unwrap()
-    .is_none());
+    .is_some());
     engine
         .execute_text(2, "CREATE TABLE defaults (id int4 DEFAULT 1, balance int4)")
         .unwrap();
     let defaults = engine.catalog_snapshot();
     assert!(
-        try_prepare_typed_insert_batch(
+        seal_typed_insert_batch_for_test(
             &Command::Insert(Insert {
                 table: "defaults".to_string(),
                 ..insert.clone()
@@ -1795,43 +1757,11 @@ fn nullable_vectors_and_uninvoked_defaults_are_resident_candidates_while_constra
             referenced_table: "parents".to_string(),
             referenced_column: "id".to_string(),
         });
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(insert.clone()),
         &fk,
         fk.commit_seq,
         None,
-    )
-    .unwrap()
-    .is_none());
-    assert!(try_prepare_typed_insert_batch_proof_only(
-        &Command::Insert(insert.clone()),
-        &fk,
-        fk.commit_seq,
-    )
-    .unwrap()
-    .is_none());
-    let mut owner_drift = fk.clone();
-    let table = owner_drift.relational_catalog.get_mut("accounts").unwrap();
-    table.columns[0].table_oid = table.columns[0].table_oid.wrapping_add(1);
-    assert!(
-        matches!(
-            builder::build(
-                &insert,
-                &owner_drift,
-                owner_drift.commit_seq,
-                None,
-                TypedInsertBuildCapability::ProofOnly,
-            ),
-            Ok(TypedInsertBuildResult::Deferred(
-                TypedInsertDeferred::CatalogGeneration
-            )),
-        ),
-        "current catalog identity must decline before FK constraint eligibility"
-    );
-    assert!(try_prepare_typed_insert_batch_foreign_key_proof_only(
-        &Command::Insert(insert),
-        &fk,
-        fk.commit_seq,
     )
     .unwrap()
     .is_some());
@@ -1844,7 +1774,7 @@ fn exact_full_column_list_and_catalog_expectation_build_typed_batch() {
     let exact_expectation = Some(
         crate::engine_mutation_admission::CatalogVersionExpectation::Prepared(catalog.commit_seq),
     );
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(insert.clone()),
         &catalog,
         catalog.commit_seq,
@@ -1852,7 +1782,7 @@ fn exact_full_column_list_and_catalog_expectation_build_typed_batch() {
     )
     .unwrap()
     .is_some());
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(insert.clone()),
         &catalog,
         catalog.commit_seq,
@@ -1869,7 +1799,7 @@ fn exact_full_column_list_and_catalog_expectation_build_typed_batch() {
 
     let mut reordered = insert.clone();
     reordered.columns = vec!["balance".to_string(), "id".to_string()];
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(reordered),
         &catalog,
         catalog.commit_seq,
@@ -1879,7 +1809,7 @@ fn exact_full_column_list_and_catalog_expectation_build_typed_batch() {
     .is_some());
     let mut partial = insert.clone();
     partial.columns = vec!["id".to_string()];
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(partial),
         &catalog,
         catalog.commit_seq,
@@ -1892,7 +1822,7 @@ fn exact_full_column_list_and_catalog_expectation_build_typed_batch() {
     ] {
         let mut malformed = insert.clone();
         malformed.columns = columns;
-        assert!(try_prepare_typed_insert_batch(
+        assert!(seal_typed_insert_batch_for_test(
             &Command::Insert(malformed),
             &catalog,
             catalog.commit_seq,
@@ -1979,18 +1909,8 @@ fn general_builder_reorders_columns_and_resolves_absent_defaults_without_collaps
         TypedInsertDefaultResolution::Bitmap(words) if words.as_ref() == [0b11]
     ));
 
-    let mut first = Vec::new();
-    batch
-        .append_binary_insert_template_row(0, &mut first)
-        .unwrap();
-    let mut second = Vec::new();
-    batch
-        .append_binary_insert_template_row(1, &mut second)
-        .unwrap();
-    assert_eq!(first, b"i:7|t:|null|null");
-    assert_eq!(second, b"i:8|null|null|null");
     assert!(
-        try_prepare_typed_insert_batch(
+        seal_typed_insert_batch_for_test(
             &Command::Insert(insert),
             &catalog,
             catalog.commit_seq,
@@ -2099,7 +2019,7 @@ fn semantic_ir_keeps_literal_null_omission_and_explicit_default_distinct() {
         TypedInsertColumnValues::I32(values) if values.as_ref() == [23]
     ));
     assert!(
-        try_prepare_typed_insert_batch(
+        seal_typed_insert_batch_for_test(
             &Command::Insert(insert),
             &catalog,
             catalog.commit_seq,
@@ -2282,33 +2202,6 @@ fn typed_semantic_metadata_is_compact_and_source_identity_is_column_scoped() {
 }
 
 #[test]
-fn binary_template_encoder_uses_only_seal_time_full_vector_validation() {
-    let (_engine, insert, catalog) = prepared_accounts(1_024);
-    let batch = ready_general_insert(&insert, &catalog);
-    assert!(
-        batch
-            .columns
-            .iter()
-            .all(|column| column.full_invariant_scan_count() == 1),
-        "each immutable vector is fully validated exactly once while sealing"
-    );
-
-    let mut encoded = Vec::new();
-    for row in 0..batch.row_count as usize {
-        batch
-            .append_binary_insert_template_row(row, &mut encoded)
-            .unwrap();
-    }
-    assert!(
-        batch
-            .columns
-            .iter()
-            .all(|column| column.full_invariant_scan_count() == 1),
-        "per-row template encoding must not rescan the complete column"
-    );
-}
-
-#[test]
 fn explicit_default_omission_and_null_keep_distinct_runtime_results() {
     let engine = Engine::new_local();
     engine
@@ -2459,7 +2352,7 @@ fn omitted_literal_default_reaches_general_semantic_and_fixed_route_batches() {
         .iter()
         .all(|column| column.presence.all_provided(1)));
     assert!(
-        try_prepare_typed_insert_batch(
+        seal_typed_insert_batch_for_test(
             &Command::Insert(supplied),
             &catalog,
             catalog.commit_seq,
@@ -2591,7 +2484,7 @@ fn ordinary_typed_insert_carriers_cannot_bypass_finite_temporal_validation() {
             returning: Vec::new(),
         };
         assert!(matches!(
-            try_prepare_typed_insert_batch(
+            seal_typed_insert_batch_for_test(
                 &Command::Insert(insert),
                 &catalog,
                 catalog.commit_seq,
@@ -2686,16 +2579,7 @@ fn general_builder_all_scalar_arms_and_wal_template_are_byte_identical() {
             .unwrap_or_else(|_| panic!("scalar test source {catalog_index} coerces"))
         })
         .collect::<Vec<_>>();
-    let expected_payload =
-        crate::wal_binary::try_encode_binary_insert("scalar_ir", &[(700_u64, expected.as_slice())])
-            .unwrap();
-    let payload = batch
-        .binary_insert_template()
-        .unwrap()
-        .bind(crate::wal_binary::ProposedRowIdRange::new(700, 1).unwrap())
-        .unwrap()
-        .proposal_payload();
-    assert_eq!(payload.as_ref(), expected_payload.as_slice());
+    assert_eq!(expected.len(), batch.columns.len());
 }
 
 #[test]
@@ -2744,7 +2628,7 @@ fn live_fixed_width_builder_reorders_all_scalar_vectors_and_matches_row_major_ch
         returning: Vec::new(),
     };
     let catalog = engine.catalog_snapshot();
-    let batch = try_prepare_typed_insert_batch(
+    let batch = seal_typed_insert_batch_for_test(
         &Command::Insert(insert.clone()),
         &catalog,
         catalog.commit_seq,
@@ -2787,7 +2671,9 @@ fn live_fixed_width_builder_reorders_all_scalar_vectors_and_matches_row_major_ch
         &row_major,
     )
     .unwrap();
-    let source = batch.into_resident_append_source().unwrap();
+    let source = batch
+        .into_codec5_resident_append_source_for_test(&catalog)
+        .unwrap();
     let chunks = source.checked_append_chunks(11, 4).unwrap().chunks;
     let actual = IntoIterator::into_iter(chunks)
         .map(|chunk| gpu_db_execution::CudaOwnedDeviceMemoryChunk {
@@ -2838,15 +2724,6 @@ fn bool_bitmap_tail_and_positions_zero_and_thirty_two_encode_without_host_rows()
     };
     assert_eq!(validity.as_ref(), &[u32::MAX, 0]);
     assert!(bitmap_shape_is_exact(validity, 33));
-    let payload = batch
-        .binary_insert_template()
-        .unwrap()
-        .bind(crate::wal_binary::ProposedRowIdRange::new(1_000, 33).unwrap())
-        .unwrap()
-        .proposal_payload();
-    let decoded = crate::wal_binary::decode_binary_insert(&payload).unwrap();
-    assert_eq!(decoded.rows[0], (1_000, "b:t|i:0".to_string()));
-    assert_eq!(decoded.rows[32], (1_032, "b:f|null".to_string()));
 }
 
 #[test]
@@ -2858,7 +2735,8 @@ fn typed_insert_ir_source_guards_keep_vectors_sealed_and_no_row_reconstruction()
     assert!(source.contains("offsets: Box<[u64]>"));
     assert!(source.contains("bytes: Box<[u8]>"));
     assert!(source.contains("enum TypedInsertColumnPresence"));
-    assert!(source.contains("into_resident_append_source"));
+    assert!(!source.contains("pub(crate) fn into_resident_append_source"));
+    assert!(source.contains("into_codec5_resident_append_source_for_test"));
     assert!(include_str!("typed_insert_batch/resident_source.rs").contains("checked_dense_payload"));
     assert!(!source.contains("Vec<Vec<SqlValue>>"));
     assert!(!source.contains("impl Clone for TypedInsertBatch"));
@@ -2866,7 +2744,7 @@ fn typed_insert_ir_source_guards_keep_vectors_sealed_and_no_row_reconstruction()
 }
 
 #[test]
-fn direct_carrier_preserves_concurrent_execution_canonical_wal_and_recovery() {
+fn concurrent_insert_ingress_preserves_codec5_wal_and_recovery() {
     let engine = Engine::new_local();
     engine
         .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")

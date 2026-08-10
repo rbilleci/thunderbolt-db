@@ -521,8 +521,15 @@ fn validate_effect_source(
                     && source.unique_constraint == (index.flags & 4 != 0)
                     && source.key_count == index.key_count
             });
-            if matching.next().is_none() || matching.next().is_some() {
-                return Err(error("target index effect has no exact S2 index source"));
+            match (matching.next(), matching.next()) {
+                (Some(_), None) => {}
+                // A populated table's S3-created index is absent from pre-CREATE statement
+                // directories. Its paired-zero descriptor and the terminal directory source
+                // authenticate the one physical prefix build; a pre-CREATE row effect therefore
+                // has no same-statement S2 index source to repeat.
+                (None, _)
+                    if index.base_index_generation == 0 && index.base_index_root == [0; 32] => {}
+                _ => return Err(error("target index effect has no exact S2 index source")),
             }
         }
         FOREIGN_KEY_GUARD => {
@@ -666,8 +673,10 @@ fn transition_digest(
     raw[40..44].copy_from_slice(&transition.key_effect_start.to_le_bytes());
     raw[44..48].copy_from_slice(&transition.key_effect_count.to_le_bytes());
     raw[48..52].copy_from_slice(&transition.final_writer_statement_ordinal.to_le_bytes());
+    raw[17] = u8::from(transition.final_writer_statement_digest != [0; 32]);
     raw[64..96].copy_from_slice(&transition.typed_statement_digest);
     raw[96..128].copy_from_slice(&transition.final_row_digest);
+    raw[160..192].copy_from_slice(&transition.final_writer_statement_digest);
     let mut digest = begin(b"gpu-db/write001/s7-transition/v2");
     digest.update(&raw[..128]);
     digest.update([0; 32]);

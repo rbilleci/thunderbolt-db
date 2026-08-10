@@ -50,10 +50,14 @@ pub(super) fn validate(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineErr
                 .checked_sub(table.row_allocator_before)
                 != Some(table.disposition_count as u64)
             || table.final_logical_row_count
-                != table
-                    .initial_logical_row_count
-                    .checked_add(table.transition_count as u64)
-                    .ok_or_else(|| error("final row count overflows"))?
+                != if table.resets_existing_rows {
+                    table.transition_count as u64
+                } else {
+                    table
+                        .initial_logical_row_count
+                        .checked_add(table.transition_count as u64)
+                        .ok_or_else(|| error("final row count overflows"))?
+                }
             || (table.transition_count == 0
                 && (table.data_generation_after != table.data_generation_before
                     || table.final_table_root != table.initial_table_root))
@@ -229,12 +233,16 @@ fn validate_transition(
         .records
         .get(transition.source_statement_ordinal as usize)
         .ok_or_else(|| error("transition S2 source is absent"))?;
+    let rewritten = transition.final_writer_statement_digest != [0; 32];
     if transition.transition_ref != expected_ref
         || transition.table_ref != table_ref
         || transition.image_ref != table_ref
         || transition.image_row_ordinal
             != expected_ref - graph.tables[table_ref as usize].transition_start
-        || transition.final_writer_statement_ordinal != transition.source_statement_ordinal
+        || (!rewritten
+            && transition.final_writer_statement_ordinal != transition.source_statement_ordinal)
+        || (rewritten
+            && transition.final_writer_statement_ordinal <= transition.source_statement_ordinal)
         || disposition.disposition != SURVIVES
         || disposition.transition_ref != transition.transition_ref
         || disposition.table_ref != table_ref
@@ -263,18 +271,20 @@ fn validate_transition(
                 "final image column differs from strict S2 catalog order",
             ));
         }
-        let (valid, value) =
-            record.column_value_at(column.catalog_column_ordinal, transition.source_row_ordinal)?;
-        if !record_image_cell_equal(
-            valid,
-            value,
-            column.validity,
-            column.values,
-            column.ty,
-            image.facts().rows,
-            transition.image_row_ordinal,
-        )? {
-            return Err(error("strict S2 cell differs from final-image cell"));
+        if !rewritten {
+            let (valid, value) = record
+                .column_value_at(column.catalog_column_ordinal, transition.source_row_ordinal)?;
+            if !record_image_cell_equal(
+                valid,
+                value,
+                column.validity,
+                column.values,
+                column.ty,
+                image.facts().rows,
+                transition.image_row_ordinal,
+            )? {
+                return Err(error("strict S2 cell differs from final-image cell"));
+            }
         }
     }
     Ok(())

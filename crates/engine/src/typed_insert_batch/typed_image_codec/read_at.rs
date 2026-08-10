@@ -693,7 +693,7 @@ fn validate_source_placeholders<S: TypedImageReadAt + ?Sized>(
             _ => {
                 return Err(image_error(
                     "placeholder value shape does not match SQL type",
-                ))
+                ));
             }
         };
         if !zero {

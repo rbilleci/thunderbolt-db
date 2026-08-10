@@ -190,7 +190,15 @@ fn exact_buffers_match_v1_and_reject_short_or_surplus_for_one_through_five_fragm
             &mut borrowed_serialized,
         )
         .expect("borrowed exact caller buffers encode");
-        assert_eq!(borrowed_exact, exact);
+        // Probe timings attribute separate wall-clock samples, so the two encodes share only
+        // their semantic footprint and commitment.  Comparing the full encoding would make this
+        // wire-contract test nondeterministic whenever `probe-timing` is enabled.
+        assert_eq!(borrowed_exact.footprint, exact.footprint);
+        assert_eq!(
+            borrowed_exact.ordered_fragment_root,
+            exact.ordered_fragment_root
+        );
+        assert_eq!(borrowed_exact.final_digest, exact.final_digest);
         assert_eq!(borrowed_packed, packed);
         assert_eq!(borrowed_serialized, serialized);
         assert_rejected_before_record_exposure(&header, &fragments, measured);

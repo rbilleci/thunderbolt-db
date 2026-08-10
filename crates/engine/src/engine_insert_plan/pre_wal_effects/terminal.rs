@@ -115,7 +115,7 @@ fn seal_after_currentness(
         returning,
     };
     let PreparedInsertEffectPlan { prepared, .. } = plan;
-    let sealed = prepared.seal(bindings.bindings, false, false)?;
+    let sealed = prepared.seal(bindings.bindings)?;
     drop(sealed);
     Ok(evidence)
 }

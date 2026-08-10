@@ -36,6 +36,8 @@ use std::env;
 use std::error::Error;
 use std::time::Instant;
 
+#[cfg(feature = "probe-timing")]
+use gpu_db_engine::InsertProbeSnapshot;
 use gpu_db_engine::{Engine, RelationalCopyAdmissionProfile};
 use gpu_db_sql::{CopyFromStdin, CopyOptions, SqlValue};
 
@@ -95,7 +97,6 @@ impl WallSamples {
 /// Accumulated `RelationalCopyAdmissionProfile` stage micros across every profiled row.
 #[derive(Default)]
 struct StageTotals {
-    render_sql_wal_payload: u128,
     unique_preflight: u128,
     check_preflight: u128,
     foreign_key_preflight: u128,
@@ -111,7 +112,6 @@ struct StageTotals {
 
 impl StageTotals {
     fn add(&mut self, p: &RelationalCopyAdmissionProfile) {
-        self.render_sql_wal_payload += p.render_sql_wal_payload_micros;
         self.unique_preflight += p.unique_preflight_micros;
         self.check_preflight += p.check_preflight_micros;
         self.foreign_key_preflight += p.foreign_key_preflight_micros;
@@ -126,8 +126,7 @@ impl StageTotals {
 
     /// Sum of the leaf stages (the ones that partition the work; roll-ups excluded).
     fn leaf_sum(&self) -> u128 {
-        self.render_sql_wal_payload
-            + self.unique_preflight
+        self.unique_preflight
             + self.check_preflight
             + self.foreign_key_preflight
             + self.row_prepare
@@ -178,6 +177,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_path_a(rows: usize) -> Result<WallSamples, Box<dyn Error>> {
     let engine = Engine::new_local();
     engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
+    #[cfg(feature = "probe-timing")]
+    let probe_before = engine.insert_probe_snapshot();
 
     let mut samples = WallSamples::with_capacity(rows);
     for i in 0..rows {
@@ -189,6 +190,12 @@ fn run_path_a(rows: usize) -> Result<WallSamples, Box<dyn Error>> {
         engine.execute_text(seq, &sql)?;
         samples.push(start.elapsed().as_nanos() as u64);
     }
+    #[cfg(feature = "probe-timing")]
+    print_canonical_probe(
+        "Path A canonical codec-5 lifecycle",
+        engine.insert_probe_snapshot().delta_since(probe_before),
+        rows,
+    );
     Ok(samples)
 }
 
@@ -197,6 +204,8 @@ fn run_path_a(rows: usize) -> Result<WallSamples, Box<dyn Error>> {
 fn run_path_b(rows: usize) -> Result<(WallSamples, StageTotals), Box<dyn Error>> {
     let engine = Engine::new_local();
     engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
+    #[cfg(feature = "probe-timing")]
+    let probe_before = engine.insert_probe_snapshot();
 
     let copy = CopyFromStdin {
         table: "accounts".to_string(),
@@ -216,7 +225,68 @@ fn run_path_b(rows: usize) -> Result<(WallSamples, StageTotals), Box<dyn Error>>
         samples.push(start.elapsed().as_nanos() as u64);
         stages.add(&profile);
     }
+    #[cfg(feature = "probe-timing")]
+    print_canonical_probe(
+        "Path B canonical codec-5 lifecycle",
+        engine.insert_probe_snapshot().delta_since(probe_before),
+        rows,
+    );
     Ok((samples, stages))
+}
+
+#[cfg(feature = "probe-timing")]
+fn print_canonical_probe(name: &str, probe: InsertProbeSnapshot, rows: usize) {
+    let rows = rows as f64;
+    let per_row_us = |nanos: u64| nanos as f64 / rows / 1_000.0;
+    println!("## {name} (probe-timing)");
+    println!(
+        "- successful statements/rows: {}/{}",
+        probe.successful_insert_statements, probe.successful_insert_rows
+    );
+    println!(
+        "- statement staging: {:.3} us/row",
+        per_row_us(probe.transaction_statement_stage_nanos)
+    );
+    println!(
+        "- snapshots begin / statement / terminal: {:.3} / {:.3} / {:.3} us/row",
+        per_row_us(probe.transaction_begin_snapshot_capture_nanos),
+        per_row_us(probe.transaction_statement_snapshot_capture_nanos),
+        per_row_us(probe.transaction_commit_snapshot_capture_nanos),
+    );
+    println!(
+        "- private overlay / record seal / final image: {:.3} / {:.3} / {:.3} us/row",
+        per_row_us(probe.transaction_private_overlay_materialize_nanos),
+        per_row_us(probe.codec5_record_seal_nanos),
+        per_row_us(probe.codec5_final_image_seal_nanos),
+    );
+    println!(
+        "- terminal total / pre-WAL / WAL-status / apply-publication: {:.3} / {:.3} / {:.3} / {:.3} us/row",
+        per_row_us(probe.transaction_terminal_nanos),
+        per_row_us(probe.transaction_terminal_pre_wal_nanos),
+        per_row_us(probe.transaction_terminal_wal_status_nanos),
+        per_row_us(probe.transaction_canonical_apply_publish_nanos),
+    );
+    println!(
+        "- typed generation host / CUDA event: {:.3} / {:.3} us/row",
+        per_row_us(probe.typed_append_generation_host_nanos),
+        per_row_us(probe.typed_append_generation_kernel_event_nanos),
+    );
+    println!(
+        "- CUDA phases validate / cells / rows / reduce / finalize: {:.3} / {:.3} / {:.3} / {:.3} / {:.3} us/row",
+        per_row_us(probe.typed_append_generation_validate_kernel_event_nanos),
+        per_row_us(probe.typed_append_generation_cells_kernel_event_nanos),
+        per_row_us(probe.typed_append_generation_rows_kernel_event_nanos),
+        per_row_us(probe.typed_append_generation_reduce_kernel_event_nanos),
+        per_row_us(probe.typed_append_generation_finalize_kernel_event_nanos),
+    );
+    println!(
+        "- typed envelope / authority prepare / device-plan compile / authority commit: {:.3} / {:.3} / {:.3} / {:.3} us/row",
+        per_row_us(probe.typed_append_envelope_prepare_nanos),
+        per_row_us(probe.typed_append_authority_prepare_nanos),
+        per_row_us(probe.typed_append_device_plan_compile_nanos),
+        per_row_us(probe.typed_append_authority_commit_nanos),
+    );
+    println!();
 }
 
 fn print_wall(name: &str, w: &WallSamples) {
@@ -279,12 +349,6 @@ fn print_stage_decomposition(stages: &StageTotals, path_b: &WallSamples, rows: u
     print_stage(
         "[DUAL] residency_invalidation",
         stages.residency_invalidation,
-        rows_f,
-        wall_b_us,
-    );
-    print_stage(
-        "[CTRL] render_sql_wal_payload",
-        stages.render_sql_wal_payload,
         rows_f,
         wall_b_us,
     );
@@ -363,12 +427,11 @@ fn print_reconciliation(
         + stages.value_index_append) as f64
         / r;
     let dual_artifact_us = stages.residency_invalidation as f64 / r;
-    let durability_log_us =
-        (stages.render_sql_wal_payload + stages.wal_commit_flush_boundary) as f64 / r;
+    let durability_log_us = stages.wal_commit_flush_boundary as f64 / r;
     println!("## Target-architecture mapping (host = control plane; data plane -> GPU)");
     println!("  Of the SQL-honest {a_us:.3} us/row:");
     println!("  - [CTRL] parse/plan (stays host):            {parse_us:.3} us/row");
-    println!("  - [CTRL] render WAL + fsync/log (stays host): {durability_log_us:.3} us/row");
+    println!("  - [CTRL] WAL framing + fsync/log (stays host): {durability_log_us:.3} us/row");
     println!("  - [DATA] device constraints+encode+mvcc+index: {data_plane_us:.3} us/row");
     println!("  - [PUB] device-generation publication/maintenance: {dual_artifact_us:.3} us/row");
     println!("  Read: [DATA] is GPU execution and [PUB] is generation maintenance; neither is a host relational tier.");
