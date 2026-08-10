@@ -72,6 +72,7 @@ fn fill_s4(
     framing.with_section_reader(3, |reader| {
         while !reader.done() {
             let raw = reader.exact::<64>()?;
+            let has_final_writer = raw[17] == 1;
             push_exact(
                 &mut graph.dispositions,
                 RetainedDisposition {
@@ -81,7 +82,21 @@ fn fill_s4(
                     disposition: raw[16],
                     table_ref: u32_at(&raw, 20),
                     transition_ref: u32_at(&raw, 24),
-                    typed_statement_digest: digest_at(&raw, 32),
+                    typed_statement_digest: if has_final_writer {
+                        [0; 32]
+                    } else {
+                        digest_at(&raw, 32)
+                    },
+                    final_writer_statement_ordinal: if has_final_writer {
+                        u32_at(&raw, 28)
+                    } else {
+                        u32_at(&raw, 0)
+                    },
+                    final_writer_statement_digest: if has_final_writer {
+                        digest_at(&raw, 32)
+                    } else {
+                        [0; 32]
+                    },
                 },
                 "S4 disposition directory",
             )?;
@@ -117,20 +132,78 @@ fn fill_s5(
             let disposition_ref = reader.u32()?;
             let body_bytes = reader.u32()?;
             let body_digest = reader.digest()?;
-            if kind != 1
-                || reserved != 0
-                || body_bytes != crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES as u32
-                || u64::from(body_bytes) > reader.remaining()
-            {
-                return Err(fill_error("S5 retained published effect shape is invalid"));
+            if reserved != 0 || u64::from(body_bytes) > reader.remaining() {
+                return Err(fill_error("S5 retained effect shape is invalid"));
             }
-            let mut body = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
-            reader.copy_exact(&mut body)?;
-            if gpu_db_wal::canonical_request_digest(&body) != body_digest {
-                return Err(fill_error("S5 retained sequence body digest drifted"));
-            }
-            let reference = crate::decode_sequence_value_reference_exact(&body)
-                .map_err(|_| fill_error("S5 retained sequence reference fails strict decode"))?;
+            let mut reference_body_digest = [0; 32];
+            let mut terminal_restart = None;
+            let reference = match kind {
+                1 => {
+                    let base = crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES as u32;
+                    let with_restart = base
+                        + crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES
+                            as u32;
+                    if !matches!(body_bytes, value if value == base || value == with_restart) {
+                        return Err(fill_error(
+                            "S5 retained published effect body width is invalid",
+                        ));
+                    }
+                    let mut body = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
+                    reader.copy_exact(&mut body)?;
+                    reference_body_digest = gpu_db_wal::canonical_request_digest(&body);
+                    let mut full = [0_u8;
+                        crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES
+                            + crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES];
+                    full[..crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES]
+                        .copy_from_slice(&body);
+                    if body_bytes == with_restart {
+                        let tail = &mut full[crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES..];
+                        reader.copy_exact(tail)?;
+                        terminal_restart = Some(
+                            crate::typed_insert_aggregate::semantics_v2::sequence_terminal::decode(
+                                tail,
+                            )
+                            .map_err(|_| fill_error("S5 terminal restart fails strict decode"))?,
+                        );
+                    }
+                    if gpu_db_wal::canonical_request_digest(&full[..body_bytes as usize])
+                        != body_digest
+                    {
+                        return Err(fill_error("S5 retained sequence body digest drifted"));
+                    }
+                    Some(
+                        crate::decode_sequence_value_reference_exact(&body).map_err(|_| {
+                            fill_error("S5 retained sequence reference fails strict decode")
+                        })?,
+                    )
+                }
+                2 => {
+                    let tail_bytes = crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES as u32;
+                    if !(body_bytes == 0 || body_bytes == tail_bytes)
+                        || (body_bytes == 0) != (body_digest == [0; 32])
+                    {
+                        return Err(fill_error(
+                            "S5 retained private effect body is not canonical",
+                        ));
+                    }
+                    if body_bytes == tail_bytes {
+                        let mut tail = [0_u8;
+                            crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES];
+                        reader.copy_exact(&mut tail)?;
+                        if gpu_db_wal::canonical_request_digest(&tail) != body_digest {
+                            return Err(fill_error("S5 private terminal body digest drifted"));
+                        }
+                        terminal_restart = Some(
+                            crate::typed_insert_aggregate::semantics_v2::sequence_terminal::decode(
+                                &tail,
+                            )
+                            .map_err(|_| fill_error("S5 terminal restart fails strict decode"))?,
+                        );
+                    }
+                    None
+                }
+                _ => return Err(fill_error("S5 retained sequence effect kind is invalid")),
+            };
             push_exact(
                 &mut graph.sequence_effects,
                 RetainedSequenceEffect {
@@ -139,7 +212,9 @@ fn fill_s5(
                     disposition_ref,
                     flags,
                     body_digest,
+                    reference_body_digest,
                     reference,
+                    terminal_restart,
                 },
                 "S5 sequence-effect directory",
             )?;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine_transaction_delta::TypedPrivateSequenceAdvance;
 use crate::{
     parse_command, transaction_statement_digest, BinarySequenceValueReference, Command, Engine,
     Insert, PreparedMutation, StagedRowOperation, TransactionOperation, TransactionSnapshot, TxnId,
@@ -530,7 +531,14 @@ fn classifier_uses_nonzero_expression_base_with_sparse_local_ordinals() {
         let statement_lock = Arc::clone(&snapshot.statement_lock);
         let _statement_guard = statement_lock.lock().unwrap();
         let mut delta = snapshot.delta.lock().unwrap();
-        let statement_ordinal = u32::try_from(delta.operations.len()).unwrap();
+        let statement_ordinal = u32::try_from(
+            delta
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, TransactionOperation::TypedInsert(_)))
+                .count(),
+        )
+        .unwrap();
         delta
             .sequence_value_references
             .push(synthetic_sequence_reference(statement_ordinal, 0));
@@ -858,4 +866,69 @@ fn classifier_leaf_has_no_execution_or_durability_authority() {
     }
     assert!(source.contains("GPUDBPRIVATESEQCHILD1"));
     assert!(source.contains("GPUDBPRIVATESEQOUTCOME1"));
+}
+
+#[test]
+fn typed_private_advances_preserve_the_prior_statement_outcome_chain() {
+    let owner = PrivateValueOwnerIdentity {
+        kind: PrivateValueOwner::Restart,
+        statement_ordinal: 4,
+        statement_digest: [5; 32],
+        creator_catalog_column_ordinal: None,
+    };
+    let mut folded = BTreeMap::from([(
+        77,
+        FoldedSequence {
+            effective_name: "typed_chain".to_string(),
+            lifetime_origin: SequenceLifetimeOrigin::Private,
+            latest_private: Some(PlannedPrivateState {
+                state: (40, false),
+                owner,
+                predecessor: PlannedPrivatePredecessor::Lifecycle(owner),
+            }),
+        },
+    )]);
+    let advances = [
+        TypedPrivateSequenceAdvance {
+            sequence_name: "typed_chain".to_string(),
+            sequence_oid: 77,
+            next_state: (40, true),
+            lifetime_origin: 2,
+            owner_kind: 2,
+            owner_statement_ordinal: 4,
+            owner_statement_digest: [5; 32],
+            owner_creator_catalog_column_ordinal: None,
+            predecessor_tag: 1,
+            predecessor_digest: [5; 32],
+            child_digest: [6; 32],
+            outcome_digest: [7; 32],
+        },
+        TypedPrivateSequenceAdvance {
+            sequence_name: "typed_chain".to_string(),
+            sequence_oid: 77,
+            next_state: (41, true),
+            lifetime_origin: 2,
+            owner_kind: 2,
+            owner_statement_ordinal: 4,
+            owner_statement_digest: [5; 32],
+            owner_creator_catalog_column_ordinal: None,
+            predecessor_tag: 2,
+            predecessor_digest: [7; 32],
+            child_digest: [8; 32],
+            outcome_digest: [9; 32],
+        },
+    ];
+
+    fold_typed_insert_advances(&advances, &mut folded).expect("ordered typed chain folds");
+    let latest = folded[&77].latest_private.expect("typed state is retained");
+    assert_eq!(latest.state, (41, true));
+    assert_eq!(
+        latest.predecessor,
+        PlannedPrivatePredecessor::PlannedOutcome([9; 32])
+    );
+
+    let mut tampered = folded.clone();
+    let mut wrong = advances[1].clone();
+    wrong.predecessor_digest = [1; 32];
+    assert!(fold_typed_insert_advances(&[wrong], &mut tampered).is_err());
 }

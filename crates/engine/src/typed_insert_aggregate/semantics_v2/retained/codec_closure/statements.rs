@@ -97,8 +97,16 @@ pub(super) fn validate(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineErr
             || !dispositions.iter().enumerate().all(|(row, entry)| {
                 entry.statement_ordinal == ordinal
                     && entry.source_row_ordinal == row as u32
-                    && entry.typed_statement_digest == statement.typed_statement_digest
                     && entry.table_ref == resolution.table_ref
+                    && if entry.final_writer_statement_digest == [0; 32] {
+                        entry.typed_statement_digest == statement.typed_statement_digest
+                            && entry.final_writer_statement_ordinal == ordinal
+                    } else {
+                        entry.disposition == APPLIED_THEN_CANCELED
+                            && entry.typed_statement_digest == [0; 32]
+                            && entry.transition_ref == ABSENT_U32
+                            && entry.final_writer_statement_ordinal > ordinal
+                    }
             })
         {
             return Err(error(
@@ -209,7 +217,7 @@ pub(super) fn validate(graph: &ReservedSemanticsV2Graph) -> Result<(), EngineErr
             }) || graph
                 .dispositions
                 .iter()
-                .any(|entry| entry.disposition != SURVIVES)
+                .any(|entry| !matches!(entry.disposition, SURVIVES | APPLIED_THEN_CANCELED))
             {
                 return Err(error(
                     "successful aggregate does not use the all-survives matrix",

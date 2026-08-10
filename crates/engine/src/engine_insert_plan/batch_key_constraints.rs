@@ -6,14 +6,18 @@
 
 use super::host_retention::{HostRetentionGeometry, HostRetentionReport};
 use super::resident_constraint_generation::{self, ResidentConstraintColumnBinding};
-use super::{CatalogSnapshot, EngineError, Index};
+#[cfg(test)]
+use super::CatalogSnapshot;
+use super::{EngineError, Index};
 use crate::relational_model::{RelationalColumn, RelationalIndex, RelationalTable};
 use crate::typed_insert_batch::{TypedInsertBatch, TypedInsertConstraintDeviceSource};
 use crate::ExecuteError;
 use gpu_db_execution::{insert_batch_key_verdict_scratch_bytes, CudaCompoundFoldColumn};
 
 pub(super) struct CompiledBatchKeyConstraints {
+    #[cfg(test)]
     target_schema: String,
+    #[cfg(test)]
     target_name: String,
     indexes: Box<[IndexBinding]>,
     evaluated_keys: Box<[CompiledBatchKey]>,
@@ -22,10 +26,13 @@ pub(super) struct CompiledBatchKeyConstraints {
 /// Complete successful catalog witness for the raw index vector.  In particular, index OIDs are
 /// explicit because the table schema digest does not own index identity.
 pub(crate) struct BatchKeyConstraintProof {
+    #[cfg(test)]
     table_oid: u32,
     target_schema: String,
     target_name: String,
+    #[cfg(test)]
     schema_digest: gpu_db_wal::CanonicalDigest,
+    #[cfg(test)]
     catalog_seq: Index,
     indexes: Box<[IndexBinding]>,
 }
@@ -33,6 +40,7 @@ pub(crate) struct BatchKeyConstraintProof {
 #[derive(Clone)]
 pub(crate) struct IndexBinding {
     raw_ordinal: usize,
+    #[cfg(test)]
     oid: u32,
     pub(super) name: String,
     table: String,
@@ -40,6 +48,7 @@ pub(crate) struct IndexBinding {
     key_columns: Box<[String]>,
     unique: bool,
     primary_key: bool,
+    #[cfg(test)]
     unique_constraint: bool,
     resolved_columns: Box<[KeyColumnBinding]>,
 }
@@ -126,31 +135,12 @@ pub(super) fn compile(
         indexes.push(binding);
     }
     Ok(CompiledBatchKeyConstraints {
+        #[cfg(test)]
         target_schema: table.schema.clone(),
+        #[cfg(test)]
         target_name: table.name.clone(),
         indexes: indexes.into(),
         evaluated_keys: evaluated_keys.into(),
-    })
-}
-
-/// Test-only proof preparation asks this before sealed-vector construction.  It intentionally
-/// bypasses only the production `indexes.is_empty()` route gate; foreign keys and unsupported
-/// CHECK/key shapes remain deferred exactly as they do on the live route.
-#[cfg(test)]
-pub(crate) fn table_has_supported_batch_key_constraints(table: &RelationalTable) -> bool {
-    table.indexes.iter().all(|index| {
-        index.table == table.name
-            && !index.key_columns.is_empty()
-            && index.column == index.key_columns[0]
-            && index.key_columns.iter().all(|name| {
-                table
-                    .columns
-                    .iter()
-                    .find(|column| column.name == *name)
-                    .is_some_and(|column| {
-                        !index.unique && !index.primary_key || cuda_key_type_supported(column.ty)
-                    })
-            })
     })
 }
 
@@ -244,19 +234,68 @@ pub(super) fn evaluate(
     Ok(candidates.into())
 }
 
+#[cfg(test)]
 pub(super) fn seal_after_success(
     batch: &TypedInsertBatch,
     compiled: &CompiledBatchKeyConstraints,
 ) -> BatchKeyConstraintProof {
     let (table_oid, schema_digest, catalog_seq) = batch.row_local_constraint_target();
     BatchKeyConstraintProof {
+        #[cfg(test)]
         table_oid,
         target_schema: compiled.target_schema.clone(),
         target_name: compiled.target_name.clone(),
+        #[cfg(test)]
         schema_digest,
+        #[cfg(test)]
         catalog_seq,
         indexes: compiled.indexes.clone(),
     }
+}
+
+/// Seal the raw catalog-index witness used by the transaction-terminal indexed append.
+///
+/// UNIQUE/PRIMARY conflict semantics are closed by the transaction's GPU verdict before this
+/// physical witness is requested. This owner binds the same maintained index descriptor for
+/// publication and does not create a second constraint decision.
+pub(crate) fn seal_current_index_witness(
+    table: &RelationalTable,
+    _catalog_seq: Index,
+) -> Result<BatchKeyConstraintProof, EngineError> {
+    if table.indexes.is_empty()
+        || table.indexes.iter().any(|index| {
+            (index.primary_key && !index.unique)
+                || (index.unique_constraint && !index.unique)
+                || index.key_columns.is_empty()
+        })
+    {
+        return Err(EngineError::ApplyFailed(
+            "indexed codec-5 path requires coherent nonempty maintained indexes".to_string(),
+        ));
+    }
+    #[cfg(test)]
+    let schema_digest =
+        crate::engine_transaction_reset::table_schema_digest(table).map_err(|error| {
+            EngineError::ApplyFailed(format!("indexed codec-5 schema digest failed: {error}"))
+        })?;
+    let indexes = table
+        .indexes
+        .iter()
+        .enumerate()
+        .map(|(ordinal, index)| bind_index(ordinal, table, index))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    Ok(BatchKeyConstraintProof {
+        #[cfg(test)]
+        table_oid: table.oid,
+        target_schema: table.schema.clone(),
+        target_name: table.name.clone(),
+        #[cfg(test)]
+        schema_digest,
+        #[cfg(test)]
+        catalog_seq: _catalog_seq,
+        indexes,
+    })
 }
 
 impl BatchKeyConstraintProof {
@@ -301,6 +340,7 @@ impl BatchKeyConstraintProof {
         Ok(geometry)
     }
 
+    #[cfg(test)]
     pub(super) fn matches_current_catalog(&self, catalog: &CatalogSnapshot) -> bool {
         self.matches_catalog_binding(catalog) && catalog.commit_seq == self.catalog_seq
     }
@@ -309,11 +349,12 @@ impl BatchKeyConstraintProof {
     /// catalog contents at a newer commit sequence.  Its target binding stays exact; only the
     /// unrelated monotonic catalog sequence is permitted to advance.  Production keeps the
     /// sequence-exact [`Self::matches_current_catalog`] witness.
-    #[allow(dead_code)] // current-generation reservation witness, not a live eligibility lift
+    #[cfg(test)]
     pub(super) fn matches_current_target_binding(&self, catalog: &CatalogSnapshot) -> bool {
         catalog.commit_seq >= self.catalog_seq && self.matches_catalog_binding(catalog)
     }
 
+    #[cfg(test)]
     fn matches_catalog_binding(&self, catalog: &CatalogSnapshot) -> bool {
         let Some(table) = catalog
             .relational_catalog
@@ -448,6 +489,7 @@ impl IndexBinding {
         resident_constraint_generation::bind_catalog_columns(table, columns)
     }
 
+    #[cfg(test)]
     fn matches(&self, ordinal: usize, table: &RelationalTable, live: &RelationalIndex) -> bool {
         self.raw_ordinal == ordinal
             && self.oid == live.oid
@@ -542,6 +584,7 @@ fn bind_index(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(IndexBinding {
         raw_ordinal,
+        #[cfg(test)]
         oid: index.oid,
         name: index.name.clone(),
         table: index.table.clone(),
@@ -549,6 +592,7 @@ fn bind_index(
         key_columns: index.key_columns.clone().into(),
         unique: index.unique,
         primary_key: index.primary_key,
+        #[cfg(test)]
         unique_constraint: index.unique_constraint,
         resolved_columns: resolved_columns.into(),
     })
@@ -632,10 +676,11 @@ mod tests {
             });
         let command =
             gpu_db_sql::parse_command("INSERT INTO raw_index_binding VALUES (1, 2, 3)").unwrap();
-        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch_proof_only(
+        let batch = crate::typed_insert_batch::seal_typed_insert_batch_for_test(
             &command,
             &catalog,
             catalog.commit_seq,
+            None,
         )
         .unwrap()
         .unwrap();

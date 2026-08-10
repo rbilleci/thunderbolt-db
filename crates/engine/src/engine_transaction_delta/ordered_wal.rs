@@ -17,11 +17,22 @@ impl Engine {
                     if reset.sequence_reset_identity.is_some()
             )
         });
+        let implicit_sequence_record = operations.iter().any(|operation| {
+            matches!(
+                operation,
+                TransactionOperation::TypedInsert(staged)
+                    if staged.private_sequence_advances.iter().any(|advance| {
+                        advance.owner_kind == 1
+                            && advance.owner_creator_catalog_column_ordinal.is_some()
+                    })
+            )
+        });
         let index_catalog_record = catalog_commands.iter().any(|staged| {
             staged.index_epoch_transition
                 || command_requires_index_catalog_opcode(&staged.command)
                 || command_is_sequence_lifecycle(&staged.command)
-        }) || sequence_reset_record;
+        }) || sequence_reset_record
+            || implicit_sequence_record;
         record.catalog_epoch = if index_catalog_record {
             BinaryTransactionCatalogEpoch::IndexIdentityV1
         } else {
@@ -82,6 +93,17 @@ impl Engine {
                     {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "transactional CREATE TABLE carries a lifecycle identity".to_string(),
+                        )));
+                    }
+                }
+                Command::CreateDomain(_) | Command::AddForeignKey(_) => {
+                    if staged.view_identity.is_some()
+                        || staged.index_identity.is_some()
+                        || staged.sequence_identity.is_some()
+                    {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "transactional catalog metadata command carries a lifecycle identity"
+                                .to_string(),
                         )));
                     }
                 }
@@ -166,7 +188,9 @@ impl Engine {
             .sequence_reset_operations
             .extend(operations.iter().filter_map(|operation| match operation {
                 TransactionOperation::TableReset(reset) => reset.sequence_reset_identity.clone(),
-                TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
+                TransactionOperation::Catalog(_)
+                | TransactionOperation::Row(_)
+                | TransactionOperation::TypedInsert(_) => None,
             }));
         if !catalog_commands.is_empty() || sequence_reset_record {
             let mut created_sequence_oids = BTreeMap::new();
@@ -223,6 +247,7 @@ impl Engine {
                     TransactionOperation::Catalog(staged) => staged.statement_digest,
                     TransactionOperation::Row(staged) => staged.statement_digest,
                     TransactionOperation::TableReset(reset) => reset.statement_digest,
+                    TransactionOperation::TypedInsert(staged) => staged.statement_digest,
                 };
                 record.statement_digests.push(statement_digest);
 
@@ -234,6 +259,11 @@ impl Engine {
                         staged.sequence_input_oids.iter().collect::<Vec<_>>()
                     }
                     TransactionOperation::TableReset(_) => Vec::new(),
+                    TransactionOperation::TypedInsert(staged) => staged
+                        .private_sequence_advances
+                        .iter()
+                        .map(|advance| (&advance.sequence_name, &advance.sequence_oid))
+                        .collect::<Vec<_>>(),
                 };
                 for (sequence, oid) in sequence_inputs {
                     record
@@ -243,21 +273,16 @@ impl Engine {
                 let sequence_record = sequence_reset_record
                     || catalog_commands
                         .iter()
-                        .any(|staged| command_is_sequence_lifecycle(&staged.command));
+                        .any(|staged| command_is_sequence_lifecycle(&staged.command))
+                    || implicit_sequence_record;
                 if sequence_record {
                     match operation {
                         TransactionOperation::Row(staged) => {
-                            if let PreparedMutation::Insert { seq_advances, .. } = &staged.mutation
-                            {
-                                for (sequence, state) in seq_advances {
-                                    let oid =
-                                        staged.sequence_input_oids.get(sequence).ok_or_else(|| {
-                                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                                "transaction INSERT sequence input \"{sequence}\" lost its stable identity"
-                                            )))
-                                        })?;
-                                    record.sequence_advances_by_oid.insert(*oid, *state);
-                                }
+                            if matches!(&staged.mutation, PreparedMutation::Insert { .. }) {
+                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "resolved INSERT reached the ordered catalog encoder after codec-5 cutover"
+                                        .to_string(),
+                                )));
                             }
                         }
                         TransactionOperation::Catalog(staged) => {
@@ -309,6 +334,16 @@ impl Engine {
                                 }
                             }
                         }
+                        TransactionOperation::TypedInsert(staged) => {
+                            for advance in staged.private_sequence_advances.iter() {
+                                // One multi-row typed statement may advance the same private
+                                // sequence repeatedly; the immutable artifact has already
+                                // proved that request-order chain, so WAL retains its final state.
+                                record
+                                    .sequence_advances_by_oid
+                                    .insert(advance.sequence_oid, advance.next_state);
+                            }
+                        }
                     }
                 }
 
@@ -326,10 +361,11 @@ impl Engine {
                         identity
                     }
                     TransactionOperation::Row(delta) => match &delta.mutation {
-                        PreparedMutation::Insert { table, .. } => {
-                            BinaryTransactionOperationIdentity::Insert {
-                                table: table.clone(),
-                            }
+                        PreparedMutation::Insert { .. } => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "resolved INSERT reached the ordered catalog encoder after codec-5 cutover"
+                                    .to_string(),
+                            )));
                         }
                         PreparedMutation::Update { table, .. } => {
                             BinaryTransactionOperationIdentity::Update {
@@ -345,6 +381,11 @@ impl Engine {
                     TransactionOperation::TableReset(reset) => {
                         BinaryTransactionOperationIdentity::TableReset {
                             table: reset.table.clone(),
+                        }
+                    }
+                    TransactionOperation::TypedInsert(staged) => {
+                        BinaryTransactionOperationIdentity::Insert {
+                            table: staged.table.clone(),
                         }
                     }
                 };

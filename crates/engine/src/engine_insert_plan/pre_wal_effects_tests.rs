@@ -221,8 +221,8 @@ fn effect_baseline_parent_identity_is_typed_for_autocommit_and_explicit() {
     );
     assert_eq!(
         explicit_parent.3.as_u32(),
-        1,
-        "the staged predecessor is the exact operation ordinal"
+        0,
+        "the first typed INSERT retains dense typed-statement ordinal zero even after catalog operations"
     );
     assert_eq!(explicit_parent.4, 0);
     assert_eq!(autocommit_parent.0, AUTOCOMMIT_TXN);
@@ -231,9 +231,9 @@ fn effect_baseline_parent_identity_is_typed_for_autocommit_and_explicit() {
         autocommit_parent.2, legacy_sql_digest,
         "autocommit uses the same typed-intent identity boundary"
     );
-    assert_ne!(
+    assert_eq!(
         explicit_parent.2, autocommit_parent.2,
-        "the statement ordinal is intentional typed-statement identity"
+        "the same first typed INSERT has one canonical statement identity across transaction shapes"
     );
     assert_eq!(
         autocommit_parent.3,
@@ -420,7 +420,14 @@ fn effect_baseline_counts_contiguous_existing_statement_references() {
             .delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let statement_ordinal = u32::try_from(delta.operations.len()).unwrap();
+        let statement_ordinal = u32::try_from(
+            delta
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, TransactionOperation::TypedInsert(_)))
+                .count(),
+        )
+        .unwrap();
         delta
             .sequence_value_references
             .push(synthetic_sequence_reference(statement_ordinal, 0));
@@ -638,7 +645,14 @@ fn effect_baseline_rejects_noncontiguous_or_duplicate_existing_statement_referen
                 .delta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let statement_ordinal = u32::try_from(delta.operations.len()).unwrap();
+            let statement_ordinal = u32::try_from(
+                delta
+                    .operations
+                    .iter()
+                    .filter(|operation| matches!(operation, TransactionOperation::TypedInsert(_)))
+                    .count(),
+            )
+            .unwrap();
             for expression_ordinal in expression_ordinals {
                 delta
                     .sequence_value_references

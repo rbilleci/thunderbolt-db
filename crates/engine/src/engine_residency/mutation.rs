@@ -4,6 +4,181 @@ use super::append_source::ResidentAppendSource;
 use super::*;
 
 impl Engine {
+    /// Publish the already-reserved first dense generation for a table introduced by codec-5 S3.
+    /// The device plan owns only the sealed allocation; this mutation owner performs the one
+    /// residency-map visibility cut, just as it does for every other resident append/rollover.
+    pub(super) fn apply_transaction_created_dense_table_generation(
+        &self,
+        plan: super::fixed_insert::TransactionCreatedDenseTablePlan<'_>,
+        created_by: AppendCreatedBy<'_>,
+    ) -> Result<(), DeviceInsertPlanApplyError> {
+        let AppendCreatedBy::InsertUniform(commit_seq) = created_by else {
+            return Err(DeviceInsertPlanApplyError::ShapeDrift);
+        };
+        if commit_seq != plan.expected_commit_seq
+            || !plan.row_ids.is_exact()
+            || !plan.row_ids.exact_len_matches(plan.row_count)
+            || plan.row_count == 0
+        {
+            return Err(DeviceInsertPlanApplyError::ShapeDrift);
+        }
+        let table_name = plan.table.name.clone();
+        if self
+            .catalog_snapshot()
+            .relational_catalog
+            .contains_key(&table_name)
+            || self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .contains_key(&table_name)
+        {
+            return Err(DeviceInsertPlanApplyError::PlanDrift);
+        }
+        let pressured = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&self.planner.default_gpu_id());
+        if pressured {
+            return Err(DeviceInsertPlanApplyError::PlanDrift);
+        }
+        let pending = plan.dense.publish_uniform_post_wal()?;
+        let row_count = plan.row_count;
+        let expected_sidecar_bytes = row_count
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(DeviceInsertPlanApplyError::ShapeDrift)?;
+        if pending.payload.final_row_count() != u64::try_from(row_count).unwrap_or(u64::MAX)
+            || pending.created_by_bytes != expected_sidecar_bytes
+            || pending.created_by_region.metadata().allocated_bytes < pending.created_by_bytes_u64
+            || pending.row_id_region.is_none()
+            || pending.row_id_region.as_ref().is_some_and(|region| {
+                region.metadata().allocated_bytes < pending.created_by_bytes_u64
+            })
+            || pending.device_memory.metadata().allocated_bytes < pending.payload_bytes
+        {
+            return Err(DeviceInsertPlanApplyError::PlanDrift);
+        }
+        let descriptor = pending.payload.into_descriptor_parts();
+        let int4_columns = plan
+            .table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let int8_columns = plan
+            .table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let numeric_columns = plan
+            .table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        if descriptor.int4_stats.len() != int4_columns.len()
+            || descriptor.bool_layouts.len()
+                != plan
+                    .table
+                    .columns
+                    .iter()
+                    .filter(|column| matches!(column.ty, SqlType::Bool))
+                    .count()
+            || descriptor.text_layouts.len()
+                != plan
+                    .table
+                    .columns
+                    .iter()
+                    .filter(|column| matches!(column.ty, SqlType::Text))
+                    .count()
+        {
+            return Err(DeviceInsertPlanApplyError::PlanDrift);
+        }
+        let resident_bytes = (8
+            + row_count
+                * (int4_columns.len() * std::mem::size_of::<i32>()
+                    + int8_columns.len() * std::mem::size_of::<i64>()
+                    + numeric_columns.len() * 16)
+            + descriptor.bool_layouts.len() * row_count.div_ceil(32) * 4
+            + descriptor.null_layouts.len() * row_count.div_ceil(32) * 4
+            + descriptor
+                .text_layouts
+                .iter()
+                .map(|layout| (row_count + 1) * 8 + layout.bytes_len as usize)
+                .sum::<usize>()) as u64;
+        let gpu_id = pending.device_memory.metadata().gpu_id;
+        if gpu_id != self.planner.default_gpu_id() {
+            return Err(DeviceInsertPlanApplyError::PlanDrift);
+        }
+        let new_shard = RelationalResidentShard {
+            shard_id: 0,
+            row_start: 0,
+            row_count,
+            history_floor_index: 0,
+            capacity: row_count,
+            int4_appendable: true,
+            resident_device_int4_column_stats: descriptor.int4_stats,
+            resident_bytes,
+            allocated_bytes: pending.device_memory.metadata().allocated_bytes,
+            count_header_byte_offset: 0,
+            resident_device_int4_columns: int4_columns,
+            resident_device_int8_columns: int8_columns,
+            resident_device_numeric_columns: numeric_columns,
+            resident_device_bool_columns: descriptor.bool_layouts,
+            resident_device_text_columns: descriptor.text_layouts,
+            resident_device_null_columns: descriptor.null_layouts,
+            gpu_id,
+            schema: plan.table.schema,
+            table: table_name.clone(),
+            point_route_generation: Arc::new(()),
+            device_memory_proof: Some(pending.device_memory.metadata().clone()),
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: false,
+            memory_pressure_active: false,
+            device_memory: Some(Arc::clone(&pending.device_memory)),
+            deleted_by_region: None,
+            created_by_region: Some(Arc::clone(&pending.created_by_region)),
+            row_id_region: pending.row_id_region.clone(),
+            max_created_by: commit_seq,
+        };
+        let mut published = false;
+        self.read_state
+            .residency
+            .with_shards_mut_for_table(&table_name, |shards| {
+                if !shards.contains_key(&table_name) {
+                    shards.insert(table_name.clone(), vec![new_shard]);
+                    published = true;
+                }
+            });
+        if !published {
+            return Err(DeviceInsertPlanApplyError::PublisherFailure);
+        }
+        self.read_state.residency.shard_device_memory.insert_shard(
+            &table_name,
+            0,
+            pending.device_memory,
+        );
+        self.read_state
+            .residency
+            .shard_created_by_memory
+            .insert_shard(&table_name, 0, pending.created_by_region);
+        if let Some(row_ids) = pending.row_id_region {
+            self.read_state
+                .residency
+                .shard_row_id_memory
+                .insert_shard(&table_name, 0, row_ids);
+        }
+        Ok(())
+    }
+
     /// Slice 1b-ii: append an INSERT's APPLIED rows IN PLACE into the table's resident OPEN shard's
     /// capacity headroom, instead of a full re-admit. `new_rows` MUST be the post-coercion/post-default
     /// applied images (the WriteDelta's `PreparedMutation::Insert.inserted_rows`), in catalog order, so
@@ -479,9 +654,11 @@ impl Engine {
         let num_numeric_cols = shard_numeric_names.len();
         let num_bool_cols = shard_bool_layouts.len();
         let preheld_budget_reservation = source.holds_budget_reservation();
+        let resets_existing_rows = source.resets_existing_rows();
 
         // Only fixed-width, NULL-free batches may append into the open shard's headroom.
-        if !has_text
+        if !resets_existing_rows
+            && !has_text
             && !has_null_shard
             && !batch_has_null
             && !source.requires_dense_rollover()
@@ -833,6 +1010,10 @@ impl Engine {
                 // The move-only pre-WAL plan retains this mutex through WAL. Re-locking would
                 // deadlock; accepting a plan without it would reopen the budget race it seals.
                 if !plan.holds_budget_reservation() {
+                    #[cfg(feature = "probe-timing")]
+                    eprintln!(
+                        "[probe] codec5_device_append stage=decline_missing_budget table={table}"
+                    );
                     return false;
                 }
                 None
@@ -863,6 +1044,8 @@ impl Engine {
                     && open.resident_device_null_columns == shard_null_layouts
             });
         if !open_still_matches {
+            #[cfg(feature = "probe-timing")]
+            eprintln!("[probe] codec5_device_append stage=decline_open_drift table={table}");
             return false;
         }
         let (current_resident_bytes, budget_scan_entries, remaining_budget) =
@@ -903,7 +1086,10 @@ impl Engine {
             };
             sealed_rollover_coordinates = Some((dense.new_shard_id, dense.new_row_start));
             let budget_scan_entries = dense.budget_scan_entries;
-            let pending = dense.pending;
+            let pending = match dense.into_pending_for_nonuniform() {
+                Ok(pending) => pending,
+                Err(_) => return false,
+            };
             if named_indexes_required
                 || row_ids.is_some() != pending.row_id_region.is_some()
                 || pending.device_memory.metadata().allocated_bytes < pending.payload_bytes
@@ -964,7 +1150,8 @@ impl Engine {
                 )),
             )
         } else if preallocated_fixed_plan {
-            // The fixed plan preallocated/uploaded every immutable section; apply only stamps and publishes.
+            // The fixed plan pre-uploaded every mutable byte before WAL; apply only the sealed
+            // count publication and install it through this same mutation owner.
             let ResidentAppendSource::DevicePlan(prepared) = &mut source else {
                 return false;
             };
@@ -972,19 +1159,34 @@ impl Engine {
                 return false;
             };
             sealed_rollover_coordinates = Some((fixed.new_shard_id, fixed.new_row_start));
-            let pending = match fixed.pending.finish_post_wal(&stamps) {
+            let fixed_capacity = fixed.capacity;
+            let capacity_fit_evaluations = fixed.capacity_fit_evaluations;
+            let fixed_budget_scan_entries = fixed.budget_scan_entries;
+            let pending = match fixed.publish_uniform_post_wal() {
                 Ok(pending) => pending,
-                Err(_) => return false,
+                Err(error) => {
+                    #[cfg(feature = "probe-timing")]
+                    eprintln!(
+                        "[probe] codec5_device_append stage=decline_fixed_finish table={table} error={error:?}"
+                    );
+                    #[cfg(not(feature = "probe-timing"))]
+                    let _ = error;
+                    return false;
+                }
             };
             if row_ids.is_some() != pending.row_id_region.is_some()
                 || stamps.len().checked_mul(std::mem::size_of::<u64>())
                     != Some(pending.created_by_stamp_bytes)
                 || pending.created_by_region.metadata().allocated_bytes < pending.created_by_bytes
             {
+                #[cfg(feature = "probe-timing")]
+                eprintln!(
+                    "[probe] codec5_device_append stage=decline_fixed_geometry table={table}"
+                );
                 return false;
             }
             (
-                fixed.capacity,
+                fixed_capacity,
                 pending.device_memory,
                 Some(pending.created_by_region),
                 pending.row_id_region,
@@ -994,8 +1196,8 @@ impl Engine {
                 Vec::new(),
                 pending.allocation_bytes,
                 Some((
-                    fixed.capacity_fit_evaluations,
-                    fixed.budget_scan_entries,
+                    capacity_fit_evaluations,
+                    fixed_budget_scan_entries,
                     pending.sidecar_fill_bytes,
                     pending.live_h2d_bytes,
                     pending.persistent_allocation_count,
@@ -1297,28 +1499,76 @@ impl Engine {
             .residency
             .with_shards_mut_for_table(table, |shards| {
                 if let Some(table_shards) = shards.get_mut(table) {
+                    if resets_existing_rows {
+                        table_shards.clear();
+                    }
                     table_shards.push(new_shard);
                 }
             });
         // Write-side bookkeeping mirrors of the SAME Arcs (alloc/stamp/purge choreography unchanged);
         // readers take resources from the one-load published descriptor above.
-        if let Some(created_region) = rolled_created_by_region {
+        if resets_existing_rows {
+            self.read_state
+                .residency
+                .shard_device_memory
+                .install_table_shards(
+                    table,
+                    std::collections::BTreeMap::from([(
+                        new_shard_id,
+                        Arc::clone(&new_device_memory),
+                    )]),
+                );
             self.read_state
                 .residency
                 .shard_created_by_memory
-                .insert_shard(table, new_shard_id, created_region);
-        }
-        if let Some(region) = rolled_row_id_region {
+                .install_table_shards(
+                    table,
+                    rolled_created_by_region
+                        .as_ref()
+                        .map(|region| {
+                            std::collections::BTreeMap::from([(new_shard_id, Arc::clone(region))])
+                        })
+                        .unwrap_or_default(),
+                );
             self.read_state
                 .residency
                 .shard_row_id_memory
-                .insert_shard(table, new_shard_id, region);
+                .install_table_shards(
+                    table,
+                    rolled_row_id_region
+                        .as_ref()
+                        .map(|region| {
+                            std::collections::BTreeMap::from([(new_shard_id, Arc::clone(region))])
+                        })
+                        .unwrap_or_default(),
+                );
+            self.read_state
+                .residency
+                .shard_deleted_by_memory
+                .invalidate_table(table);
+            self.read_state
+                .residency
+                .purge_shard_pk_index_for_table(table);
+        } else {
+            if let Some(created_region) = rolled_created_by_region {
+                self.read_state
+                    .residency
+                    .shard_created_by_memory
+                    .insert_shard(table, new_shard_id, created_region);
+            }
+            if let Some(region) = rolled_row_id_region {
+                self.read_state.residency.shard_row_id_memory.insert_shard(
+                    table,
+                    new_shard_id,
+                    region,
+                );
+            }
+            self.read_state.residency.shard_device_memory.insert_shard(
+                table,
+                new_shard_id,
+                new_device_memory,
+            );
         }
-        self.read_state.residency.shard_device_memory.insert_shard(
-            table,
-            new_shard_id,
-            new_device_memory,
-        );
         // PRODUCT-002: a rollover is a new resident generation, so every declared index must cover
         // the new shard before the commit can publish visibility. Existing shards are cache hits;
         // only this k-row shard builds. The surrounding admission budget guard remains the single
@@ -1352,7 +1602,11 @@ impl Engine {
                 .publish_relational_resident_indexes_for_generation(
                     &catalog_table,
                     publish_shards,
-                    self.committed_seq(),
+                    // The rolled rows are stamped with the caller's pending publication cut.
+                    // `committed_seq()` still names the preceding visible generation here, so
+                    // using it would build a valid-looking index that excludes this rollover
+                    // until a later rebuild (notably a concurrent nullable COPY append).
+                    stamps_max,
                     true,
                     true,
                     !incremental,
@@ -1570,7 +1824,7 @@ impl Engine {
     }
 
     /// Mutation's sole created-by publisher: use a sealed pre-WAL Arc or lazily allocate legacy rows.
-    fn get_or_alloc_created_by_region(
+    pub(super) fn get_or_alloc_created_by_region(
         &self,
         table: &str,
         shard_id: u32,

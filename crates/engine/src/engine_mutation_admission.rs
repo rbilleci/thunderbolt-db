@@ -7,7 +7,9 @@
 
 use super::*;
 use crate::engine_dml_concurrent::command_has_returning;
-use crate::engine_transaction_reset::final_transaction_operations;
+use crate::engine_transaction_reset::{
+    final_transaction_operations, final_transaction_row_operations,
+};
 
 pub struct MutationRequest {
     parsed: gpu_db_sql::ParsedCommand,
@@ -387,6 +389,9 @@ impl Engine {
         txn_id: TxnId,
         request: impl Into<TransactionRequest>,
     ) -> Result<TransactionAdmissionResult, ExecuteError> {
+        let txn_id = self
+            .resolve_or_allocate_public_transaction_id(txn_id)
+            .map_err(ExecuteError::Txn)?;
         self.observe_transaction_id(txn_id);
         match request.into() {
             TransactionRequest::Statement(request) => self.submit_statement(txn_id, request),
@@ -540,7 +545,13 @@ impl Engine {
                     let catalog_expectation = expected_catalog_version
                         .map(CatalogVersionExpectation::Prepared)
                         .or_else(|| {
-                            route_catalog_version.map(CatalogVersionExpectation::SequenceRoute)
+                            omits_published_sequence_default.then(|| {
+                                CatalogVersionExpectation::SequenceRoute(
+                                    route_catalog_version.expect(
+                                        "published sequence-default route reports its catalog cut",
+                                    ),
+                                )
+                            })
                         });
                     if omits_published_sequence_default {
                         reject_prepared_hook(on_prepared)?;
@@ -549,7 +560,14 @@ impl Engine {
                             command,
                             catalog_expectation,
                         )?
-                    } else if self.is_concurrent_dml_command(&command) {
+                    // A sequence-owning table is not itself a second INSERT authority. When
+                    // every sequence-default cell is supplied, this statement has no sequence
+                    // transition and must use the same claimed private-overlay terminal as every
+                    // other autocommit INSERT. Only an omitted/DEFAULT cell above needs the
+                    // sequence-materializing entry.
+                    } else if matches!(&command, Command::Insert(_))
+                        || self.is_concurrent_dml_command(&command)
+                    {
                         match on_prepared {
                             Some(on_prepared) => self
                                 .execute_parsed_dml_concurrent_instrumented_with_catalog(
@@ -1005,9 +1023,16 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .operations
             .clone();
+        let sequence_value_references = snapshot
+            .delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sequence_value_references
+            .clone();
         let (deltas, table_resets) = final_transaction_operations(&staged_operations);
-        let has_staged_deltas = !deltas.is_empty() || !table_resets.is_empty();
-        let provisional = Self::transaction_insert_identities(&deltas)?;
+        let final_rows = final_transaction_row_operations(&staged_operations);
+        let has_staged_deltas = !final_rows.is_empty() || !table_resets.is_empty();
+        let provisional = Self::transaction_operation_insert_identities(&staged_operations)?;
         let provisional_count = u64::try_from(provisional.len()).map_err(|_| {
             ExecuteError::Unsupported(
                 "predeclared transaction provisional identity count exceeds u64 framing"
@@ -1019,19 +1044,46 @@ impl Engine {
                 "predeclared transaction provisional identity count overflow".to_string(),
             )
         })?;
-        let mut record = Self::resolved_transaction_record(
-            &deltas,
-            &deltas,
-            &provisional,
-            1,
-            allocator_high_water,
-            &[],
-        )?;
-        record.table_resets = table_resets
+        let transaction_catalog = snapshot.transaction_catalog();
+        let catalog_commands = staged_operations
             .iter()
-            .map(StagedTableReset::to_binary)
-            .collect();
-        let wal_bytes = if has_staged_deltas {
+            .filter_map(|operation| match operation {
+                TransactionOperation::Catalog(staged) => Some(staged.as_ref().clone()),
+                TransactionOperation::Row(_)
+                | TransactionOperation::TableReset(_)
+                | TransactionOperation::TypedInsert(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let codec5_resource_geometry = self.predeclared_codec5_insert_resource_geometry(
+            &staged_operations,
+            deltas.len(),
+            table_resets.len(),
+            &final_rows,
+            &catalog_commands,
+            &transaction_catalog,
+            &sequence_value_references,
+        )?;
+
+        let mut post_image_bytes = 0u64;
+        let mut maintained_index_fanout = 0u32;
+        let wal_bytes = if let Some((post_image, logical_wal, index_fanout)) =
+            codec5_resource_geometry
+        {
+            post_image_bytes = post_image;
+            maintained_index_fanout = index_fanout;
+            logical_wal
+        } else if has_staged_deltas {
+            let mut record = Self::resolved_transaction_record(
+                &final_rows,
+                &provisional,
+                1,
+                allocator_high_water,
+                &[],
+            )?;
+            record.table_resets = table_resets
+                .iter()
+                .map(StagedTableReset::to_binary)
+                .collect();
             let payload: Arc<[u8]> =
                 Arc::from(try_encode_binary_transaction(&record).ok_or_else(|| {
                     ExecuteError::Unsupported(
@@ -1109,48 +1161,59 @@ impl Engine {
             // Empty explicit transactions are closed without sequence/WAL publication.
             0
         };
-        let mut post_image_bytes = 0u64;
-        let mut maintained_index_fanout = 0u32;
-        for mutation in &record.mutations {
-            let (table, post_image_len) = match mutation {
-                BinaryTransactionMutation::Insert {
-                    table, row_encoded, ..
-                }
-                | BinaryTransactionMutation::Update {
-                    table,
-                    new_row_encoded: row_encoded,
-                    ..
-                } => (table, row_encoded.len()),
-                BinaryTransactionMutation::Delete { table, .. } => (table, 0),
-            };
-            let post_image = u64::try_from(post_image_len).map_err(|_| {
-                ExecuteError::Unsupported(
-                    "predeclared transaction post-image length exceeds u64 framing".to_string(),
-                )
-            })?;
-            post_image_bytes = post_image_bytes.checked_add(post_image).ok_or_else(|| {
-                ExecuteError::Unsupported(
-                    "predeclared transaction post-image byte count overflow".to_string(),
-                )
-            })?;
-            let index_count = snapshot
-                .catalog
-                .relational_catalog
-                .get(table)
-                .map(|table| table.indexes.len())
-                .unwrap_or(0);
-            let index_count = u32::try_from(index_count).map_err(|_| {
-                ExecuteError::Unsupported(
-                    "predeclared transaction index count exceeds u32 framing".to_string(),
-                )
-            })?;
-            maintained_index_fanout = maintained_index_fanout
-                .checked_add(index_count)
-                .ok_or_else(|| {
+        if codec5_resource_geometry.is_none() {
+            let mut record = Self::resolved_transaction_record(
+                &final_rows,
+                &provisional,
+                1,
+                allocator_high_water,
+                &[],
+            )?;
+            record.table_resets = table_resets
+                .iter()
+                .map(StagedTableReset::to_binary)
+                .collect();
+            for mutation in &record.mutations {
+                let (table, post_image_len) = match mutation {
+                    BinaryTransactionMutation::Insert {
+                        table, row_encoded, ..
+                    }
+                    | BinaryTransactionMutation::Update {
+                        table,
+                        new_row_encoded: row_encoded,
+                        ..
+                    } => (table, row_encoded.len()),
+                    BinaryTransactionMutation::Delete { table, .. } => (table, 0),
+                };
+                let post_image = u64::try_from(post_image_len).map_err(|_| {
                     ExecuteError::Unsupported(
-                        "predeclared transaction index-fanout count overflow".to_string(),
+                        "predeclared transaction post-image length exceeds u64 framing".to_string(),
                     )
                 })?;
+                post_image_bytes = post_image_bytes.checked_add(post_image).ok_or_else(|| {
+                    ExecuteError::Unsupported(
+                        "predeclared transaction post-image byte count overflow".to_string(),
+                    )
+                })?;
+                let index_count = snapshot
+                    .catalog
+                    .relational_catalog
+                    .get(table)
+                    .map(|table| table.indexes.len())
+                    .unwrap_or(0);
+                let index_count = u32::try_from(index_count).map_err(|_| {
+                    ExecuteError::Unsupported(
+                        "predeclared transaction index count exceeds u32 framing".to_string(),
+                    )
+                })?;
+                maintained_index_fanout = maintained_index_fanout
+                    .checked_add(index_count)
+                    .ok_or_else(|| {
+                        ExecuteError::Unsupported(
+                            "predeclared transaction index-fanout count overflow".to_string(),
+                        )
+                    })?;
+            }
         }
         let result_bytes = results.iter().try_fold(0u64, |total, result| {
             total

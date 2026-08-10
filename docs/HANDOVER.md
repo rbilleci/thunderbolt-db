@@ -1,28 +1,17 @@
 # HANDOVER — Resume Baton
 
-This is only the short resume pointer. [`PLAN.md`](PLAN.md) owns all open, blocked, and sequenced work;
-[`STATUS.md`](STATUS.md) owns accepted facts.
+[PLAN.md](PLAN.md) owns open, blocked, and sequenced work; [STATUS.md](STATUS.md) owns verified facts.
 
 ## Current boundary
 
-**WRITE-001** is the sole active NOW milestone and is incomplete. The tree has substantial accepted typed-batch,
-GPU-preflight, codec/replay-witness, narrow nullable-Int4 recovery, bootstrap, and private publication foundations.
-The latest accepted internal fact is placement-only resource republication, recorded in `STATUS.md`, but these
-foundations do not yet form the one general production INSERT/WAL/GPU apply/publication/reopen route.
+**WRITE-000 is an accepted release checkpoint.** Preserve the unified `TypedInsertBatch` → overlay → codec-5 semantics-v2 → `DeviceInsertPlan` → canonical WAL/status → GPU apply/publication → fresh-replay implementation. Do not discard or rebuild it.
 
-The working tree is an integrated WIP candidate spanning engine generation/bootstrap, execution completion/rebuild,
-WAL terminal encoding, and documentation. Preserve it; do not discard or relabel it as a completed checkpoint.
+`benchmark_report_card.sh --full` measured only raw/read point paths. Its successful A/B/C transcript remains read-regression evidence, not a write-throughput claim.
 
-## Resume here
+## Deferred performance reassessment
 
-Resume at [`PLAN.md`'s WRITE-001 12-hour end-to-end recovery](PLAN.md#current-focus--write-001-12-hour-end-to-end-recovery).
-Start the clock only when implementation begins. Reconcile the current tree, then make the representative production
-pgwire-to-fresh-reopen route pass by the 2:30 gate. Do not design, audit, accept, or hand over another private
-sub-boundary. Intermediate helpers remain WIP inside the one WRITE-001 candidate.
+- The latest actual-pgwire baseline is 220,231.004 rows/s for 1,000,000 rows in 1,000 statements; it is not a 300k or paired-PostgreSQL result.
+- **WRITE-002** is parked. Do not resume write-performance work until explicitly promoted with a new workload and target contract.
+- **CARD-001** remains blocked pending explicit promotion; it is no longer gated on a superseded WRITE-000 throughput threshold.
 
-The concluded causal analysis is
-[`archive/reviews/write-001-delivery-rca-2026-08-02.md`](archive/reviews/write-001-delivery-rca-2026-08-02.md).
-The unchanged product contract is
-[`design/write-001-general-insert-pipeline.md`](design/write-001-general-insert-pipeline.md).
-
-**CARD-001** remains blocked on accepted WRITE-001, and **COPY-001** remains blocked on both.
+See [PLAN.md](PLAN.md#work-ledger) for the sole task contract and [STATUS.md](STATUS.md#write-000-unified-gpu-native-write-lifecycle--accepted-release-checkpoint-2026-08-10) for current evidence.

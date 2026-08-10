@@ -2144,6 +2144,7 @@ pub(super) mod tests {
         let table = RelationalTable {
             schema: "public".to_owned(),
             name: table_name.clone(),
+            stable_table_id: 1,
             oid: 100,
             columns: vec![RelationalColumn {
                 id: 7,

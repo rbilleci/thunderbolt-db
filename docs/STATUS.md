@@ -14,7 +14,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
-## WRITE-001 narrow sealed nullable-Int4 recovery spine — accepted, 2026-08-02
+## WRITE-000 unified GPU-native write lifecycle — accepted release checkpoint, 2026-08-10
+
+- The staged implementation retains one production INSERT-bearing lifecycle: `TypedInsertBatch` → private ordered transaction overlay → codec-5 semantics-v2 compiler → `DeviceInsertPlan` → canonical reservation/WAL/status → GPU apply → immutable publication → fresh replay. UPDATE/DELETE of pre-existing rows compose into that same compiler and publication owner; historical decoders remain compatibility readers.
+- The frozen release tree reseals the 17-case PostgreSQL semantic differential in `target/write000-release-postgresql-differential-seal`: all success output is byte-equal, required failure SQLSTATEs match, and NULL, rollback, `RETURNING`, and atomicity pass. Its GPU-lifetime HAZARD evidence is `target/write000-release-hazard-seal`: three serial and two concurrent `--ignored` cohorts of `canonical_copy_survives_sequential_and_concurrent_gpu_lifetime_hazard` pass with no CUDA 700/716/717 signatures. Those are correctness/recovery evidence, never write-performance evidence.
+- The canonical report card completed A/B/C and passed its 260M in-L2 point-read floor, but it measures `read_kernel_roofline` and `r2_wave_engine_ab`; it remains read-regression evidence only and makes no write-throughput claim.
+- The paired development qualification at `target/insert-qualification.ftLqRR` is retained as historical diagnostic evidence: GPU median 201,583.335 rows/s versus PostgreSQL 736,521.589, with GPU p99/p99.9 of 5,662/6,068µs. It proves observed non-vacuous general codec-5 operation work, but it is not this checkpoint's performance contract. The earlier `target/insert-qualification.Eebvfb` result is likewise diagnostic only.
+- The final current-engine measurement is `target/write000-final-attempt.4BHdhJ/client.record`: the actual pgwire workload completed 1,000,000 rows in 1,000 statements at **220,231.004 rows/s**, with p99/p99.9 INSERT round trips of **5,070/5,655µs**. This is the recorded baseline, not a 300k or PostgreSQL-comparative claim.
+- The sealed paired 1M-row comparison is `target/write000-release-comparison-seal`. It is an observed baseline only; the runner has no threshold and reports completion for valid paired evidence.
+- Product decision on 2026-08-10 accepts the current engine as a release checkpoint. **WRITE-002** is parked for a future performance reassessment; it must establish a new workload and explicit comparative targets before any renewed performance evaluation.
 
 - `seal_nullable_int4_rebuild_checkpoint` freezes one durable quiescent WAL prefix for exactly one nonempty,
   no-index, one-column nullable `Int4` table. It replays privately, keeps the final GPU owners, D2D-compacts a

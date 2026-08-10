@@ -15,34 +15,44 @@ mod codec;
 mod envelope;
 #[path = "typed_insert_aggregate/status.rs"]
 mod status;
-// The physical codec-5 aggregate is still format/semantics v1.  This private, unreachable
-// scaffold gives the eventual replay owner one allocation-free *v1* source traversal without
-// claiming that the incomplete section set is live or replayable yet.  It is intentionally not
-// the table-local semantics-v2 authority.
-#[path = "typed_insert_aggregate/semantics_v1_scaffold.rs"]
-mod semantics_v1_scaffold;
 
-// Semantics two is a production-compiled but unreachable normative decoder checkpoint.  It is
-// not linked into the live codec-5 decoder, WAL, recovery, apply, or publication path until the
-// remaining WRITE-001 ownership gates promote it as one whole slice.  Its reencoder/fixtures are
-// separately test-only.
+// Semantics two is the sole live codec-5 writer and strict replay authority. Historical codec
+// readers remain in their compatibility owners; no provisional S3/mixed-operation semantics is
+// compiled beside this INSERT-only profile.
 #[path = "typed_insert_aggregate/semantics_v2.rs"]
 mod semantics_v2;
 
+#[cfg(test)]
+pub(crate) use codec::reencode_legacy_catalog_marker_for_test;
 #[allow(unused_imports)] // Terminal pre-WAL adoption consumes this complete inert API next.
 pub(crate) use codec::{
     decode_typed_insert_aggregate_bodies, encode_typed_insert_aggregate_bodies,
+    measure_and_prepare_typed_insert_aggregate_encoding, prepare_typed_insert_aggregate_encoding,
     reserve_typed_insert_aggregate_bodies, typed_insert_aggregate_root,
     typed_insert_aggregate_status_roots, DecodedTypedInsertAggregate,
-    EncodedTypedInsertAggregateBodies, ReservedTypedInsertAggregateBodyBuffers,
-    TypedInsertAggregateFragmentRefs, TypedInsertAggregateSectionView,
-    TypedInsertAggregateStatusRoots, TypedInsertAggregateView,
+    EncodedTypedInsertAggregateBodies, PreparedTypedInsertAggregateEncoding,
+    ReservedTypedInsertAggregateBodyBuffers, TypedInsertAggregateFragmentRefs,
+    TypedInsertAggregateSectionView, TypedInsertAggregateStatusRoots, TypedInsertAggregateView,
 };
 #[allow(unused_imports)]
 // Consumed by ReservedInsertPreWalPlan after the inert ownership gate.
 pub(crate) use envelope::{
     encode_reserved_typed_insert_canonical_envelope, reserve_typed_insert_canonical_envelope,
     EncodedTypedInsertCanonicalEnvelope, ReservedTypedInsertCanonicalEnvelope,
+};
+#[cfg(test)]
+pub(crate) use semantics_v2::decode_catalog_composition_for_test;
+#[allow(unused_imports)]
+// Consumed by the canonical transaction terminal during WRITE-001 cutover.
+pub(crate) use semantics_v2::{
+    decode_closed_semantics_v2_replay, encode_live_typed_insert,
+    encode_live_typed_insert_transaction, live_autocommit_request_digest,
+    live_explicit_request_digest, live_explicit_request_digest_with_catalog,
+    write001_identifier_digest, LiveFinalRowDigestSource, LiveTypedInsertCreatedIndex,
+    LiveTypedInsertFinalWriter, LiveTypedInsertForeignIndexGeneration, LiveTypedInsertIdentity,
+    LiveTypedInsertIndexGeneration, LiveTypedInsertMode, LiveTypedInsertSequenceRestart,
+    LiveTypedInsertStatementView, LiveTypedInsertTableGeneration, LiveTypedInsertView,
+    SemanticsV2ReplayArtifact, SemanticsV2ReplayMetadata,
 };
 pub(crate) use status::{decode_status_v2, encode_status_v2, TypedInsertStatusV2};
 
@@ -67,6 +77,23 @@ pub(crate) const AGGREGATE_CHUNK_HEADER_BYTES: u64 = 76;
 pub(crate) const AGGREGATE_STATUS_V2_BYTES: u64 = 204;
 pub(crate) const AGGREGATE_MAX_CHUNKS: usize = 4;
 
+/// Typed aggregate semantics selected before measurement. Keeping this as a closed type prevents
+/// a live writer from smuggling an arbitrary wire version through otherwise-valid v1 geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedInsertAggregateSemantics {
+    V1,
+    V2,
+}
+
+impl TypedInsertAggregateSemantics {
+    pub(crate) const fn wire_version(self) -> u16 {
+        match self {
+            Self::V1 => AGGREGATE_SEMANTICS_V1,
+            Self::V2 => AGGREGATE_SEMANTICS_V2,
+        }
+    }
+}
+
 /// The existing canonical fragment-body ceiling minus the codec-5 chunk header.
 pub(crate) const AGGREGATE_CHUNK_PAYLOAD_BYTES: u64 =
     gpu_db_wal::canonical_fragment_body_limit() - AGGREGATE_CHUNK_HEADER_BYTES;
@@ -86,7 +113,10 @@ pub(crate) const AGGREGATE_FLAG_PUBLISHED_SEQUENCE: u32 = 1 << 4;
 pub(crate) const AGGREGATE_FLAG_PRIVATE_SEQUENCE: u32 = 1 << 5;
 pub(crate) const AGGREGATE_FLAG_RETURNING: u32 = 1 << 6;
 pub(crate) const AGGREGATE_FLAG_RETAINED_RESPONSE: u32 = 1 << 7;
-const AGGREGATE_KNOWN_FLAGS: u32 = (1 << 8) - 1;
+/// S3 carries one existing ordered transaction operation beside typed INSERT rows. `CATALOG`
+/// remains narrower: it says that the S3 operation changes the outer catalog boundary.
+pub(crate) const AGGREGATE_FLAG_OPERATION_COMPOSITION: u32 = 1 << 8;
+const AGGREGATE_KNOWN_FLAGS: u32 = (1 << 9) - 1;
 
 pub(crate) const OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1: u32 = 1 << 31;
 pub(crate) const OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH: u32 = 1 << 30;
@@ -97,7 +127,8 @@ pub(crate) const OUTER_CONTENT_REWRITE: u32 = 1 << 3;
 pub(crate) const OUTER_CONTENT_PUBLISHED_SEQUENCE: u32 = 1 << 4;
 pub(crate) const OUTER_CONTENT_PRIVATE_SEQUENCE: u32 = 1 << 5;
 pub(crate) const OUTER_CONTENT_RETURNING: u32 = 1 << 6;
-const OUTER_KNOWN_CONTENT: u32 = (1 << 7) - 1;
+pub(crate) const OUTER_CONTENT_OPERATION_COMPOSITION: u32 = 1 << 7;
+const OUTER_KNOWN_CONTENT: u32 = (1 << 8) - 1;
 
 pub(crate) const AGGREGATE_CHUNK_MAGIC: &[u8; 8] = b"GPUDBOP1";
 pub(crate) const AGGREGATE_STREAM_MAGIC: &[u8; 16] = b"GPUDBTXNAGG1\0\0\0\0";
@@ -118,6 +149,7 @@ pub(crate) struct AggregateSectionMeasure {
 /// Allocation-free input to codec-5 measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TypedInsertAggregateMeasure {
+    pub(crate) semantics: TypedInsertAggregateSemantics,
     pub(crate) flags: u32,
     pub(crate) outer_flags: u32,
     pub(crate) stable_transaction_id: u64,
@@ -367,6 +399,15 @@ impl TypedInsertAggregateMeasure {
         if self.outer_flags & OUTER_CONTENT_ROW == 0 {
             return Err(TypedInsertAggregateLayoutError::MissingRowContent);
         }
+        // S3 operation composition is additive semantics-v2 state. Retain historical v1
+        // decoder strictness for the formerly unallocated flag/content bits rather than letting
+        // a new v2 feature silently widen an old aggregate profile.
+        if self.semantics == TypedInsertAggregateSemantics::V1
+            && (self.flags & AGGREGATE_FLAG_OPERATION_COMPOSITION != 0
+                || self.outer_flags & OUTER_CONTENT_OPERATION_COMPOSITION != 0)
+        {
+            return Err(TypedInsertAggregateLayoutError::InconsistentContentFlags);
+        }
         if self.statement_count == 0
             || self.insert_statement_count == 0
             || self.insert_statement_count > self.statement_count
@@ -375,11 +416,20 @@ impl TypedInsertAggregateMeasure {
         {
             return Err(TypedInsertAggregateLayoutError::InvalidStatementCounts);
         }
-        if self.original_inserted_row_count == 0
-            || self.allocator_before == 0
-            || self.allocator_high_water <= self.allocator_before
-            || self.allocator_high_water - self.allocator_before != self.original_inserted_row_count
-        {
+        let allocator_is_valid = match self.semantics {
+            TypedInsertAggregateSemantics::V1 => {
+                self.allocator_before != 0
+                    && self.allocator_high_water > self.allocator_before
+                    && self.allocator_high_water - self.allocator_before
+                        == self.original_inserted_row_count
+            }
+            // Semantics v2 moves allocator ranges into per-table S7 witnesses. The aggregate
+            // header sentinels must stay zero so no global row allocator can be reintroduced.
+            TypedInsertAggregateSemantics::V2 => {
+                self.allocator_before == 0 && self.allocator_high_water == 0
+            }
+        };
+        if self.original_inserted_row_count == 0 || !allocator_is_valid {
             return Err(TypedInsertAggregateLayoutError::InvalidAllocatorRange);
         }
         if self.table_block_count == 0 {
@@ -387,6 +437,10 @@ impl TypedInsertAggregateMeasure {
         }
         let paired_content = [
             (AGGREGATE_FLAG_CATALOG, OUTER_CONTENT_CATALOG),
+            (
+                AGGREGATE_FLAG_OPERATION_COMPOSITION,
+                OUTER_CONTENT_OPERATION_COMPOSITION,
+            ),
             (AGGREGATE_FLAG_RESET, OUTER_CONTENT_RESET),
             (
                 AGGREGATE_FLAG_PUBLISHED_SEQUENCE,
@@ -407,10 +461,15 @@ impl TypedInsertAggregateMeasure {
         {
             return Err(TypedInsertAggregateLayoutError::InconsistentContentFlags);
         }
+        // Before semantics-v2 allocated OPERATION_COMPOSITION, a catalog-bearing S3 was the
+        // only composition shape. Preserve that decoder contract: historical CATALOG implies
+        // the legacy S3 slot, while new writers also set the explicit operation bit.
         let expected_counts = [
             u64::from(self.statement_count),
             u64::from(self.insert_statement_count),
-            0,
+            u64::from(
+                self.flags & (AGGREGATE_FLAG_OPERATION_COMPOSITION | AGGREGATE_FLAG_CATALOG) != 0,
+            ),
             self.original_inserted_row_count,
             0,
             u64::from(self.statement_count),
@@ -418,7 +477,9 @@ impl TypedInsertAggregateMeasure {
             0,
         ];
         for (index, expected) in expected_counts.into_iter().enumerate() {
-            if expected != 0 && u64::from(self.sections[index].entry_count) != expected {
+            if (index == 2 || expected != 0)
+                && u64::from(self.sections[index].entry_count) != expected
+            {
                 return Err(TypedInsertAggregateLayoutError::SectionCountMismatch {
                     section: (index + 1) as u16,
                     expected,
@@ -479,6 +540,7 @@ mod tests {
             payload_bytes: 160,
         };
         TypedInsertAggregateMeasure {
+            semantics: TypedInsertAggregateSemantics::V1,
             flags: AGGREGATE_FLAG_AUTOCOMMIT,
             outer_flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
             stable_transaction_id: 41,

@@ -148,6 +148,23 @@ impl Engine {
         command: Command,
         catalog_expectation: Option<crate::engine_mutation_admission::CatalogVersionExpectation>,
     ) -> Result<DmlExecutionResult, ExecuteError> {
+        self.execute_sequence_default_autocommit_at_timestamp_micros(
+            txn_id,
+            command,
+            catalog_expectation,
+            current_timestamp_micros(),
+        )
+    }
+
+    /// Commits a published sequence-default INSERT through the sole typed parent lifecycle,
+    /// retaining an externally supplied timestamp for public compatibility ingress.
+    pub(crate) fn execute_sequence_default_autocommit_at_timestamp_micros(
+        &self,
+        txn_id: TxnId,
+        command: Command,
+        catalog_expectation: Option<crate::engine_mutation_admission::CatalogVersionExpectation>,
+        timestamp_micros: u64,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
         let request_digest = transaction_statement_digest(&command)?;
         self.validate_sequence_default_parent_request(txn_id, request_digest)?;
         if let Some(rows_affected) =
@@ -195,12 +212,13 @@ impl Engine {
                 return Err(error);
             }
         };
-        match self.commit_claimed_transaction_delta(
-            txn_id,
-            request_digest,
-            current_timestamp_micros(),
-        ) {
-            Ok(()) => Ok(result),
+        match self.commit_claimed_transaction_delta(txn_id, request_digest, timestamp_micros) {
+            Ok(()) => {
+                // Like the ordinary typed autocommit overlay, checkpoint maintenance belongs
+                // after the shared terminal has released its commit ownership.
+                self.maybe_auto_checkpoint_wal();
+                Ok(result)
+            }
             Err(error) => {
                 if !self.is_commit_path_poisoned()
                     && self.transaction_snapshot_handle(txn_id).is_some()
@@ -418,6 +436,31 @@ impl Engine {
         parent_txn_id: TxnId,
         parent_request_digest: gpu_db_wal::CanonicalDigest,
     ) -> Result<(), ExecuteError> {
+        // The parent terminal is the exact retry authority.  Its request digest deliberately
+        // differs from the typed semantic digest retained by pre-parent sequence children, so a
+        // completed parent must resolve before comparing those child identities.
+        {
+            let commit = self.commit_state();
+            match commit
+                .resolve_transaction_retry_digest_outcome(parent_txn_id, parent_request_digest)
+            {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(error) => return Err(ExecuteError::Engine(error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Before a durable parent terminal exists, sequence-default children retain the immutable
+    /// typed statement digest that created them.  Compare that digest only after the current
+    /// command has completed pure typed preparation; comparing it to the later terminal's
+    /// request digest would reject an exact retry and encourage a second `nextval` claim.
+    pub(crate) fn validate_sequence_default_parent_typed_identity(
+        &self,
+        parent_txn_id: TxnId,
+        typed_parent_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<(), ExecuteError> {
         let outcomes = self
             .sequence_value_outcomes
             .lock()
@@ -425,7 +468,7 @@ impl Engine {
         if outcomes.values().any(|applied| {
             applied.record.parent_autocommit
                 && applied.record.parent_txn_id == parent_txn_id
-                && applied.record.parent_request_digest != parent_request_digest
+                && applied.record.parent_request_digest != typed_parent_digest
         }) {
             return Err(ExecuteError::Engine(EngineError::Durability(format!(
                 "transaction id {parent_txn_id} already has a durable sequence outcome for a different request"
@@ -447,13 +490,22 @@ impl Engine {
             .any(|applied| {
                 applied.record.parent_autocommit && applied.record.parent_txn_id == parent_txn_id
             });
-        if !claimed {
+        if !claimed
+            || matches!(
+                command,
+                Command::SequenceNextVal(_) | Command::SequenceSetVal(_)
+            )
+            || self.insert_sequence_default_route(command).0
+        {
+            // An ordinary sequence retry validates its exact transition input in
+            // `resolve_sequence_value_transition_retry`.  A sequence-default retry first
+            // rebuilds its pure typed statement identity, then validates it immediately before
+            // materializing children.  Both must bypass the raw parent-terminal digest here.
             return Ok(());
         }
-        self.validate_sequence_default_parent_request(
-            parent_txn_id,
-            transaction_statement_digest(command)?,
-        )
+        Err(ExecuteError::Engine(EngineError::Durability(format!(
+            "transaction id {parent_txn_id} already has a durable sequence outcome for a different request"
+        ))))
     }
 
     pub(crate) fn reject_nonstatement_sequence_autocommit_parent(
@@ -501,6 +553,7 @@ impl Engine {
     }
 
     pub fn sequence_currval_effects(&self, parent_txn_id: TxnId) -> Vec<(u32, i64)> {
+        let parent_txn_id = self.resolve_public_transaction_id(parent_txn_id);
         let mut effects = self
             .sequence_value_outcomes
             .lock()
@@ -545,6 +598,17 @@ impl Engine {
         let Command::Insert(insert) = command else {
             return Ok(Vec::new());
         };
+
+        // The normal typed/generic semantic preparation below remains the owner of ordinary
+        // INSERT validation. Avoid duplicating that O(rows) shape walk on the hot fixed-width
+        // path when this relation cannot possibly request a published sequence transition.
+        if !table
+            .columns
+            .iter()
+            .any(|column| matches!(column.default, Some(ColumnDefault::SequenceNextVal { .. })))
+        {
+            return Ok(Vec::new());
+        }
 
         let mut provided = BTreeSet::new();
         if !insert.columns.is_empty() {
@@ -793,6 +857,64 @@ impl Engine {
         Ok(())
     }
 
+    /// Bind published sequence defaults to the immutable typed transaction artifact. The artifact
+    /// derives its short-lived control-plane row directly from the constructor-validated private
+    /// payload, so this performs the same value/identity proof as the legacy `WriteDelta` binder
+    /// without retaining or reparsing a row-string duplicate.
+    pub(crate) fn bind_sequence_default_typed_insert_rows(
+        &self,
+        table: &RelationalTable,
+        staged: &crate::engine_transaction_delta::StagedTypedInsert,
+        references: &mut [BinarySequenceValueReference],
+    ) -> Result<(), ExecuteError> {
+        let mut bindings = BTreeSet::new();
+        for reference in references {
+            if !reference.default_expression || reference.table_oid != table.oid {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed sequence default lost its stable table identity".to_string(),
+                )));
+            }
+            let row_index = usize::try_from(reference.staging_row_ordinal).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed sequence default row ordinal exceeds usize".to_string(),
+                ))
+            })?;
+            let row_id = *staged.provisional_row_ids.get(row_index).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed sequence default row identity left its INSERT".to_string(),
+                ))
+            })?;
+            let column_index = table
+                .columns
+                .iter()
+                .position(|column| column.id == reference.column_id)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "typed sequence default lost its stable column identity".to_string(),
+                    ))
+                })?;
+            let expected = i32::try_from(reference.returned_value).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed sequence default is outside its int4 column domain".to_string(),
+                ))
+            })?;
+            let row = staged.private_row_values(table, row_index)?;
+            if row.get(column_index) != Some(&SqlValue::Int4(expected)) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed sequence default value left its private artifact".to_string(),
+                )));
+            }
+            if !bindings.insert((row_id, reference.column_id)) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed sequence default repeats one row-expression binding".to_string(),
+                )));
+            }
+            reference.row_id = row_id;
+            reference.staging_row_ordinal = 0;
+        }
+        Ok(())
+    }
+
     /// Record whether the final coalesced user mutation still carries each sequence-produced
     /// value. A later update/delete may legitimately replace it, but that disposition is itself a
     /// typed WAL claim and is checked again during canonical apply and recovery.
@@ -970,6 +1092,7 @@ impl Engine {
                         .is_some_and(|target| target.oid == sequence_oid)
                 }),
             TransactionOperation::Row(_) => false,
+            TransactionOperation::TypedInsert(_) => false,
         })
     }
 
@@ -1286,17 +1409,46 @@ impl Engine {
         Ok(records)
     }
 
+    /// Resolve the sequence references carried by a codec-5 S3 catalog envelope.
+    ///
+    /// S3 must use global transaction-operation ordinals so its established binary decoder can
+    /// prove that every reference names an INSERT. The separately durable S5 transition keeps
+    /// the dense typed-INSERT receipt ordinal. This narrow resolver accepts only that deliberate
+    /// default-expression representation difference; all stable identity, parent, value, digest,
+    /// expression, and operation-class fields remain bound to the durable transition.
+    pub(crate) fn codec5_catalog_sequence_value_reference_records(
+        &self,
+        references: &[BinarySequenceValueReference],
+    ) -> Result<Vec<BinarySequenceValueTransitionRecord>, EngineError> {
+        let outcomes = self
+            .sequence_value_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut records = Vec::with_capacity(references.len());
+        for reference in references {
+            records.push(
+                durable_sequence_value_record_for_codec5_catalog_reference(&outcomes, reference)?
+                    .clone(),
+            );
+        }
+        Ok(records)
+    }
+
     pub(crate) fn prepare_sequence_lifecycle_reference_replay(
         &self,
         working: &mut DdlCatalogState,
         references: &[BinarySequenceValueReference],
         lifecycle_oids: &BTreeSet<u32>,
+        codec5_catalog_sequence_reference_ordinals: bool,
     ) -> Result<Vec<BinarySequenceValueTransitionRecord>, EngineError> {
-        let records = self
-            .sequence_value_reference_records(references)?
-            .into_iter()
-            .filter(|record| lifecycle_oids.contains(&record.sequence_oid))
-            .collect::<Vec<_>>();
+        let records = (if codec5_catalog_sequence_reference_ordinals {
+            self.codec5_catalog_sequence_value_reference_records(references)
+        } else {
+            self.sequence_value_reference_records(references)
+        })?
+        .into_iter()
+        .filter(|record| lifecycle_oids.contains(&record.sequence_oid))
+        .collect::<Vec<_>>();
         for sequence_oid in lifecycle_oids {
             let relevant = records
                 .iter()
@@ -1335,6 +1487,144 @@ impl Engine {
             sequence.is_called = first.prior_is_called;
         }
         Ok(records)
+    }
+
+    /// Translate codec-5's dense typed-statement receipt ordinal into the enclosing transaction
+    /// operation ordinal used by catalog lifecycle replay. The durable transition and its S5
+    /// reference deliberately retain the dense typed ordinal; this is only the private-catalog
+    /// reconstruction cursor used while another statement is being staged.
+    pub(crate) fn rebind_private_typed_sequence_replay_ordinals(
+        records: &mut [BinarySequenceValueTransitionRecord],
+        references: &[BinarySequenceValueReference],
+        operations: &[TransactionOperation],
+    ) -> Result<(), EngineError> {
+        let typed_operation_ordinals = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                TransactionOperation::TypedInsert(staged) => Some(staged.operation_ordinal),
+                TransactionOperation::Catalog(_)
+                | TransactionOperation::Row(_)
+                | TransactionOperation::TableReset(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let replay_ordinals = references
+            .iter()
+            .filter(|reference| reference.default_expression)
+            .map(|reference| {
+                let operation_ordinal = typed_operation_ordinals
+                    .get(reference.statement_ordinal as usize)
+                    .copied()
+                    .ok_or_else(|| {
+                        EngineError::Durability(format!(
+                            "sequence default reference {} lost its typed INSERT operation owner",
+                            reference.transition_txn_id
+                        ))
+                    })?;
+                Ok((reference.transition_txn_id, operation_ordinal))
+            })
+            .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
+        for record in records.iter_mut() {
+            if let Some(operation_ordinal) = replay_ordinals.get(&record.transition_txn_id) {
+                record.statement_ordinal = *operation_ordinal;
+            }
+        }
+        if records
+            .windows(2)
+            .any(|pair| pair[0].statement_ordinal > pair[1].statement_ordinal)
+        {
+            return Err(EngineError::Durability(
+                "sequence lifecycle references do not follow transaction operation order"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// S3 stores global ordered-program INSERT ordinals, while the independently durable S5
+    /// transition retains its dense typed-INSERT receipt ordinal. The codec-5-specific durable
+    /// binding has already authenticated every field other than that representation boundary.
+    /// Prove the two representations name the same INSERT before using S3's global cursor for
+    /// catalog lifecycle replay. Historical ordered transaction records retain their established
+    /// statement-ordinal layout.
+    pub(crate) fn rebind_codec5_catalog_sequence_replay_ordinals(
+        records: &mut [BinarySequenceValueTransitionRecord],
+        references: &[BinarySequenceValueReference],
+        operation_order: &[BinaryTransactionOperationIdentity],
+    ) -> Result<(), EngineError> {
+        let typed_operation_ordinals = operation_order
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, operation)| {
+                matches!(operation, BinaryTransactionOperationIdentity::Insert { .. })
+                    .then_some(ordinal)
+            })
+            .map(|ordinal| {
+                u32::try_from(ordinal).map_err(|_| {
+                    EngineError::Durability(
+                        "codec-5 S3 transaction operation ordinal exceeds typed framing"
+                            .to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let replay_ordinals = references
+            .iter()
+            .filter(|reference| reference.default_expression)
+            .map(|reference| {
+                let operation = operation_order
+                    .get(reference.statement_ordinal as usize)
+                    .ok_or_else(|| {
+                        EngineError::Durability(format!(
+                            "codec-5 S3 sequence default reference {} exceeds transaction operation order",
+                            reference.transition_txn_id
+                        ))
+                    })?;
+                if !matches!(operation, BinaryTransactionOperationIdentity::Insert { .. }) {
+                    return Err(EngineError::Durability(format!(
+                        "codec-5 S3 sequence default reference {} does not name an INSERT operation",
+                        reference.transition_txn_id
+                    )));
+                }
+                Ok((reference.transition_txn_id, reference.statement_ordinal))
+            })
+            .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
+        for record in records.iter_mut() {
+            let operation_ordinal = replay_ordinals
+                .get(&record.transition_txn_id)
+                .copied()
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "codec-5 S3 lost its durable sequence reference {}",
+                        record.transition_txn_id
+                    ))
+                })?;
+            let expected = typed_operation_ordinals
+                .get(record.statement_ordinal as usize)
+                .copied()
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "codec-5 S3 durable sequence reference {} exceeds typed INSERT receipts",
+                        record.transition_txn_id
+                    ))
+                })?;
+            if operation_ordinal != expected {
+                return Err(EngineError::Durability(format!(
+                    "codec-5 S3 sequence reference {} does not name its durable typed INSERT receipt",
+                    record.transition_txn_id
+                )));
+            }
+            record.statement_ordinal = operation_ordinal;
+        }
+        if records
+            .windows(2)
+            .any(|pair| pair[0].statement_ordinal > pair[1].statement_ordinal)
+        {
+            return Err(EngineError::Durability(
+                "codec-5 S3 sequence references do not follow transaction operation order"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn apply_sequence_lifecycle_references_through(
@@ -1435,6 +1725,29 @@ fn durable_sequence_value_record_for_reference<'outcomes>(
     Ok(&applied.record)
 }
 
+/// Resolve the sole codec-5 S3 representation boundary. Unlike regular S5 consumers, its
+/// ordered catalog envelope stores a global INSERT cursor. That cursor is validated against S3's
+/// operation program by the catalog applier, while the S5 input digest still binds the dense
+/// typed-INSERT receipt carried by the durable transition.
+fn durable_sequence_value_record_for_codec5_catalog_reference<'outcomes>(
+    outcomes: &'outcomes HashMap<TxnId, AppliedSequenceValueTransition>,
+    reference: &BinarySequenceValueReference,
+) -> Result<&'outcomes BinarySequenceValueTransitionRecord, EngineError> {
+    let applied = outcomes.get(&reference.transition_txn_id).ok_or_else(|| {
+        EngineError::Durability(format!(
+            "codec-5 S3 references missing sequence transition {}",
+            reference.transition_txn_id
+        ))
+    })?;
+    if !codec5_catalog_sequence_reference_matches_durable_transition(reference, &applied.record) {
+        return Err(EngineError::Durability(format!(
+            "codec-5 S3 sequence reference {} does not match its durable transition",
+            reference.transition_txn_id
+        )));
+    }
+    Ok(&applied.record)
+}
+
 /// Exact durable binding predicate for one sequence reference.
 ///
 /// Keep this separate from opcode-21 structural validation: that codec owns the reference's
@@ -1454,6 +1767,25 @@ fn sequence_value_reference_matches_durable_transition(
         && record.expression_ordinal == reference.expression_ordinal
         && (reference.default_expression
             == matches!(record.operation, BinarySequenceValueOperation::Default))
+}
+
+/// Codec-5 S3 differs from S5 only for a default-expression reference's ordinal: S3 carries a
+/// global transaction operation position, S5 carries the dense typed-INSERT receipt position.
+/// Explicit sequence operations continue to require the exact historic binding.
+fn codec5_catalog_sequence_reference_matches_durable_transition(
+    reference: &BinarySequenceValueReference,
+    record: &BinarySequenceValueTransitionRecord,
+) -> bool {
+    if !reference.default_expression {
+        return sequence_value_reference_matches_durable_transition(reference, record);
+    }
+    record.transition_txn_id == reference.transition_txn_id
+        && record.sequence_oid == reference.sequence_oid
+        && record.parent_txn_id == reference.parent_txn_id
+        && record.returned_value == reference.returned_value
+        && record.input_digest == reference.input_digest
+        && record.expression_ordinal == reference.expression_ordinal
+        && matches!(record.operation, BinarySequenceValueOperation::Default)
 }
 
 fn sequence_value_outcome(
@@ -1642,5 +1974,52 @@ mod sequence_reference_validation_tests {
                 .to_string()
                 .contains("does not match its durable transition"));
         }
+    }
+
+    #[test]
+    fn codec5_catalog_sequence_cursor_must_match_the_durable_dense_insert_receipt() {
+        let record = durable_default_transition();
+        let mut reference = matching_default_reference(&record);
+        // The S5 transition's dense ordinal is 3. In this S3 program the fourth INSERT sits at
+        // the global operation ordinal 7; selecting any other INSERT would reorder sequence
+        // visibility around catalog commands.
+        reference.statement_ordinal = 7;
+        let operation_order = vec![
+            BinaryTransactionOperationIdentity::Catalog { command_index: 0 },
+            BinaryTransactionOperationIdentity::Insert {
+                table: "first".to_string(),
+            },
+            BinaryTransactionOperationIdentity::Catalog { command_index: 1 },
+            BinaryTransactionOperationIdentity::Insert {
+                table: "second".to_string(),
+            },
+            BinaryTransactionOperationIdentity::Catalog { command_index: 2 },
+            BinaryTransactionOperationIdentity::Insert {
+                table: "third".to_string(),
+            },
+            BinaryTransactionOperationIdentity::Catalog { command_index: 3 },
+            BinaryTransactionOperationIdentity::Insert {
+                table: "owner".to_string(),
+            },
+        ];
+        let mut rebound = vec![record.clone()];
+        Engine::rebind_codec5_catalog_sequence_replay_ordinals(
+            &mut rebound,
+            &[reference.clone()],
+            &operation_order,
+        )
+        .expect("matching S3 global cursor must rebind the S5 dense receipt");
+        assert_eq!(rebound[0].statement_ordinal, 7);
+
+        reference.statement_ordinal = 5;
+        let mut invalid_rebound = [record];
+        assert!(Engine::rebind_codec5_catalog_sequence_replay_ordinals(
+            &mut invalid_rebound,
+            &[reference],
+            &operation_order,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not name its durable typed INSERT receipt"));
     }
 }

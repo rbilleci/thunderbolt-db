@@ -169,20 +169,6 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Resolved binary WAL is product-default. OFF is retained only as an explicit
-    /// compatibility/parity kill switch; it makes eligible routes retain legacy text operations.
-    /// Once a segment contains binary records, it remains non-downgradeable for readers that do
-    /// not implement their replay format.
-    pub fn set_binary_wal_records_enabled(&self, on: bool) {
-        self.binary_wal_records_enabled
-            .store(on, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn binary_wal_records_enabled(&self) -> bool {
-        self.binary_wal_records_enabled
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// TYPE-COVERAGE track 2 slice 2: enable/disable i64-SECTION (Int8/Timestamp) columns in
     /// sharded admission (default OFF — flips after the read/append/elision stages + SLO + audit).
     pub fn set_shard_int8_section_enabled(&self, on: bool) {

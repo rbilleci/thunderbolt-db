@@ -8,11 +8,13 @@ use super::append_source::ResidentAppendSource;
 use super::*;
 use crate::engine_insert_plan::host_retention::{HostRetentionGeometry, HostRetentionReport};
 use crate::engine_insert_plan::IndexedPhysicalMaterializationPermit;
+#[cfg(test)]
+use crate::typed_insert_batch::TypedInsertBatch;
 use crate::typed_insert_batch::{
     PreparedResidentAppendSource, PreparedResidentFixedBoolUpload, PreparedResidentFixedChunk,
-    PreparedResidentFixedChunkOwners, TypedInsertBatch,
+    PreparedResidentFixedChunkOwners,
 };
-use std::sync::MutexGuard;
+use std::sync::{Arc, MutexGuard};
 
 mod indexed_fused;
 mod retained_host;
@@ -74,9 +76,14 @@ pub(crate) enum DeviceInsertPlanPrepareError {
 #[allow(dead_code)] // reservation modes compile before live indexed selection is opened
 #[derive(Clone, Copy)]
 enum ResidentOpenShardAppendPreparationMode {
-    LiveUnindexed,
-    IndexedInPlaceReservation { index_scratch_bytes: u64 },
-    IndexedFixedRolloverReservation { max_index_scratch_bytes: u64 },
+    TransactionTerminalUnindexed,
+    IndexedInPlaceReservation {
+        index_scratch_bytes: u64,
+    },
+    IndexedFixedRolloverReservation {
+        max_index_scratch_bytes: u64,
+        allow_s3_index_schema_transition: bool,
+    },
 }
 
 /// A post-WAL device-apply failure is terminal before physical group durability; the active wave
@@ -285,16 +292,55 @@ struct PreparedInPlaceAppend {
 /// A fixed-width successor generation fully reserved before WAL. The allocation owner has already
 /// uploaded all immutable bytes with a zero row-count header; mutation only stamps and publishes.
 pub(super) struct PreparedFixedRollover {
-    pub(super) pending: super::rollover::PendingFixedResidentShard,
+    pending: Option<super::rollover::PendingFixedResidentShard>,
+    uniform_publication: Option<super::rollover::PreparedFixedResidentShardPublication>,
     pub(super) capacity: usize,
     pub(super) new_shard_id: u32,
     pub(super) new_row_start: usize,
     pub(super) capacity_fit_evaluations: u64,
     pub(super) budget_scan_entries: u64,
-    #[allow(dead_code)] // held for the unreachable indexed rollover reservation
     pub(super) planned_index_allocation_bytes: u64,
-    #[allow(dead_code)] // held for the unreachable indexed rollover reservation
     pub(super) max_index_scratch_bytes: u64,
+}
+
+impl PreparedFixedRollover {
+    fn pending(&self) -> Option<&super::rollover::PendingFixedResidentShard> {
+        self.pending.as_ref().or_else(|| {
+            self.uniform_publication
+                .as_ref()
+                .map(|owner| owner.pending())
+        })
+    }
+
+    fn prepare_uniform_commit_pre_wal(
+        &mut self,
+        commit_seq: Index,
+    ) -> Result<(), DeviceInsertPlanPrepareError> {
+        if self.uniform_publication.is_some() {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let pending = self
+            .pending
+            .take()
+            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        self.uniform_publication = Some(
+            pending
+                .prepare_uniform_commit_pre_wal(commit_seq)
+                .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?,
+        );
+        Ok(())
+    }
+
+    pub(super) fn publish_uniform_post_wal(
+        self,
+    ) -> Result<super::rollover::PendingFixedResidentShard, DeviceInsertPlanApplyError> {
+        match (self.pending, self.uniform_publication) {
+            (None, Some(publication)) => publication
+                .publish_post_wal()
+                .map_err(|_| DeviceInsertPlanApplyError::PublisherFailure),
+            _ => Err(DeviceInsertPlanApplyError::PlanDrift),
+        }
+    }
 }
 
 pub(super) enum PreparedInPlaceCreatedBy {
@@ -306,10 +352,64 @@ pub(super) enum PreparedInPlaceCreatedBy {
 /// plan owns the mutation and budget gates, before WAL. Apply may only upload/write them and hand
 /// their Arcs to mutation's existing descriptor publisher.
 pub(super) struct PreparedDenseRollover {
-    pub(super) pending: super::rollover::PendingDenseResidentShard,
+    pending: Option<super::rollover::PendingDenseResidentShard>,
+    uniform_publication: Option<super::rollover::PreparedDenseResidentShardPublication>,
     pub(super) new_shard_id: u32,
     pub(super) new_row_start: usize,
     pub(super) budget_scan_entries: u64,
+    pub(super) planned_index_allocation_bytes: u64,
+    pub(super) max_index_scratch_bytes: u64,
+}
+
+impl PreparedDenseRollover {
+    fn pending(&self) -> Option<&super::rollover::PendingDenseResidentShard> {
+        self.pending.as_ref().or_else(|| {
+            self.uniform_publication
+                .as_ref()
+                .map(|owner| owner.pending())
+        })
+    }
+
+    fn prepare_uniform_commit_pre_wal(
+        &mut self,
+        commit_seq: Index,
+    ) -> Result<(), DeviceInsertPlanPrepareError> {
+        if self.uniform_publication.is_some() {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let pending = self
+            .pending
+            .take()
+            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        self.uniform_publication = Some(
+            pending
+                .prepare_uniform_commit_pre_wal(commit_seq)
+                .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?,
+        );
+        Ok(())
+    }
+
+    pub(super) fn into_pending_for_nonuniform(
+        self,
+    ) -> Result<super::rollover::PendingDenseResidentShard, ExecuteError> {
+        match (self.pending, self.uniform_publication) {
+            (Some(pending), None) => Ok(pending),
+            _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "sealed dense rollover publication state drifted".to_string(),
+            ))),
+        }
+    }
+
+    pub(super) fn publish_uniform_post_wal(
+        self,
+    ) -> Result<super::rollover::PendingDenseResidentShard, DeviceInsertPlanApplyError> {
+        match (self.pending, self.uniform_publication) {
+            (None, Some(publication)) => publication
+                .publish_post_wal()
+                .map_err(|_| DeviceInsertPlanApplyError::PublisherFailure),
+            _ => Err(DeviceInsertPlanApplyError::PlanDrift),
+        }
+    }
 }
 
 fn checked_rollover_coordinates(
@@ -326,7 +426,9 @@ pub(super) struct ResidentOpenShardAppendPlan<'a> {
     source: PreparedResidentAppendSource,
     identity: PreparedOpenShardIdentity,
     catalog_seq: Index,
+    foreign_keys_prevalidated: bool,
     row_ids: DeviceInsertRowIds,
+    resets_existing_rows: bool,
     bootstrap_sentinel: bool,
     branch: PreparedResidentAppendBranch,
     fixed_chunks: Option<Box<[PreparedResidentFixedChunk]>>,
@@ -339,13 +441,17 @@ pub(super) struct ResidentOpenShardAppendPlan<'a> {
     // Field order is load-bearing: Rust drops fields in declaration order, so a failed or
     // completed apply releases its budget reservation before it releases the device gate.
     budget_allocation: Option<MutexGuard<'a, ()>>,
+    // Plural compilation moves the one guard forward into a later plan. The earlier plan remains
+    // in the same owned vector and may apply only while that later owner is still retained by the
+    // vector's consuming iterator; this marker records that proven handoff without minting a
+    // second guard or treating an unlocked budget snapshot as sufficient.
+    budget_reservation_retained_by_transaction: bool,
     // The plan crosses WAL while owning the only locks that can change its descriptor or consume
     // its sealed budget. This is a reservation, not a best-effort budget snapshot: no other
     // normal device publisher/allocation transaction can invalidate this geometry before apply.
     _device_apply: Option<MutexGuard<'a, ()>>,
 }
 
-#[allow(dead_code)] // scalar-only test inspection reads the reservation basis
 pub(super) struct ResidentFixedRolloverReservationBasis<'a> {
     pub(super) predecessor_shard_id: u32,
     pub(super) predecessor_row_count: usize,
@@ -355,9 +461,11 @@ pub(super) struct ResidentFixedRolloverReservationBasis<'a> {
     pub(super) new_shard_id: u32,
     pub(super) new_row_start: usize,
     pub(super) capacity_fit_evaluations: u64,
-    pub(super) budget_scan_entries: u64,
     pub(super) payload: &'a Arc<CudaResidentDeviceMemory>,
+    pub(super) created_by_region: &'a Arc<CudaResidentDeviceMemory>,
+    pub(super) row_id_region: Option<&'a Arc<CudaResidentDeviceMemory>>,
     pub(super) bool_layouts: &'a [ResidentDeviceBoolColumnLayout],
+    pub(super) int4_stats: &'a [ResidentDeviceInt4ColumnStats],
     pub(super) payload_bytes: u64,
     pub(super) created_by_bytes: u64,
     pub(super) row_id_bytes: u64,
@@ -367,7 +475,30 @@ pub(super) struct ResidentFixedRolloverReservationBasis<'a> {
     pub(super) max_index_scratch_bytes: u64,
 }
 
-impl ResidentOpenShardAppendPlan<'_> {
+#[derive(Clone, Copy)]
+pub(super) struct ResidentDenseRolloverReservationBasis<'a> {
+    pub(super) predecessor_shard_id: u32,
+    pub(super) predecessor_row_count: usize,
+    pub(super) catalog_seq: Index,
+    pub(super) incoming_rows: usize,
+    pub(super) capacity: usize,
+    pub(super) new_shard_id: u32,
+    pub(super) new_row_start: usize,
+    pub(super) payload: &'a Arc<CudaResidentDeviceMemory>,
+    pub(super) created_by_region: &'a Arc<CudaResidentDeviceMemory>,
+    pub(super) row_id_region: Option<&'a Arc<CudaResidentDeviceMemory>>,
+    pub(super) bool_layouts: &'a [ResidentDeviceBoolColumnLayout],
+    pub(super) text_layouts: &'a [ResidentDeviceTextColumnLayout],
+    pub(super) null_layouts: &'a [ResidentDeviceNullBitmapLayout],
+    pub(super) int4_stats: &'a [ResidentDeviceInt4ColumnStats],
+    pub(super) payload_bytes: u64,
+    pub(super) payload_sidecar_allocation_bytes: u64,
+    pub(super) payload_sidecar_allocation_count: u64,
+    pub(super) planned_index_allocation_bytes: u64,
+    pub(super) max_index_scratch_bytes: u64,
+}
+
+impl<'a> ResidentOpenShardAppendPlan<'a> {
     pub(crate) fn table_name(&self) -> &str {
         self.source.table_name()
     }
@@ -378,6 +509,47 @@ impl ResidentOpenShardAppendPlan<'_> {
 
     pub(super) fn row_count(&self) -> usize {
         self.source.row_count()
+    }
+
+    pub(super) fn resets_existing_rows(&self) -> bool {
+        self.resets_existing_rows
+    }
+
+    fn pre_wal_reserved_persistent_bytes(&self) -> u64 {
+        match &self.branch {
+            PreparedResidentAppendBranch::InPlace(in_place) => in_place
+                .pending_created_by
+                .as_ref()
+                .map_or(0, |pending| pending.allocation_bytes),
+            PreparedResidentAppendBranch::FixedRollover(fixed) => fixed
+                .pending()
+                .map_or(0, |pending| pending.allocation_bytes)
+                .checked_add(fixed.planned_index_allocation_bytes)
+                .expect("validated fixed rollover reservation bytes fit u64"),
+            PreparedResidentAppendBranch::DenseRollover(dense) => dense
+                .pending()
+                .map_or(0, |pending| pending.allocation_bytes)
+                .checked_add(dense.planned_index_allocation_bytes)
+                .expect("validated dense rollover reservation bytes fit u64"),
+            PreparedResidentAppendBranch::ConsumedDense => 0,
+        }
+    }
+
+    pub(super) fn take_transaction_terminal_device_apply_guard(
+        &mut self,
+    ) -> Option<MutexGuard<'a, ()>> {
+        self._device_apply.take()
+    }
+
+    pub(super) fn take_transaction_terminal_budget_guard(
+        &mut self,
+    ) -> Option<(MutexGuard<'a, ()>, u64)> {
+        let bytes = self.pre_wal_reserved_persistent_bytes();
+        let retained = self.budget_allocation.take().map(|guard| (guard, bytes));
+        if retained.is_some() {
+            self.budget_reservation_retained_by_transaction = true;
+        }
+        retained
     }
 
     /// Retained host plan allocations for the materialized append plan. GPU allocation guards,
@@ -391,11 +563,21 @@ impl ResidentOpenShardAppendPlan<'_> {
             PreparedResidentAppendBranch::InPlace(_)
             | PreparedResidentAppendBranch::ConsumedDense => {}
             PreparedResidentAppendBranch::FixedRollover(fixed) => {
-                append_pending_bool_layout_box(&mut report, &fixed.pending.bool_layouts)?;
-                append_pending_int4_stats_box(&mut report, &fixed.pending.int4_stats)?;
+                let pending = fixed.pending().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "materialized fixed rollover lost its private generation".to_string(),
+                    ))
+                })?;
+                append_pending_bool_layout_box(&mut report, &pending.bool_layouts)?;
+                append_pending_int4_stats_box(&mut report, &pending.int4_stats)?;
             }
             PreparedResidentAppendBranch::DenseRollover(dense) => {
-                report.merge(dense.pending.payload.host_retention_report()?)?;
+                let pending = dense.pending().ok_or_else(|| {
+                    EngineError::ApplyFailed(
+                        "materialized dense rollover lost its private generation".to_string(),
+                    )
+                })?;
+                report.merge(pending.payload.host_retention_report()?)?;
             }
         }
         if let Some(chunks) = self.fixed_chunks.as_ref() {
@@ -434,7 +616,8 @@ impl ResidentOpenShardAppendPlan<'_> {
     }
 
     pub(super) fn catalog_matches(&self, table: &RelationalTable, catalog_seq: Index) -> bool {
-        self.catalog_seq == catalog_seq && source_matches_table(&self.source, table)
+        self.catalog_seq == catalog_seq
+            && source_matches_table(&self.source, table, self.foreign_keys_prevalidated)
     }
 
     pub(super) fn identity_matches(&self, open: &RelationalResidentShard, pressured: bool) -> bool {
@@ -445,32 +628,27 @@ impl ResidentOpenShardAppendPlan<'_> {
         &self.int4_min_max
     }
 
-    pub(crate) fn is_bound_bootstrap_sentinel(&self) -> bool {
-        self.bootstrap_sentinel
-    }
-
     fn take_row_ids(&mut self) -> Option<Box<[u64]>> {
         self.row_ids.take_exact()
     }
 
     pub(super) fn holds_budget_reservation(&self) -> bool {
-        self.budget_allocation.is_some()
+        self.budget_allocation.is_some() || self.budget_reservation_retained_by_transaction
     }
 
     pub(super) fn indexed_fixed_rollover_host_materialization_scratch(
         &self,
     ) -> Option<HostRetentionGeometry> {
         match &self.branch {
-            PreparedResidentAppendBranch::FixedRollover(fixed) => {
-                Some(fixed.pending.host_materialization_scratch)
-            }
+            PreparedResidentAppendBranch::FixedRollover(fixed) => fixed
+                .pending()
+                .map(|pending| pending.host_materialization_scratch),
             PreparedResidentAppendBranch::InPlace(_)
             | PreparedResidentAppendBranch::DenseRollover(_)
             | PreparedResidentAppendBranch::ConsumedDense => None,
         }
     }
 
-    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
     pub(super) fn indexed_in_place_reservation_basis(&self) -> (u32, usize, Index) {
         (
             self.identity.shard_id,
@@ -523,13 +701,13 @@ impl ResidentOpenShardAppendPlan<'_> {
         Ok(())
     }
 
-    #[allow(dead_code)] // consumed by the production-compiled, unreachable reservation
     pub(super) fn indexed_fixed_rollover_reservation_basis(
         &self,
     ) -> Option<ResidentFixedRolloverReservationBasis<'_>> {
         let PreparedResidentAppendBranch::FixedRollover(fixed) = &self.branch else {
             return None;
         };
+        let pending = fixed.pending()?;
         Some(ResidentFixedRolloverReservationBasis {
             predecessor_shard_id: self.identity.shard_id,
             predecessor_row_count: self.identity.row_count,
@@ -539,17 +717,44 @@ impl ResidentOpenShardAppendPlan<'_> {
             new_shard_id: fixed.new_shard_id,
             new_row_start: fixed.new_row_start,
             capacity_fit_evaluations: fixed.capacity_fit_evaluations,
-            budget_scan_entries: fixed.budget_scan_entries,
-            payload: &fixed.pending.device_memory,
-            bool_layouts: &fixed.pending.bool_layouts,
-            payload_bytes: fixed.pending.payload_bytes,
-            created_by_bytes: fixed.pending.created_by_bytes,
-            row_id_bytes: fixed.pending.row_id_bytes,
-            payload_sidecar_allocation_bytes: fixed.pending.allocation_bytes,
-            payload_sidecar_allocation_count: fixed.pending.persistent_allocation_count,
+            payload: &pending.device_memory,
+            created_by_region: &pending.created_by_region,
+            row_id_region: pending.row_id_region.as_ref(),
+            bool_layouts: &pending.bool_layouts,
+            int4_stats: &pending.int4_stats,
+            payload_bytes: pending.payload_bytes,
+            created_by_bytes: pending.created_by_bytes,
+            row_id_bytes: pending.row_id_bytes,
+            payload_sidecar_allocation_bytes: pending.allocation_bytes,
+            payload_sidecar_allocation_count: pending.persistent_allocation_count,
             planned_index_allocation_bytes: fixed.planned_index_allocation_bytes,
             max_index_scratch_bytes: fixed.max_index_scratch_bytes,
         })
+    }
+
+    pub(super) fn prepare_fixed_rollover_uniform_commit(
+        &mut self,
+        expected_commit_seq: Index,
+    ) -> Result<(), DeviceInsertPlanPrepareError> {
+        match &mut self.branch {
+            PreparedResidentAppendBranch::FixedRollover(fixed) => {
+                fixed.prepare_uniform_commit_pre_wal(expected_commit_seq)
+            }
+            PreparedResidentAppendBranch::DenseRollover(_)
+            | PreparedResidentAppendBranch::InPlace(_) => Ok(()),
+            PreparedResidentAppendBranch::ConsumedDense => {
+                Err(DeviceInsertPlanPrepareError::UnsupportedShape)
+            }
+        }
+    }
+
+    pub(super) fn publish_fixed_rollover_header(
+        mut self,
+    ) -> Result<super::rollover::PendingFixedResidentShard, DeviceInsertPlanApplyError> {
+        let fixed = self
+            .take_fixed_rollover()
+            .ok_or(DeviceInsertPlanApplyError::PlanDrift)?;
+        fixed.publish_uniform_post_wal()
     }
 
     fn sidecars_still_match(&self, engine: &Engine) -> bool {
@@ -615,14 +820,18 @@ impl ResidentOpenShardAppendPlan<'_> {
 
     pub(super) fn dense_rollover_payload_len(&self) -> Option<u64> {
         match &self.branch {
-            PreparedResidentAppendBranch::DenseRollover(dense) => Some(dense.pending.payload_bytes),
+            PreparedResidentAppendBranch::DenseRollover(dense) => {
+                dense.pending().map(|pending| pending.payload_bytes)
+            }
             _ => None,
         }
     }
 
     pub(super) fn fixed_rollover_payload_len(&self) -> Option<u64> {
         match &self.branch {
-            PreparedResidentAppendBranch::FixedRollover(fixed) => Some(fixed.pending.payload_bytes),
+            PreparedResidentAppendBranch::FixedRollover(fixed) => {
+                fixed.pending().map(|pending| pending.payload_bytes)
+            }
             _ => None,
         }
     }
@@ -661,6 +870,139 @@ impl ResidentOpenShardAppendPlan<'_> {
         }
     }
 
+    /// Complete the descriptor half of an indexed fused append after its payload, index tail,
+    /// device row-count header, and cache coverage have all succeeded. The fused branch writes
+    /// the same open allocation as the ordinary append publisher, but it cannot call that
+    /// publisher without uploading the payload and extending the index a second time. Consume
+    /// this plan here to publish only the already-sealed descriptor metadata through the common
+    /// residency owner.
+    pub(super) fn publish_indexed_in_place_descriptor_after_fused_apply(
+        mut self,
+        engine: &Engine,
+        expected_commit_seq: Index,
+    ) -> Result<(), DeviceInsertPlanApplyError> {
+        let table = self.source.table_name().to_string();
+        let base_row = self.identity.row_count;
+        let capacity = self.identity.capacity;
+        let incoming_rows = self.source.row_count();
+        let end_row = base_row
+            .checked_add(incoming_rows)
+            .filter(|end| *end <= capacity)
+            .ok_or(DeviceInsertPlanApplyError::PlanDrift)?;
+        if incoming_rows == 0
+            || !source_is_all_i32_fixed(&self.source)
+            || !self.row_ids.exact_len_matches(incoming_rows)
+            || self.int4_min_max.len() != self.identity.int4_columns.len()
+        {
+            return Err(DeviceInsertPlanApplyError::PlanDrift);
+        }
+
+        let pressured = engine.router.runtime().snapshot().memory_pressured_gpu_ids;
+        let still_current = engine
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(&table)
+            .and_then(|shards| shards.last())
+            .is_some_and(|open| {
+                self.identity
+                    .matches(open, pressured.contains(&open.gpu_id))
+            });
+        if !still_current {
+            return Err(DeviceInsertPlanApplyError::PlanDrift);
+        }
+
+        let created_by_region = match self.take_in_place_created_by(capacity, base_row) {
+            Some(PreparedInPlaceCreatedBy::Existing(region)) => {
+                let current = engine
+                    .read_state
+                    .residency
+                    .shard_created_by_memory
+                    .get(&(table.clone(), self.identity.shard_id));
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &region))
+                {
+                    return Err(DeviceInsertPlanApplyError::PlanDrift);
+                }
+                region
+            }
+            Some(PreparedInPlaceCreatedBy::Reserved(pending)) => {
+                let region = pending
+                    .into_region(capacity)
+                    .ok_or(DeviceInsertPlanApplyError::PlanDrift)?;
+                engine
+                    .get_or_alloc_created_by_region(
+                        &table,
+                        self.identity.shard_id,
+                        capacity,
+                        self.identity.gpu_id,
+                        true,
+                        Some(region),
+                    )
+                    .ok_or(DeviceInsertPlanApplyError::PublisherFailure)?
+            }
+            None => return Err(DeviceInsertPlanApplyError::PlanDrift),
+        };
+
+        let appended_bytes = incoming_rows
+            .checked_mul(self.identity.int4_columns.len())
+            .and_then(|values| values.checked_mul(std::mem::size_of::<i32>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(DeviceInsertPlanApplyError::PlanDrift)?;
+        let mut published = false;
+        engine
+            .read_state
+            .residency
+            .with_shards_mut_for_table(&table, |shards| {
+                let Some(open) = shards.get_mut(&table).and_then(|shards| shards.last_mut()) else {
+                    return;
+                };
+                let payload_matches =
+                    same_optional_device_region(&open.device_memory, &self.identity.device_memory);
+                let created_by_matches = open
+                    .created_by_region
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &created_by_region));
+                let row_ids_match =
+                    same_optional_device_region(&open.row_id_region, &self.identity.row_id_region);
+                if open.shard_id != self.identity.shard_id
+                    || open.capacity != capacity
+                    || open.row_count != base_row
+                    || open.row_start != self.identity.row_start
+                    || open.gpu_id != self.identity.gpu_id
+                    || !payload_matches
+                    || !created_by_matches
+                    || !row_ids_match
+                    || open.resident_device_int4_column_stats.len() != self.int4_min_max.len()
+                {
+                    return;
+                }
+                open.row_count = end_row;
+                open.max_created_by = open.max_created_by.max(expected_commit_seq);
+                open.resident_bytes = open.resident_bytes.saturating_add(appended_bytes);
+                for (stat, (lo, hi)) in open
+                    .resident_device_int4_column_stats
+                    .iter_mut()
+                    .zip(self.int4_min_max.iter())
+                {
+                    stat.min = stat.min.min(*lo);
+                    stat.max = stat.max.max(*hi);
+                }
+                published = true;
+            });
+        if !published {
+            return Err(DeviceInsertPlanApplyError::PublisherFailure);
+        }
+        engine
+            .read_state
+            .residency
+            .open_shard_append_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     pub(super) fn take_dense_rollover(&mut self) -> Option<PreparedDenseRollover> {
         match std::mem::replace(
             &mut self.branch,
@@ -673,6 +1015,55 @@ impl ResidentOpenShardAppendPlan<'_> {
             }
         }
     }
+
+    pub(super) fn indexed_dense_rollover_reservation_basis(
+        &self,
+    ) -> Option<ResidentDenseRolloverReservationBasis<'_>> {
+        let PreparedResidentAppendBranch::DenseRollover(dense) = &self.branch else {
+            return None;
+        };
+        let pending = dense.pending()?;
+        Some(ResidentDenseRolloverReservationBasis {
+            predecessor_shard_id: self.identity.shard_id,
+            predecessor_row_count: self.identity.row_count,
+            catalog_seq: self.catalog_seq,
+            incoming_rows: self.source.row_count(),
+            capacity: self.source.row_count(),
+            new_shard_id: dense.new_shard_id,
+            new_row_start: dense.new_row_start,
+            payload: &pending.device_memory,
+            created_by_region: &pending.created_by_region,
+            row_id_region: pending.row_id_region.as_ref(),
+            bool_layouts: pending.payload.bool_layouts(),
+            text_layouts: pending.payload.text_layouts(),
+            null_layouts: pending.payload.null_layouts(),
+            int4_stats: pending.payload.int4_stats(),
+            payload_bytes: pending.payload_bytes,
+            payload_sidecar_allocation_bytes: pending.allocation_bytes,
+            payload_sidecar_allocation_count: pending.persistent_allocation_count,
+            planned_index_allocation_bytes: dense.planned_index_allocation_bytes,
+            max_index_scratch_bytes: dense.max_index_scratch_bytes,
+        })
+    }
+
+    pub(super) fn prepare_indexed_dense_rollover_uniform_commit(
+        &mut self,
+        expected_commit_seq: Index,
+    ) -> Result<(), DeviceInsertPlanPrepareError> {
+        let PreparedResidentAppendBranch::DenseRollover(dense) = &mut self.branch else {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        };
+        dense.prepare_uniform_commit_pre_wal(expected_commit_seq)
+    }
+
+    pub(super) fn publish_indexed_dense_rollover_header(
+        mut self,
+    ) -> Result<super::rollover::PendingDenseResidentShard, DeviceInsertPlanApplyError> {
+        let dense = self
+            .take_dense_rollover()
+            .ok_or(DeviceInsertPlanApplyError::PlanDrift)?;
+        dense.publish_uniform_post_wal()
+    }
 }
 
 /// The only post-compile token that can reach typed device append. Its physical variant is
@@ -680,22 +1071,116 @@ impl ResidentOpenShardAppendPlan<'_> {
 /// inspect, replace, or construct a resident append source.
 pub(crate) struct DeviceInsertPlan<'a>(DeviceInsertPlanKind<'a>);
 
+/// Opaque pre-WAL handoff from one indexed rollover plan to the next plan in the same transaction.
+/// It contains only the first plan's already-built successor roots and cannot apply or publish.
+pub(crate) struct DeviceInsertPlanManifestPredecessor(
+    super::prepared_table_index_manifest::PreparedIndexedRolloverManifestPredecessor,
+);
+
+#[allow(clippy::large_enum_variant)] // opaque plan variants preserve move-only GPU resource ownership
 enum DeviceInsertPlanKind<'a> {
     ResidentOpenShardAppend(ResidentOpenShardAppendPlan<'a>),
+    /// The first physical generation for a relation created by the transaction's S3 catalog
+    /// composition.  It is still the one codec-5 device-plan lifecycle: the table is absent
+    /// from the public catalog until the common publication step, so this plan retains the
+    /// exact private dense generation rather than manufacturing a public empty predecessor.
+    TransactionCreatedDenseTable(TransactionCreatedDenseTablePlan<'a>),
+    IndexedInPlace(super::indexed_reservation::PreparedIndexedPhysicalReservation<'a>),
 }
 
-impl DeviceInsertPlan<'_> {
-    pub(crate) fn table_name(&self) -> &str {
+/// A transaction-created table has no public descriptor to append to before its catalog
+/// composition commits.  This is the dense first-row counterpart of the ordinary preallocated
+/// rollover: all bytes and the uniform header capability are sealed before WAL; post-WAL only
+/// resolves that capability and installs the resulting descriptor through the common residency
+/// maps.  It deliberately owns neither catalog publication nor a second row representation.
+pub(super) struct TransactionCreatedDenseTablePlan<'a> {
+    pub(super) table: RelationalTable,
+    pub(super) expected_commit_seq: Index,
+    pub(super) row_count: usize,
+    pub(super) row_ids: DeviceInsertRowIds,
+    pub(super) dense: PreparedDenseRollover,
+    // The generic plural coordinator keeps the one budget guard while it prepares every table.
+    // This exact private dense allocation must remain in that coordinator's running pre-WAL
+    // charge when a later table receives the guard; otherwise two transaction-created tables
+    // could each fit the same remaining-budget snapshot independently.
+    pub(super) reserved_bytes: u64,
+    // The same transaction-wide named-index lifecycle follows a private first-row table through
+    // the dense reservation and back to the generic codec-5 finalizer.  The finalizer remains
+    // the sole catalog/index publication owner after the durable cut.
+    pub(super) named_index_lifecycle:
+        Option<crate::engine_state::TransactionNamedIndexPublicationGuard<'a>>,
+    pub(super) budget_allocation: Option<MutexGuard<'a, ()>>,
+    pub(super) _device_apply: Option<MutexGuard<'a, ()>>,
+}
+
+impl<'a> DeviceInsertPlan<'a> {
+    pub(crate) fn indexed_rollover_manifest_successor_predecessor(
+        &self,
+    ) -> Option<DeviceInsertPlanManifestPredecessor> {
         match &self.0 {
-            DeviceInsertPlanKind::ResidentOpenShardAppend(plan) => plan.table_name(),
+            DeviceInsertPlanKind::ResidentOpenShardAppend(_) => None,
+            DeviceInsertPlanKind::TransactionCreatedDenseTable(_) => None,
+            DeviceInsertPlanKind::IndexedInPlace(plan) => plan
+                .rollover_manifest_successor_predecessor()
+                .map(DeviceInsertPlanManifestPredecessor),
         }
     }
 
-    pub(crate) fn is_bound_bootstrap_sentinel(&self) -> bool {
-        match &self.0 {
-            DeviceInsertPlanKind::ResidentOpenShardAppend(plan) => {
-                plan.is_bound_bootstrap_sentinel()
+    /// Move the sole common lifecycle guard back to the generic transaction finalizer before it
+    /// enters final publication.  The indexed plan owned it during pre-WAL reservation so no
+    /// detached or second named-index lifecycle can race cache retirement.
+    pub(crate) fn take_named_index_publication_guard(
+        &mut self,
+    ) -> Option<crate::engine_state::TransactionNamedIndexPublicationGuard<'a>> {
+        match &mut self.0 {
+            DeviceInsertPlanKind::ResidentOpenShardAppend(_) => None,
+            DeviceInsertPlanKind::TransactionCreatedDenseTable(plan) => {
+                plan.named_index_lifecycle.take()
             }
+            DeviceInsertPlanKind::IndexedInPlace(plan) => plan.take_named_index_publication_guard(),
+        }
+    }
+
+    /// Move the one global mutation gate between unindexed table reservations while the generic
+    /// transaction owner composes a plural plan. No plan can apply through this handoff, and the
+    /// final plan retains the guard across WAL for the whole vector.
+    pub(crate) fn take_transaction_terminal_unindexed_device_apply_guard(
+        &mut self,
+    ) -> Option<MutexGuard<'a, ()>> {
+        match &mut self.0 {
+            DeviceInsertPlanKind::ResidentOpenShardAppend(plan) => plan._device_apply.take(),
+            DeviceInsertPlanKind::TransactionCreatedDenseTable(plan) => plan._device_apply.take(),
+            DeviceInsertPlanKind::IndexedInPlace(plan) => {
+                plan.take_transaction_terminal_device_apply_guard()
+            }
+        }
+    }
+
+    pub(crate) fn take_transaction_terminal_unindexed_budget_guard(
+        &mut self,
+    ) -> Option<(MutexGuard<'a, ()>, u64)> {
+        match &mut self.0 {
+            DeviceInsertPlanKind::ResidentOpenShardAppend(plan) => {
+                plan.take_transaction_terminal_budget_guard()
+            }
+            DeviceInsertPlanKind::TransactionCreatedDenseTable(plan) => plan
+                .budget_allocation
+                .take()
+                .map(|guard| (guard, plan.reserved_bytes)),
+            DeviceInsertPlanKind::IndexedInPlace(plan) => {
+                plan.take_transaction_terminal_budget_guard()
+            }
+        }
+    }
+
+    #[cfg(feature = "probe-timing")]
+    pub(crate) fn probe_retains_exclusive_budget_guard(&self) -> bool {
+        match &self.0 {
+            DeviceInsertPlanKind::ResidentOpenShardAppend(plan) => plan.budget_allocation.is_some(),
+            DeviceInsertPlanKind::TransactionCreatedDenseTable(plan) => {
+                plan.budget_allocation.is_some()
+            }
+            DeviceInsertPlanKind::IndexedInPlace(_) => true,
         }
     }
 
@@ -712,54 +1197,744 @@ impl DeviceInsertPlan<'_> {
             DeviceInsertPlanKind::ResidentOpenShardAppend(plan) => {
                 engine.apply_resident_open_shard_append(plan, created_by)
             }
+            DeviceInsertPlanKind::TransactionCreatedDenseTable(plan) => {
+                engine.apply_transaction_created_dense_table_generation(plan, created_by)
+            }
+            DeviceInsertPlanKind::IndexedInPlace(plan) => {
+                plan.apply_after_transaction_wal_claim(engine, created_by)
+            }
         }
+    }
+
+    /// Transaction-terminal sibling of the typed wave handoff. Its permit is still opaque and
+    /// may only be issued after the canonical transaction outcome is durable; this method owns
+    /// no WAL, status, allocator, or publication authority.
+    pub(crate) fn apply_after_transaction_wal_claim(
+        self,
+        engine: &Engine,
+        permit: crate::engine_dml_concurrent::TypedInsertPostWalApplyPermit,
+    ) -> Result<(), DeviceInsertPlanApplyError> {
+        self.apply_after_typed_wal_claim(engine, permit)
     }
 }
 
 impl Engine {
-    /// Compile the one move-only semantic batch into the opaque device plan. Physical branches
-    /// are fixed-width append/rollover and dense nullable-or-text rollover; neither adds a
-    /// parallel wave carrier or publisher.
-    pub(crate) fn compile_typed_insert_device_plan<'a>(
+    /// Exercise the production transaction-terminal physical compiler from a sealed batch in
+    /// low-level tests. This fixture owns no selector: it only performs the same batch-to-source
+    /// move that the transaction overlay completes before entering the canonical compiler.
+    #[cfg(test)]
+    pub(crate) fn compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test<'a>(
         &'a self,
         batch: TypedInsertBatch,
         row_ids: DeviceInsertRowIds,
     ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
-        let source = batch
-            .into_resident_append_source()
-            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-        self.prepare_resident_open_shard_append(source, row_ids)
-            .map(|plan| DeviceInsertPlan(DeviceInsertPlanKind::ResidentOpenShardAppend(plan)))
-    }
-
-    /// Consume a sealed source and prepare its exact resident append shape before WAL. A decline is
-    /// side-effect-free; the source is dropped and the caller may still take the legacy route.
-    ///
-    /// The caller must consume the returned plan after canonical WAL/status buffering and before
-    /// physical group durability, while it owns the canonical commit boundary. The plan deliberately
-    /// retains the device gate (and, when needed, allocation gate) only across that device-apply
-    /// interval; it is not an asynchronous durability-tail or publication/ack handle.
-    fn prepare_resident_open_shard_append<'a>(
-        &'a self,
-        source: PreparedResidentAppendSource,
-        row_ids: DeviceInsertRowIds,
-    ) -> Result<ResidentOpenShardAppendPlan<'a>, DeviceInsertPlanPrepareError> {
-        self.prepare_resident_open_shard_append_core(
-            source,
+        self.compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test_at_commit(
+            batch,
             row_ids,
-            ResidentOpenShardAppendPreparationMode::LiveUnindexed,
-            None,
+            self.committed_seq(),
         )
     }
 
+    /// Test-only physical fixture for a sealed post-WAL permit. Production callers receive the
+    /// exact commit sequence from the canonical transaction finalizer before WAL.
+    #[cfg(test)]
+    pub(crate) fn compile_transaction_terminal_typed_insert_device_plan_from_batch_for_test_at_commit<
+        'a,
+    >(
+        &'a self,
+        batch: TypedInsertBatch,
+        row_ids: DeviceInsertRowIds,
+        expected_commit_seq: Index,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        let source = batch
+            .into_codec5_resident_append_source_for_test(&self.catalog_snapshot())
+            .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        let mut plan = self.prepare_resident_open_shard_append_core(
+            source,
+            row_ids,
+            ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed,
+            None,
+            None,
+            0,
+            false,
+            None,
+        )?;
+        plan.prepare_fixed_rollover_uniform_commit(expected_commit_seq)?;
+        Ok(DeviceInsertPlan(
+            DeviceInsertPlanKind::ResidentOpenShardAppend(plan),
+        ))
+    }
+
+    pub(crate) fn compile_transaction_terminal_typed_insert_device_plan<'a>(
+        &'a self,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        expected_commit_seq: Index,
+        resets_existing_rows: bool,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        let mut plan = self.prepare_resident_open_shard_append_core(
+            source,
+            row_ids,
+            ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed,
+            None,
+            None,
+            0,
+            resets_existing_rows,
+            None,
+        )?;
+        plan.prepare_fixed_rollover_uniform_commit(expected_commit_seq)?;
+        Ok(DeviceInsertPlan(
+            DeviceInsertPlanKind::ResidentOpenShardAppend(plan),
+        ))
+    }
+
+    /// Compile the first rowset for a relation introduced by the transaction's catalog
+    /// composition.  The public catalog and shard map must both still be absent here: publishing
+    /// either before the canonical WAL/status claim would create a second write authority.
+    pub(crate) fn compile_transaction_created_table_typed_insert_device_plan<'a>(
+        &'a self,
+        table: &RelationalTable,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        expected_commit_seq: Index,
+        named_index_lifecycle: Option<
+            crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        >,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        self.compile_transaction_created_table_typed_insert_device_plan_core(
+            table,
+            source,
+            row_ids,
+            expected_commit_seq,
+            named_index_lifecycle,
+            None,
+            None,
+            0,
+        )
+    }
+
+    /// Plural codec-5 preparation moves its one mutation/budget reservation through each table
+    /// plan.  A transaction-created table participates in that same handoff: it still owns its
+    /// private first-generation allocation, but never manufactures a second writer or publishes
+    /// before the common terminal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_transaction_created_table_typed_insert_device_plan_with_gate<'a>(
+        &'a self,
+        table: &RelationalTable,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        expected_commit_seq: Index,
+        named_index_lifecycle: Option<
+            crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        >,
+        device_apply: MutexGuard<'a, ()>,
+        budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        self.compile_transaction_created_table_typed_insert_device_plan_core(
+            table,
+            source,
+            row_ids,
+            expected_commit_seq,
+            named_index_lifecycle,
+            Some(device_apply),
+            budget_allocation,
+            prior_reserved_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_transaction_created_table_typed_insert_device_plan_core<'a>(
+        &'a self,
+        table: &RelationalTable,
+        mut source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        expected_commit_seq: Index,
+        named_index_lifecycle: Option<
+            crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        >,
+        preheld_device_apply: Option<MutexGuard<'a, ()>>,
+        preheld_budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        let nonempty = source.row_count() != 0;
+        let source_matches = source_matches_indexed_in_place_reservation(&source, table);
+        let exact_row_ids = row_ids.is_exact() && row_ids.exact_len_matches(source.row_count());
+        let catalog_absent = !self
+            .catalog_snapshot()
+            .relational_catalog
+            .contains_key(source.table_name());
+        let shards_absent = !self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .contains_key(source.table_name());
+        if !(nonempty
+            && source_matches
+            && exact_row_ids
+            && catalog_absent
+            && shards_absent
+            && (table.indexes.is_empty() == named_index_lifecycle.is_none()))
+        {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+
+        // A transaction-created relation has no prior fixed-width shard. Keep it on the existing
+        // dense first-generation branch even when its immutable source is NULL-free/fixed-width;
+        // manufacturing a public empty predecessor here would split the codec-5 lifecycle.
+        source.require_dense_first_generation();
+
+        let device_apply = preheld_device_apply.unwrap_or_else(|| {
+            self.read_state
+                .residency
+                .mutation_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let budget_allocation = preheld_budget_allocation.unwrap_or_else(|| {
+            self.read_state
+                .residency
+                .budget_allocation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let gpu_id = self.planner.default_gpu_id();
+        let payload = source
+            .checked_dense_payload(table)
+            .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        let rows = source.row_count();
+        let sidecar_bytes = u64::try_from(rows)
+            .ok()
+            .and_then(|rows| rows.checked_mul(std::mem::size_of::<u64>() as u64))
+            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        let row_id_payload = row_ids.pre_wal_payload();
+        if row_id_payload
+            .as_ref()
+            .is_none_or(|payload| u64::try_from(payload.len()).ok() != Some(sidecar_bytes))
+        {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let requested_bytes = payload
+            .device_payload_len()
+            .and_then(|bytes| bytes.checked_add(sidecar_bytes))
+            .and_then(|bytes| bytes.checked_add(sidecar_bytes))
+            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        let (resident_bytes, budget_scan_entries) =
+            self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
+        let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
+            Some(budget) => match budget
+                .checked_sub(resident_bytes)
+                .and_then(|remaining| remaining.checked_sub(prior_reserved_bytes))
+            {
+                Some(remaining) => Some(remaining),
+                None => {
+                    self.read_state
+                        .residency
+                        .rollover_budget_declines
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+                }
+            },
+            None => None,
+        };
+        if remaining_budget.is_some_and(|remaining| requested_bytes > remaining) {
+            self.read_state
+                .residency
+                .rollover_budget_declines
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let pending = super::rollover::PendingDenseResidentShard::reserve_pre_wal(
+            self,
+            gpu_id,
+            payload,
+            sidecar_bytes,
+            row_id_payload,
+        )
+        .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        if remaining_budget.is_some_and(|remaining| pending.allocation_bytes > remaining) {
+            self.read_state
+                .residency
+                .rollover_budget_declines
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let mut dense = PreparedDenseRollover {
+            pending: Some(pending),
+            uniform_publication: None,
+            new_shard_id: 0,
+            new_row_start: 0,
+            budget_scan_entries,
+            planned_index_allocation_bytes: 0,
+            max_index_scratch_bytes: 0,
+        };
+        dense.prepare_uniform_commit_pre_wal(expected_commit_seq)?;
+        let reserved_bytes = dense
+            .pending()
+            .map(|pending| pending.allocation_bytes)
+            .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        Ok(DeviceInsertPlan(
+            DeviceInsertPlanKind::TransactionCreatedDenseTable(TransactionCreatedDenseTablePlan {
+                table: table.clone(),
+                expected_commit_seq,
+                row_count: rows,
+                row_ids,
+                dense,
+                reserved_bytes,
+                named_index_lifecycle,
+                budget_allocation: Some(budget_allocation),
+                _device_apply: Some(device_apply),
+            }),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)] // One move-only DeviceInsertPlan consumes every pre-WAL ownership input.
+    pub(crate) fn compile_transaction_terminal_typed_insert_device_plan_with_gate<'a>(
+        &'a self,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        expected_commit_seq: Index,
+        resets_existing_rows: bool,
+        device_apply: MutexGuard<'a, ()>,
+        budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        let mut plan = self.prepare_resident_open_shard_append_core(
+            source,
+            row_ids,
+            ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed,
+            Some(device_apply),
+            budget_allocation,
+            prior_reserved_bytes,
+            resets_existing_rows,
+            None,
+        )?;
+        plan.prepare_fixed_rollover_uniform_commit(expected_commit_seq)?;
+        Ok(DeviceInsertPlan(
+            DeviceInsertPlanKind::ResidentOpenShardAppend(plan),
+        ))
+    }
+
+    /// Predict whether this source needs the exclusive allocation budget. Plural preparation
+    /// compiles an indexed rollover first because its prebuilt global roots must publish before
+    /// table-local in-place successors; the existing budget guard is then handed through every
+    /// remaining plan rather than recursively acquiring the non-reentrant lock.
+    pub(crate) fn transaction_terminal_typed_insert_requires_rollover(
+        &self,
+        source: &PreparedResidentAppendSource,
+        resets_existing_rows: bool,
+    ) -> bool {
+        resets_existing_rows
+            || source.requires_dense_rollover()
+            || !source_is_all_i32_fixed(source)
+            || !self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(source.table_name())
+                .and_then(|shards| shards.last())
+                .and_then(|open| {
+                    open.row_count
+                        .checked_add(source.row_count())
+                        .map(|end| end <= open.capacity)
+                })
+                .unwrap_or(false)
+    }
+
+    /// Prepare the one production-reachable indexed physical branch. It returns the same opaque
+    /// `DeviceInsertPlan` consumed by the generic finalizer/replay owner; UNIQUE/PRIMARY verdicts
+    /// have already closed before this physical reservation and create no second terminal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_transaction_terminal_indexed_typed_insert_device_plan<'a>(
+        &'a self,
+        table: &RelationalTable,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        named_index_lifecycle: crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        expected_commit_seq: Index,
+        resets_existing_rows: bool,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        self.compile_transaction_terminal_indexed_typed_insert_device_plan_core(
+            table,
+            source,
+            row_ids,
+            named_index_lifecycle,
+            expected_commit_seq,
+            resets_existing_rows,
+            None,
+            None,
+            0,
+            None,
+            None,
+            &[],
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_transaction_terminal_indexed_typed_insert_device_plan_with_gate<'a>(
+        &'a self,
+        table: &RelationalTable,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        named_index_lifecycle: crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        expected_commit_seq: Index,
+        resets_existing_rows: bool,
+        device_apply: MutexGuard<'a, ()>,
+        budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+        manifest_predecessor: Option<DeviceInsertPlanManifestPredecessor>,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        self.compile_transaction_terminal_indexed_typed_insert_device_plan_core(
+            table,
+            source,
+            row_ids,
+            named_index_lifecycle,
+            expected_commit_seq,
+            resets_existing_rows,
+            Some(device_apply),
+            budget_allocation,
+            prior_reserved_bytes,
+            manifest_predecessor,
+            None,
+            &[],
+            &[],
+        )
+    }
+
+    /// S3-created named indexes retain the public catalog predecessor through pre-WAL
+    /// preparation.  The composed table is still the sole typed source/codec-5 successor;
+    /// this merely prevents a private index from masquerading as a publicly enrolled one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_transaction_terminal_s3_created_index_typed_insert_device_plan_with_gate<
+        'a,
+    >(
+        &'a self,
+        table: &RelationalTable,
+        public_table: &RelationalTable,
+        created_index_ids: &[u64],
+        retired_index_ids: &[u64],
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        named_index_lifecycle: crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        expected_commit_seq: Index,
+        device_apply: MutexGuard<'a, ()>,
+        budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+        manifest_predecessor: Option<DeviceInsertPlanManifestPredecessor>,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        self.compile_transaction_terminal_indexed_typed_insert_device_plan_core(
+            table,
+            source,
+            row_ids,
+            named_index_lifecycle,
+            expected_commit_seq,
+            false,
+            Some(device_apply),
+            budget_allocation,
+            prior_reserved_bytes,
+            manifest_predecessor,
+            Some(public_table),
+            created_index_ids,
+            retired_index_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_transaction_terminal_s3_created_index_typed_insert_device_plan<'a>(
+        &'a self,
+        table: &RelationalTable,
+        public_table: &RelationalTable,
+        created_index_ids: &[u64],
+        retired_index_ids: &[u64],
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        named_index_lifecycle: crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        expected_commit_seq: Index,
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        self.compile_transaction_terminal_indexed_typed_insert_device_plan_core(
+            table,
+            source,
+            row_ids,
+            named_index_lifecycle,
+            expected_commit_seq,
+            false,
+            None,
+            None,
+            0,
+            None,
+            Some(public_table),
+            created_index_ids,
+            retired_index_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_transaction_terminal_indexed_typed_insert_device_plan_core<'a>(
+        &'a self,
+        table: &RelationalTable,
+        source: PreparedResidentAppendSource,
+        row_ids: DeviceInsertRowIds,
+        named_index_lifecycle: crate::engine_state::TransactionNamedIndexPublicationGuard<'a>,
+        expected_commit_seq: Index,
+        resets_existing_rows: bool,
+        preheld_device_apply: Option<MutexGuard<'a, ()>>,
+        preheld_budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+        manifest_predecessor: Option<DeviceInsertPlanManifestPredecessor>,
+        public_table: Option<&RelationalTable>,
+        created_index_ids: &[u64],
+        retired_index_ids: &[u64],
+    ) -> Result<DeviceInsertPlan<'a>, DeviceInsertPlanPrepareError> {
+        let current_catalog = self.catalog_snapshot();
+        let predecessor_boundary = current_catalog.commit_seq;
+        let public_table = public_table.unwrap_or(table);
+        let created_indexes_are_exact =
+            created_index_ids.iter().enumerate().all(|(ordinal, id)| {
+                *id != 0
+                    && (ordinal == 0 || created_index_ids[ordinal - 1] < *id)
+                    && table
+                        .indexes
+                        .iter()
+                        .any(|index| u64::from(index.oid) == *id)
+                    && !public_table
+                        .indexes
+                        .iter()
+                        .any(|index| u64::from(index.oid) == *id)
+            });
+        let retired_indexes_are_exact =
+            retired_index_ids.iter().enumerate().all(|(ordinal, id)| {
+                *id != 0
+                    && (ordinal == 0 || retired_index_ids[ordinal - 1] < *id)
+                    && public_table
+                        .indexes
+                        .iter()
+                        .any(|index| u64::from(index.oid) == *id)
+                    && !table
+                        .indexes
+                        .iter()
+                        .any(|index| u64::from(index.oid) == *id)
+            });
+        let has_s3_index_transition =
+            !created_index_ids.is_empty() || !retired_index_ids.is_empty();
+        if current_catalog.relational_catalog.get(&table.name) != Some(public_table)
+            || expected_commit_seq <= predecessor_boundary
+            || !created_indexes_are_exact
+            || !retired_indexes_are_exact
+            || created_index_ids
+                .iter()
+                .any(|id| retired_index_ids.binary_search(id).is_ok())
+            || (public_table == table) != !has_s3_index_transition
+        {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let key_proof =
+            crate::engine_insert_plan::batch_key_constraints::seal_current_index_witness(
+                table,
+                predecessor_boundary,
+            )
+            .map_err(|_error| {
+                #[cfg(feature = "probe-timing")]
+                eprintln!(
+                    "[probe] codec5_indexed_plan decline stage=key_witness table={} error={_error:?}",
+                    table.name
+                );
+                DeviceInsertPlanPrepareError::UnsupportedShape
+            })?;
+        let mutation_gate = preheld_device_apply.unwrap_or_else(|| {
+            self.read_state
+                .residency
+                .mutation_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let validation = if !has_s3_index_transition {
+            crate::engine_insert_plan::resident_key_constraints::validate_current_index_in_place_generation(
+                self,
+                table,
+                &current_catalog,
+                predecessor_boundary,
+                &mutation_gate,
+            )
+        } else {
+            crate::engine_insert_plan::resident_key_constraints::validate_s3_created_index_generation(
+                self,
+                public_table,
+                table,
+                &current_catalog,
+                predecessor_boundary,
+                &mutation_gate,
+            )
+        }
+        .map_err(|_error| {
+            #[cfg(feature = "probe-timing")]
+            eprintln!(
+                "[probe] codec5_indexed_plan decline stage=resident_validation table={} error={_error:?}",
+                table.name
+            );
+            DeviceInsertPlanPrepareError::UnsupportedShape
+        })?;
+        let dense_rollover = source.requires_dense_rollover();
+        let fits_in_place = !resets_existing_rows
+            && !dense_rollover
+            && source_is_all_i32_fixed(&source)
+            && self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(&table.name)
+                .and_then(|shards| shards.last())
+                .and_then(|open| {
+                    open.row_count
+                        .checked_add(source.row_count())
+                        .map(|end| (open, end))
+                })
+                .is_some_and(|(open, end)| {
+                    open.resident_device_null_columns.is_empty() && end <= open.capacity
+                });
+        if manifest_predecessor.is_some() && fits_in_place {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        if has_s3_index_transition && (!dense_rollover || resets_existing_rows) {
+            return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+        }
+        let manifest_predecessor = manifest_predecessor.map(|predecessor| predecessor.0);
+        let permit = crate::engine_insert_plan::
+            issue_codec5_terminal_indexed_physical_materialization_permit();
+        let reservation = if dense_rollover {
+            super::index_rollover::materialize_dense(
+                self,
+                table,
+                has_s3_index_transition.then_some(public_table),
+                created_index_ids,
+                retired_index_ids,
+                predecessor_boundary,
+                source,
+                row_ids,
+                key_proof,
+                validation,
+                mutation_gate,
+                named_index_lifecycle,
+                expected_commit_seq,
+                permit,
+                preheld_budget_allocation,
+                prior_reserved_bytes,
+                manifest_predecessor,
+                resets_existing_rows,
+            )
+            .map_err(|error| {
+                #[cfg(feature = "probe-timing")]
+                eprintln!(
+                    "[probe] codec5_indexed_plan decline stage=dense_rollover table={} error={error:?}",
+                    table.name
+                );
+                error
+            })
+            .map(super::indexed_reservation::PreparedIndexedPhysicalReservation::dense_rollover)
+        } else if fits_in_place {
+            let preview = super::index_delta_preview::prepare_from_resident_source(
+                self,
+                table,
+                predecessor_boundary,
+                source,
+                row_ids,
+                key_proof,
+                validation,
+                mutation_gate,
+                named_index_lifecycle,
+            )
+            .map_err(|_error| {
+                #[cfg(feature = "probe-timing")]
+                eprintln!(
+                    "[probe] codec5_indexed_plan decline stage=in_place_preview table={} error={_error:?}",
+                    table.name
+                );
+                DeviceInsertPlanPrepareError::UnsupportedShape
+            })?;
+            super::index_delta::prepare(
+                self,
+                table,
+                preview,
+                expected_commit_seq,
+                permit,
+                preheld_budget_allocation,
+                prior_reserved_bytes,
+            )
+                .map_err(|error| {
+                    #[cfg(feature = "probe-timing")]
+                    eprintln!(
+                        "[probe] codec5_indexed_plan decline stage=in_place_materialize table={} error={error:?}",
+                        table.name
+                    );
+                    error
+                })
+                .map(super::indexed_reservation::PreparedIndexedPhysicalReservation::in_place)
+        } else {
+            let preview = super::index_rollover::prepare_fixed_rollover_preview(
+                self,
+                table,
+                predecessor_boundary,
+                source,
+                row_ids,
+                key_proof,
+                validation,
+                mutation_gate,
+                named_index_lifecycle,
+                resets_existing_rows,
+            )
+            .map_err(|_error| {
+                #[cfg(feature = "probe-timing")]
+                eprintln!(
+                    "[probe] codec5_indexed_plan decline stage=fixed_rollover_preview table={} error={_error:?}",
+                    table.name
+                );
+                DeviceInsertPlanPrepareError::UnsupportedShape
+            })?;
+            super::index_rollover::materialize(
+                self,
+                table,
+                preview,
+                expected_commit_seq,
+                permit,
+                preheld_budget_allocation,
+                prior_reserved_bytes,
+                manifest_predecessor,
+            )
+                .map_err(|error| {
+                    #[cfg(feature = "probe-timing")]
+                    eprintln!(
+                        "[probe] codec5_indexed_plan decline stage=fixed_rollover_materialize table={} error={error:?}",
+                        table.name
+                    );
+                    error
+                })
+                .map(super::indexed_reservation::PreparedIndexedPhysicalReservation::fixed_rollover)
+        }
+        .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
+        Ok(DeviceInsertPlan(DeviceInsertPlanKind::IndexedInPlace(
+            reservation,
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)] // each argument names a distinct lifecycle guard or invariant
     fn prepare_resident_open_shard_append_core<'a>(
         &'a self,
         mut source: PreparedResidentAppendSource,
         row_ids: DeviceInsertRowIds,
         mode: ResidentOpenShardAppendPreparationMode,
         preheld_device_apply: Option<MutexGuard<'a, ()>>,
+        mut preheld_budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+        resets_existing_rows: bool,
+        indexed_final_table: Option<&RelationalTable>,
     ) -> Result<ResidentOpenShardAppendPlan<'a>, DeviceInsertPlanPrepareError> {
-        let live_unindexed = matches!(mode, ResidentOpenShardAppendPreparationMode::LiveUnindexed);
+        let unindexed = matches!(
+            mode,
+            ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed
+        );
         let indexed_in_place_proof = matches!(
             mode,
             ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation { .. }
@@ -768,23 +1943,33 @@ impl Engine {
             mode,
             ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation { .. }
         );
+        let allow_s3_index_schema_transition = matches!(
+            mode,
+            ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation {
+                allow_s3_index_schema_transition: true,
+                ..
+            }
+        );
         let apply_leader =
             crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(std::cell::Cell::get);
         // A lane leader already owns this lock, but the current intentional general-path policy
         // does not export a cross-WAL plan after its leader scope ends. It declines before WAL;
         // ordinary callers retain the lock in the returned move-only plan, closing
         // descriptor/generation races through apply.
-        if live_unindexed && apply_leader {
+        if unindexed && apply_leader {
             return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
         }
         let device_apply = match (mode, preheld_device_apply) {
-            (ResidentOpenShardAppendPreparationMode::LiveUnindexed, None) => Some(
+            (ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed, None) => Some(
                 self.read_state
                     .residency
                     .mutation_gate
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
             ),
+            (ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed, Some(held)) => {
+                Some(held)
+            }
             (
                 ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation { .. },
                 Some(held),
@@ -800,16 +1985,32 @@ impl Engine {
             .relational_catalog
             .get(source.table_name())
             .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-        let catalog_matches = if live_unindexed {
-            source.prepared_catalog_seq() == catalog.commit_seq
+        let index_table = indexed_final_table.unwrap_or(table);
+        let catalog_matches = if unindexed {
+            source.prepared_catalog_seq() != 0
+                && source.prepared_catalog_seq() <= catalog.commit_seq
         } else {
             source.prepared_catalog_seq() <= catalog.commit_seq
         };
-        let source_matches = if live_unindexed {
-            source_matches_table(&source, table)
+        let source_matches = if unindexed {
+            source_matches_table(&source, table, true)
         } else {
-            source_matches_indexed_in_place_reservation(&source, table)
+            source_matches_indexed_in_place_reservation(&source, index_table)
+                || (allow_s3_index_schema_transition
+                    && source_matches_s3_created_index_reservation(&source, index_table))
         };
+        #[cfg(feature = "probe-timing")]
+        if source.row_count() == 0 || !catalog_matches || !source_matches {
+            eprintln!(
+                "[probe] typed_insert_plan_decline stage=source table={} rows={} catalog_matches={} source_matches={} source_schema={:02x?} catalog_schema={:02x?}",
+                source.table_name(),
+                source.row_count(),
+                catalog_matches,
+                source_matches,
+                source.schema_digest(),
+                crate::engine_transaction_reset::table_schema_digest(table).unwrap_or([0; 32]),
+            );
+        }
         if source.row_count() == 0 || !catalog_matches || !source_matches {
             return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
         }
@@ -845,7 +2046,7 @@ impl Engine {
                     )
                     .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?,
                 )
-            } else if indexed_fixed_rollover_proof {
+            } else if indexed_fixed_rollover_proof && !dense_rollover {
                 Some(
                     indexed_fixed_rollover_plan_owned_host_retention_prediction(
                         &source, &row_ids, open, table,
@@ -896,8 +2097,10 @@ impl Engine {
         };
         let k = source.row_count();
         if indexed_in_place_proof
-            && (dense_rollover
+            && (resets_existing_rows
+                || dense_rollover
                 || bootstrap_sentinel
+                || !identity.supports_in_place_append()
                 || identity
                     .row_count
                     .checked_add(k)
@@ -906,13 +2109,16 @@ impl Engine {
             return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
         }
         if indexed_fixed_rollover_proof
-            && (dense_rollover
-                || bootstrap_sentinel
-                || table.indexes.is_empty()
-                || identity
-                    .row_count
-                    .checked_add(k)
-                    .is_none_or(|end| end <= identity.capacity))
+            && ((!dense_rollover && bootstrap_sentinel)
+                || index_table.indexes.is_empty()
+                || (!resets_existing_rows
+                    && !dense_rollover
+                    && source_is_all_i32_fixed(&source)
+                    && identity.supports_in_place_append()
+                    && identity
+                        .row_count
+                        .checked_add(k)
+                        .is_none_or(|end| end <= identity.capacity)))
         {
             return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
         }
@@ -926,8 +2132,18 @@ impl Engine {
             bool_uploads,
             budget_allocation,
         ) = if dense_rollover {
+            let (named_indexes_required, max_index_scratch_bytes) = match mode {
+                ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation {
+                    max_index_scratch_bytes,
+                    ..
+                } => (true, max_index_scratch_bytes),
+                ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed => (false, 0),
+                ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation { .. } => {
+                    return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
+                }
+            };
             let payload = source
-                .checked_dense_payload(table)
+                .checked_dense_payload(index_table)
                 .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
             let sidecar_bytes = u64::try_from(k)
                 .ok()
@@ -937,26 +2153,42 @@ impl Engine {
             let payload_bytes = payload
                 .device_payload_len()
                 .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            let planned_index_allocation_bytes = if named_indexes_required {
+                super::estimated_named_index_bytes_for_shard(index_table, k, k)
+                    .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?
+            } else {
+                0
+            };
             let requested_bytes = payload_bytes
                 .checked_add(sidecar_bytes)
                 .and_then(|bytes| bytes.checked_add(row_id_bytes))
+                .and_then(|bytes| bytes.checked_add(planned_index_allocation_bytes))
+                .and_then(|bytes| bytes.checked_add(max_index_scratch_bytes))
                 .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
             let row_id_payload = row_ids.pre_wal_payload();
             if row_ids_present != row_id_payload.is_some() {
                 return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
             }
-            let (new_shard_id, new_row_start) = checked_rollover_coordinates(
-                identity.shard_id,
-                identity.row_start,
-                identity.row_count,
-            )
+            let (new_shard_id, new_row_start) = if resets_existing_rows {
+                identity
+                    .shard_id
+                    .checked_add(1)
+                    .map(|shard_id| (shard_id, 0))
+            } else {
+                checked_rollover_coordinates(
+                    identity.shard_id,
+                    identity.row_start,
+                    identity.row_count,
+                )
+            }
             .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
-            let budget_allocation = self
-                .read_state
-                .residency
-                .budget_allocation_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let budget_allocation = preheld_budget_allocation.take().unwrap_or_else(|| {
+                self.read_state
+                    .residency
+                    .budget_allocation_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
             let still_matches = self
                 .read_state
                 .residency
@@ -968,7 +2200,10 @@ impl Engine {
             let (resident_bytes, budget_scan_entries) =
                 self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
             let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
-                Some(budget) => match budget.checked_sub(resident_bytes) {
+                Some(budget) => match budget
+                    .checked_sub(resident_bytes)
+                    .and_then(|remaining| remaining.checked_sub(prior_reserved_bytes))
+                {
                     Some(remaining) => Some(remaining),
                     None => {
                         self.read_state
@@ -1005,7 +2240,12 @@ impl Engine {
                 row_id_payload,
             )
             .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
-            if remaining_budget.is_some_and(|remaining| pending.allocation_bytes > remaining) {
+            let actual_peak_bytes = pending
+                .allocation_bytes
+                .checked_add(planned_index_allocation_bytes)
+                .and_then(|bytes| bytes.checked_add(max_index_scratch_bytes))
+                .ok_or(DeviceInsertPlanPrepareError::UnsupportedShape)?;
+            if remaining_budget.is_some_and(|remaining| actual_peak_bytes > remaining) {
                 self.read_state
                     .residency
                     .rollover_budget_declines
@@ -1018,10 +2258,13 @@ impl Engine {
             }
             (
                 PreparedResidentAppendBranch::DenseRollover(PreparedDenseRollover {
-                    pending,
+                    pending: Some(pending),
+                    uniform_publication: None,
                     new_shard_id,
                     new_row_start,
                     budget_scan_entries,
+                    planned_index_allocation_bytes,
+                    max_index_scratch_bytes,
                 }),
                 None,
                 None,
@@ -1029,7 +2272,10 @@ impl Engine {
                 None,
                 Some(budget_allocation),
             )
-        } else if !bootstrap_sentinel
+        } else if !resets_existing_rows
+            && !bootstrap_sentinel
+            && identity.supports_in_place_append()
+            && (!indexed_fixed_rollover_proof || source_is_all_i32_fixed(&source))
             && identity
                 .row_count
                 .checked_add(k)
@@ -1039,7 +2285,7 @@ impl Engine {
                 .checked_append_chunks(identity.capacity, identity.row_count)
                 .map_err(|_| DeviceInsertPlanPrepareError::UnsupportedShape)?;
             let index_scratch_bytes = match mode {
-                ResidentOpenShardAppendPreparationMode::LiveUnindexed => 0,
+                ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed => 0,
                 ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation {
                     index_scratch_bytes,
                 } => index_scratch_bytes,
@@ -1053,14 +2299,15 @@ impl Engine {
             // The proof mode always carries the budget guard, including when the append has
             // an existing sidecar.  Its exact pooled index preparation footprint is charged
             // alongside any append-sidecar reservation before the latter allocates.
-            let retain_budget_guard = reserve_created_by || !live_unindexed;
+            let retain_budget_guard = reserve_created_by || !unindexed;
             let (pending_created_by, budget_allocation) = if retain_budget_guard {
-                let budget_allocation = self
-                    .read_state
-                    .residency
-                    .budget_allocation_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let budget_allocation = preheld_budget_allocation.take().unwrap_or_else(|| {
+                    self.read_state
+                        .residency
+                        .budget_allocation_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                });
                 let still_matches = self
                     .read_state
                     .residency
@@ -1085,7 +2332,10 @@ impl Engine {
                 let (resident_bytes, _) =
                     self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
                 let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
-                    Some(budget) => match budget.checked_sub(resident_bytes) {
+                    Some(budget) => match budget
+                        .checked_sub(resident_bytes)
+                        .and_then(|remaining| remaining.checked_sub(prior_reserved_bytes))
+                    {
                         Some(remaining) => Some(remaining),
                         None => return Err(DeviceInsertPlanPrepareError::UnsupportedShape),
                     },
@@ -1122,7 +2372,7 @@ impl Engine {
                 };
                 (pending_created_by, Some(budget_allocation))
             } else {
-                (None, None)
+                (None, preheld_budget_allocation.take())
             };
             (
                 PreparedResidentAppendBranch::InPlace(PreparedInPlaceAppend { pending_created_by }),
@@ -1144,12 +2394,13 @@ impl Engine {
             }
             // Rollover capacity is an allocation transaction even though this pre-WAL phase makes
             // no allocation. Snapshot the exact budget under the same lock the publisher rechecks.
-            let budget_allocation = self
-                .read_state
-                .residency
-                .budget_allocation_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let budget_allocation = preheld_budget_allocation.take().unwrap_or_else(|| {
+                self.read_state
+                    .residency
+                    .budget_allocation_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
             let still_matches = self
                 .read_state
                 .residency
@@ -1168,7 +2419,10 @@ impl Engine {
             let (resident_bytes, budget_scan_entries) =
                 self.relational_resident_bytes_and_entries_for_gpu(gpu_id);
             let remaining_budget = match self.relational_residency_budget_bytes(gpu_id) {
-                Some(budget) => match budget.checked_sub(resident_bytes) {
+                Some(budget) => match budget
+                    .checked_sub(resident_bytes)
+                    .and_then(|remaining| remaining.checked_sub(prior_reserved_bytes))
+                {
                     Some(remaining) => Some(remaining),
                     None => {
                         self.read_state
@@ -1187,8 +2441,9 @@ impl Engine {
             let (named_indexes_required, max_index_scratch_bytes) = match mode {
                 ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation {
                     max_index_scratch_bytes,
+                    ..
                 } => (true, max_index_scratch_bytes),
-                ResidentOpenShardAppendPreparationMode::LiveUnindexed => (false, 0),
+                ResidentOpenShardAppendPreparationMode::TransactionTerminalUnindexed => (false, 0),
                 ResidentOpenShardAppendPreparationMode::IndexedInPlaceReservation { .. } => {
                     return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
                 }
@@ -1270,11 +2525,18 @@ impl Engine {
             if row_ids_present != row_id_payload.is_some() {
                 return Err(DeviceInsertPlanPrepareError::UnsupportedShape);
             }
-            let (new_shard_id, new_row_start) = checked_rollover_coordinates(
-                identity.shard_id,
-                identity.row_start,
-                identity.row_count,
-            )
+            let (new_shard_id, new_row_start) = if resets_existing_rows {
+                identity
+                    .shard_id
+                    .checked_add(1)
+                    .map(|shard_id| (shard_id, 0))
+            } else {
+                checked_rollover_coordinates(
+                    identity.shard_id,
+                    identity.row_start,
+                    identity.row_count,
+                )
+            }
             .ok_or(if bootstrap_sentinel {
                 DeviceInsertPlanPrepareError::RetryableBoundBootstrapState
             } else {
@@ -1318,7 +2580,8 @@ impl Engine {
             }
             (
                 PreparedResidentAppendBranch::FixedRollover(PreparedFixedRollover {
-                    pending,
+                    pending: Some(pending),
+                    uniform_publication: None,
                     capacity: rollover.capacity(),
                     new_shard_id,
                     new_row_start,
@@ -1338,7 +2601,9 @@ impl Engine {
             source,
             identity,
             catalog_seq: catalog.commit_seq,
+            foreign_keys_prevalidated: unindexed,
             row_ids,
+            resets_existing_rows,
             bootstrap_sentinel,
             branch,
             fixed_chunks,
@@ -1347,6 +2612,7 @@ impl Engine {
             bool_uploads,
             host_retention_prediction,
             budget_allocation,
+            budget_reservation_retained_by_transaction: false,
             _device_apply: device_apply,
         })
     }
@@ -1376,10 +2642,10 @@ impl Engine {
         .ok_or(DeviceInsertPlanApplyError::PublisherFailure)
     }
 
-    /// Internal reservation adapter over the one append compiler. It is intentionally not used
-    /// by live `DeviceInsertPlan` selection: the returned append reservation is owned only by
-    /// the private indexed physical-reservation owner until the future handoff is designed.
-    #[allow(dead_code)] // reached only by scalar-only inspection until live selection is designed
+    /// Internal reservation adapter over the one append compiler. The returned append reservation
+    /// is owned only by the private indexed physical owner and reaches production solely through
+    /// the generic codec-5 `DeviceInsertPlan` handoff.
+    #[allow(clippy::too_many_arguments)] // exact indexed reservation capability inputs
     pub(super) fn prepare_resident_open_shard_append_indexed_in_place_reservation<'a>(
         &'a self,
         source: PreparedResidentAppendSource,
@@ -1387,6 +2653,8 @@ impl Engine {
         device_apply: MutexGuard<'a, ()>,
         index_scratch_bytes: u64,
         _permit: IndexedPhysicalMaterializationPermit,
+        budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
     ) -> Result<ResidentOpenShardAppendPlan<'a>, DeviceInsertPlanPrepareError> {
         self.prepare_resident_open_shard_append_core(
             source,
@@ -1395,13 +2663,17 @@ impl Engine {
                 index_scratch_bytes,
             },
             Some(device_apply),
+            budget_allocation,
+            prior_reserved_bytes,
+            false,
+            None,
         )
     }
 
     /// Internal fixed-rollover reservation adapter. It reserves the private payload/sidecars
     /// plus the exact index and scratch envelope, without constructing a `DeviceInsertPlan` or
     /// exposing WAL, apply, cache, or descriptor-publication authority.
-    #[allow(dead_code)] // reached only by scalar-only inspection until live selection is designed
+    #[allow(clippy::too_many_arguments)] // exact rollover reservation capability inputs
     pub(super) fn prepare_resident_open_shard_append_indexed_fixed_rollover_reservation<'a>(
         &'a self,
         source: PreparedResidentAppendSource,
@@ -1409,24 +2681,38 @@ impl Engine {
         device_apply: MutexGuard<'a, ()>,
         max_index_scratch_bytes: u64,
         _permit: IndexedPhysicalMaterializationPermit,
+        budget_allocation: Option<MutexGuard<'a, ()>>,
+        prior_reserved_bytes: u64,
+        resets_existing_rows: bool,
+        allow_s3_index_schema_transition: bool,
+        s3_final_table: Option<&RelationalTable>,
     ) -> Result<ResidentOpenShardAppendPlan<'a>, DeviceInsertPlanPrepareError> {
         self.prepare_resident_open_shard_append_core(
             source,
             row_ids,
             ResidentOpenShardAppendPreparationMode::IndexedFixedRolloverReservation {
                 max_index_scratch_bytes,
+                allow_s3_index_schema_transition,
             },
             Some(device_apply),
+            budget_allocation,
+            prior_reserved_bytes,
+            resets_existing_rows,
+            s3_final_table,
         )
     }
 }
 
-fn source_matches_table(source: &PreparedResidentAppendSource, table: &RelationalTable) -> bool {
+fn source_matches_table(
+    source: &PreparedResidentAppendSource,
+    table: &RelationalTable,
+    foreign_keys_prevalidated: bool,
+) -> bool {
     source.table_name() == table.name
         && source.exact_single_table_dependency()
         && source.table_oid() == table.oid
         && table.indexes.is_empty()
-        && table.foreign_keys.is_empty()
+        && (foreign_keys_prevalidated || table.foreign_keys.is_empty())
         && crate::engine_transaction_reset::table_schema_digest(table)
             .is_ok_and(|digest| digest == source.schema_digest())
         && table.columns.len() == source.columns().len()
@@ -1456,10 +2742,11 @@ pub(super) fn source_matches_indexed_in_place_reservation(
     source: &PreparedResidentAppendSource,
     table: &RelationalTable,
 ) -> bool {
+    // Transaction-terminal FK validation closes before codec-5 compiles this physical plan. FK
+    // metadata and its additional table dependencies therefore constrain the semantic preflight,
+    // not the single-target indexed append layout.
     source.table_name() == table.name
-        && source.exact_single_table_dependency()
         && source.table_oid() == table.oid
-        && table.foreign_keys.is_empty()
         && crate::engine_transaction_reset::table_schema_digest(table)
             .is_ok_and(|digest| digest == source.schema_digest())
         && table.columns.len() == source.columns().len()
@@ -1476,6 +2763,31 @@ pub(super) fn source_matches_indexed_in_place_reservation(
                     && column.type_oid == source_column.type_oid()
                     && column.type_size == source_column.type_size()
                     && source_column.ty() == column.ty
+            })
+}
+
+/// The final S3 catalog shape may append exact index identities after the source's statement
+/// snapshot. Its relation identity and physical column layout remain exact; only the catalog
+/// schema digest is statement-time for this narrow pre-WAL reservation.
+pub(super) fn source_matches_s3_created_index_reservation(
+    source: &PreparedResidentAppendSource,
+    table: &RelationalTable,
+) -> bool {
+    source.table_name() == table.name
+        && source.table_oid() == table.oid
+        && table.columns.len() == source.columns().len()
+        && table
+            .columns
+            .iter()
+            .zip(source.columns())
+            .all(|(column, source_column)| {
+                is_live_resident_append_type(column.ty)
+                    && column.table_oid == table.oid
+                    && column.id == source_column.column_id()
+                    && column.attnum == source_column.attnum()
+                    && column.ty == source_column.ty()
+                    && column.type_oid == source_column.type_oid()
+                    && column.type_size == source_column.type_size()
             })
 }
 
@@ -1520,309 +2832,5 @@ fn plan_matches_live_open(engine: &Engine, plan: &ResidentOpenShardAppendPlan) -
 }
 
 #[cfg(test)]
-mod ownership_tests {
-    #[test]
-    fn live_device_plan_apply_requires_the_post_wal_typed_claim_permit() {
-        let source = include_str!("fixed_insert.rs")
-            .split("\n#[cfg(test)]\nmod ownership_tests")
-            .next()
-            .expect("implementation precedes tests");
-        assert!(source.contains("fn apply_after_typed_wal_claim"));
-        assert!(source.contains("TypedInsertPostWalApplyPermit"));
-        assert!(source.contains("permit.into_append_created_by()"));
-        assert!(
-            !source.contains("pub(crate) fn apply(\n"),
-            "DeviceInsertPlan must not expose an unclaimed apply entry"
-        );
-    }
-
-    #[test]
-    fn exact_row_id_box_is_slot_only_and_synthetic_or_consumed_forms_fail_closed() {
-        let row_ids = super::DeviceInsertRowIds::exact(vec![7_u64, 8].into());
-        let mut report = crate::engine_insert_plan::host_retention::HostRetentionReport::default();
-        row_ids.append_host_allocation_slot(&mut report).unwrap();
-        assert_eq!(report.retained_bytes(), 0);
-        assert_eq!(report.allocation_slots().unwrap(), 1);
-
-        let synthetic = super::DeviceInsertRowIds::synthetic_no_identity();
-        assert!(synthetic.append_host_allocation_slot(&mut report).is_err());
-        let mut consumed = super::DeviceInsertRowIds::exact(vec![9_u64].into());
-        assert!(consumed.take_exact().is_some());
-        assert!(consumed.append_host_allocation_slot(&mut report).is_err());
-    }
-
-    #[test]
-    fn indexed_reservation_mode_reuses_the_single_append_preparation_core() {
-        let source = include_str!("fixed_insert.rs")
-            .split("\n#[cfg(test)]\nmod ownership_tests")
-            .next()
-            .expect("implementation precedes tests");
-        let core = source
-            .split("fn prepare_resident_open_shard_append_core")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("\n    /// Apply exactly one pre-WAL plan")
-                    .next()
-            })
-            .expect("one append preparation core");
-        assert!(core.contains("LiveUnindexed"));
-        assert!(core.contains("IndexedInPlaceReservation"));
-        assert!(core.contains("source_matches_table(&source, table)"));
-        assert!(core.contains("source_matches_indexed_in_place_reservation(&source, table)"));
-        let reservation_decline = core
-            .find("&& (dense_rollover")
-            .expect("proof mode rejects dense/bootstrap/headroom shapes");
-        for later in [
-            ".checked_dense_payload(table)",
-            "fixed_width_desired_capacity",
-            "PendingInPlaceCreatedBy::reserve_pre_wal",
-            "budget_allocation_lock",
-        ] {
-            assert!(
-                reservation_decline < core.find(later).expect("ordinary later preparation branch"),
-                "reservation mode must decline before {later}"
-            );
-        }
-        assert!(
-            [
-                "dense_rollover",
-                "bootstrap_sentinel",
-                ".checked_add(k)",
-                "end > identity.capacity"
-            ]
-            .into_iter()
-            .all(|decline| core[reservation_decline..].contains(decline)),
-            "reservation mode must explicitly decline every fixed/bootstrap/dense shape before allocation"
-        );
-        let adapter = source
-            .split("fn prepare_resident_open_shard_append_indexed_in_place_reservation")
-            .nth(1)
-            .and_then(|section| section.split("\n}\n\nfn source_matches_table").next())
-            .expect("proof adapter");
-        assert!(adapter.contains("prepare_resident_open_shard_append_core"));
-        assert!(!adapter.contains("let catalog ="));
-        assert!(!adapter.contains("reserve_pre_wal"));
-
-        let live_selector = source
-            .split("pub(crate) fn compile_typed_insert_device_plan")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("fn prepare_resident_open_shard_append")
-                    .next()
-            })
-            .expect("sole live device-plan selector");
-        assert!(live_selector.contains("ResidentOpenShardAppend"));
-        assert!(
-            !live_selector.contains("IndexedInPlaceReservation")
-                && !live_selector.contains("IndexedFixedRolloverReservation"),
-            "the live DeviceInsertPlan selector must not choose an indexed reservation"
-        );
-    }
-
-    #[test]
-    fn indexed_in_place_fused_owner_is_all_i32_only_and_has_no_publication_surface() {
-        let source = include_str!("fixed_insert/indexed_fused.rs");
-        let fused = source
-            .split("pub(in super::super) struct IndexedInPlaceFusedApplyInputs")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("pub(in super::super) fn prepare_inputs")
-                    .next()
-            })
-            .expect("private fused input and owner section");
-        for required in [
-            "prepare_i32_fused_apply",
-            "index: None",
-            "created_by_stamps",
-            "stamps_match_expected_commit",
-            "owner_array_backing_identity",
-            "staging_backing_identity",
-        ] {
-            assert!(
-                fused.contains(required),
-                "indexed fused owner must retain {required}"
-            );
-        }
-        for forbidden in [
-            "apply_before_header",
-            ".apply(",
-            "submit_resident",
-            ".publish(",
-            "shard_pk_device_index",
-        ] {
-            assert!(
-                !fused.contains(forbidden),
-                "indexed fused owner must not expose {forbidden}"
-            );
-        }
-        let inputs = source
-            .split("pub(in super::super) fn prepare_inputs")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("pub(in super::super) fn source_is_all_i32_fixed")
-                    .next()
-            })
-            .expect("sealed fused input derivation");
-        let compact_inputs: String = inputs
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        assert!(compact_inputs.contains("source_is_all_i32_fixed(&plan.source)"));
-        assert!(compact_inputs.contains("plan.identity.device_memory"));
-        assert!(compact_inputs.contains("plan.row_ids"));
-        assert!(compact_inputs.contains("expected_commit_seq"));
-    }
-    #[test]
-    fn rollover_coordinates_are_checked_before_allocation() {
-        assert_eq!(
-            super::checked_rollover_coordinates(7, 11, 13),
-            Some((8, 24))
-        );
-        assert_eq!(super::checked_rollover_coordinates(u32::MAX, 0, 0), None);
-        assert_eq!(super::checked_rollover_coordinates(7, usize::MAX, 1), None);
-    }
-    #[test]
-    fn typed_post_wal_paths_cannot_allocate_a_replacement_generation() {
-        let mutation = include_str!("mutation.rs");
-        let fixed_apply = mutation
-            .split("} else if preallocated_fixed_plan {")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("} else if !has_text && !batch_has_null {")
-                    .next()
-            })
-            .expect("typed fixed post-WAL apply section");
-        assert!(fixed_apply.contains("finish_post_wal"));
-        for forbidden in [
-            "relational_residency_device_memory",
-            "retain_device_memory_",
-            "PendingResidentShard::build",
-            "fixed_width_desired_capacity",
-        ] {
-            assert!(
-                !fixed_apply.contains(forbidden),
-                "typed fixed post-WAL apply must not {forbidden}"
-            );
-        }
-
-        let rollover = include_str!("rollover.rs");
-        let fixed_finish = rollover
-            .split("fn finish_post_wal")
-            .nth(1)
-            .and_then(|section| section.split("impl PendingInPlaceCreatedBy").next())
-            .expect("fixed post-WAL finalization");
-        for forbidden in [
-            "relational_residency_device_memory",
-            "retain_device_memory_",
-        ] {
-            assert!(
-                !fixed_finish.contains(forbidden),
-                "fixed post-WAL finalization must not {forbidden}"
-            );
-        }
-
-        let typed_in_place = mutation
-            .split("let typed_created_by_region = match &mut source {")
-            .nth(1)
-            .and_then(|section| section.split("let fused = if").next())
-            .expect("typed in-place sidecar handoff");
-        assert!(
-            typed_in_place.contains("pending.into_region")
-                && typed_in_place.contains("get_or_alloc_created_by_region"),
-            "mutation must consume and publish the sealed in-place Arc"
-        );
-        assert!(!typed_in_place.contains("install_preallocated_created_by_region"));
-        let pending_in_place = rollover
-            .split("impl PendingInPlaceCreatedBy")
-            .nth(1)
-            .and_then(|section| section.split("impl PendingResidentShard").next())
-            .expect("in-place allocation lifecycle");
-        for forbidden in [
-            "with_shards_mut",
-            ".insert_shard(",
-            "shard_created_by_memory",
-        ] {
-            assert!(
-                !pending_in_place.contains(forbidden),
-                "rollover lifecycle leaf must not publish {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn adapter_has_no_second_residency_or_durability_publisher() {
-        let source = include_str!("fixed_insert.rs");
-        let implementation = source
-            .split("#[cfg(test)]\nmod ownership_tests")
-            .next()
-            .expect("source has an implementation prefix");
-        for (prefix, suffix) in [
-            ("RelationalResident", "Shard {"),
-            ("with_shards_mut", "_for_table("),
-            (".insert_", "shard("),
-            ("retain_device_", "memory_"),
-            (".append_owned_", "chunks("),
-            ("write_", "wal"),
-            ("append_", "wal"),
-        ] {
-            let forbidden = format!("{prefix}{suffix}");
-            assert!(
-                !implementation.contains(&forbidden),
-                "fixed INSERT adapter must not own {forbidden}"
-            );
-        }
-        for forbidden in [
-            "relational_residency_device_memory",
-            "retain_device_memory_",
-            "shard_created_by_memory.insert",
-            "shard_row_id_memory.insert",
-        ] {
-            assert!(
-                !implementation.contains(forbidden),
-                "fixed INSERT adapter must delegate {forbidden} to the allocation/publisher owner"
-            );
-        }
-        assert!(implementation.contains("ResidentAppendSource::DevicePlan"));
-        assert_eq!(
-            implementation
-                .matches("try_append_to_resident_open_shard")
-                .count(),
-            1,
-            "the typed plan must enter mutation through exactly one publisher"
-        );
-        assert!(implementation.contains("_device_apply"));
-        assert!(implementation.contains("budget_allocation"));
-        assert!(
-            !implementation.contains("pub(crate) fn new"),
-            "the move-only plan must have no raw public constructor"
-        );
-        assert!(
-            implementation.contains("row_ids: DeviceInsertRowIds"),
-            "the plan must own its row-id input before WAL"
-        );
-        assert!(
-            !implementation.contains("row_ids_present: bool"),
-            "a caller-provided row-id presence bit must not cross the WAL/apply boundary"
-        );
-        let apply = implementation
-            .split("fn apply_resident_open_shard_append")
-            .nth(1)
-            .expect("sealed apply exists")
-            .split("\n    /// Internal reservation adapter")
-            .next()
-            .expect("sealed apply precedes reservation adapters");
-        assert!(
-            !apply.contains("row_ids:"),
-            "apply must consume only row IDs sealed into the opaque plan"
-        );
-        assert!(
-            source.contains("#[cfg(test)]\n    pub(crate) fn synthetic_no_identity"),
-            "synthetic no-identity construction must remain test-only"
-        );
-    }
-}
+#[path = "fixed_insert/tests.rs"]
+mod ownership_tests;

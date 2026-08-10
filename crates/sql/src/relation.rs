@@ -1447,43 +1447,107 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
     } else {
         (normalize_relation_identifier(target)?, Vec::new())
     };
-    let mut rows = Vec::new();
-    let mut tail = values;
-    loop {
-        let open = tail.find('(').ok_or(ParseError::InvalidRelationalSql)?;
-        if !tail[..open].trim().is_empty() {
-            return Err(ParseError::InvalidRelationalSql);
-        }
-        let close = find_matching_paren(tail, open).ok_or(ParseError::InvalidRelationalSql)?;
-        let row = split_csv(&tail[open + 1..close])?
-            .into_iter()
-            .map(|cell| {
-                if cell.trim().eq_ignore_ascii_case("DEFAULT") {
-                    Ok(InsertCell::sql_default())
-                } else {
-                    parse_sql_value(cell).map(InsertCell::from_parsed_value)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if !columns.is_empty() && row.len() != columns.len() {
-            return Err(ParseError::InvalidRelationalSql);
-        }
-        rows.push(row);
-        tail = tail[close + 1..].trim_start();
-        if tail.is_empty() {
-            break;
-        }
-        let Some(after_comma) = tail.strip_prefix(',') else {
-            return Err(ParseError::InvalidRelationalSql);
-        };
-        tail = after_comma.trim_start();
-    }
+    let rows = parse_insert_values_rows(values, columns.len())?;
     Ok(Insert {
         table,
         columns,
         rows,
         returning,
     })
+}
+
+/// Parse a comma-separated `VALUES` tuple list in one pass.  The old composition first scanned
+/// each tuple to find its closing parenthesis, then scanned its contents again to split cells.
+/// This remains the general quote/nesting-aware grammar, but produces each retained row while
+/// walking the original input once.
+fn parse_insert_values_rows(
+    values: &str,
+    expected_columns: usize,
+) -> Result<Vec<Vec<InsertCell>>, ParseError> {
+    let bytes = values.as_bytes();
+    let mut rows = Vec::new();
+    let mut index = 0;
+    let mut need_row = true;
+    let mut depth = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut cell_start = 0;
+    let mut row = Vec::new();
+
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_whitespace() && depth == 0 => {}
+            b'\'' if !in_double_quote && depth != 0 => {
+                if in_single_quote && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 1;
+                } else {
+                    in_single_quote = !in_single_quote;
+                }
+            }
+            b'"' if !in_single_quote && depth != 0 => {
+                if in_double_quote && bytes.get(index + 1) == Some(&b'"') {
+                    index += 1;
+                } else {
+                    in_double_quote = !in_double_quote;
+                }
+            }
+            b'(' if !in_single_quote && !in_double_quote => {
+                if depth == 0 {
+                    if !need_row {
+                        return Err(ParseError::InvalidRelationalSql);
+                    }
+                    need_row = false;
+                    row = Vec::with_capacity(expected_columns.max(1));
+                    cell_start = index + 1;
+                }
+                depth += 1;
+            }
+            b')' if !in_single_quote && !in_double_quote => {
+                if depth == 0 {
+                    return Err(ParseError::InvalidRelationalSql);
+                }
+                if depth == 1 {
+                    push_insert_value_cell(&mut row, &values[cell_start..index])?;
+                    if expected_columns != 0 && row.len() != expected_columns {
+                        return Err(ParseError::InvalidRelationalSql);
+                    }
+                    rows.push(std::mem::take(&mut row));
+                    need_row = false;
+                }
+                depth -= 1;
+            }
+            b',' if !in_single_quote && !in_double_quote && depth == 0 => {
+                if need_row {
+                    return Err(ParseError::InvalidRelationalSql);
+                }
+                need_row = true;
+            }
+            b',' if !in_single_quote && !in_double_quote && depth == 1 => {
+                push_insert_value_cell(&mut row, &values[cell_start..index])?;
+                cell_start = index + 1;
+            }
+            _ if depth == 0 => return Err(ParseError::InvalidRelationalSql),
+            _ => {}
+        }
+        index += 1;
+    }
+    if depth != 0 || in_single_quote || in_double_quote || need_row || rows.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(rows)
+}
+
+fn push_insert_value_cell(row: &mut Vec<InsertCell>, input: &str) -> Result<(), ParseError> {
+    let cell = input.trim();
+    if cell.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    row.push(if cell.eq_ignore_ascii_case("DEFAULT") {
+        InsertCell::sql_default()
+    } else {
+        InsertCell::from_parsed_value(parse_sql_value(cell)?)
+    });
+    Ok(())
 }
 
 fn parse_delete(input: &str) -> Result<Delete, ParseError> {
@@ -1576,8 +1640,11 @@ fn split_returning_clause(input: &str) -> Result<(&str, Vec<String>), ParseError
         return Ok((input.trim(), Vec::new()));
     };
     let body = input[..position].trim();
+    if body.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
     let projection = input[position + "RETURNING".len()..].trim();
-    if body.is_empty() || projection.is_empty() {
+    if projection.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
     let returning = split_csv(projection)?
@@ -1813,6 +1880,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(delete.returning, vec!["pending_id"]);
+    }
+
+    #[test]
+    fn insert_values_row_scanner_retains_quoted_and_default_cells() {
+        let insert = parse_insert(
+            "INSERT INTO notes (id, body, metadata) VALUES (1, 'comma, value', DEFAULT), \
+             (2, 'VALUES RETURNING', 'func(3, 4)')",
+        )
+        .unwrap();
+        assert_eq!(insert.rows.len(), 2);
+        assert_eq!(insert.rows[0].len(), 3);
+        assert!(matches!(insert.rows[0][2], InsertCell::Default { .. }));
+        assert_eq!(insert.rows[1].len(), 3);
+        assert_eq!(
+            insert.rows[1][1].value(),
+            Some(&SqlValue::Text("VALUES RETURNING".to_string()))
+        );
     }
 
     #[test]

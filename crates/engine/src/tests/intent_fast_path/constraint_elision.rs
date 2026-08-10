@@ -21,7 +21,6 @@ fn gpu_check_constrained_table_elides() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     engine
@@ -134,7 +133,6 @@ fn gpu_fk_referenced_parent_elides() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     engine
@@ -249,7 +247,6 @@ fn gpu_fk_child_table_elides() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     engine
@@ -345,7 +342,6 @@ fn gpu_fk_child_date_fk_stays_elided() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     engine
@@ -469,7 +465,6 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         engine.execute_text(txn_id, fk_ddl).unwrap();
     }
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     // Per pair: (child, parent, pk_col, [kept, departing, missing] key literals).
@@ -666,7 +661,6 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let mut txn = 2u64;
@@ -846,7 +840,6 @@ fn gpu_check_elided_preflight_rehydrate_no_bypass() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     engine

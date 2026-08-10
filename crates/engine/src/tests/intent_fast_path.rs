@@ -186,14 +186,10 @@ fn covered_insert_route_requires_covered_shape() {
     let err = engine.prepare_covered_insert_route("nope").unwrap_err();
     assert!(err.to_string().contains("does not exist"), "{err}");
 
-    // Binary WAL records disabled.
-    engine.set_binary_wal_records_enabled(false);
-    let err = engine.prepare_covered_insert_route("t").unwrap_err();
-    assert!(err.to_string().contains("binary WAL records"), "{err}");
-
-    // Flags on, but the table is not elided (no GPU warm-up ran), so the
+    // The table is not elided (no GPU warm-up ran), so the
     // wave-batched device validation is unavailable.
-    engine.set_binary_wal_records_enabled(true);
+    engine.set_auto_admit_on_commit(false);
+    engine.set_table_device_authoritative("t", false);
     engine.set_device_write_locate_wave_batch_enabled(true);
     let err = engine.prepare_covered_insert_route("t").unwrap_err();
     assert!(
@@ -232,7 +228,6 @@ fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
@@ -345,7 +340,6 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
@@ -447,7 +441,6 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
@@ -548,7 +541,6 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let mut txn = 2u64;
@@ -689,7 +681,6 @@ fn gpu_zero_match_dml_keeps_table_elided() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8, s TEXT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let mut txn = 2u64;
@@ -782,7 +773,6 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let mut txn = 2u64;
@@ -883,7 +873,6 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let mut txn = 2u64;
@@ -1012,7 +1001,6 @@ fn gpu_int8_range_dml_resolves_on_device() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     // b = id * 2_000_000_000 -> ids 3..=8 have b > i32::MAX (2.1e9), so the bound cannot be an Int4Literal.
@@ -1127,7 +1115,6 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     // ids 1..=6 at ts = 2020-01..06-01. Purge everything strictly before 2020-04-01 -> ids 1,2,3.
@@ -1209,7 +1196,6 @@ fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     // ids 1..=6 at ts = 2020-01..06-01.
@@ -1295,7 +1281,6 @@ fn gpu_nullable_column_dml_resolves_on_device() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, notes TEXT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     // id=1 'a', id=2 NULL, id=3 'c', id=4 NULL — a nullable value column that actually holds NULLs.
@@ -1393,7 +1378,6 @@ fn gpu_numeric_range_dml_resolves_on_device() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(12,2))")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     // ids 1..=6 at amt = id * 50.00 -> 50, 100, 150, 200, 250, 300.
@@ -1514,7 +1498,6 @@ fn gpu_text_predicate_dml_resolves_on_device() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let mut txn = 2u64;
@@ -1624,7 +1607,6 @@ fn gpu_like_prefix_dml_resolves_on_device() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     engine
@@ -1701,7 +1683,6 @@ fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Optio
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let mut txn = 2u64;
@@ -2374,34 +2355,23 @@ fn gpu_text_range_dml_resolves_on_device() {
     }
 }
 
-/// CPU-ENGINE RETIREMENT (ADR-006, multi-statement elision): a MULTI-ENTRY commit BATCH of INSERTs
-/// (the group-commit batcher grouping GpuBatched inserts under load — the SQL-text write path) now
-/// KEEPS the table ELIDED via ONE incremental device append per table, instead of de-eliding the
-/// whole batch scope to the CPU host store (`to_apply.len() > 1` used to rehydrate every touched
-/// elided table). Drives the real path: `commit_mutation_batch` -> `apply_and_publish_committed_inner`
-/// with `to_apply.len() == 3`. A CONSTRAINT-FREE int4 table is elision-eligible AND its INSERTs group
-/// (a unique-index table takes the immediate single-entry commit and never batches). All rows land +
-/// read back on-device, the table stays elided, and every entry took the elided host-install skip
-/// (device_authoritative_commits += 3 in the one batch). GPU-gated.
+/// WRITE-001: a multi-statement INSERT transaction keeps its resident table elided through the
+/// sole typed overlay/device-plan/codec-5 lifecycle. The historical raw multi-entry commit batch
+/// is deliberately not an INSERT route. All rows land and read back on-device from one immutable
+/// transaction-final publication. GPU-gated.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_multi_entry_insert_batch_stays_elided() {
+fn gpu_multi_statement_typed_insert_transaction_stays_elided() {
     let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
 
-    let payload = |sql: &str| -> std::sync::Arc<[u8]> { std::sync::Arc::from(sql.as_bytes()) };
-    let commit_batch = |engine: &Engine, items: &[(u64, std::sync::Arc<[u8]>)]| {
-        engine
-            .commit_mutation_batch(items)
-            .map_err(|failure| failure.error)
-            .expect("group commit");
-    };
-
-    // Seed row 1 as a batch of ONE (single-entry path), then admit residency — self-guard on no GPU.
-    commit_batch(&engine, &[(2, payload("INSERT INTO t VALUES (1, 10)"))]);
+    // Seed row 1, then admit residency — self-guard on no GPU.
+    engine
+        .execute_text(2, "INSERT INTO t VALUES (1, 10)")
+        .unwrap();
     let snap = engine.populate_relational_residency_snapshot("t");
     if snap
         .map(|s| s.device_memory_proof.is_none())
@@ -2409,13 +2379,17 @@ fn gpu_multi_entry_insert_batch_stays_elided() {
     {
         return; // no usable GPU
     }
-    // Two more single-entry commits drive the (now-resident) table into elision — ENTER needs a
-    // handled incremental append.
-    commit_batch(&engine, &[(3, payload("INSERT INTO t VALUES (2, 20)"))]);
-    commit_batch(&engine, &[(4, payload("INSERT INTO t VALUES (3, 30)"))]);
+    // Two more typed commits drive the (now-resident) table into elision — ENTER needs a handled
+    // incremental append.
+    engine
+        .execute_text(3, "INSERT INTO t VALUES (2, 20)")
+        .unwrap();
+    engine
+        .execute_text(4, "INSERT INTO t VALUES (3, 30)")
+        .unwrap();
     assert!(
         engine.table_device_authoritative("t"),
-        "the table must be elided before the multi-entry batch"
+        "the table must be elided before the multi-statement transaction"
     );
 
     let ids = |engine: &Engine| -> Vec<i64> {
@@ -2437,31 +2411,33 @@ fn gpu_multi_entry_insert_batch_stays_elided() {
     };
     assert_eq!(ids(&engine), (1..=3).collect::<Vec<_>>());
 
-    // THE MULTI-ENTRY BATCH: three INSERTs group-committed as ONE commit (`to_apply.len() == 3`).
-    // Before ADR-006 multi-statement elision, the `to_apply.len() > 1` guard de-elided the scope.
+    // Three separate INSERT statements compose into one transaction-final typed aggregate.
     let elisions_before = engine.device_authoritative_commits();
-    commit_batch(
-        &engine,
-        &[
-            (10, payload("INSERT INTO t VALUES (4, 40)")),
-            (11, payload("INSERT INTO t VALUES (5, 50)")),
-            (12, payload("INSERT INTO t VALUES (6, 60)")),
-        ],
-    );
+    engine.execute_text(10, "BEGIN").unwrap();
+    engine
+        .execute_text(10, "INSERT INTO t VALUES (4, 40)")
+        .unwrap();
+    engine
+        .execute_text(10, "INSERT INTO t VALUES (5, 50)")
+        .unwrap();
+    engine
+        .execute_text(10, "INSERT INTO t VALUES (6, 60)")
+        .unwrap();
+    engine.execute_text(10, "COMMIT").unwrap();
 
     assert!(
         engine.table_device_authoritative("t"),
-        "a multi-entry INSERT batch must NOT de-elide — it stays device-authoritative"
+        "a multi-statement typed INSERT transaction must NOT de-elide"
     );
     assert_eq!(
         engine.device_authoritative_commits() - elisions_before,
-        3,
-        "all three batched INSERTs took the elided host-install skip (multi-entry stayed elided)"
+        1,
+        "one typed transaction publication must take the elided host-install skip"
     );
     assert_eq!(
         ids(&engine),
         (1..=6).collect::<Vec<_>>(),
-        "every batched row landed on-device and reads back exactly"
+        "every transaction row landed on-device and reads back exactly"
     );
 }
 
@@ -2540,7 +2516,6 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(3);
@@ -2695,7 +2670,6 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
@@ -2801,7 +2775,6 @@ fn gpu_compound_drop_constraint_shifts_ordinal_without_aliasing_the_device_index
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(2);

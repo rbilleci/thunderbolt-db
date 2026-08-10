@@ -143,6 +143,8 @@ pub(super) struct RetainedDisposition {
     pub(super) table_ref: u32,
     pub(super) transition_ref: u32,
     pub(super) typed_statement_digest: Digest,
+    pub(super) final_writer_statement_ordinal: u32,
+    pub(super) final_writer_statement_digest: Digest,
 }
 
 pub(super) struct RetainedSequenceEffect {
@@ -151,7 +153,14 @@ pub(super) struct RetainedSequenceEffect {
     pub(super) disposition_ref: u32,
     pub(super) flags: u8,
     pub(super) body_digest: Digest,
-    pub(super) reference: crate::BinarySequenceValueReference,
+    /// Digest of only the independently durable published receipt. It remains zero for private
+    /// effects and deliberately excludes an optional later terminal-restart suffix.
+    pub(super) reference_body_digest: Digest,
+    /// Published effects retain the independently durable receipt. Transaction-private effects
+    /// retain no synthetic receipt: their complete state remains in the strict decoded S2 owner.
+    pub(super) reference: Option<crate::BinarySequenceValueReference>,
+    pub(super) terminal_restart:
+        Option<crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SequenceRestartTail>,
 }
 
 pub(super) struct RetainedStatementOutcome {
@@ -168,6 +177,8 @@ pub(super) struct RetainedStatementOutcome {
 
 pub(super) struct RetainedTable {
     pub(super) table_ref: u32,
+    pub(super) resets_existing_rows: bool,
+    pub(super) initial_table_absent: bool,
     pub(super) stable_table_id: u64,
     pub(super) display_oid: u32,
     pub(super) target_dependency_ref: u32,
@@ -330,6 +341,7 @@ pub(super) struct RetainedTransition {
     pub(super) key_effect_start: u32,
     pub(super) key_effect_count: u32,
     pub(super) final_writer_statement_ordinal: u32,
+    pub(super) final_writer_statement_digest: Digest,
     pub(super) typed_statement_digest: Digest,
     pub(super) final_row_digest: Digest,
     pub(super) transition_digest: Digest,

@@ -507,7 +507,6 @@ fn resident_named_index_publication_and_mutation_omit_indexed_nulls() {
     lazy.set_shard_residency_enabled(true);
     lazy.set_auto_admit_on_commit(true);
     lazy.set_shard_size_target(64);
-    lazy.set_binary_wal_records_enabled(true);
     lazy.set_device_write_locate_wave_batch_enabled(true);
     lazy.execute_text(
         1,
@@ -921,7 +920,10 @@ fn resident_named_index_publication_and_mutation_do_not_deadlock() {
     engine
         .publish_relational_resident_indexes("lock_order_idx")
         .unwrap();
-    engine.attach_test_intent_lanes(crate::tests::test_wal_path("named-index-lock-order"), 4);
+    engine.attach_test_intent_lanes(
+        crate::tests::test_wal_path("named-index-lock-order").into_path_buf(),
+        4,
+    );
 
     let engine = Arc::new(engine);
     let start = Arc::new(std::sync::Barrier::new(3));

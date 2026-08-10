@@ -11,6 +11,11 @@ use super::*;
 pub struct RelationalTable {
     pub schema: String,
     pub name: String,
+    /// Engine-stable table identity. This is an independent identity domain from the PostgreSQL
+    /// compatibility OID below: it is never changed by rename and is the table key carried by
+    /// GPU data generations, row allocators, codec-5 witnesses, and recovery validation.
+    pub stable_table_id: u64,
+    /// PostgreSQL-compatible display/catalog identity (`pg_class.oid`).
     pub oid: u32,
     pub columns: Vec<RelationalColumn>,
     pub indexes: Vec<RelationalIndex>,
@@ -460,7 +465,6 @@ pub(crate) struct RelationalSelectSpecificationFixture {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RelationalCopyAdmissionProfile {
     pub rows: usize,
-    pub render_sql_wal_payload_micros: u128,
     pub commit_total_micros: u128,
     pub wal_commit_flush_boundary_micros: u128,
     pub current_apply_total_micros: u128,

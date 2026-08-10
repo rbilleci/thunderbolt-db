@@ -5,8 +5,6 @@
 //! derives needles from the sealed typed batch, probes every physical destination on the GPU, and
 //! reduces each locate result to scalar evidence before control returns to the owner.
 
-#![allow(dead_code)] // part of the deliberately unreachable physical reservation
-
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -21,8 +19,6 @@ use gpu_db_execution::{
     WriteLocateShard,
 };
 
-#[cfg(test)]
-use super::ReservedPrivateIndexGeneration;
 use super::{PreparedFixedRolloverLogicalBindings, PreparedPrivateIndexGeneration};
 
 struct ExpectedPhysicalLookup {
@@ -40,8 +36,6 @@ pub(super) struct PrivateGpuLookupOracle {
 
 /// Scalar evidence retained after every private GPU lookup result has been checked and dropped.
 pub(super) struct PrivateGpuLookupEvidence {
-    pub(super) gpu_probe_count: usize,
-    pub(super) bounded_readback_bytes: u64,
     pub(super) max_concurrent_readback_bytes: u64,
     pub(super) host_call_peak: HostRetentionGeometry,
 }
@@ -66,10 +60,6 @@ impl PrivateGpuLookupOracle {
             report.retain_boxed_slice(&destination.needles)?;
         }
         Ok(())
-    }
-
-    pub(super) fn host_retention_geometry(&self) -> Result<HostRetentionGeometry, ExecuteError> {
-        lookup_oracle_host_retention_geometry(self.destinations.len(), self.incoming_rows())
     }
 }
 
@@ -118,14 +108,7 @@ pub(super) fn prepare_gpu_lookup_oracle(
     let max_hits = u32::try_from(row_count).map_err(|_| {
         super::decline("indexed rollover proof GPU lookup oracle row count overflows")
     })?;
-    if row_count == 0
-        || columns.len() != table.columns.len()
-        || columns.iter().any(|column| {
-            column
-                .i32_values()
-                .is_none_or(|values| values.len() != row_count)
-        })
-    {
+    if row_count == 0 || columns.len() != table.columns.len() || source.requires_dense_rollover() {
         return Err(super::decline(
             "indexed rollover proof GPU lookup oracle batch geometry drifted",
         ));
@@ -157,6 +140,7 @@ pub(super) fn prepare_gpu_lookup_oracle(
         for row in 0..row_count {
             let value = if uses_fingerprint {
                 let mut fingerprint = 0x811C_9DC5_u32;
+                let mut word_count = 0_usize;
                 for name in index.key_columns.iter() {
                     let position = table
                         .columns
@@ -167,18 +151,21 @@ pub(super) fn prepare_gpu_lookup_oracle(
                                 "indexed rollover proof GPU lookup key column disappeared",
                             )
                         })?;
-                    let word = columns[position]
-                        .i32_values()
-                        .and_then(|values| values.get(row))
-                        .copied()
-                        .ok_or_else(|| {
-                            super::decline(
-                                "indexed rollover proof GPU lookup value geometry drifted",
-                            )
-                        })?;
-                    fingerprint ^= word as u32;
-                    fingerprint = fingerprint.wrapping_mul(0x0100_0193);
-                    fingerprint = fingerprint.rotate_left(13).wrapping_add(0x9E37_79B1);
+                    if !columns[position].try_for_each_fixed_index_key_word(row, |word| {
+                        word_count += 1;
+                        fingerprint ^= word as u32;
+                        fingerprint = fingerprint.wrapping_mul(0x0100_0193);
+                        fingerprint = fingerprint.rotate_left(13).wrapping_add(0x9E37_79B1);
+                    }) {
+                        return Err(super::decline(
+                            "indexed rollover proof GPU lookup value geometry drifted",
+                        ));
+                    }
+                }
+                if word_count == 0 {
+                    return Err(super::decline(
+                        "indexed rollover proof GPU lookup value geometry is empty",
+                    ));
                 }
                 fingerprint as i32
             } else if index.key_columns.len() == 1 {
@@ -191,13 +178,18 @@ pub(super) fn prepare_gpu_lookup_oracle(
                             "indexed rollover proof GPU lookup raw key column disappeared",
                         )
                     })?;
-                columns[position]
-                    .i32_values()
-                    .and_then(|values| values.get(row))
-                    .copied()
-                    .ok_or_else(|| {
-                        super::decline("indexed rollover proof GPU lookup value geometry drifted")
-                    })?
+                let mut raw = None;
+                let mut word_count = 0_usize;
+                if !columns[position].try_for_each_fixed_index_key_word(row, |word| {
+                    word_count += 1;
+                    raw = Some(word);
+                }) || word_count != 1
+                {
+                    return Err(super::decline(
+                        "indexed rollover proof GPU lookup raw value geometry drifted",
+                    ));
+                }
+                raw.expect("one checked raw index word")
             } else {
                 unreachable!("compound bindings must use the fingerprint directory")
             };
@@ -321,18 +313,7 @@ pub(super) fn verify_private_gpu_lookups(
             }
         }
     }
-    let gpu_probe_count = generations.len();
-    let bounded_readback_bytes = oracle
-        .geometry
-        .readback_bytes
-        .checked_mul(
-            u64::try_from(gpu_probe_count)
-                .map_err(|_| super::decline("indexed rollover proof GPU lookup count overflows"))?,
-        )
-        .ok_or_else(|| super::decline("indexed rollover proof GPU lookup readback overflows"))?;
     Ok(PrivateGpuLookupEvidence {
-        gpu_probe_count,
-        bounded_readback_bytes,
         max_concurrent_readback_bytes: oracle.geometry.readback_bytes,
         host_call_peak,
     })
@@ -437,88 +418,25 @@ pub(super) fn published_index_enrollment_is_complete(
                 })
             })
     });
-    physical_coverage_is_exact
-        && publications.get(&table.oid) == Some(&table.indexes)
-        && complete
-            .get(&table.name)
-            .is_some_and(|(oid, indexes)| *oid == table.oid && indexes == &table.indexes)
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(super) enum PrivateIndexBuildSabotage {
-    SwapFirstTwoDirectories,
-    ReverseCompoundDescriptors,
-}
-
-#[cfg(test)]
-thread_local! {
-    static PRIVATE_INDEX_BUILD_SABOTAGE: std::cell::Cell<Option<PrivateIndexBuildSabotage>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(super) fn arm_private_index_build_sabotage(sabotage: PrivateIndexBuildSabotage) {
-    PRIVATE_INDEX_BUILD_SABOTAGE.with(|slot| slot.set(Some(sabotage)));
-}
-
-/// Corrupt only the private test build input. The oracle still derives its expected semantics from
-/// the sealed catalog/batch carrier, so either corruption must be rejected before inspection.
-#[cfg(test)]
-pub(super) fn apply_test_build_sabotage(
-    reserved: &mut [ReservedPrivateIndexGeneration],
-) -> Result<(), ExecuteError> {
-    let Some(sabotage) = PRIVATE_INDEX_BUILD_SABOTAGE.with(|slot| slot.replace(None)) else {
-        return Ok(());
-    };
-    match sabotage {
-        PrivateIndexBuildSabotage::SwapFirstTwoDirectories => {
-            let (first, rest) = reserved.split_first_mut().ok_or_else(|| {
-                super::decline("indexed rollover proof sabotage needs two physical directories")
-            })?;
-            let second = rest.first_mut().ok_or_else(|| {
-                super::decline("indexed rollover proof sabotage needs two physical directories")
-            })?;
-            if first.build_columns.len() != second.build_columns.len() {
-                return Err(super::decline(
-                    "indexed rollover proof sabotage needs matching descriptor geometry",
-                ));
-            }
-            std::mem::swap(&mut first.build_columns, &mut second.build_columns);
-        }
-        PrivateIndexBuildSabotage::ReverseCompoundDescriptors => {
-            let generation = reserved
-                .iter_mut()
-                .find(|generation| {
-                    generation
-                        .build_columns
-                        .iter()
-                        .filter(|column| {
-                            !matches!(
-                                column,
-                                gpu_db_execution::CudaCompoundFoldColumn::Validity { .. }
-                            )
-                        })
-                        .count()
-                        >= 2
-                })
-                .ok_or_else(|| {
-                    super::decline("indexed rollover proof sabotage needs a compound directory")
-                })?;
-            let data_columns = generation
-                .build_columns
-                .iter()
-                .position(|column| {
-                    matches!(
-                        column,
-                        gpu_db_execution::CudaCompoundFoldColumn::Validity { .. }
-                    )
-                })
-                .unwrap_or(generation.build_columns.len());
-            generation.build_columns[..data_columns].reverse();
-        }
+    let publication_is_exact = publications.get(&table.oid) == Some(&table.indexes);
+    let completion_is_exact = complete
+        .get(&table.name)
+        .is_some_and(|(oid, indexes)| *oid == table.oid && indexes == &table.indexes);
+    let enrolled = physical_coverage_is_exact && publication_is_exact && completion_is_exact;
+    #[cfg(feature = "probe-timing")]
+    if !enrolled {
+        eprintln!(
+            "[probe] index_enrollment table={} physical={} publication={} completion={} catalog_indexes={} publication_indexes={} completion_indexes={}",
+            table.name,
+            physical_coverage_is_exact,
+            publication_is_exact,
+            completion_is_exact,
+            table.indexes.len(),
+            publications.get(&table.oid).map_or(0, Vec::len),
+            complete.get(&table.name).map_or(0, |(_, indexes)| indexes.len()),
+        );
     }
-    Ok(())
+    enrolled
 }
 
 /// Reconstruct the exact bounded readback contract from the survivor-only scalar dimensions.

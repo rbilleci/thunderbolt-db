@@ -10,9 +10,11 @@ mod input;
 
 pub(super) use input::GenerationQuarantineRegistry;
 
+#[cfg(test)]
 use super::{
     CatalogAndAllocatorValidated, FullyWitnessValidatedSemanticsV2, GenerationPendingSemanticsV2,
 };
+use super::{RetainedSemanticsV2Graph, SemanticsV2CatalogWitness};
 use crate::typed_insert_aggregate::semantics_v2::retained::graph::{
     ReservedSemanticsV2Graph, RetainedTable,
 };
@@ -27,6 +29,15 @@ mod sealed {
     pub trait Candidate {}
     pub trait Work {}
 }
+
+#[path = "generation_validation/runtime_builder.rs"]
+mod runtime_builder;
+// Validation children consume these private concrete owners through this module boundary.
+#[allow(unused_imports)]
+pub(super) use runtime_builder::{
+    LiveTypedInsertGenerationBuilder, LiveTypedInsertGenerationCandidate,
+    LiveTypedInsertGenerationWork,
+};
 
 /// A builder work owner reports whether the device/runtime is definitely quiescent.  The
 /// lifecycle, not the work implementation, enforces exact-once invocation.
@@ -61,6 +72,16 @@ pub(super) trait SemanticsV2ReservedGenerationBuilder: sealed::Builder {
         self,
         launch: input::ReservedGenerationLaunch<Self::Candidate, Self::Work>,
     ) -> LaunchedAttempt<Self::Candidate, Self::Work>;
+
+    /// After the work fence proves quiescence, transfer the device-produced fixed commitments
+    /// from the candidate into the already-reserved validation slots.  This operation may not
+    /// launch, allocate, hash, or consult the retained graph.
+    fn finalize_quiesced(
+        _candidate: &mut Self::Candidate,
+        _outputs: &mut input::ReservedGenerationOutputs,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 /// Opaque, armed post-launch owner.  It intentionally has no getters for input, output slots,
@@ -168,6 +189,21 @@ impl<C, W: SemanticsV2ReservedGenerationWork> LaunchedAttempt<C, W> {
                 .expect("quiesced generation attempt retains candidate backing"),
         }
     }
+
+    fn finalize_quiesced<B>(&mut self) -> Result<(), EngineError>
+    where
+        B: SemanticsV2ReservedGenerationBuilder<Candidate = C, Work = W>,
+    {
+        debug_assert!(self.drain_attempted && self.work.is_none());
+        B::finalize_quiesced(
+            self.candidate
+                .as_mut()
+                .expect("quiesced generation retains its candidate"),
+            self.outputs
+                .as_mut()
+                .expect("quiesced generation retains its output slots"),
+        )
+    }
 }
 
 impl<C, W: SemanticsV2ReservedGenerationWork> Drop for LaunchedAttempt<C, W> {
@@ -195,6 +231,7 @@ pub(super) struct OwnedGenerationResult<C> {
 /// Consume catalog/allocator-validated ownership through the only reserved builder lifecycle.
 /// All fallible preparation is complete before `launch`; every post-launch path drains or parks
 /// without exposing partial output.
+#[cfg(test)]
 pub(super) fn validate_reserved_builder_result<'a, B>(
     pending: GenerationPendingSemanticsV2<'a>,
     builder: B,
@@ -203,9 +240,37 @@ pub(super) fn validate_reserved_builder_result<'a, B>(
 where
     B: SemanticsV2ReservedGenerationBuilder,
 {
-    let identity = pending.graph.identity;
-    let graph = &pending.graph.graph;
-    let catalog = &pending.catalog_and_allocator.catalog;
+    let generation = validate_reserved_graph(
+        &pending.graph,
+        &pending.catalog_and_allocator.catalog,
+        builder,
+        quarantine_registry,
+    )?;
+    let CatalogAndAllocatorValidated {
+        catalog: _,
+        allocator_index: _,
+        allocator_assignment: _,
+    } = pending.catalog_and_allocator;
+    Ok(FullyWitnessValidatedSemanticsV2 {
+        graph: pending.graph,
+        generation,
+    })
+}
+
+/// Run the sole reserved builder lifecycle over one already-closed retained graph.  Both live
+/// and replay call this exact function; only their source of the retained graph and borrowed
+/// witnesses differs.
+pub(super) fn validate_reserved_graph<B>(
+    retained: &RetainedSemanticsV2Graph,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+    builder: B,
+    quarantine_registry: &input::GenerationQuarantineRegistry<B::Candidate, B::Work>,
+) -> Result<OwnedGenerationResult<B::Candidate>, EngineError>
+where
+    B: SemanticsV2ReservedGenerationBuilder,
+{
+    let identity = retained.identity;
+    let graph = &retained.graph;
     let measure = input::measure(graph, catalog, identity)?;
     let candidate = builder.try_reserve_candidate(measure.builder_reservation())?;
     let launch = input::reserve_and_fill(
@@ -219,17 +284,8 @@ where
     let mut attempt = builder.launch(launch);
     match attempt.drain_once() {
         DrainOutcome::Quiesced { execution: Ok(()) } => {
-            let drained = attempt.into_drained();
-            let generation = validate_drained(&pending, drained)?;
-            let CatalogAndAllocatorValidated {
-                catalog: _,
-                allocator_index: _,
-                allocator_assignment: _,
-            } = pending.catalog_and_allocator;
-            Ok(FullyWitnessValidatedSemanticsV2 {
-                graph: pending.graph,
-                generation,
-            })
+            attempt.finalize_quiesced::<B>()?;
+            validate_drained(retained, catalog, attempt.into_drained())
         }
         DrainOutcome::Quiesced {
             execution: Err(error),
@@ -239,7 +295,8 @@ where
 }
 
 fn validate_drained<C>(
-    pending: &GenerationPendingSemanticsV2<'_>,
+    retained: &RetainedSemanticsV2Graph,
+    catalog: &SemanticsV2CatalogWitness<'_>,
     drained: DrainedAttempt<C>,
 ) -> Result<OwnedGenerationResult<C>, EngineError> {
     let DrainedAttempt { outputs, candidate } = drained;
@@ -259,8 +316,8 @@ fn validate_drained<C>(
             "generation builder left missing, duplicate, or extra fixed outputs",
         ));
     }
-    validate_header(pending, &outputs.header)?;
-    validate_table_outputs(pending, &outputs.tables, &outputs.indexes)?;
+    validate_header(retained, catalog, &outputs.header)?;
+    validate_table_outputs(retained, &outputs.tables, &outputs.indexes)?;
     Ok(OwnedGenerationResult {
         header: outputs.header,
         tables: outputs.tables.into_boxed_slice(),
@@ -270,12 +327,12 @@ fn validate_drained<C>(
 }
 
 fn validate_header(
-    pending: &GenerationPendingSemanticsV2<'_>,
+    retained: &RetainedSemanticsV2Graph,
+    catalog: &SemanticsV2CatalogWitness<'_>,
     header: &input::GenerationOutputHeader,
 ) -> Result<(), EngineError> {
-    let identity = pending.graph.identity;
-    let graph = &pending.graph.graph;
-    let catalog = &pending.catalog_and_allocator.catalog;
+    let identity = retained.identity;
+    let graph = &retained.graph;
     if header.root_descriptor_version != ROOT_DESCRIPTOR_VERSION
         || header.root_descriptor_version != graph.header.root_descriptor_version
         || header.database_id != identity.database_id
@@ -286,9 +343,9 @@ fn validate_header(
         || header.initial_database_root != identity.initial_database_root
         || header.final_database_root != graph.header.final_database_root
         || graph.header.catalog_before_epoch != identity.catalog_epoch
-        || graph.header.catalog_after_epoch != identity.catalog_epoch
         || graph.header.catalog_before_digest != identity.catalog_digest
-        || graph.header.catalog_after_digest != identity.catalog_digest
+        || graph.header.catalog_after_epoch < identity.catalog_epoch
+        || graph.header.catalog_after_digest == [0; 32]
         || graph.header.initial_database_root != identity.initial_database_root
         || catalog.database_id != identity.database_id
         || catalog.catalog_epoch != identity.catalog_epoch
@@ -309,12 +366,12 @@ fn validate_header(
 }
 
 fn validate_table_outputs(
-    pending: &GenerationPendingSemanticsV2<'_>,
+    retained: &RetainedSemanticsV2Graph,
     outputs: &[input::GenerationOutputTable],
     index_outputs: &[input::GenerationOutputIndex],
 ) -> Result<(), EngineError> {
-    let graph = &pending.graph.graph;
-    let initial_database_root = pending.graph.identity.initial_database_root;
+    let graph = &retained.graph;
+    let initial_database_root = retained.identity.initial_database_root;
     if outputs.len() != graph.tables.len() {
         return Err(generation_error(
             "generation output table count does not equal retained tables",

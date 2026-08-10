@@ -106,7 +106,13 @@ fn encode_s4(graph: &ReservedSemanticsV2Graph) -> Result<Vec<u8>, EngineError> {
         raw[16] = entry.disposition;
         put_u32(&mut raw, 20, entry.table_ref);
         put_u32(&mut raw, 24, entry.transition_ref);
-        put_digest(&mut raw, 32, entry.typed_statement_digest);
+        if entry.final_writer_statement_digest == [0; 32] {
+            put_digest(&mut raw, 32, entry.typed_statement_digest);
+        } else {
+            raw[17] = 1;
+            put_u32(&mut raw, 28, entry.final_writer_statement_ordinal);
+            put_digest(&mut raw, 32, entry.final_writer_statement_digest);
+        }
         out.extend_from_slice(&raw);
     }
     Ok(out)
@@ -115,27 +121,49 @@ fn encode_s4(graph: &ReservedSemanticsV2Graph) -> Result<Vec<u8>, EngineError> {
 fn encode_s5(graph: &ReservedSemanticsV2Graph) -> Result<Vec<u8>, EngineError> {
     let mut out = Vec::new();
     for effect in &graph.sequence_effects {
-        let mut body = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
-        encode_sequence_value_reference_into_exact(&effect.reference, &mut body)?;
-        if effect.body_digest != gpu_db_wal::canonical_request_digest(&body) {
+        let mut prefix = [0_u8; 52];
+        put_u32(&mut prefix, 0, effect.statement_ordinal);
+        put_u32(&mut prefix, 4, effect.effect_ordinal);
+        prefix[9] = effect.flags;
+        put_u32(&mut prefix, 12, effect.disposition_ref);
+        let mut encoded_body = Vec::new();
+        match effect.reference.as_ref() {
+            Some(reference) => {
+                let mut body = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
+                encode_sequence_value_reference_into_exact(reference, &mut body)?;
+                encoded_body.extend_from_slice(&body);
+                prefix[8] = 1;
+            }
+            None => {
+                prefix[8] = 2;
+            }
+        }
+        if let Some(tail) = effect.terminal_restart {
+            encoded_body.extend_from_slice(
+                &crate::typed_insert_aggregate::semantics_v2::sequence_terminal::encode_retained(
+                    tail,
+                ),
+            );
+        }
+        let expected_digest = if encoded_body.is_empty() {
+            [0; 32]
+        } else {
+            gpu_db_wal::canonical_request_digest(&encoded_body)
+        };
+        if effect.body_digest != expected_digest {
             return Err(reencode_error(
                 "reconstructed S5 sequence body differs from retained digest",
             ));
         }
-        let mut prefix = [0_u8; 52];
-        put_u32(&mut prefix, 0, effect.statement_ordinal);
-        put_u32(&mut prefix, 4, effect.effect_ordinal);
-        prefix[8] = 1;
-        prefix[9] = effect.flags;
-        put_u32(&mut prefix, 12, effect.disposition_ref);
         put_u32(
             &mut prefix,
             16,
-            crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES as u32,
+            u32::try_from(encoded_body.len())
+                .map_err(|_| reencode_error("S5 sequence body exceeds u32"))?,
         );
         put_digest(&mut prefix, 20, effect.body_digest);
         out.extend_from_slice(&prefix);
-        out.extend_from_slice(&body);
+        out.extend_from_slice(&encoded_body);
     }
     Ok(out)
 }
@@ -304,6 +332,11 @@ fn append_tables(out: &mut Vec<u8>, values: &[RetainedTable]) {
     for value in values {
         let mut raw = [0_u8; 384];
         put_u32(&mut raw, 0, value.table_ref);
+        put_u32(
+            &mut raw,
+            4,
+            u32::from(value.resets_existing_rows) | (u32::from(value.initial_table_absent) << 1),
+        );
         put_u64(&mut raw, 8, value.stable_table_id);
         put_u32(&mut raw, 16, value.display_oid);
         put_u32(&mut raw, 20, value.target_dependency_ref);
@@ -492,9 +525,11 @@ fn append_transitions(out: &mut Vec<u8>, values: &[RetainedTransition]) {
         put_u32(&mut raw, 40, value.key_effect_start);
         put_u32(&mut raw, 44, value.key_effect_count);
         put_u32(&mut raw, 48, value.final_writer_statement_ordinal);
+        raw[17] = u8::from(value.final_writer_statement_digest != [0; 32]);
         put_digest(&mut raw, 64, value.typed_statement_digest);
         put_digest(&mut raw, 96, value.final_row_digest);
         put_digest(&mut raw, 128, value.transition_digest);
+        put_digest(&mut raw, 160, value.final_writer_statement_digest);
         out.extend_from_slice(&raw);
     }
 }
@@ -814,6 +849,10 @@ fn reconstructed_root_descriptor(
             return Err(reencode_error("root descriptor table order differs"));
         }
         digest.update(table.table_ref.to_le_bytes());
+        digest.update(
+            (u32::from(table.resets_existing_rows) | (u32::from(table.initial_table_absent) << 1))
+                .to_le_bytes(),
+        );
         digest.update(table.stable_table_id.to_le_bytes());
         digest.update(table.data_generation_before.to_le_bytes());
         digest.update(table.data_generation_after.to_le_bytes());

@@ -5,63 +5,7 @@
 
 use super::*;
 
-/// Canonical framing output that keeps the sealed record paired with the exact move-only proposal
-/// which produced its row identities. The serial wave consumes this token for WAL append and
-/// range-aware allocator apply without reconstructing `(first, count, high_water)`.
-pub(crate) struct PreparedBoundBinaryInsert {
-    record: gpu_db_wal::PreparedCanonicalWalRecord,
-    proposed_range: crate::wal_binary::ProposedRowIdRange,
-}
-
-impl PreparedBoundBinaryInsert {
-    pub(crate) fn into_record_and_proposed_range(
-        self,
-    ) -> (
-        gpu_db_wal::PreparedCanonicalWalRecord,
-        crate::wal_binary::ProposedRowIdRange,
-    ) {
-        (self.record, self.proposed_range)
-    }
-}
-
 impl Engine {
-    /// Frame one already-bound fixed-width INSERT through the same canonical envelope authority
-    /// as every other commit. The caller obtains the live catalog boundary from `commit`; the
-    /// bound token is consumed so its proposal bytes and resolved-binary operation body cannot be
-    /// reused with a different outcome or boundary.
-    pub(crate) fn canonical_wal_record_with_commit_bound_insert(
-        commit: &mut CommitState,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        bound: crate::wal_binary::BoundBinaryInsert,
-        request_digest: gpu_db_wal::CanonicalDigest,
-    ) -> Result<PreparedBoundBinaryInsert, EngineError> {
-        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
-            commit.canonical_identity,
-            commit.wal.canonical_catalog_tail()?,
-        )?;
-        let sealed = SealedCanonicalOperation::from_bound_binary_insert(bound)?;
-        let (operation, proposed_range) = sealed.into_operation_and_proposed_range();
-        let record = Self::canonical_exact_wal_record_from_sealed_operation(
-            commit.canonical_identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            operation,
-            request_digest,
-            gpu_db_wal::CanonicalOutcomeKind::CommitSuccess,
-            Some(u64::from(proposed_range.count())),
-            gpu_db_wal::CanonicalIsolation::ReadCommitted,
-        )?;
-        Ok(PreparedBoundBinaryInsert {
-            record,
-            proposed_range,
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn canonical_wal_record_from_sealed_operation(
         identity: gpu_db_wal::CanonicalIdentity,
@@ -88,41 +32,10 @@ impl Engine {
             outcome_kind,
             outcome_rows,
             isolation,
-            false,
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // mirrors the generic compatibility constructor above
-    fn canonical_exact_wal_record_from_sealed_operation(
-        identity: gpu_db_wal::CanonicalIdentity,
-        catalog_epoch: u64,
-        catalog_digest: gpu_db_wal::CanonicalDigest,
-        txn_id: TxnId,
-        commit_seq: Index,
-        lane_id: u32,
-        operation: SealedCanonicalOperation,
-        request_digest: gpu_db_wal::CanonicalDigest,
-        outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
-        outcome_rows: Option<u64>,
-        isolation: gpu_db_wal::CanonicalIsolation,
-    ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
-        Self::canonical_wal_record_from_sealed_operation_with_encoding(
-            identity,
-            catalog_epoch,
-            catalog_digest,
-            txn_id,
-            commit_seq,
-            lane_id,
-            operation,
-            request_digest,
-            outcome_kind,
-            outcome_rows,
-            isolation,
-            true,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)] // one canonical envelope derivation, two output modes
+    #[allow(clippy::too_many_arguments)]
     fn canonical_wal_record_from_sealed_operation_with_encoding(
         identity: gpu_db_wal::CanonicalIdentity,
         catalog_epoch: u64,
@@ -135,7 +48,6 @@ impl Engine {
         outcome_kind: gpu_db_wal::CanonicalOutcomeKind,
         outcome_rows: Option<u64>,
         isolation: gpu_db_wal::CanonicalIsolation,
-        exact_typed: bool,
     ) -> Result<gpu_db_wal::PreparedCanonicalWalRecord, EngineError> {
         if outcome_kind == gpu_db_wal::CanonicalOutcomeKind::AbortError {
             return Err(EngineError::Durability(
@@ -196,13 +108,7 @@ impl Engine {
             first_frame_ordinal: 0,
         };
         let fragments = [operation_fragment, status_fragment];
-        if exact_typed {
-            gpu_db_wal::prepare_exact_canonical_wal_record(
-                txn_id, physical, header, &fragments, outcome,
-            )
-        } else {
-            gpu_db_wal::encode_canonical_envelope(physical, &header, &fragments, &outcome)?
-                .into_prepared_record(txn_id)
-        }
+        gpu_db_wal::encode_canonical_envelope(physical, &header, &fragments, &outcome)?
+            .into_prepared_record(txn_id)
     }
 }

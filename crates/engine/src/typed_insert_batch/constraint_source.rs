@@ -14,16 +14,6 @@ thread_local! {
     static CONSTRAINT_SOURCE_UPLOAD_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_constraint_source_upload_count() {
-    CONSTRAINT_SOURCE_UPLOAD_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn constraint_source_upload_count() -> usize {
-    CONSTRAINT_SOURCE_UPLOAD_COUNT.with(Cell::get)
-}
-
 /// Geometry-only lookup for one catalog column in the common pre-WAL payload.  The key proof
 /// receives this only after the batch/table binding is already sealed; it contains no values and
 /// cannot make a host-side relational decision.
@@ -543,7 +533,7 @@ mod tests {
                 returning: Vec::new(),
             };
             let catalog = engine.catalog_snapshot();
-            let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch(
+            let batch = crate::typed_insert_batch::seal_typed_insert_batch_for_test(
                 &crate::Command::Insert(insert),
                 &catalog,
                 catalog.commit_seq,

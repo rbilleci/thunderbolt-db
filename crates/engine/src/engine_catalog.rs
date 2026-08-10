@@ -5,7 +5,7 @@
 //! object kind) plus COPY-rows execution (execute_relational_copy_rows[_profiled]).
 
 use super::*;
-use crate::engine_transaction_reset::{table_access_dependency_identities, StableRetryOr};
+use crate::engine_transaction_reset::table_access_dependency_identities;
 
 /// Opaque identity of the exact relation definition accepted when COPY FROM begins.
 ///
@@ -227,13 +227,13 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .next_row_id;
-            self.prepare_dml(
-                &Command::Insert(insert),
+            self.prepare_insert(
+                &insert,
                 DmlReadSnapshot {
                     commit_seq: snapshot.boundary,
                     next_row_id,
                 },
-                InsertPrepareValidation::Full,
+                None,
             )?;
             return Ok(DmlExecutionResult {
                 rows_affected: 0,
@@ -395,113 +395,48 @@ impl Engine {
             }
             return Ok((0, profile));
         }
-        let render_started = Instant::now();
-        let sql = render_relational_insert(&insert).map_err(ExecuteError::Engine)?;
-        profile.render_sql_wal_payload_micros = render_started.elapsed().as_micros();
-        let payload: std::sync::Arc<[u8]> = sql.into_bytes().into();
-        let request_digest = gpu_db_wal::canonical_request_digest(&payload);
-        let terminal_rows = if proof.table_access.is_none() {
-            match self.acquire_autocommit_table_access_after_retry(
-                &copy.table,
-                txn_id,
-                request_digest,
-            )? {
-                StableRetryOr::Terminal(affected_rows) => Some(affected_rows),
-                StableRetryOr::Fresh(table_access) => {
-                    proof.table_access = Some(table_access);
-                    None
-                }
-            }
-        } else {
-            self.resolve_stable_retry_before_table_access(txn_id, request_digest)?
-        };
-        if let Some(affected_rows) = terminal_rows {
-            let affected_rows = usize::try_from(affected_rows).map_err(|_| {
-                ExecuteError::Engine(EngineError::Durability(
-                    "recorded COPY affected-row count exceeds usize".to_string(),
-                ))
-            })?;
-            return Ok((affected_rows, profile));
+        // COPY is INSERT compatibility ingress, not a separate direct-current apply authority.
+        // Establish the protocol target's exact catalog cut before staging, then carry that same
+        // cut into the ordinary typed autocommit overlay.  The overlay rechecks it under its
+        // statement lock, builds `TypedInsertBatch`, and owns the only WAL/apply/publication
+        // terminal.  In particular, it cannot lose one of two overlapping COPY commits between
+        // a direct CPU apply and the resident-generation append.
+        let catalog = self.catalog_snapshot();
+        if !self.copy_target_matches_catalog(&catalog, &normalized_copy, &proof) {
+            return Err(stale_copy_target(&normalized_copy.table));
         }
         on_precommit();
-        let timestamp_micros = self.next_commit_timestamp_micros();
-        let mut apply_profile = RelationalCopyAdmissionProfile::default();
-        let mut current_apply_total_micros = 0;
-        let mut locked_preflight_micros = 0;
-        let mut target_changed = false;
-        let validation_insert = insert.clone();
-        let validation_copy = normalized_copy.clone();
-        let validation_proof = proof.clone();
+        // Request identity is derived from the already-typed programmatic INSERT. Reconstructing
+        // SQL here made text a second carrier below COPY decoding, performed a full row-matrix
+        // render, and obscured that COPY values retain Programmatic provenance. The JSON shape is
+        // the existing typed-command compatibility encoding; it is request identity only and is
+        // never selected as WAL, replay, apply, or publication authority.
+        let request_payload = serde_json::to_vec(&insert).map_err(|error| {
+            ExecuteError::Engine(EngineError::Durability(format!(
+                "typed COPY request identity encode failed: {error}"
+            )))
+        })?;
+        let request_digest = gpu_db_wal::canonical_request_digest(&request_payload);
         let commit_started = Instant::now();
-        let commit_result = self.commit_mutation_at_with_current_apply(
+        let outcome = self.execute_autocommit_insert_as_one_statement_overlay(
             txn_id,
-            payload,
-            timestamp_micros,
-            |engine, _commit_seq| {
-                let preflight_started = Instant::now();
-                let catalog = engine.catalog_snapshot();
-                if !engine.copy_target_matches_catalog(
-                    &catalog,
-                    &validation_copy,
-                    &validation_proof,
-                ) {
-                    target_changed = true;
-                    return Err(EngineError::ApplyFailed(format!(
-                        "COPY target relation \"{}\" changed after COPY began",
-                        validation_copy.table
-                    )));
-                }
-                let command = Command::Insert(validation_insert.clone());
-                // We already own `commit_mutex`. Establish any missing device generation with
-                // the catalog latch acquired in the canonical order, then run the definitive
-                // constraint pass through the no-admission seam. Calling the ordinary preflight
-                // here could re-enter `commit_state()` when admission is required.
-                {
-                    let mut catalog = engine.ddl_catalog();
-                    engine.ensure_dml_device_generation_with_catalog(&command, &mut catalog)?;
-                }
-                let result = engine
-                    .preflight_constraints_against_current_device_generation(&command, txn_id);
-                locked_preflight_micros += preflight_started.elapsed().as_micros();
-                result
-            },
-            |engine, cat, commit_seq| {
-                let apply_started = Instant::now();
-                // Stamp with the commit sequence (commit `Index`), NOT the facade txn_id, so the
-                // live COPY apply produces the same `created_by` a WAL replay would (Stage 0). The
-                // held catalog latch (`cat`) carries any working-map mutation (sequence advance).
-                let result = engine.apply_insert_with_profile(
-                    cat,
-                    insert.clone(),
-                    commit_seq,
-                    Some(&mut apply_profile),
-                );
-                current_apply_total_micros += apply_started.elapsed().as_micros();
-                result
-            },
-        );
-        let (_token, residency_invalidation_micros) = match commit_result {
-            Ok(committed) => committed,
-            Err(_error) if target_changed => {
-                return Err(stale_copy_target(&normalized_copy.table));
-            }
-            Err(error) => return Err(ExecuteError::Engine(error)),
-        };
+            Command::Insert(insert),
+            request_digest,
+            Some(
+                crate::engine_mutation_admission::CatalogVersionExpectation::Prepared(
+                    catalog.commit_seq,
+                ),
+            ),
+            current_timestamp_micros(),
+            || {},
+        )?;
         profile.commit_total_micros = commit_started.elapsed().as_micros();
-        profile.current_apply_total_micros = current_apply_total_micros;
-        profile.row_prepare_micros = apply_profile.row_prepare_micros;
-        profile.unique_preflight_micros =
-            locked_preflight_micros.saturating_add(apply_profile.unique_preflight_micros);
-        profile.check_preflight_micros = apply_profile.check_preflight_micros;
-        profile.foreign_key_preflight_micros = apply_profile.foreign_key_preflight_micros;
-        profile.mvcc_insert_micros = apply_profile.mvcc_insert_micros;
-        profile.value_index_append_micros = apply_profile.value_index_append_micros;
-        profile.residency_invalidation_micros = residency_invalidation_micros;
-        profile.wal_commit_flush_boundary_micros = profile
-            .commit_total_micros
-            .saturating_sub(profile.current_apply_total_micros)
-            .saturating_sub(profile.residency_invalidation_micros);
-        Ok((row_count, profile))
+        let rows_affected = usize::try_from(outcome.rows_affected).map_err(|_| {
+            ExecuteError::Engine(EngineError::Durability(
+                "typed COPY affected-row count exceeds usize".to_string(),
+            ))
+        })?;
+        Ok((rows_affected, profile))
     }
 
     pub(crate) fn relational_copy_insert(

@@ -1,6 +1,5 @@
 use super::{
-    exact_device_verdict_cardinality, Engine, Index, LaneIntent, LaneOpKind, RelationalTable,
-    SqlValue,
+    exact_device_verdict_cardinality, Engine, Index, LaneIntent, RelationalTable, SqlValue,
 };
 
 impl Engine {
@@ -44,8 +43,8 @@ impl Engine {
     /// integer slots, returning both visibility at each item's read snapshot and the highest
     /// physical-version write stamp for that key. A stamp newer than the snapshot is a retryable
     /// first-committer-wins conflict even when the key has since been deleted or moved away;
-    /// otherwise an INSERT-visible match is the normal 23505 duplicate. Catalog drift (DDL between
-    /// build and pump, pre-activation-window only) aborts the item retryably.
+    /// Catalog drift (DDL between build and pump, pre-activation-window only) aborts the item
+    /// retryably.
     pub(super) fn lane_validate_unique(
         &self,
         batch: &[LaneIntent],
@@ -143,17 +142,6 @@ impl Engine {
                     continue;
                 }
                 target_counts[position] = Some(u64::from(count));
-                if batch[position].op == LaneOpKind::Insert && count > 0 {
-                    let index_name = table
-                        .columns
-                        .get(filter_idx as usize)
-                        .map(|column| format!("{}_{}_key", table.name, column.name))
-                        .unwrap_or_else(|| format!("{}_key", table.name));
-                    violations.insert(
-                        position,
-                        format!("duplicate key value violates unique index \"{index_name}\""),
-                    );
-                }
             }
         }
         (violations, conflicts, target_counts)
@@ -172,29 +160,12 @@ impl Engine {
             "a chunk-authoritative table reached optimized apply"
         );
         let table = request.table.as_str();
-        let rows = std::mem::take(&mut request.rows);
-        let row_ids = std::mem::take(&mut request.row_ids);
-        let stamps = std::mem::take(&mut request.stamps);
         let tombstones = std::mem::take(&mut request.tombstones);
         let updates = std::mem::take(&mut request.updates);
-        let appended = rows.is_empty()
-            || self.try_append_resident_int4_open_shard(
-                table,
-                &rows,
-                crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
-                Some(&row_ids),
-            );
-        if appended && !rows.is_empty() && !self.table_device_authoritative(table) {
-            let snapshot = self.catalog_snapshot();
-            if self.table_device_authority_eligible(&snapshot, table) {
-                self.set_table_device_authoritative(table, true);
-            }
-        }
-        let deletes_ok = tombstones.is_empty()
-            || (appended && self.apply_lane_tombstones_device(table, &tombstones));
-        let updates_ok =
-            updates.is_empty() || (appended && self.apply_lane_updates_device(table, &updates));
-        if !(appended && deletes_ok && updates_ok) {
+        let deletes_ok =
+            tombstones.is_empty() || self.apply_lane_tombstones_device(table, &tombstones);
+        let updates_ok = updates.is_empty() || self.apply_lane_updates_device(table, &updates);
+        if !(deletes_ok && updates_ok) {
             panic!(
                 "commit-path invariant violation: durable optimized DML for relation \"{table}\" \
                  declined device publication — refusing acknowledgement; WAL replay is required"

@@ -423,7 +423,10 @@ fn disjoint_inserts_into_one_table_all_commit_no_false_conflicts() {
                         thread::spawn(move || {
                             let sql = format!("INSERT INTO t (id) VALUES ({w})");
                             barrier.wait();
-                            run_write(&shared, &sql)
+                            // Preserve the underlying diagnostic in this regression's failure
+                            // output. Reducing it to ErrorCategory would hide which canonical
+                            // pre-WAL validation falsely serialized a disjoint INSERT.
+                            run(&shared, &sql).map(|_| ())
                         })
                     })
                     .collect();
@@ -641,14 +644,16 @@ fn concurrent_writers_overlap_off_lock_prepare() {
         TEST_DEADLINE_SECS,
         "concurrent_writers_overlap_off_lock_prepare",
         || {
-            for _ in 0..REPS {
-                let shared = Arc::new(SharedEngine::new());
-                run_ok(&shared, "CREATE TABLE t (id INT, v INT)");
-                // A few hundred rows so the off-lock preflight/scan is non-trivial.
-                for id in 0..200 {
-                    run_ok(&shared, &format!("INSERT INTO t (id, v) VALUES ({id}, 0)"));
-                }
+            let shared = Arc::new(SharedEngine::new());
+            run_ok(&shared, "CREATE TABLE t (id INT, v INT)");
+            // Keep the actual preflight shape non-trivial, but do not count fixture construction
+            // fifty times as evidence of writer overlap. Every repetition below submits the same
+            // eight real disjoint updates against this 200-row GPU-published table.
+            for id in 0..200 {
+                run_ok(&shared, &format!("INSERT INTO t (id, v) VALUES ({id}, 0)"));
+            }
 
+            for rep in 0..REPS {
                 let concurrent = Arc::new(AtomicUsize::new(0));
                 let peak = Arc::new(AtomicUsize::new(0));
                 let barrier = Arc::new(Barrier::new(THREADS));
@@ -660,26 +665,36 @@ fn concurrent_writers_overlap_off_lock_prepare() {
                         let peak = Arc::clone(&peak);
                         let barrier = Arc::clone(&barrier);
                         thread::spawn(move || {
-                            // Mark "in flight", then meet at the barrier. All writers must be able to
-                            // be in flight simultaneously — impossible if a global write lock
-                            // serialized them.
-                            let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-                            let mut observed = peak.load(Ordering::SeqCst);
-                            while now > observed {
-                                match peak.compare_exchange_weak(
-                                    observed,
-                                    now,
-                                    Ordering::SeqCst,
-                                    Ordering::SeqCst,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(actual) => observed = actual,
-                                }
-                            }
-                            barrier.wait();
-                            concurrent.fetch_sub(1, Ordering::SeqCst);
-                            // Then actually commit a disjoint-row update (all should succeed).
-                            run_write(&shared, &format!("UPDATE t SET v = 1 WHERE id = {w}"))
+                            let hook_concurrent = Arc::clone(&concurrent);
+                            let hook_peak = Arc::clone(&peak);
+                            let hook_barrier = Arc::clone(&barrier);
+                            submit_instrumented_dml(
+                                &shared,
+                                &format!("UPDATE t SET v = 1 WHERE id = {w}"),
+                                move || {
+                                    // This fires only after the production DML route captured its
+                                    // snapshot and completed prepare. A writer lock around prepare
+                                    // strands the first arrival here because later writers cannot
+                                    // reach this hook.
+                                    let now = hook_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let mut observed = hook_peak.load(Ordering::SeqCst);
+                                    while now > observed {
+                                        match hook_peak.compare_exchange_weak(
+                                            observed,
+                                            now,
+                                            Ordering::SeqCst,
+                                            Ordering::SeqCst,
+                                        ) {
+                                            Ok(_) => break,
+                                            Err(actual) => observed = actual,
+                                        }
+                                    }
+                                    hook_barrier.wait();
+                                    hook_concurrent.fetch_sub(1, Ordering::SeqCst);
+                                },
+                            )
+                            .map(|_| ())
+                            .map_err(|err| err.category)
                         })
                     })
                     .collect();
@@ -690,7 +705,7 @@ fn concurrent_writers_overlap_off_lock_prepare() {
                 assert_eq!(
                     peak.load(Ordering::SeqCst),
                     THREADS,
-                    "concurrent writers did not all overlap; the write path is serializing before commit"
+                    "rep {rep}: concurrent writers did not all overlap during production prepare"
                 );
             }
         },

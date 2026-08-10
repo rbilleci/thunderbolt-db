@@ -773,6 +773,167 @@ impl Engine {
         self.append_transaction_delta_shard_inner(table, rows, row_ids, shards, gpu_reservation)
     }
 
+    /// Install one already-columnar typed INSERT payload into the transaction-private shard map.
+    /// The artifact has consumed its `TypedInsertBatch`, so this method deliberately has no
+    /// row-major `SqlValue` input and cannot route through `WriteDelta` payload construction.
+    pub(crate) fn append_transaction_typed_insert_shard(
+        &self,
+        table: &RelationalTable,
+        staged: &crate::engine_transaction_delta::StagedTypedInsert,
+        shards: &mut BTreeMap<String, Vec<RelationalResidentShard>>,
+        gpu_reservation: &mut TransactionGpuReservation<'_>,
+    ) -> Result<(), ExecuteError> {
+        #[cfg(feature = "probe-timing")]
+        let probe_revalidate_started = std::time::Instant::now();
+        staged.validate_private_payload(table)?;
+        #[cfg(feature = "probe-timing")]
+        self.record_insert_probe_staged_payload_nanos([
+            0,
+            0,
+            0,
+            probe_revalidate_started.elapsed().as_nanos() as u64,
+            0,
+        ]);
+        #[cfg(feature = "probe-timing")]
+        let probe_upload_started = std::time::Instant::now();
+        let table_shards = shards.get_mut(&table.name).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" lost its transaction shard generation",
+                table.name
+            )))
+        })?;
+        let gpu_id = table_shards
+            .first()
+            .map(|shard| shard.gpu_id)
+            .unwrap_or_else(|| self.planner.default_gpu_id());
+        let payload_bytes = u64::try_from(staged.private_device_payload().len()).map_err(|_| {
+            ExecuteError::Unsupported(
+                "typed transaction INSERT payload length exceeds u64".to_string(),
+            )
+        })?;
+        gpu_reservation.reserve(gpu_id, payload_bytes)?;
+        let memory = self
+            .relational_residency_device_memory(gpu_id, staged.private_device_payload())
+            .map(Arc::new)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "typed transaction INSERT payload allocation failed".to_string(),
+                ))
+            })?;
+        gpu_reservation.verify_allocation(
+            gpu_id,
+            payload_bytes,
+            memory.metadata().allocated_bytes,
+        )?;
+        let row_id_bytes = staged
+            .provisional_row_ids
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| {
+                ExecuteError::Unsupported(
+                    "typed transaction INSERT identity payload size overflow".to_string(),
+                )
+            })?;
+        let mut row_id_payload = Vec::with_capacity(row_id_bytes);
+        for row_id in staged.provisional_row_ids.iter() {
+            row_id_payload.extend_from_slice(&row_id.to_le_bytes());
+        }
+        let row_id_region = if row_id_payload.is_empty() {
+            None
+        } else {
+            let row_id_bytes = u64::try_from(row_id_payload.len()).map_err(|_| {
+                ExecuteError::Unsupported(
+                    "typed transaction INSERT identity payload length exceeds u64".to_string(),
+                )
+            })?;
+            gpu_reservation.reserve(gpu_id, row_id_bytes)?;
+            let region = self
+                .relational_residency_device_memory(gpu_id, &row_id_payload)
+                .map(Arc::new)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "typed transaction INSERT identity allocation failed".to_string(),
+                    ))
+                })?;
+            gpu_reservation.verify_allocation(
+                gpu_id,
+                row_id_bytes,
+                region.metadata().allocated_bytes,
+            )?;
+            Some(region)
+        };
+        let shard_id = table_shards
+            .iter()
+            .map(|shard| shard.shard_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let row_start = table_shards
+            .iter()
+            .map(|shard| shard.row_start.saturating_add(shard.row_count))
+            .max()
+            .unwrap_or(0);
+        let row_count = staged.provisional_row_ids.len();
+        let allocated_bytes = memory.metadata().allocated_bytes;
+        table_shards.push(RelationalResidentShard {
+            shard_id,
+            row_start,
+            row_count,
+            history_floor_index: 0,
+            capacity: row_count,
+            int4_appendable: staged.private_text_layouts().is_empty()
+                && staged.private_bool_layouts().is_empty(),
+            resident_device_int4_column_stats: staged.private_int4_stats().to_vec(),
+            resident_bytes: payload_bytes,
+            allocated_bytes,
+            count_header_byte_offset: 0,
+            resident_device_int4_columns: table
+                .columns
+                .iter()
+                .filter(|column| matches!(column.ty, SqlType::Int2 | SqlType::Int4 | SqlType::Date))
+                .map(|column| column.name.clone())
+                .collect(),
+            resident_device_int8_columns: table
+                .columns
+                .iter()
+                .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
+                .map(|column| column.name.clone())
+                .collect(),
+            resident_device_numeric_columns: table
+                .columns
+                .iter()
+                .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
+                .map(|column| column.name.clone())
+                .collect(),
+            resident_device_bool_columns: staged.private_bool_layouts().to_vec(),
+            resident_device_text_columns: staged.private_text_layouts().to_vec(),
+            resident_device_null_columns: staged.private_null_layouts().to_vec(),
+            gpu_id,
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            point_route_generation: Arc::new(()),
+            device_memory_proof: Some(memory.metadata().clone()),
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: false,
+            memory_pressure_active: false,
+            device_memory: Some(memory),
+            deleted_by_region: None,
+            created_by_region: None,
+            row_id_region,
+            max_created_by: 0,
+        });
+        #[cfg(feature = "probe-timing")]
+        self.record_insert_probe_staged_payload_nanos([
+            0,
+            0,
+            0,
+            0,
+            probe_upload_started.elapsed().as_nanos() as u64,
+        ]);
+        Ok(())
+    }
+
     /// Install an allocation-backed, typed zero-row root for a private reset/fence. An empty Vec is
     /// only a construction placeholder; it is never accepted as GPU authority or durable proof.
     pub(crate) fn append_transaction_empty_root(

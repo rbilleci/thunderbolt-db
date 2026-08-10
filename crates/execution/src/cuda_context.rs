@@ -42,12 +42,16 @@ pub(super) const POOLED_STREAM_SCRATCH_BYTES: usize = 64;
 /// per-call `cuMemAlloc`/`cuEventCreate`/`cuEventDestroy` (all driver-serialized) that the
 /// P2-M1 step-4 benchmark found re-serializing concurrent reads once the module load and
 /// whole-context sync were gone. `start_event`/`stop_event` are null when the event symbols
-/// are unavailable (timing is then skipped).
+/// are unavailable (timing is then skipped).  Probe builds retain four additional boundaries for
+/// the WRITE-001 generic generation phases; they are pooled with the stream rather than created
+/// in a latency-sensitive write call.
 pub(super) struct PooledStream {
     pub(super) stream: *mut c_void,
     pub(super) output: u64,
     pub(super) start_event: *mut c_void,
     pub(super) stop_event: *mut c_void,
+    #[cfg(feature = "probe-timing")]
+    pub(super) generation_phase_events: [*mut c_void; 4],
 }
 
 /// Lower bound on a pooled output buffer — one bucket holds all the tiny counter/needle
@@ -593,11 +597,34 @@ impl GpuPrimaryContext {
             start_event = std::ptr::null_mut();
             stop_event = std::ptr::null_mut();
         }
+        #[cfg(feature = "probe-timing")]
+        let generation_phase_events = {
+            let mut events = [std::ptr::null_mut(); 4];
+            let mut complete = true;
+            for event in &mut events {
+                if unsafe { (self.cu_event_create)(event, 0) } != 0 {
+                    complete = false;
+                    break;
+                }
+            }
+            if !complete {
+                for event in events {
+                    if !event.is_null() {
+                        unsafe { (self.cu_event_destroy)(event) };
+                    }
+                }
+                [std::ptr::null_mut(); 4]
+            } else {
+                events
+            }
+        };
         Ok(PooledStream {
             stream,
             output,
             start_event,
             stop_event,
+            #[cfg(feature = "probe-timing")]
+            generation_phase_events,
         })
     }
 
@@ -1031,6 +1058,12 @@ impl Drop for GpuPrimaryContext {
                     }
                     if !pooled.stop_event.is_null() {
                         (self.cu_event_destroy)(pooled.stop_event);
+                    }
+                    #[cfg(feature = "probe-timing")]
+                    for event in pooled.generation_phase_events {
+                        if !event.is_null() {
+                            (self.cu_event_destroy)(event);
+                        }
                     }
                     (self.cu_mem_free)(pooled.output);
                     (self.cu_stream_destroy)(pooled.stream);

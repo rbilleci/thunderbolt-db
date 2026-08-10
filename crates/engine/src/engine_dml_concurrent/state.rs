@@ -2,8 +2,8 @@
 
 use super::CommitPathFailure;
 use super::{
-    AtomicOrdering, AtomicU64, CatalogSnapshot, Command, Engine, EngineError, ExecuteError, Index,
-    Mutex, RelationalSelectResult, SqlValue, WriteSet,
+    AtomicOrdering, AtomicU64, Command, Engine, EngineError, ExecuteError, Index, Mutex,
+    RelationalSelectResult, SqlValue, WriteSet,
 };
 use gpu_db_types::DurabilityFault;
 use std::sync::Arc;
@@ -43,6 +43,7 @@ impl CanonicalRequest {
         Arc::clone(&self.payload)
     }
 
+    #[cfg(test)]
     fn same_origin(&self, payload: &Arc<[u8]>) -> bool {
         Arc::ptr_eq(&self.payload, payload)
     }
@@ -67,177 +68,50 @@ pub(super) fn wave_tail_failure_publish_hook() -> &'static Mutex<Option<WaveTail
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
-/// One authoritative off-lock preparation carried into a commit wave.
-///
-/// The fixed-width variant owns only its direct columnar proof and request binding. It never
-/// materializes a `WriteDelta` or predicted row keys; legacy remains the sole carrier of that
-/// host mutation authority.
-pub(super) struct OfflockPreparedDml(OfflockPreparedDmlKind);
-
-// The hot legacy wave keeps its established by-value `WriteDelta`; boxing it solely to equalize
-// variants would add an allocation to every legacy commit. The fixed batch is already isolated in
-// its own box and remains move-only (not Arc-shared).
-#[allow(clippy::large_enum_variant)]
-enum OfflockPreparedDmlKind {
-    Legacy {
-        delta: crate::write_path::WriteDelta,
-        read_snapshot: Index,
-    },
-    /// A legacy item must not inflate to the fixed batch's columnar size. The box is only enum
-    /// layout isolation: the inner carrier owns the batch by value (never through `Arc`).
-    TypedInsert(Box<OfflockTypedInsert>),
-}
-
-struct OfflockTypedInsert {
-    prepared_plan: crate::engine_insert_plan::PreparedDeviceInsertPlan,
-    /// A cloned allocation witness keeps the fixed carrier bound to the precise sealed request
-    /// that entered admission.  Digest equality alone is not enough at preflight.
-    request_payload: Arc<[u8]>,
-    request_digest: gpu_db_wal::CanonicalDigest,
+/// One authoritative off-lock UPDATE/DELETE preparation carried into a commit wave.
+/// INSERT is intercepted into the codec-5 transaction overlay before this type is constructed.
+pub(super) struct OfflockPreparedDml {
+    delta: crate::write_path::WriteDelta,
     read_snapshot: Index,
-    write_set: WriteSet,
-}
-
-/// The only pre-WAL hand-off that may consume a sealed fixed INSERT carrier. It carries no
-/// legacy mutation state: any pre-WAL typed mismatch discards it and invokes the established
-/// full preparation once from the parsed command held by the wave item.
-pub(super) struct TypedInsertPreflight {
-    prepared_plan: crate::engine_insert_plan::PreparedDeviceInsertPlan,
-    request_digest: gpu_db_wal::CanonicalDigest,
-}
-
-impl TypedInsertPreflight {
-    pub(super) fn into_parts(
-        self,
-    ) -> (
-        crate::engine_insert_plan::PreparedDeviceInsertPlan,
-        gpu_db_wal::CanonicalDigest,
-    ) {
-        (self.prepared_plan, self.request_digest)
-    }
 }
 
 impl OfflockPreparedDml {
-    pub(super) fn legacy(delta: crate::write_path::WriteDelta, read_snapshot: Index) -> Self {
-        Self(OfflockPreparedDmlKind::Legacy {
+    /// The generic wave owns UPDATE and DELETE only.  INSERT must retain its consumed typed
+    /// batch through the canonical cut; accepting an INSERT `WriteDelta` here would recreate a
+    /// second live authority.
+    pub(super) fn legacy_update_or_delete(
+        delta: crate::write_path::WriteDelta,
+        read_snapshot: Index,
+    ) -> Result<Self, EngineError> {
+        if matches!(
+            &delta.mutation,
+            crate::write_path::PreparedMutation::Insert { .. }
+        ) {
+            return Err(EngineError::ApplyFailed(
+                "legacy off-lock carrier rejects INSERT; use the typed INSERT authority"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
             delta,
             read_snapshot,
         })
     }
 
-    /// Pair a fixed batch with the precise sealed request that entered admission. The carrier
-    /// retains an allocation witness, so no caller can attach a batch to an unrelated payload or
-    /// separately supplied digest.
-    pub(super) fn typed_insert(
-        batch: crate::typed_insert_batch::TypedInsertBatch,
-        engine: &Engine,
-        catalog: &CatalogSnapshot,
-        request: &CanonicalRequest,
-        read_snapshot: Index,
-    ) -> Result<Self, EngineError> {
-        let prepared_plan = crate::engine_insert_plan::PreparedDeviceInsertPlan::from_typed_batch(
-            batch, engine, catalog,
-        )?;
-        let write_set = WriteSet {
-            tables: std::collections::BTreeSet::from([prepared_plan.table_name().to_string()]),
-            table_oids: vec![prepared_plan.table_oid()],
-            rows: Vec::new(),
-            stable_rows: Vec::new(),
-            unique_slots: Vec::new(),
-            unique_slots_i32: Vec::new(),
-        };
-        Ok(Self(OfflockPreparedDmlKind::TypedInsert(Box::new(
-            OfflockTypedInsert {
-                prepared_plan,
-                request_payload: request.payload_arc(),
-                request_digest: request.digest(),
-                read_snapshot,
-                write_set,
-            },
-        ))))
-    }
-
     pub(super) fn legacy_delta(&self) -> Option<&crate::write_path::WriteDelta> {
-        match &self.0 {
-            OfflockPreparedDmlKind::Legacy { delta, .. } => Some(delta),
-            OfflockPreparedDmlKind::TypedInsert(_) => None,
-        }
+        Some(&self.delta)
     }
 
     /// The wave's conflict footprint is always owned by the same off-lock carrier that supplied
     /// it. The item retains a clone for the canonical owner, never an independently derived set.
     pub(super) fn write_set(&self) -> &WriteSet {
-        match &self.0 {
-            OfflockPreparedDmlKind::Legacy { delta, .. } => &delta.write_set,
-            OfflockPreparedDmlKind::TypedInsert(fixed) => &fixed.write_set,
-        }
+        &self.delta.write_set
     }
 
     /// Snapshot identity travels with either carrier variant; a wave-item mismatch is a
     /// programming error at admission, while a fixed preflight still rechecks it defensively.
     pub(super) fn read_snapshot(&self) -> Index {
-        match &self.0 {
-            OfflockPreparedDmlKind::Legacy { read_snapshot, .. } => *read_snapshot,
-            OfflockPreparedDmlKind::TypedInsert(fixed) => fixed.read_snapshot,
-        }
-    }
-
-    /// Privately extract a typed candidate only after proving that all pieces still describe the
-    /// same live statement. The `Err` value lets the caller distinguish a direct-carrier binding
-    /// mismatch from a normal legacy item, then discard the typed carrier before full prepare.
-    #[allow(clippy::result_large_err)]
-    pub(super) fn into_typed_insert_preflight(
-        self,
-        request: &CanonicalRequest,
-        expected_write_set: &WriteSet,
-        catalog: &CatalogSnapshot,
-        prepared_catalog_seq: Index,
-        read_snapshot: Index,
-        reuse_eligible: bool,
-    ) -> Result<TypedInsertPreflight, Self> {
-        let Self(kind) = self;
-        let OfflockPreparedDmlKind::TypedInsert(fixed) = kind else {
-            return Err(Self(kind));
-        };
-        let exact_request =
-            fixed.request_digest == request.digest() && request.same_origin(&fixed.request_payload);
-        let plan_matches = fixed.prepared_plan.matches_current_binding(
-            expected_write_set,
-            catalog,
-            prepared_catalog_seq,
-        );
-        if !exact_request
-            || fixed.read_snapshot != read_snapshot
-            || !reuse_eligible
-            || fixed.write_set != *expected_write_set
-            || !plan_matches
-        {
-            return Err(Self(OfflockPreparedDmlKind::TypedInsert(fixed)));
-        }
-        let OfflockTypedInsert {
-            prepared_plan,
-            request_digest,
-            ..
-        } = *fixed;
-        Ok(TypedInsertPreflight {
-            prepared_plan,
-            request_digest,
-        })
-    }
-
-    pub(super) fn is_typed_insert(&self) -> bool {
-        matches!(self.0, OfflockPreparedDmlKind::TypedInsert(_))
-    }
-
-    #[cfg(any(test, debug_assertions))]
-    pub(super) fn matches_request(&self, request: &CanonicalRequest) -> bool {
-        match &self.0 {
-            OfflockPreparedDmlKind::Legacy { .. } => true,
-            OfflockPreparedDmlKind::TypedInsert(fixed) => {
-                fixed.request_digest == request.digest()
-                    && request.same_origin(&fixed.request_payload)
-            }
-        }
+        self.read_snapshot
     }
 }
 
@@ -254,125 +128,24 @@ mod offlock_prepared_tests {
     }
 
     #[test]
-    fn direct_fixed_batch_is_paired_to_the_same_request_and_snapshot() {
-        let engine = Engine::new_local();
-        engine
-            .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
-            .unwrap();
-        let insert = crate::Insert {
-            table: "accounts".to_string(),
-            columns: Vec::new(),
-            rows: gpu_db_sql::Insert::programmatic_rows(vec![vec![
-                SqlValue::Int4(7),
-                SqlValue::Int4(70),
-            ]]),
-            returning: Vec::new(),
+    fn production_legacy_carrier_rejects_insert_deltas() {
+        let insert = crate::write_path::WriteDelta {
+            write_set: WriteSet::default(),
+            read_snapshot: 0,
+            catalog_dependencies: std::collections::BTreeMap::new(),
+            foreign_key_dependencies: std::collections::BTreeSet::new(),
+            rows_consumed: 1,
+            mutation: crate::write_path::PreparedMutation::Insert {
+                table: "forbidden_legacy_insert".to_string(),
+                inserted_rows: Vec::new(),
+                seq_advances: std::collections::BTreeMap::new(),
+            },
         };
-        let catalog = engine.catalog_snapshot();
-        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch(
-            &Command::Insert(insert),
-            &catalog,
-            catalog.commit_seq,
-            None,
-        )
-        .unwrap()
-        .expect("the exact NULL-free int4 shape is a direct fixed candidate");
-        let request = CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
-        let prepared = OfflockPreparedDml::typed_insert(
-            batch,
-            &engine,
-            &catalog,
-            &request,
-            engine.committed_seq(),
-        )
-        .unwrap();
-        assert!(prepared.matches_request(&request));
-        let other_request =
-            CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (8, 80)");
-        assert!(!prepared.matches_request(&other_request));
-        assert!(prepared.legacy_delta().is_none());
-        assert_eq!(prepared.read_snapshot(), engine.committed_seq());
-        let OfflockPreparedDmlKind::TypedInsert(fixed) = &prepared.0 else {
-            unreachable!("typed constructor must retain the prepared plan atomically");
+        let error = match OfflockPreparedDml::legacy_update_or_delete(insert, 0) {
+            Ok(_) => panic!("the generic wave must not carry an INSERT delta"),
+            Err(error) => error,
         };
-        assert_eq!(fixed.prepared_plan.row_count(), 1);
-        let write_set = WriteSet {
-            tables: std::collections::BTreeSet::from(["accounts".to_string()]),
-            table_oids: vec![catalog.relational_catalog["accounts"].oid],
-            rows: Vec::new(),
-            stable_rows: Vec::new(),
-            unique_slots: Vec::new(),
-            unique_slots_i32: Vec::new(),
-        };
-        assert_eq!(prepared.write_set(), &write_set);
-        assert!(prepared
-            .into_typed_insert_preflight(
-                &request,
-                &write_set,
-                &catalog,
-                catalog.commit_seq,
-                engine.committed_seq() + 1,
-                true,
-            )
-            .is_err());
-    }
-
-    #[test]
-    fn direct_fixed_preflight_rejects_same_bytes_from_a_different_sealed_request() {
-        let engine = Engine::new_local();
-        engine
-            .execute_text(1, "CREATE TABLE accounts (id int4, balance int4)")
-            .unwrap();
-        let insert = crate::Insert {
-            table: "accounts".to_string(),
-            columns: Vec::new(),
-            rows: gpu_db_sql::Insert::programmatic_rows(vec![vec![
-                SqlValue::Int4(7),
-                SqlValue::Int4(70),
-            ]]),
-            returning: Vec::new(),
-        };
-        let catalog = engine.catalog_snapshot();
-        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch(
-            &Command::Insert(insert),
-            &catalog,
-            catalog.commit_seq,
-            None,
-        )
-        .unwrap()
-        .expect("the exact NULL-free int4 shape is a direct fixed candidate");
-        let request = CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
-        let prepared = OfflockPreparedDml::typed_insert(
-            batch,
-            &engine,
-            &catalog,
-            &request,
-            engine.committed_seq(),
-        )
-        .unwrap();
-        let same_bytes_different_request =
-            CanonicalRequest::from_text(&engine, "INSERT INTO accounts VALUES (7, 70)");
-
-        assert_eq!(request.digest(), same_bytes_different_request.digest());
-        assert!(!prepared.matches_request(&same_bytes_different_request));
-        let write_set = WriteSet {
-            tables: std::collections::BTreeSet::from(["accounts".to_string()]),
-            table_oids: vec![catalog.relational_catalog["accounts"].oid],
-            rows: Vec::new(),
-            stable_rows: Vec::new(),
-            unique_slots: Vec::new(),
-            unique_slots_i32: Vec::new(),
-        };
-        assert!(prepared
-            .into_typed_insert_preflight(
-                &same_bytes_different_request,
-                &write_set,
-                &catalog,
-                catalog.commit_seq,
-                engine.committed_seq(),
-                true,
-            )
-            .is_err());
+        assert!(error.to_string().contains("rejects INSERT"));
     }
 
     #[test]
@@ -394,7 +167,7 @@ mod offlock_prepared_tests {
         assert!(!wave.contains("canonical_request_digest(&batch"));
 
         let intent = include_str!("../engine_dml_intent.rs");
-        assert!(intent.contains("CanonicalRequest::from_text(self, &logical_request)"));
+        assert!(intent.contains("execute_parsed_dml_concurrent_with_result("));
         assert!(!intent.contains("canonical_request_digest(logical_request.as_bytes())"));
     }
 
@@ -405,15 +178,12 @@ mod offlock_prepared_tests {
         let request = CanonicalRequest::from_text(&engine, text);
         let digest = request.digest();
         let witness = request.payload_arc();
-        let item = engine.make_covered_insert_wave_item(
+        let item = engine.make_test_commit_wave_item(
             2,
             crate::parse_command(text).unwrap(),
             request,
             WriteSet::default(),
             engine.committed_seq(),
-            engine.catalog_snapshot().commit_seq,
-            None,
-            None,
         );
 
         assert_eq!(item.request.digest(), digest);
@@ -454,37 +224,13 @@ pub(crate) struct CommitWaveItem {
     pub(super) request: CanonicalRequest,
     pub(super) write_set: WriteSet,
     pub(super) read_snapshot: Index,
-    /// The catalog generation the OFF-LOCK prepare validated against.
-    /// The sequencer grants the device-covered re-resolve skip ONLY while the live catalog
-    /// still carries this stamp — a constraint-adding DDL (ADD UNIQUE/CHECK) committing
-    /// between snapshot and wave is absent from the prepared key projection, so the skip would
-    /// silently bypass the new constraint; any DDL bumps the stamp and forces the
-    /// always-correct Full re-validation instead.
-    pub(super) prepared_catalog_seq: Index,
-    /// Catalog generation revalidated for a protocol-neutral prepared execution. Unlike
-    /// `prepared_catalog_seq` (the off-lock optimizer stamp), this is a correctness precondition:
-    /// a mismatch must fail before WAL/apply rather than re-resolve under a changed row type.
+    /// Catalog generation revalidated for a protocol-neutral prepared execution. A mismatch must
+    /// fail before WAL/apply rather than re-resolve under a changed row type.
     pub(super) expected_catalog_version:
         Option<crate::engine_mutation_admission::CatalogVersionExpectation>,
-    /// DELTA-REUSE (B): the off-lock delta, optionally paired with a sealed fixed-width batch
-    /// when INSERT-001 eligibility is exact. Typed preflight consumes that pair only after all
-    /// ordinary wave guards; every other shape follows the unchanged `prepare_dml` path.
+    /// Off-lock UPDATE/DELETE delta used for conflict projection. The wave re-resolves at its
+    /// serial commit sequence before WAL/apply.
     pub(super) offlock_prepared: Option<OfflockPreparedDml>,
-    /// Build-only handoff from the sealed typed apply to the common durable/publication tail.
-    /// Counting at the tail makes qualification compare successful statements to typed commits
-    /// without treating a later durability failure as a completed typed commit.
-    #[cfg(feature = "probe-timing")]
-    pub(super) fixed_insert_typed: bool,
-    /// E2.2(b) — the PRE-ENCODED W5a binary WAL record, built OFF the sequencer at intent-build
-    /// time as a pure function of `(route, params)` with a PLACEHOLDER row id, plus the fixed byte
-    /// offset of that row id. Present only for single-row covered-INSERT intents. The sequencer
-    /// patches the 8-byte row id at `offset` with the wave-assigned id (no String row-key parse, no
-    /// per-item `encode_relational_row` + `try_encode_binary_insert`) and uses the result verbatim
-    /// as the reuse-eligible delta's WAL payload. `None` = the classic per-item encode path.
-    pub(super) binary_wal_template: Option<(Arc<[u8]>, u32)>,
-    /// Shared stable-OID lease owned by the queued work through terminal apply/cancel. A caller
-    /// ticket may be dropped independently; the mutation item remains the reset-exclusion owner.
-    pub(crate) table_access: Option<Arc<crate::table_access::TableAccessLease>>,
     pub(super) outcome: CommitWaveOutcome,
 }
 
@@ -560,7 +306,6 @@ impl CommitWaveDone {
 /// legacy row-id reservation for replay-format/high-water compatibility, including on a 0-row update.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneOpKind {
-    Insert,
     Delete,
     Update,
 }
@@ -570,9 +315,8 @@ pub(crate) enum LaneOpKind {
 /// pump's host passes were the measured final wall (~6.5ms/lane cycle of cold
 /// cache traffic at ~925-item waves); this struct is the fix.
 pub(crate) struct LaneIntent {
-    /// U1/U2: which op this intent performs (Insert rides every existing path
-    /// unchanged; Delete adds the visible-locate + tombstone arms; Update adds a
-    /// conditional new-version append on top of the delete's locate + tombstone).
+    /// U1/U2: DELETE uses the visible-locate + tombstone arm; UPDATE adds a conditional
+    /// new-version append on top of the locate + tombstone.
     pub(crate) op: LaneOpKind,
     pub(crate) txn_id: u64,
     pub(crate) slot: crate::write_path::IntUniqueSlotKey,
@@ -598,19 +342,17 @@ pub(crate) struct LaneIntent {
     /// Live-population decrement handle (see `IntentLaneState::outstanding`);
     /// None outside lanes mode.
     pub(crate) outstanding: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// U1: the rows-affected count a settled Ok reports for INSERT intents (always 1).
+    /// Exact pre-WAL target cardinality reproduced by device apply.
     pub(crate) rows_affected: u64,
     /// U1/U2 WAL-first: a DELETE's (and UPDATE's) rows-affected is resolved at APPLY (the locate
     /// moved off the pump critical path), so the outcome comes from this shared cell the apply
-    /// writes (0 or 1). `None` for inserts — they use `rows_affected`. Shared with the delete's
-    /// `LaneTombstone.rows_affected` / the update's `LaneUpdate.rows_affected`; completion reads it
-    /// after canonical device apply succeeds.
+    /// writes (0 or 1). Shared with the delete's `LaneTombstone.rows_affected` / the update's
+    /// `LaneUpdate.rows_affected`; completion reads it after canonical device apply succeeds.
     pub(crate) rows_affected_cell: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl LaneIntent {
-    /// The rows-affected an Ok outcome reports: a delete reads its apply-resolved cell; an
-    /// insert (no cell) uses the fixed `rows_affected` (1). Read at completion, after apply.
+    /// Read the apply-resolved rows-affected result after device publication.
     pub(crate) fn resolved_rows_affected(&self) -> u64 {
         match &self.rows_affected_cell {
             Some(cell) => cell.load(AtomicOrdering::Acquire),
@@ -759,10 +501,6 @@ pub(super) struct CommitWaveTail {
     /// durable-commit point, in wave order (aborted items' outcomes were already set in-section).
     /// `rows_affected` is the applied delta's exact row count — the Ok payload of the ack (U1).
     pub(super) committed: Vec<(usize, Index, u64)>,
-    /// Typed INSERT claims remain pinned until the publication coordinator has
-    /// made their commit sequence visible.  The tail owns these linear receipts
-    /// so fsync/publication failure leaves the ledger claim armed for recovery.
-    pub(super) typed_ledger_receipts: Vec<crate::write_path::LedgerClaimReceipt>,
     pub(super) last_position: usize,
     pub(super) armed: bool,
     /// A structured serial-WAL failure selected by the owning completion handoff.  Its `Copy`
@@ -780,13 +518,6 @@ impl Drop for CommitWaveTail {
     fn drop(&mut self) {
         if !self.armed {
             return;
-        }
-        // The tail's failure path has already selected restart recovery. Keep
-        // the ledger cells Pending (and therefore non-prunable), but consume
-        // the linear receipts explicitly so this intentional failure returns
-        // its established indeterminate outcome instead of a destructor panic.
-        for receipt in self.typed_ledger_receipts.drain(..) {
-            receipt.abandon_for_recovery();
         }
         // The durability half of the wave died before acking (the group-fsync-failure panic
         // path, or claimer death): fail every still-unset member outcome. Queue wedging + the

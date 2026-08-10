@@ -505,6 +505,14 @@ impl Engine {
                 }
                 per_col
             };
+            #[cfg(feature = "probe-timing")]
+            eprintln!(
+                "[probe] rehydrate_shard table={} shard={} rows={} null_layouts={}",
+                table.name,
+                shard.shard_id,
+                rows,
+                shard.resident_device_null_columns.len(),
+            );
             // Bulk DtoH: identities (2 i32 halves LE per slot), then each column's live prefix.
             let id_halves = row_id_region.read_resident_i32_column(0, rows * 2).ok()?;
             let deleted = match &shard.deleted_by_region {
@@ -683,6 +691,17 @@ impl Engine {
                         }
                     })
                     .collect::<Option<Vec<SqlValue>>>()?;
+                #[cfg(feature = "probe-timing")]
+                {
+                    let null_cells = row
+                        .iter()
+                        .filter(|value| matches!(value, SqlValue::Null))
+                        .count();
+                    eprintln!(
+                        "[probe] rehydrate_row table={} shard={} slot={} null_cells={}",
+                        table.name, shard.shard_id, slot, null_cells,
+                    );
+                }
                 out.push((row_id, row));
             }
         }

@@ -92,50 +92,16 @@ pub(crate) struct IntentLaneState {
     pub(crate) stat_apply_ns: AtomicU64,
     pub(crate) stat_encode_ns: AtomicU64,
     pub(crate) stat_publish_ns: AtomicU64,
-    /// Cross-lane device-validate coalescing (v1 of the device-stage
-    /// aggregator): lanes push locate requests; one leader drains matching
-    /// requests, launches ONE kernel over the concatenated needles, and
-    /// scatters counts back. Device cost is fixed-per-launch, so coalescing
-    /// K lanes' waves cuts the shared section ~K-fold.
-    pub(crate) validate_queue: Mutex<Vec<ValidateRequest>>,
-    pub(crate) validate_leader: Mutex<()>,
-    pub(crate) stat_coalesced_launches: AtomicU64,
-    pub(crate) stat_coalesced_requests: AtomicU64,
     /// Apply completes synchronously under the canonical commit mutex before the
     /// durability/publication tail is registered.
     pub(crate) stat_apply_launches: AtomicU64,
     /// Device-boundary busy time.
-    pub(crate) stat_validate_leader_ns: AtomicU64,
     pub(crate) stat_apply_leader_ns: AtomicU64,
 }
 
-/// One lane's pending locate request (see `IntentLaneState::validate_queue`).
-pub(crate) struct ValidateRequest {
-    pub(crate) table: String,
-    /// COMPOUND KEYS: the device-probe key id — a single-column column-index or `FLAG | ordinal`
-    /// (see `index_probe_key_id`). Requests coalesce per (table, key_id); the needles are the raw
-    /// keys or the compound fingerprints for that index.
-    pub(crate) key_id: usize,
-    pub(crate) needles: Vec<i32>,
-    pub(crate) slot: std::sync::Arc<ValidateSlot>,
-}
-
-/// Completion slot: `done` flips after `result` is written (None = declined,
-/// callers fall back exactly like a direct-call decline).
-pub(crate) struct ValidateSlot {
-    pub(crate) done: AtomicBool,
-    pub(crate) result: Mutex<Option<Option<Vec<u32>>>>,
-}
-
-/// One lane's prepared device-apply request. Everything the merged append needs travels in the
-/// request; no `CommitWaveItem` re-walk or cross-lane apply queue remains.
+/// One lane's prepared DELETE/UPDATE device-apply request.
 pub(crate) struct ApplyRequest {
     pub(crate) table: String,
-    /// INSERT winners only (parallel with `row_ids`/`stamps`): the merged
-    /// open-shard append inputs. A delete-only wave ships these empty (U1).
-    pub(crate) rows: Vec<Vec<crate::SqlValue>>,
-    pub(crate) row_ids: Vec<u64>,
-    pub(crate) stamps: Vec<u64>,
     /// U1 WAL-first: DELETE winners as UNRESOLVED by-key tombstones — the apply LOCATES them
     /// (device visible-locate at the delete's read snapshot), off the pump's critical path.
     pub(crate) tombstones: Vec<LaneTombstone>,
@@ -246,12 +212,7 @@ impl IntentLaneState {
             stat_apply_ns: AtomicU64::new(0),
             stat_encode_ns: AtomicU64::new(0),
             stat_publish_ns: AtomicU64::new(0),
-            validate_queue: Mutex::new(Vec::new()),
-            validate_leader: Mutex::new(()),
-            stat_coalesced_launches: AtomicU64::new(0),
-            stat_coalesced_requests: AtomicU64::new(0),
             stat_apply_launches: AtomicU64::new(0),
-            stat_validate_leader_ns: AtomicU64::new(0),
             stat_apply_leader_ns: AtomicU64::new(0),
         }
     }
@@ -339,13 +300,10 @@ impl crate::Engine {
         ))
     }
 
-    /// Leader-busy diagnostics: (validate_leader_ns, validate_launches,
-    /// apply_leader_ns, apply_launches).
-    pub fn intent_lane_leader_stats(&self) -> Option<(u64, u64, u64, u64)> {
+    /// Apply-leader diagnostics: (busy_ns, launches).
+    pub fn intent_lane_apply_leader_stats(&self) -> Option<(u64, u64)> {
         let lanes = self.intent_lanes.as_ref()?;
         Some((
-            lanes.stat_validate_leader_ns.load(Ordering::Relaxed),
-            lanes.stat_coalesced_launches.load(Ordering::Relaxed),
             lanes.stat_apply_leader_ns.load(Ordering::Relaxed),
             lanes.stat_apply_launches.load(Ordering::Relaxed),
         ))

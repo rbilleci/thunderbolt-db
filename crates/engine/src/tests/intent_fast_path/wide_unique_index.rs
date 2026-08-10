@@ -66,7 +66,6 @@ fn gpu_text_unique_key_away_history_conflicts_from_device_stamp() {
 
     let mut engine = Engine::new_local_test_engine();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine
         .execute_text(
@@ -210,7 +209,6 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
         let mut engine = Engine::new_local_test_engine();
         engine.commit_state_mut().wal = WalBuffer::with_durable_segment(&wal_path);
         engine.set_auto_admit_on_commit(true);
-        engine.set_binary_wal_records_enabled(true);
         engine.set_device_write_locate_wave_batch_enabled(true);
         let txn_ids = AtomicU64::new(1);
         macro_rules! sql {
@@ -461,7 +459,6 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
         let mut engine = Engine::new_local_test_engine();
         engine.commit_state_mut().wal = WalBuffer::with_durable_segment(&wal_path);
         engine.set_auto_admit_on_commit(true);
-        engine.set_binary_wal_records_enabled(true);
         engine.set_device_write_locate_wave_batch_enabled(true);
         let txn_ids = AtomicU64::new(1);
         macro_rules! sql {
@@ -561,7 +558,6 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
             &null_duplicate,
             engine.dml_read_snapshot(engine.committed_seq()),
             None,
-            InsertPrepareValidation::WaveFallbackFull,
         );
         assert!(
             prepared.is_ok(),
@@ -623,7 +619,6 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
 fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
     let mut engine = Engine::new_local();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     engine
@@ -718,7 +713,6 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
 fn gpu_nullable_i32_unique_mutations_remain_device_authoritative() {
     let mut engine = Engine::new_local();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let cases = [

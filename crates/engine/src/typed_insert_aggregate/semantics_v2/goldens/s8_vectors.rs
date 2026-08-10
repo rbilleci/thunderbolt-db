@@ -114,7 +114,7 @@ fn c_selective_a_b_a_retention_reaches_pending_with_exact_s8_owners() {
     // coherent successful statement omitted from S8 remains locally accepted and advances only
     // to RetentionAuthorityPending, where a future claim proof owns eligibility completeness.
     fill_canonical_semantics_v2_for_test(&fixture.outer, &fixture.outcome, &fragments)
-        .and_then(|quarantined| quarantined.close_codec())
+        .and_then(|quarantined| quarantined.close_codec(None))
         .expect("selective locally coherent omission reaches retention-authority pending");
 
     let s6_flags = [
@@ -158,7 +158,7 @@ fn c_selective_a_b_a_source_copy_failures_drop_every_partial_s8_owner() {
         });
         assert!(failed.is_err(), "source-copy attempt {attempt} must fail");
         fill_canonical_semantics_v2_for_test(&fixture.outer, &fixture.outcome, &fragments)
-            .and_then(|quarantined| quarantined.close_codec())
+            .and_then(|quarantined| quarantined.close_codec(None))
             .unwrap_or_else(|error| {
                 panic!("source-copy attempt {attempt} leaves a partial C owner: {error}")
             });
@@ -177,7 +177,7 @@ fn b_explicit_abort_retains_earlier_applied_then_canceled_returning() {
         "the final statement remains the terminal abort"
     );
     fill_canonical_semantics_v2_for_test(&fixture.outer, &fixture.outcome, &fragments)
-        .and_then(|quarantined| quarantined.close_codec())
+        .and_then(|quarantined| quarantined.close_codec(None))
         .expect("the earlier statement-visible response reaches retention-authority pending");
 
     assert_eq!(read_u16(&fixture.sections[5], 10), 3);
@@ -264,7 +264,7 @@ fn b_explicit_abort_cross_chunk_s8_owners_pass_full_inert_close() {
         measure_canonical_semantics_v2(&fixture.outer, &fixture.outcome, &fragments)
             .expect("cross-chunk B source passes production pass zero");
         fill_canonical_semantics_v2_for_test(&fixture.outer, &fixture.outcome, &fragments)
-            .and_then(|quarantined| quarantined.close_codec())
+            .and_then(|quarantined| quarantined.close_codec(None))
             .unwrap_or_else(|error| panic!("cross-chunk B {label} reaches inert pending: {error}"));
     }
 }
@@ -557,7 +557,7 @@ fn canonical_insert_from_ast(
         sequence_defaults::SequenceDefaultBindings::empty()
     };
     let batch = prepared
-        .seal(bindings, false, false)
+        .seal(bindings)
         .expect("B fixture final typed batch seals");
     encode_canonical_typed_insert_record_for_test(&batch)
         .expect("B fixture final canonical S2 record encodes")
@@ -954,6 +954,7 @@ fn s7_root_descriptor(s7: &[u8]) -> [u8; 32] {
     hasher.update(&s7[504..536]);
     hasher.update(read_u32(s7, 40).to_le_bytes());
     hasher.update(0_u32.to_le_bytes());
+    hasher.update(&table[4..8]);
     hasher.update(&table[8..16]);
     hasher.update(&table[32..48]);
     hasher.update(&table[160..224]);

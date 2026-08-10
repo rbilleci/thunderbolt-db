@@ -47,12 +47,110 @@ pub(crate) fn assert_recovered_relational_access_path(
     assert_eq!(result.fallback_reason, None);
 }
 
-pub(crate) fn test_wal_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "gpu-db-engine-{name}-{}-{}.segment",
-        std::process::id(),
-        NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
-    ))
+/// An exact, test-owned durable-WAL basename.
+///
+/// A durable WAL has a family of on-disk artifacts rather than one file: the serial tail and
+/// identity sidecars, FUA frame segments, historical lane files, checkpoints, and recovery
+/// status sidecars. Returning a bare `PathBuf` made every fixture responsible for knowing that
+/// evolving family, which left fixed-size FUA segments behind until a full suite exhausted its
+/// test volume. This test-only owner removes only files whose name begins with its globally
+/// unique basename when the fixture scope ends.
+pub(crate) struct TestWalPath {
+    path: std::path::PathBuf,
+}
+
+impl TestWalPath {
+    /// Use only for test-only APIs that deliberately discard the filesystem base.
+    pub(crate) fn into_path_buf(self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+}
+
+impl AsRef<std::path::Path> for TestWalPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl From<&TestWalPath> for std::path::PathBuf {
+    fn from(path: &TestWalPath) -> Self {
+        path.path.clone()
+    }
+}
+
+impl std::ops::Deref for TestWalPath {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for TestWalPath {
+    fn drop(&mut self) {
+        cleanup_test_wal_artifacts(&self.path);
+    }
+}
+
+/// Best-effort cleanup for the complete artifact family rooted at one uniquely allocated test
+/// WAL basename. The `test_wal_path` nonce makes the prefix exact enough that parallel tests
+/// cannot remove one another's files.
+pub(crate) fn cleanup_test_wal_artifacts(path: &std::path::Path) {
+    let (Some(parent), Some(stem)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    // Checkpoint/control companions replace `.segment` rather than append to it, while FUA,
+    // identity, status, and tail companions append. Both forms retain this nonce-bearing root.
+    let root = stem
+        .to_str()
+        .and_then(|name| name.strip_suffix(".segment"))
+        .unwrap_or_else(|| stem.to_str().unwrap_or("wal.segment"));
+    let prefix = format!("{root}.");
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == stem || name.to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+pub(crate) fn test_wal_path(name: &str) -> TestWalPath {
+    TestWalPath {
+        path: std::env::temp_dir().join(format!(
+            "gpu-db-engine-{name}-{}-{}.segment",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        )),
+    }
+}
+
+#[test]
+fn test_wal_path_drop_cleans_its_complete_artifact_family_only() {
+    let owned = test_wal_path("artifact-cleanup");
+    let base = std::path::PathBuf::from(&owned);
+    let stem = base
+        .file_name()
+        .expect("test WAL basename")
+        .to_string_lossy();
+    let fua = base.with_file_name(format!("{stem}.fua.1"));
+    let checkpoint_identity = base.with_extension("checkpoint.identity");
+    let neighbor = base.with_file_name(format!("unrelated-{stem}"));
+    for artifact in [&base, &fua, &checkpoint_identity, &neighbor] {
+        std::fs::write(artifact, b"test artifact").expect("write test artifact");
+    }
+
+    drop(owned);
+
+    assert!(!base.exists());
+    assert!(!fua.exists());
+    assert!(!checkpoint_identity.exists());
+    assert!(
+        neighbor.exists(),
+        "cleanup must not widen beyond its exact root"
+    );
+    let _ = std::fs::remove_file(neighbor);
 }
 
 /// Remove a mandatory DML generation when a residency-control test needs to construct a synthetic

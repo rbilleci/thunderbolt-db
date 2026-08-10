@@ -19,6 +19,7 @@ pub(crate) struct TypedInsertAggregateSectionView<'a> {
 /// Borrowed aggregate semantics used by the allocation-free measure/encode passes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TypedInsertAggregateView<'a> {
+    pub(crate) semantics: TypedInsertAggregateSemantics,
     pub(crate) flags: u32,
     pub(crate) outer_flags: u32,
     pub(crate) stable_transaction_id: u64,
@@ -48,6 +49,7 @@ impl TypedInsertAggregateView<'_> {
             };
         }
         TypedInsertAggregateMeasure {
+            semantics: self.semantics,
             flags: self.flags,
             outer_flags: self.outer_flags,
             stable_transaction_id: self.stable_transaction_id,
@@ -92,6 +94,21 @@ pub(crate) struct TypedInsertAggregateStatusRoots {
     pub(crate) aggregate_root: gpu_db_wal::CanonicalDigest,
     pub(crate) statement_outcome_root: gpu_db_wal::CanonicalDigest,
     pub(crate) response_root: gpu_db_wal::CanonicalDigest,
+}
+
+/// Move-only result of the generic, allocation-free aggregate preparation pass.
+///
+/// The prepared view carries the one measured layout, encoded framing, and section-root
+/// traversal that both STATUS2 and the final body encoder require.  Keeping it tied to the
+/// exact borrowed view prevents the live writer from remeasuring or rehashing the same typed
+/// payload merely to cross the pre-WAL status/body boundary.
+pub(crate) struct PreparedTypedInsertAggregateEncoding<'a> {
+    view: TypedInsertAggregateView<'a>,
+    layout: TypedInsertAggregateLayout,
+    header: [u8; AGGREGATE_HEADER_BYTES as usize],
+    section_headers: [[u8; AGGREGATE_SECTION_HEADER_BYTES as usize]; AGGREGATE_SECTION_COUNT],
+    roots: TypedInsertAggregateStatusRoots,
+    section_roots: [gpu_db_wal::CanonicalDigest; AGGREGATE_SECTION_COUNT],
 }
 
 /// Stack-only borrowed projection into the exact outer canonical WAL encoder.
@@ -199,14 +216,66 @@ pub(crate) fn typed_insert_aggregate_status_roots(
     view: &TypedInsertAggregateView<'_>,
     layout: &TypedInsertAggregateLayout,
 ) -> Result<TypedInsertAggregateStatusRoots, EngineError> {
+    Ok(prepare_typed_insert_aggregate_encoding(*view, *layout)?.roots())
+}
+
+/// Measure and hash the exact generic aggregate once before a caller constructs STATUS2.
+///
+/// This is deliberately data-driven: every supported aggregate semantic/type shape uses the
+/// same view, framing, and root proof as the compatibility entry points.
+pub(crate) fn prepare_typed_insert_aggregate_encoding<'a>(
+    view: TypedInsertAggregateView<'a>,
+    layout: TypedInsertAggregateLayout,
+) -> Result<PreparedTypedInsertAggregateEncoding<'a>, EngineError> {
     let measured = view
         .measure()
         .map_err(|layout_error| error(&format!("measurement failed: {layout_error}")))?;
-    if measured != *layout {
+    if measured != layout {
         return Err(error("measured layout does not match aggregate view"));
     }
-    let (header, section_headers) = encoded_headers(view, layout)?;
-    Ok(aggregate_status_roots(view, &header, &section_headers))
+    prepare_typed_insert_aggregate_encoding_from_measured(view, layout)
+}
+
+/// Measure one immutable aggregate view and prepare the exact encoding from that measurement.
+///
+/// The live codec-5 writer owns this short, synchronous handoff.  It must not remeasure the
+/// unchanged aggregate after it has just established the layout; callers with separately held
+/// layouts continue to use [`prepare_typed_insert_aggregate_encoding`], which verifies them.
+pub(crate) fn measure_and_prepare_typed_insert_aggregate_encoding<'a>(
+    view: TypedInsertAggregateView<'a>,
+) -> Result<
+    (
+        TypedInsertAggregateLayout,
+        PreparedTypedInsertAggregateEncoding<'a>,
+    ),
+    EngineError,
+> {
+    let layout = view
+        .measure()
+        .map_err(|layout_error| error(&format!("measurement failed: {layout_error}")))?;
+    let prepared = prepare_typed_insert_aggregate_encoding_from_measured(view, layout)?;
+    Ok((layout, prepared))
+}
+
+/// Finish preparation from the measurement made in this call path.
+///
+/// Keeping this private ensures no independent caller can skip the layout/view equivalence
+/// check exposed by `prepare_typed_insert_aggregate_encoding`.
+fn prepare_typed_insert_aggregate_encoding_from_measured<'a>(
+    view: TypedInsertAggregateView<'a>,
+    layout: TypedInsertAggregateLayout,
+) -> Result<PreparedTypedInsertAggregateEncoding<'a>, EngineError> {
+    let (header, section_headers) = encoded_headers(&view, &layout)?;
+    let section_roots = aggregate_section_roots(&view, &section_headers);
+    let roots = status_roots_from_sections(view.flags, &header, &section_roots);
+    Ok(PreparedTypedInsertAggregateEncoding {
+        view,
+        layout,
+        header,
+        section_headers,
+        roots,
+        section_roots,
+    })
 }
 
 /// Fill every reserved chunk and STATUS2 body. Complete geometry, status identity, and all output
@@ -215,60 +284,67 @@ pub(crate) fn typed_insert_aggregate_status_roots(
 pub(crate) fn encode_typed_insert_aggregate_bodies(
     view: &TypedInsertAggregateView<'_>,
     status: &TypedInsertStatusV2,
-    mut reserved: ReservedTypedInsertAggregateBodyBuffers,
+    reserved: ReservedTypedInsertAggregateBodyBuffers,
 ) -> Result<EncodedTypedInsertAggregateBodies, EngineError> {
-    let prepared = preflight_encoding(view, status, &reserved)?;
-    for (index, chunk) in reserved.layout.live_chunks().iter().copied().enumerate() {
-        let body = reserved.bodies[index]
+    prepare_typed_insert_aggregate_encoding(*view, *reserved.layout())?.encode(status, reserved)
+}
+
+impl<'a> PreparedTypedInsertAggregateEncoding<'a> {
+    pub(crate) fn roots(&self) -> TypedInsertAggregateStatusRoots {
+        self.roots
+    }
+
+    /// Fill the buffers whose exact geometry this preparation pass authenticated.  STATUS2
+    /// closure and all output lengths are checked before the first output byte is changed.
+    pub(crate) fn encode(
+        self,
+        status: &TypedInsertStatusV2,
+        mut reserved: ReservedTypedInsertAggregateBodyBuffers,
+    ) -> Result<EncodedTypedInsertAggregateBodies, EngineError> {
+        if reserved.layout != self.layout {
+            return Err(error(
+                "reserved layout does not match prepared aggregate view",
+            ));
+        }
+        validate_body_buffers(&self.layout, &reserved.bodies)?;
+        validate_status_identity(&self.view, &self.roots, status)?;
+        // Validate STATUS2 against a stack buffer before touching any reserved body.
+        let mut status_bytes = [0_u8; AGGREGATE_STATUS_V2_BYTES as usize];
+        encode_status_v2(status, &mut status_bytes)?;
+        for (index, chunk) in self.layout.live_chunks().iter().copied().enumerate() {
+            let body = reserved.bodies[index]
+                .as_deref_mut()
+                .expect("validated live aggregate chunk body exists");
+            encode_chunk_header(body, &self.layout, chunk, self.roots.aggregate_root);
+        }
+        let mut stream = ChunkPayloadWriter::new(&self.layout, &mut reserved.bodies);
+        stream.bytes(&self.header)?;
+        for (index, section) in self.view.sections.iter().enumerate() {
+            stream.bytes(&self.section_headers[index])?;
+            stream.bytes(section.payload)?;
+        }
+        stream.bytes(&self.roots.aggregate_root)?;
+        stream.finish()?;
+        let status_index = self.layout.chunk_count as usize;
+        reserved.bodies[status_index]
             .as_deref_mut()
-            .expect("preflight proved that the live chunk body exists");
-        encode_chunk_header(body, &reserved.layout, chunk, prepared.roots.aggregate_root);
+            .expect("validated STATUS2 aggregate body exists")
+            .copy_from_slice(&status_bytes);
+        Ok(EncodedTypedInsertAggregateBodies {
+            layout: self.layout,
+            aggregate_root: self.roots.aggregate_root,
+            section_roots: self.section_roots,
+            status: *status,
+            bodies: reserved.bodies,
+        })
     }
-    let mut stream = ChunkPayloadWriter::new(&reserved.layout, &mut reserved.bodies);
-    stream.bytes(&prepared.header)?;
-    for (index, section) in view.sections.iter().enumerate() {
-        stream.bytes(&prepared.section_headers[index])?;
-        stream.bytes(section.payload)?;
-    }
-    stream.bytes(&prepared.roots.aggregate_root)?;
-    stream.finish()?;
-    let status_index = reserved.layout.chunk_count as usize;
-    reserved.bodies[status_index]
-        .as_deref_mut()
-        .expect("preflight proved that the STATUS2 body exists")
-        .copy_from_slice(&prepared.status);
-    Ok(EncodedTypedInsertAggregateBodies {
-        layout: reserved.layout,
-        aggregate_root: prepared.roots.aggregate_root,
-        section_roots: prepared.section_roots,
-        status: *status,
-        bodies: reserved.bodies,
-    })
 }
 
-struct AggregateEncodingPreflight {
-    header: [u8; AGGREGATE_HEADER_BYTES as usize],
-    section_headers: [[u8; AGGREGATE_SECTION_HEADER_BYTES as usize]; AGGREGATE_SECTION_COUNT],
-    roots: TypedInsertAggregateStatusRoots,
-    section_roots: [gpu_db_wal::CanonicalDigest; AGGREGATE_SECTION_COUNT],
-    status: [u8; AGGREGATE_STATUS_V2_BYTES as usize],
-}
-
-fn preflight_encoding(
+fn validate_status_identity(
     view: &TypedInsertAggregateView<'_>,
+    roots: &TypedInsertAggregateStatusRoots,
     status: &TypedInsertStatusV2,
-    reserved: &ReservedTypedInsertAggregateBodyBuffers,
-) -> Result<AggregateEncodingPreflight, EngineError> {
-    let measured = view
-        .measure()
-        .map_err(|layout_error| error(&format!("measurement failed: {layout_error}")))?;
-    if measured != reserved.layout {
-        return Err(error("reserved layout does not match aggregate view"));
-    }
-    validate_body_buffers(&reserved.layout, &reserved.bodies)?;
-    let (header, section_headers) = encoded_headers(view, &reserved.layout)?;
-    let section_roots = aggregate_section_roots(view, &section_headers);
-    let roots = status_roots_from_sections(view.flags, &header, &section_roots);
+) -> Result<(), EngineError> {
     if status.txn_id != view.stable_transaction_id
         || status.statement_count != view.statement_count
         || status.response_artifact_count != view.sections[7].entry_count
@@ -278,16 +354,7 @@ fn preflight_encoding(
     {
         return Err(error("STATUS2 identity or aggregate root drifted"));
     }
-    // Validate STATUS2 against a stack buffer before touching any reserved body.
-    let mut status_bytes = [0_u8; AGGREGATE_STATUS_V2_BYTES as usize];
-    encode_status_v2(status, &mut status_bytes)?;
-    Ok(AggregateEncodingPreflight {
-        header,
-        section_headers,
-        roots,
-        section_roots,
-        status: status_bytes,
-    })
+    Ok(())
 }
 
 /// Strictly decode chunk bodies plus STATUS2 without assembling an aggregate stream allocation.
@@ -441,6 +508,7 @@ impl<'a> DecodedAggregateFraming<'a> {
             ));
         }
         let measure = TypedInsertAggregateMeasure {
+            semantics: TypedInsertAggregateSemantics::V1,
             flags: self.header.flags,
             outer_flags: self.outer_flags,
             stable_transaction_id: self.header.stable_transaction_id,
@@ -480,6 +548,12 @@ impl<'a> DecodedAggregateFraming<'a> {
 
     pub(super) fn semantics_version(&self) -> u16 {
         self.header.semantics_version
+    }
+
+    /// The exact canonical row-chunk count plus the trailing STATUS2 fragment.
+    /// Version-specific closure shares this already-proved framing rather than rebuilding it.
+    pub(super) fn fragment_count(&self) -> usize {
+        self.chunk_count + 1
     }
 
     pub(super) fn outer_flags(&self) -> u32 {
@@ -539,6 +613,100 @@ impl<'a> DecodedAggregateFraming<'a> {
         reader.finish()?;
         Ok(value)
     }
+}
+
+/// Re-encode a valid catalog-bearing semantics-v2 aggregate as the historical profile that
+/// predated the additive `OPERATION_COMPOSITION` marker. This exists solely to keep the old
+/// CATALOG-only S3 decoder/replay contract covered without making the current writer emit a
+/// retired profile.
+#[cfg(test)]
+pub(crate) fn reencode_legacy_catalog_marker_for_test(
+    outer: &gpu_db_wal::CanonicalPreApplyHeader,
+    outcome: &gpu_db_wal::CanonicalOutcome,
+    fragments: &[gpu_db_wal::CanonicalFragment],
+) -> Result<
+    (
+        gpu_db_wal::CanonicalPreApplyHeader,
+        gpu_db_wal::CanonicalOutcome,
+        Vec<gpu_db_wal::CanonicalFragment>,
+    ),
+    EngineError,
+> {
+    let refs = fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let mut bodies = [&[][..]; AGGREGATE_MAX_CHUNKS + 1];
+    for (target, fragment) in bodies.iter_mut().zip(refs.iter()) {
+        *target = fragment.body;
+    }
+    let framing = decode_aggregate_framing(outer.flags, &bodies[..refs.len()])?;
+    let scalar = framing.header_scalars();
+    if framing.semantics_version() != AGGREGATE_SEMANTICS_V2
+        || scalar.flags & AGGREGATE_FLAG_CATALOG == 0
+        || scalar.flags & AGGREGATE_FLAG_OPERATION_COMPOSITION == 0
+        || outer.flags & OUTER_CONTENT_CATALOG == 0
+        || outer.flags & OUTER_CONTENT_OPERATION_COMPOSITION == 0
+    {
+        return Err(error(
+            "legacy catalog-marker test source is not an explicit current catalog S3 aggregate",
+        ));
+    }
+
+    let mut payloads: [Vec<u8>; AGGREGATE_SECTION_COUNT] = std::array::from_fn(|_| Vec::new());
+    for (index, payload) in payloads.iter_mut().enumerate() {
+        let bytes = usize::try_from(framing.sections()[index].payload_bytes)
+            .map_err(|_| error("legacy catalog-marker section length is not addressable"))?;
+        payload
+            .try_reserve_exact(bytes)
+            .map_err(|_| error("legacy catalog-marker section reservation failed"))?;
+        payload.resize(bytes, 0);
+        framing.with_section_reader(index, |reader| reader.copy_exact(payload))?;
+    }
+    let sections = std::array::from_fn(|index| TypedInsertAggregateSectionView {
+        entry_count: framing.sections()[index].entry_count,
+        payload: payloads[index].as_slice(),
+    });
+    let view = TypedInsertAggregateView {
+        semantics: TypedInsertAggregateSemantics::V2,
+        flags: scalar.flags & !AGGREGATE_FLAG_OPERATION_COMPOSITION,
+        outer_flags: outer.flags & !OUTER_CONTENT_OPERATION_COMPOSITION,
+        stable_transaction_id: scalar.stable_transaction_id,
+        statement_count: scalar.statement_count,
+        insert_statement_count: scalar.insert_statement_count,
+        original_inserted_row_count: scalar.original_inserted_row_count,
+        final_row_transition_count: scalar.final_row_transition_count,
+        allocator_before: scalar.allocator_before,
+        allocator_high_water: scalar.allocator_high_water,
+        table_block_count: scalar.table_block_count,
+        sections,
+    };
+    let (layout, prepared) = measure_and_prepare_typed_insert_aggregate_encoding(view)?;
+    let roots = prepared.roots();
+    let mut status = *framing.status();
+    status.statement_outcome_root = roots.statement_outcome_root;
+    status.response_root = roots.response_root;
+    status.aggregate_root = roots.aggregate_root;
+    let reencoded = prepared.encode(&status, reserve_typed_insert_aggregate_bodies(layout)?)?;
+
+    let mut historical_outer = outer.clone();
+    historical_outer.flags &= !OUTER_CONTENT_OPERATION_COMPOSITION;
+    let mut historical_outcome = outcome.clone();
+    historical_outcome.target_digest = roots.aggregate_root;
+    historical_outcome.returning_digest = roots.response_root;
+    let historical_fragments = reencoded
+        .canonical_fragment_refs()
+        .as_slice()
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragment {
+            kind: fragment.kind,
+            body: fragment.body.to_vec(),
+        })
+        .collect();
+    Ok((historical_outer, historical_outcome, historical_fragments))
 }
 
 #[derive(Clone, Copy)]
@@ -772,7 +940,7 @@ fn encoded_headers(
     let mut writer = FixedWriter::new(&mut header);
     writer.bytes(AGGREGATE_STREAM_MAGIC)?;
     writer.u16(AGGREGATE_FORMAT_VERSION)?;
-    writer.u16(AGGREGATE_SEMANTICS_V1)?;
+    writer.u16(view.semantics.wire_version())?;
     writer.u16(AGGREGATE_FORMAT_VERSION)?;
     writer.u16(AGGREGATE_FORMAT_VERSION)?;
     writer.u32(view.flags)?;
@@ -1283,6 +1451,7 @@ mod internal_tests {
 
     fn view<'a>(payloads: &'a [Vec<u8>; AGGREGATE_SECTION_COUNT]) -> TypedInsertAggregateView<'a> {
         TypedInsertAggregateView {
+            semantics: TypedInsertAggregateSemantics::V1,
             flags: AGGREGATE_FLAG_AUTOCOMMIT,
             outer_flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
             stable_transaction_id: 7,
@@ -1323,7 +1492,6 @@ mod internal_tests {
             std::array::from_fn(|index| vec![index as u8 + 1; index + 1]);
         let view = view(&payloads);
         let layout = view.measure().unwrap();
-        let status = status(typed_insert_aggregate_status_roots(&view, &layout).unwrap());
 
         for (body_index, adjustment) in [(0_usize, -1_isize), (0, 1), (1, -1), (1, 1)] {
             let mut reserved = reserve_typed_insert_aggregate_bodies(layout).unwrap();
@@ -1339,7 +1507,9 @@ mod internal_tests {
                 .flatten()
                 .map(|body| body.to_vec())
                 .collect();
-            assert!(preflight_encoding(&view, &status, &reserved).is_err());
+            // The prepared encoder validates exact reserved geometry before it can write a
+            // chunk header, so this is the no-mutation rejection boundary.
+            assert!(validate_body_buffers(&layout, &reserved.bodies).is_err());
             let after: Vec<Vec<u8>> = reserved
                 .bodies
                 .iter()

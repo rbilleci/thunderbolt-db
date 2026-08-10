@@ -1035,7 +1035,7 @@ fn scan_effects<S: CanonicalTypedInsertReadAt + ?Sized>(
             2 => {
                 return Err(codec_error(
                     "private sequence effects are forbidden by this S2 profile",
-                ))
+                ));
             }
             _ => return Err(codec_error("sequence effect tag is unknown")),
         }

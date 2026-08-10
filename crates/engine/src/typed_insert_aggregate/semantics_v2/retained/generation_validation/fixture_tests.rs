@@ -250,6 +250,8 @@ fn fixture_graph(
         outcomes: Vec::new(),
         tables: vec![RetainedTable {
             table_ref: 0,
+            resets_existing_rows: false,
+            initial_table_absent: false,
             stable_table_id: TABLE_ID,
             display_oid: 50,
             target_dependency_ref: 0,
@@ -339,6 +341,7 @@ fn fixture_graph(
             key_effect_start: 0,
             key_effect_count: 1,
             final_writer_statement_ordinal: 0,
+            final_writer_statement_digest: [0; 32],
             typed_statement_digest: [28; 32],
             final_row_digest: [29; 32],
             transition_digest: [30; 32],

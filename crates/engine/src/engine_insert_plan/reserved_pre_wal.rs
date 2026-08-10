@@ -473,6 +473,7 @@ pub(super) fn inspect_test_indexed_autocommit<P, R>(
     let empty = &[][..];
     let counts = [1, 1, 0, inserted_rows, 0, 1, 1, 0];
     let view = TypedInsertAggregateView {
+        semantics: crate::typed_insert_aggregate::TypedInsertAggregateSemantics::V1,
         flags: AGGREGATE_FLAG_AUTOCOMMIT,
         outer_flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
         stable_transaction_id: allocator_before,

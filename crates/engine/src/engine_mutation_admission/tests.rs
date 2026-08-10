@@ -333,7 +333,7 @@ fn compatibility_reads_are_unsequenced_and_do_not_enter_representation_repair() 
 }
 
 #[test]
-fn nonconcurrent_returning_rejects_before_sequence_or_wal_claim() {
+fn nonconcurrent_returning_fails_before_sequence_or_wal_claim() {
     let engine = Engine::new_local();
     let visible_before = engine.committed_seq();
     let wal_before = engine.durable_wal_records().len();
@@ -343,7 +343,10 @@ fn nonconcurrent_returning_rejects_before_sequence_or_wal_claim() {
             MutationRequest::new(parsed("INSERT INTO missing VALUES (1) RETURNING id")),
         )
         .unwrap_err();
-    assert!(matches!(error, crate::ExecuteError::Unsupported(_)));
+    assert!(
+        matches!(error, crate::ExecuteError::UndefinedRelation(ref relation) if relation == "missing"),
+        "the generic typed INSERT route must reject the unresolved target before it can claim a sequence or WAL: {error:?}"
+    );
     assert_eq!(engine.committed_seq(), visible_before);
     assert_eq!(engine.durable_wal_records().len(), wal_before);
 }
@@ -412,6 +415,10 @@ fn general_atomic_program_reads_its_writes_commits_once_and_recovers() {
     )
     .unwrap()
     .expect("canonical transaction WAL");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "the predeclared INSERT/UPDATE/DELETE overlay must publish one codec-5 authority"
+    );
     assert_eq!(
         envelope.header.isolation,
         gpu_db_wal::CanonicalIsolation::RepeatableRead

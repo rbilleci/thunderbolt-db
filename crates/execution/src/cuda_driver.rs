@@ -159,6 +159,21 @@ impl CudaDriverRuntime {
         ))
     }
 
+    /// Retain the exact primary target for the plural, type-neutral typed-INSERT generation
+    /// program.  It exposes context identity but no raw CUDA pointer.
+    pub fn runtime_typed_insert_generation_target(
+        &self,
+        gpu_id: u16,
+    ) -> Result<crate::RuntimeTypedInsertGenerationTarget, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+        Ok(crate::RuntimeTypedInsertGenerationTarget::from_primary(
+            gpu_id,
+            self.context_for(gpu_id)?,
+        ))
+    }
+
     pub fn launch_smoke_add_one(&self, input: u32) -> Result<u32, CudaRuntimeProbeError> {
         if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
             return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);

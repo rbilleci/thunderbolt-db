@@ -16,7 +16,6 @@ use gpu_db_execution::CudaOwnedDeviceMemoryChunk;
 /// `header_publication`; it cannot allocate, encode, rebuild a destination, or resolve CUDA
 /// state on the committed path.
 #[must_use]
-#[allow(dead_code)] // test-only foundation until the live fixed-rollover carrier adopts it
 pub(in crate::engine_residency) struct PreparedFixedResidentShardPublication {
     pending: PendingFixedResidentShard,
     header_publication: gpu_db_execution::PreparedU64HtoDPublication,
@@ -65,8 +64,7 @@ impl PendingFixedResidentShard {
     /// exact-length created-by image, and resolves the count-header publication while the caller
     /// still owns the pre-WAL reservation. The payload header remains zero throughout this method:
     /// only [`PreparedFixedResidentShardPublication::publish_post_wal`] may make the rows visible.
-    #[allow(dead_code)] // test-only foundation until the live fixed-rollover carrier adopts it
-    pub(super) fn prepare_uniform_commit_pre_wal(
+    pub(in crate::engine_residency) fn prepare_uniform_commit_pre_wal(
         self,
         commit_seq: Index,
     ) -> Result<PreparedFixedResidentShardPublication, ExecuteError> {
@@ -144,13 +142,18 @@ impl PendingFixedResidentShard {
 }
 
 impl PreparedFixedResidentShardPublication {
+    pub(in crate::engine_residency) fn pending(&self) -> &PendingFixedResidentShard {
+        &self.pending
+    }
+
     /// Publish the header prepared before WAL, then return the sealed private generation.
     ///
     /// The capability owns the exact allocation, destination, primary context, value, and driver
     /// entry point. This consuming success path intentionally has no alternate encoding,
     /// allocation, device preparation, launch, cache, or fallback surface.
-    #[allow(dead_code)] // test-only foundation until the live fixed-rollover carrier adopts it
-    pub(super) fn publish_post_wal(self) -> Result<PendingFixedResidentShard, ExecuteError> {
+    pub(in crate::engine_residency) fn publish_post_wal(
+        self,
+    ) -> Result<PendingFixedResidentShard, ExecuteError> {
         let Self {
             pending,
             header_publication,

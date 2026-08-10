@@ -504,6 +504,7 @@ mod tests {
         RelationalTable {
             schema: "public".to_string(),
             name: name.to_string(),
+            stable_table_id: u64::from(oid),
             oid,
             columns: Vec::new(),
             indexes: Vec::new(),

@@ -120,11 +120,9 @@ pub(crate) fn private_chain_batch_for_test(
         predecessor_digest = outcome_digest;
     }
     prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::from_bindings(parent, bindings),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::from_bindings(
+            parent, bindings,
+        ))
         .expect("private sequence fixture seals")
 }
 

@@ -4,11 +4,17 @@
 //! (CatalogHistory/CatalogSnapshot), plus the residency read-state and route
 //! telemetry. Small state aggregates the Engine owns; not the commit-critical core.
 
+use super::engine_data_generation::{
+    FixedRadixMap, GpuRadixEmptyRoots, GpuRadixMapTransition, RadixLeafValue,
+};
 use super::*;
 use std::sync::atomic::AtomicU32;
 
 mod point_slots;
 pub(crate) use point_slots::TablePointSlot;
+
+#[cfg(test)]
+mod typed_generation_roots_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BacklogBlocker {
@@ -350,6 +356,11 @@ pub struct ReadState {
     /// generation before release-publishing its table OID, and clears this gate before removing
     /// that generation.  A zero avoids even an ArcSwap guard on the normal hot read path.
     pub(crate) sealed_int4_publication_table_oid: AtomicU32,
+    /// Immutable, type-neutral WRITE-001 root lineage.  This is the control-plane identity half
+    /// of the general typed publication; SQL storage tags never select a different authority.
+    /// The commit serializer publishes a whole successor snapshot after device apply, so readers
+    /// and later writers cannot observe a table root detached from its database root.
+    pub(crate) typed_generation_roots: ArcSwap<TypedGenerationRootSnapshot>,
     /// Build-only route evidence for the sealed source handoff. It is absent from normal builds;
     /// tests and `probe-timing` can prove that a real GPU result used this retained generation.
     #[cfg(any(test, feature = "probe-timing"))]
@@ -379,6 +390,7 @@ impl ReadState {
             committed_seq: AtomicU64::new(0),
             sealed_int4_publication: ArcSwapOption::empty(),
             sealed_int4_publication_table_oid: AtomicU32::new(0),
+            typed_generation_roots: ArcSwap::new(Arc::new(TypedGenerationRootSnapshot::default())),
             #[cfg(any(test, feature = "probe-timing"))]
             sealed_int4_direct_source_gpu_served_total: AtomicU64::new(0),
             sealed_int4_capture_table_oid: AtomicU32::new(0),
@@ -471,6 +483,632 @@ impl ReadState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TypedTableGenerationRoot {
+    pub(crate) data_generation: u64,
+    pub(crate) table_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) logical_row_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TypedColumnGenerationRoot {
+    pub(crate) catalog_column_ordinal: u32,
+    pub(crate) stable_column_id: u32,
+    pub(crate) attnum: i16,
+    pub(crate) column_shape_root: gpu_db_wal::CanonicalDigest,
+    pub(crate) column_root: gpu_db_wal::CanonicalDigest,
+}
+
+/// One catalog-ordered index commitment owned by a table generation.  An index root can never be
+/// paired with a table root from another immutable leaf: indexed writes and CREATE INDEX relink
+/// this collection through the same GPU-authenticated table-map COW transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TypedIndexGenerationRoot {
+    pub(crate) stable_index_id: u64,
+    pub(crate) index_generation: u64,
+    pub(crate) index_root: gpu_db_wal::CanonicalDigest,
+}
+
+/// One immutable table-map leaf.  Table and column commitments must move as one unit: a reader
+/// must never see a table root paired with another generation's catalog-ordered column or index
+/// roots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedTableGenerationLeaf {
+    table: TypedTableGenerationRoot,
+    columns: Vec<TypedColumnGenerationRoot>,
+    index_roots: Vec<TypedIndexGenerationRoot>,
+}
+
+impl RadixLeafValue for TypedTableGenerationLeaf {
+    fn same_commitment(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+type TypedTableGenerationMap =
+    FixedRadixMap<u64, gpu_db_wal::CanonicalDigest, TypedTableGenerationLeaf>;
+
+/// Exact root-only table-map transition copied from one completed GPU generation.  It exposes no
+/// hash implementation or host-derived commitment; validation and COW relinking stay in the
+/// persistent map owner.
+#[derive(Clone, Debug)]
+pub(crate) struct TypedTableMapGpuCompletion {
+    empty_roots: [[u8; 32]; 65],
+    initial_leaf_root: gpu_db_wal::CanonicalDigest,
+    initial_path_roots: [[u8; 32]; 64],
+    final_leaf_root: gpu_db_wal::CanonicalDigest,
+    final_path_roots: [[u8; 32]; 64],
+}
+
+impl TypedTableMapGpuCompletion {
+    /// Copy exactly the map witness produced by the runtime generation completion.  The caller
+    /// cannot replace it with a host hash or an inferred table-map path.
+    pub(crate) fn from_logical_completion(
+        completion: &gpu_db_execution::RuntimeTypedInsertGenerationLogicalCompletion,
+    ) -> Result<Self, EngineError> {
+        let mut empty_roots = [[0; 32]; 65];
+        let mut initial_leaf_root = [0; 32];
+        let mut initial_path_roots = [[0; 32]; 64];
+        let mut final_leaf_root = [0; 32];
+        let mut final_path_roots = [[0; 32]; 64];
+        completion
+            .copy_table_map_transition_into(
+                &mut empty_roots,
+                &mut initial_leaf_root,
+                &mut initial_path_roots,
+                &mut final_leaf_root,
+                &mut final_path_roots,
+            )
+            .map_err(|_| {
+                EngineError::ApplyFailed(
+                    "typed GPU generation table-map completion shape drifted".to_string(),
+                )
+            })?;
+        Self::from_completed_roots(
+            empty_roots,
+            initial_leaf_root,
+            initial_path_roots,
+            final_leaf_root,
+            final_path_roots,
+        )
+    }
+
+    fn from_completed_roots(
+        empty_roots: [[u8; 32]; 65],
+        initial_leaf_root: gpu_db_wal::CanonicalDigest,
+        initial_path_roots: [[u8; 32]; 64],
+        final_leaf_root: gpu_db_wal::CanonicalDigest,
+        final_path_roots: [[u8; 32]; 64],
+    ) -> Result<Self, EngineError> {
+        if empty_roots
+            .iter()
+            .chain([initial_leaf_root].iter())
+            .any(|root| *root == [0; 32])
+            || initial_path_roots.contains(&[0; 32])
+            || final_leaf_root == [0; 32]
+            || final_path_roots.contains(&[0; 32])
+        {
+            return Err(EngineError::ApplyFailed(
+                "typed GPU table-map completion contains a zero root".to_string(),
+            ));
+        }
+        Ok(Self {
+            empty_roots,
+            initial_leaf_root,
+            initial_path_roots,
+            final_leaf_root,
+            final_path_roots,
+        })
+    }
+
+    fn transition(
+        &self,
+    ) -> Result<GpuRadixMapTransition<gpu_db_wal::CanonicalDigest>, EngineError> {
+        let empty_roots = GpuRadixEmptyRoots::from_verified_depths(
+            self.empty_roots
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(depth, root)| (depth as u8, root))
+                .collect(),
+        )
+        .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        GpuRadixMapTransition::new(
+            empty_roots,
+            self.initial_leaf_root,
+            self.initial_path_roots,
+            self.final_leaf_root,
+            self.final_path_roots,
+        )
+        .map_err(|error| EngineError::ApplyFailed(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_first_create_for_test(seed: u64) -> Self {
+        fn root(seed: u64) -> gpu_db_wal::CanonicalDigest {
+            let mut root = [0; 32];
+            root[..8].copy_from_slice(&seed.to_le_bytes());
+            root[31] = 0xa5;
+            root
+        }
+
+        let empty_roots = std::array::from_fn(|depth| root(seed + depth as u64));
+        Self::from_completed_roots(
+            empty_roots,
+            empty_roots[64],
+            std::array::from_fn(|depth| empty_roots[depth]),
+            root(seed + 1_000),
+            std::array::from_fn(|depth| root(seed + 2_000 + depth as u64)),
+        )
+        .expect("synthetic GPU table-map completion")
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TypedGenerationRootSnapshot {
+    pub(crate) database_root: Option<gpu_db_wal::CanonicalDigest>,
+    table_map: Option<TypedTableGenerationMap>,
+}
+
+fn index_roots_are_catalog_ordered(roots: &[TypedIndexGenerationRoot]) -> bool {
+    roots.iter().enumerate().all(|(ordinal, root)| {
+        root.stable_index_id != 0
+            && root.stable_index_id != u64::MAX
+            && root.index_generation != 0
+            && root.index_generation != u64::MAX
+            && root.index_root != [0; 32]
+            && (ordinal == 0 || roots[ordinal - 1].stable_index_id < root.stable_index_id)
+    })
+}
+
+fn index_successors_strictly_evolve(
+    predecessors: &[TypedIndexGenerationRoot],
+    successors: &[TypedIndexGenerationRoot],
+    resets_existing_rows: bool,
+    successor_table_generation: u64,
+    created_index_ids: &[u64],
+    retired_index_ids: &[u64],
+) -> bool {
+    let evolves = |before: &TypedIndexGenerationRoot, after: &TypedIndexGenerationRoot| {
+        after.stable_index_id == before.stable_index_id
+            && after.index_generation > before.index_generation
+            && after.index_root != before.index_root
+    };
+    let created_are_ordered = created_index_ids.iter().enumerate().all(|(ordinal, id)| {
+        *id != 0 && *id != u64::MAX && (ordinal == 0 || created_index_ids[ordinal - 1] < *id)
+    });
+    let retired_are_ordered = retired_index_ids.iter().enumerate().all(|(ordinal, id)| {
+        *id != 0 && *id != u64::MAX && (ordinal == 0 || retired_index_ids[ordinal - 1] < *id)
+    });
+    if !created_are_ordered
+        || !retired_are_ordered
+        || created_index_ids
+            .iter()
+            .any(|id| retired_index_ids.binary_search(id).is_ok())
+        || (resets_existing_rows
+            && (!created_index_ids.is_empty() || !retired_index_ids.is_empty()))
+    {
+        return false;
+    }
+    if !resets_existing_rows {
+        return successors.iter().all(|after| {
+            predecessors
+                .iter()
+                .find(|before| before.stable_index_id == after.stable_index_id)
+                .map_or_else(
+                    || {
+                        created_index_ids
+                            .binary_search(&after.stable_index_id)
+                            .is_ok()
+                            && after.index_generation == successor_table_generation
+                    },
+                    |before| evolves(before, after),
+                )
+        }) && predecessors.iter().all(|before| {
+            if retired_index_ids
+                .binary_search(&before.stable_index_id)
+                .is_ok()
+            {
+                successors
+                    .iter()
+                    .all(|after| after.stable_index_id != before.stable_index_id)
+            } else {
+                successors.iter().any(|after| evolves(before, after))
+            }
+        }) && successors.len()
+            == predecessors
+                .len()
+                .saturating_sub(retired_index_ids.len())
+                .saturating_add(created_index_ids.len());
+    }
+    successors.iter().all(|after| {
+        predecessors
+            .iter()
+            .find(|before| before.stable_index_id == after.stable_index_id)
+            .map_or(
+                after.index_generation == successor_table_generation,
+                |before| evolves(before, after),
+            )
+    })
+}
+
+impl TypedGenerationRootSnapshot {
+    pub(crate) fn table(&self, stable_table_id: u64) -> Option<TypedTableGenerationRoot> {
+        self.table_map
+            .as_ref()
+            .and_then(|map| map.get(stable_table_id))
+            .map(|leaf| leaf.table)
+    }
+
+    pub(crate) fn table_columns(
+        &self,
+        stable_table_id: u64,
+    ) -> impl Iterator<Item = TypedColumnGenerationRoot> + '_ {
+        self.table_map
+            .iter()
+            .flat_map(move |map| map.get(stable_table_id))
+            .flat_map(|leaf| leaf.columns.iter().copied())
+    }
+
+    /// The exact catalog-ordered index commitments captured with this table generation.  The
+    /// iterator deliberately exposes no mutable leaf access; callers pass this ordered witness
+    /// back to GPU generation work and the COW transition checks it against the current snapshot.
+    pub(crate) fn table_index_roots(
+        &self,
+        stable_table_id: u64,
+    ) -> impl Iterator<Item = TypedIndexGenerationRoot> + '_ {
+        self.table_map
+            .iter()
+            .flat_map(move |map| map.get(stable_table_id))
+            .flat_map(|leaf| leaf.index_roots.iter().copied())
+    }
+
+    /// Find one index commitment by its stable catalog identity.  Leaf validation keeps this
+    /// vector strictly raw-ID ordered, so lookup neither hashes nor manufactures a host index.
+    pub(crate) fn table_index_root(
+        &self,
+        stable_table_id: u64,
+        stable_index_id: u64,
+    ) -> Option<TypedIndexGenerationRoot> {
+        self.table_map
+            .as_ref()
+            .and_then(|map| map.get(stable_table_id))
+            .and_then(|leaf| {
+                leaf.index_roots
+                    .binary_search_by_key(&stable_index_id, |root| root.stable_index_id)
+                    .ok()
+                    .map(|position| leaf.index_roots[position])
+            })
+    }
+
+    /// The map root currently committed for the typed generation, if GPU CREATE has initialized
+    /// the database.  It is paired with `database_root` and cannot be inferred from a table.
+    pub(crate) fn table_map_root(&self) -> Option<gpu_db_wal::CanonicalDigest> {
+        self.table_map.as_ref().map(FixedRadixMap::root)
+    }
+
+    /// The bounded root-to-leaf sibling witness the GPU must validate before a later CREATE or
+    /// INSERT.  The sequence is always depth zero through 63.
+    #[cfg(test)]
+    pub(crate) fn table_map_sibling_roots(
+        &self,
+        stable_table_id: u64,
+    ) -> Result<Option<[[u8; 32]; 64]>, EngineError> {
+        self.table_map
+            .as_ref()
+            .map(|map| {
+                map.sibling_roots(stable_table_id)
+                    .map_err(|error| EngineError::ApplyFailed(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Produce the one retained GPU-authenticated predecessor witness for a physical generation
+    /// schedule. It contains no successor root or host hash: the device still computes the final
+    /// path and normal publication revalidates the carried initial roots before it installs that
+    /// path. A mismatched database root fails before the descriptor is admitted.
+    pub(crate) fn retained_table_map_predecessor(
+        &self,
+        stable_table_id: u64,
+        initial_database_root: gpu_db_wal::CanonicalDigest,
+    ) -> Result<
+        Option<gpu_db_execution::RuntimeTypedInsertGenerationTableMapPredecessor>,
+        EngineError,
+    > {
+        if self.database_root != Some(initial_database_root) {
+            return Err(EngineError::ApplyFailed(
+                "typed retained table-map witness database predecessor differs".to_string(),
+            ));
+        }
+        self.table_map
+            .as_ref()
+            .map(|map| {
+                let witness = map
+                    .predecessor_witness(stable_table_id)
+                    .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+                Ok(
+                    gpu_db_execution::RuntimeTypedInsertGenerationTableMapPredecessor::PinnedRetained {
+                        initial_database_root,
+                        sibling_roots: witness.sibling_roots,
+                        empty_roots: witness.empty_roots,
+                        initial_leaf_root: witness.initial_leaf_root,
+                        initial_path_roots: witness.initial_path_roots,
+                    },
+                )
+            })
+            .transpose()
+    }
+
+    /// Build exactly one persistent table-map successor from GPU-completed roots.  A missing
+    /// predecessor is CREATE: it may initialize the previously uninitialized database or add a
+    /// distinct table to an existing map, either empty or with the transaction's first GPU row
+    /// set. A present predecessor is RowSetInsert. Neither path may substitute a host root or
+    /// mutate a table-local allocator mirror.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_gpu_completed_table_map_substitution(
+        &self,
+        stable_table_id: u64,
+        expected_predecessor: Option<TypedTableGenerationRoot>,
+        resets_existing_rows: bool,
+        expected_database_root: Option<gpu_db_wal::CanonicalDigest>,
+        successor: TypedTableGenerationRoot,
+        successor_columns: &[TypedColumnGenerationRoot],
+        expected_predecessor_index_roots: &[TypedIndexGenerationRoot],
+        successor_index_roots: &[TypedIndexGenerationRoot],
+        final_database_root: gpu_db_wal::CanonicalDigest,
+        gpu_completion: &TypedTableMapGpuCompletion,
+    ) -> Result<Self, EngineError> {
+        self.with_gpu_completed_table_map_substitution_with_created_indexes(
+            stable_table_id,
+            expected_predecessor,
+            resets_existing_rows,
+            expected_database_root,
+            successor,
+            successor_columns,
+            expected_predecessor_index_roots,
+            successor_index_roots,
+            final_database_root,
+            gpu_completion,
+            &[],
+            &[],
+        )
+    }
+
+    /// Variant used only when S3 has already proven a transaction-local CREATE INDEX over an
+    /// existing table.  The supplied ids are not catalog inference: they authorize exactly the
+    /// absent-to-present index leaves in this one GPU-completed table-map substitution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_gpu_completed_table_map_substitution_with_created_indexes(
+        &self,
+        stable_table_id: u64,
+        expected_predecessor: Option<TypedTableGenerationRoot>,
+        resets_existing_rows: bool,
+        expected_database_root: Option<gpu_db_wal::CanonicalDigest>,
+        successor: TypedTableGenerationRoot,
+        successor_columns: &[TypedColumnGenerationRoot],
+        expected_predecessor_index_roots: &[TypedIndexGenerationRoot],
+        successor_index_roots: &[TypedIndexGenerationRoot],
+        final_database_root: gpu_db_wal::CanonicalDigest,
+        gpu_completion: &TypedTableMapGpuCompletion,
+        created_index_ids: &[u64],
+        retired_index_ids: &[u64],
+    ) -> Result<Self, EngineError> {
+        let ordered_columns = !successor_columns.is_empty()
+            && successor_columns
+                .iter()
+                .enumerate()
+                .all(|(ordinal, column)| {
+                    usize::try_from(column.catalog_column_ordinal).ok() == Some(ordinal)
+                        && column.stable_column_id != 0
+                        && column.attnum > 0
+                        && column.column_shape_root != [0; 32]
+                        && column.column_root != [0; 32]
+                });
+        let unique_column_identities =
+            successor_columns
+                .iter()
+                .enumerate()
+                .all(|(ordinal, column)| {
+                    !successor_columns[..ordinal].iter().any(|prior| {
+                        prior.stable_column_id == column.stable_column_id
+                            || prior.attnum == column.attnum
+                    })
+                });
+        if stable_table_id == 0
+            || stable_table_id == u64::MAX
+            || successor.data_generation == 0
+            || successor.data_generation == u64::MAX
+            || successor.table_root == [0; 32]
+            || final_database_root == [0; 32]
+            || self.database_root != expected_database_root
+            || self.table_map.is_some() != self.database_root.is_some()
+            || (self.table_map.is_some() && expected_database_root.is_none())
+            || self.table(stable_table_id) != expected_predecessor
+            || (expected_predecessor.is_none() && resets_existing_rows)
+            || !ordered_columns
+            || !unique_column_identities
+            || !index_roots_are_catalog_ordered(expected_predecessor_index_roots)
+            || !index_roots_are_catalog_ordered(successor_index_roots)
+        {
+            return Err(EngineError::ApplyFailed(
+                "typed table-map GPU substitution predecessor or leaf is invalid".to_string(),
+            ));
+        }
+        match expected_predecessor {
+            Some(predecessor)
+                if successor.data_generation <= predecessor.data_generation
+                    || (!resets_existing_rows
+                        && successor.logical_row_count <= predecessor.logical_row_count)
+                    || successor.table_root == predecessor.table_root
+                    || expected_database_root == Some(final_database_root) =>
+            {
+                return Err(EngineError::ApplyFailed(
+                    "typed RowSetInsert successor is not strict".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        let predecessor_index_roots = self
+            .table_index_roots(stable_table_id)
+            .collect::<Vec<TypedIndexGenerationRoot>>();
+        if predecessor_index_roots.as_slice() != expected_predecessor_index_roots
+            || match expected_predecessor {
+                None => {
+                    !expected_predecessor_index_roots.is_empty()
+                        || successor_index_roots
+                            .iter()
+                            .any(|root| root.index_generation != successor.data_generation)
+                }
+                Some(_) => !index_successors_strictly_evolve(
+                    &predecessor_index_roots,
+                    successor_index_roots,
+                    resets_existing_rows,
+                    successor.data_generation,
+                    created_index_ids,
+                    retired_index_ids,
+                ),
+            }
+        {
+            return Err(EngineError::ApplyFailed(
+                "typed table-map GPU substitution index roots are not exact successors".to_string(),
+            ));
+        }
+        let predecessor_columns = expected_predecessor.map(|_| {
+            self.table_columns(stable_table_id)
+                .collect::<Vec<TypedColumnGenerationRoot>>()
+        });
+        if predecessor_columns.as_ref().is_some_and(|columns| {
+            if resets_existing_rows {
+                false
+            } else {
+                columns.len() != successor_columns.len()
+                    || columns
+                        .iter()
+                        .zip(successor_columns)
+                        .any(|(before, after)| {
+                            before.catalog_column_ordinal != after.catalog_column_ordinal
+                                || before.stable_column_id != after.stable_column_id
+                                || before.attnum != after.attnum
+                                || before.column_shape_root != after.column_shape_root
+                        })
+            }
+        }) {
+            return Err(EngineError::ApplyFailed(
+                "typed RowSetInsert changes catalog column identity".to_string(),
+            ));
+        }
+        let transition = gpu_completion.transition()?;
+        let map = match &self.table_map {
+            Some(map) => map.clone(),
+            None => FixedRadixMap::empty(transition.empty_roots.clone())
+                .map_err(|error| EngineError::ApplyFailed(error.to_string()))?,
+        };
+        let expected_leaf = expected_predecessor.map(|table| TypedTableGenerationLeaf {
+            table,
+            columns: predecessor_columns.expect("present table has its captured column leaf"),
+            index_roots: predecessor_index_roots,
+        });
+        let after = TypedTableGenerationLeaf {
+            table: successor,
+            columns: successor_columns.to_vec(),
+            index_roots: successor_index_roots.to_vec(),
+        };
+        let table_map = map
+            .substitute_gpu_completed(
+                stable_table_id,
+                expected_leaf.as_ref(),
+                Some(after),
+                &transition,
+            )
+            .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        Ok(Self {
+            database_root: Some(final_database_root),
+            table_map: Some(table_map),
+        })
+    }
+
+    /// Relink one existing table leaf after GPU CREATE INDEX produces its base index root and
+    /// table-map COW witness.  Its table root/generation must strictly advance to authenticate the
+    /// appended index tuple, while the logical row count, columns, and every existing index
+    /// commitment remain exact predecessors. This keeps DDL within the same immutable root
+    /// snapshot and avoids a second publication owner.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_gpu_completed_index_root_enrollment(
+        &self,
+        stable_table_id: u64,
+        expected_table_predecessor: TypedTableGenerationRoot,
+        successor_table: TypedTableGenerationRoot,
+        expected_database_root: gpu_db_wal::CanonicalDigest,
+        expected_predecessor_index_roots: &[TypedIndexGenerationRoot],
+        successor_index_root: TypedIndexGenerationRoot,
+        final_database_root: gpu_db_wal::CanonicalDigest,
+        gpu_completion: &TypedTableMapGpuCompletion,
+    ) -> Result<Self, EngineError> {
+        let predecessor_columns = self
+            .table_columns(stable_table_id)
+            .collect::<Vec<TypedColumnGenerationRoot>>();
+        let predecessor_index_roots = self
+            .table_index_roots(stable_table_id)
+            .collect::<Vec<TypedIndexGenerationRoot>>();
+        if stable_table_id == 0
+            || stable_table_id == u64::MAX
+            || successor_table.data_generation == 0
+            || successor_table.data_generation == u64::MAX
+            || successor_table.table_root == [0; 32]
+            || successor_table.data_generation <= expected_table_predecessor.data_generation
+            || successor_table.logical_row_count != expected_table_predecessor.logical_row_count
+            || successor_table.table_root == expected_table_predecessor.table_root
+            || final_database_root == [0; 32]
+            || final_database_root == expected_database_root
+            || self.database_root != Some(expected_database_root)
+            || self.table_map.is_none()
+            || self.table(stable_table_id) != Some(expected_table_predecessor)
+            || predecessor_index_roots.as_slice() != expected_predecessor_index_roots
+            || !index_roots_are_catalog_ordered(&predecessor_index_roots)
+            || !index_roots_are_catalog_ordered(std::slice::from_ref(&successor_index_root))
+            || predecessor_index_roots.last().is_some_and(|previous| {
+                successor_index_root.stable_index_id <= previous.stable_index_id
+            })
+        {
+            return Err(EngineError::ApplyFailed(
+                "typed CREATE INDEX root enrollment predecessor or successor is invalid"
+                    .to_string(),
+            ));
+        }
+        let transition = gpu_completion.transition()?;
+        let map = self
+            .table_map
+            .as_ref()
+            .expect("table map is present with a database root")
+            .clone();
+        let expected_leaf = TypedTableGenerationLeaf {
+            table: expected_table_predecessor,
+            columns: predecessor_columns.clone(),
+            index_roots: predecessor_index_roots.clone(),
+        };
+        let mut successor_index_roots = predecessor_index_roots;
+        successor_index_roots.push(successor_index_root);
+        let after = TypedTableGenerationLeaf {
+            table: successor_table,
+            columns: predecessor_columns,
+            index_roots: successor_index_roots,
+        };
+        let table_map = map
+            .substitute_gpu_completed(
+                stable_table_id,
+                Some(&expected_leaf),
+                Some(after),
+                &transition,
+            )
+            .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        Ok(Self {
+            database_root: Some(final_database_root),
+            table_map: Some(table_map),
+        })
+    }
+}
+
 /// The minimum number of recent catalog generations the ring ALWAYS retains, so a lock-free reader
 /// that pinned a `committed_seq` boundary without registering an active snapshot still finds the
 /// generation as-of that boundary (a single statement cannot straddle this many serialized DDLs). DDL
@@ -500,6 +1138,7 @@ impl CatalogHistory {
                 relational_public_schema_exists: true,
                 relational_public_schema_implicit: true,
                 relational_next_oid: FIRST_USER_RELATION_OID,
+                relational_next_table_id: FIRST_USER_TABLE_ID,
                 index_oid_epoch_current: true,
                 legacy_recovery_index_oids_assigned: false,
                 legacy_recovery_next_index_oid: FIRST_LEGACY_RECOVERY_INDEX_OID,
@@ -602,6 +1241,8 @@ pub(crate) struct CatalogSnapshot {
     /// are unchanged; otherwise replaying the staged command could silently assign different OIDs
     /// or column identities than the private catalog used by later statements.
     pub(crate) relational_next_oid: u32,
+    /// High-water for the independent engine-stable table identity domain.
+    pub(crate) relational_next_table_id: u64,
     /// One-way stable-index identity migration state is part of the allocator proof. A transaction
     /// may not rebase across this boundary or forget recovery-assigned identities while retaining
     /// an otherwise byte-identical catalog.

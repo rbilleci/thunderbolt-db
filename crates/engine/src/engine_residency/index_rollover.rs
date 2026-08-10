@@ -1,12 +1,9 @@
 //! Physical ownership for one indexed fixed-width rollover reservation.
 //!
 //! This leaf builds a complete private payload plus every distinct physical index before WAL.
-//! It exposes only scalar inspection, never a canonical operation, mutation launcher, cache
-//! insertion, descriptor publication, or durability surface.
+//! The common codec-5 transaction finalizer owns WAL and calls the narrow post-claim apply method;
+//! this leaf owns no canonical operation, row-id allocator, durability loop, or acknowledgement.
 
-#![allow(dead_code)] // deliberately compiled reservation; live strategy selection remains closed
-
-#[cfg(test)]
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,7 +15,6 @@ use crate::engine_insert_plan::{
 };
 use crate::engine_state::TransactionNamedIndexPublicationGuard;
 use crate::relational_model::{RelationalIndex, RelationalTable};
-use crate::typed_insert_batch::TypedInsertBatch;
 use crate::{Engine, ExecuteError, Index};
 use gpu_db_execution::{
     multi_shard_i32_write_locate_resource_geometry, resident_index_allocated_bytes,
@@ -60,10 +56,6 @@ impl PreparedFixedRolloverLogicalBindings {
         report.retain_boxed_slice(&self.physical)?;
         Ok(())
     }
-
-    fn host_retention_geometry(&self) -> Result<HostRetentionGeometry, ExecuteError> {
-        fixed_rollover_logical_host_geometry(self.raw.len(), self.physical.len())
-    }
 }
 
 struct PreparedPrivateIndexGeneration {
@@ -93,22 +85,10 @@ struct ReservedPrivateIndexGeneration {
 }
 
 struct FixedRolloverResourceLedger {
-    payload_bytes: u64,
-    created_by_bytes: u64,
-    row_id_bytes: u64,
-    payload_sidecar_persistent_bytes: u64,
-    index_persistent_bytes: u64,
     total_persistent_bytes: u64,
     max_concurrent_scratch_bytes: u64,
-    observed_scratch_peak_bytes: u64,
-    bounded_readback_bytes: u64,
     max_concurrent_readback_bytes: u64,
     persistent_allocation_count: u64,
-    raw_index_count: usize,
-    physical_index_count: usize,
-    descriptor_count: usize,
-    max_descriptor_count: usize,
-    gpu_probe_count: usize,
 }
 
 /// Scalar raw/physical geometry derived without building the materialized binding boxes.  The
@@ -167,6 +147,7 @@ pub(super) struct IndexedFixedRolloverPreview<'a> {
     predecessor_capacity: usize,
     predecessor_payload: Arc<CudaResidentDeviceMemory>,
     predecessor_generation: Arc<()>,
+    resets_existing_rows: bool,
     key_proof: BatchKeyConstraintProof,
     validation: ResidentKeyValidationSeal,
     logical: FixedRolloverLogicalForecast,
@@ -211,54 +192,6 @@ impl IndexedFixedRolloverPreview<'_> {
     }
 }
 
-/// Scalar-only evidence from the private generation. Device pointers, allocations, CUDA state,
-/// semantic carriers, and guards cannot cross this boundary.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IndexedFixedRolloverProofReport {
-    pub(crate) raw_index_count: usize,
-    pub(crate) physical_index_count: usize,
-    pub(crate) predecessor_shard_id: u32,
-    pub(crate) successor_shard_id: u32,
-    pub(crate) successor_row_start: usize,
-    pub(crate) incoming_rows: usize,
-    pub(crate) capacity: usize,
-    pub(crate) original_read_snapshot: Index,
-    pub(crate) predecessor_boundary: Index,
-    pub(crate) payload_bytes: u64,
-    pub(crate) created_by_bytes: u64,
-    pub(crate) row_id_bytes: u64,
-    pub(crate) payload_sidecar_persistent_bytes: u64,
-    pub(crate) index_persistent_bytes: u64,
-    pub(crate) total_persistent_bytes: u64,
-    pub(crate) max_concurrent_scratch_bytes: u64,
-    pub(crate) observed_scratch_peak_bytes: u64,
-    pub(crate) bounded_readback_bytes: u64,
-    pub(crate) max_concurrent_readback_bytes: u64,
-    pub(crate) persistent_allocation_count: u64,
-    pub(crate) descriptor_count: usize,
-    pub(crate) max_descriptor_count: usize,
-    pub(crate) capacity_fit_evaluations: u64,
-    pub(crate) budget_scan_entries: u64,
-    pub(crate) gpu_build_count: usize,
-    pub(crate) gpu_probe_count: usize,
-    pub(crate) posting_index_count: usize,
-    pub(crate) duplicate_tolerant_index_count: usize,
-    pub(crate) private_header_zero: bool,
-    pub(crate) final_host_retained_bytes: u64,
-    pub(crate) final_host_allocation_slots: u64,
-    pub(crate) final_host_generation_pin_slots: u64,
-    pub(crate) observed_peak_host_retained_bytes: u64,
-    pub(crate) observed_peak_host_allocation_slots: u64,
-    pub(crate) observed_peak_host_generation_pin_slots: u64,
-    pub(crate) forecast_final_host_retained_bytes: u64,
-    pub(crate) forecast_final_host_allocation_slots: u64,
-    pub(crate) forecast_peak_host_retained_bytes: u64,
-    pub(crate) forecast_peak_host_allocation_slots: u64,
-    pub(crate) concrete_generation_box_bytes: u64,
-    pub(crate) concrete_generation_box_slots: u64,
-}
-
 /// Every completed zero-based build and its exact proof ledger. Index allocations drop before the
 /// private payload owner, so no index can retain a source pointer after rollover abandonment.
 struct PreparedPrivateRolloverIndexes {
@@ -282,18 +215,6 @@ impl PreparedPrivateRolloverIndexes {
         report.retain_arc_owner(&self.mutation_epoch)?;
         Ok(report)
     }
-
-    #[cfg(test)]
-    fn host_retention_report_without_generation_box(
-        &self,
-    ) -> Result<HostRetentionReport, ExecuteError> {
-        let mut report = HostRetentionReport::default();
-        self.key_proof.append_host_retention(&mut report)?;
-        self.validation.append_host_retention(&mut report)?;
-        report.retain_boxed_slice(&self.raw_bindings)?;
-        report.retain_arc_owner(&self.mutation_epoch)?;
-        Ok(report)
-    }
 }
 
 /// Move-only physical reservation. Declaration order is load-bearing: private indexes drop first, then the
@@ -301,18 +222,138 @@ impl PreparedPrivateRolloverIndexes {
 pub(super) struct PreparedIndexedFixedRolloverReservation<'a> {
     indexes: PreparedPrivateRolloverIndexes,
     append: super::fixed_insert::ResidentOpenShardAppendPlan<'a>,
+    manifest: super::prepared_table_index_manifest::PreparedTableIndexManifest<'a>,
     forecast: IndexedPhysicalResourceForecast,
     target_witness: IndexedPhysicalTargetWitness,
     generation_witness: IndexedPhysicalGenerationWitness,
     old_generation_pinned_bytes: u64,
     generation_pin_slots: u64,
     host_retention_peak_before_finalization: HostRetentionGeometry,
-    #[cfg(test)]
-    report: IndexedFixedRolloverProofReport,
-    _named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
+    named_index_lifecycle: Option<TransactionNamedIndexPublicationGuard<'a>>,
 }
 
-impl PreparedIndexedFixedRolloverReservation<'_> {
+/// Dense text/validity rollover beneath the same generic codec-5 terminal. Unlike the older
+/// fixed proof carrier, this owner is built directly from the exact dense payload descriptors;
+/// it owns no WAL encoder, allocator, status transition, or acknowledgement path.
+pub(super) struct PreparedIndexedDenseRolloverReservation<'a> {
+    _indexes: PreparedPrivateRolloverIndexes,
+    append: super::fixed_insert::ResidentOpenShardAppendPlan<'a>,
+    manifest: super::prepared_table_index_manifest::PreparedTableIndexManifest<'a>,
+    named_index_lifecycle: Option<TransactionNamedIndexPublicationGuard<'a>>,
+}
+
+impl<'a> PreparedIndexedDenseRolloverReservation<'a> {
+    pub(super) fn take_named_index_publication_guard(
+        &mut self,
+    ) -> Option<TransactionNamedIndexPublicationGuard<'a>> {
+        self.named_index_lifecycle.take()
+    }
+
+    pub(super) fn take_transaction_terminal_device_apply_guard(
+        &mut self,
+    ) -> Option<std::sync::MutexGuard<'a, ()>> {
+        self.append.take_transaction_terminal_device_apply_guard()
+    }
+
+    pub(super) fn take_transaction_terminal_budget_guard(
+        &mut self,
+    ) -> Option<(std::sync::MutexGuard<'a, ()>, u64)> {
+        self.append.take_transaction_terminal_budget_guard()
+    }
+
+    pub(super) fn manifest_successor_predecessor(
+        &self,
+    ) -> super::prepared_table_index_manifest::PreparedIndexedRolloverManifestPredecessor {
+        self.manifest.indexed_rollover_successor_predecessor()
+    }
+
+    pub(super) fn apply_after_transaction_wal_claim(
+        self,
+        engine: &Engine,
+        created_by: super::AppendCreatedBy<'_>,
+    ) -> Result<(), super::DeviceInsertPlanApplyError> {
+        let Self {
+            _indexes: _,
+            append,
+            manifest,
+            named_index_lifecycle: _,
+        } = self;
+        let expected_commit = match created_by {
+            super::AppendCreatedBy::InsertUniform(sequence) => sequence,
+            _ => return Err(super::DeviceInsertPlanApplyError::PlanDrift),
+        };
+        if engine.catalog_snapshot().commit_seq >= expected_commit {
+            return Err(super::DeviceInsertPlanApplyError::PlanDrift);
+        }
+        let armed = manifest
+            .arm_post_wal_for_indexed_rollover()
+            .map_err(|_| super::DeviceInsertPlanApplyError::PlanDrift)?;
+        let _published_generation = append.publish_indexed_dense_rollover_header()?;
+        armed
+            .publish_after_physical_completion(&engine.read_state.residency, &engine.read_state)
+            .map_err(|_| super::DeviceInsertPlanApplyError::PublisherFailure)
+    }
+}
+
+impl<'a> PreparedIndexedFixedRolloverReservation<'a> {
+    pub(super) fn take_named_index_publication_guard(
+        &mut self,
+    ) -> Option<TransactionNamedIndexPublicationGuard<'a>> {
+        self.named_index_lifecycle.take()
+    }
+
+    pub(super) fn take_transaction_terminal_device_apply_guard(
+        &mut self,
+    ) -> Option<std::sync::MutexGuard<'a, ()>> {
+        self.append.take_transaction_terminal_device_apply_guard()
+    }
+
+    pub(super) fn take_transaction_terminal_budget_guard(
+        &mut self,
+    ) -> Option<(std::sync::MutexGuard<'a, ()>, u64)> {
+        self.append.take_transaction_terminal_budget_guard()
+    }
+
+    pub(super) fn manifest_successor_predecessor(
+        &self,
+    ) -> super::prepared_table_index_manifest::PreparedIndexedRolloverManifestPredecessor {
+        self.manifest.indexed_rollover_successor_predecessor()
+    }
+
+    pub(super) fn apply_after_transaction_wal_claim(
+        self,
+        engine: &Engine,
+        created_by: super::AppendCreatedBy<'_>,
+    ) -> Result<(), super::DeviceInsertPlanApplyError> {
+        let Self {
+            indexes: _,
+            append,
+            manifest,
+            forecast: _,
+            target_witness: _,
+            generation_witness: _,
+            old_generation_pinned_bytes: _,
+            generation_pin_slots: _,
+            host_retention_peak_before_finalization: _,
+            named_index_lifecycle: _,
+        } = self;
+        let expected_commit = match created_by {
+            super::AppendCreatedBy::InsertUniform(sequence) => sequence,
+            _ => return Err(super::DeviceInsertPlanApplyError::PlanDrift),
+        };
+        let catalog = engine.catalog_snapshot();
+        if catalog.commit_seq >= expected_commit {
+            return Err(super::DeviceInsertPlanApplyError::PlanDrift);
+        }
+        let armed = manifest
+            .arm_post_wal_for_indexed_rollover()
+            .map_err(|_| super::DeviceInsertPlanApplyError::PlanDrift)?;
+        let _published_generation = append.publish_fixed_rollover_header()?;
+        armed
+            .publish_after_physical_completion(&engine.read_state.residency, &engine.read_state)
+            .map_err(|_| super::DeviceInsertPlanApplyError::PublisherFailure)
+    }
+
     fn host_retention_report(&self) -> Result<HostRetentionReport, ExecuteError> {
         let mut report = self.append.host_retention_report()?;
         report.merge(self.indexes.host_retention_report()?)?;
@@ -371,213 +412,6 @@ impl PreparedIndexedFixedRolloverReservation<'_> {
     }
 }
 
-#[cfg(test)]
-impl PreparedIndexedFixedRolloverReservation<'_> {
-    pub(super) fn inspect<R>(
-        self,
-        inspect: impl FnOnce(IndexedFixedRolloverProofReport) -> R,
-    ) -> Result<R, ExecuteError> {
-        let report = self.scalar_report_if_intact()?;
-        Ok(inspect(report))
-    }
-
-    fn scalar_report_if_intact(&self) -> Result<IndexedFixedRolloverProofReport, ExecuteError> {
-        let basis = self
-            .append
-            .indexed_fixed_rollover_reservation_basis()
-            .ok_or_else(|| decline("indexed rollover proof lost its fixed private generation"))?;
-        let indexes = &self.indexes;
-        let ledger = &indexes.ledger;
-        let final_host = self.host_retention_report()?.geometry()?;
-        let observed_peak = self
-            .host_retention_peak_before_finalization
-            .peak(final_host);
-        let mut without_generation_box = self.append.host_retention_report()?;
-        without_generation_box.merge(
-            self.indexes
-                .host_retention_report_without_generation_box()?,
-        )?;
-        let without_generation_box = without_generation_box.geometry()?;
-        let mut report = self.report;
-        report.final_host_retained_bytes = final_host.retained_bytes();
-        report.final_host_allocation_slots = final_host.allocation_slots();
-        report.final_host_generation_pin_slots = final_host.generation_pin_slots();
-        report.observed_peak_host_retained_bytes = observed_peak.retained_bytes();
-        report.observed_peak_host_allocation_slots = observed_peak.allocation_slots();
-        report.observed_peak_host_generation_pin_slots = observed_peak.generation_pin_slots();
-        report.forecast_final_host_retained_bytes = self.forecast.final_host_retained_bytes;
-        report.forecast_final_host_allocation_slots = self.forecast.final_host_allocation_slots;
-        report.forecast_peak_host_retained_bytes = self.forecast.peak_host_retained_bytes;
-        report.forecast_peak_host_allocation_slots = self.forecast.peak_host_allocation_slots;
-        report.concrete_generation_box_bytes = final_host
-            .retained_bytes()
-            .checked_sub(without_generation_box.retained_bytes())
-            .ok_or_else(|| decline("indexed rollover generation-box byte report underflowed"))?;
-        report.concrete_generation_box_slots = final_host
-            .allocation_slots()
-            .checked_sub(without_generation_box.allocation_slots())
-            .ok_or_else(|| decline("indexed rollover generation-box slot report underflowed"))?;
-        if !self.append.holds_budget_reservation()
-            || basis.predecessor_shard_id != self.report.predecessor_shard_id
-            || basis.new_shard_id != self.report.successor_shard_id
-            || basis.new_row_start != self.report.successor_row_start
-            || basis.incoming_rows != self.report.incoming_rows
-            || basis.capacity != self.report.capacity
-            || basis.planned_index_allocation_bytes != ledger.index_persistent_bytes
-            || basis.max_index_scratch_bytes != ledger.max_concurrent_scratch_bytes
-            || !Arc::ptr_eq(basis.payload, &indexes.source_payload)
-            || indexes.source_payload.device_ptr() == 0
-            || indexes.mutation_epoch.load(Ordering::Acquire)
-                != indexes.mutation_epoch_expected_even
-            || indexes.mutation_epoch_expected_even & 1 != 0
-            || indexes.key_proof.indexes().len() != indexes.raw_bindings.len()
-            || indexes.validation.original_read_snapshot() != self.report.original_read_snapshot
-            || indexes.validation.predecessor_boundary() != self.report.predecessor_boundary
-            || indexes
-                .source_payload
-                .read_resident_u64_column(0, 1)
-                .map_err(|_| decline("indexed rollover proof private header readback failed"))?
-                != [0]
-        {
-            return Err(decline(
-                "indexed rollover proof retained resource integrity drifted",
-            ));
-        }
-
-        let mut distinct_destinations = BTreeSet::new();
-        let mut actual_index_bytes = 0_u64;
-        let mut descriptor_count = 0_usize;
-        for generation in indexes.generations.iter() {
-            if generation.raw_ordinal >= indexes.key_proof.indexes().len()
-                || generation.memory.device_ptr() == indexes.source_payload.device_ptr()
-                || !distinct_destinations.insert(generation.memory.device_ptr())
-                || generation.memory.metadata().allocated_bytes != generation.allocated_bytes
-                || generation.table_mask == 0
-                || generation.hash_shift
-                    != 32 - (u64::from(generation.table_mask) + 1).trailing_zeros()
-                || generation.descriptor_count == 0
-            {
-                return Err(decline(
-                    "indexed rollover proof retained private index drifted",
-                ));
-            }
-            actual_index_bytes = actual_index_bytes
-                .checked_add(generation.allocated_bytes)
-                .ok_or_else(|| decline("indexed rollover proof index byte sum overflows"))?;
-            descriptor_count = descriptor_count
-                .checked_add(generation.descriptor_count)
-                .ok_or_else(|| decline("indexed rollover proof descriptor sum overflows"))?;
-        }
-        for (raw_ordinal, raw) in indexes.raw_bindings.iter().enumerate() {
-            let physical = indexes
-                .generations
-                .get(raw.physical_ordinal)
-                .ok_or_else(|| decline("indexed rollover proof lost raw-to-physical mapping"))?;
-            if raw.raw_ordinal != raw_ordinal
-                || raw.key_id != physical.key_id
-                || indexes
-                    .key_proof
-                    .indexes()
-                    .get(raw_ordinal)
-                    .is_none_or(|binding| binding.raw_ordinal() != raw_ordinal)
-            {
-                return Err(decline("indexed rollover proof raw mapping drifted"));
-            }
-        }
-        let expected_total = basis
-            .payload_sidecar_allocation_bytes
-            .checked_add(actual_index_bytes)
-            .ok_or_else(|| decline("indexed rollover proof persistent byte sum overflows"))?;
-        let expected_payload_sidecars = basis
-            .payload_bytes
-            .checked_add(basis.created_by_bytes)
-            .and_then(|bytes| bytes.checked_add(basis.row_id_bytes))
-            .ok_or_else(|| decline("indexed rollover proof payload/sidecar bytes overflow"))?;
-        if actual_index_bytes != ledger.index_persistent_bytes
-            || expected_total != ledger.total_persistent_bytes
-            || expected_payload_sidecars != basis.payload_sidecar_allocation_bytes
-            || ledger.payload_bytes != basis.payload_bytes
-            || ledger.created_by_bytes != basis.created_by_bytes
-            || ledger.row_id_bytes != basis.row_id_bytes
-            || basis.payload_sidecar_allocation_bytes != ledger.payload_sidecar_persistent_bytes
-            || basis
-                .payload_sidecar_allocation_count
-                .checked_add(indexes.generations.len() as u64)
-                != Some(ledger.persistent_allocation_count)
-            || ledger.raw_index_count != indexes.raw_bindings.len()
-            || ledger.physical_index_count != indexes.generations.len()
-            || descriptor_count != ledger.descriptor_count
-            || indexes
-                .generations
-                .iter()
-                .map(|generation| generation.descriptor_count)
-                .max()
-                .unwrap_or(0)
-                != ledger.max_descriptor_count
-            || ledger.max_concurrent_scratch_bytes != ledger.observed_scratch_peak_bytes
-            || physical_probe::expected_resource_ledger(
-                indexes.generations.len(),
-                self.report.incoming_rows,
-            ) != Some((
-                ledger.bounded_readback_bytes,
-                ledger.max_concurrent_readback_bytes,
-            ))
-            || self.report.payload_sidecar_persistent_bytes
-                != ledger.payload_sidecar_persistent_bytes
-            || self.report.payload_bytes != ledger.payload_bytes
-            || self.report.created_by_bytes != ledger.created_by_bytes
-            || self.report.row_id_bytes != ledger.row_id_bytes
-            || self.report.index_persistent_bytes != ledger.index_persistent_bytes
-            || self.report.total_persistent_bytes != ledger.total_persistent_bytes
-            || self.report.max_concurrent_scratch_bytes != ledger.max_concurrent_scratch_bytes
-            || self.report.observed_scratch_peak_bytes != ledger.observed_scratch_peak_bytes
-            || self.report.bounded_readback_bytes != ledger.bounded_readback_bytes
-            || self.report.max_concurrent_readback_bytes != ledger.max_concurrent_readback_bytes
-            || self.report.persistent_allocation_count != ledger.persistent_allocation_count
-            || self.report.raw_index_count != ledger.raw_index_count
-            || self.report.physical_index_count != ledger.physical_index_count
-            || self.report.descriptor_count != ledger.descriptor_count
-            || self.report.max_descriptor_count != ledger.max_descriptor_count
-            || self.report.capacity_fit_evaluations != basis.capacity_fit_evaluations
-            || self.report.budget_scan_entries != basis.budget_scan_entries
-            || self.report.gpu_build_count != indexes.generations.len()
-            || self.report.gpu_probe_count != ledger.gpu_probe_count
-            || ledger.gpu_probe_count != indexes.generations.len()
-            || self.report.posting_index_count
-                != indexes
-                    .generations
-                    .iter()
-                    .filter(|generation| generation.created_posting)
-                    .count()
-            || self.report.duplicate_tolerant_index_count
-                != indexes
-                    .generations
-                    .iter()
-                    .filter(|generation| generation.duplicate_tolerant)
-                    .count()
-            || !self.report.private_header_zero
-            || report.final_host_retained_bytes != report.forecast_final_host_retained_bytes
-            || report.final_host_allocation_slots != report.forecast_final_host_allocation_slots
-            || report.observed_peak_host_retained_bytes != report.forecast_peak_host_retained_bytes
-            || report.observed_peak_host_allocation_slots
-                != report.forecast_peak_host_allocation_slots
-            || report.concrete_generation_box_bytes
-                != u64::try_from(indexes.generations.len())
-                    .ok()
-                    .and_then(|count| {
-                        count.checked_mul(
-                            std::mem::size_of::<PreparedPrivateIndexGeneration>() as u64
-                        )
-                    })
-                    .unwrap_or(u64::MAX)
-            || report.concrete_generation_box_slots != 1
-        {
-            return Err(decline("indexed rollover proof retained ledger drifted"));
-        }
-        Ok(report)
-    }
-}
-
 /// Prepare only the fixed-rollover metadata and exact scalar capacity forecast.  No CUDA
 /// allocation, driver call, lookup oracle, private payload, sidecar, or index build is permitted
 /// before the resulting owner consumes an `engine_insert_plan` materialization permit.
@@ -586,25 +420,14 @@ pub(super) fn prepare_fixed_rollover_preview<'a>(
     engine: &'a Engine,
     table: &RelationalTable,
     predecessor_boundary: Index,
-    batch: TypedInsertBatch,
+    source: crate::typed_insert_batch::PreparedResidentAppendSource,
     row_ids: super::DeviceInsertRowIds,
     key_proof: BatchKeyConstraintProof,
     validation: ResidentKeyValidationSeal,
     mutation_gate: std::sync::MutexGuard<'a, ()>,
     named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
-    _commit_proof: &std::sync::MutexGuard<'_, crate::CommitState>,
+    resets_existing_rows: bool,
 ) -> Result<IndexedFixedRolloverPreview<'a>, ExecuteError> {
-    let source_retention_prediction = batch
-        .resident_append_source_host_retention_prediction()
-        .map_err(|_| decline("indexed rollover forecast source retention prediction declined"))?;
-    let source = batch
-        .into_resident_append_source()
-        .ok_or_else(|| decline("indexed rollover forecast lost its resident append source"))?;
-    if source_retention_prediction != source.host_retention_geometry()? {
-        return Err(decline(
-            "indexed rollover forecast source retention materialization drifted",
-        ));
-    }
     let catalog = engine.catalog_snapshot();
     let current_table = catalog
         .relational_catalog
@@ -622,16 +445,19 @@ pub(super) fn prepare_fixed_rollover_preview<'a>(
             "indexed rollover forecast source is not fixed eligible",
         ));
     }
-    let logical = fixed_rollover_logical_forecast(table, &key_proof)?;
+    let logical = fixed_rollover_logical_forecast(table, &key_proof, &source)?;
     let shards = engine.read_state.residency.shards.load_full();
     let open = shards
         .get(&table.name)
         .and_then(|shards| shards.last())
         .ok_or_else(|| decline("indexed rollover forecast has no current open shard"))?;
-    if open
-        .row_count
-        .checked_add(source.row_count())
-        .is_none_or(|end| end <= open.capacity)
+    if (!resets_existing_rows
+        && super::fixed_insert::source_is_all_i32_fixed(&source)
+        && open.resident_device_null_columns.is_empty()
+        && open
+            .row_count
+            .checked_add(source.row_count())
+            .is_none_or(|end| end <= open.capacity))
         || !validation.matches_fixed_rollover_predecessor(
             table,
             catalog.commit_seq,
@@ -773,6 +599,7 @@ pub(super) fn prepare_fixed_rollover_preview<'a>(
         predecessor_capacity: open.capacity,
         predecessor_payload: payload,
         predecessor_generation: Arc::clone(&open.point_route_generation),
+        resets_existing_rows,
         key_proof,
         validation,
         logical,
@@ -815,41 +642,10 @@ pub(super) fn prepare_fixed_rollover_preview<'a>(
     })
 }
 
-/// Test-only construction of the shared opaque forecast. The returned owner has performed no
-/// private CUDA allocation or launch; only the terminal pre-WAL carrier can issue its later
-/// materialization permit.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_indexed_fixed_rollover_forecast<'a>(
-    engine: &'a Engine,
-    table: &RelationalTable,
-    predecessor_boundary: Index,
-    batch: TypedInsertBatch,
-    row_ids: super::DeviceInsertRowIds,
-    key_proof: BatchKeyConstraintProof,
-    validation: ResidentKeyValidationSeal,
-    mutation_gate: std::sync::MutexGuard<'a, ()>,
-    named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
-    commit_proof: &std::sync::MutexGuard<'_, crate::CommitState>,
-) -> Result<super::indexed_forecast::PreparedIndexedPhysicalForecast<'a>, ExecuteError> {
-    prepare_fixed_rollover_preview(
-        engine,
-        table,
-        predecessor_boundary,
-        batch,
-        row_ids,
-        key_proof,
-        validation,
-        mutation_gate,
-        named_index_lifecycle,
-        commit_proof,
-    )
-    .map(super::indexed_forecast::PreparedIndexedPhysicalForecast::fixed_rollover)
-}
-
 fn fixed_rollover_logical_forecast(
     table: &RelationalTable,
     keys: &BatchKeyConstraintProof,
+    source: &crate::typed_insert_batch::PreparedResidentAppendSource,
 ) -> Result<FixedRolloverLogicalForecast, ExecuteError> {
     if table.indexes.is_empty() || keys.indexes().len() != table.indexes.len() {
         return Err(decline(
@@ -873,7 +669,7 @@ fn fixed_rollover_logical_forecast(
         }
         let key_id = super::index_probe_key_id(table, index, raw_ordinal)
             .ok_or_else(|| decline("indexed rollover forecast found no key id"))?;
-        let descriptor = binding.key_column_count();
+        let descriptor = rollover_binding_descriptor_count(table, binding, source)?;
         if descriptor == 0 {
             return Err(decline("indexed rollover forecast found empty descriptor"));
         }
@@ -889,7 +685,11 @@ fn fixed_rollover_logical_forecast(
                     .get(prior)
                     .filter(|binding| binding.raw_ordinal() == prior)
                     .ok_or_else(|| decline("indexed rollover forecast prior binding drifted"))?;
-                prior_descriptor = Some(prior_binding.key_column_count());
+                prior_descriptor = Some(rollover_binding_descriptor_count(
+                    table,
+                    prior_binding,
+                    source,
+                )?);
                 break;
             }
         }
@@ -923,6 +723,31 @@ fn fixed_rollover_logical_forecast(
         max_descriptor_count,
         max_build_scratch_bytes,
     })
+}
+
+fn rollover_binding_descriptor_count(
+    table: &RelationalTable,
+    binding: &crate::engine_insert_plan::batch_key_constraints::IndexBinding,
+    source: &crate::typed_insert_batch::PreparedResidentAppendSource,
+) -> Result<usize, ExecuteError> {
+    let mut validity = BTreeSet::new();
+    binding.try_for_each_resolved_catalog_column(table, |_, column| {
+        let source_column = source
+            .columns()
+            .iter()
+            .find(|candidate| {
+                candidate.column_id() == column.id && candidate.attnum() == column.attnum
+            })
+            .ok_or_else(|| decline("indexed rollover descriptor lost its source column"))?;
+        if source_column.has_validity_bitmap() {
+            validity.insert((column.attnum, column.id));
+        }
+        Ok(())
+    })?;
+    binding
+        .key_column_count()
+        .checked_add(validity.len())
+        .ok_or_else(|| decline("indexed rollover descriptor count overflows"))
 }
 
 fn resident_index_bytes_for_rollover(rows: usize, capacity: usize) -> Result<u64, ExecuteError> {
@@ -1265,6 +1090,7 @@ fn host_geometry_from_execution_scratch(
 fn prepare_logical_bindings(
     table: &RelationalTable,
     keys: &BatchKeyConstraintProof,
+    source: &crate::typed_insert_batch::PreparedResidentAppendSource,
     expected: FixedRolloverLogicalForecast,
 ) -> Result<PreparedFixedRolloverLogicalBindings, ExecuteError> {
     if table.indexes.is_empty() || keys.indexes().len() != table.indexes.len() {
@@ -1291,7 +1117,7 @@ fn prepare_logical_bindings(
         }
         let key_id = super::index_probe_key_id(table, index, raw_ordinal)
             .ok_or_else(|| decline("indexed rollover proof found no resident index key id"))?;
-        let binding_descriptor_count = binding.key_column_count();
+        let binding_descriptor_count = rollover_binding_descriptor_count(table, binding, source)?;
         if binding_descriptor_count == 0 {
             return Err(decline(
                 "indexed rollover proof found an empty physical descriptor",
@@ -1544,13 +1370,620 @@ fn fixed_rollover_build_columns(
     Ok(columns)
 }
 
+fn fixed_rollover_successor_shard(
+    table: &RelationalTable,
+    basis: super::fixed_insert::ResidentFixedRolloverReservationBasis<'_>,
+    commit_seq: Index,
+) -> Result<crate::RelationalResidentShard, ExecuteError> {
+    let incoming_rows = basis.incoming_rows;
+    let fixed_row_bytes = table.columns.iter().try_fold(0_usize, |bytes, column| {
+        let width = match column.ty {
+            crate::SqlType::Int2 | crate::SqlType::Int4 | crate::SqlType::Date => 4,
+            crate::SqlType::Int8 | crate::SqlType::Timestamp => 8,
+            crate::SqlType::Numeric { .. } | crate::SqlType::Uuid => 16,
+            crate::SqlType::Bool => 0,
+            _ => return None,
+        };
+        bytes.checked_add(width)
+    });
+    let resident_bytes = fixed_row_bytes
+        .and_then(|width| incoming_rows.checked_mul(width))
+        .and_then(|bytes| {
+            basis
+                .bool_layouts
+                .len()
+                .checked_mul(incoming_rows.div_ceil(32))
+                .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+                .and_then(|bool_bytes| bytes.checked_add(bool_bytes))
+        })
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| decline("indexed rollover resident-byte geometry overflowed"))?;
+    let names = |include: fn(crate::SqlType) -> bool| {
+        table
+            .columns
+            .iter()
+            .filter(|column| include(column.ty))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>()
+    };
+    Ok(crate::RelationalResidentShard {
+        shard_id: basis.new_shard_id,
+        row_start: basis.new_row_start,
+        row_count: incoming_rows,
+        history_floor_index: 0,
+        capacity: basis.capacity,
+        int4_appendable: true,
+        resident_device_int4_column_stats: basis.int4_stats.to_vec(),
+        resident_bytes,
+        allocated_bytes: basis.payload.metadata().allocated_bytes,
+        count_header_byte_offset: 0,
+        resident_device_int4_columns: names(|ty| {
+            matches!(
+                ty,
+                crate::SqlType::Int2 | crate::SqlType::Int4 | crate::SqlType::Date
+            )
+        }),
+        resident_device_int8_columns: names(|ty| {
+            matches!(ty, crate::SqlType::Int8 | crate::SqlType::Timestamp)
+        }),
+        resident_device_numeric_columns: names(|ty| {
+            matches!(ty, crate::SqlType::Numeric { .. } | crate::SqlType::Uuid)
+        }),
+        resident_device_bool_columns: basis.bool_layouts.to_vec(),
+        resident_device_text_columns: Vec::new(),
+        resident_device_null_columns: Vec::new(),
+        gpu_id: basis.payload.metadata().gpu_id,
+        schema: table.schema.clone(),
+        table: table.name.clone(),
+        point_route_generation: Arc::new(()),
+        device_memory_proof: Some(basis.payload.metadata().clone()),
+        invalidated_by_txn_id: None,
+        invalidated_at_index: None,
+        invalidated_by_memory_pressure: false,
+        memory_pressure_active: false,
+        device_memory: Some(Arc::clone(basis.payload)),
+        deleted_by_region: None,
+        created_by_region: Some(Arc::clone(basis.created_by_region)),
+        row_id_region: basis.row_id_region.map(Arc::clone),
+        max_created_by: commit_seq,
+    })
+}
+
+fn dense_rollover_successor_shard(
+    table: &RelationalTable,
+    basis: super::fixed_insert::ResidentDenseRolloverReservationBasis<'_>,
+    commit_seq: Index,
+) -> Result<crate::RelationalResidentShard, ExecuteError> {
+    let incoming_rows = basis.incoming_rows;
+    let names = |include: fn(crate::SqlType) -> bool| {
+        table
+            .columns
+            .iter()
+            .filter(|column| include(column.ty))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>()
+    };
+    Ok(crate::RelationalResidentShard {
+        shard_id: basis.new_shard_id,
+        row_start: basis.new_row_start,
+        row_count: incoming_rows,
+        history_floor_index: 0,
+        capacity: basis.capacity,
+        int4_appendable: true,
+        resident_device_int4_column_stats: basis.int4_stats.to_vec(),
+        resident_bytes: basis.payload_bytes,
+        allocated_bytes: basis.payload.metadata().allocated_bytes,
+        count_header_byte_offset: 0,
+        resident_device_int4_columns: names(|ty| {
+            matches!(
+                ty,
+                crate::SqlType::Int2 | crate::SqlType::Int4 | crate::SqlType::Date
+            )
+        }),
+        resident_device_int8_columns: names(|ty| {
+            matches!(ty, crate::SqlType::Int8 | crate::SqlType::Timestamp)
+        }),
+        resident_device_numeric_columns: names(|ty| {
+            matches!(ty, crate::SqlType::Numeric { .. } | crate::SqlType::Uuid)
+        }),
+        resident_device_bool_columns: basis.bool_layouts.to_vec(),
+        resident_device_text_columns: basis.text_layouts.to_vec(),
+        resident_device_null_columns: basis.null_layouts.to_vec(),
+        gpu_id: basis.payload.metadata().gpu_id,
+        schema: table.schema.clone(),
+        table: table.name.clone(),
+        point_route_generation: Arc::new(()),
+        device_memory_proof: Some(basis.payload.metadata().clone()),
+        invalidated_by_txn_id: None,
+        invalidated_at_index: None,
+        invalidated_by_memory_pressure: false,
+        memory_pressure_active: false,
+        device_memory: Some(Arc::clone(basis.payload)),
+        deleted_by_region: None,
+        created_by_region: Some(Arc::clone(basis.created_by_region)),
+        row_id_region: basis.row_id_region.map(Arc::clone),
+        max_created_by: commit_seq,
+    })
+}
+
+fn dense_rollover_build_columns(
+    engine: &Engine,
+    table: &RelationalTable,
+    shard: &crate::RelationalResidentShard,
+    binding: &crate::engine_insert_plan::batch_key_constraints::IndexBinding,
+    descriptor_count: usize,
+) -> Result<Vec<CudaCompoundFoldColumn>, ExecuteError> {
+    let columns = binding.resident_constraint_columns(table)?;
+    let snapshot = engine.resident_snapshot_for_shard(shard, table);
+    let descriptors =
+        crate::engine_insert_plan::resident_constraint_generation::resident_columns_for_snapshot(
+            table, &snapshot, &columns,
+        )?;
+    if descriptors.len() != descriptor_count {
+        return Err(decline(
+            "indexed dense rollover descriptor geometry drifted",
+        ));
+    }
+    Ok(descriptors)
+}
+
+/// Materialize a dense indexed rollover beneath the common transaction terminal. Every payload,
+/// sidecar, directory, descriptor map and header capability exists before this returns; the
+/// caller may then claim WAL and consume only the opaque physical reservation.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn materialize_dense<'a>(
+    engine: &'a Engine,
+    table: &RelationalTable,
+    public_table: Option<&RelationalTable>,
+    created_index_ids: &[u64],
+    retired_index_ids: &[u64],
+    predecessor_boundary: Index,
+    source: crate::typed_insert_batch::PreparedResidentAppendSource,
+    row_ids: super::DeviceInsertRowIds,
+    key_proof: BatchKeyConstraintProof,
+    validation: ResidentKeyValidationSeal,
+    mutation_gate: std::sync::MutexGuard<'a, ()>,
+    named_index_lifecycle: TransactionNamedIndexPublicationGuard<'a>,
+    expected_commit_seq: Index,
+    permit: IndexedPhysicalMaterializationPermit,
+    preheld_budget_allocation: Option<std::sync::MutexGuard<'a, ()>>,
+    prior_reserved_bytes: u64,
+    manifest_predecessor: Option<
+        super::prepared_table_index_manifest::PreparedIndexedRolloverManifestPredecessor,
+    >,
+    resets_existing_rows: bool,
+) -> Result<PreparedIndexedDenseRolloverReservation<'a>, ExecuteError> {
+    let catalog = engine.catalog_snapshot();
+    let public_table = public_table.unwrap_or(table);
+    let current_table = catalog
+        .relational_catalog
+        .get(&table.name)
+        .ok_or_else(|| decline("indexed dense rollover lost current table"))?;
+    let shards = engine.read_state.residency.shards.load_full();
+    let open = shards
+        .get(&table.name)
+        .and_then(|shards| shards.last())
+        .ok_or_else(|| decline("indexed dense rollover has no predecessor shard"))?;
+    let current_table_matches = current_table == public_table;
+    let catalog_covers_source = catalog.commit_seq >= source.prepared_catalog_seq();
+    let dense_source = source.requires_dense_rollover();
+    let nonempty_source = source.row_count() != 0;
+    let exact_row_ids = row_ids.is_exact() && row_ids.exact_len_matches(source.row_count());
+    let has_s3_index_transition = !created_index_ids.is_empty() || !retired_index_ids.is_empty();
+    let source_matches =
+        super::fixed_insert::source_matches_indexed_in_place_reservation(&source, table)
+            || (has_s3_index_transition
+                && super::fixed_insert::source_matches_s3_created_index_reservation(
+                    &source, table,
+                ));
+    let predecessor_matches = validation.matches_fixed_rollover_predecessor(
+        table,
+        catalog.commit_seq,
+        open,
+        predecessor_boundary,
+    );
+    let snapshot_is_covered = validation.original_read_snapshot() <= predecessor_boundary;
+    let enrollment_is_complete = public_table.indexes.is_empty()
+        || physical_probe::published_index_enrollment_is_complete(engine, public_table);
+    let created_indexes_are_exact = created_index_ids.iter().enumerate().all(|(ordinal, id)| {
+        *id != 0
+            && (ordinal == 0 || created_index_ids[ordinal - 1] < *id)
+            && table
+                .indexes
+                .iter()
+                .any(|index| u64::from(index.oid) == *id)
+            && !public_table
+                .indexes
+                .iter()
+                .any(|index| u64::from(index.oid) == *id)
+    });
+    let retired_indexes_are_exact = retired_index_ids.iter().enumerate().all(|(ordinal, id)| {
+        *id != 0
+            && (ordinal == 0 || retired_index_ids[ordinal - 1] < *id)
+            && public_table
+                .indexes
+                .iter()
+                .any(|index| u64::from(index.oid) == *id)
+            && !table
+                .indexes
+                .iter()
+                .any(|index| u64::from(index.oid) == *id)
+    });
+    if !current_table_matches
+        || !catalog_covers_source
+        || !dense_source
+        || !nonempty_source
+        || !exact_row_ids
+        || !source_matches
+        || !predecessor_matches
+        || !snapshot_is_covered
+        || !enrollment_is_complete
+        || !created_indexes_are_exact
+        || !retired_indexes_are_exact
+        || created_index_ids
+            .iter()
+            .any(|id| retired_index_ids.binary_search(id).is_ok())
+    {
+        #[cfg(feature = "probe-timing")]
+        eprintln!(
+            "[probe] indexed_dense_witness table={} current_table={} catalog={} dense={} nonempty={} row_ids={} source={} predecessor={} snapshot={} enrollment={}",
+            table.name,
+            current_table_matches,
+            catalog_covers_source,
+            dense_source,
+            nonempty_source,
+            exact_row_ids,
+            source_matches,
+            predecessor_matches,
+            snapshot_is_covered,
+            enrollment_is_complete,
+        );
+        return Err(decline(
+            "indexed dense rollover source or predecessor witness drifted",
+        ));
+    }
+    let logical_forecast = fixed_rollover_logical_forecast(table, &key_proof, &source)?;
+    let logical = prepare_logical_bindings(table, &key_proof, &source, logical_forecast)?;
+    let predecessor_shard_id = open.shard_id;
+    let predecessor_row_start = open.row_start;
+    let predecessor_row_count = open.row_count;
+    let predecessor_gpu_id = open.gpu_id;
+    let predecessor_shards = shards
+        .get(&table.name)
+        .cloned()
+        .ok_or_else(|| decline("indexed dense rollover lost predecessor shard set"))?;
+    drop(shards);
+
+    let append = engine
+        .prepare_resident_open_shard_append_indexed_fixed_rollover_reservation(
+            source,
+            row_ids,
+            mutation_gate,
+            logical.max_concurrent_scratch_bytes,
+            permit,
+            preheld_budget_allocation,
+            prior_reserved_bytes,
+            resets_existing_rows,
+            has_s3_index_transition,
+            has_s3_index_transition.then_some(table),
+        )
+        .map_err(|_| decline("indexed dense rollover append reservation declined"))?;
+    let basis = append
+        .indexed_dense_rollover_reservation_basis()
+        .ok_or_else(|| decline("indexed dense rollover lost its private payload"))?;
+    if basis.predecessor_shard_id != predecessor_shard_id
+        || basis.predecessor_row_count != predecessor_row_count
+        || if resets_existing_rows {
+            basis.new_row_start != 0
+        } else {
+            predecessor_row_start.checked_add(predecessor_row_count) != Some(basis.new_row_start)
+        }
+        || basis.catalog_seq != catalog.commit_seq
+        || basis.capacity != basis.incoming_rows
+        || basis.payload.metadata().gpu_id != predecessor_gpu_id
+        || basis.max_index_scratch_bytes != logical.max_concurrent_scratch_bytes
+    {
+        return Err(decline("indexed dense rollover append geometry drifted"));
+    }
+    let successor = dense_rollover_successor_shard(table, basis, expected_commit_seq)?;
+    let table_size =
+        super::resident_shard_index_table_size(basis.incoming_rows as u64, basis.capacity as u64)
+            .ok_or_else(|| decline("indexed dense rollover index horizon overflows"))?;
+    let table_mask = u32::try_from(table_size - 1)
+        .map_err(|_| decline("indexed dense rollover table mask overflows"))?;
+    let hash_shift = 32 - table_size.trailing_zeros();
+    let one_index_bytes = resident_index_allocated_bytes(
+        table_mask,
+        u64::try_from(basis.capacity)
+            .map_err(|_| decline("indexed dense rollover capacity overflows"))?,
+    )
+    .ok_or_else(|| decline("indexed dense rollover index allocation overflows"))?;
+    let expected_index_bytes = one_index_bytes
+        .checked_mul(logical.physical.len() as u64)
+        .ok_or_else(|| decline("indexed dense rollover total index bytes overflow"))?;
+    if expected_index_bytes != basis.planned_index_allocation_bytes {
+        return Err(decline(
+            "indexed dense rollover planned index bytes drifted",
+        ));
+    }
+
+    let mutation_epoch = engine
+        .read_state
+        .residency
+        .point_index_mutation_epoch_for_table(&engine.read_state, public_table)
+        .ok_or_else(|| decline("indexed dense rollover relation identity changed"))?;
+    let mutation_epoch_expected_even = mutation_epoch.load(Ordering::Acquire);
+    if mutation_epoch_expected_even & 1 != 0
+        || basis
+            .payload
+            .read_resident_u64_column(0, 1)
+            .map_err(|_| decline("indexed dense rollover header readback failed"))?
+            != [0]
+    {
+        return Err(decline(
+            "indexed dense rollover observed an active or public generation",
+        ));
+    }
+
+    let runtime = engine.cuda_driver_probe_runtime();
+    let mut reserved = Vec::with_capacity(logical.physical.len());
+    for physical in logical.physical.iter() {
+        let binding = key_proof
+            .indexes()
+            .get(physical.raw_ordinal)
+            .filter(|binding| binding.raw_ordinal() == physical.raw_ordinal)
+            .ok_or_else(|| decline("indexed dense rollover build binding drifted"))?;
+        let build_columns = dense_rollover_build_columns(
+            engine,
+            table,
+            &successor,
+            binding,
+            physical.descriptor_count,
+        )?;
+        let memory = Arc::new(
+            runtime
+                .retain_device_memory_zeroed(predecessor_gpu_id, one_index_bytes)
+                .map_err(|error| {
+                    decline(format!(
+                        "indexed dense rollover private index allocation failed: {error}"
+                    ))
+                })?,
+        );
+        reserved.push(ReservedPrivateIndexGeneration {
+            raw_ordinal: physical.raw_ordinal,
+            key_id: physical.key_id,
+            memory,
+            table_mask,
+            hash_shift,
+            allocated_bytes: one_index_bytes,
+            descriptor_count: physical.descriptor_count,
+            duplicate_tolerant: physical.duplicate_tolerant,
+            build_columns,
+        });
+    }
+    reserved.sort_unstable_by_key(|generation| {
+        (
+            std::cmp::Reverse(generation.descriptor_count),
+            generation.raw_ordinal,
+        )
+    });
+    let allocation_scope = CudaAllocationScope::with_budget(logical.max_concurrent_scratch_bytes);
+    let mut generations = Vec::with_capacity(reserved.len());
+    let expected_build_host_scratch =
+        resident_typed_index_build_host_scratch_geometry(logical.max_descriptor_count)
+            .ok_or_else(|| decline("indexed dense rollover host scratch overflows"))?;
+    for reserved in reserved {
+        let (status, host_scratch) = basis
+            .payload
+            .submit_resident_typed_index_build_status_observed(
+                &reserved.memory,
+                reserved.table_mask,
+                reserved.hash_shift,
+                &reserved.build_columns,
+                basis.incoming_rows,
+                None,
+                0,
+                reserved.duplicate_tolerant,
+            )
+            .map_err(|error| {
+                decline(format!(
+                    "indexed dense rollover GPU index build failed: {error}"
+                ))
+            })?;
+        if status.declined
+            || host_scratch.bytes > expected_build_host_scratch.bytes
+            || host_scratch.allocation_slots > expected_build_host_scratch.allocation_slots
+        {
+            return Err(decline("indexed dense rollover GPU build declined"));
+        }
+        generations.push(PreparedPrivateIndexGeneration {
+            raw_ordinal: reserved.raw_ordinal,
+            key_id: reserved.key_id,
+            memory: reserved.memory,
+            table_mask: reserved.table_mask,
+            hash_shift: reserved.hash_shift,
+            allocated_bytes: reserved.allocated_bytes,
+            descriptor_count: reserved.descriptor_count,
+            duplicate_tolerant: reserved.duplicate_tolerant,
+            created_posting: status.created_posting,
+        });
+    }
+    if allocation_scope.peak_bytes() > logical.max_concurrent_scratch_bytes
+        || mutation_epoch.load(Ordering::Acquire) != mutation_epoch_expected_even
+        || basis
+            .payload
+            .read_resident_u64_column(0, 1)
+            .map_err(|_| decline("indexed dense rollover post-build header readback failed"))?
+            != [0]
+    {
+        return Err(decline(
+            "indexed dense rollover build escaped its sealed resource envelope",
+        ));
+    }
+    drop(allocation_scope);
+    generations.sort_unstable_by_key(|generation| generation.raw_ordinal);
+    if !prepared_generations_preserve_catalog_duplicate_tolerance(table, &logical, &generations) {
+        return Err(decline(
+            "indexed dense rollover duplicate-tolerance mapping drifted",
+        ));
+    }
+    let actual_index_bytes = generations.iter().try_fold(0_u64, |total, generation| {
+        total
+            .checked_add(generation.allocated_bytes)
+            .ok_or_else(|| decline("indexed dense rollover actual index bytes overflow"))
+    })?;
+    let total_persistent_bytes = basis
+        .payload_sidecar_allocation_bytes
+        .checked_add(actual_index_bytes)
+        .ok_or_else(|| decline("indexed dense rollover persistent bytes overflow"))?;
+    let persistent_allocation_count = basis
+        .payload_sidecar_allocation_count
+        .checked_add(generations.len() as u64)
+        .ok_or_else(|| decline("indexed dense rollover allocation count overflows"))?;
+    let ledger = FixedRolloverResourceLedger {
+        total_persistent_bytes,
+        max_concurrent_scratch_bytes: logical.max_concurrent_scratch_bytes,
+        max_concurrent_readback_bytes: std::mem::size_of::<u32>() as u64,
+        persistent_allocation_count,
+    };
+    let PreparedFixedRolloverLogicalBindings {
+        raw: raw_bindings,
+        physical,
+        ..
+    } = logical;
+    drop(physical);
+    let generations = generations.into_boxed_slice();
+    let source_payload = Arc::clone(basis.payload);
+
+    let mut append = append;
+    append
+        .prepare_indexed_dense_rollover_uniform_commit(expected_commit_seq)
+        .map_err(|_| decline("indexed dense rollover header preparation declined"))?;
+    let publication_basis = append
+        .indexed_dense_rollover_reservation_basis()
+        .ok_or_else(|| decline("indexed dense rollover publication basis disappeared"))?;
+    let new_shard = dense_rollover_successor_shard(table, publication_basis, expected_commit_seq)?;
+    let manifest_entries = generations
+        .iter()
+        .map(|generation| {
+            super::prepared_table_index_manifest::PreparedRolloverIndexManifestEntry {
+                key_id: generation.key_id,
+                memory: Arc::clone(&generation.memory),
+                table_mask: generation.table_mask,
+                hash_shift: generation.hash_shift,
+                duplicate_tolerant: generation.duplicate_tolerant,
+                has_postings: generation.created_posting,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let prefix_entries = created_index_ids
+        .iter()
+        .map(|created_id| {
+            table
+                .indexes
+                .iter()
+                .enumerate()
+                .find(|(_, index)| u64::from(index.oid) == *created_id)
+                .ok_or_else(|| decline("indexed dense rollover lost S3-created index"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flat_map(|(ordinal, index)| {
+            predecessor_shards
+                .iter()
+                .filter(|shard| shard.row_count != 0)
+                .map(move |shard| (ordinal, index, shard))
+        })
+        .map(|(ordinal, index, shard)| {
+            engine.prepare_s3_created_index_manifest_entry(
+                table,
+                index,
+                ordinal,
+                shard,
+                predecessor_boundary,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    let final_key_ids = table
+        .indexes
+        .iter()
+        .enumerate()
+        .map(|(ordinal, index)| crate::engine_residency::index_probe_key_id(table, index, ordinal))
+        .collect::<Option<std::collections::BTreeSet<_>>>()
+        .ok_or_else(|| decline("indexed dense rollover lost a final index key"))?;
+    let retired_key_ids = retired_index_ids
+        .iter()
+        .map(|retired_id| {
+            public_table
+                .indexes
+                .iter()
+                .enumerate()
+                .find(|(_, index)| u64::from(index.oid) == *retired_id)
+                .and_then(|(ordinal, index)| {
+                    crate::engine_residency::index_probe_key_id(public_table, index, ordinal)
+                })
+                // A raw one-column directory may be shared by a surviving catalog index. In
+                // that case it remains the same device directory; only keys absent from the
+                // final catalog are retired from the manifest.
+                .filter(|key_id| !final_key_ids.contains(key_id))
+                .ok_or_else(|| decline("indexed dense rollover lost an S3-retired index key"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest =
+        super::prepared_table_index_manifest::PreparedTableIndexManifest::prepare_indexed_rollover(
+            &engine.read_state.residency,
+            &engine.read_state,
+            table,
+            has_s3_index_transition.then_some(public_table),
+            new_shard,
+            manifest_entries,
+            prefix_entries,
+            retired_key_ids,
+            expected_commit_seq,
+            &mutation_epoch,
+            mutation_epoch_expected_even,
+            manifest_predecessor,
+            resets_existing_rows,
+        )
+        .map_err(|error| {
+            decline(format!(
+                "indexed dense rollover manifest preparation declined: {error:?}"
+            ))
+        })?;
+    Ok(PreparedIndexedDenseRolloverReservation {
+        _indexes: PreparedPrivateRolloverIndexes {
+            generations,
+            source_payload,
+            key_proof,
+            validation,
+            raw_bindings,
+            mutation_epoch,
+            mutation_epoch_expected_even,
+            ledger,
+        },
+        append,
+        manifest,
+        named_index_lifecycle: Some(named_index_lifecycle),
+    })
+}
+
 /// Consume the capacity forecast only after `engine_insert_plan` has issued the move-only
 /// capability.  All CUDA-facing preparation is deliberately below this line.
+#[allow(clippy::too_many_arguments)] // explicit predecessor/budget capabilities prevent a second authority
 pub(super) fn materialize<'a>(
     engine: &'a Engine,
     table: &RelationalTable,
     preview: IndexedFixedRolloverPreview<'a>,
+    expected_commit_seq: Index,
     permit: IndexedPhysicalMaterializationPermit,
+    preheld_budget_allocation: Option<std::sync::MutexGuard<'a, ()>>,
+    prior_reserved_bytes: u64,
+    manifest_predecessor: Option<
+        super::prepared_table_index_manifest::PreparedIndexedRolloverManifestPredecessor,
+    >,
 ) -> Result<PreparedIndexedFixedRolloverReservation<'a>, ExecuteError> {
     let preview_geometry = preview.host_retention_geometry()?;
     let preview_report = preview.host_retention_report()?;
@@ -1575,6 +2008,7 @@ pub(super) fn materialize<'a>(
         predecessor_capacity,
         predecessor_payload,
         predecessor_generation,
+        resets_existing_rows,
         key_proof,
         validation,
         logical: expected_logical,
@@ -1647,7 +2081,7 @@ pub(super) fn materialize<'a>(
     drop(predecessor_payload);
     drop(predecessor_generation);
 
-    let mut logical = prepare_logical_bindings(table, &key_proof, expected_logical)?;
+    let mut logical = prepare_logical_bindings(table, &key_proof, &source, expected_logical)?;
     if logical.raw.len() != expected_logical.raw_index_count
         || logical.physical.len() != expected_logical.physical_index_count
         || logical.descriptor_count != expected_logical.descriptor_count
@@ -1683,6 +2117,11 @@ pub(super) fn materialize<'a>(
             mutation_gate,
             logical.max_concurrent_scratch_bytes,
             permit,
+            preheld_budget_allocation,
+            prior_reserved_bytes,
+            resets_existing_rows,
+            false,
+            None,
         )
         .map_err(|_| decline("indexed rollover materialization append reservation declined"))?;
     let append_host_scratch = append
@@ -1718,6 +2157,7 @@ pub(super) fn materialize<'a>(
         engine,
         table,
         predecessor_boundary,
+        expected_commit_seq,
         append,
         key_proof,
         validation,
@@ -1730,6 +2170,8 @@ pub(super) fn materialize<'a>(
         resource_forecast.old_generation_pinned_bytes,
         resource_forecast.generation_pin_slots,
         host_peak,
+        manifest_predecessor,
+        resets_existing_rows,
     )
 }
 
@@ -1738,7 +2180,8 @@ fn prepare<'a>(
     engine: &'a Engine,
     table: &RelationalTable,
     predecessor_boundary: Index,
-    append: super::fixed_insert::ResidentOpenShardAppendPlan<'a>,
+    expected_commit_seq: Index,
+    mut append: super::fixed_insert::ResidentOpenShardAppendPlan<'a>,
     key_proof: BatchKeyConstraintProof,
     validation: ResidentKeyValidationSeal,
     logical: PreparedFixedRolloverLogicalBindings,
@@ -1750,6 +2193,10 @@ fn prepare<'a>(
     old_generation_pinned_bytes: u64,
     generation_pin_slots: u64,
     mut host_peak: FixedRolloverHostPeakTracker,
+    manifest_predecessor: Option<
+        super::prepared_table_index_manifest::PreparedIndexedRolloverManifestPredecessor,
+    >,
+    resets_existing_rows: bool,
 ) -> Result<PreparedIndexedFixedRolloverReservation<'a>, ExecuteError> {
     let basis = append
         .indexed_fixed_rollover_reservation_basis()
@@ -1775,10 +2222,14 @@ fn prepare<'a>(
         predecessor_boundary,
     ) || validation.original_read_snapshot() > predecessor_boundary
         || predecessor.row_count != basis.predecessor_row_count
-        || basis
-            .predecessor_row_count
-            .checked_add(predecessor.row_start)
-            != Some(basis.new_row_start)
+        || if resets_existing_rows {
+            basis.new_row_start != 0
+        } else {
+            basis
+                .predecessor_row_count
+                .checked_add(predecessor.row_start)
+                != Some(basis.new_row_start)
+        }
         || basis.predecessor_shard_id.checked_add(1) != Some(basis.new_shard_id)
         || basis.payload.metadata().gpu_id != predecessor.gpu_id
         || basis.payload.metadata().allocated_bytes == 0
@@ -1872,15 +2323,6 @@ fn prepare<'a>(
                 "indexed rollover proof private index allocation drifted",
             ));
         }
-        #[cfg(test)]
-        PRIVATE_INDEX_ALLOCATIONS.with(|count| {
-            count.set(
-                count
-                    .get()
-                    .checked_add(1)
-                    .expect("test-only private index allocation counter overflowed"),
-            );
-        });
         reserved.push(ReservedPrivateIndexGeneration {
             raw_ordinal: physical.raw_ordinal,
             key_id: physical.key_id,
@@ -1916,9 +2358,6 @@ fn prepare<'a>(
         reserved_peak.retain_vec(&generation.build_columns)?;
     }
     host_peak.observe(reserved_peak)?;
-
-    #[cfg(test)]
-    physical_probe::apply_test_build_sabotage(&mut reserved)?;
 
     // Build the widest descriptor first. Every reserved build-column owner and the final
     // generation Vec backing are then simultaneously live with the execution primitive's maximum
@@ -1995,15 +2434,6 @@ fn prepare<'a>(
                 "indexed rollover proof zero-based GPU build declined",
             ));
         }
-        #[cfg(test)]
-        PRIVATE_INDEX_BUILDS.with(|count| {
-            count.set(
-                count
-                    .get()
-                    .checked_add(1)
-                    .expect("test-only private index build counter overflowed"),
-            );
-        });
         generations.push(PreparedPrivateIndexGeneration {
             raw_ordinal: reserved.raw_ordinal,
             key_id: reserved.key_id,
@@ -2015,12 +2445,6 @@ fn prepare<'a>(
             duplicate_tolerant: reserved.duplicate_tolerant,
             created_posting: status.created_posting,
         });
-        #[cfg(test)]
-        if take_fail_after_build(generations.len()) {
-            return Err(decline(
-                "indexed rollover proof injected failure after private index build",
-            ));
-        }
     }
     if observed_build_host_scratch != Some(expected_build_host_scratch) {
         return Err(decline(
@@ -2079,30 +2503,12 @@ fn prepare<'a>(
         .payload_sidecar_allocation_count
         .checked_add(generations.len() as u64)
         .ok_or_else(|| decline("indexed rollover proof allocation count overflows"))?;
-    let build_readback_bytes = (generations.len() as u64)
-        .checked_mul(std::mem::size_of::<u32>() as u64)
-        .ok_or_else(|| decline("indexed rollover proof readback bytes overflow"))?;
-    let bounded_readback_bytes = build_readback_bytes
-        .checked_add(probe_evidence.bounded_readback_bytes)
-        .ok_or_else(|| decline("indexed rollover proof probe readback bytes overflow"))?;
     let ledger = FixedRolloverResourceLedger {
-        payload_bytes: basis.payload_bytes,
-        created_by_bytes: basis.created_by_bytes,
-        row_id_bytes: basis.row_id_bytes,
-        payload_sidecar_persistent_bytes: basis.payload_sidecar_allocation_bytes,
-        index_persistent_bytes: actual_index_bytes,
         total_persistent_bytes,
         max_concurrent_scratch_bytes: logical.max_concurrent_scratch_bytes,
-        observed_scratch_peak_bytes,
-        bounded_readback_bytes,
         max_concurrent_readback_bytes: (std::mem::size_of::<u32>() as u64)
             .max(probe_evidence.max_concurrent_readback_bytes),
         persistent_allocation_count,
-        raw_index_count: logical.raw.len(),
-        physical_index_count: generations.len(),
-        descriptor_count: logical.descriptor_count,
-        max_descriptor_count: logical.max_descriptor_count,
-        gpu_probe_count: probe_evidence.gpu_probe_count,
     };
     let PreparedFixedRolloverLogicalBindings {
         raw: raw_bindings,
@@ -2114,56 +2520,48 @@ fn prepare<'a>(
     drop(physical);
     drop(gpu_lookup_oracle);
     let generations = generations.into_boxed_slice();
-    #[cfg(test)]
-    let report = IndexedFixedRolloverProofReport {
-        raw_index_count: ledger.raw_index_count,
-        physical_index_count: ledger.physical_index_count,
-        predecessor_shard_id: basis.predecessor_shard_id,
-        successor_shard_id: basis.new_shard_id,
-        successor_row_start: basis.new_row_start,
-        incoming_rows: basis.incoming_rows,
-        capacity: basis.capacity,
-        original_read_snapshot: validation.original_read_snapshot(),
-        predecessor_boundary,
-        payload_bytes: ledger.payload_bytes,
-        created_by_bytes: ledger.created_by_bytes,
-        row_id_bytes: ledger.row_id_bytes,
-        payload_sidecar_persistent_bytes: ledger.payload_sidecar_persistent_bytes,
-        index_persistent_bytes: ledger.index_persistent_bytes,
-        total_persistent_bytes: ledger.total_persistent_bytes,
-        max_concurrent_scratch_bytes: ledger.max_concurrent_scratch_bytes,
-        observed_scratch_peak_bytes: ledger.observed_scratch_peak_bytes,
-        bounded_readback_bytes: ledger.bounded_readback_bytes,
-        max_concurrent_readback_bytes: ledger.max_concurrent_readback_bytes,
-        persistent_allocation_count: ledger.persistent_allocation_count,
-        descriptor_count: ledger.descriptor_count,
-        max_descriptor_count: ledger.max_descriptor_count,
-        capacity_fit_evaluations: basis.capacity_fit_evaluations,
-        budget_scan_entries: basis.budget_scan_entries,
-        gpu_build_count: generations.len(),
-        gpu_probe_count: ledger.gpu_probe_count,
-        posting_index_count: generations
-            .iter()
-            .filter(|generation| generation.created_posting)
-            .count(),
-        duplicate_tolerant_index_count: generations
-            .iter()
-            .filter(|generation| generation.duplicate_tolerant)
-            .count(),
-        private_header_zero: true,
-        final_host_retained_bytes: 0,
-        final_host_allocation_slots: 0,
-        final_host_generation_pin_slots: 0,
-        observed_peak_host_retained_bytes: 0,
-        observed_peak_host_allocation_slots: 0,
-        observed_peak_host_generation_pin_slots: 0,
-        forecast_final_host_retained_bytes: 0,
-        forecast_final_host_allocation_slots: 0,
-        forecast_peak_host_retained_bytes: 0,
-        forecast_peak_host_allocation_slots: 0,
-        concrete_generation_box_bytes: 0,
-        concrete_generation_box_slots: 0,
-    };
+    append
+        .prepare_fixed_rollover_uniform_commit(expected_commit_seq)
+        .map_err(|_| decline("indexed rollover header publication preparation declined"))?;
+    let publication_basis = append
+        .indexed_fixed_rollover_reservation_basis()
+        .ok_or_else(|| decline("indexed rollover publication lost its fixed basis"))?;
+    let new_shard = fixed_rollover_successor_shard(table, publication_basis, expected_commit_seq)?;
+    let manifest_entries = generations
+        .iter()
+        .map(|generation| {
+            super::prepared_table_index_manifest::PreparedRolloverIndexManifestEntry {
+                key_id: generation.key_id,
+                memory: Arc::clone(&generation.memory),
+                table_mask: generation.table_mask,
+                hash_shift: generation.hash_shift,
+                duplicate_tolerant: generation.duplicate_tolerant,
+                has_postings: generation.created_posting,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let manifest =
+        super::prepared_table_index_manifest::PreparedTableIndexManifest::prepare_indexed_rollover(
+            &engine.read_state.residency,
+            &engine.read_state,
+            table,
+            None,
+            new_shard,
+            manifest_entries,
+            Box::new([]),
+            vec![],
+            expected_commit_seq,
+            &mutation_epoch,
+            mutation_epoch_expected_even,
+            manifest_predecessor,
+            resets_existing_rows,
+        )
+        .map_err(|error| {
+            decline(format!(
+                "indexed rollover manifest preparation declined: {error:?}"
+            ))
+        })?;
     let reservation = PreparedIndexedFixedRolloverReservation {
         indexes: PreparedPrivateRolloverIndexes {
             generations,
@@ -2176,15 +2574,14 @@ fn prepare<'a>(
             ledger,
         },
         append,
+        manifest,
         forecast: resource_forecast,
         target_witness,
         generation_witness,
         old_generation_pinned_bytes,
         generation_pin_slots,
         host_retention_peak_before_finalization: host_peak.peak(),
-        #[cfg(test)]
-        report,
-        _named_index_lifecycle: named_index_lifecycle,
+        named_index_lifecycle: Some(named_index_lifecycle),
     };
     if !reservation.forecast_matches_actual()? {
         return Err(decline(
@@ -2194,810 +2591,6 @@ fn prepare<'a>(
     Ok(reservation)
 }
 
-#[cfg(test)]
-thread_local! {
-    static FAIL_AFTER_PRIVATE_INDEX_BUILDS: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-    static PRIVATE_INDEX_ALLOCATIONS: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-    static PRIVATE_INDEX_BUILDS: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-}
-#[cfg(test)]
-fn take_fail_after_build(completed: usize) -> bool {
-    FAIL_AFTER_PRIVATE_INDEX_BUILDS.with(|slot| {
-        if slot.get() == Some(completed) {
-            slot.set(None);
-            true
-        } else {
-            false
-        }
-    })
-}
-#[cfg(test)]
-fn fail_next_after_private_index_builds(completed: usize) {
-    FAIL_AFTER_PRIVATE_INDEX_BUILDS.with(|slot| slot.set(Some(completed)));
-}
-#[cfg(test)]
-fn private_index_work_counts() -> (u64, u64) {
-    (
-        PRIVATE_INDEX_ALLOCATIONS.with(std::cell::Cell::get),
-        PRIVATE_INDEX_BUILDS.with(std::cell::Cell::get),
-    )
-}
 fn decline(message: impl Into<String>) -> ExecuteError {
     ExecuteError::Serialization(message.into())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[derive(Debug, PartialEq, Eq)]
-    struct PublicStateFingerprint {
-        wal_records: usize,
-        committed_seq: Index,
-        next_row_id: u64,
-        resident_bytes: u64,
-        mutation_epoch: u64,
-        shards: Vec<String>,
-        cache: Vec<String>,
-        coverage: Vec<String>,
-        complete: String,
-        publications: String,
-    }
-    fn device_ptr(memory: Option<&Arc<CudaResidentDeviceMemory>>) -> u64 {
-        memory.map_or(0, |memory| memory.device_ptr())
-    }
-    fn indexed_rollover_engine() -> (Engine, i32) {
-        let mut engine = Engine::new_local();
-        let hardware = engine.cuda_driver_probe_runtime().snapshot();
-        assert!(
-            hardware.driver_available && hardware.device_count != 0,
-            "this ignored proof test requires a real CUDA device"
-        );
-        engine.set_shard_residency_enabled(true);
-        engine.set_shard_size_target(2);
-        for (txn_id, sql) in [
-            (1, "CREATE TABLE inert_index_rollover_other (value int4)"),
-            (
-                2,
-                "CREATE TABLE inert_index_rollover \
-                 (id int4 PRIMARY KEY, shared int4, code int4 UNIQUE)",
-            ),
-            (
-                3,
-                "CREATE INDEX inert_index_rollover_shared_a \
-                 ON inert_index_rollover (shared)",
-            ),
-            (
-                4,
-                "CREATE INDEX inert_index_rollover_shared_b \
-                 ON inert_index_rollover (shared)",
-            ),
-            (
-                5,
-                "CREATE INDEX inert_index_rollover_compound \
-                 ON inert_index_rollover (shared, code)",
-            ),
-            (6, "INSERT INTO inert_index_rollover VALUES (1, 10, 100)"),
-            (7, "INSERT INTO inert_index_rollover VALUES (2, 20, 200)"),
-        ] {
-            engine.execute_text(txn_id, sql).unwrap();
-        }
-        engine
-            .populate_relational_residency_snapshot("inert_index_rollover")
-            .unwrap();
-        engine
-            .publish_relational_resident_indexes("inert_index_rollover")
-            .unwrap();
-        {
-            let shards = engine.read_state.residency.shards.load();
-            let table_shards = shards
-                .get("inert_index_rollover")
-                .expect("resident indexed fixture");
-            assert!(!table_shards.is_empty());
-            let open = table_shards.last().unwrap();
-            assert_eq!(open.row_count, open.capacity);
-        }
-        (engine, 3)
-    }
-    fn indexed_rollover_plan(
-        engine: &Engine,
-        next_id: i32,
-    ) -> crate::engine_insert_plan::PreparedDeviceInsertPlan {
-        let catalog = engine.catalog_snapshot();
-        let command = gpu_db_sql::parse_command(&format!(
-            "INSERT INTO inert_index_rollover VALUES \
-             ({next_id}, {}, {})",
-            next_id * 10,
-            next_id * 100
-        ))
-        .unwrap();
-        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch_proof_only(
-            &command,
-            &catalog,
-            catalog.commit_seq,
-        )
-        .unwrap()
-        .expect("indexed fixed-rollover proof-only builder remains eligible");
-        crate::engine_insert_plan::PreparedDeviceInsertPlan::from_typed_batch(
-            batch, engine, &catalog,
-        )
-        .unwrap()
-    }
-    fn inspect_rollover(
-        engine: &Engine,
-        next_id: i32,
-    ) -> Result<IndexedFixedRolloverProofReport, ExecuteError> {
-        let plan = indexed_rollover_plan(engine, next_id);
-        let proposal = plan
-            .prepare_row_id_proposal(engine.read_state.mvcc.current_row_id())
-            .unwrap();
-        plan.inspect_current_resident_index_rollover(engine, proposal, |report| report)
-    }
-    fn public_state(engine: &Engine) -> PublicStateFingerprint {
-        let shards = engine.read_state.residency.shards.load();
-        let table_shards = shards
-            .get("inert_index_rollover")
-            .into_iter()
-            .flatten()
-            .map(|shard| {
-                format!(
-                    "{}:{}:{}:{}:{}:{}:{}:{:p}",
-                    shard.shard_id,
-                    shard.row_count,
-                    shard.capacity,
-                    device_ptr(shard.device_memory.as_ref()),
-                    device_ptr(shard.created_by_region.as_ref()),
-                    device_ptr(shard.row_id_region.as_ref()),
-                    device_ptr(shard.deleted_by_region.as_ref()),
-                    Arc::as_ptr(&shard.point_route_generation),
-                )
-            })
-            .collect();
-        drop(shards);
-        let cache = engine
-            .read_state
-            .residency
-            .shard_pk_device_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|((table, _, _), _)| table == "inert_index_rollover")
-            .map(|(key, entry)| {
-                format!(
-                    "{key:?}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    entry.resident_device_ptr,
-                    entry.row_count,
-                    entry.published_row_count.load(Ordering::Acquire),
-                    device_ptr(entry.device_index.as_ref()),
-                    entry.table_mask,
-                    entry.hash_shift,
-                    entry.has_postings,
-                    entry.published_has_postings.load(Ordering::Acquire),
-                )
-            })
-            .collect();
-        let coverage = engine
-            .read_state
-            .residency
-            .named_index_coverage
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|((table, _, _), _)| table == "inert_index_rollover")
-            .map(|(key, value)| format!("{key:?}:{value:?}"))
-            .collect();
-        let complete = format!(
-            "{:?}",
-            engine
-                .read_state
-                .residency
-                .named_index_coverage_complete
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get("inert_index_rollover")
-        );
-        let publications = {
-            let catalog = engine.catalog_snapshot();
-            let oid = catalog.relational_catalog["inert_index_rollover"].oid;
-            format!(
-                "{:?}",
-                engine
-                    .read_state
-                    .residency
-                    .named_index_publications
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(&oid)
-            )
-        };
-        PublicStateFingerprint {
-            wal_records: engine.durable_wal_records().len(),
-            committed_seq: engine.committed_seq(),
-            next_row_id: engine.read_state.mvcc.current_row_id(),
-            resident_bytes: engine.relational_resident_bytes_for_gpu(0),
-            mutation_epoch: {
-                let catalog = engine.catalog_snapshot();
-                engine
-                    .read_state
-                    .residency
-                    .point_index_mutation_epoch_for_table(
-                        &engine.read_state,
-                        catalog
-                            .relational_catalog
-                            .get("inert_index_rollover")
-                            .expect("inert rollover table remains catalog-visible"),
-                    )
-                    .expect("exact inert rollover table installs its point slot")
-                    .load(Ordering::Acquire)
-            },
-            shards: table_shards,
-            cache,
-            coverage,
-            complete,
-            publications,
-        }
-    }
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn indexed_fixed_rollover_private_generation_is_exact_gpu_work_and_inert() {
-        let (engine, next_id) = indexed_rollover_engine();
-        let before = public_state(&engine);
-        let reservations_before = super::super::rollover::fixed_rollover_reservation_count();
-        let report = {
-            let plan = indexed_rollover_plan(&engine, next_id);
-            let proposal = plan
-                .prepare_row_id_proposal(engine.read_state.mvcc.current_row_id())
-                .unwrap();
-            plan.inspect_current_resident_index_rollover(&engine, proposal, |report| report)
-                .unwrap()
-        };
-        assert_eq!(public_state(&engine), before);
-        assert_eq!(
-            super::super::rollover::fixed_rollover_reservation_count(),
-            reservations_before + 1
-        );
-        assert_eq!(report.raw_index_count, 5);
-        assert_eq!(report.physical_index_count, 4);
-        assert_eq!(report.gpu_build_count, 4);
-        assert_eq!(report.gpu_probe_count, 4);
-        assert_eq!(report.descriptor_count, 5);
-        assert_eq!(report.max_descriptor_count, 2);
-        assert_eq!(report.posting_index_count, 0);
-        assert_eq!(
-            report.duplicate_tolerant_index_count, 2,
-            "two physical generations retain non-unique/compound posting semantics even though this first build created no postings"
-        );
-        assert_eq!(report.bounded_readback_bytes, 64);
-        assert_eq!(report.max_concurrent_readback_bytes, 12);
-        assert_eq!(report.persistent_allocation_count, 7);
-        assert_eq!(
-            report.payload_sidecar_persistent_bytes,
-            report
-                .payload_bytes
-                .checked_add(report.created_by_bytes)
-                .and_then(|bytes| bytes.checked_add(report.row_id_bytes))
-                .unwrap()
-        );
-        assert_eq!(
-            report.total_persistent_bytes,
-            report
-                .payload_sidecar_persistent_bytes
-                .checked_add(report.index_persistent_bytes)
-                .unwrap()
-        );
-        assert_eq!(
-            report.max_concurrent_scratch_bytes,
-            resident_typed_index_build_preparation_bytes(2).unwrap()
-        );
-        assert_eq!(
-            report.observed_scratch_peak_bytes,
-            report.max_concurrent_scratch_bytes
-        );
-        assert!(report.index_persistent_bytes > 0);
-        assert!(report.payload_bytes > 0);
-        assert!(report.capacity_fit_evaluations > 0);
-        assert!(report.budget_scan_entries > 0);
-        assert_eq!(report.successor_shard_id, report.predecessor_shard_id + 1);
-        assert!(report.successor_row_start > 0);
-        assert_eq!(report.incoming_rows, 1);
-        assert!(report.private_header_zero);
-        assert_eq!(
-            report.final_host_retained_bytes,
-            report.forecast_final_host_retained_bytes
-        );
-        assert_eq!(
-            report.final_host_allocation_slots,
-            report.forecast_final_host_allocation_slots
-        );
-        assert_eq!(
-            report.observed_peak_host_retained_bytes,
-            report.forecast_peak_host_retained_bytes
-        );
-        assert_eq!(
-            report.observed_peak_host_allocation_slots,
-            report.forecast_peak_host_allocation_slots
-        );
-        assert!(
-            report.observed_peak_host_retained_bytes > report.final_host_retained_bytes,
-            "permit-time host scratch must be a non-vacuous measured high-water"
-        );
-        assert!(
-            report.observed_peak_host_allocation_slots > report.final_host_allocation_slots,
-            "permit-time temporary owners must increase the allocation-slot high-water"
-        );
-        assert_eq!(report.final_host_generation_pin_slots, 0);
-        assert_eq!(
-            report.observed_peak_host_generation_pin_slots, 2,
-            "catalog and shard-map generations must both be charged during revalidation"
-        );
-        assert_eq!(
-            report.concrete_generation_box_bytes,
-            report.physical_index_count as u64
-                * std::mem::size_of::<PreparedPrivateIndexGeneration>() as u64
-        );
-        assert_eq!(report.concrete_generation_box_slots, 1);
-    }
-
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn indexed_fixed_rollover_actual_host_high_water_one_short_rejects_before_permit() {
-        let (engine, next_id) = indexed_rollover_engine();
-        let actual = inspect_rollover(&engine, next_id).unwrap();
-        let materialization_scratch = actual
-            .observed_peak_host_retained_bytes
-            .checked_sub(actual.final_host_retained_bytes)
-            .expect("actual peak covers final host retention");
-        let execution_build_scratch =
-            resident_typed_index_build_host_scratch_geometry(actual.max_descriptor_count)
-                .expect("reported descriptor count has exact execution host geometry");
-        assert!(
-            materialization_scratch > actual.max_concurrent_readback_bytes,
-            "the test must target the concrete owner-overlap peak, not only readback"
-        );
-        assert!(
-            materialization_scratch >= execution_build_scratch.bytes,
-            "the one-short limit must cover the execution-owned descriptor/PTX build scratch"
-        );
-        assert!(
-            actual
-                .observed_peak_host_allocation_slots
-                .checked_sub(actual.final_host_allocation_slots)
-                .expect("actual peak covers final host slots")
-                >= execution_build_scratch.allocation_slots,
-            "the one-short limit must cover every execution-owned build allocation slot"
-        );
-        let before = public_state(&engine);
-        let reservations_before = super::super::rollover::fixed_rollover_reservation_count();
-        let work_before = private_index_work_counts();
-        crate::engine_insert_plan::limit_next_test_indexed_host_scratch_to(
-            materialization_scratch - 1,
-        );
-        assert!(matches!(
-            inspect_rollover(&engine, next_id),
-            Err(ExecuteError::Serialization(_))
-        ));
-        assert_eq!(public_state(&engine), before);
-        assert_eq!(
-            super::super::rollover::fixed_rollover_reservation_count(),
-            reservations_before,
-            "actual-high-water one-short must reject before private payload allocation"
-        );
-        assert_eq!(
-            private_index_work_counts(),
-            work_before,
-            "actual-high-water one-short must reject before index allocation or launch"
-        );
-        let retry = inspect_rollover(&engine, next_id).unwrap();
-        assert_eq!(
-            retry.observed_peak_host_retained_bytes,
-            actual.observed_peak_host_retained_bytes
-        );
-        assert_eq!(public_state(&engine), before);
-    }
-
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn indexed_fixed_rollover_exact_minimum_peak_refuses_then_shrinks() {
-        let (mut engine, next_id) = indexed_rollover_engine();
-        let unlimited = inspect_rollover(&engine, next_id).unwrap();
-        assert!(unlimited.capacity > unlimited.incoming_rows);
-        let catalog = engine.catalog_snapshot();
-        let table = &catalog.relational_catalog["inert_index_rollover"];
-        let column_types = table
-            .columns
-            .iter()
-            .map(|column| column.ty)
-            .collect::<Vec<_>>();
-        let minimum = super::super::rollover::ResidentRolloverPlan::fixed_width_null_free(
-            table,
-            &column_types,
-            1,
-            1,
-            true,
-            true,
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        let minimum_persistent = minimum.total_allocation_bytes();
-        let resident = engine.relational_resident_bytes_for_gpu(0);
-        let minimum_peak = minimum_persistent
-            .checked_add(unlimited.max_concurrent_scratch_bytes)
-            .unwrap();
-        engine.set_relational_residency_budget_bytes(0, resident + minimum_peak - 1);
-        let refused_state = public_state(&engine);
-        let reservations_before = super::super::rollover::fixed_rollover_reservation_count();
-        assert!(matches!(
-            inspect_rollover(&engine, next_id),
-            Err(ExecuteError::Serialization(_))
-        ));
-        assert_eq!(public_state(&engine), refused_state);
-        assert_eq!(
-            super::super::rollover::fixed_rollover_reservation_count(),
-            reservations_before,
-            "minimum-peak refusal must happen before private payload allocation"
-        );
-        engine.set_relational_residency_budget_bytes(0, resident + minimum_peak);
-        let exact_state = public_state(&engine);
-        let report = inspect_rollover(&engine, next_id).unwrap();
-        assert_eq!(public_state(&engine), exact_state);
-        assert_eq!(report.capacity, 1);
-        assert_eq!(report.total_persistent_bytes, minimum_persistent);
-        assert_eq!(
-            report
-                .total_persistent_bytes
-                .checked_add(report.max_concurrent_scratch_bytes),
-            Some(minimum_peak)
-        );
-        assert_eq!(
-            super::super::rollover::fixed_rollover_reservation_count(),
-            reservations_before + 1
-        );
-    }
-
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn indexed_fixed_rollover_first_middle_last_failure_is_atomic_and_reusable() {
-        for completed_before_failure in [1, 2, 4] {
-            let (engine, next_id) = indexed_rollover_engine();
-            let before = public_state(&engine);
-            let reservations_before = super::super::rollover::fixed_rollover_reservation_count();
-            let work_before = private_index_work_counts();
-            fail_next_after_private_index_builds(completed_before_failure);
-            assert!(matches!(
-                inspect_rollover(&engine, next_id),
-                Err(ExecuteError::Serialization(_))
-            ));
-            assert_eq!(
-                public_state(&engine),
-                before,
-                "failure after build {completed_before_failure} changed public state"
-            );
-            assert_eq!(
-                super::super::rollover::fixed_rollover_reservation_count(),
-                reservations_before + 1
-            );
-            assert_eq!(
-                private_index_work_counts(),
-                (
-                    work_before.0 + 4,
-                    work_before.1 + completed_before_failure as u64
-                ),
-                "all four persistent directories must exist before the first build"
-            );
-            let retry = inspect_rollover(&engine, next_id).unwrap();
-            assert_eq!(retry.gpu_build_count, 4);
-            assert_eq!(public_state(&engine), before);
-            assert_eq!(
-                private_index_work_counts(),
-                (
-                    work_before.0 + 8,
-                    work_before.1 + completed_before_failure as u64 + 4
-                )
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn indexed_fixed_rollover_gpu_oracle_rejects_misbound_and_reversed_directories() {
-        for (name, sabotage) in [
-            (
-                "swapped",
-                physical_probe::PrivateIndexBuildSabotage::SwapFirstTwoDirectories,
-            ),
-            (
-                "reversed_compound",
-                physical_probe::PrivateIndexBuildSabotage::ReverseCompoundDescriptors,
-            ),
-        ] {
-            let (engine, next_id) = indexed_rollover_engine();
-            let before = public_state(&engine);
-            let work_before = private_index_work_counts();
-            physical_probe::arm_private_index_build_sabotage(sabotage);
-            assert!(matches!(
-                inspect_rollover(&engine, next_id),
-                Err(ExecuteError::Serialization(_))
-            ));
-            assert_eq!(
-                public_state(&engine),
-                before,
-                "{name} private build must not publish, write WAL, or advance eligibility"
-            );
-            assert_eq!(
-                private_index_work_counts(),
-                (work_before.0 + 4, work_before.1 + 4),
-                "{name} must build every destination before the independent lookup rejects it"
-            );
-            let retry = inspect_rollover(&engine, next_id).unwrap();
-            assert_eq!(retry.gpu_probe_count, retry.physical_index_count, "{name}");
-            assert_eq!(public_state(&engine), before, "{name} retry remains inert");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn indexed_fixed_rollover_rejects_catalog_and_physical_coverage_drift() {
-        {
-            let (engine, next_id) = indexed_rollover_engine();
-            let plan = indexed_rollover_plan(&engine, next_id);
-            let proposal = plan
-                .prepare_row_id_proposal(engine.read_state.mvcc.current_row_id())
-                .unwrap();
-            engine
-                .execute_text(
-                    9_001,
-                    "CREATE INDEX inert_index_rollover_extra \
-                     ON inert_index_rollover (code, shared)",
-                )
-                .unwrap();
-            let drifted = public_state(&engine);
-            assert!(plan
-                .inspect_current_resident_index_rollover(&engine, proposal, |_| ())
-                .is_err());
-            assert_eq!(public_state(&engine), drifted);
-        }
-        for sabotage in ["coverage", "cache_geometry"] {
-            let (engine, next_id) = indexed_rollover_engine();
-            let catalog = engine.catalog_snapshot();
-            let table = &catalog.relational_catalog["inert_index_rollover"];
-            let key_id = super::super::index_probe_key_id(table, &table.indexes[0], 0).unwrap();
-            let shard_id = engine
-                .read_state
-                .residency
-                .shards
-                .load()
-                .get("inert_index_rollover")
-                .and_then(|shards| shards.last())
-                .unwrap()
-                .shard_id;
-            let plan = indexed_rollover_plan(&engine, next_id);
-            let proposal = plan
-                .prepare_row_id_proposal(engine.read_state.mvcc.current_row_id())
-                .unwrap();
-            let cache_key = ("inert_index_rollover".to_string(), shard_id, key_id);
-            match sabotage {
-                "coverage" => {
-                    engine
-                        .read_state
-                        .residency
-                        .named_index_coverage
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&cache_key);
-                }
-                "cache_geometry" => {
-                    engine
-                        .read_state
-                        .residency
-                        .shard_pk_device_index
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .get_mut(&cache_key)
-                        .unwrap()
-                        .table_mask ^= 1;
-                }
-                _ => unreachable!(),
-            }
-            let drifted = public_state(&engine);
-            assert!(matches!(
-                plan.inspect_current_resident_index_rollover(&engine, proposal, |_| ()),
-                Err(ExecuteError::Serialization(_))
-            ));
-            assert_eq!(public_state(&engine), drifted, "{sabotage}");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn indexed_fixed_rollover_null_shape_declines_but_canonical_null_semantics_survive() {
-        let mut engine = Engine::new_local();
-        let hardware = engine.cuda_driver_probe_runtime().snapshot();
-        assert!(
-            hardware.driver_available && hardware.device_count != 0,
-            "this ignored differential requires a real CUDA device"
-        );
-        engine.set_shard_residency_enabled(true);
-        engine.set_shard_size_target(1);
-        for (txn_id, sql) in [
-            (
-                1,
-                "CREATE TABLE nullable_index_rollover \
-                 (id int4 PRIMARY KEY, value int4)",
-            ),
-            (
-                2,
-                "CREATE INDEX nullable_index_rollover_value \
-                 ON nullable_index_rollover (value)",
-            ),
-            (3, "INSERT INTO nullable_index_rollover VALUES (1, NULL)"),
-        ] {
-            engine.execute_text(txn_id, sql).unwrap();
-        }
-        engine
-            .populate_relational_residency_snapshot("nullable_index_rollover")
-            .unwrap();
-        engine
-            .publish_relational_resident_indexes("nullable_index_rollover")
-            .unwrap();
-        let catalog = engine.catalog_snapshot();
-        let command =
-            gpu_db_sql::parse_command("INSERT INTO nullable_index_rollover VALUES (2, NULL)")
-                .unwrap();
-        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch_proof_only(
-            &command,
-            &catalog,
-            catalog.commit_seq,
-        )
-        .unwrap()
-        .expect("NULL batch still reaches the proof-only semantic carrier");
-        let plan = crate::engine_insert_plan::PreparedDeviceInsertPlan::from_typed_batch(
-            batch, &engine, &catalog,
-        )
-        .unwrap();
-        let proposal = plan
-            .prepare_row_id_proposal(engine.read_state.mvcc.current_row_id())
-            .unwrap();
-        let wal_before = engine.durable_wal_records().len();
-        let boundary_before = engine.committed_seq();
-        assert!(matches!(
-            plan.inspect_current_resident_index_rollover(&engine, proposal, |_| ()),
-            Err(ExecuteError::Serialization(_))
-        ));
-        assert_eq!(engine.durable_wal_records().len(), wal_before);
-        assert_eq!(engine.committed_seq(), boundary_before);
-        engine
-            .execute_text(4, "INSERT INTO nullable_index_rollover VALUES (2, NULL)")
-            .unwrap();
-        let rows = engine
-            .execute_relational_select_text(
-                "SELECT id, value FROM nullable_index_rollover ORDER BY id",
-            )
-            .unwrap()
-            .rows;
-        assert_eq!(
-            rows,
-            vec![
-                vec![crate::SqlValue::Int4(1), crate::SqlValue::Null],
-                vec![crate::SqlValue::Int4(2), crate::SqlValue::Null],
-            ]
-        );
-    }
-
-    #[test]
-    fn indexed_fixed_rollover_owner_and_entrypoint_remain_production_ineligible() {
-        let source = include_str!("index_rollover.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("reservation implementation precedes tests");
-        assert!(!source.contains("MutexGuard<'a, crate::CommitState>"));
-        let wrapper = source
-            .split("struct PreparedIndexedFixedRolloverReservation")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("\n}\n\n#[cfg(test)]\nimpl PreparedIndexedFixedRolloverReservation")
-                    .next()
-            })
-            .expect("move-only rollover owner");
-        assert!(
-            wrapper.find("indexes:") < wrapper.find("append:")
-                && wrapper.find("append:") < wrapper.find("report:")
-                && wrapper.find("report:") < wrapper.find("_named_index_lifecycle:"),
-            "drop order must remain private indexes -> append -> report -> lifecycle"
-        );
-        let owner = source
-            .split("\n#[cfg(test)]\nimpl PreparedIndexedFixedRolloverReservation")
-            .nth(1)
-            .and_then(|section| section.split("\n/// Prepare only").next())
-            .expect("scalar-only owner inspection");
-        assert!(owner.contains("fn inspect"));
-        for forbidden in [
-            "submit_resident",
-            "apply_resident",
-            "bind_for_current_commit",
-            "durable_wal",
-            "publish_",
-            "cache.insert",
-            "into_parts",
-        ] {
-            assert!(
-                !owner.contains(forbidden),
-                "scalar owner inspection must not expose {forbidden}"
-            );
-        }
-        assert!(!source.contains("pub(crate) fn new"));
-        assert!(!source.contains("DeviceInsertPlan"));
-        assert!(!source.contains("begin_point_index_mutation"));
-        assert!(!source.contains("enter_final_publication"));
-        let prepared_generation = source
-            .split("struct PreparedPrivateIndexGeneration")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("struct ReservedPrivateIndexGeneration")
-                    .next()
-            })
-            .expect("prepared private generation contract");
-        assert!(prepared_generation.contains("duplicate_tolerant: bool"));
-        assert!(source.contains("duplicate_tolerant: reserved.duplicate_tolerant"));
-        assert!(source.contains("prepared_generations_preserve_catalog_duplicate_tolerance"));
-        assert!(source.contains("expected_duplicate_tolerant != generation.duplicate_tolerant"));
-        assert!(source.contains("generation.created_posting"));
-        assert!(source.contains("generation.duplicate_tolerant"));
-        let physical_probe = include_str!("index_rollover/physical_probe.rs");
-        assert!(physical_probe.contains("submit_multi_shard_i32_write_locate"));
-        for forbidden in [
-            "apply_resident",
-            "bind_for_current_commit",
-            "durable_wal",
-            "begin_point_index_mutation",
-            "enter_final_publication",
-        ] {
-            assert!(
-                !physical_probe.contains(forbidden),
-                "private GPU lookup leaf must not expose {forbidden}"
-            );
-        }
-        let evidence = physical_probe
-            .split("pub(super) struct PrivateGpuLookupEvidence")
-            .nth(1)
-            .and_then(|section| section.split("}\n\nimpl PrivateGpuLookupOracle").next())
-            .expect("scalar private GPU lookup evidence");
-        assert!(evidence.contains("gpu_probe_count"));
-        assert!(evidence.contains("bounded_readback_bytes"));
-        assert!(evidence.contains("max_concurrent_readback_bytes"));
-        assert!(!evidence.contains("Vec<"));
-        let module = include_str!("../engine_residency.rs");
-        assert!(module.contains("pub(crate) mod index_rollover;"));
-        assert!(module.contains("mod indexed_reservation;"));
-        let entrypoint = include_str!("../engine_insert_plan.rs")
-            .split("pub(crate) fn inspect_current_resident_index_rollover")
-            .nth(1)
-            .and_then(|section| {
-                section
-                    .split("\n    /// Revalidate the catalog-order semantic carrier")
-                    .next()
-            })
-            .expect("test-only engine-plan inspection entrypoint");
-        for forbidden in [
-            "bind_for_current_commit",
-            "apply_resident",
-            "durable_wal",
-            "enter_final_publication",
-        ] {
-            assert!(
-                !entrypoint.contains(forbidden),
-                "test-only entrypoint must not expose {forbidden}"
-            );
-        }
-        let fixed = include_str!("fixed_insert.rs");
-        let production_eligibility = fixed
-            .split("fn source_matches_table")
-            .nth(1)
-            .and_then(|section| section.split("\n}\n").next())
-            .expect("production append eligibility");
-        assert!(production_eligibility.contains("table.indexes.is_empty()"));
-    }
 }

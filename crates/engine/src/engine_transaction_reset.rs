@@ -334,6 +334,7 @@ impl Engine {
                     | PreparedMutation::Delete { table, .. } => table,
                 },
                 TransactionOperation::TableReset(reset) => &reset.table,
+                TransactionOperation::TypedInsert(staged) => &staged.table,
             };
             newly_fenced.contains(table).then_some(table)
         }) {
@@ -572,10 +573,11 @@ impl Engine {
         )
     }
 
-    /// Guard the low-level compatibility claimant, including binary covered-route records.
-    /// Ordinary row bodies share the same dependency-closure discipline as SQL; catalog,
-    /// sequence, and table-reset binary bodies are internal typed-transaction artifacts and are
-    /// rejected from this independently callable raw claimant.
+    /// Guard the low-level compatibility claimant for non-INSERT commands. Binary INSERT bodies
+    /// are a decode-only historical format and must never acquire a live raw table lease; the
+    /// outer generic-commit admission rejects them first, and this boundary repeats that check
+    /// for direct crate-private callers. Catalog, sequence, and table-reset binary bodies are
+    /// internal typed-transaction artifacts and are also rejected here.
     pub(crate) fn acquire_raw_mutation_table_access(
         &self,
         payload: &[u8],
@@ -625,7 +627,11 @@ impl Engine {
             Ok(())
         };
         match record {
-            BinaryWalRecord::Insert(record) => add_table(&record.table)?,
+            BinaryWalRecord::Insert(_) => {
+                return Err(EngineError::ApplyFailed(
+                    "raw serialized INSERT must enter typed transaction admission".to_string(),
+                ));
+            }
             BinaryWalRecord::DeleteByKey(record) => add_table(&record.table)?,
             BinaryWalRecord::UpdateByKey(record) => add_table(&record.table)?,
             BinaryWalRecord::Transaction(record) => {
@@ -641,8 +647,13 @@ impl Engine {
                 }
                 for mutation in &record.mutations {
                     let table = match mutation {
-                        BinaryTransactionMutation::Insert { table, .. }
-                        | BinaryTransactionMutation::Update { table, .. }
+                        BinaryTransactionMutation::Insert { .. } => {
+                            return Err(EngineError::ApplyFailed(
+                                "raw serialized INSERT must enter typed transaction admission"
+                                    .to_string(),
+                            ));
+                        }
+                        BinaryTransactionMutation::Update { table, .. }
                         | BinaryTransactionMutation::Delete { table, .. } => table,
                     };
                     add_table(table)?;
@@ -1730,20 +1741,32 @@ pub(crate) fn transaction_row_deltas(operations: &[TransactionOperation]) -> Vec
         .iter()
         .filter_map(|operation| match operation {
             TransactionOperation::Row(staged) => Some(staged.delta.clone()),
-            TransactionOperation::Catalog(_) | TransactionOperation::TableReset(_) => None,
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::TableReset(_)
+            | TransactionOperation::TypedInsert(_) => None,
         })
         .collect()
 }
 
+/// A surviving statement-order row operation after reset folding.  Typed INSERT retains its own
+/// post-batch authority here so final WAL binding never reconstructs a legacy `WriteDelta`.
+#[derive(Clone)]
+pub(crate) enum FinalTransactionRowOperation {
+    Legacy(Arc<StagedRowOperation>),
+    TypedInsert(Arc<crate::engine_transaction_delta::StagedTypedInsert>),
+}
+
 pub(crate) fn final_transaction_row_operations(
     operations: &[TransactionOperation],
-) -> Vec<Arc<StagedRowOperation>> {
+) -> Vec<FinalTransactionRowOperation> {
     let last_resets = operations
         .iter()
         .enumerate()
         .filter_map(|(ordinal, operation)| match operation {
             TransactionOperation::TableReset(reset) => Some((reset.table.clone(), ordinal)),
-            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::Row(_)
+            | TransactionOperation::TypedInsert(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
     operations
@@ -1755,10 +1778,20 @@ pub(crate) fn final_transaction_row_operations(
                     .get(mutation_table(&staged.mutation))
                     .is_none_or(|reset| ordinal > *reset) =>
             {
-                Some(Arc::clone(staged))
+                Some(FinalTransactionRowOperation::Legacy(Arc::clone(staged)))
+            }
+            TransactionOperation::TypedInsert(staged)
+                if last_resets
+                    .get(staged.table.as_str())
+                    .is_none_or(|reset| ordinal > *reset) =>
+            {
+                Some(FinalTransactionRowOperation::TypedInsert(Arc::clone(
+                    staged,
+                )))
             }
             TransactionOperation::Catalog(_)
             | TransactionOperation::Row(_)
+            | TransactionOperation::TypedInsert(_)
             | TransactionOperation::TableReset(_) => None,
         })
         .collect()
@@ -1772,17 +1805,24 @@ pub(crate) fn final_transaction_operations(
         .enumerate()
         .filter_map(|(ordinal, operation)| match operation {
             TransactionOperation::TableReset(reset) => Some((reset.table.clone(), ordinal)),
-            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => None,
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::Row(_)
+            | TransactionOperation::TypedInsert(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
     let rows = final_transaction_row_operations(operations)
         .into_iter()
-        .map(|staged| staged.delta.clone())
+        .filter_map(|staged| match staged {
+            FinalTransactionRowOperation::Legacy(staged) => Some(staged.delta.clone()),
+            FinalTransactionRowOperation::TypedInsert(_) => None,
+        })
         .collect();
     let mut resets = Vec::new();
     for (ordinal, operation) in operations.iter().enumerate() {
         match operation {
-            TransactionOperation::Catalog(_) | TransactionOperation::Row(_) => {}
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::Row(_)
+            | TransactionOperation::TypedInsert(_) => {}
             TransactionOperation::TableReset(reset)
                 if last_resets.get(&reset.table) == Some(&ordinal) =>
             {
@@ -1807,6 +1847,11 @@ pub(crate) fn final_transaction_write_set(operations: &[TransactionOperation]) -
         write_set
             .table_oids
             .extend(reset.dependency_identities.into_values());
+    }
+    for operation in final_transaction_row_operations(operations) {
+        if let FinalTransactionRowOperation::TypedInsert(staged) = operation {
+            write_set.extend_deduplicated(&staged.write_set);
+        }
     }
     write_set
 }

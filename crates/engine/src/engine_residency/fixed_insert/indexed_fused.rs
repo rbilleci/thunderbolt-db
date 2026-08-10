@@ -1,7 +1,8 @@
-//! Exact all-i32 fused-tail ownership for the inert indexed in-place reservation.
+//! Exact all-i32 fused-tail ownership for the indexed in-place reservation.
 //!
 //! This leaf owns the allocation-free forecast, sealed append derivation, and opaque prepared
-//! token. It deliberately has no WAL, apply, cache, descriptor, or publication operation.
+//! token. It deliberately has no WAL or transaction authority; the enclosing reservation owns
+//! the bounded post-WAL apply and common residency publication handoff.
 
 use super::{
     DeviceInsertPlanPrepareError, PreparedResidentAppendBranch, ResidentOpenShardAppendPlan,
@@ -130,6 +131,30 @@ impl PreparedIndexedInPlaceFusedApply {
         self.created_by_stamps
             .iter()
             .all(|stamp| *stamp == self.expected_commit_seq)
+    }
+
+    pub(in super::super) fn expected_commit_sequence(&self) -> Index {
+        self.expected_commit_seq
+    }
+
+    /// Write the sealed payload and identity sidecars while intentionally withholding the shard
+    /// row-count header.  The indexed reservation submits its independently prepared tail next;
+    /// only that tail's success is allowed to make these rows visible.
+    pub(in super::super) fn apply_payload_before_header(
+        self,
+    ) -> Result<
+        (
+            gpu_db_execution::CudaResidentIndexStatus,
+            gpu_db_execution::PreparedI32FusedHeader,
+        ),
+        super::DeviceInsertPlanApplyError,
+    > {
+        if !self.stamps_match_expected_commit() {
+            return Err(super::DeviceInsertPlanApplyError::PlanDrift);
+        }
+        self.fused
+            .apply_before_header(&self.created_by_stamps)
+            .map_err(|_| super::DeviceInsertPlanApplyError::PublisherFailure)
     }
 }
 

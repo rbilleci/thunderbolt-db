@@ -4,6 +4,8 @@
 //! and dense payload boundary so physical layout cannot grow back into the semantic builder.
 
 use super::*;
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 
 /// Move-only, catalog-order resident payload derived solely by consuming a sealed batch.
 ///
@@ -13,8 +15,198 @@ pub(crate) struct PreparedResidentAppendSource {
     pub(super) table: TypedInsertBatchTable,
     pub(super) row_count: u32,
     pub(super) columns: Box<[PreparedResidentAppendColumn]>,
+    /// Exact payload geometry derived while the strict final image still owns the vectors.
+    /// Runtime generation needs this scalar to reserve its encoder, but must not rescan every
+    /// logical cell immediately before `write_rows` consumes those same vectors.
+    pub(super) runtime_value_bytes: usize,
     pub(super) dependencies: Box<[TypedInsertDependencyBinding]>,
     pub(super) requires_dense_rollover: bool,
+}
+
+impl PreparedResidentAppendSource {
+    /// Strict constructor for a decoded final-table image. The image remains move-only:
+    /// successful construction transfers its typed vector owners, while a catalog mismatch drops
+    /// the complete image and exposes no partially materialized append source.
+    pub(crate) fn from_decoded_final_table_image(
+        image: DecodedTypedImage,
+        table: &RelationalTable,
+        table_schema_digest: gpu_db_wal::CanonicalDigest,
+        prepared_catalog_seq: Index,
+    ) -> Result<Self, EngineError> {
+        image.into_resident_append_source(table, table_schema_digest, prepared_catalog_seq)
+    }
+
+    /// Compose the table-local statements and bind their shared image to its plural S7 table
+    /// reference before either CUDA generation or WAL closure observes the layout digest.
+    pub(crate) fn from_decoded_final_table_images_for_table_ref(
+        mut images: Vec<(DecodedTypedImage, Arc<[u8]>)>,
+        table_ref: u32,
+        table: &RelationalTable,
+        table_schema_digest: gpu_db_wal::CanonicalDigest,
+        prepared_catalog_seq: Index,
+    ) -> Result<(Self, Arc<[u8]>), EngineError> {
+        let (image, encoded) = if images.len() == 1 {
+            images.pop().expect("one checked final image")
+        } else {
+            return DecodedTypedImage::concatenate_final_table_images_for_table_ref(
+                images.into_iter().map(|(image, _)| image).collect(),
+                table_ref,
+            )
+            .and_then(|(image, encoded)| {
+                image
+                    .into_resident_append_source(table, table_schema_digest, prepared_catalog_seq)
+                    .map(|source| (source, encoded))
+            });
+        };
+        // Statement sealing uses table reference zero. The first table in the deterministic S7
+        // order is also zero, so the strict source image is already the exact final authority.
+        // Do not produce a byte-identical replacement and then strictly decode it a second time:
+        // the original decode above authenticated its grammar and layout digest, and the opaque
+        // Arc remains the same sole S7/GPU image authority. Nonzero table references still take
+        // the explicit rebind because that reference participates in the layout digest.
+        if image.facts().role == TypedImageRole::FinalTableImage
+            && image.columns().all(|column| column.table_ref == table_ref)
+        {
+            return image
+                .into_resident_append_source(table, table_schema_digest, prepared_catalog_seq)
+                .map(|source| (source, encoded));
+        }
+        let (image, encoded) = image.rebind_final_table_ref(table_ref)?;
+        let source =
+            image.into_resident_append_source(table, table_schema_digest, prepared_catalog_seq)?;
+        Ok((source, encoded))
+    }
+}
+
+/// Borrowed, fully checked row-major view of the same catalog-order source used by resident
+/// apply. It creates no row matrix and owns no fallback bytes; the type-neutral runtime encoder
+/// consumes logical cells through this view before the source moves into physical apply.
+pub(crate) struct PreparedResidentRuntimeGenerationView<'a> {
+    pub(super) source: &'a PreparedResidentAppendSource,
+    pub(super) geometry: gpu_db_execution::RuntimeTypedInsertGenerationGeometry,
+    pub(super) first_row_id: u64,
+    pub(super) row_sources:
+        &'a [crate::engine_transaction_delta::TypedInsertRuntimeGenerationRowSource],
+}
+
+impl PreparedResidentRuntimeGenerationView<'_> {
+    pub(crate) fn geometry(&self) -> gpu_db_execution::RuntimeTypedInsertGenerationGeometry {
+        self.geometry
+    }
+
+    pub(crate) fn first_row_id(&self) -> u64 {
+        self.first_row_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn final_row_digest(
+        &self,
+        row_ordinal: usize,
+        image_ref: u32,
+        image_row_ordinal: u32,
+    ) -> Result<[u8; 32], EngineError> {
+        if row_ordinal >= self.geometry.rows {
+            return Err(generation_source_error("final-row ordinal"));
+        }
+        let stable_row_id = self
+            .first_row_id
+            .checked_add(
+                u64::try_from(row_ordinal)
+                    .map_err(|_| generation_source_error("final-row identity ordinal"))?,
+            )
+            .ok_or_else(|| generation_source_error("final-row identity"))?;
+        let domain = b"gpu-db/write001/s7-final-row/v2";
+        let mut digest = Sha256::new();
+        digest.update((domain.len() as u64).to_le_bytes());
+        digest.update(domain);
+        digest.update(self.source.table.stable_table_id.to_le_bytes());
+        digest.update(stable_row_id.to_le_bytes());
+        digest.update(image_ref.to_le_bytes());
+        digest.update(image_row_ordinal.to_le_bytes());
+        digest.update(
+            u32::try_from(self.source.columns.len())
+                .map_err(|_| generation_source_error("final-row column count"))?
+                .to_le_bytes(),
+        );
+        for (ordinal, column) in self.source.columns.iter().enumerate() {
+            digest.update(
+                u32::try_from(ordinal)
+                    .map_err(|_| generation_source_error("final-row column ordinal"))?
+                    .to_le_bytes(),
+            );
+            digest.update(column.column_id.to_le_bytes());
+            digest.update(column.attnum.to_le_bytes());
+            digest.update(typed_image_sql_storage(column.ty));
+            digest.update(column.type_oid.to_le_bytes());
+            digest.update(column.type_size.to_le_bytes());
+            let validity = column
+                .validity
+                .as_ref()
+                .ok_or_else(|| generation_source_error("final-row validity"))?;
+            let values = column
+                .values
+                .as_ref()
+                .ok_or_else(|| generation_source_error("final-row values"))?;
+            with_logical_cell(
+                validity,
+                values,
+                column.ty,
+                row_ordinal,
+                |is_null, value| {
+                    digest.update([u8::from(is_null)]);
+                    digest.update(
+                        u32::try_from(value.len())
+                            .expect("typed final-row value length fits u32")
+                            .to_le_bytes(),
+                    );
+                    digest.update(value);
+                },
+            )?;
+        }
+        Ok(digest.finalize().into())
+    }
+
+    pub(crate) fn write_rows(
+        &self,
+        encoder: &mut gpu_db_execution::RuntimeTypedInsertGenerationEncoder<'_>,
+    ) {
+        let table_id = self.source.table.stable_table_id;
+        for row in 0..self.geometry.rows {
+            let row_source = self.row_sources[row];
+            encoder.write_row(gpu_db_execution::RuntimeTypedInsertGenerationRow {
+                stable_table_id: table_id,
+                stable_row_id: row_source.stable_row_id,
+                source_statement_ordinal: row_source.statement_ordinal,
+                source_row_ordinal: row_source.source_row_ordinal,
+                cell_count: u32::try_from(self.source.columns.len())
+                    .expect("prepared generation column count fits u32"),
+            });
+            for (ordinal, column) in self.source.columns.iter().enumerate() {
+                let validity = column
+                    .validity
+                    .as_ref()
+                    .expect("prepared generation retains validity");
+                let values = column
+                    .values
+                    .as_ref()
+                    .expect("prepared generation retains values");
+                with_logical_cell(validity, values, column.ty, row, |is_null, value| {
+                    encoder.write_cell(gpu_db_execution::RuntimeTypedInsertGenerationCell {
+                        catalog_column_ordinal: u32::try_from(ordinal)
+                            .expect("typed column ordinal fits u32"),
+                        stable_column_id: column.column_id,
+                        attnum: column.attnum,
+                        storage: typed_image_sql_storage(column.ty),
+                        declared_type_oid: column.type_oid,
+                        signed_type_size: column.type_size,
+                        is_null,
+                        value,
+                    });
+                })
+                .expect("prepared generation cell remains valid");
+            }
+        }
+    }
 }
 
 pub(crate) struct PreparedResidentAppendColumn {
@@ -27,6 +219,131 @@ pub(crate) struct PreparedResidentAppendColumn {
     /// plan crosses WAL, retaining only the immutable catalog binding above.
     pub(super) validity: Option<TypedInsertColumnValidity>,
     pub(super) values: Option<TypedInsertColumnValues>,
+}
+
+/// Compute the exact variable payload extent without re-walking every logical cell at runtime.
+///
+/// The only constructor consumes `DecodedTypedImage`, whose strict decoder has already checked
+/// vector shapes, bitmap tails, text offsets, UTF-8, and type/vector agreement. The source is
+/// then private and move-only. Keep the scalar computation at that ownership boundary so runtime
+/// generation can retain its identity checks without duplicating the logical-value traversal that
+/// `write_rows` performs to emit its ABI.
+pub(super) fn runtime_generation_value_bytes(
+    rows: usize,
+    columns: &[PreparedResidentAppendColumn],
+) -> Result<usize, EngineError> {
+    let mut total = 0_usize;
+    for column in columns {
+        let validity = column
+            .validity
+            .as_ref()
+            .ok_or_else(|| generation_source_error("value-byte validity"))?;
+        let values = column
+            .values
+            .as_ref()
+            .ok_or_else(|| generation_source_error("value-byte values"))?;
+        let valid_rows = match validity {
+            TypedInsertColumnValidity::AllValid => rows,
+            TypedInsertColumnValidity::Bitmap(words) => {
+                words.iter().try_fold(0_usize, |sum, word| {
+                    sum.checked_add(word.count_ones() as usize)
+                        .ok_or_else(|| generation_source_error("value-byte valid-row count"))
+                })?
+            }
+        };
+        if valid_rows > rows {
+            return Err(generation_source_error("value-byte validity count"));
+        }
+        let bytes = match (values, column.ty) {
+            (TypedInsertColumnValues::I32(_), SqlType::Int2 | SqlType::Int4 | SqlType::Date) => {
+                valid_rows.checked_mul(std::mem::size_of::<i32>())
+            }
+            (TypedInsertColumnValues::I64(_), SqlType::Int8 | SqlType::Timestamp) => {
+                valid_rows.checked_mul(std::mem::size_of::<i64>())
+            }
+            (TypedInsertColumnValues::I128(_), SqlType::Numeric { .. }) => {
+                valid_rows.checked_mul(std::mem::size_of::<i128>())
+            }
+            (TypedInsertColumnValues::Bytes16(_), SqlType::Uuid) => {
+                valid_rows.checked_mul(std::mem::size_of::<[u8; 16]>())
+            }
+            (TypedInsertColumnValues::BoolBits(_), SqlType::Bool) => Some(valid_rows),
+            (TypedInsertColumnValues::Text { bytes, .. }, SqlType::Text) => Some(bytes.len()),
+            _ => return Err(generation_source_error("value-byte SQL storage arm")),
+        }
+        .ok_or_else(|| generation_source_error("value-byte total"))?;
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| generation_source_error("value-byte total"))?;
+    }
+    Ok(total)
+}
+
+pub(super) fn with_logical_cell<R>(
+    validity: &TypedInsertColumnValidity,
+    values: &TypedInsertColumnValues,
+    ty: SqlType,
+    row: usize,
+    consume: impl FnOnce(bool, &[u8]) -> R,
+) -> Result<R, EngineError> {
+    if !validity.is_valid(row) {
+        return Ok(consume(true, &[]));
+    }
+    match (values, ty) {
+        (TypedInsertColumnValues::I32(values), SqlType::Int2 | SqlType::Int4 | SqlType::Date) => {
+            let value = values
+                .get(row)
+                .ok_or_else(|| generation_source_error("i32 row"))?
+                .to_le_bytes();
+            Ok(consume(false, &value))
+        }
+        (TypedInsertColumnValues::I64(values), SqlType::Int8 | SqlType::Timestamp) => {
+            let value = values
+                .get(row)
+                .ok_or_else(|| generation_source_error("i64 row"))?
+                .to_le_bytes();
+            Ok(consume(false, &value))
+        }
+        (TypedInsertColumnValues::I128(values), SqlType::Numeric { .. }) => {
+            let value = values
+                .get(row)
+                .ok_or_else(|| generation_source_error("numeric row"))?
+                .to_le_bytes();
+            Ok(consume(false, &value))
+        }
+        (TypedInsertColumnValues::Bytes16(values), SqlType::Uuid) => values
+            .get(row)
+            .map(|value| consume(false, value))
+            .ok_or_else(|| generation_source_error("UUID row")),
+        (TypedInsertColumnValues::BoolBits(words), SqlType::Bool) => {
+            let word = words
+                .get(row / 32)
+                .ok_or_else(|| generation_source_error("BOOL row"))?;
+            let value = [u8::from(word & (1_u32 << (row % 32)) != 0)];
+            Ok(consume(false, &value))
+        }
+        (TypedInsertColumnValues::Text { offsets, bytes }, SqlType::Text) => {
+            let start = offsets
+                .get(row)
+                .and_then(|value| usize::try_from(*value).ok())
+                .ok_or_else(|| generation_source_error("TEXT start"))?;
+            let end = offsets
+                .get(row + 1)
+                .and_then(|value| usize::try_from(*value).ok())
+                .ok_or_else(|| generation_source_error("TEXT end"))?;
+            let value = bytes
+                .get(start..end)
+                .ok_or_else(|| generation_source_error("TEXT range"))?;
+            Ok(consume(false, value))
+        }
+        _ => Err(generation_source_error("SQL storage arm")),
+    }
+}
+
+fn generation_source_error(part: &str) -> EngineError {
+    EngineError::Durability(format!(
+        "typed INSERT runtime generation source has invalid {part}"
+    ))
 }
 
 /// One exact fixed-width device upload retained across WAL.  The source encoder writes this
@@ -138,6 +455,26 @@ impl PreparedResidentDensePayload {
         self.device_payload
             .as_ref()
             .and_then(|payload| u64::try_from(payload.len()).ok())
+    }
+
+    pub(crate) fn final_row_count(&self) -> u64 {
+        u64::from_le_bytes(self.final_count_header)
+    }
+
+    pub(crate) fn text_layouts(&self) -> &[ResidentDeviceTextColumnLayout] {
+        &self.text_layouts
+    }
+
+    pub(crate) fn bool_layouts(&self) -> &[ResidentDeviceBoolColumnLayout] {
+        &self.bool_layouts
+    }
+
+    pub(crate) fn int4_stats(&self) -> &[ResidentDeviceInt4ColumnStats] {
+        &self.int4_stats
+    }
+
+    pub(crate) fn null_layouts(&self) -> &[ResidentDeviceNullBitmapLayout] {
+        &self.null_layouts
     }
 
     /// Move the one host payload into a private allocation upload. The count is deliberately

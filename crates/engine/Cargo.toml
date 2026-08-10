@@ -10,6 +10,7 @@ imbl.workspace = true
 arc-swap.workspace = true
 sha2 = "0.10"
 serde_json = "1"
+itoa = "1"
 gpu_db_types = { path = "../types" }
 gpu_db_replication = { path = "../replication" }
 gpu_db_wal = { path = "../wal" }
@@ -31,7 +32,7 @@ pg_query = "6"
 # Passthrough for the analysis-instrumentation feature (docs/proposals/feature-gated-instrumentation.md):
 # enabling it here forwards to gpu_db_execution so the predicate/result-path probes in BOTH crates light up
 # with a single `cargo run --example ... --features probe-timing`. OFF by default (zero-cost).
-probe-timing = ["gpu_db_execution/probe-timing"]
+probe-timing = ["gpu_db_execution/probe-timing", "gpu_db_wal/probe-timing"]
 # End-to-end CUDA fault-injection coverage for recovery. It is opt-in so normal engine tests and
 # production builds never compile the execution fault hook.
 test-support = ["gpu_db_execution/test-support"]

@@ -7,20 +7,22 @@
 use super::super::super::super::codec::DecodedAggregateFraming;
 use super::{checked_mul, error, read_u32, ABSENT_U32, S4_BYTES};
 use crate::typed_insert_aggregate::{
-    AGGREGATE_FLAG_AUTOCOMMIT, AGGREGATE_FLAG_EXPLICIT, AGGREGATE_FLAG_PUBLISHED_SEQUENCE,
-    AGGREGATE_FLAG_RETAINED_RESPONSE, AGGREGATE_FLAG_RETURNING, OUTER_CONTENT_PUBLISHED_SEQUENCE,
-    OUTER_CONTENT_RETURNING, OUTER_CONTENT_ROW, OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH,
-    OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1,
+    AGGREGATE_FLAG_AUTOCOMMIT, AGGREGATE_FLAG_CATALOG, AGGREGATE_FLAG_EXPLICIT,
+    AGGREGATE_FLAG_OPERATION_COMPOSITION, AGGREGATE_FLAG_PRIVATE_SEQUENCE,
+    AGGREGATE_FLAG_PUBLISHED_SEQUENCE, AGGREGATE_FLAG_RETAINED_RESPONSE, AGGREGATE_FLAG_RETURNING,
+    OUTER_CONTENT_CATALOG, OUTER_CONTENT_OPERATION_COMPOSITION, OUTER_CONTENT_PRIVATE_SEQUENCE,
+    OUTER_CONTENT_PUBLISHED_SEQUENCE, OUTER_CONTENT_RETURNING, OUTER_CONTENT_ROW,
+    OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH, OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1,
 };
 use crate::typed_insert_batch::{
-    measure_decoded_canonical_typed_insert_published_only_from_source,
-    parse_canonical_typed_insert_record_prefix, CanonicalTypedInsertReadAt,
-    CANONICAL_TYPED_INSERT_RECORD_HEADER_BYTES,
+    measure_decoded_canonical_typed_insert_from_source, parse_canonical_typed_insert_record_prefix,
+    CanonicalTypedInsertReadAt, CANONICAL_TYPED_INSERT_RECORD_HEADER_BYTES,
 };
 use crate::EngineError;
 
 const S5_PREFIX_BYTES: u64 = 52;
 const S5_PUBLISHED: u8 = 1;
+const S5_PRIVATE: u8 = 2;
 const S5_DEFAULT_EXPRESSION: u8 = 1;
 const S5_FINAL_OVERWRITTEN: u8 = 1 << 1;
 
@@ -30,6 +32,9 @@ pub(super) fn validate_scalar_and_outer_flags(
     let scalar = framing.header_scalars();
     let aggregate_allowed = AGGREGATE_FLAG_AUTOCOMMIT
         | AGGREGATE_FLAG_EXPLICIT
+        | AGGREGATE_FLAG_CATALOG
+        | AGGREGATE_FLAG_OPERATION_COMPOSITION
+        | AGGREGATE_FLAG_PRIVATE_SEQUENCE
         | AGGREGATE_FLAG_PUBLISHED_SEQUENCE
         | AGGREGATE_FLAG_RETURNING
         | AGGREGATE_FLAG_RETAINED_RESPONSE;
@@ -47,13 +52,21 @@ pub(super) fn validate_scalar_and_outer_flags(
     let outer_allowed = OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1
         | OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH
         | OUTER_CONTENT_ROW
+        | OUTER_CONTENT_CATALOG
+        | OUTER_CONTENT_OPERATION_COMPOSITION
+        | OUTER_CONTENT_PRIVATE_SEQUENCE
         | OUTER_CONTENT_PUBLISHED_SEQUENCE
         | OUTER_CONTENT_RETURNING;
     if outer & !outer_allowed != 0
         || outer & OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 == 0
         || outer & OUTER_CONTENT_ROW == 0
+        || (scalar.flags & AGGREGATE_FLAG_CATALOG != 0) != (outer & OUTER_CONTENT_CATALOG != 0)
+        || (scalar.flags & AGGREGATE_FLAG_OPERATION_COMPOSITION != 0)
+            != (outer & OUTER_CONTENT_OPERATION_COMPOSITION != 0)
         || (scalar.flags & AGGREGATE_FLAG_PUBLISHED_SEQUENCE != 0)
             != (outer & OUTER_CONTENT_PUBLISHED_SEQUENCE != 0)
+        || (scalar.flags & AGGREGATE_FLAG_PRIVATE_SEQUENCE != 0)
+            != (outer & OUTER_CONTENT_PRIVATE_SEQUENCE != 0)
         || (scalar.flags & AGGREGATE_FLAG_RETURNING != 0) != (outer & OUTER_CONTENT_RETURNING != 0)
     {
         return Err(error(
@@ -119,11 +132,8 @@ pub(super) fn measure_s2(
                         .ok_or_else(|| error("S2 record source offset overflows"))?,
                     bytes,
                 };
-                let measured =
-                    measure_decoded_canonical_typed_insert_published_only_from_source(&source)
-                        .map_err(|_| {
-                            error("S2 published-only source measure rejects the canonical record")
-                        })?;
+                let measured = measure_decoded_canonical_typed_insert_from_source(&source)
+                    .map_err(|_| error("S2 source measure rejects the canonical record"))?;
                 if measured.record_bytes() != bytes {
                     return Err(error("S2 strict source measure length drifted"));
                 }
@@ -201,18 +211,26 @@ impl CanonicalTypedInsertReadAt for S2RecordSource<'_> {
     }
 }
 
-/// S5 has no attacker-owned variable-size grammar in this profile: every effect is one published
-/// sequence reference with its fixed 86-byte binary body. Semantic closure to the strict S2
-/// sequence request belongs to the retained-model pass; this raw pass rejects private/opaque
-/// bodies and validates the canonical durable-reference shell.
+#[derive(Clone, Copy)]
+pub(super) struct S5PassZeroMeasure {
+    pub(super) effect_count: u32,
+    pub(super) published_count: u32,
+    pub(super) private_count: u32,
+}
+
+/// S5 admits the existing two canonical sequence forms. A later terminal RESTART may suffix the
+/// existing effect body without changing the S2/S5 entry bijection. Semantic closure belongs to
+/// the retained-model pass.
 pub(super) fn measure_s5(
     framing: &DecodedAggregateFraming<'_>,
     statement_count: u32,
     original_rows: u64,
-) -> Result<u32, EngineError> {
+) -> Result<S5PassZeroMeasure, EngineError> {
     let expected_body = crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES as u32;
     framing.with_section_reader(4, |reader| {
         let mut count = 0_u32;
+        let mut published_count = 0_u32;
+        let mut private_count = 0_u32;
         let mut prior_transition = None;
         while reader.remaining() != 0 {
             if reader.remaining() < S5_PREFIX_BYTES {
@@ -230,30 +248,75 @@ pub(super) fn measure_s5(
             let digest = reader.digest()?;
             if statement >= statement_count
                 || effect == ABSENT_U32
-                || kind != S5_PUBLISHED
+                || !matches!(kind, S5_PUBLISHED | S5_PRIVATE)
                 || flags & !(S5_DEFAULT_EXPRESSION | S5_FINAL_OVERWRITTEN) != 0
                 || flags & S5_DEFAULT_EXPRESSION == 0
                 || disposition == ABSENT_U32
                 || u64::from(disposition) >= original_rows
-                || body_bytes != expected_body
-                || digest == [0; 32]
                 || u64::from(body_bytes) > reader.remaining()
             {
-                return Err(error("S5 published sequence-effect shell is invalid"));
+                return Err(error("S5 sequence-effect shell is invalid"));
             }
-            let mut body = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
-            reader.copy_exact(&mut body)?;
-            if gpu_db_wal::canonical_request_digest(&body) != digest {
-                return Err(error("S5 published sequence body digest is invalid"));
+            match kind {
+                S5_PUBLISHED => {
+                    let with_restart = expected_body
+                        + crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES as u32;
+                    if !matches!(body_bytes, value if value == expected_body || value == with_restart)
+                        || digest == [0; 32]
+                    {
+                        return Err(error("S5 published sequence-effect shell is invalid"));
+                    }
+                    let mut full = [0_u8;
+                        crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES
+                            + crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES];
+                    reader.copy_exact(&mut full[..crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES])?;
+                    if body_bytes == with_restart {
+                        let tail = &mut full[crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES..];
+                        reader.copy_exact(tail)?;
+                        crate::typed_insert_aggregate::semantics_v2::sequence_terminal::decode(tail)
+                            .map_err(|_| error("S5 terminal restart fails strict decode"))?;
+                    }
+                    if gpu_db_wal::canonical_request_digest(&full[..body_bytes as usize]) != digest {
+                        return Err(error("S5 published sequence body digest is invalid"));
+                    }
+                    let reference = crate::decode_sequence_value_reference_exact(
+                        &full[..crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES]
+                    )
+                        .map_err(|_| error("S5 published sequence body fails strict decode"))?;
+                    if !reference.default_expression
+                        || prior_transition
+                            .is_some_and(|prior| prior >= reference.transition_txn_id)
+                    {
+                        return Err(error("S5 published sequence transition order is invalid"));
+                    }
+                    prior_transition = Some(reference.transition_txn_id);
+                    published_count = published_count
+                        .checked_add(1)
+                        .ok_or_else(|| error("S5 published count overflows"))?;
+                }
+                S5_PRIVATE => {
+                    let tail_bytes = crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES as u32;
+                    if !(body_bytes == 0 || body_bytes == tail_bytes)
+                        || (body_bytes == 0) != (digest == [0; 32])
+                    {
+                        return Err(error("S5 private sequence body is not canonical"));
+                    }
+                    if body_bytes == tail_bytes {
+                        let mut tail = [0_u8;
+                            crate::typed_insert_aggregate::semantics_v2::sequence_terminal::SEQUENCE_RESTART_TAIL_BYTES];
+                        reader.copy_exact(&mut tail)?;
+                        if gpu_db_wal::canonical_request_digest(&tail) != digest {
+                            return Err(error("S5 private terminal body digest is invalid"));
+                        }
+                        crate::typed_insert_aggregate::semantics_v2::sequence_terminal::decode(&tail)
+                            .map_err(|_| error("S5 terminal restart fails strict decode"))?;
+                    }
+                    private_count = private_count
+                        .checked_add(1)
+                        .ok_or_else(|| error("S5 private count overflows"))?;
+                }
+                _ => unreachable!("kind checked above"),
             }
-            let reference = crate::decode_sequence_value_reference_exact(&body)
-                .map_err(|_| error("S5 published sequence body fails strict decode"))?;
-            if !reference.default_expression
-                || prior_transition.is_some_and(|prior| prior >= reference.transition_txn_id)
-            {
-                return Err(error("S5 published sequence transition order is invalid"));
-            }
-            prior_transition = Some(reference.transition_txn_id);
             count = count
                 .checked_add(1)
                 .ok_or_else(|| error("S5 entry count overflows"))?;
@@ -263,7 +326,11 @@ pub(super) fn measure_s5(
                 "S5 entry count does not equal its canonical byte traversal",
             ));
         }
-        Ok(count)
+        Ok(S5PassZeroMeasure {
+            effect_count: count,
+            published_count,
+            private_count,
+        })
     })
 }
 
@@ -416,24 +483,31 @@ pub(super) fn measure_s1_s4_s6(
                         let source = s4.u32()?;
                         let row_id = s4.u64()?;
                         let kind = s4.u8()?;
-                        if s4.u8()? != 0 || s4.u16()? != 0 {
-                            return Err(error("S4 flags/reserved bytes are nonzero"));
-                        }
+                        let writer_flag = s4.u8()?;
+                        let reserved = s4.u16()?;
                         let table = s4.u32()?;
                         let transition = s4.u32()?;
-                        if s4.u32()? != 0 {
-                            return Err(error("S4 trailing reserved bytes are nonzero"));
-                        }
+                        let final_writer_statement = s4.u32()?;
                         let digest = s4.digest()?;
+                        let ordinary = kind == expected_s4_kind(abort_at, expected_statement)
+                            && writer_flag == 0
+                            && final_writer_statement == 0
+                            && digest == statement_digest
+                            && ((kind == 1 && transition != u32::MAX)
+                                || (kind != 1 && transition == u32::MAX));
+                        let committed_cancellation = abort_at.is_none()
+                            && kind == 2
+                            && writer_flag == 1
+                            && transition == u32::MAX
+                            && final_writer_statement > expected_statement
+                            && digest != [0; 32];
                         if statement != expected_statement
                             || source != expected_source
                             || row_id == 0
                             || row_id == u64::MAX
-                            || digest != statement_digest
                             || table == u32::MAX
-                            || kind != expected_s4_kind(abort_at, expected_statement)
-                            || (kind == 1 && transition == u32::MAX)
-                            || (kind != 1 && transition != u32::MAX)
+                            || reserved != 0
+                            || !(ordinary || committed_cancellation)
                             || (total_rows != 0
                                 && (statement < prior_statement
                                     || (statement == prior_statement

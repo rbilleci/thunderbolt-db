@@ -1,5 +1,10 @@
 use super::*;
 
+#[path = "product_001_tests/product_001_copy_tests.rs"]
+mod product_001_copy_tests;
+#[path = "product_001_tests/product_001_mixed_dml_tests.rs"]
+mod product_001_mixed_dml_tests;
+
 fn parsed(sql: &str) -> gpu_db_sql::ParsedCommand {
     gpu_db_sql::ParsedCommand::parse(sql).unwrap()
 }
@@ -14,6 +19,38 @@ fn operation_payload(record: &WalRecord) -> Arc<[u8]> {
         .find(|fragment| fragment.kind != gpu_db_wal::CanonicalFragmentKind::TransactionClaimStatus)
         .unwrap();
     Engine::decode_engine_operation(&operation.body).unwrap()
+}
+
+fn operation_payload_if_not_codec5(record: &WalRecord) -> Option<Arc<[u8]>> {
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&record.payload)
+        .unwrap()
+        .unwrap();
+    (!Engine::canonical_envelope_is_codec5(&envelope)).then(|| operation_payload(record))
+}
+
+fn codec5_replay_metadata(
+    record: &WalRecord,
+) -> crate::typed_insert_aggregate::SemanticsV2ReplayMetadata {
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&record.payload)
+        .expect("decode codec-5 canonical envelope")
+        .expect("codec-5 record must use a canonical envelope");
+    assert!(Engine::canonical_envelope_is_codec5(&envelope));
+    let fragments = envelope
+        .fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &envelope.header,
+        &envelope.outcome,
+        &fragments,
+    )
+    .expect("codec-5 INSERT must pass strict closure")
+    .expect("live INSERT must select semantics-v2")
+    .metadata()
 }
 
 fn encoded_operation(codec: u8, body: &[u8]) -> Arc<[u8]> {
@@ -124,6 +161,2150 @@ fn product_001_pre_fsync_failure_has_no_visibility_or_recovery_effect_and_retry_
     let reopened =
         Engine::open_durable_wal_segment_auto(&fixture.wal).expect("recover acknowledged retry");
     assert_eq!(durable_ids(&reopened, "product_fsync"), vec![1]);
+    let retry_record = reopened
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == 71_001)
+        .expect("acknowledged retry remains in canonical WAL");
+    let retry_envelope = gpu_db_wal::decode_canonical_record_payload(&retry_record.payload)
+        .expect("decode retry record")
+        .expect("retry uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&retry_envelope),
+        "the clean retry must not enter a displaced INSERT authority"
+    );
+}
+
+#[test]
+fn product_001_codec5_pre_durable_crash_prefixes_reopen_empty_and_retry_once() {
+    use crate::engine_transaction_delta::TransactionTerminalPreDurableFault;
+
+    let boundaries = [
+        (
+            "before-replication-proposal",
+            TransactionTerminalPreDurableFault::ReplicationProposal,
+        ),
+        (
+            "before-canonical-wal-append",
+            TransactionTerminalPreDurableFault::CanonicalWalAppend,
+        ),
+        (
+            "before-wal-flush",
+            TransactionTerminalPreDurableFault::WalFlush,
+        ),
+    ];
+
+    for (ordinal, (label, boundary)) in boundaries.into_iter().enumerate() {
+        let fixture = DurableFixture::new(label);
+        let engine = Engine::with_durable_wal_segment(&fixture.wal);
+        let create_txn = 71_100 + u64::try_from(ordinal).unwrap() * 10;
+        let insert_txn = create_txn + 1;
+        engine
+            .execute_text(
+                create_txn,
+                "CREATE TABLE product_codec5_prefix (id INT PRIMARY KEY, value BIGINT)",
+            )
+            .expect("durable crash-prefix fixture DDL");
+        let durable_before = engine.durable_wal_records();
+        let visible_before = engine.visible_up_to();
+        let flushed_before = engine.wal_flushed_count();
+
+        engine.fail_next_transaction_terminal_pre_durable_at(boundary);
+        let failure = engine.execute_text(
+            insert_txn,
+            "INSERT INTO product_codec5_prefix VALUES (1, 9000000001)",
+        );
+        assert!(
+            matches!(
+                failure,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "{label} must fail before acknowledgement: {failure:?}"
+        );
+        assert_eq!(engine.visible_up_to(), visible_before, "{label}");
+        assert_eq!(engine.wal_flushed_count(), flushed_before, "{label}");
+        assert_eq!(engine.durable_wal_records(), durable_before, "{label}");
+        assert!(durable_ids(&engine, "product_codec5_prefix").is_empty());
+
+        // Dropping here is the crash. Recovery must consume only the acknowledged prefix; in
+        // particular the tentative codec-5 append at WalFlush must not become replayable.
+        drop(engine);
+        let recovered =
+            Engine::open_durable_wal_segment_auto(&fixture.wal).expect("recover crash prefix");
+        assert_eq!(recovered.durable_wal_records(), durable_before, "{label}");
+        assert!(durable_ids(&recovered, "product_codec5_prefix").is_empty());
+
+        recovered
+            .execute_text(
+                insert_txn,
+                "INSERT INTO product_codec5_prefix VALUES (1, 9000000001)",
+            )
+            .expect("the unacknowledged codec-5 request must retry through the same authority");
+        drop(recovered);
+        let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("recover the acknowledged retry");
+        assert_eq!(durable_ids(&reopened, "product_codec5_prefix"), vec![1]);
+        let retry_record = reopened
+            .durable_wal_records()
+            .into_iter()
+            .find(|record| record.txn_id == insert_txn)
+            .expect("the acknowledged retry remains in canonical WAL");
+        let retry_envelope = gpu_db_wal::decode_canonical_record_payload(&retry_record.payload)
+            .expect("decode crash-prefix retry record")
+            .expect("crash-prefix retry uses a canonical envelope");
+        assert!(
+            Engine::canonical_envelope_is_codec5(&retry_envelope),
+            "{label} retry must not enter the displaced resolved INSERT authority"
+        );
+    }
+}
+
+#[test]
+fn product_001_private_create_index_crash_prefixes_retry_once() {
+    use crate::engine_transaction_delta::TransactionTerminalPreDurableFault;
+
+    let boundaries = [
+        (
+            "before-replication-proposal",
+            TransactionTerminalPreDurableFault::ReplicationProposal,
+        ),
+        (
+            "before-canonical-wal-append",
+            TransactionTerminalPreDurableFault::CanonicalWalAppend,
+        ),
+        (
+            "before-wal-flush",
+            TransactionTerminalPreDurableFault::WalFlush,
+        ),
+    ];
+    let stage_private_index = |engine: &Engine, txn_id| {
+        for sql in [
+            "BEGIN",
+            "CREATE TABLE product_private_index_prefix (id INT, value INT)",
+            "CREATE UNIQUE INDEX product_private_index_prefix_id \
+             ON product_private_index_prefix (id)",
+            "INSERT INTO product_private_index_prefix VALUES (1, 10), (2, 20)",
+        ] {
+            engine
+                .submit_transaction(txn_id, parsed(sql))
+                .expect("stage transaction-private CREATE INDEX and typed INSERT");
+        }
+    };
+
+    for (ordinal, (label, boundary)) in boundaries.into_iter().enumerate() {
+        let fixture = DurableFixture::new(&format!("private-create-index-{label}"));
+        let engine = Engine::with_durable_wal_segment(&fixture.wal);
+        let txn_id = 71_300 + u64::try_from(ordinal).unwrap();
+        let durable_before = engine.durable_wal_records();
+        let visible_before = engine.visible_up_to();
+        stage_private_index(&engine, txn_id);
+        engine.fail_next_transaction_terminal_pre_durable_at(boundary);
+        let failure = engine.submit_transaction(txn_id, parsed("COMMIT"));
+        assert!(
+            matches!(
+                failure,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "{label} must fail before acknowledgement: {failure:?}"
+        );
+        assert_eq!(engine.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(engine.visible_up_to(), visible_before, "{label}");
+        assert!(
+            engine
+                .relational_catalog_table("product_private_index_prefix")
+                .is_none(),
+            "{label} must not publish the private table or index"
+        );
+
+        drop(engine);
+        let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("recover the private CREATE INDEX crash prefix");
+        assert_eq!(recovered.durable_wal_records(), durable_before, "{label}");
+        assert!(
+            recovered
+                .relational_catalog_table("product_private_index_prefix")
+                .is_none(),
+            "{label} fresh reopen must not materialize the private table or index"
+        );
+
+        stage_private_index(&recovered, txn_id);
+        recovered
+            .submit_transaction(txn_id, parsed("COMMIT"))
+            .expect("the unacknowledged private CREATE INDEX transaction retries through codec-5");
+        assert_eq!(
+            durable_ids(&recovered, "product_private_index_prefix"),
+            vec![1, 2],
+            "{label} retry publishes both private indexed rows exactly once"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            recovered.relational_named_index_covered_rows("product_private_index_prefix"),
+            Some(2),
+            "{label} retry publishes the first private named-index generation exactly once"
+        );
+        let record = recovered
+            .durable_wal_records()
+            .into_iter()
+            .find(|record| record.txn_id == txn_id)
+            .expect("the acknowledged private-index retry remains in canonical WAL");
+        assert!(codec5_replay_metadata(&record).initial_table_absent);
+
+        drop(recovered);
+        let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("fresh reopen must recover the acknowledged private-index retry");
+        assert_eq!(
+            durable_ids(&reopened, "product_private_index_prefix"),
+            vec![1, 2],
+            "{label} fresh replay owns the private indexed rowset"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            reopened.relational_named_index_covered_rows("product_private_index_prefix"),
+            Some(2),
+            "{label} fresh replay owns the first private named-index generation"
+        );
+    }
+}
+
+#[test]
+fn product_001_private_create_index_post_durable_recovery_owns_once() {
+    let fixture = DurableFixture::new("private-create-index-post-durable");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_350;
+    let records_before = engine.durable_wal_records().len();
+    for sql in [
+        "BEGIN",
+        "CREATE TABLE product_private_index_indeterminate (id INT, value INT)",
+        "CREATE UNIQUE INDEX product_private_index_indeterminate_id \
+         ON product_private_index_indeterminate (id)",
+        "INSERT INTO product_private_index_indeterminate VALUES (1, 10), (2, 20)",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage post-durable private CREATE INDEX transaction");
+    }
+    engine.fail_next_transaction_post_durable_apply();
+    let failure = engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect_err("post-durable private-index apply fault must be indeterminate");
+    assert!(
+        failure.is_indeterminate(),
+        "expected indeterminate failure: {failure}"
+    );
+    assert!(engine.is_commit_path_poisoned());
+    assert_eq!(engine.durable_wal_records().len(), records_before + 1);
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("recover the indeterminate private CREATE INDEX transaction");
+    assert_eq!(recovered.durable_wal_records().len(), records_before + 1);
+    assert_eq!(
+        durable_ids(&recovered, "product_private_index_indeterminate"),
+        vec![1, 2]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("product_private_index_indeterminate"),
+        Some(2),
+        "post-durable recovery must publish the first private named-index generation"
+    );
+    let record = recovered
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == txn_id)
+        .expect("the durable private-index transaction remains in canonical WAL");
+    assert!(codec5_replay_metadata(&record).initial_table_absent);
+
+    let records_before_second_reopen = recovered.durable_wal_records().len();
+    drop(recovered);
+    let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("repeat private-index recovery is exact");
+    assert_eq!(
+        reopened.durable_wal_records().len(),
+        records_before_second_reopen,
+        "repeat recovery must not append or duplicate the private CREATE INDEX transaction"
+    );
+    assert_eq!(
+        durable_ids(&reopened, "product_private_index_indeterminate"),
+        vec![1, 2]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        reopened.relational_named_index_covered_rows("product_private_index_indeterminate"),
+        Some(2),
+        "repeat recovery must retain the first private named-index generation"
+    );
+}
+
+#[test]
+fn product_001_existing_table_s3_index_replacement_crash_prefixes_retry_once() {
+    use crate::engine_transaction_delta::TransactionTerminalPreDurableFault;
+
+    let boundaries = [
+        (
+            "before-replication-proposal",
+            TransactionTerminalPreDurableFault::ReplicationProposal,
+        ),
+        (
+            "before-canonical-wal-append",
+            TransactionTerminalPreDurableFault::CanonicalWalAppend,
+        ),
+        (
+            "before-wal-flush",
+            TransactionTerminalPreDurableFault::WalFlush,
+        ),
+    ];
+    let stage_transition = |engine: &Engine, txn_id| {
+        for sql in [
+            "BEGIN",
+            "DROP INDEX product_existing_s3_index_prefix_original_code_region",
+            "CREATE UNIQUE INDEX product_existing_s3_index_prefix_replacement_code_region \
+             ON product_existing_s3_index_prefix (code, region)",
+            "INSERT INTO product_existing_s3_index_prefix VALUES \
+             (3, 30, 'west'), (4, 40, 'south'), (5, NULL, 'south')",
+        ] {
+            engine
+                .submit_transaction(txn_id, parsed(sql))
+                .expect("stage populated-table S3 CREATE INDEX transition");
+        }
+    };
+
+    for (ordinal, (label, boundary)) in boundaries.into_iter().enumerate() {
+        let fixture = DurableFixture::new(&format!("existing-s3-index-{label}"));
+        let engine = Engine::with_durable_wal_segment(&fixture.wal);
+        engine
+            .execute_text(
+                71_380 + u64::try_from(ordinal).unwrap() * 10,
+                "CREATE TABLE product_existing_s3_index_prefix \
+                 (id INT PRIMARY KEY, code INT, region TEXT)",
+            )
+            .expect("create populated-table S3 transition fixture");
+        engine
+            .execute_text(
+                71_381 + u64::try_from(ordinal).unwrap() * 10,
+                "INSERT INTO product_existing_s3_index_prefix VALUES \
+                 (1, NULL, 'north'), (2, 20, 'east')",
+            )
+            .expect("seed the published prefix through codec-5");
+        engine
+            .execute_text(
+                71_382 + u64::try_from(ordinal).unwrap() * 10,
+                "CREATE UNIQUE INDEX product_existing_s3_index_prefix_original_code_region \
+                 ON product_existing_s3_index_prefix (code, region)",
+            )
+            .expect("create the published predecessor index through codec-5");
+        let durable_before = engine.durable_wal_records();
+        let visible_before = engine.visible_up_to();
+        let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+        let txn_id = 71_383 + u64::try_from(ordinal).unwrap();
+        stage_transition(&engine, txn_id);
+        engine.fail_next_transaction_terminal_pre_durable_at(boundary);
+        let failure = engine.submit_transaction(txn_id, parsed("COMMIT"));
+        assert!(
+            matches!(
+                failure,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "{label} must fail before acknowledgement: {failure:?}"
+        );
+        assert_eq!(engine.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(engine.visible_up_to(), visible_before, "{label}");
+        assert_eq!(
+            engine.catalog_snapshot().relational_next_oid,
+            next_oid_before,
+            "{label} must not publish the private S3 index identity"
+        );
+        assert!(
+            engine
+                .relational_catalog_table("product_existing_s3_index_prefix")
+                .unwrap()
+                .indexes
+                .iter()
+                .any(|index| index.name == "product_existing_s3_index_prefix_original_code_region"),
+            "{label} must retain the published predecessor index"
+        );
+        assert!(
+            engine
+                .relational_catalog_table("product_existing_s3_index_prefix")
+                .unwrap()
+                .indexes
+                .iter()
+                .all(|index| {
+                    index.name != "product_existing_s3_index_prefix_replacement_code_region"
+                }),
+            "{label} must not publish the private replacement index"
+        );
+
+        drop(engine);
+        let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("recover the unacknowledged populated-table S3 transition");
+        assert_eq!(recovered.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(
+            durable_ids(&recovered, "product_existing_s3_index_prefix"),
+            vec![1, 2],
+            "{label} recovery must retain only the published prefix"
+        );
+        stage_transition(&recovered, txn_id);
+        recovered
+            .submit_transaction(txn_id, parsed("COMMIT"))
+            .expect("same transaction ID retries the populated-table S3 transition once");
+        assert_eq!(
+            durable_ids(&recovered, "product_existing_s3_index_prefix"),
+            vec![1, 2, 3, 4, 5],
+            "{label} retry publishes every prefix and private row exactly once"
+        );
+        assert!(
+            recovered
+                .relational_catalog_table("product_existing_s3_index_prefix")
+                .unwrap()
+                .indexes
+                .iter()
+                .all(|index| index.name != "product_existing_s3_index_prefix_original_code_region"),
+            "{label} retry retires the original S3 index"
+        );
+        assert!(
+            recovered
+                .relational_catalog_table("product_existing_s3_index_prefix")
+                .unwrap()
+                .indexes
+                .iter()
+                .any(|index| {
+                    index.name == "product_existing_s3_index_prefix_replacement_code_region"
+                }),
+            "{label} retry publishes the S3 replacement index"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            recovered.relational_named_index_covered_rows("product_existing_s3_index_prefix"),
+            Some(10),
+            "{label} retry publishes complete S3-created named-index coverage"
+        );
+        let record = recovered
+            .durable_wal_records()
+            .into_iter()
+            .find(|record| record.txn_id == txn_id)
+            .expect("the acknowledged retry remains in canonical WAL");
+        assert!(
+            !codec5_replay_metadata(&record).initial_table_absent,
+            "{label} retry must preserve the published-table predecessor"
+        );
+
+        drop(recovered);
+        let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("fresh reopen must recover the acknowledged S3 transition");
+        assert_eq!(
+            durable_ids(&reopened, "product_existing_s3_index_prefix"),
+            vec![1, 2, 3, 4, 5],
+            "{label} fresh replay owns the complete populated-table rowset"
+        );
+        let reopened_table = reopened
+            .relational_catalog_table("product_existing_s3_index_prefix")
+            .expect("fresh replay retains the transitioned table catalog");
+        assert!(
+            reopened_table
+                .indexes
+                .iter()
+                .all(|index| index.name != "product_existing_s3_index_prefix_original_code_region"),
+            "{label} fresh replay must not resurrect the retired index"
+        );
+        assert!(
+            reopened_table.indexes.iter().any(|index| {
+                index.name == "product_existing_s3_index_prefix_replacement_code_region"
+            }),
+            "{label} fresh replay must retain the replacement index"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            reopened.relational_named_index_covered_rows("product_existing_s3_index_prefix"),
+            Some(10),
+            "{label} fresh replay owns complete S3-created named-index coverage"
+        );
+    }
+}
+
+#[test]
+fn product_001_existing_table_s3_index_replacement_post_durable_recovery_owns_once() {
+    let fixture = DurableFixture::new("existing-s3-index-post-durable");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(
+            71_420,
+            "CREATE TABLE product_existing_s3_index_indeterminate \
+             (id INT PRIMARY KEY, code INT, region TEXT)",
+        )
+        .expect("create populated-table S3 indeterminate fixture");
+    engine
+        .execute_text(
+            71_421,
+            "INSERT INTO product_existing_s3_index_indeterminate VALUES \
+             (1, NULL, 'north'), (2, 20, 'east')",
+        )
+        .expect("seed the published S3 indeterminate prefix");
+    engine
+        .execute_text(
+            71_422,
+            "CREATE UNIQUE INDEX product_existing_s3_index_indeterminate_original_code_region \
+             ON product_existing_s3_index_indeterminate (code, region)",
+        )
+        .expect("create the published S3 indeterminate predecessor index");
+    let records_before = engine.durable_wal_records().len();
+    let txn_id = 71_423;
+    for sql in [
+        "BEGIN",
+        "DROP INDEX product_existing_s3_index_indeterminate_original_code_region",
+        "CREATE UNIQUE INDEX product_existing_s3_index_indeterminate_replacement_code_region \
+         ON product_existing_s3_index_indeterminate (code, region)",
+        "INSERT INTO product_existing_s3_index_indeterminate VALUES \
+         (3, 30, 'west'), (4, 40, 'south'), (5, NULL, 'south')",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage populated-table S3 post-durable transition");
+    }
+    engine.fail_next_transaction_post_durable_apply();
+    let failure = engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect_err("post-durable populated-table S3 fault must be indeterminate");
+    assert!(
+        failure.is_indeterminate(),
+        "expected indeterminate failure: {failure}"
+    );
+    assert!(engine.is_commit_path_poisoned());
+    assert_eq!(engine.durable_wal_records().len(), records_before + 1);
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("recover the indeterminate populated-table S3 transition");
+    assert_eq!(recovered.durable_wal_records().len(), records_before + 1);
+    assert_eq!(
+        durable_ids(&recovered, "product_existing_s3_index_indeterminate"),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert!(recovered
+        .relational_catalog_table("product_existing_s3_index_indeterminate")
+        .unwrap()
+        .indexes
+        .iter()
+        .all(|index| {
+            index.name != "product_existing_s3_index_indeterminate_original_code_region"
+        }));
+    assert!(recovered
+        .relational_catalog_table("product_existing_s3_index_indeterminate")
+        .unwrap()
+        .indexes
+        .iter()
+        .any(|index| {
+            index.name == "product_existing_s3_index_indeterminate_replacement_code_region"
+        }));
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("product_existing_s3_index_indeterminate"),
+        Some(10),
+        "post-durable recovery must publish complete S3-created named-index coverage"
+    );
+
+    drop(recovered);
+    let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("repeat recovery of the populated-table S3 transition is exact");
+    assert_eq!(
+        durable_ids(&reopened, "product_existing_s3_index_indeterminate"),
+        vec![1, 2, 3, 4, 5]
+    );
+    let reopened_table = reopened
+        .relational_catalog_table("product_existing_s3_index_indeterminate")
+        .expect("repeat recovery retains the transitioned table catalog");
+    assert!(
+        reopened_table.indexes.iter().all(|index| {
+            index.name != "product_existing_s3_index_indeterminate_original_code_region"
+        }),
+        "repeat recovery must not resurrect the retired index"
+    );
+    assert!(
+        reopened_table.indexes.iter().any(|index| {
+            index.name == "product_existing_s3_index_indeterminate_replacement_code_region"
+        }),
+        "repeat recovery must retain the replacement index"
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        reopened.relational_named_index_covered_rows("product_existing_s3_index_indeterminate"),
+        Some(10),
+        "repeat recovery retains complete S3-created named-index coverage"
+    );
+}
+
+#[test]
+fn product_001_existing_table_s3_index_unique_failure_rolls_back_without_publication() {
+    let fixture = DurableFixture::new("existing-s3-index-unique-rollback");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(
+            71_430,
+            "CREATE TABLE product_existing_s3_index_unique_failure \
+             (id INT PRIMARY KEY, code INT, region TEXT)",
+        )
+        .expect("create populated-table S3 unique-failure fixture");
+    engine
+        .execute_text(
+            71_431,
+            "INSERT INTO product_existing_s3_index_unique_failure VALUES (1, 10, 'north')",
+        )
+        .expect("seed the published unique-failure prefix");
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+    let txn_id = 71_432;
+    for sql in [
+        "BEGIN",
+        "INSERT INTO product_existing_s3_index_unique_failure VALUES (2, 20, 'west')",
+        "CREATE UNIQUE INDEX product_existing_s3_index_unique_failure_code_region \
+         ON product_existing_s3_index_unique_failure (code, region)",
+        "INSERT INTO product_existing_s3_index_unique_failure VALUES (3, 30, 'south')",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage populated-table S3 unique-failure transition");
+    }
+    let duplicate = engine
+        .submit_transaction(
+            txn_id,
+            parsed("INSERT INTO product_existing_s3_index_unique_failure VALUES (4, 30, 'south')"),
+        )
+        .expect_err("private S3-created unique index must reject the duplicate before WAL");
+    assert!(
+        duplicate.to_string().contains("duplicate key"),
+        "S3-created index must retain its PostgreSQL diagnostic: {duplicate}"
+    );
+    engine
+        .submit_transaction(txn_id, parsed("ROLLBACK"))
+        .expect("rollback after populated-table S3 unique rejection");
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(
+        engine.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert_eq!(
+        durable_ids(&engine, "product_existing_s3_index_unique_failure"),
+        vec![1]
+    );
+    assert!(engine
+        .relational_catalog_table("product_existing_s3_index_unique_failure")
+        .unwrap()
+        .indexes
+        .iter()
+        .all(|index| index.name != "product_existing_s3_index_unique_failure_code_region"));
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("fresh reopen must retain only the published unique-failure prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert_eq!(
+        durable_ids(&recovered, "product_existing_s3_index_unique_failure"),
+        vec![1]
+    );
+    assert!(recovered
+        .relational_catalog_table("product_existing_s3_index_unique_failure")
+        .unwrap()
+        .indexes
+        .iter()
+        .all(|index| index.name != "product_existing_s3_index_unique_failure_code_region"));
+}
+
+#[test]
+fn product_001_private_create_index_unique_failure_rolls_back_without_publication() {
+    let fixture = DurableFixture::new("private-create-index-unique-rollback");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_360;
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+
+    for sql in [
+        "BEGIN",
+        "CREATE TABLE product_private_index_unique_failure (id INT, value INT)",
+        "CREATE UNIQUE INDEX product_private_index_unique_failure_id \
+         ON product_private_index_unique_failure (id)",
+        "INSERT INTO product_private_index_unique_failure VALUES (1, 10)",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private CREATE INDEX unique-failure transaction");
+    }
+    let duplicate = engine
+        .submit_transaction(
+            txn_id,
+            parsed("INSERT INTO product_private_index_unique_failure VALUES (1, 20)"),
+        )
+        .expect_err(
+            "private named unique index must reject the duplicate before codec-5 admission",
+        );
+    assert!(
+        duplicate.to_string().contains("duplicate key"),
+        "private named unique index must retain its PostgreSQL diagnostic: {duplicate}"
+    );
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+
+    engine
+        .submit_transaction(txn_id, parsed("ROLLBACK"))
+        .expect("rollback after private named-index duplicate rejection");
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(
+        engine.catalog_snapshot().relational_next_oid,
+        next_oid_before,
+        "private named-index rollback must not leak catalog allocation"
+    );
+    assert!(
+        engine
+            .relational_catalog_table("product_private_index_unique_failure")
+            .is_none(),
+        "rollback must not publish the private table or named index"
+    );
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("private named-index rollback leaves an empty durable prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert_eq!(recovered.visible_up_to(), visible_before);
+    assert_eq!(
+        recovered.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(
+        recovered
+            .relational_catalog_table("product_private_index_unique_failure")
+            .is_none(),
+        "fresh reopen must not materialize the rolled-back private table or named index"
+    );
+}
+
+#[test]
+fn product_001_codec5_private_create_sequence_table_rename_crash_prefixes_retry_once() {
+    use crate::engine_transaction_delta::TransactionTerminalPreDurableFault;
+
+    let boundaries = [
+        (
+            "before-replication-proposal",
+            TransactionTerminalPreDurableFault::ReplicationProposal,
+        ),
+        (
+            "before-canonical-wal-append",
+            TransactionTerminalPreDurableFault::CanonicalWalAppend,
+        ),
+        (
+            "before-wal-flush",
+            TransactionTerminalPreDurableFault::WalFlush,
+        ),
+    ];
+
+    let stage_private_create = |engine: &Engine, txn_id| {
+        for sql in [
+            "BEGIN",
+            "CREATE SEQUENCE product_private_prefix_sequence",
+            "CREATE TABLE product_private_prefix_owner \
+             (id INT DEFAULT nextval('product_private_prefix_sequence'::regclass), \
+              row_key INT PRIMARY KEY, note TEXT)",
+            "INSERT INTO product_private_prefix_owner (row_key, note) VALUES (1, 'before-rename')",
+            "ALTER SEQUENCE product_private_prefix_sequence \
+             RENAME TO product_private_prefix_sequence_final",
+            "INSERT INTO product_private_prefix_owner (row_key, note) VALUES (2, 'after-rename')",
+            "ALTER SEQUENCE product_private_prefix_sequence_final RESTART WITH 40",
+            "INSERT INTO product_private_prefix_owner (row_key, note) VALUES (3, 'after-restart')",
+        ] {
+            engine
+                .submit_transaction(txn_id, parsed(sql))
+                .expect("stage private sequence/table/rename transaction");
+        }
+    };
+
+    for (ordinal, (label, boundary)) in boundaries.into_iter().enumerate() {
+        let fixture = DurableFixture::new(&format!("private-create-{label}"));
+        let engine = Engine::with_durable_wal_segment(&fixture.wal);
+        let txn_id = 71_200 + u64::try_from(ordinal).unwrap();
+        let durable_before = engine.durable_wal_records();
+        let visible_before = engine.visible_up_to();
+        let flushed_before = engine.wal_flushed_count();
+
+        stage_private_create(&engine, txn_id);
+        engine.fail_next_transaction_terminal_pre_durable_at(boundary);
+        let failure = engine.submit_transaction(txn_id, parsed("COMMIT"));
+        assert!(
+            matches!(
+                failure,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "{label} must fail before acknowledgement: {failure:?}"
+        );
+        assert_eq!(engine.visible_up_to(), visible_before, "{label}");
+        assert_eq!(engine.wal_flushed_count(), flushed_before, "{label}");
+        assert_eq!(engine.durable_wal_records(), durable_before, "{label}");
+        assert!(
+            engine
+                .relational_catalog_table("product_private_prefix_owner")
+                .is_none(),
+            "{label} must not publish the private table"
+        );
+        assert!(
+            engine
+                .relational_catalog_sequence("product_private_prefix_sequence_final")
+                .is_none(),
+            "{label} must not publish the renamed private sequence"
+        );
+
+        // Dropping here models a process crash. The prefix may contain neither the first table
+        // generation nor the final stable sequence name, because both belong to this one codec-5
+        // terminal record.
+        drop(engine);
+        let recovered =
+            Engine::open_durable_wal_segment_auto(&fixture.wal).expect("recover crash prefix");
+        assert_eq!(recovered.durable_wal_records(), durable_before, "{label}");
+        assert!(
+            recovered
+                .relational_catalog_table("product_private_prefix_owner")
+                .is_none(),
+            "{label} fresh reopen must not materialize the private table"
+        );
+        assert!(
+            recovered
+                .relational_catalog_sequence("product_private_prefix_sequence_final")
+                .is_none(),
+            "{label} fresh reopen must not materialize the renamed private sequence"
+        );
+
+        stage_private_create(&recovered, txn_id);
+        recovered
+            .submit_transaction(txn_id, parsed("COMMIT"))
+            .expect("the unacknowledged private transaction retries through codec-5");
+        assert_eq!(
+            durable_ids(&recovered, "product_private_prefix_owner"),
+            vec![1, 2, 40],
+            "{label} retry publishes every pre-rename, post-rename, and post-restart row exactly once"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            recovered.relational_named_index_covered_rows("product_private_prefix_owner"),
+            Some(3),
+            "{label} retry must publish the transaction-created primary index with every row"
+        );
+        let sequence = recovered
+            .relational_catalog_sequence("product_private_prefix_sequence_final")
+            .expect("retry publishes final sequence binding");
+        assert_eq!(
+            (sequence.last_value, sequence.is_called),
+            (40, true),
+            "{label}"
+        );
+        let retry_record = recovered
+            .durable_wal_records()
+            .into_iter()
+            .find(|record| record.txn_id == txn_id)
+            .expect("the acknowledged retry remains in canonical WAL");
+        let metadata = codec5_replay_metadata(&retry_record);
+        assert!(
+            metadata.initial_table_absent,
+            "{label} retry must retain the S7-authenticated first-table predecessor"
+        );
+
+        drop(recovered);
+        let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("recover acknowledged private retry");
+        assert_eq!(
+            durable_ids(&reopened, "product_private_prefix_owner"),
+            vec![1, 2, 40],
+            "{label} replay owns the same first-table generation"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            reopened.relational_named_index_covered_rows("product_private_prefix_owner"),
+            Some(3),
+            "{label} fresh replay must republish the transaction-created primary index"
+        );
+        let sequence = reopened
+            .relational_catalog_sequence("product_private_prefix_sequence_final")
+            .expect("replay restores final sequence binding");
+        assert_eq!(
+            (sequence.last_value, sequence.is_called),
+            (40, true),
+            "{label}"
+        );
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn product_001_codec5_private_create_replay_parks_persistent_719_then_uses_fresh_context() {
+    let Ok(runtime) = gpu_db_execution::CudaDriverRuntime::probe() else {
+        return;
+    };
+    if !runtime.snapshot().driver_available || runtime.snapshot().device_count == 0 {
+        return;
+    }
+
+    let fixture = DurableFixture::new("private-create-persistent-719");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_245;
+    for sql in [
+        "BEGIN",
+        "CREATE SEQUENCE product_private_719_sequence",
+        "CREATE TABLE product_private_719_owner \
+         (id INT DEFAULT nextval('product_private_719_sequence'::regclass), \
+          row_key INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO product_private_719_owner (row_key, note) VALUES (1, 'before-rename')",
+        "ALTER SEQUENCE product_private_719_sequence \
+         RENAME TO product_private_719_sequence_final",
+        "INSERT INTO product_private_719_owner (row_key, note) VALUES (2, 'after-rename')",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage one codec-5 private CREATE/INSERT authority");
+    }
+    engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect("durably commit the private CREATE/INSERT authority");
+    let durable = engine.durable_wal_records();
+    drop(engine);
+
+    // The first completion failure returns UnknownQuiescence; dropping that owner consumes the
+    // second injected failure during its bounded drain and quarantines the old-context leases.
+    // Recovery must then replay the immutable codec-5 record exactly once on a new context.
+    gpu_db_execution::fail_owned_stream_syncs_with_cuda_code_for_test(2, 719);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("persistent typed-generation 719 must use one fresh-context replay retry");
+    assert_eq!(Engine::recovery_attempt_count(), 2);
+    assert!(recovered.uses_dedicated_recovery_cuda_contexts_for_test());
+    assert_eq!(recovered.durable_wal_records(), durable);
+    assert_eq!(
+        durable_ids(&recovered, "product_private_719_owner"),
+        vec![1, 2]
+    );
+    let sequence = recovered
+        .relational_catalog_sequence("product_private_719_sequence_final")
+        .expect("fresh replay retains the renamed private sequence");
+    assert_eq!((sequence.last_value, sequence.is_called), (2, true));
+}
+
+#[test]
+fn product_001_codec5_private_serial_table_rename_crash_prefixes_retry_once() {
+    use crate::engine_transaction_delta::TransactionTerminalPreDurableFault;
+
+    let boundaries = [
+        (
+            "before-replication-proposal",
+            TransactionTerminalPreDurableFault::ReplicationProposal,
+        ),
+        (
+            "before-canonical-wal-append",
+            TransactionTerminalPreDurableFault::CanonicalWalAppend,
+        ),
+        (
+            "before-wal-flush",
+            TransactionTerminalPreDurableFault::WalFlush,
+        ),
+    ];
+    let stage_private_serial = |engine: &Engine, txn_id| {
+        for sql in [
+            "BEGIN",
+            "CREATE TABLE product_private_serial_prefix_owner \
+             (id serial PRIMARY KEY, note text)",
+            "ALTER SEQUENCE product_private_serial_prefix_owner_id_seq \
+             RENAME TO product_private_serial_prefix_owner_id_seq_final",
+            "INSERT INTO product_private_serial_prefix_owner (note) \
+             VALUES ('first'), ('second')",
+        ] {
+            engine
+                .submit_transaction(txn_id, parsed(sql))
+                .expect("stage private serial/rename/typed-INSERT transaction");
+        }
+    };
+
+    for (ordinal, (label, boundary)) in boundaries.into_iter().enumerate() {
+        let fixture = DurableFixture::new(&format!("private-serial-{label}"));
+        let engine = Engine::with_durable_wal_segment(&fixture.wal);
+        let txn_id = 71_203 + u64::try_from(ordinal).unwrap();
+        let durable_before = engine.durable_wal_records();
+        let visible_before = engine.visible_up_to();
+        let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+
+        stage_private_serial(&engine, txn_id);
+        engine.fail_next_transaction_terminal_pre_durable_at(boundary);
+        let failure = engine.submit_transaction(txn_id, parsed("COMMIT"));
+        assert!(
+            matches!(
+                failure,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "{label} must fail before acknowledgement: {failure:?}"
+        );
+        assert_eq!(engine.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(engine.visible_up_to(), visible_before, "{label}");
+        assert_eq!(
+            engine.catalog_snapshot().relational_next_oid,
+            next_oid_before,
+            "{label} must not publish the generated table/sequence OIDs"
+        );
+        assert!(
+            engine
+                .relational_catalog_table("product_private_serial_prefix_owner")
+                .is_none(),
+            "{label} must not publish the private serial table"
+        );
+        assert!(
+            engine
+                .relational_catalog_sequence("product_private_serial_prefix_owner_id_seq_final")
+                .is_none(),
+            "{label} must not publish the renamed generated sequence"
+        );
+
+        drop(engine);
+        let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("recover the unacknowledged private serial prefix");
+        assert_eq!(recovered.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(
+            recovered.catalog_snapshot().relational_next_oid,
+            next_oid_before,
+            "{label} fresh reopen must not materialize generated catalog identity"
+        );
+        assert!(
+            recovered
+                .relational_catalog_table("product_private_serial_prefix_owner")
+                .is_none(),
+            "{label} fresh reopen must not materialize the private serial table"
+        );
+
+        stage_private_serial(&recovered, txn_id);
+        recovered
+            .submit_transaction(txn_id, parsed("COMMIT"))
+            .expect("the unacknowledged private serial transaction retries through codec-5");
+        assert_eq!(
+            durable_ids(&recovered, "product_private_serial_prefix_owner"),
+            vec![1, 2],
+            "{label} retry publishes every generated serial row exactly once"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            recovered.relational_named_index_covered_rows("product_private_serial_prefix_owner"),
+            Some(2),
+            "{label} retry publishes the generated primary index exactly once"
+        );
+        let sequence = recovered
+            .relational_catalog_sequence("product_private_serial_prefix_owner_id_seq_final")
+            .expect("retry publishes the renamed generated sequence");
+        assert_eq!(
+            (sequence.last_value, sequence.is_called),
+            (2, true),
+            "{label}"
+        );
+        assert!(
+            recovered
+                .relational_catalog_sequence("product_private_serial_prefix_owner_id_seq")
+                .is_none(),
+            "{label} retry must retain only the final generated sequence name"
+        );
+        let retry_record = recovered
+            .durable_wal_records()
+            .into_iter()
+            .find(|record| record.txn_id == txn_id)
+            .expect("the acknowledged private serial retry remains in canonical WAL");
+        assert!(codec5_replay_metadata(&retry_record).initial_table_absent);
+
+        drop(recovered);
+        let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("fresh reopen recovers the acknowledged private serial retry");
+        assert_eq!(
+            durable_ids(&reopened, "product_private_serial_prefix_owner"),
+            vec![1, 2],
+            "{label} fresh replay owns the private serial rowset"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            reopened.relational_named_index_covered_rows("product_private_serial_prefix_owner"),
+            Some(2),
+            "{label} fresh replay owns the generated primary index"
+        );
+        let sequence = reopened
+            .relational_catalog_sequence("product_private_serial_prefix_owner_id_seq_final")
+            .expect("fresh replay restores the final generated sequence name");
+        assert_eq!(
+            (sequence.last_value, sequence.is_called),
+            (2, true),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn product_001_private_serial_table_rename_post_durable_recovery_owns_once() {
+    let fixture = DurableFixture::new("private-serial-post-durable");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_206;
+    let records_before = engine.durable_wal_records().len();
+    for sql in [
+        "BEGIN",
+        "CREATE TABLE product_private_serial_indeterminate_owner \
+         (id serial PRIMARY KEY, note text)",
+        "ALTER SEQUENCE product_private_serial_indeterminate_owner_id_seq \
+         RENAME TO product_private_serial_indeterminate_owner_id_seq_final",
+        "INSERT INTO product_private_serial_indeterminate_owner (note) \
+         VALUES ('first'), ('second')",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private serial/rename/typed-INSERT post-durable transaction");
+    }
+    engine.fail_next_transaction_post_durable_apply();
+    let failure = engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect_err("post-durable private serial apply fault must be indeterminate");
+    assert!(
+        failure.is_indeterminate(),
+        "expected indeterminate private serial failure: {failure}"
+    );
+    assert!(engine.is_commit_path_poisoned());
+    assert_eq!(engine.durable_wal_records().len(), records_before + 1);
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("recover the durable private serial transaction");
+    assert_eq!(recovered.durable_wal_records().len(), records_before + 1);
+    assert_eq!(
+        durable_ids(&recovered, "product_private_serial_indeterminate_owner"),
+        vec![1, 2]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("product_private_serial_indeterminate_owner"),
+        Some(2),
+        "post-durable recovery must publish the generated primary index"
+    );
+    let sequence = recovered
+        .relational_catalog_sequence("product_private_serial_indeterminate_owner_id_seq_final")
+        .expect("recovery publishes the renamed generated sequence");
+    assert_eq!((sequence.last_value, sequence.is_called), (2, true));
+    assert!(
+        recovered
+            .relational_catalog_sequence("product_private_serial_indeterminate_owner_id_seq")
+            .is_none(),
+        "recovery must not restore the pre-rename generated sequence name"
+    );
+    let record = recovered
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == txn_id)
+        .expect("durable private serial transaction remains present");
+    assert!(codec5_replay_metadata(&record).initial_table_absent);
+
+    let records_before_repeat_reopen = recovered.durable_wal_records().len();
+    drop(recovered);
+    let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("repeat private serial recovery is exact");
+    assert_eq!(
+        reopened.durable_wal_records().len(),
+        records_before_repeat_reopen,
+        "repeat recovery must not append or duplicate the private serial transaction"
+    );
+    assert_eq!(
+        durable_ids(&reopened, "product_private_serial_indeterminate_owner"),
+        vec![1, 2]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        reopened.relational_named_index_covered_rows("product_private_serial_indeterminate_owner"),
+        Some(2),
+        "repeat recovery must retain the generated primary index"
+    );
+    let sequence = reopened
+        .relational_catalog_sequence("product_private_serial_indeterminate_owner_id_seq_final")
+        .expect("repeat recovery retains the renamed generated sequence");
+    assert_eq!((sequence.last_value, sequence.is_called), (2, true));
+}
+
+#[test]
+fn product_001_private_serial_table_rename_duplicate_rolls_back_without_publication() {
+    let fixture = DurableFixture::new("private-serial-duplicate-rollback");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_207;
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+    for sql in [
+        "BEGIN",
+        "CREATE TABLE product_private_serial_duplicate_owner \
+         (id serial PRIMARY KEY, note text)",
+        "ALTER SEQUENCE product_private_serial_duplicate_owner_id_seq \
+         RENAME TO product_private_serial_duplicate_owner_id_seq_final",
+        "INSERT INTO product_private_serial_duplicate_owner (note) VALUES ('first')",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private serial/rename/valid typed INSERT before duplicate");
+    }
+    let duplicate = engine
+        .submit_transaction(
+            txn_id,
+            parsed("INSERT INTO product_private_serial_duplicate_owner (id, note) VALUES (1, 'duplicate')"),
+        )
+        .expect_err("private serial primary key must reject the duplicate before codec-5 admission");
+    assert!(
+        duplicate
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("duplicate key"),
+        "private serial duplicate must retain its PostgreSQL diagnostic: {duplicate}"
+    );
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+
+    engine
+        .submit_transaction(txn_id, parsed("ROLLBACK"))
+        .expect("rollback after private serial duplicate rejection");
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(
+        engine.catalog_snapshot().relational_next_oid,
+        next_oid_before,
+        "private serial rollback must not leak generated table or sequence OIDs"
+    );
+    assert!(engine
+        .relational_catalog_table("product_private_serial_duplicate_owner")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_serial_duplicate_owner_id_seq")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_serial_duplicate_owner_id_seq_final")
+        .is_none());
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("private serial rollback leaves no durable prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert_eq!(recovered.visible_up_to(), visible_before);
+    assert_eq!(
+        recovered.catalog_snapshot().relational_next_oid,
+        next_oid_before,
+        "fresh reopen must not consume private serial catalog identity"
+    );
+    assert!(recovered
+        .relational_catalog_table("product_private_serial_duplicate_owner")
+        .is_none());
+    assert!(recovered
+        .relational_catalog_sequence("product_private_serial_duplicate_owner_id_seq_final")
+        .is_none());
+}
+
+#[test]
+fn product_001_private_create_sequence_table_rename_rollback_publishes_nothing() {
+    let fixture = DurableFixture::new("private-create-rollback");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_300;
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+
+    for sql in [
+        "BEGIN",
+        "CREATE SEQUENCE product_private_rollback_sequence",
+        "CREATE TABLE product_private_rollback_owner \
+         (id INT DEFAULT nextval('product_private_rollback_sequence'::regclass), \
+          row_key INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO product_private_rollback_owner (row_key, note) VALUES (1, 'before-rename')",
+        "ALTER SEQUENCE product_private_rollback_sequence \
+         RENAME TO product_private_rollback_sequence_final",
+        "INSERT INTO product_private_rollback_owner (row_key, note) VALUES (2, 'after-rename')",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private rollback transaction");
+    }
+    engine
+        .submit_transaction(txn_id, parsed("ROLLBACK"))
+        .expect("rollback private first-table transaction");
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(
+        engine.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(engine
+        .relational_catalog_table("product_private_rollback_owner")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_rollback_sequence")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_rollback_sequence_final")
+        .is_none());
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("rollback leaves an empty durable prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert_eq!(
+        recovered.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(recovered
+        .relational_catalog_table("product_private_rollback_owner")
+        .is_none());
+    assert!(recovered
+        .relational_catalog_sequence("product_private_rollback_sequence_final")
+        .is_none());
+}
+
+#[test]
+fn product_001_private_create_sequence_table_rename_check_failure_rolls_back_without_publication() {
+    let fixture = DurableFixture::new("private-create-check-rollback");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(
+            71_348,
+            "CREATE TABLE product_private_check_parent (id INT PRIMARY KEY)",
+        )
+        .expect("create the published CHECK/FK parent");
+    engine
+        .execute_text(
+            71_349,
+            "INSERT INTO product_private_check_parent VALUES (7)",
+        )
+        .expect("seed the published CHECK/FK parent");
+    engine
+        .execute_text(71_350, "CREATE DOMAIN product_private_check_tally AS INT")
+        .expect("create the published domain used by the private CHECK table");
+    let txn_id = 71_351;
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+
+    for sql in [
+        "BEGIN",
+        "CREATE SEQUENCE product_private_check_sequence",
+        "CREATE TABLE product_private_check_owner \
+         (id INT DEFAULT nextval('product_private_check_sequence'::regclass), parent_id INT, \
+          row_key INT PRIMARY KEY, tally product_private_check_tally, \
+          CONSTRAINT product_private_check_positive CHECK (tally > 0))",
+        "ALTER TABLE ONLY product_private_check_owner \
+         ADD CONSTRAINT product_private_check_owner_parent \
+         FOREIGN KEY (parent_id) REFERENCES product_private_check_parent(id)",
+        "INSERT INTO product_private_check_owner (row_key, parent_id, tally) VALUES (1, 7, 1)",
+        "ALTER SEQUENCE product_private_check_sequence \
+         RENAME TO product_private_check_sequence_final",
+        "ALTER SEQUENCE product_private_check_sequence_final RESTART WITH 40",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private check transaction");
+    }
+    let check = engine
+        .submit_transaction(
+            txn_id,
+            parsed(
+                "INSERT INTO product_private_check_owner (row_key, parent_id, tally) VALUES (2, 7, 0)",
+            ),
+        )
+        .expect_err("private first-table CHECK must reject before codec-5 admission");
+    assert!(
+        check.to_string().contains("check constraint"),
+        "private CHECK must retain its PostgreSQL diagnostic: {check}"
+    );
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+
+    engine
+        .submit_transaction(txn_id, parsed("ROLLBACK"))
+        .expect("rollback after private CHECK rejection");
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(
+        engine.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(engine
+        .relational_catalog_table("product_private_check_owner")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_check_sequence")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_check_sequence_final")
+        .is_none());
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("private CHECK rollback leaves an empty durable prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert_eq!(recovered.visible_up_to(), visible_before);
+    assert_eq!(
+        recovered.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(recovered
+        .relational_catalog_table("product_private_check_owner")
+        .is_none());
+    assert!(recovered
+        .relational_catalog_sequence("product_private_check_sequence_final")
+        .is_none());
+}
+
+#[test]
+fn product_001_private_create_sequence_table_foreign_key_rename_reopens_through_codec5() {
+    let fixture = DurableFixture::new("private-create-foreign-key");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(71_359, "CREATE DOMAIN product_private_fk_tally AS INT")
+        .expect("create the domain used by the private FK table");
+
+    let txn_id = 71_362;
+    for sql in [
+        "BEGIN",
+        "CREATE SEQUENCE product_private_fk_sequence",
+        "CREATE TABLE product_private_fk_parent (id INT PRIMARY KEY)",
+        "CREATE TABLE product_private_fk_owner \
+         (id INT DEFAULT nextval('product_private_fk_sequence'::regclass), parent_id INT, \
+          row_key INT PRIMARY KEY, tally product_private_fk_tally, \
+          CONSTRAINT product_private_fk_tally_positive CHECK (tally > 0))",
+        "ALTER TABLE ONLY product_private_fk_owner ADD CONSTRAINT product_private_fk_owner_parent \
+         FOREIGN KEY (parent_id) REFERENCES product_private_fk_parent(id)",
+        "INSERT INTO product_private_fk_parent VALUES (7)",
+        "INSERT INTO product_private_fk_owner (row_key, parent_id, tally) VALUES (1, 7, 11)",
+        "ALTER SEQUENCE product_private_fk_sequence \
+         RENAME TO product_private_fk_sequence_final",
+        "INSERT INTO product_private_fk_owner (row_key, parent_id, tally) VALUES (2, 7, 22)",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private sequence/table/FK/rename transaction");
+    }
+    engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect("private FK transaction must retain codec-5 S3 composition");
+    assert_eq!(durable_ids(&engine, "product_private_fk_owner"), vec![1, 2]);
+    assert_eq!(durable_ids(&engine, "product_private_fk_parent"), vec![7]);
+    let sequence = engine
+        .relational_catalog_sequence("product_private_fk_sequence_final")
+        .expect("private FK transaction publishes the renamed sequence");
+    assert_eq!((sequence.last_value, sequence.is_called), (2, true));
+    let record = engine
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == txn_id)
+        .expect("private FK transaction emits one canonical record");
+    let metadata = codec5_replay_metadata(&record);
+    assert!(metadata.initial_table_absent);
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("reopen private FK transaction from codec-5 WAL");
+    assert_eq!(
+        durable_ids(&recovered, "product_private_fk_owner"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        durable_ids(&recovered, "product_private_fk_parent"),
+        vec![7]
+    );
+    let sequence = recovered
+        .relational_catalog_sequence("product_private_fk_sequence_final")
+        .expect("reopen retains renamed private sequence");
+    assert_eq!((sequence.last_value, sequence.is_called), (2, true));
+}
+
+#[test]
+fn product_001_private_create_domain_table_insert_reopens_through_codec5() {
+    let fixture = DurableFixture::new("private-create-domain");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_364;
+    for sql in [
+        "BEGIN",
+        "CREATE DOMAIN product_private_inline_amount AS INT",
+        "CREATE TABLE product_private_inline_domain_owner \
+         (id INT PRIMARY KEY, amount product_private_inline_amount, \
+          CONSTRAINT product_private_inline_amount_positive CHECK (amount > 0))",
+        "INSERT INTO product_private_inline_domain_owner VALUES (1, 11), (2, 22)",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private domain/table/INSERT transaction");
+    }
+    engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect("private domain/table/INSERT transaction must retain codec-5 S3 composition");
+    assert_eq!(
+        durable_ids(&engine, "product_private_inline_domain_owner"),
+        vec![1, 2]
+    );
+    assert!(engine
+        .relational_catalog_domain("product_private_inline_amount")
+        .is_some());
+    assert_eq!(
+        engine.relational_named_index_covered_rows("product_private_inline_domain_owner"),
+        Some(2)
+    );
+    let record = engine
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == txn_id)
+        .expect("private domain transaction emits one canonical record");
+    let metadata = codec5_replay_metadata(&record);
+    assert!(metadata.initial_table_absent);
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("reopen private domain transaction from codec-5 WAL");
+    assert_eq!(
+        durable_ids(&recovered, "product_private_inline_domain_owner"),
+        vec![1, 2]
+    );
+    assert!(recovered
+        .relational_catalog_domain("product_private_inline_amount")
+        .is_some());
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("product_private_inline_domain_owner"),
+        Some(2)
+    );
+}
+
+#[test]
+fn product_001_private_create_domain_table_check_failure_rolls_back_without_publication() {
+    let fixture = DurableFixture::new("private-create-domain-check-rollback");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_365;
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+    for sql in [
+        "BEGIN",
+        "CREATE DOMAIN product_private_inline_failure_amount AS INT",
+        "CREATE TABLE product_private_inline_failure_owner \
+         (id INT PRIMARY KEY, amount product_private_inline_failure_amount, \
+          CONSTRAINT product_private_inline_failure_amount_positive CHECK (amount > 0))",
+        "INSERT INTO product_private_inline_failure_owner VALUES (1, 11)",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private domain/table/valid INSERT before CHECK failure");
+    }
+    let check = engine
+        .submit_transaction(
+            txn_id,
+            parsed("INSERT INTO product_private_inline_failure_owner VALUES (2, -1)"),
+        )
+        .expect_err("private domain CHECK must reject the bad typed row at statement admission");
+    assert!(
+        check.to_string().to_ascii_lowercase().contains("check"),
+        "private domain CHECK must retain its PostgreSQL diagnostic: {check}"
+    );
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+
+    engine
+        .submit_transaction(txn_id, parsed("ROLLBACK"))
+        .expect("rollback after private domain CHECK rejection");
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(
+        engine.catalog_snapshot().relational_next_oid,
+        next_oid_before,
+        "failed private domain composition must not consume a catalog OID"
+    );
+    assert!(engine
+        .relational_catalog_domain("product_private_inline_failure_amount")
+        .is_none());
+    assert!(engine
+        .relational_catalog_table("product_private_inline_failure_owner")
+        .is_none());
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("fresh reopen must retain no failed private-domain transaction prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert_eq!(recovered.visible_up_to(), visible_before);
+    assert_eq!(
+        recovered.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(recovered
+        .relational_catalog_domain("product_private_inline_failure_amount")
+        .is_none());
+    assert!(recovered
+        .relational_catalog_table("product_private_inline_failure_owner")
+        .is_none());
+}
+
+#[test]
+fn product_001_private_create_domain_table_crash_prefixes_retry_once() {
+    use crate::engine_transaction_delta::TransactionTerminalPreDurableFault;
+
+    let boundaries = [
+        (
+            "before-replication-proposal",
+            TransactionTerminalPreDurableFault::ReplicationProposal,
+        ),
+        (
+            "before-canonical-wal-append",
+            TransactionTerminalPreDurableFault::CanonicalWalAppend,
+        ),
+        (
+            "before-wal-flush",
+            TransactionTerminalPreDurableFault::WalFlush,
+        ),
+    ];
+    let stage_private_domain = |engine: &Engine, txn_id| {
+        for sql in [
+            "BEGIN",
+            "CREATE DOMAIN product_private_inline_prefix_amount AS INT",
+            "CREATE TABLE product_private_inline_prefix_owner \
+             (id INT PRIMARY KEY, amount product_private_inline_prefix_amount, \
+              CONSTRAINT product_private_inline_prefix_amount_positive CHECK (amount > 0))",
+            "INSERT INTO product_private_inline_prefix_owner VALUES (1, 11), (2, 22)",
+        ] {
+            engine
+                .submit_transaction(txn_id, parsed(sql))
+                .expect("stage private domain/table/INSERT crash-prefix transaction");
+        }
+    };
+
+    for (ordinal, (label, boundary)) in boundaries.into_iter().enumerate() {
+        let fixture = DurableFixture::new(&format!("private-create-domain-{label}"));
+        let engine = Engine::with_durable_wal_segment(&fixture.wal);
+        let txn_id = 71_366 + u64::try_from(ordinal).unwrap();
+        let durable_before = engine.durable_wal_records();
+        let visible_before = engine.visible_up_to();
+        let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+        stage_private_domain(&engine, txn_id);
+        engine.fail_next_transaction_terminal_pre_durable_at(boundary);
+        let failure = engine.submit_transaction(txn_id, parsed("COMMIT"));
+        assert!(
+            matches!(
+                failure,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "{label} must fail before acknowledgement: {failure:?}"
+        );
+        assert_eq!(engine.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(engine.visible_up_to(), visible_before, "{label}");
+        assert_eq!(
+            engine.catalog_snapshot().relational_next_oid,
+            next_oid_before,
+            "{label} must not publish a private-domain catalog allocation"
+        );
+        assert!(engine
+            .relational_catalog_domain("product_private_inline_prefix_amount")
+            .is_none());
+        assert!(engine
+            .relational_catalog_table("product_private_inline_prefix_owner")
+            .is_none());
+
+        drop(engine);
+        let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("fresh reopen must retain no pre-durable private-domain prefix");
+        assert_eq!(recovered.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(recovered.visible_up_to(), visible_before, "{label}");
+        assert_eq!(
+            recovered.catalog_snapshot().relational_next_oid,
+            next_oid_before,
+            "{label} fresh reopen must not consume a private-domain catalog allocation"
+        );
+        assert!(recovered
+            .relational_catalog_domain("product_private_inline_prefix_amount")
+            .is_none());
+        assert!(recovered
+            .relational_catalog_table("product_private_inline_prefix_owner")
+            .is_none());
+
+        stage_private_domain(&recovered, txn_id);
+        recovered
+            .submit_transaction(txn_id, parsed("COMMIT"))
+            .expect("the unacknowledged private-domain transaction retries through codec-5");
+        assert_eq!(
+            durable_ids(&recovered, "product_private_inline_prefix_owner"),
+            vec![1, 2],
+            "{label} retry publishes the private-domain rowset exactly once"
+        );
+        assert!(recovered
+            .relational_catalog_domain("product_private_inline_prefix_amount")
+            .is_some());
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            recovered.relational_named_index_covered_rows("product_private_inline_prefix_owner"),
+            Some(2),
+            "{label} retry publishes the private-domain primary index exactly once"
+        );
+        let record = recovered
+            .durable_wal_records()
+            .into_iter()
+            .find(|record| record.txn_id == txn_id)
+            .expect("the acknowledged private-domain retry remains in canonical WAL");
+        assert!(codec5_replay_metadata(&record).initial_table_absent);
+
+        drop(recovered);
+        let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("fresh reopen must recover the acknowledged private-domain retry");
+        assert_eq!(
+            durable_ids(&reopened, "product_private_inline_prefix_owner"),
+            vec![1, 2],
+            "{label} fresh replay owns the retried private-domain rowset"
+        );
+        assert!(reopened
+            .relational_catalog_domain("product_private_inline_prefix_amount")
+            .is_some());
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            reopened.relational_named_index_covered_rows("product_private_inline_prefix_owner"),
+            Some(2),
+            "{label} fresh replay restores the private-domain primary index"
+        );
+    }
+}
+
+#[test]
+fn product_001_private_create_domain_table_post_durable_recovery_owns_once() {
+    let fixture = DurableFixture::new("private-create-domain-post-durable");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 71_371;
+    let records_before = engine.durable_wal_records().len();
+    for sql in [
+        "BEGIN",
+        "CREATE DOMAIN product_private_inline_indeterminate_amount AS INT",
+        "CREATE TABLE product_private_inline_indeterminate_owner \
+         (id INT PRIMARY KEY, amount product_private_inline_indeterminate_amount, \
+          CONSTRAINT product_private_inline_indeterminate_amount_positive CHECK (amount > 0))",
+        "INSERT INTO product_private_inline_indeterminate_owner VALUES (1, 11), (2, 22)",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private domain/table/INSERT post-durable transaction");
+    }
+    engine.fail_next_transaction_post_durable_apply();
+    let failure = engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect_err("post-durable private-domain apply fault must be indeterminate");
+    assert!(
+        failure.is_indeterminate(),
+        "expected indeterminate private-domain failure: {failure}"
+    );
+    assert!(engine.is_commit_path_poisoned());
+    assert_eq!(engine.durable_wal_records().len(), records_before + 1);
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("recovery owns the durable private-domain transaction");
+    assert_eq!(recovered.durable_wal_records().len(), records_before + 1);
+    assert_eq!(
+        durable_ids(&recovered, "product_private_inline_indeterminate_owner"),
+        vec![1, 2]
+    );
+    assert!(recovered
+        .relational_catalog_domain("product_private_inline_indeterminate_amount")
+        .is_some());
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("product_private_inline_indeterminate_owner"),
+        Some(2),
+        "recovery publishes the transaction-created private-domain primary index"
+    );
+    let record = recovered
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == txn_id)
+        .expect("durable private-domain transaction remains present");
+    assert!(codec5_replay_metadata(&record).initial_table_absent);
+
+    let records_before_second_reopen = recovered.durable_wal_records().len();
+    drop(recovered);
+    let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("repeat recovery of the private-domain transaction is exact");
+    assert_eq!(
+        reopened.durable_wal_records().len(),
+        records_before_second_reopen,
+        "repeat recovery must not append or duplicate the private-domain transaction"
+    );
+    assert_eq!(
+        durable_ids(&reopened, "product_private_inline_indeterminate_owner"),
+        vec![1, 2]
+    );
+    assert!(reopened
+        .relational_catalog_domain("product_private_inline_indeterminate_amount")
+        .is_some());
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        reopened.relational_named_index_covered_rows("product_private_inline_indeterminate_owner"),
+        Some(2),
+        "repeat recovery retains the private-domain primary index"
+    );
+}
+
+#[test]
+fn product_001_private_create_sequence_table_foreign_key_failure_rolls_back_without_publication() {
+    let fixture = DurableFixture::new("private-create-foreign-key-rollback");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(
+            71_369,
+            "CREATE DOMAIN product_private_fk_failure_tally AS INT",
+        )
+        .expect("create the domain used by the private FK failure table");
+
+    let txn_id = 71_372;
+    let durable_before = engine.durable_wal_records();
+    let visible_before = engine.visible_up_to();
+    let next_oid_before = engine.catalog_snapshot().relational_next_oid;
+    for sql in [
+        "BEGIN",
+        "CREATE SEQUENCE product_private_fk_failure_sequence",
+        "CREATE TABLE product_private_fk_failure_parent (id INT PRIMARY KEY)",
+        "CREATE TABLE product_private_fk_failure_owner \
+         (id INT DEFAULT nextval('product_private_fk_failure_sequence'::regclass), \
+          row_key INT PRIMARY KEY, parent_id INT, \
+          tally product_private_fk_failure_tally, \
+          CONSTRAINT product_private_fk_failure_tally_positive CHECK (tally > 0))",
+        "ALTER TABLE ONLY product_private_fk_failure_owner ADD CONSTRAINT product_private_fk_failure_owner_parent \
+         FOREIGN KEY (parent_id) REFERENCES product_private_fk_failure_parent(id)",
+        "INSERT INTO product_private_fk_failure_parent VALUES (7)",
+        "INSERT INTO product_private_fk_failure_owner (row_key, parent_id, tally) VALUES (1, 7, 1)",
+        "ALTER SEQUENCE product_private_fk_failure_sequence \
+         RENAME TO product_private_fk_failure_sequence_final",
+        "ALTER SEQUENCE product_private_fk_failure_sequence_final RESTART WITH 40",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private sequence/table/FK/rename transaction");
+    }
+    let foreign_key = engine
+        .submit_transaction(
+            txn_id,
+            parsed(
+                "INSERT INTO product_private_fk_failure_owner (row_key, parent_id, tally) VALUES (2, 99, 2)",
+            ),
+        )
+        .expect_err("private first-table foreign key must reject at the INSERT statement");
+    assert!(
+        foreign_key
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("foreign key"),
+        "private FK must retain its PostgreSQL diagnostic: {foreign_key}"
+    );
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+
+    engine
+        .submit_transaction(txn_id, parsed("ROLLBACK"))
+        .expect("rollback after private FK rejection");
+    assert_eq!(engine.durable_wal_records(), durable_before);
+    assert_eq!(engine.visible_up_to(), visible_before);
+    assert_eq!(
+        engine.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(engine
+        .relational_catalog_table("product_private_fk_failure_owner")
+        .is_none());
+    assert!(engine
+        .relational_catalog_table("product_private_fk_failure_parent")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_fk_failure_sequence")
+        .is_none());
+    assert!(engine
+        .relational_catalog_sequence("product_private_fk_failure_sequence_final")
+        .is_none());
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("private FK rollback leaves only the published parent prefix");
+    assert_eq!(recovered.durable_wal_records(), durable_before);
+    assert_eq!(recovered.visible_up_to(), visible_before);
+    assert_eq!(
+        recovered.catalog_snapshot().relational_next_oid,
+        next_oid_before
+    );
+    assert!(recovered
+        .relational_catalog_table("product_private_fk_failure_owner")
+        .is_none());
+    assert!(recovered
+        .relational_catalog_table("product_private_fk_failure_parent")
+        .is_none());
+    assert!(recovered
+        .relational_catalog_sequence("product_private_fk_failure_sequence_final")
+        .is_none());
+}
+
+#[test]
+fn product_001_private_create_sequence_table_foreign_key_crash_prefixes_retry_once() {
+    use crate::engine_transaction_delta::TransactionTerminalPreDurableFault;
+
+    let boundaries = [
+        (
+            "before-replication-proposal",
+            TransactionTerminalPreDurableFault::ReplicationProposal,
+        ),
+        (
+            "before-canonical-wal-append",
+            TransactionTerminalPreDurableFault::CanonicalWalAppend,
+        ),
+        (
+            "before-wal-flush",
+            TransactionTerminalPreDurableFault::WalFlush,
+        ),
+    ];
+
+    let stage_private_fk = |engine: &Engine, txn_id| {
+        for sql in [
+            "BEGIN",
+            "CREATE SEQUENCE product_private_fk_prefix_sequence",
+            "CREATE TABLE product_private_fk_prefix_parent (id INT PRIMARY KEY)",
+            "CREATE TABLE product_private_fk_prefix_owner \
+             (id INT DEFAULT nextval('product_private_fk_prefix_sequence'::regclass), \
+              row_key INT PRIMARY KEY, parent_id INT, \
+              tally product_private_fk_prefix_tally, \
+              CONSTRAINT product_private_fk_prefix_tally_positive CHECK (tally > 0))",
+            "ALTER TABLE ONLY product_private_fk_prefix_owner ADD CONSTRAINT product_private_fk_prefix_owner_parent \
+             FOREIGN KEY (parent_id) REFERENCES product_private_fk_prefix_parent(id)",
+            "INSERT INTO product_private_fk_prefix_parent VALUES (7)",
+            "INSERT INTO product_private_fk_prefix_owner (row_key, parent_id, tally) VALUES (1, 7, 11)",
+            "ALTER SEQUENCE product_private_fk_prefix_sequence \
+             RENAME TO product_private_fk_prefix_sequence_final",
+            "INSERT INTO product_private_fk_prefix_owner (row_key, parent_id, tally) VALUES (2, 7, 22)",
+            "ALTER SEQUENCE product_private_fk_prefix_sequence_final RESTART WITH 40",
+            "INSERT INTO product_private_fk_prefix_owner (row_key, parent_id, tally) VALUES (3, 7, 33)",
+        ] {
+            engine
+                .submit_transaction(txn_id, parsed(sql))
+                .expect("stage private sequence/table/FK/rename transaction");
+        }
+    };
+
+    for (ordinal, (label, boundary)) in boundaries.into_iter().enumerate() {
+        let fixture = DurableFixture::new(&format!("private-create-foreign-key-{label}"));
+        let engine = Engine::with_durable_wal_segment(&fixture.wal);
+        engine
+            .execute_text(
+                71_390 + u64::try_from(ordinal).unwrap() * 10,
+                "CREATE DOMAIN product_private_fk_prefix_tally AS INT",
+            )
+            .expect("create the domain used by the private retry table");
+
+        let txn_id = 71_500 + u64::try_from(ordinal).unwrap();
+        let durable_before = engine.durable_wal_records();
+        let visible_before = engine.visible_up_to();
+        stage_private_fk(&engine, txn_id);
+        engine.fail_next_transaction_terminal_pre_durable_at(boundary);
+        let failure = engine.submit_transaction(txn_id, parsed("COMMIT"));
+        assert!(
+            matches!(
+                failure,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "{label} must fail before acknowledgement: {failure:?}"
+        );
+        assert_eq!(engine.durable_wal_records(), durable_before, "{label}");
+        assert_eq!(engine.visible_up_to(), visible_before, "{label}");
+        assert!(
+            engine
+                .relational_catalog_table("product_private_fk_prefix_owner")
+                .is_none(),
+            "{label} must not publish the private FK table"
+        );
+        assert!(
+            engine
+                .relational_catalog_table("product_private_fk_prefix_parent")
+                .is_none(),
+            "{label} must not publish the private FK parent"
+        );
+        assert!(
+            engine
+                .relational_catalog_sequence("product_private_fk_prefix_sequence_final")
+                .is_none(),
+            "{label} must not publish the renamed private FK sequence"
+        );
+
+        drop(engine);
+        let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("recover private FK crash prefix");
+        assert_eq!(recovered.durable_wal_records(), durable_before, "{label}");
+        assert!(
+            recovered
+                .relational_catalog_table("product_private_fk_prefix_owner")
+                .is_none(),
+            "{label} fresh reopen must not materialize the private FK table"
+        );
+        assert!(
+            recovered
+                .relational_catalog_table("product_private_fk_prefix_parent")
+                .is_none(),
+            "{label} fresh reopen must not materialize the private FK parent"
+        );
+
+        stage_private_fk(&recovered, txn_id);
+        recovered
+            .submit_transaction(txn_id, parsed("COMMIT"))
+            .expect("the unacknowledged private FK transaction retries through codec-5");
+        assert_eq!(
+            durable_ids(&recovered, "product_private_fk_prefix_owner"),
+            vec![1, 2, 40],
+            "{label} retry publishes every pre-rename, post-rename, and post-restart row exactly once"
+        );
+        assert_eq!(
+            durable_ids(&recovered, "product_private_fk_prefix_parent"),
+            vec![7],
+            "{label} retry publishes the private FK parent exactly once"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            recovered.relational_named_index_covered_rows("product_private_fk_prefix_owner"),
+            Some(3),
+            "{label} retry must publish the transaction-created FK owner's primary index with every row"
+        );
+        let sequence = recovered
+            .relational_catalog_sequence("product_private_fk_prefix_sequence_final")
+            .expect("retry publishes final private FK sequence binding");
+        assert_eq!(
+            (sequence.last_value, sequence.is_called),
+            (40, true),
+            "{label}"
+        );
+        let record = recovered
+            .durable_wal_records()
+            .into_iter()
+            .find(|record| record.txn_id == txn_id)
+            .expect("the acknowledged retry remains in canonical WAL");
+        assert!(codec5_replay_metadata(&record).initial_table_absent);
+
+        drop(recovered);
+        let reopened = Engine::open_durable_wal_segment_auto(&fixture.wal)
+            .expect("fresh reopen must recover the acknowledged private FK retry");
+        assert_eq!(
+            durable_ids(&reopened, "product_private_fk_prefix_owner"),
+            vec![1, 2, 40],
+            "{label} fresh replay owns the retried private FK rowset"
+        );
+        assert_eq!(
+            durable_ids(&reopened, "product_private_fk_prefix_parent"),
+            vec![7],
+            "{label} fresh replay owns the retried private FK parent"
+        );
+        #[cfg(feature = "probe-timing")]
+        assert_eq!(
+            reopened.relational_named_index_covered_rows("product_private_fk_prefix_owner"),
+            Some(3),
+            "{label} fresh replay must republish the retried private FK primary index"
+        );
+        let sequence = reopened
+            .relational_catalog_sequence("product_private_fk_prefix_sequence_final")
+            .expect("fresh replay restores the final private FK sequence binding");
+        assert_eq!(
+            (sequence.last_value, sequence.is_called),
+            (40, true),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn product_001_private_create_sequence_table_foreign_key_post_durable_recovery_owns_once() {
+    let fixture = DurableFixture::new("private-create-foreign-key-post-durable");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    engine
+        .execute_text(
+            71_379,
+            "CREATE DOMAIN product_private_fk_indeterminate_tally AS INT",
+        )
+        .expect("create the domain used by the private recovery table");
+
+    let txn_id = 71_382;
+    let records_before = engine.durable_wal_records().len();
+    for sql in [
+        "BEGIN",
+        "CREATE SEQUENCE product_private_fk_indeterminate_sequence",
+        "CREATE TABLE product_private_fk_indeterminate_parent (id INT PRIMARY KEY)",
+        "CREATE TABLE product_private_fk_indeterminate_owner \
+         (id INT DEFAULT nextval('product_private_fk_indeterminate_sequence'::regclass), \
+          row_key INT PRIMARY KEY, parent_id INT, \
+          tally product_private_fk_indeterminate_tally, \
+          CONSTRAINT product_private_fk_indeterminate_tally_positive CHECK (tally > 0))",
+        "ALTER TABLE ONLY product_private_fk_indeterminate_owner ADD CONSTRAINT product_private_fk_indeterminate_owner_parent \
+         FOREIGN KEY (parent_id) REFERENCES product_private_fk_indeterminate_parent(id)",
+        "INSERT INTO product_private_fk_indeterminate_parent VALUES (7)",
+        "INSERT INTO product_private_fk_indeterminate_owner (row_key, parent_id, tally) VALUES (1, 7, 11)",
+        "ALTER SEQUENCE product_private_fk_indeterminate_sequence \
+         RENAME TO product_private_fk_indeterminate_sequence_final",
+        "INSERT INTO product_private_fk_indeterminate_owner (row_key, parent_id, tally) VALUES (2, 7, 22)",
+        "ALTER SEQUENCE product_private_fk_indeterminate_sequence_final RESTART WITH 40",
+        "INSERT INTO product_private_fk_indeterminate_owner (row_key, parent_id, tally) VALUES (3, 7, 33)",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private sequence/table/FK/rename transaction");
+    }
+    engine.fail_next_transaction_post_durable_apply();
+    let failure = engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect_err("post-durable private FK apply fault must be indeterminate");
+    assert!(
+        failure.is_indeterminate(),
+        "expected indeterminate failure: {failure}"
+    );
+    assert!(engine.is_commit_path_poisoned());
+    assert_eq!(engine.durable_wal_records().len(), records_before + 1);
+
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("recover indeterminate private FK transaction");
+    assert_eq!(recovered.durable_wal_records().len(), records_before + 1);
+    assert_eq!(
+        durable_ids(&recovered, "product_private_fk_indeterminate_owner"),
+        vec![1, 2, 40]
+    );
+    assert_eq!(
+        durable_ids(&recovered, "product_private_fk_indeterminate_parent"),
+        vec![7]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("product_private_fk_indeterminate_owner"),
+        Some(3),
+        "post-durable recovery must publish the transaction-created FK owner's primary index"
+    );
+    let sequence = recovered
+        .relational_catalog_sequence("product_private_fk_indeterminate_sequence_final")
+        .expect("recovery publishes the final FK sequence binding");
+    assert_eq!((sequence.last_value, sequence.is_called), (40, true));
+    let record = recovered
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == txn_id)
+        .expect("durable private FK transaction remains present");
+    assert!(codec5_replay_metadata(&record).initial_table_absent);
+
+    let records_before_second_reopen = recovered.durable_wal_records().len();
+    drop(recovered);
+    let reopened =
+        Engine::open_durable_wal_segment_auto(&fixture.wal).expect("repeat FK recovery is exact");
+    assert_eq!(
+        reopened.durable_wal_records().len(),
+        records_before_second_reopen,
+        "repeat recovery must not append or duplicate the private FK transaction"
+    );
+    assert_eq!(
+        durable_ids(&reopened, "product_private_fk_indeterminate_owner"),
+        vec![1, 2, 40]
+    );
+    assert_eq!(
+        durable_ids(&reopened, "product_private_fk_indeterminate_parent"),
+        vec![7]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        reopened.relational_named_index_covered_rows("product_private_fk_indeterminate_owner"),
+        Some(3),
+        "repeat recovery must retain the transaction-created FK owner's primary index"
+    );
+    let sequence = reopened
+        .relational_catalog_sequence("product_private_fk_indeterminate_sequence_final")
+        .expect("repeat recovery retains the final FK sequence binding");
+    assert_eq!((sequence.last_value, sequence.is_called), (40, true));
 }
 
 #[test]
@@ -172,7 +2353,31 @@ fn product_001_post_durable_transaction_apply_failure_wedges_live_and_recovers_o
         .iter()
         .find(|record| record.txn_id == 72_001)
         .expect("post-durable explicit transaction remains in canonical WAL");
-    let request_digest = gpu_db_wal::canonical_request_digest(&operation_payload(committed));
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&committed.payload)
+        .expect("decode durable canonical record")
+        .expect("post-durable typed INSERT uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&envelope),
+        "the recovery-owned transaction must retain the one codec-5 INSERT authority"
+    );
+    let fragments = envelope
+        .fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let replay = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &envelope.header,
+        &envelope.outcome,
+        &fragments,
+    )
+    .expect("strictly close durable codec-5 transaction")
+    .expect("durable INSERT selects semantics-v2 replay");
+    let request_digest = replay.metadata().request_digest;
+    assert_eq!(request_digest, envelope.header.request_digest);
+    assert_eq!(replay.metadata().affected_rows, 1);
     assert_eq!(
         recovered
             .commit_state()
@@ -208,6 +2413,114 @@ fn product_001_post_durable_transaction_apply_failure_wedges_live_and_recovers_o
         records_before_second_reopen + 1,
         "only the acknowledged post-recovery append extends the canonical WAL"
     );
+}
+
+#[test]
+fn product_001_private_create_sequence_table_rename_post_durable_recovery_owns_once() {
+    let fixture = DurableFixture::new("private-create-post-durable");
+    let engine = Engine::with_durable_wal_segment(&fixture.wal);
+    let txn_id = 72_100;
+    let records_before = engine.durable_wal_records().len();
+
+    for sql in [
+        "BEGIN",
+        "CREATE SEQUENCE product_private_indeterminate_sequence",
+        "CREATE TABLE product_private_indeterminate_owner \
+         (id INT DEFAULT nextval('product_private_indeterminate_sequence'::regclass), \
+          row_key INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO product_private_indeterminate_owner (row_key, note) VALUES (1, 'before-rename')",
+        "ALTER SEQUENCE product_private_indeterminate_sequence \
+         RENAME TO product_private_indeterminate_sequence_final",
+        "INSERT INTO product_private_indeterminate_owner (row_key, note) VALUES (2, 'after-rename')",
+        "ALTER SEQUENCE product_private_indeterminate_sequence_final RESTART WITH 40",
+        "INSERT INTO product_private_indeterminate_owner (row_key, note) VALUES (3, 'after-restart')",
+    ] {
+        engine
+            .submit_transaction(txn_id, parsed(sql))
+            .expect("stage private first-table transaction");
+    }
+    engine.fail_next_transaction_post_durable_apply();
+    let failure = engine
+        .submit_transaction(txn_id, parsed("COMMIT"))
+        .expect_err("post-durable first-table apply fault must be indeterminate");
+    assert!(
+        failure.is_indeterminate(),
+        "expected indeterminate failure: {failure}"
+    );
+    assert!(engine.is_commit_path_poisoned());
+    assert_eq!(engine.durable_wal_records().len(), records_before + 1);
+    assert!(
+        engine
+            .execute_text(
+                72_101,
+                "CREATE TABLE product_private_indeterminate_decoy (id INT)"
+            )
+            .is_err(),
+        "the indeterminate engine must fail closed before a second catalog authority can publish"
+    );
+
+    // The acknowledged codec-5 record owns both S3 catalog composition and the first GPU table
+    // generation. Restart recovery is therefore the sole completion path.
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment_auto(&fixture.wal)
+        .expect("recover indeterminate private first-table transaction");
+    assert_eq!(recovered.durable_wal_records().len(), records_before + 1);
+    assert_eq!(
+        durable_ids(&recovered, "product_private_indeterminate_owner"),
+        vec![1, 2, 40]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("product_private_indeterminate_owner"),
+        Some(3),
+        "post-durable recovery must publish the transaction-created primary index"
+    );
+    let sequence = recovered
+        .relational_catalog_sequence("product_private_indeterminate_sequence_final")
+        .expect("recovery publishes the final stable sequence binding");
+    assert_eq!((sequence.last_value, sequence.is_called), (40, true));
+    let record = recovered
+        .durable_wal_records()
+        .into_iter()
+        .find(|record| record.txn_id == txn_id)
+        .expect("durable first-table transaction remains present");
+    let metadata = codec5_replay_metadata(&record);
+    assert!(metadata.initial_table_absent);
+    let request_digest = metadata.request_digest;
+    assert_eq!(
+        recovered
+            .commit_state()
+            .resolve_transaction_retry_digest_outcome(txn_id, request_digest)
+            .expect("recovery indexes the exact transaction retry outcome")
+            .expect("matching retry digest resolves")
+            .1,
+        3,
+        "the recovered terminal outcome reports every user row"
+    );
+
+    let records_before_second_reopen = recovered.durable_wal_records().len();
+    drop(recovered);
+    let reopened =
+        Engine::open_durable_wal_segment_auto(&fixture.wal).expect("repeat recovery is exact");
+    assert_eq!(
+        reopened.durable_wal_records().len(),
+        records_before_second_reopen,
+        "repeat recovery must not append or duplicate the private transaction"
+    );
+    assert_eq!(
+        durable_ids(&reopened, "product_private_indeterminate_owner"),
+        vec![1, 2, 40]
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        reopened.relational_named_index_covered_rows("product_private_indeterminate_owner"),
+        Some(3),
+        "repeat recovery must retain the transaction-created primary index"
+    );
+    let sequence = reopened
+        .relational_catalog_sequence("product_private_indeterminate_sequence_final")
+        .expect("repeat recovery retains the final sequence binding");
+    assert_eq!((sequence.last_value, sequence.is_called), (40, true));
 }
 
 #[test]
@@ -1049,17 +3362,8 @@ fn ordinary_default_transition_precedes_and_is_referenced_by_user_wal() {
             ),
         )
         .unwrap();
-    let sequence_oid = engine
-        .relational_catalog_sequence("default_wal_value")
-        .unwrap()
-        .oid;
     let table = engine
         .relational_catalog_table("default_wal_owner")
-        .unwrap();
-    let id_column = table
-        .columns
-        .iter()
-        .find(|column| column.name == "id")
         .unwrap();
 
     let wal_before_rollback = engine.durable_wal_records().len();
@@ -1110,26 +3414,12 @@ fn ordinary_default_transition_precedes_and_is_referenced_by_user_wal() {
         BinarySequenceValueOperation::Default
     ));
 
-    let user_payload = operation_payload(records.last().unwrap());
-    let BinaryWalRecord::Transaction(user) = decode_binary_record(&user_payload).unwrap() else {
-        panic!("default INSERT must publish one referenced user transaction");
-    };
-    let [reference] = user.sequence_value_references.as_slice() else {
-        panic!("user WAL must carry exactly one materialized default reference");
-    };
-    assert_eq!(reference.transition_txn_id, transition.transition_txn_id);
-    assert_eq!(reference.parent_txn_id, 7_110);
-    assert_eq!(reference.sequence_oid, sequence_oid);
-    assert_eq!(reference.returned_value, 2);
-    assert_eq!(reference.table_oid, table.oid);
-    assert_eq!(reference.column_id, id_column.id);
-    assert_eq!(reference.staging_row_ordinal, 0);
-    let BinaryTransactionMutation::Insert { row_id, .. } = &user.mutations[0] else {
-        panic!("materialized default must bind one INSERT entity");
-    };
-    assert_eq!(reference.row_id, *row_id);
-    assert!(!reference.final_value_overwritten);
-    assert!(reference.default_expression);
+    let user = codec5_replay_metadata(records.last().unwrap());
+    assert_eq!(user.stable_transaction_id, 7_110);
+    assert_eq!(user.display_oid, table.oid);
+    assert_eq!(user.statement_count, 1);
+    assert_eq!(user.affected_rows, 1);
+    assert_eq!(user.row_allocator_high_water, user.row_allocator_before + 1);
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
     let recovered_sequence = recovered
@@ -1220,7 +3510,7 @@ fn explicit_sequence_default_cells_use_catalog_order_and_only_requested_cells_tr
     let transitions = records[wal_before..]
         .iter()
         .filter_map(|record| {
-            let payload = operation_payload(record);
+            let payload = operation_payload_if_not_codec5(record)?;
             let BinaryWalRecord::SequenceValueTransition(transition) =
                 decode_binary_record(&payload).unwrap()
             else {
@@ -1234,6 +3524,10 @@ fn explicit_sequence_default_cells_use_catalog_order_and_only_requested_cells_tr
         })
         .collect::<Vec<_>>();
     assert_eq!(transitions, vec![(0, 0, 1), (0, 1, 2)]);
+    assert_eq!(
+        codec5_replay_metadata(records.last().unwrap()).affected_rows,
+        1
+    );
 
     // Both sequence-default columns are present in this statement, but each row asks for just
     // one. Reserve the skipped potential positions so the durable expression identities remain
@@ -1256,7 +3550,7 @@ fn explicit_sequence_default_cells_use_catalog_order_and_only_requested_cells_tr
     let transitions = records[wal_before..]
         .iter()
         .filter_map(|record| {
-            let payload = operation_payload(record);
+            let payload = operation_payload_if_not_codec5(record)?;
             let BinaryWalRecord::SequenceValueTransition(transition) =
                 decode_binary_record(&payload).unwrap()
             else {
@@ -1266,6 +3560,10 @@ fn explicit_sequence_default_cells_use_catalog_order_and_only_requested_cells_tr
         })
         .collect::<Vec<_>>();
     assert_eq!(transitions, vec![(1, 3), (2, 4)]);
+    assert_eq!(
+        codec5_replay_metadata(records.last().unwrap()).affected_rows,
+        2
+    );
 
     // The implicit target list is catalog ordered too. Explicit NULL and scalar literals are
     // supplied values, so neither can take the sequence-default transition route.
@@ -1284,17 +3582,27 @@ fn explicit_sequence_default_cells_use_catalog_order_and_only_requested_cells_tr
     assert_eq!(result.rows_affected, 1);
     let literal = parsed("INSERT INTO explicit_default_cells (a, b, marker) VALUES (99, 100, 7)");
     assert!(!engine.insert_sequence_default_route(literal.command()).0);
-    let literal_result = engine.submit_transaction(7_500, literal).unwrap();
-    assert!(matches!(
-        literal_result,
-        TransactionAdmissionResult::Command
-    ));
+    #[cfg(feature = "probe-timing")]
+    let probe_before = engine.insert_probe_snapshot();
+    let TransactionAdmissionResult::Dml(literal_result) =
+        engine.submit_transaction(7_500, literal).unwrap()
+    else {
+        panic!("supplied sequence-table values must use the typed INSERT terminal");
+    };
+    assert_eq!(literal_result.rows_affected, 1);
     let null = parsed("INSERT INTO explicit_default_cells (a, b, marker) VALUES (NULL, 100, 8)");
     assert!(!engine.insert_sequence_default_route(null.command()).0);
-    assert!(matches!(
-        engine.submit_transaction(7_600, null).unwrap(),
-        TransactionAdmissionResult::Command
-    ));
+    let TransactionAdmissionResult::Dml(null_result) =
+        engine.submit_transaction(7_600, null).unwrap()
+    else {
+        panic!("supplied NULL sequence-table values must use the typed INSERT terminal");
+    };
+    assert_eq!(null_result.rows_affected, 1);
+    #[cfg(feature = "probe-timing")]
+    {
+        let probe = engine.insert_probe_snapshot().delta_since(probe_before);
+        assert_eq!(probe.successful_insert_statements, 2);
+    }
     assert_eq!(
         engine
             .relational_catalog_sequence("explicit_default_cells_value")
@@ -1518,7 +3826,7 @@ fn failed_default_retry_reuses_the_durable_expression_identity() {
             parsed(
                 "CREATE TABLE failed_default_owner \
                  (id INT DEFAULT nextval('failed_default_value'::regclass), \
-                  required INT, marker INT DEFAULT 0)",
+                  required INT PRIMARY KEY, marker INT DEFAULT 0)",
             ),
         )
         .unwrap();
@@ -1527,10 +3835,7 @@ fn failed_default_retry_reuses_the_durable_expression_identity() {
     let first = engine
         .submit_transaction(7_202, parsed(statement))
         .unwrap_err();
-    assert!(
-        first.to_string().contains("provide every column"),
-        "{first}"
-    );
+    assert!(first.to_string().contains("not-null constraint"), "{first}");
     assert_eq!(engine.durable_wal_records().len(), wal_before + 1);
     assert_eq!(
         engine
@@ -1543,10 +3848,7 @@ fn failed_default_retry_reuses_the_durable_expression_identity() {
     let retry = engine
         .submit_transaction(7_202, parsed(statement))
         .unwrap_err();
-    assert!(
-        retry.to_string().contains("provide every column"),
-        "{retry}"
-    );
+    assert!(retry.to_string().contains("not-null constraint"), "{retry}");
     assert_eq!(
         engine.durable_wal_records().len(),
         wal_before + 1,
@@ -1609,10 +3911,7 @@ fn failed_default_retry_reuses_the_durable_expression_identity() {
     let retry = recovered
         .submit_transaction(7_202, parsed(statement))
         .unwrap_err();
-    assert!(
-        retry.to_string().contains("provide every column"),
-        "{retry}"
-    );
+    assert!(retry.to_string().contains("not-null constraint"), "{retry}");
     assert_eq!(
         recovered.durable_wal_records().len(),
         recovered_wal_before,
@@ -1650,7 +3949,7 @@ fn failed_default_retry_reuses_the_durable_expression_identity() {
 }
 
 #[test]
-fn sequence_transition_and_reference_tamper_are_clone_first_and_effect_free() {
+fn sequence_transition_tamper_is_clone_first_and_codec5_reference_replay_is_effect_free() {
     let source = Engine::new_local_test_engine();
     source
         .submit_transaction(7_300, parsed("CREATE SEQUENCE tamper_value"))
@@ -1674,29 +3973,9 @@ fn sequence_transition_and_reference_tamper_are_clone_first_and_effect_free() {
     else {
         panic!("expected typed sequence transition");
     };
-    let user_payload = operation_payload(records.last().unwrap());
-    let BinaryWalRecord::Transaction(user) = decode_binary_record(&user_payload).unwrap() else {
-        panic!("expected referenced user transaction");
-    };
-    let wrapped_base_len =
-        usize::try_from(u64::from_le_bytes(user_payload[3..11].try_into().unwrap())).unwrap();
-    let reference_count_at = 11 + wrapped_base_len;
-    let mut huge_reference_count = user_payload.to_vec();
-    huge_reference_count[reference_count_at..reference_count_at + 4]
-        .copy_from_slice(&u32::MAX.to_le_bytes());
-    let recovery_error = match Engine::recover_from_durable_wal(&[WalRecord {
-        txn_id: records.last().unwrap().txn_id,
-        payload: Arc::from(huge_reference_count),
-    }]) {
-        Ok(_) => panic!("recovery must reject an oversized sequence-reference count"),
-        Err(error) => error,
-    };
-    assert!(
-        recovery_error
-            .to_string()
-            .contains("reference count does not match remaining bytes"),
-        "{recovery_error}"
-    );
+    let user = codec5_replay_metadata(records.last().unwrap());
+    assert_eq!(user.stable_transaction_id, 7_302);
+    assert_eq!(user.affected_rows, 1);
 
     let transition_target =
         Engine::recover_from_durable_wal(&records[..transition_position]).unwrap();
@@ -1737,61 +4016,18 @@ fn sequence_transition_and_reference_tamper_are_clone_first_and_effect_free() {
         .unwrap()
         .rows
         .is_empty());
-    let entry = LogEntry {
-        term: 1,
-        index: before.commit_seq + 1,
-        payload: Arc::from(&b""[..]),
-    };
-    for tampered in [
-        {
-            let mut tampered = user.clone();
-            tampered.sequence_value_references[0].returned_value += 1;
-            tampered
-        },
-        {
-            let mut tampered = user.clone();
-            tampered.sequence_value_references[0].table_oid += 1;
-            tampered
-        },
-        {
-            let mut tampered = user.clone();
-            tampered.sequence_value_references[0].transition_txn_id += 1;
-            tampered
-        },
-        {
-            let mut tampered = user.clone();
-            tampered.sequence_value_references[0].row_id += 1;
-            tampered
-        },
-        {
-            let mut tampered = user.clone();
-            let BinaryTransactionMutation::Insert { row_encoded, .. } = &mut tampered.mutations[0]
-            else {
-                panic!("expected final INSERT mutation");
-            };
-            *row_encoded = encode_relational_row(&[SqlValue::Int4(99), SqlValue::Int4(8)]);
-            tampered
-        },
-        {
-            let mut tampered = user.clone();
-            tampered.sequence_value_references[0].final_value_overwritten = true;
-            tampered
-        },
-    ] {
-        let mut catalog = user_target.ddl_catalog().clone();
-        assert!(user_target
-            .apply_binary_transaction_record(&entry, &mut catalog, tampered)
-            .is_err());
-        assert!(
-            Engine::catalog_snapshot_from_working(&catalog, before.commit_seq)
-                .same_contents(before.as_ref())
-        );
-        assert!(user_target
-            .execute_relational_select(&select)
-            .unwrap()
-            .rows
-            .is_empty());
-    }
+    // The codec-5 S5 reference is validated by strict closure and then again against the durable
+    // sequence-outcome index during recovery.  Replaying the exact acknowledged record through
+    // that production route must install the row once; the rehashed S5 field-level hostile cases
+    // live in the codec-5 Q1 sabotage matrix rather than the historical binary decoder tests.
+    let recovered = Engine::recover_from_durable_wal(&records).unwrap();
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(1), SqlValue::Int4(8)]]
+    );
+    assert!(user_target
+        .catalog_snapshot()
+        .same_contents(before.as_ref()));
 }
 
 #[test]
@@ -1828,37 +4064,29 @@ fn sequence_default_row_binding_preserves_later_update_and_delete() {
         .unwrap();
     engine.submit_transaction(7_420, parsed("COMMIT")).unwrap();
     let records = engine.durable_wal_records();
-    let BinaryWalRecord::Transaction(updated) =
-        decode_binary_record(&operation_payload(records.last().unwrap())).unwrap()
-    else {
-        panic!("expected referenced update transaction");
-    };
-    let [updated_reference] = updated.sequence_value_references.as_slice() else {
-        panic!("updated INSERT must retain one default reference");
-    };
-    assert!(updated_reference.final_value_overwritten);
-    let BinaryTransactionMutation::Insert {
-        row_id,
-        row_encoded,
-        ..
-    } = &updated.mutations[0]
-    else {
-        panic!("insert-then-update must coalesce to INSERT");
-    };
-    assert_eq!(updated_reference.row_id, *row_id);
-    assert_eq!(
-        decode_relational_row(
-            row_encoded,
-            &engine
-                .catalog_snapshot()
-                .relational_catalog
-                .get("rebound_owner")
-                .unwrap()
-                .columns,
-        )
-        .unwrap(),
-        vec![SqlValue::Int4(77), SqlValue::Int4(1)]
+    let updated = gpu_db_wal::decode_canonical_record_payload(&records.last().unwrap().payload)
+        .expect("decode insert-then-update canonical record")
+        .expect("insert-then-update uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&updated),
+        "insert-then-update must retain codec-5 as its sole INSERT authority"
     );
+    let fragments = updated
+        .fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let replay = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &updated.header,
+        &updated.outcome,
+        &fragments,
+    )
+    .expect("strictly close insert-then-update codec-5 record")
+    .expect("insert-then-update selects semantics-v2 replay");
+    assert_eq!(replay.metadata().affected_rows, 1);
 
     engine.submit_transaction(7_440, parsed("BEGIN")).unwrap();
     engine
@@ -1869,16 +4097,29 @@ fn sequence_default_row_binding_preserves_later_update_and_delete() {
         .unwrap();
     engine.submit_transaction(7_440, parsed("COMMIT")).unwrap();
     let records = engine.durable_wal_records();
-    let BinaryWalRecord::Transaction(deleted) =
-        decode_binary_record(&operation_payload(records.last().unwrap())).unwrap()
-    else {
-        panic!("expected referenced delete transaction");
-    };
-    let [deleted_reference] = deleted.sequence_value_references.as_slice() else {
-        panic!("deleted INSERT must retain one default reference");
-    };
-    assert!(deleted_reference.final_value_overwritten);
-    assert!(deleted.mutations.is_empty());
+    let deleted = gpu_db_wal::decode_canonical_record_payload(&records.last().unwrap().payload)
+        .expect("decode insert-then-delete canonical record")
+        .expect("insert-then-delete uses a canonical envelope");
+    assert!(
+        Engine::canonical_envelope_is_codec5(&deleted),
+        "insert-then-delete must retain codec-5 as its sole INSERT authority"
+    );
+    let fragments = deleted
+        .fragments
+        .iter()
+        .map(|fragment| gpu_db_wal::CanonicalFragmentRef {
+            kind: fragment.kind,
+            body: &fragment.body,
+        })
+        .collect::<Vec<_>>();
+    let replay = crate::typed_insert_aggregate::decode_closed_semantics_v2_replay(
+        &deleted.header,
+        &deleted.outcome,
+        &fragments,
+    )
+    .expect("strictly close insert-then-delete codec-5 record")
+    .expect("insert-then-delete selects semantics-v2 replay");
+    assert_eq!(replay.metadata().affected_rows, 1);
 
     let recovered = Engine::recover_from_durable_wal(&records).unwrap();
     let select = match parse_command("SELECT id, note FROM rebound_owner").unwrap() {

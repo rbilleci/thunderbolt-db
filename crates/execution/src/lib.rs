@@ -85,6 +85,23 @@ pub use runtime_generation_rebuild::{
     RuntimeGenerationRebuildV1TableMapCompletion,
     RUNTIME_GENERATION_REBUILD_V1_DURABLE_COMMITMENT_BYTES,
 };
+mod runtime_typed_insert_generation;
+pub use runtime_typed_insert_generation::{
+    OpaqueRuntimeTypedInsertGenerationProof, PreparedRuntimeTypedInsertGeneration,
+    RuntimeTypedInsertGenerationAttempt, RuntimeTypedInsertGenerationCell,
+    RuntimeTypedInsertGenerationCommitments, RuntimeTypedInsertGenerationCompletion,
+    RuntimeTypedInsertGenerationEncoder, RuntimeTypedInsertGenerationError,
+    RuntimeTypedInsertGenerationGeometry, RuntimeTypedInsertGenerationIdentity,
+    RuntimeTypedInsertGenerationIndex, RuntimeTypedInsertGenerationIndexEffect,
+    RuntimeTypedInsertGenerationIndexEffectComponent, RuntimeTypedInsertGenerationIndexKeyColumn,
+    RuntimeTypedInsertGenerationIndexRoot, RuntimeTypedInsertGenerationLogicalCompletion,
+    RuntimeTypedInsertGenerationPrepareError, RuntimeTypedInsertGenerationRow,
+    RuntimeTypedInsertGenerationSubmission, RuntimeTypedInsertGenerationTable,
+    RuntimeTypedInsertGenerationTableAction, RuntimeTypedInsertGenerationTableMapPredecessor,
+    RuntimeTypedInsertGenerationTarget, RuntimeTypedInsertGenerationUnknownQuiescence,
+    RUNTIME_TYPED_INSERT_GENERATION_COMMITMENT_BYTES,
+    RUNTIME_TYPED_INSERT_GENERATION_TABLE_MAP_DEPTH,
+};
 mod resident_index_build;
 #[cfg(any(test, feature = "probe-timing"))]
 pub use resident_index_build::prepared_resident_typed_indexes_insert_counters;

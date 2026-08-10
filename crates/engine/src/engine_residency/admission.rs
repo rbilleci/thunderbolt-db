@@ -88,11 +88,43 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
             )
         };
+        let catalog_table = cat
+            .relational_catalog
+            .get(table)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{table}\" does not exist"
+                )))
+            })?
+            .clone();
+        let current_device_generation_is_empty = self
+            .read_residency_shards()
+            .get(table)
+            .is_some_and(|shards| {
+                !shards.is_empty() && shards.iter().all(|shard| shard.row_count == 0)
+            })
+            || self
+                .relational_residency_entry(table)
+                .is_some_and(|entry| entry.descriptor.row_count == 0);
+        let write001_empty_index_enrollment = self
+            .relational_named_index_publication_required(&catalog_table)
+            && super::write001_empty_foldable_index_enrollment(&catalog_table)
+            && (current_device_generation_is_empty
+                // COPY and the other compatibility ingresses may encounter an explicitly
+                // de-authoritized/absent generation. Their ordinary pre-statement admission must
+                // publish the same complete empty named-index predecessor as CREATE admission;
+                // otherwise the codec-5 dense rollover sees a payload without its enrollment
+                // completion and declines before WAL. Never use this arm to reconstruct a lost
+                // device-authoritative table from a host shadow.
+                || (!self.table_device_authoritative(table)
+                    && !self.table_has_live_dml_generation(table)));
         // R3-004: normal DML no longer keeps a host tuple-store shadow. An explicit warmup of an
         // already authoritative table therefore means "retain the current device generation", not
-        // "scan the host store and overwrite it". If that generation is unavailable, fail closed;
-        // only the explicit RETIRE-002 repair boundary may reverse-gather and clear elision first.
-        if self.table_device_authoritative(table) {
+        // "scan the host store and overwrite it". The sole exception replaces an existing
+        // zero-capacity empty descriptor with the bounded WRITE-001 index predecessor below; it
+        // remains the ordinary admission/publisher owner and preserves the prior generation until
+        // every replacement allocation succeeds.
+        if self.table_device_authoritative(table) && !write001_empty_index_enrollment {
             return self
                 .current_device_authoritative_snapshot(cat, table)
                 .ok_or_else(|| {
@@ -108,15 +140,6 @@ impl Engine {
             .load()
             .get(table)
             .map(|entry| entry.descriptor.clone());
-        let catalog_table = cat
-            .relational_catalog
-            .get(table)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{table}\" does not exist"
-                )))
-            })?
-            .clone();
         let named_index_publication_table = self
             .relational_named_index_publication_required(&catalog_table)
             .then(|| catalog_table.clone());
@@ -166,6 +189,13 @@ impl Engine {
                 resident_rows.push(decoded);
             }
         }
+        // Enrollment is selected from the currently published empty/absent generation, but a
+        // repair scan can legitimately recover rows before this replacement is laid out. The
+        // one-slot empty predecessor is valid only while the actual replacement image is empty;
+        // a nonempty image uses its ordinary bounded headroom and named-index geometry.
+        let write001_empty_index_preallocation = row_count == 0
+            && write001_empty_index_enrollment
+            && super::write001_empty_index_in_place_preallocation(&catalog_table);
         // int4 AND date columns share the i32 section: a `date` is physically an i32 (days since
         // 2000-01-01), so it rides the int4 residency layout + the i32 compare kernels (the type
         // matrix, doc 19). The catalog type distinguishes them for lowering/projection.
@@ -268,7 +298,12 @@ impl Engine {
         // INSERTs append in place (1b-ii). S-d2: the sharded read is now capacity-aware (the recompaction
         // gather + `resident_snapshot_for_shard` stride by `shard.capacity`), so the OPEN shard gets the
         // same headroom as the single buffer. Other shapes (and huge/empty tables) stay dense.
-        let capacity = if row_count == 0 {
+        let capacity = if row_count == 0 && write001_empty_index_preallocation {
+            // The first indexed CUDA append needs one physical slot and its matching identity
+            // sidecar before WAL. Broader empty relations retain the ordinary zero-capacity
+            // descriptor, so this cannot become a general host-staged index bootstrap.
+            1
+        } else if row_count == 0 {
             // An empty authoritative generation needs only its descriptor/header. Giving it the
             // normal 262k-row open-shard floor consumes megabytes before the first write and can
             // make a correctly configured small STRATA budget impossible to establish.
@@ -404,6 +439,13 @@ impl Engine {
         } else {
             None
         };
+        // A sidecar-free re-admission is a deliberately collapsed all-visible generation, not a
+        // sparse generation with missing metadata. Keep the historical high-water only when the
+        // matching stamps were retained; otherwise publish the same zero sentinel used by created-
+        // by GC. This keeps the descriptor self-consistent for the next device INSERT proof.
+        let admitted_max_created_by = admitted_created_by_region.as_ref().map_or(0, |_| {
+            resident_created_by.iter().copied().max().unwrap_or(0)
+        });
         #[cfg(not(test))]
         if row_id_payload
             .as_ref()
@@ -431,7 +473,15 @@ impl Engine {
         let allocated_created_by_bytes = admitted_created_by_region
             .as_ref()
             .map_or(0, |memory| memory.metadata().allocated_bytes);
-        let named_index_bytes = if named_index_publication_table.is_some() {
+        let named_index_bytes = if write001_empty_index_preallocation {
+            super::estimated_write001_empty_index_bytes(&catalog_table, capacity).ok_or_else(
+                || {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{table}\" empty named-index allocation geometry is unsupported"
+                    )))
+                },
+            )?
+        } else if named_index_publication_table.is_some() {
             estimated_named_index_bytes_for_shard(&catalog_table, row_count, capacity).ok_or_else(
                 || {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -630,7 +680,7 @@ impl Engine {
                 deleted_by_region: None,
                 created_by_region: admitted_created_by_region,
                 row_id_region: admitted_row_id_region,
-                max_created_by: resident_created_by.iter().copied().max().unwrap_or(0),
+                max_created_by: admitted_max_created_by,
             };
             let mut shard_memory = BTreeMap::new();
             shard_memory.insert(0_u32, dm);
@@ -650,7 +700,7 @@ impl Engine {
             // replacement invalid before returning the explicit error; no reader may bind a partial set.
             if let Some(named_index_table) = named_index_publication_table
                 .as_ref()
-                .filter(|_| row_count != 0)
+                .filter(|_| row_count != 0 || write001_empty_index_enrollment)
             {
                 let current_shards = read_state.residency.shards.load_full();
                 let table_shards = current_shards.get(table).ok_or_else(|| {

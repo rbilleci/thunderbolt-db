@@ -2,7 +2,160 @@
 
 use super::*;
 
+/// Relational-residency consequences of one SQL command.
+///
+/// Keep the two axes together: `requires_repair` controls whether a legacy catalog operator must
+/// first reconstruct its relational input, while `invalidation_scope` controls which resident
+/// generations the command may retire.  An empty scope is an explicit proof that the command is
+/// catalog/control-plane-only; `None` is the conservative global fallback.  This match is
+/// deliberately exhaustive so a new SQL command cannot silently inherit global data publication
+/// authority.
+struct CommandResidencyImpact {
+    requires_repair: bool,
+    invalidation_scope: Option<BTreeSet<String>>,
+}
+
+impl CommandResidencyImpact {
+    fn data_neutral() -> Self {
+        Self {
+            requires_repair: false,
+            invalidation_scope: Some(BTreeSet::new()),
+        }
+    }
+
+    fn exact_without_repair(table: String) -> Self {
+        Self {
+            requires_repair: false,
+            invalidation_scope: Some(BTreeSet::from([table])),
+        }
+    }
+
+    fn exact_with_repair(tables: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            requires_repair: true,
+            invalidation_scope: Some(tables.into_iter().collect()),
+        }
+    }
+
+    fn global_repair() -> Self {
+        Self {
+            requires_repair: true,
+            invalidation_scope: None,
+        }
+    }
+}
+
 impl Engine {
+    fn command_residency_impact(command: &Command) -> CommandResidencyImpact {
+        match command {
+            Command::Insert(insert) => {
+                CommandResidencyImpact::exact_without_repair(insert.table.clone())
+            }
+            Command::Update(update) => {
+                CommandResidencyImpact::exact_without_repair(update.table.clone())
+            }
+            Command::Delete(delete) => {
+                CommandResidencyImpact::exact_without_repair(delete.table.clone())
+            }
+            Command::CreateTable(create) => {
+                CommandResidencyImpact::exact_without_repair(create.table.clone())
+            }
+            Command::TruncateTable(truncate) => {
+                CommandResidencyImpact::exact_with_repair([truncate.name.clone()])
+            }
+            Command::DropTable(drop) => {
+                CommandResidencyImpact::exact_with_repair(drop.names.clone())
+            }
+
+            // These commands mutate only control/catalog state. In particular, sequence
+            // lifecycle/value operations may influence a future INSERT default but cannot
+            // republish any existing table generation.
+            Command::Begin { .. }
+            | Command::Commit { .. }
+            | Command::Rollback { .. }
+            | Command::Flush
+            | Command::ResetAll
+            | Command::SetRole { .. }
+            | Command::SetKv { .. }
+            | Command::DeleteKv { .. }
+            | Command::GetKv { .. }
+            | Command::CreateSchema(_)
+            | Command::DropSchema(_)
+            | Command::CreateDatabase(_)
+            | Command::DropDatabase(_)
+            | Command::RenameDatabase(_)
+            | Command::CreateTablespace(_)
+            | Command::DropTablespace(_)
+            | Command::RenameTablespace(_)
+            | Command::CreateView(_)
+            | Command::RenameView(_)
+            | Command::DropView(_)
+            | Command::CreateFunction(_)
+            | Command::RenameFunction(_)
+            | Command::DropFunction(_)
+            | Command::SelectFunction(_)
+            | Command::CreateExtension(_)
+            | Command::DropExtension(_)
+            | Command::CreateSequence(_)
+            | Command::SequenceNextVal(_)
+            | Command::SequenceCurrVal(_)
+            | Command::SequenceSetVal(_)
+            | Command::SequenceRestart(_)
+            | Command::RenameSequence(_)
+            | Command::DropSequence(_)
+            | Command::CreateDomain(_)
+            | Command::DropDomain(_)
+            | Command::CreatePublication(_)
+            | Command::DropPublication(_)
+            | Command::CreateSubscription(_)
+            | Command::DropSubscription(_)
+            | Command::CreateRole(_)
+            | Command::DropRole(_)
+            | Command::RenameRole(_)
+            | Command::GrantTable(_)
+            | Command::RevokeTable(_)
+            | Command::GrantDatabase(_)
+            | Command::RevokeDatabase(_)
+            | Command::GrantTablespace(_)
+            | Command::RevokeTablespace(_)
+            | Command::GrantFunction(_)
+            | Command::RevokeFunction(_)
+            | Command::GrantSchema(_)
+            | Command::RevokeSchema(_)
+            | Command::GrantDefaultTablePrivileges(_)
+            | Command::RevokeDefaultTablePrivileges(_)
+            | Command::CommentOn(_)
+            | Command::Select(_)
+            | Command::SelectLiteral(_)
+            | Command::ShowTransactionIsolation
+            | Command::SessionControl { .. }
+            | Command::PreparedCatalog(_)
+            | Command::AlterRoleLogin(_) => CommandResidencyImpact::data_neutral(),
+
+            // These operators can consume or change a table/index representation. Until each has
+            // a typed GPU-native publication owner, retain the explicit repair boundary rather
+            // than granting it data-neutral authority.
+            Command::AddPrimaryKey(_)
+            | Command::AddUniqueConstraint(_)
+            | Command::AddCheckConstraint(_)
+            | Command::AddForeignKey(_)
+            | Command::AddColumn(_)
+            | Command::RenameTable(_)
+            | Command::RenameColumn(_)
+            | Command::RenameConstraint(_)
+            | Command::DropColumn(_)
+            | Command::DropConstraint(_)
+            | Command::CreateIndex(_)
+            | Command::RenameIndex(_)
+            | Command::CreateMaterializedView(_)
+            | Command::RefreshMaterializedView(_)
+            | Command::RenameMaterializedView(_)
+            | Command::DropIndex(_)
+            | Command::DropMaterializedView(_)
+            | Command::AlterColumnDefault(_) => CommandResidencyImpact::global_repair(),
+        }
+    }
+
     /// Exact tables affected by a committed batch, or `None` when conservative global handling is
     /// required. Under-invalidation could serve stale rows, so undecodable or broad commands never
     /// narrow the scope.
@@ -67,27 +220,8 @@ impl Engine {
                 }
             }
             let command = Self::decode_engine_command(&entry.payload).ok()??;
-            match command {
-                Command::Insert(insert) => {
-                    tables.insert(insert.table);
-                }
-                Command::Update(update) => {
-                    tables.insert(update.table);
-                }
-                Command::Delete(delete) => {
-                    tables.insert(delete.table);
-                }
-                Command::TruncateTable(truncate) => {
-                    tables.insert(truncate.name);
-                }
-                Command::DropTable(drop) => {
-                    tables.extend(drop.names);
-                }
-                Command::CreateTable(create) => {
-                    tables.insert(create.table);
-                }
-                _ => return None,
-            }
+            let impact = Self::command_residency_impact(&command);
+            tables.extend(impact.invalidation_scope?);
         }
         Some(tables)
     }
@@ -125,15 +259,11 @@ impl Engine {
                     | crate::wal_binary::BinaryWalRecord::SequenceValueTransition(_)
             );
         }
-        !matches!(
-            Self::decode_engine_command(&entry.payload),
-            Ok(Some(
-                Command::Insert(_)
-                    | Command::Update(_)
-                    | Command::Delete(_)
-                    | Command::CreateTable(_)
-            ))
-        )
+        Self::decode_engine_command(&entry.payload)
+            .ok()
+            .flatten()
+            .map(|command| Self::command_residency_impact(&command).requires_repair)
+            .unwrap_or(true)
     }
 
     pub(crate) fn entry_is_relational_dml(entry: &LogEntry) -> bool {

@@ -69,7 +69,7 @@ pub(super) fn validate<'a>(
     graph: &ReservedSemanticsV2Graph,
     witness: &SemanticsV2CatalogAllocatorWitness<'a>,
 ) -> Result<ValidatedAllocatorAssignment<'a>, crate::EngineError> {
-    validate_catalog_allocator_witness_identity(identity, witness)?;
+    validate_catalog_allocator_witness_identity(identity, graph, witness)?;
     validate_retained_header_identity(identity, graph)?;
     validate_catalog_order(&witness.catalog)?;
     let assignment = allocator::validate_allocator_closure(
@@ -112,9 +112,9 @@ fn validate_retained_header_identity(
     require(
         header.root_descriptor_version == 1
             && header.catalog_before_epoch == identity.catalog_epoch
-            && header.catalog_after_epoch == identity.catalog_epoch
             && header.catalog_before_digest == identity.catalog_digest
-            && header.catalog_after_digest == identity.catalog_digest
+            && header.catalog_after_epoch >= identity.catalog_epoch
+            && header.catalog_after_digest != [0; 32]
             && header.initial_database_root == identity.initial_database_root,
         "retained S7 header does not match the sealed catalog identity",
     )
@@ -248,6 +248,14 @@ fn validate_index_descriptor(
     descriptor: &RetainedIndexDescriptor,
     catalog: &SemanticsV2CatalogIndexWitness<'_>,
 ) -> Result<(), crate::EngineError> {
+    let owner = catalog_table_by_identity(
+        graph,
+        catalog.owner_stable_table_id,
+        catalog.owner_display_oid,
+    );
+    let owner_is_initially_absent = owner.is_some_and(|table| table.initial_table_absent);
+    let index_predecessor_is_absent =
+        descriptor.base_index_generation == 0 && descriptor.base_index_root == [0; 32];
     require(
         catalog.owner_stable_table_id == descriptor.owner_stable_table_id
             && catalog.owner_display_oid == descriptor.owner_display_oid
@@ -263,18 +271,15 @@ fn validate_index_descriptor(
             && qualified_name_digest(catalog.schema, catalog.name)? == descriptor.index_name_digest
             && qualified_name_digest(catalog.owner_schema, catalog.owner_name)?
                 == descriptor.owner_name_digest
-            && descriptor.owner_table_base_root != [0; 32]
-            && descriptor.base_index_root != [0; 32]
+            && (descriptor.owner_table_base_root != [0; 32] || owner_is_initially_absent)
+            && (descriptor.base_index_root != [0; 32]
+                || owner_is_initially_absent
+                || index_predecessor_is_absent)
             && descriptor.descriptor_digest != [0; 32]
             && descriptor.null_equality_policy == 1,
         "pinned catalog index does not match its S7 descriptor identity",
     )?;
     validate_index_constraint_identity(descriptor, catalog)?;
-    let owner = catalog_table_by_identity(
-        graph,
-        catalog.owner_stable_table_id,
-        catalog.owner_display_oid,
-    );
     if let Some(owner) = owner {
         require(
             owner.initial_table_root == descriptor.owner_table_base_root
@@ -612,7 +617,11 @@ fn validate_sequence_closure(
         )?;
     }
     for effect in &graph.sequence_effects {
-        validate_published_sequence_effect(identity, graph, catalog, effect)?;
+        if effect.reference.is_some() {
+            validate_published_sequence_effect(identity, graph, catalog, effect)?;
+        } else {
+            validate_private_sequence_effect(graph, catalog, effect)?;
+        }
     }
     for dependency in graph
         .dependencies
@@ -653,14 +662,17 @@ fn validate_published_sequence_effect(
     catalog: &SemanticsV2CatalogWitness<'_>,
     effect: &super::graph::RetainedSequenceEffect,
 ) -> Result<(), crate::EngineError> {
+    let reference = effect.reference.as_ref().ok_or_else(|| {
+        validation_error("published S5 sequence effect lacks its durable reference")
+    })?;
     let sequence = catalog
         .sequences
         .iter()
-        .find(|sequence| sequence.display_oid == effect.reference.sequence_oid)
+        .find(|sequence| sequence.display_oid == reference.sequence_oid)
         .ok_or_else(|| validation_error("S5 sequence effect is absent from the pinned catalog"))?;
     require(
-        effect.reference.parent_txn_id == identity.stable_transaction_id
-            && effect.reference.transition_txn_id != identity.stable_transaction_id
+        reference.parent_txn_id == identity.stable_transaction_id
+            && reference.transition_txn_id != identity.stable_transaction_id
             && effect.body_digest != [0; 32],
         "S5 sequence effect has an invalid durable transaction/body identity",
     )?;
@@ -708,14 +720,67 @@ fn validate_published_sequence_effect(
     )
 }
 
+fn validate_private_sequence_effect(
+    graph: &ReservedSemanticsV2Graph,
+    catalog: &SemanticsV2CatalogWitness<'_>,
+    effect: &super::graph::RetainedSequenceEffect,
+) -> Result<(), crate::EngineError> {
+    require(
+        effect.reference.is_none()
+            && effect.reference_body_digest == [0; 32]
+            && (effect.terminal_restart.is_some() || effect.body_digest == [0; 32]),
+        "private S5 sequence effect manufactured a durable receipt",
+    )?;
+    let record = graph
+        .records
+        .iter()
+        .find(|record| record.facts().statement_ordinal.as_u32() == effect.statement_ordinal)
+        .ok_or_else(|| validation_error("private S5 effect source record is absent"))?;
+    let source = record
+        .sequence_effects()
+        .find(|source| source.request.effect_ordinal == effect.effect_ordinal)
+        .ok_or_else(|| validation_error("private S5 effect has no S2 sequence source"))?;
+    let binding = record
+        .sequence_bindings()
+        .find(|binding| binding.effect_ordinal == effect.effect_ordinal)
+        .ok_or_else(|| validation_error("private S5 effect has no S2 sequence binding"))?;
+    let disposition = graph
+        .dispositions
+        .get(usize::try_from(effect.disposition_ref).map_err(|_| {
+            validation_error("private S5 disposition reference exceeds addressability")
+        })?)
+        .ok_or_else(|| validation_error("private S5 disposition source is absent"))?;
+    let sequence = catalog
+        .sequences
+        .iter()
+        .find(|sequence| sequence.display_oid == source.request.sequence_oid)
+        .ok_or_else(|| validation_error("private S5 sequence is absent from the pinned catalog"))?;
+    require(
+        matches!(
+            source.kind,
+            crate::typed_insert_batch::DecodedSequenceEffectKindFacts::Private { .. }
+        ) && binding.request == source.request
+            && binding.request.sequence_oid == sequence.display_oid
+            && binding.effective_name == sequence.name
+            && binding.descriptor_digest == sequence.descriptor_digest
+            && disposition.statement_ordinal == effect.statement_ordinal
+            && disposition.source_row_ordinal == source.request.row_ordinal
+            && effect.flags == (1 | if disposition.disposition == 1 { 0 } else { 2 }),
+        "private S5 sequence effect does not close its exact S2/S4/catalog identity",
+    )
+}
+
 fn dependency_matches_sequence_effect(
     dependency: &RetainedDependencyToken,
     effect: &super::graph::RetainedSequenceEffect,
 ) -> bool {
+    let Some(reference) = effect.reference.as_ref() else {
+        return false;
+    };
     dependency.kind == PUBLISHED_SEQUENCE
-        && dependency.display_oid == effect.reference.sequence_oid
-        && dependency.base_generation == effect.reference.transition_txn_id
-        && dependency.base_root == effect.body_digest
+        && dependency.display_oid == reference.sequence_oid
+        && dependency.base_generation == reference.transition_txn_id
+        && dependency.base_root == effect.reference_body_digest
 }
 
 fn sequence_dependency_matches_effect(
@@ -742,6 +807,9 @@ fn sequence_has_exact_s2_effect_source(
     sequence: &SemanticsV2CatalogSequenceWitness<'_>,
     effect: &super::graph::RetainedSequenceEffect,
 ) -> Result<bool, crate::EngineError> {
+    let Some(reference) = effect.reference.as_ref() else {
+        return Ok(false);
+    };
     let record = graph
         .records
         .iter()
@@ -768,21 +836,21 @@ fn sequence_has_exact_s2_effect_source(
             input_digest,
             returned_value,
         } => {
-            transition_txn_id == effect.reference.transition_txn_id
-                && input_digest == effect.reference.input_digest
-                && returned_value == effect.reference.returned_value
+            transition_txn_id == reference.transition_txn_id
+                && input_digest == reference.input_digest
+                && returned_value == reference.returned_value
         }
         crate::typed_insert_batch::DecodedSequenceEffectKindFacts::Private { .. } => false,
     };
     Ok(published
-        && effect.reference.parent_txn_id != 0
-        && effect.reference.default_expression
-        && effect.reference.statement_ordinal == effect.statement_ordinal
-        && effect.reference.expression_ordinal == source.request.expression_ordinal
-        && effect.reference.sequence_oid == source.request.sequence_oid
-        && effect.reference.table_oid == source.request.target_table_oid
-        && effect.reference.column_id == source.request.column_id
-        && effect.reference.row_id == disposition.stable_row_id
+        && reference.parent_txn_id != 0
+        && reference.default_expression
+        && reference.statement_ordinal == effect.statement_ordinal
+        && reference.expression_ordinal == source.request.expression_ordinal
+        && reference.sequence_oid == source.request.sequence_oid
+        && reference.table_oid == source.request.target_table_oid
+        && reference.column_id == source.request.column_id
+        && reference.row_id == disposition.stable_row_id
         && disposition.statement_ordinal == effect.statement_ordinal
         && binding.request.sequence_oid == sequence.display_oid
         && binding.effective_name == sequence.name
@@ -795,19 +863,22 @@ fn published_sequence_identity_digest(
     catalog_epoch: u64,
     effect: &super::graph::RetainedSequenceEffect,
 ) -> Result<[u8; 32], crate::EngineError> {
+    let reference = effect.reference.as_ref().ok_or_else(|| {
+        validation_error("published sequence identity lacks its durable reference")
+    })?;
     let name_digest = qualified_name_digest(sequence.schema, sequence.name)?;
-    let mut reference = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
-    crate::encode_sequence_value_reference_into_exact(&effect.reference, &mut reference)?;
+    let mut reference_bytes = [0_u8; crate::ENCODED_SEQUENCE_VALUE_REFERENCE_BYTES];
+    crate::encode_sequence_value_reference_into_exact(reference, &mut reference_bytes)?;
     Ok(v2_digest(
         b"gpu-db/write001/s7-published-sequence/v2",
         &[
             &sequence.stable_sequence_id.to_le_bytes(),
             &sequence.display_oid.to_le_bytes(),
             &catalog_epoch.to_le_bytes(),
-            &effect.reference.transition_txn_id.to_le_bytes(),
+            &reference.transition_txn_id.to_le_bytes(),
             &name_digest,
-            &effect.body_digest,
-            &reference,
+            &effect.reference_body_digest,
+            &reference_bytes,
         ],
     ))
 }

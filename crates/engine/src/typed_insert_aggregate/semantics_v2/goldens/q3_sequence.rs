@@ -287,7 +287,7 @@ fn retention_pending(
     ];
     fill_canonical_semantics_v2_for_test(fixture.outer(), fixture.outcome(), &fragments)
         .expect("actual strict fill accepts the frozen fixture")
-        .close_codec()
+        .close_codec(None)
         .expect("actual codec closure accepts the frozen fixture")
 }
 

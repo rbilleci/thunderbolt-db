@@ -17,9 +17,12 @@ mod resources;
 mod status;
 
 pub(crate) use live_spine::{SealedInt4PublicationGenerationV1, SealedInt4RebuildMetadataV1};
+pub(crate) use manifest::{
+    FixedRadixMap, GpuRadixEmptyRoots, GpuRadixMapTransition, RadixLeafValue,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(super) enum DataGenerationError {
+pub(crate) enum DataGenerationError {
     #[error("unsupported root format {0}")]
     UnsupportedRootFormat(u16),
     #[error("zero {0}")]
@@ -636,14 +639,18 @@ mod tests {
             .expect("old table")
             .rows
             .root();
-        assert!(matches!(
-            fixture
-                .builder
-                .build_row_set(&fixture.predecessor, &fixture.input, gpu),
-            Err(DataGenerationError::GpuCompletionMismatch(
-                "changed row-map root"
-            ))
-        ));
+        let result = fixture
+            .builder
+            .build_row_set(&fixture.predecessor, &fixture.input, gpu);
+        assert!(
+            matches!(
+                result,
+                Err(DataGenerationError::GpuCompletionMismatch(
+                    "changed row-map root" | "nonempty radix node root"
+                ))
+            ),
+            "replayed row-map root reached the wrong rejection: {result:?}"
+        );
 
         let fixture = row_set_fixture();
         let mut gpu = fixture.gpu.clone();
@@ -665,7 +672,7 @@ mod tests {
                 .builder
                 .build_row_set(&fixture.predecessor, &fixture.input, gpu),
             Err(DataGenerationError::GpuCompletionMismatch(
-                "changed index-map root"
+                "changed index-map root" | "nonempty radix node root"
             ))
         ));
 

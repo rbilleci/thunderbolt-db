@@ -14,8 +14,9 @@ use crate::typed_insert_batch::{
 
 mod prepared_fixed_publication;
 use prepared_fixed_publication::fixed_rollover_host_materialization_scratch;
-#[allow(unused_imports)] // sibling-private handoff for the immediate live-caller migration
 pub(super) use prepared_fixed_publication::PreparedFixedResidentShardPublication;
+mod prepared_dense_publication;
+pub(super) use prepared_dense_publication::PreparedDenseResidentShardPublication;
 
 /// Sealed allocation geometry for one fixed-width, NULL-free rollover.
 ///
@@ -777,8 +778,6 @@ impl PendingFixedResidentShard {
                 "sealed fixed-width rollover row-id geometry drifted".to_string(),
             )));
         }
-        #[cfg(test)]
-        FIXED_ROLLOVER_RESERVATIONS.with(|count| count.set(count.get() + 1));
         let runtime = engine.cuda_driver_probe_runtime();
         let device_memory = Arc::new(
             runtime
@@ -913,55 +912,6 @@ impl PendingFixedResidentShard {
             host_materialization_scratch,
         })
     }
-
-    /// Temporary compatibility bridge for the unconverted live fixed-rollover caller.
-    ///
-    /// The immediate caller-migration slice must replace this allocation-bearing finalizer with
-    /// `prepare_uniform_commit_pre_wal` plus
-    /// [`PreparedFixedResidentShardPublication::publish_post_wal`] and then delete this method.
-    /// The generation remains private until mutation publishes its descriptor.
-    pub(super) fn finish_post_wal(self, stamps: &[Index]) -> Result<Self, ExecuteError> {
-        if stamps.is_empty()
-            || std::mem::size_of_val(stamps) != self.created_by_stamp_bytes
-            || self.device_memory.metadata().allocated_bytes < self.payload_bytes
-            || self.created_by_region.metadata().allocated_bytes < self.created_by_bytes
-            || self
-                .row_id_region
-                .as_ref()
-                .is_some_and(|region| region.metadata().allocated_bytes < self.row_id_bytes)
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "sealed fixed-width rollover drifted before post-WAL header publication"
-                    .to_string(),
-            )));
-        }
-        self.created_by_region
-            .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
-                byte_offset: 0,
-                bytes: encode_u64(stamps),
-            }))
-            .map_err(device_write_error("sealed fixed-width created-by stamps"))?;
-        self.device_memory
-            .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
-                byte_offset: 0,
-                bytes: self.final_count_header.to_vec(),
-            }))
-            .map_err(device_write_error(
-                "sealed fixed-width final row-count header",
-            ))?;
-        Ok(self)
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static FIXED_ROLLOVER_RESERVATIONS: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(super) fn fixed_rollover_reservation_count() -> u64 {
-    FIXED_ROLLOVER_RESERVATIONS.with(std::cell::Cell::get)
 }
 
 impl PendingInPlaceCreatedBy {

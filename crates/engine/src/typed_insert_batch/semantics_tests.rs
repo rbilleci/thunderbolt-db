@@ -165,14 +165,14 @@ fn semantic_prepare_binds_returning_identities_duplicates_wildcards_and_result_g
             .collect::<Vec<_>>(),
         "the scalar effect handoff retains SQL order, duplicate projections, and wildcard expansion"
     );
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(insert),
         &catalog,
         catalog.commit_seq,
         None,
     )
     .unwrap()
-    .is_none());
+    .is_some());
 }
 
 #[test]
@@ -443,7 +443,7 @@ fn sequence_defaults_discover_row_major_requests_without_execution_and_seal_exac
         ]
     );
     assert_eq!(catalog.relational_sequences, sequence_state_before);
-    assert!(try_prepare_typed_insert_batch(
+    assert!(seal_typed_insert_batch_for_test(
         &Command::Insert(insert.clone()),
         &catalog,
         catalog.commit_seq,
@@ -459,11 +459,9 @@ fn sequence_defaults_discover_row_major_requests_without_execution_and_seal_exac
         100,
     );
     let batch = prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::from_bindings(parent, bindings),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::from_bindings(
+            parent, bindings,
+        ))
         .unwrap();
     assert_eq!(batch.sequence_bindings.len(), 5);
     assert!(matches!(
@@ -636,11 +634,10 @@ fn sequence_default_seal_rejects_missing_duplicate_order_identity_and_value_drif
         mutate(&mut bindings);
         sequence_defaults::reset_materialization_write_count();
         assert!(prepared
-            .seal(
-                sequence_defaults::SequenceDefaultBindings::from_bindings(parent.clone(), bindings),
-                false,
-                false,
-            )
+            .seal(sequence_defaults::SequenceDefaultBindings::from_bindings(
+                parent.clone(),
+                bindings
+            ),)
             .is_err());
         assert_eq!(
             sequence_defaults::materialization_write_count(),
@@ -650,11 +647,7 @@ fn sequence_default_seal_rejects_missing_duplicate_order_identity_and_value_drif
     };
     let prepared = prepared_sequence_insert(&insert, &catalog);
     assert!(prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty(),)
         .is_err());
     seal_rejects(&|bindings| {
         bindings[1] = sequence_defaults::SequenceDefaultBinding::published(
@@ -697,7 +690,7 @@ fn semantic_lowering_leaves_result_wal_apply_and_route_authority_outside_new_lea
     let semantics = include_str!("semantics.rs");
     let sequence = include_str!("sequence_defaults.rs");
     let sequence_effects = include_str!("sequence_defaults/effects.rs");
-    let builder = include_str!("builder.rs");
+    let batch = include_str!("../typed_insert_batch.rs");
     for source in [returning, semantics, sequence, sequence_effects] {
         assert!(!source.contains("project_dml_returning"));
         assert!(!source.contains("WriteDelta"));
@@ -708,6 +701,6 @@ fn semantic_lowering_leaves_result_wal_apply_and_route_authority_outside_new_lea
     assert!(!sequence.contains("execute_sequence"));
     assert!(!sequence.contains("apply_and_publish"));
     assert!(!sequence_effects.contains("apply_and_publish"));
-    assert!(!builder.contains("coerce_insert_value"));
-    assert!(!builder.contains("defaults::resolve"));
+    assert!(!batch.contains("mod builder"));
+    assert!(!batch.contains(&["TypedInsertBuild", "Capability"].concat()));
 }

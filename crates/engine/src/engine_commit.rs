@@ -1,12 +1,23 @@
 //! Commit / replication-apply path (P0 §9.6 decomposition, behavior-preserving):
 //! a focused `impl Engine` block for the Raft role transitions (become_follower/
 //! leader/candidate), the commit oracle (commit_mutation, commit_mutation_at,
-//! next_commit_timestamp_micros, commit_mutation_at_with_current_apply), the
+//! next_commit_timestamp_micros), the
 //! resident-memory invalidation appliers (invalidate_relational_residency and its
 //! table/concurrent/for-commit/for-memory-pressure variants + scope), and the
 //! committed MVCC log-entry applier (apply_mvcc_entry).
 
 use super::*;
+
+#[path = "engine_commit/empty_root_publication.rs"]
+mod empty_root_publication;
+#[path = "engine_commit/root_publication.rs"]
+mod root_publication;
+
+pub(crate) use root_publication::LiveTypedGenerationRootPublication;
+#[path = "engine_commit/index_enrollment.rs"]
+mod index_enrollment;
+#[path = "engine_commit/reset_root.rs"]
+mod reset_root;
 
 /// Failure from [`Engine::commit_mutation_batch`]. `requeue` is true only for a clean transient
 /// pre-durable abort; semantic claim failures and post-fsync uncertainty must not poison the queue
@@ -14,6 +25,243 @@ use super::*;
 pub(crate) struct BatchCommitFailure {
     pub(crate) requeue: bool,
     pub(crate) error: EngineError,
+}
+
+/// One already-validated typed transaction whose device bytes were applied after WAL/status
+/// durability. The shared publisher consumes this only when it proves the exact committed entry
+/// identity. Both the live terminal and the strict codec-5 recovery owner use this same final
+/// device/publication cut; neither path decodes a host row matrix after generation.
+pub(crate) struct LiveTypedTransactionApply {
+    pub(crate) txn_id: TxnId,
+    pub(crate) expected_index: Index,
+    pub(crate) payload_authority: LiveTypedPayloadAuthority,
+    pub(crate) payload_len: usize,
+    pub(crate) tables: Box<[String]>,
+    pub(crate) allocator_high_water: u64,
+    /// The generic one-record codec-5 route consumes its exact proposed range immediately after
+    /// device apply. Historical claim/lease replay retains the legacy monotonic apply behavior.
+    pub(crate) allocator_already_consumed: bool,
+    pub(crate) affected_rows: u64,
+    pub(crate) write_set: WriteSet,
+    /// Final transaction-private sequence states closed by codec-5 S2/S5. These publications
+    /// share the row-generation visibility cut. When the authenticated stable OID is currently
+    /// bound under a different name, the same publication cut applies the S2-witnessed rename
+    /// through the existing catalog mutation owner before installing the scalar state.
+    pub(crate) private_sequence_publications: Box<[LiveTypedPrivateSequencePublication]>,
+    /// Existing ordered catalog envelope decoded from / written into codec-5 S3. It carries no
+    /// row mutation or allocator state and is consumed by the same catalog applier as legacy
+    /// ordered transactions at this transaction's single visibility cut.
+    pub(crate) catalog_composition: Option<BinaryTransactionRecord>,
+    pub(crate) parent_authority: Option<LiveTypedParentAuthority>,
+}
+
+pub(crate) struct LiveTypedPrivateSequencePublication {
+    pub(crate) name: Box<str>,
+    pub(crate) sequence_oid: u32,
+    pub(crate) last_value: i64,
+    pub(crate) is_called: bool,
+}
+
+impl Engine {
+    pub(crate) fn apply_codec5_catalog_composition(
+        &self,
+        cat: &mut DdlCatalogState,
+        commit_seq: Index,
+        record: &BinaryTransactionRecord,
+    ) -> Result<(), EngineError> {
+        if record.catalog_commands.is_empty()
+            || !record.mutations.is_empty()
+            || record.allocator_high_water != 0
+            || !record.table_resets.is_empty()
+        {
+            return Err(EngineError::ApplyFailed(
+                "codec-5 S3 catalog composition acquired row, reset, or allocator authority"
+                    .to_string(),
+            ));
+        }
+        self.apply_transaction_catalog_envelope(
+            cat,
+            commit_seq.saturating_sub(1),
+            record.catalog_epoch,
+            commit_seq,
+            &record.catalog_commands,
+            crate::engine_transaction_catalog::TransactionCatalogEnvelopeSlices {
+                view_operations: &record.view_operations,
+                view_lifecycle_operations: &record.view_lifecycle_operations,
+                index_lifecycle_operations: &record.index_lifecycle_operations,
+                sequence_lifecycle_operations: &record.sequence_lifecycle_operations,
+                sequence_reset_operations: &record.sequence_reset_operations,
+                operation_order: &record.operation_order,
+                catalog_output: record.catalog_output.as_ref(),
+                sequence_input_oids: &record.sequence_input_oids,
+                sequence_value_references: &record.sequence_value_references,
+            },
+            true,
+        )
+    }
+
+    /// Apply codec-5's one optional S3 operation through the existing transaction applier. S2/
+    /// S4/S7 remain the sole INSERT carrier; this admits only pre-existing-row UPDATE/DELETE
+    /// facts that cannot be folded into those private images. It is deliberately called inside
+    /// the same common publication owner as the typed device plan, never as a second terminal.
+    pub(crate) fn apply_codec5_operation_composition(
+        &self,
+        entry: &LogEntry,
+        cat: &mut DdlCatalogState,
+        record: &BinaryTransactionRecord,
+    ) -> Result<Vec<AppliedRowMutation>, EngineError> {
+        if record.allocator_high_water != 0 || !record.table_resets.is_empty() {
+            return Err(EngineError::ApplyFailed(
+                "codec-5 S3 operation composition acquired reset or allocator authority"
+                    .to_string(),
+            ));
+        }
+        if record.catalog_commands.is_empty() {
+            if record.mutations.is_empty()
+                || record.catalog_output.is_some()
+                || !record.operation_order.is_empty()
+                || !record.statement_digests.is_empty()
+                || !record.sequence_input_oids.is_empty()
+                || !record.sequence_value_references.is_empty()
+            {
+                return Err(EngineError::ApplyFailed(
+                    "codec-5 row-only S3 composition is not an exact resolved UPDATE/DELETE record"
+                        .to_string(),
+                ));
+            }
+        } else if record.catalog_commands.iter().any(|command| {
+            !crate::wal_binary::command_is_codec5_catalog_composition(&command.command)
+        }) {
+            return Err(EngineError::ApplyFailed(
+                "codec-5 S3 catalog composition contains an unsupported command".to_string(),
+            ));
+        }
+        if !record.catalog_commands.is_empty() {
+            // Preserve the established S3 catalog owner for all historical/current DDL and
+            // sequence closure shapes. Only the co-resident pre-existing-row mutations are
+            // projected into the existing row-only transaction applier afterwards.
+            let mut catalog_only = record.clone();
+            catalog_only.mutations.clear();
+            self.apply_codec5_catalog_composition(cat, entry.index, &catalog_only)?;
+            if record.mutations.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        let mut row_only = record.clone();
+        let mutation_tables = row_only
+            .mutations
+            .iter()
+            .map(|mutation| match mutation {
+                BinaryTransactionMutation::Insert { table, .. }
+                | BinaryTransactionMutation::Update { table, .. }
+                | BinaryTransactionMutation::Delete { table, .. } => table,
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        row_only.catalog_epoch = crate::wal_binary::BinaryTransactionCatalogEpoch::Legacy;
+        row_only.catalog_commands.clear();
+        row_only.created_table_identities.clear();
+        row_only.created_table_index_identities.clear();
+        row_only.catalog_output = None;
+        row_only.view_operations.clear();
+        row_only.view_lifecycle_operations.clear();
+        row_only.index_lifecycle_operations.clear();
+        row_only.sequence_lifecycle_operations.clear();
+        row_only.sequence_reset_operations.clear();
+        row_only.sequence_advances_by_oid.clear();
+        row_only.operation_order.clear();
+        row_only.statement_digests.clear();
+        row_only.sequence_input_oids.clear();
+        row_only.sequence_value_references.clear();
+        row_only.sequence_advances.clear();
+        row_only
+            .table_identities
+            .retain(|table, _| mutation_tables.contains(table));
+        self.apply_binary_transaction_record(entry, cat, row_only)
+    }
+
+    /// Apply the catalog-name portion of one codec-5 private-sequence publication. Live commit
+    /// and fresh recovery preflight share this exact stable-OID binding: recovery applies it only
+    /// to a cloned catalog postimage, while the live publication cut applies it to the working
+    /// catalog before installing the scalar sequence state.
+    pub(crate) fn apply_codec5_private_sequence_name_binding(
+        &self,
+        cat: &mut DdlCatalogState,
+        publication: &LiveTypedPrivateSequencePublication,
+    ) -> Result<(), EngineError> {
+        if publication.sequence_oid == 0 {
+            return Err(EngineError::ApplyFailed(
+                "codec-5 private sequence publication has zero stable identity".to_string(),
+            ));
+        }
+        let current_name = cat
+            .relational_sequences
+            .iter()
+            .find_map(|(name, sequence)| {
+                (sequence.oid == publication.sequence_oid).then(|| name.clone())
+            })
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "codec-5 private sequence publication targets missing stable identity {}",
+                    publication.sequence_oid
+                ))
+            })?;
+        if current_name != publication.name.as_ref() {
+            self.apply_rename_sequence(
+                cat,
+                RenameSequence {
+                    old_name: current_name,
+                    new_name: publication.name.to_string(),
+                },
+            )?;
+        }
+        let sequence = cat
+            .relational_sequences
+            .get(publication.name.as_ref())
+            .expect("stable-OID rename established the final sequence name");
+        if sequence.oid != publication.sequence_oid {
+            return Err(EngineError::ApplyFailed(format!(
+                "codec-5 private sequence publication changed stable identity for {:?}",
+                publication.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) enum LiveTypedPayloadAuthority {
+    /// The typed exact control plane preserves this Arc through replication and WAL append. Live
+    /// apply therefore proves identity without hashing the multi-fragment payload before and after
+    /// proposal.
+    Exact(std::sync::Arc<[u8]>),
+    /// Compatibility and fresh-recovery callers may not share the live allocation and retain the
+    /// content digest proof.
+    Digest(gpu_db_wal::CanonicalDigest),
+}
+
+impl LiveTypedPayloadAuthority {
+    fn matches(&self, payload: &std::sync::Arc<[u8]>) -> bool {
+        match self {
+            Self::Exact(expected) => std::sync::Arc::ptr_eq(expected, payload),
+            Self::Digest(expected) => gpu_db_wal::canonical_request_digest(payload) == *expected,
+        }
+    }
+}
+
+pub(crate) struct LiveTypedParentAuthority {
+    pub(crate) request_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) autocommit: bool,
+    pub(crate) typed_statement_digests: Box<[gpu_db_wal::CanonicalDigest]>,
+}
+
+/// The ordinary validated witness remains on the legacy/default state-machine path. Only the
+/// strict codec-5 semantics-v2 owner may select the prevalidated path, after either live
+/// S1--S8 closure or its exact durable replay closure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LiveTypedApplySemantics {
+    #[default]
+    Legacy,
+    SemanticsV2Codec5,
 }
 
 impl Engine {
@@ -91,6 +339,42 @@ impl Engine {
         Ok(())
     }
 
+    /// Raw serialized commits remain the compatibility authority for non-INSERT commands and
+    /// historical replay. A newly admitted textual INSERT must never use that generic record
+    /// shape: it would skip the move-only typed batch, transaction overlay, device plan, and
+    /// codec-5 terminal. Recovery intentionally keeps decoding prior records in
+    /// `apply_mvcc_entry`; this guard applies only to new live claims.
+    fn reject_live_serialized_insert_payload(payload: &[u8]) -> Result<(), EngineError> {
+        let text_insert = matches!(
+            Self::decode_engine_command(payload),
+            Ok(Some(Command::Insert(_)))
+        );
+        // The binary INSERT and transaction frames remain decode-only so an old durable prefix
+        // can recover.  A live caller may not smuggle either frame through the generic commit
+        // API: doing so would recreate the resolved-row encoder, raw apply, and publication
+        // authority that codec-5 replaced.
+        let binary_insert = if is_binary_wal_record(payload) {
+            match decode_binary_record(payload)? {
+                BinaryWalRecord::Insert(_) => true,
+                BinaryWalRecord::Transaction(record) => record
+                    .mutations
+                    .iter()
+                    .any(|mutation| matches!(mutation, BinaryTransactionMutation::Insert { .. })),
+                BinaryWalRecord::DeleteByKey(_)
+                | BinaryWalRecord::UpdateByKey(_)
+                | BinaryWalRecord::SequenceValueTransition(_) => false,
+            }
+        } else {
+            false
+        };
+        if text_insert || binary_insert {
+            return Err(EngineError::ApplyFailed(
+                "raw serialized INSERT must enter typed transaction admission".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn next_commit_timestamp_micros(&self) -> u64 {
         let wall_clock = current_timestamp_micros();
         // O(1): read the running max instead of scanning the never-pruned timestamp map. Identical
@@ -158,13 +442,14 @@ impl Engine {
             )));
         }
         Self::reject_discarded_returning_payload(&payload)?;
+        Self::reject_live_serialized_insert_payload(&payload)?;
         self.ensure_commit_path_available()?;
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
 
         // Durable-commit critical section under the **commit_mutex** (A.4 unification — this method is
-        // now `&self`, the SERIALIZED commit path for DDL / KV / sequence-default INSERT / replay,
+        // now `&self`, the SERIALIZED commit path for DDL / KV / replay,
         // reached through `&Engine`; the concurrent autocommit-DML path is `commit_dml_concurrent`,
         // which runs the SAME WAL-before-publish sequence under this same lock). Lock order is fixed:
         // `commit_state()` (commit_mutex) FIRST, then `ddl_catalog()` (catalog latch) acquired INSIDE.
@@ -302,6 +587,20 @@ impl Engine {
     ) -> Result<(), BatchCommitFailure> {
         if items.is_empty() {
             return Ok(());
+        }
+        for (_, payload) in items {
+            Self::reject_discarded_returning_payload(payload).map_err(|error| {
+                BatchCommitFailure {
+                    requeue: false,
+                    error,
+                }
+            })?;
+            Self::reject_live_serialized_insert_payload(payload).map_err(|error| {
+                BatchCommitFailure {
+                    requeue: false,
+                    error,
+                }
+            })?;
         }
         if let Err(error) = self.ensure_commit_path_available() {
             return Err(BatchCommitFailure {
@@ -559,7 +858,132 @@ impl Engine {
         publish_index: Index,
     ) -> Result<(), EngineError> {
         self.skip_leader_check_during_internal_read(|engine| {
-            engine.apply_and_publish_committed_inner(commit, txn_id, publish_index)
+            engine.apply_and_publish_committed_inner(
+                commit,
+                txn_id,
+                publish_index,
+                None,
+                LiveTypedApplySemantics::default(),
+                None,
+            )
+        })
+    }
+
+    /// Apply one already-durable WRITE-001 claim/allocator control record. These records are
+    /// canonical authorities, but are deliberately not relational operations and therefore never
+    /// enter the legacy `GPUDBOP1` decoder or transaction-status terminal map.
+    pub(crate) fn apply_and_publish_write_authority_control(
+        &self,
+        commit: &mut CommitState,
+        expected_txn_id: TxnId,
+        publish_index: Index,
+    ) -> Result<(), EngineError> {
+        let mut to_apply = commit
+            .repl
+            .drain_committed_from(commit.repl.applied_index());
+        let entry = to_apply.next().cloned().ok_or_else(|| {
+            EngineError::ApplyFailed(
+                "write-authority control apply found no committed entry".to_string(),
+            )
+        })?;
+        if to_apply.next().is_some()
+            || entry.index != publish_index
+            || entry.index == 0
+            || expected_txn_id == 0
+        {
+            return Err(EngineError::ApplyFailed(
+                "write-authority control apply does not own one exact committed entry".to_string(),
+            ));
+        }
+        drop(to_apply);
+        let envelope =
+            gpu_db_wal::decode_canonical_record_payload(&entry.payload)?.ok_or_else(|| {
+                EngineError::ApplyFailed(
+                    "write-authority control entry is not canonical WAL".to_string(),
+                )
+            })?;
+        if envelope.header.stable_transaction_id != expected_txn_id
+            || envelope.header.commit_seq != publish_index
+        {
+            return Err(EngineError::ApplyFailed(
+                "write-authority control entry identity differs from its apply witness".to_string(),
+            ));
+        }
+        let authority = crate::engine_write_authority::decode_write_authority_envelope(&envelope)?
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(
+                    "canonical entry is not a strict WRITE-001 control record".to_string(),
+                )
+            })?;
+        self.apply_and_publish_decoded_write_authority_control(commit, publish_index, authority)
+    }
+
+    fn apply_and_publish_decoded_write_authority_control(
+        &self,
+        commit: &mut CommitState,
+        publish_index: Index,
+        authority: crate::engine_write_authority::DecodedWriteAuthority,
+    ) -> Result<(), EngineError> {
+        let allocator_high_water = commit.write_authority.apply(
+            publish_index,
+            authority,
+            self.read_state.mvcc.current_row_id(),
+        )?;
+        if let Some(high_water) = allocator_high_water {
+            self.read_state.mvcc.advance_row_id_to_at_least(high_water);
+        }
+        commit.last_applied_outcome = Some((publish_index, 0));
+        commit.repl.mark_applied(publish_index);
+        let visible = self.publish_ready_indices(std::iter::once(publish_index))?;
+        self.require_publication_coverage(visible, publish_index)?;
+        commit.ledger.mark_published_through(publish_index);
+        Ok(())
+    }
+
+    /// Consume the already-prevalidated codec-5 semantics-v2 entry after its device generation
+    /// is complete. The strict retained decoder is the only recovery authority allowed to reach
+    /// the corresponding recovered entry point below.
+    pub(crate) fn apply_and_publish_committed_with_live_semantics_v2_codec5_transaction(
+        &self,
+        commit: &mut CommitState,
+        txn_id: TxnId,
+        publish_index: Index,
+        live: LiveTypedTransactionApply,
+        root_publication: Option<LiveTypedGenerationRootPublication>,
+    ) -> Result<(), EngineError> {
+        self.skip_leader_check_during_internal_read(|engine| {
+            engine.apply_and_publish_committed_inner(
+                commit,
+                txn_id,
+                publish_index,
+                Some(live),
+                LiveTypedApplySemantics::SemanticsV2Codec5,
+                root_publication,
+            )
+        })
+    }
+
+    /// Publish a codec-5 entry whose exact durable aggregate was strictly closed, rebound to
+    /// the recovered catalog/allocator authorities, and applied by the same generic device plan
+    /// used by the live terminal. This accepts no raw WAL body and cannot be selected by legacy
+    /// recovery, so it is not a decoder-free compatibility escape hatch.
+    pub(crate) fn apply_and_publish_committed_with_recovered_semantics_v2_codec5_transaction(
+        &self,
+        commit: &mut CommitState,
+        txn_id: TxnId,
+        publish_index: Index,
+        recovered: LiveTypedTransactionApply,
+        root_publication: Option<LiveTypedGenerationRootPublication>,
+    ) -> Result<(), EngineError> {
+        self.skip_leader_check_during_internal_read(|engine| {
+            engine.apply_and_publish_committed_inner(
+                commit,
+                txn_id,
+                publish_index,
+                Some(recovered),
+                LiveTypedApplySemantics::SemanticsV2Codec5,
+                root_publication,
+            )
         })
     }
 
@@ -568,12 +992,45 @@ impl Engine {
         commit: &mut CommitState,
         txn_id: TxnId,
         publish_index: Index,
+        live_typed: Option<LiveTypedTransactionApply>,
+        live_typed_semantics: LiveTypedApplySemantics,
+        mut root_publication: Option<LiveTypedGenerationRootPublication>,
     ) -> Result<(), EngineError> {
+        if live_typed_semantics == LiveTypedApplySemantics::SemanticsV2Codec5
+            && live_typed.is_none()
+        {
+            return Err(EngineError::ApplyFailed(
+                "semantics-v2 codec-5 live apply requires an exact live witness".to_string(),
+            ));
+        }
+        if root_publication.is_some()
+            && live_typed.is_some()
+            && live_typed_semantics != LiveTypedApplySemantics::SemanticsV2Codec5
+        {
+            return Err(EngineError::ApplyFailed(
+                "typed generation root publication requires semantics-v2 codec-5 live apply"
+                    .to_string(),
+            ));
+        }
         let to_apply: Vec<LogEntry> = commit
             .repl
             .drain_committed_from(commit.repl.applied_index())
             .cloned()
             .collect();
+        if let Some(live) = live_typed.as_ref() {
+            let matches_exact_entry = to_apply.len() == 1
+                && live.txn_id == txn_id
+                && live.expected_index == publish_index
+                && to_apply[0].index == live.expected_index
+                && to_apply[0].payload.len() == live.payload_len
+                && live.payload_authority.matches(&to_apply[0].payload);
+            if !matches_exact_entry {
+                return Err(EngineError::ApplyFailed(
+                    "live typed transaction witness does not match the durable canonical entry"
+                        .to_string(),
+                ));
+            }
+        }
         // Coalesce an insert-only durable batch into one device append per table. Every other DML
         // entry is published at its exact durable boundary below so a following repair-consuming
         // DDL observes it. No batch is de-authorized to a host tuple store.
@@ -602,26 +1059,45 @@ impl Engine {
         let (handled, maintained) = {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
-            let atomic_transaction =
-                crate::engine_transaction_reset::is_single_binary_transaction(&to_apply);
+            let atomic_transaction = live_typed.is_some()
+                || crate::engine_transaction_reset::is_single_binary_transaction(&to_apply);
             let mut applied: Vec<AppliedRowMutation> = Vec::new();
             let mut recorded_write_set = false;
+            let mut live_typed_consumed = false;
             let mut insert_batch: BTreeMap<String, InsertAccum> = BTreeMap::new();
             let mut maintained: BTreeSet<String> = BTreeSet::new();
+            // A codec-5 CREATE-with-rowset plan has already installed its first resident shard
+            // before this common catalog cut.  Remember only tables that the exact captured root
+            // predecessor proves absent, so the existing named-index enrollment can publish the
+            // corresponding device directory after S3 makes the final catalog identity visible.
+            let mut typed_created_index_lifecycle_tables = BTreeSet::new();
+            // The root holder remains the sole GPU root/publication authority.  This is only the
+            // exact physical-residency enrollment it requires before the first indexed append.
+            let mut write001_empty_index_lifecycle_table: Option<String> = None;
             let mut working_catalog_changed = false;
             for e in &to_apply {
-                let mutates_working_catalog = Self::entry_mutates_working_catalog(e, cat);
+                // Codec-5 retains any admitted ordered catalog envelope as S3 and applies it
+                // through the existing catalog owner at the same visibility cut as its rows.
+                // Live commit never decodes its just-written bytes; recovery supplies the same
+                // move-only decoded record after strict aggregate closure.
+                let mutates_working_catalog = if live_typed.is_none() {
+                    Self::entry_mutates_working_catalog(e, cat)
+                } else {
+                    false
+                };
                 let prior_table_identities =
                     mutates_working_catalog.then(|| Self::table_root_identities(cat));
-                crate::engine_transaction_reset::validate_binary_table_reset_source_roots_payload(
-                    &e.payload,
-                    &commit.ledger,
-                )?;
+                if live_typed.is_none() {
+                    crate::engine_transaction_reset::validate_binary_table_reset_source_roots_payload(
+                        &e.payload,
+                        &commit.ledger,
+                    )?;
+                }
                 // RETIRE-002 repair boundary: DML no longer maintains a host tuple-store shadow.
                 // A rare DDL/recovery operator that still consumes that repair representation must
                 // reconstruct it explicitly from the current device generation immediately before
                 // the DDL, at the preceding durable boundary. This is not write-path authority.
-                if Self::entry_requires_relational_repair(e) {
+                if live_typed.is_none() && Self::entry_requires_relational_repair(e) {
                     let boundary = e.index.saturating_sub(1);
                     let class_tables = self
                         .read_state
@@ -657,11 +1133,209 @@ impl Engine {
                 }
                 let working_catalog = working_catalog_changed
                     .then(|| Self::catalog_snapshot_from_working(cat, e.index.saturating_sub(1)));
-                let applied_entry = self.with_apply_catalog(working_catalog, || {
-                    commit.sm.apply(e)?;
-                    self.apply_mvcc_entry(e, cat)
-                })?;
-                if Self::entry_requires_relational_repair(e) {
+                #[cfg(feature = "probe-timing")]
+                let transaction_record_apply_started =
+                    atomic_transaction.then(std::time::Instant::now);
+                let applied_entry = if let Some(live) = live_typed.as_ref() {
+                    if !live_typed_consumed {
+                        match live_typed_semantics {
+                            LiveTypedApplySemantics::Legacy => commit.sm.apply(e)?,
+                            LiveTypedApplySemantics::SemanticsV2Codec5 => {
+                                // Historical bit-30 codec-5 replay carries the retired
+                                // claim/lease parent witness. The generic one-record arm has no
+                                // such parent by construction and must not recreate one here.
+                                if let Some(parent) = live.parent_authority.as_ref() {
+                                    commit.write_authority.mark_parent_terminal(
+                                        txn_id,
+                                        parent.request_digest,
+                                        e.index,
+                                        parent.autocommit,
+                                        &parent.typed_statement_digests,
+                                    )?;
+                                }
+                                commit.sm.record_prevalidated_semantics_v2_codec5(e)?
+                            }
+                        }
+                        let mut prior_sequence_oid = None;
+                        let composed_mutations =
+                            if let Some(catalog_composition) = live.catalog_composition.as_ref() {
+                                let mutations = self.apply_codec5_operation_composition(
+                                    e,
+                                    cat,
+                                    catalog_composition,
+                                )?;
+                                working_catalog_changed |=
+                                    !catalog_composition.catalog_commands.is_empty();
+                                mutations
+                            } else {
+                                Vec::new()
+                            };
+                        for publication in live.private_sequence_publications.iter() {
+                            if publication.sequence_oid == 0
+                                || prior_sequence_oid
+                                    .is_some_and(|prior| prior >= publication.sequence_oid)
+                            {
+                                return Err(EngineError::ApplyFailed(
+                                    "codec-5 private sequence publications are not in unique stable-OID order"
+                                        .to_string(),
+                                ));
+                            }
+                            self.apply_codec5_private_sequence_name_binding(cat, publication)?;
+                            let sequence = cat
+                                .relational_sequences
+                                .get_mut(publication.name.as_ref())
+                                .expect("stable-OID rename established the final sequence name");
+                            if sequence.oid != publication.sequence_oid {
+                                return Err(EngineError::ApplyFailed(format!(
+                                    "codec-5 private sequence publication changed stable identity for {:?}",
+                                    publication.name
+                                )));
+                            }
+                            sequence.last_value = publication.last_value;
+                            sequence.is_called = publication.is_called;
+                            prior_sequence_oid = Some(publication.sequence_oid);
+                            working_catalog_changed = true;
+                        }
+                        if !live.allocator_already_consumed {
+                            self.read_state
+                                .mvcc
+                                .advance_row_id_to_at_least(live.allocator_high_water);
+                        }
+                        // The device plan has already appended the exact committed row images
+                        // under its post-WAL permit. Establish the same authority telemetry and
+                        // table flag as the typed-wave terminal before the visibility cut.
+                        for table in live.tables.iter() {
+                            if self.table_chunk_authoritative(table).is_some() {
+                                self.read_state
+                                    .residency
+                                    .chunk_class_device_commits
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            } else {
+                                if !self.table_device_authoritative(table) {
+                                    // S3 may have just introduced this relation in `cat`, before
+                                    // the catalog-ring publication below.  Eligibility must see
+                                    // that exact working postimage so the already-applied first
+                                    // device shard becomes the read authority at the same cut.
+                                    let snapshot =
+                                        Self::catalog_snapshot_from_working(cat, e.index);
+                                    if self.table_device_authority_eligible(&snapshot, table) {
+                                        self.set_table_device_authoritative(table, true);
+                                    }
+                                }
+                                self.read_state
+                                    .residency
+                                    .device_authoritative_commits
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+                            let catalog_table = cat.relational_catalog.get(table).ok_or_else(|| {
+                                EngineError::ApplyFailed(format!(
+                                    "codec-5 live typed table \"{table}\" is absent after catalog composition"
+                                ))
+                            })?;
+                            if !catalog_table.indexes.is_empty()
+                                && root_publication.as_ref().is_some_and(|publication| {
+                                    publication.introduced_table_from_absent_predecessor(
+                                        catalog_table.stable_table_id,
+                                    )
+                                })
+                            {
+                                typed_created_index_lifecycle_tables.insert(table.clone());
+                            }
+                        }
+                        live_typed_consumed = true;
+                        composed_mutations
+                    } else {
+                        return Err(EngineError::ApplyFailed(
+                            "live typed transaction witness attempted to consume multiple entries"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    self.with_apply_catalog(working_catalog, || {
+                        commit.sm.apply(e)?;
+                        self.apply_mvcc_entry(e, cat)
+                    })?
+                };
+                if live_typed.is_none() && to_apply.len() == 1 && root_publication.is_none() {
+                    root_publication =
+                        self.prepare_empty_typed_create_root_publication(commit, e, cat)?;
+                    if root_publication.is_none() {
+                        root_publication = self
+                            .prepare_empty_typed_index_enrollment_root_publication(
+                                commit, e, cat,
+                            )?;
+                    }
+                    if root_publication.is_none() {
+                        root_publication =
+                            self.prepare_empty_typed_reset_root_publication(commit, e, cat)?;
+                    }
+                    if root_publication.is_none() {
+                        root_publication = self
+                            .prepare_populated_typed_catalog_rewrite_root_publication(
+                                commit, e, cat,
+                            )?;
+                    }
+                }
+                if live_typed.is_none() {
+                    match Self::decode_engine_command(&e.payload)? {
+                        Some(Command::CreateIndex(create))
+                            if cat.relational_catalog.get(&create.table).is_some_and(
+                                crate::engine_residency::write001_empty_foldable_index_enrollment,
+                            ) =>
+                        {
+                            write001_empty_index_lifecycle_table = Some(create.table);
+                        }
+                        Some(Command::AddPrimaryKey(add))
+                            if cat.relational_catalog.get(&add.table).is_some_and(
+                                crate::engine_residency::write001_empty_foldable_index_enrollment,
+                            ) =>
+                        {
+                            write001_empty_index_lifecycle_table = Some(add.table);
+                        }
+                        Some(Command::AddUniqueConstraint(add))
+                            if cat.relational_catalog.get(&add.table).is_some_and(
+                                crate::engine_residency::write001_empty_foldable_index_enrollment,
+                            ) =>
+                        {
+                            write001_empty_index_lifecycle_table = Some(add.table);
+                        }
+                        Some(Command::CreateTable(create))
+                            if cat.relational_catalog.get(&create.table).is_some_and(|table| {
+                                !table.indexes.is_empty()
+                                    && crate::engine_residency::write001_empty_foldable_index_enrollment(table)
+                            }) =>
+                        {
+                            // Inline indexed CREATE has no earlier unindexed commit from which to
+                            // inherit the real zero-row resident generation. Materialize that exact
+                            // working-catalog generation now; the common lifecycle owner below then
+                            // replaces it with the one-slot indexed predecessor used by first append.
+                            let working = Self::catalog_snapshot_from_working(cat, e.index);
+                            self.with_apply_catalog(Some(working), || {
+                                self.populate_relational_residency_snapshot_inner_with_boundary(
+                                    cat,
+                                    &create.table,
+                                    self.planner.default_gpu_id(),
+                                    Some(e.index),
+                                )
+                                .map(|_| ())
+                                .map_err(|error| {
+                                    EngineError::ApplyFailed(format!(
+                                        "inline indexed CREATE could not publish its zero-row GPU generation: {error}"
+                                    ))
+                                })
+                            })?;
+                            write001_empty_index_lifecycle_table = Some(create.table);
+                        }
+                        _ => {}
+                    }
+                }
+                #[cfg(feature = "probe-timing")]
+                if let Some(started) = transaction_record_apply_started {
+                    self.record_insert_probe_transaction_canonical_record_apply_nanos(
+                        started.elapsed().as_nanos() as u64,
+                    );
+                }
+                if live_typed.is_none() && Self::entry_requires_relational_repair(e) {
                     self.rebuild_device_generations_from_repair(cat, e.index)?;
                 }
                 // A mixed DDL/DML durable batch must publish each DML entry to the device before
@@ -699,7 +1373,9 @@ impl Engine {
                     }
                     maintained.extend(touched);
                 }
-                let affected_rows = if atomic_transaction {
+                let affected_rows = if let Some(live) = live_typed.as_ref() {
+                    live.affected_rows
+                } else if atomic_transaction {
                     // Pre-coalescing v1 transaction WAL counted statement-order mutation records
                     // in its durable outcome marker. Canonical apply normalizes those records to
                     // final entity images, but retry/recovery status must remain byte-compatible
@@ -713,6 +1389,10 @@ impl Engine {
                 };
                 commit.last_applied_outcome = Some((e.index, affected_rows));
                 working_catalog_changed |= mutates_working_catalog;
+                if let Some(live) = live_typed.as_ref() {
+                    commit.ledger.record(&live.write_set, e.index);
+                    recorded_write_set = true;
+                }
                 for m in applied_entry {
                     // C2 (write-path assessment): record the SERIALIZED path's write-set into the
                     // SI recent-commits ledger, exactly as the concurrent path records its own —
@@ -779,7 +1459,52 @@ impl Engine {
             // visibility cut. INSERT appends into open-shard headroom; UPDATE/DELETE stamps exact stable
             // identities and UPDATE appends its new version. A device decline is handled below by wedging
             // before acknowledgement; only DDL/recovery repair reaches conservative invalidation.
-            let handled = if !atomic_transaction
+            let handled = if live_typed.is_some() {
+                // The exact witness proved a typed INSERT transaction whose catalog effect, if
+                // present, is only the S2/S5-closed private sequence final state applied above.
+                // Its move-only device
+                // plan has already published the sole resident append, so decoding the just
+                // durable transaction only to rediscover empty lifecycle sets would rebuild
+                // host rows and duplicate physicalization. Recovery never has this witness and
+                // therefore continues through the generic decoder below.
+                if !applied.is_empty() {
+                    let final_catalog = Self::catalog_snapshot_from_working(cat, publish_index);
+                    let row_maintained = self.with_apply_catalog(Some(final_catalog), || {
+                        self.try_maintain_transaction_residency(
+                            cat,
+                            &applied,
+                            publish_index,
+                            &BTreeSet::new(),
+                        )
+                    })?;
+                    let touched = applied
+                        .iter()
+                        .map(Self::applied_mutation_table)
+                        .collect::<BTreeSet<_>>();
+                    if row_maintained != touched {
+                        return Err(EngineError::ApplyFailed(
+                            "codec-5 S3 pre-existing-row mutations did not publish every GPU generation"
+                                .to_string(),
+                        ));
+                    }
+                    maintained.extend(row_maintained);
+                }
+                if !typed_created_index_lifecycle_tables.is_empty() {
+                    let enrolled = self.maintain_transaction_index_lifecycle_residency(
+                        cat,
+                        &typed_created_index_lifecycle_tables,
+                        publish_index,
+                    )?;
+                    if enrolled != typed_created_index_lifecycle_tables {
+                        return Err(EngineError::ApplyFailed(
+                            "codec-5 CREATE-with-rowset did not enroll every initial named-index generation"
+                                .to_string(),
+                        ));
+                    }
+                    maintained.extend(enrolled);
+                }
+                true
+            } else if !atomic_transaction
                 && applied.is_empty()
                 && to_apply.len() == 1
                 && Self::entry_is_relational_dml(&to_apply[0])
@@ -813,6 +1538,8 @@ impl Engine {
                         _ => (BTreeSet::new(), BTreeSet::new()),
                     };
                 let final_catalog = Self::catalog_snapshot_from_working(cat, publish_index);
+                #[cfg(feature = "probe-timing")]
+                let transaction_residency_publish_started = std::time::Instant::now();
                 let (row_maintained, index_maintained) =
                     self.with_apply_catalog(Some(final_catalog), || {
                         let row_maintained = self.try_maintain_transaction_residency(
@@ -829,6 +1556,10 @@ impl Engine {
                             )?;
                         Ok::<_, EngineError>((row_maintained, index_maintained))
                     })?;
+                #[cfg(feature = "probe-timing")]
+                self.record_insert_probe_transaction_canonical_residency_publish_nanos(
+                    transaction_residency_publish_started.elapsed().as_nanos() as u64,
+                );
                 maintained = row_maintained;
                 maintained.extend(index_maintained);
                 let touched = applied
@@ -1121,6 +1852,19 @@ impl Engine {
                     }
                 }
             }
+            if let Some(table_name) = write001_empty_index_lifecycle_table.take() {
+                let enrolled = self.maintain_transaction_index_lifecycle_residency(
+                    cat,
+                    &BTreeSet::from([table_name.clone()]),
+                    publish_index,
+                )?;
+                if !enrolled.contains(&table_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "typed indexed DDL did not enroll its WRITE-001 empty physical predecessor for relation \"{table_name}\""
+                    )));
+                }
+                maintained.extend(enrolled);
+            }
             if !handled {
                 // Only representation-changing DDL/repair entries may remain unhandled here. Never
                 // invalidate a table whose device generation was maintained by this batch.
@@ -1135,6 +1879,12 @@ impl Engine {
             self.publish_catalog_snapshot(cat, publish_index, prune_below);
             (handled, maintained)
         };
+        // The device plan is already complete and the exact entry/witness was validated above.
+        // Install its type-neutral root successor before the contiguous visibility join; any
+        // predecessor drift is post-durable and therefore fails closed for restart recovery.
+        if let Some(root_publication) = root_publication {
+            root_publication.install_if_current(&self.read_state.typed_generation_roots)?;
+        }
         let visible = self.publish_ready_indices(to_apply.iter().map(|entry| entry.index))?;
         self.require_publication_coverage(visible, publish_index)?;
         commit.ledger.mark_published_through(publish_index);
@@ -1174,289 +1924,6 @@ impl Engine {
         // R3-004: no commit-time cold-store patch or class entry. Normal relational DML publishes
         // only its device generation; RETIRE-002 owns any future device-native cold repair/import.
         Ok(())
-    }
-
-    pub(crate) fn commit_mutation_at_with_current_apply<V, F>(
-        &self,
-        txn_id: u64,
-        payload: std::sync::Arc<[u8]>,
-        timestamp_micros: u64,
-        mut validate_current: V,
-        mut apply_current: F,
-    ) -> Result<(CommitToken, u128), EngineError>
-    where
-        // This is the definitive validation point for the direct-current strategy: it runs after
-        // all earlier waves have published, while owning `commit_mutex`, and before any sequence
-        // or WAL claim.  COPY uses it to re-check its exact relation proof and every INSERT
-        // constraint, closing both concurrent-key and intervening-DDL races.
-        V: FnMut(&Self, Index) -> Result<(), EngineError>,
-        // `apply_current` receives the commit sequence (the replicator-assigned commit `Index`) so
-        // the directly-applied current entry stamps versions with the SAME commit-seq that
-        // `apply_mvcc_entry` derives from `entry.index` on replay — keeping the live COPY hot path
-        // byte-identical to a WAL replay of the same record (Stage 0 stamp/boundary unification).
-        F: FnMut(
-            &Self,
-            &mut DdlCatalogState,
-            Index,
-        ) -> Result<Option<crate::engine_dml_prepare::AppliedInsert>, EngineError>,
-    {
-        if self.transaction_snapshot_handle(txn_id).is_some() {
-            return Err(EngineError::ApplyFailed(format!(
-                "transaction id {txn_id} is active and cannot be claimed by a COPY/current-apply write"
-            )));
-        }
-        self.legacy_lane_history_write_guard()?;
-        self.ensure_commit_path_available()?;
-        if self.repl_role() != Role::Leader {
-            return Err(EngineError::NotLeader);
-        }
-
-        // A.4 unification: `&self`, the whole critical section under the commit_mutex (held in
-        // `commit`); the catalog latch is acquired INSIDE (fixed lock order).
-        let mut commit = self.commit_state_after_wave_quiescence()?;
-        self.legacy_lane_history_write_guard()?;
-        self.ensure_commit_path_available()?;
-        if let Some(token) = commit.resolve_transaction_retry(txn_id, &payload)? {
-            return Ok((token, 0));
-        }
-        if self.resolve_pending_transaction_claim(
-            txn_id,
-            gpu_db_wal::canonical_request_digest(&payload),
-        )? {
-            return Err(EngineError::Durability(format!(
-                "transaction id {txn_id} is pending in canonical mutation admission"
-            )));
-        }
-        if let Some(state) = commit.txn_manager.state(txn_id) {
-            return Err(EngineError::ApplyFailed(format!(
-                "transaction id {txn_id} is already owned by transaction state {state:?}"
-            )));
-        }
-        let commit_seq = commit.repl.peek_next_index();
-        self.skip_leader_check_during_internal_read(|engine| validate_current(engine, commit_seq))?;
-        let affected_rows = Self::canonical_affected_rows(&payload)?;
-        let token = {
-            let wal_len_before = commit.wal.len();
-            let token = match commit.repl.propose(payload.clone()) {
-                Ok(token) => token,
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-            let record =
-                match Self::canonical_wal_record(&mut commit, txn_id, token.index, 0, &payload) {
-                    Ok(record) => record,
-                    Err(err) => {
-                        commit.repl.rollback_unapplied_from(token.index);
-                        return Err(err);
-                    }
-                };
-            commit.wal.append_canonical(record);
-            if let Err(err) = commit.wal.flush_all() {
-                commit.repl.rollback_unapplied_from(token.index);
-                commit.wal.truncate(wal_len_before);
-                return Err(err);
-            }
-            if let Err(error) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
-                self.wedge_commit_path();
-                return Err(EngineError::Durability(format!(
-                    "COPY/current-apply transaction {txn_id} WAL is durable but replication confirmation failed: {error}; outcome is indeterminate until restart recovery"
-                )));
-            }
-            if let Err(error) = commit.record_transaction_status_digest_outcome(
-                txn_id,
-                gpu_db_wal::canonical_request_digest(&payload),
-                token.index,
-                affected_rows,
-            ) {
-                self.wedge_commit_path();
-                return Err(EngineError::Durability(format!(
-                    "COPY/current-apply transaction {txn_id} WAL is durable but terminal status installation failed: {error}; outcome is indeterminate until restart recovery"
-                )));
-            }
-            // `txn_id` is the durable transaction identity (decoupled from the MVCC `commit_seq`).
-            commit.record_commit_timestamp(txn_id, timestamp_micros);
-            token
-        };
-
-        let to_apply: Vec<LogEntry> = commit
-            .repl
-            .drain_committed_from(commit.repl.applied_index())
-            .cloned()
-            .collect();
-        // Hold the catalog latch across the apply loop AND the catalog publish (PART B; lock order:
-        // commit_mutex FIRST, then this latch).
-        let residency_invalidation_micros;
-        let mut maintained = BTreeSet::new();
-        {
-            let mut catalog_guard = self.ddl_catalog();
-            let cat = &mut *catalog_guard;
-            let mut working_catalog_changed = false;
-            let mut recorded_write_set = false;
-            for e in &to_apply {
-                let mutates_working_catalog = Self::entry_mutates_working_catalog(e, cat);
-                let prior_table_identities =
-                    mutates_working_catalog.then(|| Self::table_root_identities(cat));
-                if Self::entry_requires_relational_repair(e) {
-                    let boundary = e.index.saturating_sub(1);
-                    let class_tables = self
-                        .read_state
-                        .residency
-                        .chunk_authoritative_tables
-                        .load()
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for table_name in class_tables {
-                        if let Err(error) = self.deauthoritize_chunk_table(&table_name, true) {
-                            self.wedge_commit_path();
-                            return Err(error);
-                        }
-                    }
-                    let elided = self
-                        .read_state
-                        .residency
-                        .device_authoritative_tables
-                        .load()
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for table_name in elided {
-                        let Some(table) = cat.relational_catalog.get(&table_name) else {
-                            continue;
-                        };
-                        self.rehydrate_elided_table(
-                            table,
-                            boundary,
-                            &Default::default(),
-                            &Default::default(),
-                            boundary,
-                        )?;
-                    }
-                }
-                let working_catalog = working_catalog_changed
-                    .then(|| Self::catalog_snapshot_from_working(cat, e.index.saturating_sub(1)));
-                let apply_entry = || {
-                    if e.index == token.index {
-                        // Apply directly: avoid COPY payload clone/reparse while preserving WAL.
-                        // Its sequence matches replay; the catalog latch permits map mutation.
-                        apply_current(self, cat, e.index)
-                    } else {
-                        commit.sm.apply(e)?;
-                        self.apply_mvcc_entry(e, cat).map(|_| None)
-                    }
-                };
-                let apply_result = self.with_apply_catalog(working_catalog, apply_entry);
-                let applied_insert = match apply_result {
-                    Ok(applied) => applied,
-                    Err(error) => {
-                        self.wedge_commit_path();
-                        return Err(error);
-                    }
-                };
-                if let Some((table, rows, write_set, row_ids)) = applied_insert {
-                    // The direct-current COPY optimization bypasses `apply_mvcc_entry` for the
-                    // current record, so it must install the same row/table write footprint here.
-                    // Typed reset source roots and replay both consume this canonical high-water.
-                    commit.ledger.record(&write_set, e.index);
-                    recorded_write_set = true;
-                    let appended = if rows.is_empty() {
-                        true
-                    } else if self.table_chunk_authoritative(&table).is_some() {
-                        cat.relational_catalog.get(&table).is_some_and(|relation| {
-                            self.append_streaming_cold_tail(relation, &rows, &row_ids, e.index)
-                        })
-                    } else {
-                        self.try_append_resident_int4_open_shard(
-                            &table,
-                            &rows,
-                            crate::engine_residency::AppendCreatedBy::InsertUniform(e.index),
-                            Some(&row_ids),
-                        )
-                    };
-                    if !appended {
-                        self.wedge_commit_path();
-                        return Err(EngineError::ApplyFailed(format!(
-                            "durable COPY for relation \"{table}\" could not publish its device generation"
-                        )));
-                    }
-                    maintained.insert(table);
-                }
-                if Self::entry_requires_relational_repair(e) {
-                    if let Err(error) = self.rebuild_device_generations_from_repair(cat, e.index) {
-                        self.wedge_commit_path();
-                        return Err(error);
-                    }
-                }
-                working_catalog_changed |= mutates_working_catalog;
-                if let Some(prior_table_identities) = prior_table_identities.as_ref() {
-                    self.reconcile_table_root_ledger(
-                        &mut commit.ledger,
-                        prior_table_identities,
-                        cat,
-                    );
-                }
-                commit.repl.mark_applied(e.index);
-            }
-            if recorded_write_set {
-                let prune_boundary = self
-                    .active_snapshots
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .oldest()
-                    .map(|oldest| oldest.saturating_sub(1))
-                    .unwrap_or(token.index);
-                commit.ledger.prune_below(prune_boundary);
-            }
-
-            // Publish ordering (PART B): residency → catalog ring push → `committed_seq` LAST (mirrors
-            // `commit_mutation_at`). The current-apply closure already published data + mutated the maps.
-            let residency_invalidation_started = Instant::now();
-            self.invalidate_relational_residency_for_commit_except(
-                &to_apply,
-                &maintained,
-                txn_id,
-                token.index,
-            );
-            residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
-            let prune_below = self.catalog_prune_boundary(token.index);
-            self.publish_catalog_snapshot(cat, token.index, prune_below);
-        }
-        let visible = self.publish_ready_indices(to_apply.iter().map(|entry| entry.index))?;
-        self.require_publication_coverage(visible, token.index)?;
-        commit.ledger.mark_published_through(token.index);
-        {
-            let precise_scope = Self::residency_invalidation_scope(&to_apply);
-            let tables = if self.auto_admit_on_commit_enabled() {
-                precise_scope.unwrap_or_else(|| {
-                    self.catalog_snapshot()
-                        .relational_catalog
-                        .keys()
-                        .cloned()
-                        .collect()
-                })
-            } else {
-                precise_scope.unwrap_or_else(|| {
-                    let mut resident: BTreeSet<String> = self
-                        .read_state
-                        .residency
-                        .snapshots
-                        .load()
-                        .keys()
-                        .cloned()
-                        .collect();
-                    resident.extend(self.read_state.residency.shards.load().keys().cloned());
-                    resident
-                })
-            };
-            let admit = tables.difference(&maintained).cloned().collect();
-            self.auto_admit_resident_tables(&admit);
-        }
-        // R3-004: no commit-time cold-store patch or class entry. Normal relational DML publishes
-        // only its device generation; RETIRE-002 owns any future device-native cold repair/import.
-        self.metrics.inc_commit();
-
-        Ok((token, residency_invalidation_micros))
     }
 
     /// Run an effect-free validation at the same serialized current-state boundary used by a
@@ -2257,5 +2724,179 @@ impl Engine {
         }
 
         Ok(applied.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpu_db_replication::LogReplicator;
+
+    fn opaque_codec5_payload() -> Arc<[u8]> {
+        Arc::from(&b"GPUDBCANREC1\0\0\0\0prevalidated-codec5"[..])
+    }
+
+    fn live_witness(txn_id: TxnId, index: Index, payload: &Arc<[u8]>) -> LiveTypedTransactionApply {
+        LiveTypedTransactionApply {
+            txn_id,
+            expected_index: index,
+            payload_authority: LiveTypedPayloadAuthority::Exact(Arc::clone(payload)),
+            payload_len: payload.len(),
+            // These unit witnesses prove the common publication/root cut only; they do not
+            // synthesize a catalog or a typed table contribution. Production witnesses name
+            // their tables after S3 has established the catalog postimage.
+            tables: Box::new([]),
+            allocator_high_water: 17,
+            allocator_already_consumed: false,
+            affected_rows: 1,
+            write_set: WriteSet::default(),
+            private_sequence_publications: Box::new([]),
+            catalog_composition: None,
+            parent_authority: None,
+        }
+    }
+
+    fn test_column_root(seed: u8) -> TypedColumnGenerationRoot {
+        TypedColumnGenerationRoot {
+            catalog_column_ordinal: 0,
+            stable_column_id: u32::from(seed) + 1,
+            attnum: 1,
+            column_shape_root: [seed; 32],
+            column_root: [seed.wrapping_add(1); 32],
+        }
+    }
+
+    #[test]
+    fn exact_live_payload_authority_rejects_an_equal_valued_distinct_allocation() {
+        let engine = Engine::new_local();
+        let proposed = opaque_codec5_payload();
+        let equal_copy: Arc<[u8]> = Arc::from(proposed.as_ref());
+        assert!(!Arc::ptr_eq(&proposed, &equal_copy));
+        let mut commit = engine.commit_state();
+        let token = commit
+            .repl
+            .propose(Arc::clone(&proposed))
+            .expect("local proposal succeeds");
+
+        let error = engine
+            .apply_and_publish_committed_with_live_semantics_v2_codec5_transaction(
+                &mut commit,
+                9_000,
+                token.index,
+                live_witness(9_000, token.index, &equal_copy),
+                None,
+            )
+            .expect_err("equal bytes under another allocation are not live payload authority");
+
+        assert!(error
+            .to_string()
+            .contains("live typed transaction witness does not match"));
+        assert_eq!(engine.visible_up_to(), 0);
+    }
+
+    #[test]
+    fn semantics_v2_codec5_live_apply_records_prevalidated_entry_and_root_before_visibility() {
+        let engine = Engine::new_local();
+        let payload = opaque_codec5_payload();
+        let predecessor = engine.read_state.typed_generation_roots.load_full();
+        let successor = TypedTableGenerationRoot {
+            data_generation: 1,
+            table_root: [0x41; 32],
+            logical_row_count: 0,
+        };
+        let completion = TypedTableMapGpuCompletion::synthetic_first_create_for_test(41);
+        let root_publication =
+            LiveTypedGenerationRootPublication::from_exact_gpu_completed_table_map_predecessor(
+                predecessor,
+                41,
+                None,
+                false,
+                None,
+                successor,
+                &[test_column_root(0x41)],
+                &[],
+                &[],
+                [0x73; 32],
+                &completion,
+            )
+            .expect("initial typed root can produce its first successor");
+        let mut commit = engine.commit_state();
+        let token = commit
+            .repl
+            .propose(Arc::clone(&payload))
+            .expect("local proposal succeeds");
+
+        engine
+            .apply_and_publish_committed_with_live_semantics_v2_codec5_transaction(
+                &mut commit,
+                9_001,
+                token.index,
+                live_witness(9_001, token.index, &payload),
+                Some(root_publication),
+            )
+            .expect("prevalidated codec-5 live entry publishes");
+
+        assert_eq!(commit.sm.applied, vec![payload.to_vec()]);
+        assert!(commit.sm.kv.is_empty());
+        assert_eq!(commit.last_applied_outcome, Some((token.index, 1)));
+        let roots = engine.read_state.typed_generation_roots.load_full();
+        assert_eq!(roots.database_root, Some([0x73; 32]));
+        assert_eq!(roots.table(41), Some(successor));
+        assert_eq!(engine.visible_up_to(), token.index);
+    }
+
+    #[test]
+    fn semantics_v2_codec5_live_apply_fails_closed_on_root_predecessor_drift() {
+        let engine = Engine::new_local();
+        let payload = opaque_codec5_payload();
+        // This equal-valued but independently allocated snapshot proves installation requires the
+        // exact captured publication object, not just an equal root collection.
+        let stale_predecessor = Arc::new(TypedGenerationRootSnapshot::default());
+        let completion = TypedTableMapGpuCompletion::synthetic_first_create_for_test(42);
+        let root_publication =
+            LiveTypedGenerationRootPublication::from_exact_gpu_completed_table_map_predecessor(
+                stale_predecessor,
+                42,
+                None,
+                false,
+                None,
+                TypedTableGenerationRoot {
+                    data_generation: 1,
+                    table_root: [0x42; 32],
+                    logical_row_count: 0,
+                },
+                &[test_column_root(0x42)],
+                &[],
+                &[],
+                [0x74; 32],
+                &completion,
+            )
+            .expect("stale root can still form a self-consistent candidate");
+        let mut commit = engine.commit_state();
+        let token = commit
+            .repl
+            .propose(Arc::clone(&payload))
+            .expect("local proposal succeeds");
+
+        let error = engine
+            .apply_and_publish_committed_with_live_semantics_v2_codec5_transaction(
+                &mut commit,
+                9_002,
+                token.index,
+                live_witness(9_002, token.index, &payload),
+                Some(root_publication),
+            )
+            .expect_err("root predecessor drift must stop publication");
+
+        assert!(error
+            .to_string()
+            .contains("typed generation root publication predecessor drifted"));
+        assert!(engine
+            .read_state
+            .typed_generation_roots
+            .load_full()
+            .database_root
+            .is_none());
+        assert_eq!(engine.visible_up_to(), 0);
     }
 }

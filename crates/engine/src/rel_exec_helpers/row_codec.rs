@@ -2,6 +2,7 @@ use super::NULL_TOKEN;
 use crate::{ExecuteError, RelationalColumn};
 use gpu_db_sql::{Decimal128, SqlType, SqlValue};
 use gpu_db_types::EngineError;
+use std::io::Write as _;
 
 /// A borrowed relational cell accepted by the canonical row encoder.  The typed INSERT carrier
 /// uses this directly, so its WAL template never has to materialize a `SqlValue` solely to reuse
@@ -24,11 +25,24 @@ pub(crate) enum RelationalCellRef<'a> {
 pub(crate) fn append_relational_cell(out: &mut Vec<u8>, cell: RelationalCellRef<'_>) {
     match cell {
         RelationalCellRef::Null => out.extend_from_slice(NULL_TOKEN.as_bytes()),
-        RelationalCellRef::Int2(value) => out.extend_from_slice(format!("i2:{value}").as_bytes()),
-        RelationalCellRef::Int4(value) => out.extend_from_slice(format!("i:{value}").as_bytes()),
-        RelationalCellRef::Int8(value) => out.extend_from_slice(format!("n:{value}").as_bytes()),
+        RelationalCellRef::Int2(value) => {
+            out.extend_from_slice(b"i2:");
+            let mut buffer = itoa::Buffer::new();
+            out.extend_from_slice(buffer.format(value).as_bytes());
+        }
+        RelationalCellRef::Int4(value) => {
+            out.extend_from_slice(b"i:");
+            let mut buffer = itoa::Buffer::new();
+            out.extend_from_slice(buffer.format(value).as_bytes());
+        }
+        RelationalCellRef::Int8(value) => {
+            out.extend_from_slice(b"n:");
+            let mut buffer = itoa::Buffer::new();
+            out.extend_from_slice(buffer.format(value).as_bytes());
+        }
         RelationalCellRef::Numeric { mantissa, scale } => {
-            out.extend_from_slice(format!("d:{mantissa}:{scale}").as_bytes())
+            out.extend_from_slice(b"d:");
+            write!(out, "{mantissa}:{scale}").expect("Vec formatting is infallible");
         }
         RelationalCellRef::Bool(value) => {
             out.extend_from_slice(if value { b"b:t" } else { b"b:f" })
@@ -42,9 +56,15 @@ pub(crate) fn append_relational_cell(out: &mut Vec<u8>, cell: RelationalCellRef<
                 out.push(byte);
             }
         }
-        RelationalCellRef::Date(value) => out.extend_from_slice(format!("date:{value}").as_bytes()),
+        RelationalCellRef::Date(value) => {
+            out.extend_from_slice(b"date:");
+            let mut buffer = itoa::Buffer::new();
+            out.extend_from_slice(buffer.format(value).as_bytes());
+        }
         RelationalCellRef::Timestamp(value) => {
-            out.extend_from_slice(format!("ts:{value}").as_bytes())
+            out.extend_from_slice(b"ts:");
+            let mut buffer = itoa::Buffer::new();
+            out.extend_from_slice(buffer.format(value).as_bytes());
         }
         RelationalCellRef::Uuid(bytes) => {
             out.extend_from_slice(b"uuid:");

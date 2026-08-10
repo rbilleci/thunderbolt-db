@@ -1,266 +1,17 @@
 use super::{
     shard_fixed_width_key_offset, shard_key_column_blob_len, shard_key_column_blob_offset,
     shard_key_column_validity_offset, Arc, CudaResidentDeviceMemory, Engine, RelationalTable,
-    ShardDeviceIndexKey, VisibleLocateShard, WaveVisibleLocate, WriteLocateShard,
+    ShardDeviceIndexKey, VisibleLocateShard, WaveVisibleLocate,
 };
 
 impl Engine {
-    /// M1 design B (wave-time batched validation): probe a BATCH of `needles` against the table's
-    /// DEVICE hash indexes in ONE kernel launch, returning each needle's HIT COUNT (any shard). A
-    /// FAST-PATH FILTER for the wave's PK-unique validation: `count == 0` proves NO physical slot
-    /// holds the key -> no visible dup -> the INSERT passes with zero further work (the common
-    /// case: unique keys). `count > 0` (incl u32::MAX overflow) -> the caller runs the
-    /// authoritative per-item `visible_row_with_value` (a tombstoned/invisible slot is a
-    /// false-positive here, filtered there). `None` (caller validates per-item) on: no shards,
-    /// any invalid/pressured/mismatched shard, a dup-key index (== host Declined), a device-probe
-    /// failure. One launch amortizes across the whole wave (the amortization curve: launch cost
-    /// is flat vs batch size).
-    pub(crate) fn wave_batch_locate_hit_counts(
-        &self,
-        table: &RelationalTable,
-        key_id: usize,
-        needles: &[i32],
-    ) -> Option<Vec<u32>> {
-        // E2.5b-2 device-stage aggregation (v1): under lanes, funnel locate
-        // calls through the cross-lane coalescer — one kernel launch covers
-        // every lane's concurrently-pending wave (fixed-per-launch device cost
-        // was the measured scaling bound past 4 lanes).
-        if self.intent_lanes.is_some() {
-            return self.wave_batch_locate_coalesced(table, key_id, needles);
-        }
-        self.wave_batch_locate_hit_counts_direct(table, key_id, needles)
-    }
-
-    /// The cross-lane coalescing front of the device locate (see
-    /// `IntentLaneState::validate_queue`). Push the request, then either lead
-    /// (drain every same-target request, ONE launch, scatter counts) or spin
-    /// until a leader completes ours.
-    fn wave_batch_locate_coalesced(
-        &self,
-        table: &RelationalTable,
-        key_id: usize,
-        needles: &[i32],
-    ) -> Option<Vec<u32>> {
-        use std::sync::atomic::Ordering as AOrd;
-        let lanes = self
-            .intent_lanes
-            .as_ref()
-            .expect("coalesced locate requires lanes");
-        let slot = std::sync::Arc::new(crate::engine_intent_lanes::ValidateSlot {
-            done: std::sync::atomic::AtomicBool::new(false),
-            result: std::sync::Mutex::new(None),
-        });
-        lanes
-            .validate_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(crate::engine_intent_lanes::ValidateRequest {
-                table: table.name.clone(),
-                key_id,
-                needles: needles.to_vec(),
-                slot: std::sync::Arc::clone(&slot),
-            });
-        loop {
-            if slot.done.load(AOrd::Acquire) {
-                return slot
-                    .result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                    .expect("done implies result written");
-            }
-            let Ok(_leader) = lanes.validate_leader.try_lock() else {
-                std::hint::spin_loop();
-                continue;
-            };
-            // LEADER: drain every request for THIS (table, filter) target —
-            // including our own — into one concatenated launch.
-            let batch: Vec<crate::engine_intent_lanes::ValidateRequest> = {
-                let mut queue = lanes
-                    .validate_queue
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut matched = Vec::new();
-                let mut rest = Vec::with_capacity(queue.len());
-                for request in queue.drain(..) {
-                    if request.table == table.name && request.key_id == key_id {
-                        matched.push(request);
-                    } else {
-                        rest.push(request);
-                    }
-                }
-                *queue = rest;
-                matched
-            };
-            if batch.is_empty() {
-                // someone else's leader round already served us; loop re-checks
-                continue;
-            }
-            let leader_started = std::time::Instant::now();
-            let mut all_needles: Vec<i32> =
-                Vec::with_capacity(batch.iter().map(|r| r.needles.len()).sum());
-            for request in &batch {
-                all_needles.extend_from_slice(&request.needles);
-            }
-            lanes.stat_coalesced_launches.fetch_add(1, AOrd::Relaxed);
-            lanes
-                .stat_coalesced_requests
-                .fetch_add(batch.len() as u64, AOrd::Relaxed);
-            let counts = self.wave_batch_locate_hit_counts_direct(table, key_id, &all_needles);
-            let mut offset = 0usize;
-            for request in batch {
-                let take = request.needles.len();
-                let piece = counts
-                    .as_ref()
-                    .map(|all| all[offset..offset + take].to_vec());
-                offset += take;
-                *request
-                    .slot
-                    .result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(piece);
-                request.slot.done.store(true, AOrd::Release);
-            }
-            lanes
-                .stat_validate_leader_ns
-                .fetch_add(leader_started.elapsed().as_nanos() as u64, AOrd::Relaxed);
-            // our own slot was in the batch; the loop's next pass returns it
-        }
-    }
-
-    pub(crate) fn wave_batch_locate_hit_counts_direct(
-        &self,
-        table: &RelationalTable,
-        // COMPOUND KEYS: the probe key id (single-column column-index, or `FLAG | ordinal`). The
-        // `needles` are the raw i32 keys for a single-column key, or the host-computed compound
-        // fingerprints — the device index treats both as opaque 32-bit keys.
-        key_id: usize,
-        needles: &[i32],
-    ) -> Option<Vec<u32>> {
-        let positions = crate::engine_residency::probe_key_id_positions(table, key_id)?;
-        // COUNT-ONLY (max_hits=0): the kernel emits per-needle counts only (0 = no dup, else
-        // u32::MAX), skipping the shard/slot buffers + 2 DtoH reads this fn never consumes.
-        const MAX_HITS: u32 = 0;
-        if needles.is_empty() {
-            return Some(Vec::new());
-        }
-        let shards = self.read_state.residency.shards.load();
-        let Some(table_shards) = shards.get(&table.name) else {
-            return self
-                .zero_row_resident_generation_boundary(table)
-                .is_some()
-                .then(|| vec![0u32; needles.len()]);
-        };
-        if table_shards.is_empty() {
-            return self
-                .zero_row_resident_generation_boundary(table)
-                .is_some()
-                .then(|| vec![0u32; needles.len()]);
-        }
-        let runtime_snapshot = self.router.runtime().snapshot();
-        let gc_boundary = self
-            .active_snapshots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .oldest()
-            .unwrap_or_else(|| self.committed_seq());
-        let mut descs: Vec<WriteLocateShard> = Vec::new();
-        for shard in table_shards.iter() {
-            if shard.schema != table.schema || shard.table != table.name {
-                return None;
-            }
-            if !shard.is_valid(
-                runtime_snapshot
-                    .memory_pressured_gpu_ids
-                    .contains(&shard.gpu_id),
-            ) {
-                return None;
-            }
-            if shard.row_count == 0 {
-                continue;
-            }
-            // PERF (this runs SERIALLY on the sequencer, per wave): compute the i32 filter offset
-            // DIRECTLY from the shard's own fields — `resident_snapshot_for_shard` would clone the
-            // whole descriptor (int4/int8/text/null name vectors) per shard per wave for nothing.
-            let offsets = positions
-                .iter()
-                .map(|&p| shard_fixed_width_key_offset(shard, table, p))
-                .collect::<Option<Vec<u64>>>()?;
-            let blob_offsets = positions
-                .iter()
-                .map(|&p| shard_key_column_blob_offset(shard, table, p))
-                .collect::<Option<Vec<u64>>>()?;
-            let blob_lens = positions
-                .iter()
-                .map(|&p| shard_key_column_blob_len(shard, table, p))
-                .collect::<Option<Vec<u64>>>()?;
-            let validity_offsets = positions
-                .iter()
-                .map(|&p| shard_key_column_validity_offset(shard, table, p))
-                .collect::<Option<Vec<Option<u64>>>>()?;
-            let device_memory = shard.device_memory.clone()?;
-            // The descriptor flag alone cannot observe a concurrent generation replacement;
-            // require the captured buffer to remain the authoritative device cell.
-            if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
-                return None;
-            }
-            let (device_index, table_mask, hash_shift, index_row_count, _has_postings) = self
-                .ensure_shard_pk_device_index(
-                    table,
-                    &table.name,
-                    shard.shard_id,
-                    &device_memory,
-                    super::shard_point_lookup::ShardDeviceIndexBuild {
-                        key: ShardDeviceIndexKey {
-                            key_id,
-                            positions: &positions,
-                            offsets: &offsets,
-                            blob_offsets: &blob_offsets,
-                            blob_lens: &blob_lens,
-                            validity_offsets: &validity_offsets,
-                        },
-                        row_count: shard.row_count,
-                        capacity_rows: shard.capacity as u64,
-                        gc_boundary,
-                        deleted_by: shard.deleted_by_region.clone(),
-                        duplicate_tolerant: false,
-                        apply_already_locked: false,
-                        budget_already_locked: false,
-                    },
-                )
-                .ok()
-                .flatten()?;
-            descs.push(WriteLocateShard {
-                index: device_index,
-                table_mask,
-                hash_shift,
-                row_count: u32::try_from(index_row_count).ok()?,
-            });
-        }
-        if descs.is_empty() {
-            return Some(vec![0u32; needles.len()]); // no probed shards -> every needle misses
-        }
-        let ctx = Arc::clone(&descs[0].index);
-        let result = ctx
-            .submit_multi_shard_i32_write_locate(&descs, needles, MAX_HITS)
-            .ok()?;
-        if result.count.len() != needles.len() {
-            return None;
-        }
-        self.read_state
-            .residency
-            .device_write_locate_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(result.count)
-    }
-
     /// U1 (lane DELETE intents): the batched DEVICE VISIBLE-LOCATE — one coalesced launch
     /// resolving every needle to its VISIBLE match count + first visible (shard_id, slot) at the
     /// needle's OWN snapshot (visibility evaluated ON-DEVICE from the shards' created_by /
     /// deleted_by regions; absent region = born-visible / all-live, matching the fills).
-    /// Declines (`None`) exactly like `wave_batch_locate_hit_counts_direct`: any invalid /
-    /// pressured / mismatched / stale-cell shard, or an index that can't be ensured — the caller
-    /// falls back per-needle or aborts retryably. `targets[i]` carries the probed shard's
+    /// Declines (`None`) on any invalid, pressured, mismatched, or stale-cell shard, or when an
+    /// index cannot be ensured; the caller falls back per-needle or aborts retryably. `targets[i]`
+    /// carries the probed shard's
     /// identity handles for the APPLY-TIME liveness recheck (a VACUUM/re-admit between locate
     /// and the coalesced tombstone apply rebuilds the shard and re-clusters slots — the apply
     /// must decline on identity mismatch, never stamp a re-clustered slot).
@@ -348,8 +99,10 @@ impl Engine {
                         gc_boundary,
                         deleted_by: shard.deleted_by_region.clone(),
                         duplicate_tolerant: false,
+                        allow_empty: false,
                         apply_already_locked: false,
                         budget_already_locked: false,
+                        defer_cache_publication: false,
                     },
                 )
                 .ok()

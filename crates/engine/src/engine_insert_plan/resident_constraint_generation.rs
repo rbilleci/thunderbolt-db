@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, MutexGuard};
 
 use crate::relational_model::{RelationalColumn, RelationalResidencySnapshot, RelationalTable};
-use crate::typed_insert_batch::{TypedInsertBatch, TypedInsertConstraintDeviceSource};
-use crate::{Engine, EngineError, ExecuteError, Index, RelationalResidentShard, SqlType};
+use crate::{Engine, ExecuteError, Index, RelationalResidentShard, SqlType};
 use gpu_db_execution::{CudaCompoundFoldColumn, CudaResidentDeviceMemory};
 
 /// An immutable shard-map pin validated beneath the caller's residency mutation gate.
@@ -21,31 +20,7 @@ pub(super) struct PinnedResidentConstraintGeneration<'guard, 'mutex> {
     shard_map: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
     table_name: String,
     history_floor_requires_retry: bool,
-    runtime: gpu_db_execution::GpuRuntimeSnapshot,
     _held_mutation_gate: &'guard MutexGuard<'mutex, ()>,
-}
-
-/// Opaque validated table slice from the exact map and pressure snapshot held by a generation
-/// pin.  Callers can inspect only the generation they just validated; the map itself remains
-/// private to prevent a later name lookup from bypassing the same-map invariant.
-pub(super) struct ValidatedResidentConstraintTable<'pin> {
-    shards: &'pin [RelationalResidentShard],
-    history_floor_requires_retry: bool,
-    generation: Arc<()>,
-}
-
-impl<'pin> ValidatedResidentConstraintTable<'pin> {
-    pub(super) fn shards(&self) -> &'pin [RelationalResidentShard] {
-        self.shards
-    }
-
-    pub(super) fn history_floor_requires_retry(&self) -> bool {
-        self.history_floor_requires_retry
-    }
-
-    pub(super) fn generation(&self) -> &Arc<()> {
-        &self.generation
-    }
 }
 
 /// One exact catalog column admitted to a resident constraint layout.
@@ -103,38 +78,6 @@ impl<'guard, 'mutex> PinnedResidentConstraintGeneration<'guard, 'mutex> {
     pub(super) fn history_floor_requires_retry(&self) -> bool {
         self.history_floor_requires_retry
     }
-
-    /// Validate another table against the same immutable shard-map Arc captured for the child.
-    /// No caller may reload residency while one FK proof is in flight.
-    pub(super) fn validate_table(
-        &self,
-        engine: &Engine,
-        table: &RelationalTable,
-        original_read_snapshot: Index,
-        expected_gpu: u16,
-    ) -> Result<ValidatedResidentConstraintTable<'_>, ExecuteError> {
-        let shards = self.shard_map.get(&table.name).ok_or_else(|| {
-            decline("resident INSERT key proof found no hot shard generation for its table")
-        })?;
-        let history_floor_requires_retry = validate_hot_shard_generation(
-            engine,
-            table,
-            shards,
-            original_read_snapshot,
-            expected_gpu,
-            &self.runtime,
-        )?;
-        Ok(ValidatedResidentConstraintTable {
-            shards,
-            history_floor_requires_retry,
-            generation: Arc::clone(
-                &shards
-                    .first()
-                    .expect("validated resident constraint table unexpectedly has no shard")
-                    .point_route_generation,
-            ),
-        })
-    }
 }
 
 /// Pin and validate the exact authoritative hot generation for a later device constraint proof.
@@ -165,7 +108,6 @@ pub(super) fn pin_hot_shard_generation<'guard, 'mutex>(
         shard_map,
         table_name: table.name.clone(),
         history_floor_requires_retry,
-        runtime,
         _held_mutation_gate: held_mutation_gate,
     })
 }
@@ -250,67 +192,6 @@ fn validate_hot_shard_generation(
         }
     }
     Ok(history_floor_requires_retry)
-}
-
-/// The descriptor count for the incoming batch side of one physical key proof.
-pub(crate) fn descriptor_count_for_batch(
-    batch: &TypedInsertBatch,
-    columns: &[ResidentConstraintColumnBinding],
-) -> Result<usize, EngineError> {
-    let mut validity = BTreeSet::new();
-    for column in columns {
-        if batch.row_local_constraint_column_has_validity_bitmap(column.id)? {
-            validity.insert((column.attnum, column.id));
-        }
-    }
-    columns.len().checked_add(validity.len()).ok_or_else(|| {
-        EngineError::ApplyFailed("resident key descriptor count overflows".to_string())
-    })
-}
-
-/// The descriptor count for the resident side of one physical key proof.
-pub(crate) fn descriptor_count_for_resident(
-    table: &RelationalTable,
-    snapshot: &RelationalResidencySnapshot,
-    columns: &[ResidentConstraintColumnBinding],
-) -> Result<usize, ExecuteError> {
-    let mut validity = BTreeSet::new();
-    for column in columns {
-        let column_idx = table_column_index(table, column)?;
-        if crate::resident_device_null_column_offset(snapshot, table, column_idx)
-            .map_err(|error| decline(format!("resident key layout declined: {error}")))?
-            .is_some()
-        {
-            validity.insert((column.attnum, column.id));
-        }
-    }
-    columns
-        .len()
-        .checked_add(validity.len())
-        .ok_or_else(|| decline("resident key descriptor count overflows"))
-}
-
-/// Build the incoming device descriptors in the catalog key order, followed by deduplicated
-/// validity descriptors in stable attribute order.
-pub(crate) fn incoming_columns(
-    source: &TypedInsertConstraintDeviceSource,
-    columns: &[ResidentConstraintColumnBinding],
-) -> Result<Vec<CudaCompoundFoldColumn>, EngineError> {
-    let mut descriptors = Vec::with_capacity(columns.len() * 2);
-    let mut validity = BTreeSet::new();
-    for column in columns {
-        let (data, valid) = source.key_column_layout(column.id, &column.name)?;
-        descriptors.push(data);
-        if let Some(offset) = valid {
-            validity.insert((column.attnum, column.id, offset));
-        }
-    }
-    descriptors.extend(
-        validity.into_iter().map(
-            |(_, _, bitmap_byte_offset)| CudaCompoundFoldColumn::Validity { bitmap_byte_offset },
-        ),
-    );
-    Ok(descriptors)
 }
 
 /// Build the resident descriptors for one pinned shard using its exact published layout.
@@ -430,8 +311,6 @@ mod tests {
         assert!(source.contains("_held_mutation_gate: held_mutation_gate"));
         assert!(source.contains("pub(super) fn shards"));
         assert!(source.contains("pub(super) fn history_floor_requires_retry"));
-        assert!(source.contains("fn descriptor_count_for_batch"));
-        assert!(source.contains("fn incoming_columns"));
         assert!(source.contains("fn resident_columns_for_snapshot"));
         assert!(source.contains("fn table_column_index"));
         assert!(source.contains("struct ResidentConstraintColumnBinding"));

@@ -425,7 +425,6 @@ fn int8_payload_elision_matches_install_twin() {
     );
 
     // R3-002 single-wide index: BIGINT UNIQUE now rides the flagged fingerprint index.
-    on.set_binary_wal_records_enabled(true);
     on.set_device_write_locate_wave_batch_enabled(true);
     on.execute_text(700, "CREATE TABLE u8 (v BIGINT UNIQUE, x INT)")
         .unwrap();

@@ -561,38 +561,9 @@ pub(crate) fn relational_value_index_entries_for_rows(
     entries
 }
 
-pub(crate) fn render_relational_insert(insert: &Insert) -> Result<String, EngineError> {
-    let mut sql = format!("INSERT INTO {}", insert.table);
-    if !insert.columns.is_empty() {
-        sql.push_str(" (");
-        sql.push_str(&insert.columns.join(", "));
-        sql.push(')');
-    }
-    sql.push_str(" VALUES ");
-    let rendered_rows = insert
-        .rows
-        .iter()
-        .map(|row| {
-            let rendered_values = row
-                .iter()
-                .map(|cell| match cell {
-                    InsertCell::Value { value, .. } => render_sql_value_literal(value),
-                    InsertCell::Default { .. } => Ok("DEFAULT".to_string()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(format!("({})", rendered_values.join(", ")))
-        })
-        .collect::<Result<Vec<_>, EngineError>>()?;
-    sql.push_str(&rendered_rows.join(", "));
-    Ok(sql)
-}
-
 pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, EngineError> {
-    // The COPY-to-engine bridge renders each parsed cell back to a SQL literal that `parse_sql_value` +
-    // `coerce_insert_value` re-parse to the SAME value at the column's type. Integers/numerics/bool are
-    // unquoted literals (inferred directly); date/timestamp/uuid are QUOTED strings the INSERT coercion
-    // converts to the column type (Text -> Date/Timestamp/Uuid, exactly like a user INSERT of a string
-    // literal into such a column). None of these renderings contain a `'`, so no extra escaping is needed.
+    // Catalog/default display and psql-introspection helper. COPY retains typed programmatic cells
+    // and no longer reconstructs INSERT text through this formatter.
     match value {
         SqlValue::Int2(value) => Ok(value.to_string()),
         SqlValue::Int4(value) => Ok(value.to_string()),

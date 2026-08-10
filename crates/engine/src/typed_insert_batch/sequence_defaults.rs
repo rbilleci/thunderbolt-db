@@ -98,10 +98,6 @@ pub(crate) struct SequenceDefaultRequests {
 }
 
 impl SequenceDefaultRequests {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.requests.is_empty()
-    }
-
     #[allow(dead_code)] // The current live route intentionally has no effect-plan consumer.
     pub(crate) fn effect_shapes(
         &self,
@@ -121,7 +117,6 @@ impl SequenceDefaultRequests {
             })
     }
 
-    #[cfg(test)]
     pub(crate) fn requests(&self) -> &[SequenceDefaultRequest] {
         &self.requests
     }

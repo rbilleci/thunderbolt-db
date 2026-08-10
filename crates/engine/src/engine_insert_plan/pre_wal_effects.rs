@@ -93,6 +93,7 @@ struct ExplicitOverlayBaseline {
     catalog_base: Option<Arc<CatalogSnapshot>>,
     delta_generation: u64,
     operation_count: u32,
+    typed_insert_count: u32,
     operation_fingerprint: gpu_db_wal::CanonicalDigest,
     next_row_id: u64,
     sequence_reference_count: u32,
@@ -106,14 +107,111 @@ struct ExplicitOverlayBaseline {
 
 /// Move-only semantic/effect handoff. It has no physical, result, or state-update authority.
 #[allow(dead_code)] // The production consumer is deliberately deferred to the next PLAN slice.
-struct PreparedInsertEffectPlan {
+pub(crate) struct PreparedInsertEffectPlan {
     prepared: crate::typed_insert_batch::PreparedTypedInsert,
     parent: InsertEffectParentIdentity,
     sequence_effects: classification::PlannedSequenceEffects,
     baseline: InsertEffectBaseline,
 }
 
+/// The sole live output of explicit typed sequence sealing. It keeps the consumed semantic batch
+/// together with scalar private sequence-chain provenance; neither a parsed INSERT nor a legacy
+/// delta can cross this boundary.
+pub(crate) struct LiveExplicitTypedInsertSeal {
+    pub(crate) batch: crate::typed_insert_batch::TypedInsertBatch,
+    pub(crate) private_sequence_advances:
+        Vec<crate::engine_transaction_delta::TypedPrivateSequenceAdvance>,
+}
+
 impl PreparedInsertEffectPlan {
+    pub(crate) const fn parent_request_digest(&self) -> gpu_db_wal::CanonicalDigest {
+        self.parent.request_digest
+    }
+
+    /// Capture an explicit typed INSERT effect plan while the caller owns the registered
+    /// transaction statement lock. The public transaction DML boundary supplies that lock; this
+    /// helper must never be called from an unlocked ingress.
+    pub(crate) fn prepare_explicit_on_locked_snapshot(
+        engine: &Engine,
+        txn_id: TxnId,
+        snapshot: Arc<TransactionSnapshot>,
+        insert: &Insert,
+        parent_autocommit: bool,
+        expected_catalog_version: Option<
+            crate::engine_mutation_admission::CatalogVersionExpectation,
+        >,
+    ) -> Result<Option<Self>, ExecuteError> {
+        engine.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let captured = ExplicitCapture::from_statement_locked(&snapshot)?;
+        let statement_ordinal = crate::insert_semantic_ir::InsertStatementOrdinal::from_u32(
+            captured.typed_insert_count,
+        );
+        let Some(prepared) = crate::typed_insert_batch::prepare_typed_insert_semantics_at(
+            insert,
+            &captured.transaction_catalog,
+            captured.transaction_catalog.commit_seq,
+            expected_catalog_version,
+            statement_ordinal,
+        )?
+        else {
+            return Ok(None);
+        };
+        let parent = InsertEffectParentIdentity::from_prepared(
+            txn_id,
+            parent_autocommit,
+            &prepared,
+            statement_ordinal,
+            captured.expression_ordinal_base,
+        )?;
+        let touched_sequence_seeds = touched_sequence_seeds(&prepared, &captured)?;
+        let operation_fingerprint = operation_identity_fingerprint(&captured.operations)?;
+        let sequence_reference_fingerprint =
+            sequence_reference_fingerprint(&captured.sequence_value_references)?;
+        let sequence_effects = classification::classify_explicit(&prepared, &parent, &captured)?;
+        Ok(Some(Self {
+            prepared,
+            parent,
+            sequence_effects,
+            baseline: InsertEffectBaseline::Explicit(ExplicitOverlayBaseline {
+                snapshot,
+                boundary: captured.boundary,
+                transaction_catalog: captured.transaction_catalog,
+                catalog_base: captured.catalog_base,
+                delta_generation: captured.delta_generation,
+                operation_count: captured.operation_count,
+                typed_insert_count: captured.typed_insert_count,
+                operation_fingerprint,
+                next_row_id: captured.next_row_id,
+                sequence_reference_count: captured.sequence_reference_count,
+                resident_shards: captured.resident_shards,
+                streaming_cold_chunks: captured.streaming_cold_chunks,
+                catalog_overlay: captured.catalog_overlay,
+                touched_sequence_seeds,
+                sequence_reference_fingerprint,
+            }),
+        }))
+    }
+
+    /// Consume the plan after ordinary sequence transitions have been materialized. Published
+    /// receipts are matched exactly; transaction-private values derive solely from the captured
+    /// stable-OID classifier and travel with the typed artifact to COMMIT.
+    pub(crate) fn seal_live_explicit(
+        self,
+        published_references: &[BinarySequenceValueReference],
+    ) -> Result<LiveExplicitTypedInsertSeal, ExecuteError> {
+        let bindings = classification::build_live_seal_bindings(
+            &self.prepared,
+            &self.parent,
+            &self.sequence_effects,
+            published_references,
+        )?;
+        let batch = self.prepared.seal(bindings.bindings)?;
+        Ok(LiveExplicitTypedInsertSeal {
+            batch,
+            private_sequence_advances: bindings.private_advances,
+        })
+    }
+
     /// Capture an exact current autocommit catalog cut before semantic lowering. The caller owns
     /// normal admission; this inert leaf only refuses a catalog Arc or boundary that has moved.
     #[allow(dead_code)] // The production consumer is deliberately deferred to the next PLAN slice.
@@ -208,8 +306,9 @@ impl PreparedInsertEffectPlan {
     ) -> Result<Option<Self>, ExecuteError> {
         engine.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
         let captured = ExplicitCapture::from_statement_locked(&snapshot)?;
-        let statement_ordinal =
-            crate::insert_semantic_ir::InsertStatementOrdinal::from_u32(captured.operation_count);
+        let statement_ordinal = crate::insert_semantic_ir::InsertStatementOrdinal::from_u32(
+            captured.typed_insert_count,
+        );
         let Some(prepared) = crate::typed_insert_batch::prepare_typed_insert_semantics_at(
             insert,
             &captured.transaction_catalog,
@@ -243,6 +342,7 @@ impl PreparedInsertEffectPlan {
                 catalog_base: captured.catalog_base,
                 delta_generation: captured.delta_generation,
                 operation_count: captured.operation_count,
+                typed_insert_count: captured.typed_insert_count,
                 operation_fingerprint,
                 next_row_id: captured.next_row_id,
                 sequence_reference_count: captured.sequence_reference_count,
@@ -308,6 +408,7 @@ struct ExplicitCapture {
     transaction_catalog: Arc<CatalogSnapshot>,
     delta_generation: u64,
     operation_count: u32,
+    typed_insert_count: u32,
     expression_ordinal_base: u32,
     next_row_id: u64,
     sequence_reference_count: u32,
@@ -341,8 +442,22 @@ impl ExplicitCapture {
                 "transaction operation count exceeds INSERT effect framing".to_string(),
             )
         })?;
-        let expression_ordinal_base =
-            statement_sequence_expression_count(&delta.sequence_value_references, operation_count)?;
+        let typed_insert_count = u32::try_from(
+            delta
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, TransactionOperation::TypedInsert(_)))
+                .count(),
+        )
+        .map_err(|_| {
+            ExecuteError::Unsupported(
+                "transaction typed INSERT count exceeds INSERT effect framing".to_string(),
+            )
+        })?;
+        let expression_ordinal_base = statement_sequence_expression_count(
+            &delta.sequence_value_references,
+            typed_insert_count,
+        )?;
         let sequence_reference_count = u32::try_from(delta.sequence_value_references.len())
             .map_err(|_| {
                 ExecuteError::Unsupported(
@@ -363,6 +478,7 @@ impl ExplicitCapture {
             transaction_catalog,
             delta_generation: delta.generation,
             operation_count,
+            typed_insert_count,
             expression_ordinal_base,
             next_row_id: delta.next_row_id,
             sequence_reference_count,
@@ -416,10 +532,10 @@ impl ExplicitOverlayBaseline {
             .delta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if statement_ordinal.as_u32() != self.operation_count
+        if statement_ordinal.as_u32() != self.typed_insert_count
             || statement_sequence_expression_count(
                 &delta.sequence_value_references,
-                self.operation_count,
+                self.typed_insert_count,
             )? != expression_ordinal_base
             || operation_identity_fingerprint(&delta.operations)? != self.operation_fingerprint
             || sequence_reference_fingerprint(&delta.sequence_value_references)?
@@ -444,6 +560,16 @@ impl ExplicitOverlayBaseline {
                 .is_some_and(|captured| Arc::ptr_eq(&delta.streaming_cold_chunks, &captured))
             || delta.generation != self.delta_generation
             || usize::try_from(self.operation_count).ok() != Some(delta.operations.len())
+            || usize::try_from(self.typed_insert_count).ok()
+                != Some(
+                    delta
+                        .operations
+                        .iter()
+                        .filter(|operation| {
+                            matches!(operation, TransactionOperation::TypedInsert(_))
+                        })
+                        .count(),
+                )
             || delta.next_row_id != self.next_row_id
             || usize::try_from(self.sequence_reference_count).ok()
                 != Some(delta.sequence_value_references.len())
@@ -647,6 +773,28 @@ fn operation_identity_fingerprint(
                     &mut body,
                     reset.sequence_reset_identity.as_ref(),
                 )?;
+            }
+            TransactionOperation::TypedInsert(staged) => {
+                // A typed INSERT is the current generic private-overlay authority.  Its
+                // immutable carrier must therefore participate in the same statement-prefix
+                // witness as legacy row/catalog/reset operations: a following typed INSERT
+                // captures this exact prefix before it can materialize sequence effects.  This
+                // is deliberately a witness only, not a second row/WAL encoding.
+                if staged.operation_ordinal != ordinal {
+                    return Err(baseline_drift(
+                        "typed transaction INSERT lost its exact operation ordinal",
+                    ));
+                }
+                body.push(6);
+                push_witness_string(&mut body, &staged.table)?;
+                body.extend_from_slice(&staged.table_oid.to_le_bytes());
+                body.extend_from_slice(&staged.table_schema_digest);
+                body.extend_from_slice(&staged.statement_digest);
+                body.extend_from_slice(&staged.typed_statement_digest);
+                body.extend_from_slice(&staged.prepared_catalog_seq.to_le_bytes());
+                body.extend_from_slice(&staged.read_snapshot.to_le_bytes());
+                body.extend_from_slice(&staged.rows_consumed().to_le_bytes());
+                body.extend_from_slice(&staged.private_payload_digest());
             }
         }
     }

@@ -133,20 +133,26 @@ pub(crate) fn binary_update_new_row_id_offset(table: &str, pk_column: &str) -> u
     3 + 2 + table.len() + 2 + pk_column.len() + 4
 }
 
-/// Encode a covered INSERT delta as a v1 binary record. `rows` are `(row_id, values)`.
-pub(crate) fn try_encode_binary_insert(
+/// Test fixture encoder for historical v1 INSERT decoder/recovery compatibility.
+/// This is not compiled into the live engine and has no production caller.
+#[cfg(test)]
+pub(crate) fn encode_historical_binary_insert_fixture(
     table: &str,
     rows: &[(u64, &[SqlValue])],
 ) -> Option<Vec<u8>> {
     if table.len() > u16::MAX as usize || rows.len() > u32::MAX as usize {
         return None;
     }
-    let mut out = encode_binary_insert_unchecked(table, rows)?;
+    let mut out = encode_historical_binary_insert_fixture_unchecked(table, rows)?;
     out.shrink_to_fit();
     Some(out)
 }
 
-fn encode_binary_insert_unchecked(table: &str, rows: &[(u64, &[SqlValue])]) -> Option<Vec<u8>> {
+#[cfg(test)]
+fn encode_historical_binary_insert_fixture_unchecked(
+    table: &str,
+    rows: &[(u64, &[SqlValue])],
+) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(64 + rows.len() * 48);
     out.push(WAL_BINARY_TAG);
     out.push(WAL_BINARY_VERSION);

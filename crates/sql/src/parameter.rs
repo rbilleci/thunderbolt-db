@@ -97,6 +97,12 @@ pub fn canonicalize_sql_for_exact_match(input: &str) -> Result<String, ParseErro
 
 /// Quote/comment/dollar-quote-aware arity of raw PostgreSQL `$n` references.
 pub(crate) fn sql_parameter_arity(input: &str) -> Result<usize, ParseError> {
+    // A PostgreSQL positional parameter necessarily contains `$`. Avoid constructing the
+    // transformed copy on the overwhelmingly common no-parameter text path; callers that need
+    // syntax validation still parse the command itself.
+    if !input.as_bytes().contains(&b'$') {
+        return Ok(0);
+    }
     transform_sql_parameters(input, CommentMode::Preserve, |_number, _end| Ok(None))
         .map(|(_, highest)| highest)
 }
@@ -460,6 +466,14 @@ mod tests {
             lower_sql_parameters("SELECT $0", &[]),
             Err(ParseError::InvalidParameterReference)
         ));
+    }
+
+    #[test]
+    fn raw_arity_fast_path_accepts_parameter_free_sql_without_transforming_it() {
+        assert_eq!(
+            sql_parameter_arity("INSERT INTO accounts (id, balance) VALUES (7, -9)").unwrap(),
+            0
+        );
     }
 
     #[test]

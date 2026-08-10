@@ -37,3 +37,6 @@ tikv-jemallocator = "0.6"
 # Keep latency-critical host orchestration in one optimization/code-placement domain. The point-read report card
 # is sensitive to parallel codegen-unit layout even when the GPU kernel and source are unchanged.
 codegen-units = 1
+# The unified typed-generation program substantially enlarges the executable. ThinLTO restores
+# cross-crate point-route locality without adding a route, cache, or alternate write authority.
+lto = "thin"

@@ -571,6 +571,14 @@ fn parse_inferred_unquoted_literal(s: &str) -> Result<SqlValue, ParseError> {
 }
 
 fn split_supported_sql_value_cast(input: &str) -> Result<(&str, Option<SqlType>), ParseError> {
+    // PostgreSQL's scalar cast operator necessarily contains `:`. Most INSERT cells are
+    // uncast literals, so reject that shape before entering the quote-aware scanner. Keep this
+    // at the shared scalar boundary rather than in an INSERT/type-specific route: every
+    // supported literal family receives the same optimization and explicit casts retain the
+    // exact parser below.
+    if !input.as_bytes().contains(&b':') {
+        return Ok((input, None));
+    }
     let Some(pos) = find_cast_operator_outside_quotes(input) else {
         return Ok((input, None));
     };

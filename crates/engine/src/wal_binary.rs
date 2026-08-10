@@ -39,7 +39,6 @@ pub(crate) use index_identity_codec::{
     BinaryTransactionIndexLifecycleTargetIdentity,
 };
 pub(crate) use insert_template::ProposedRowIdRange;
-pub(crate) use insert_template::{BoundBinaryInsert, PreparedBinaryInsertTemplate};
 pub(crate) use operation_identity::BinaryTransactionOperationIdentity;
 pub(crate) use record_decode::decode_binary_record;
 pub(crate) use row_codec::*;
@@ -88,6 +87,21 @@ pub(crate) use view_identity_codec::{
     BinaryCatalogRelationKind, BinaryTransactionViewLifecycleOperationIdentity,
     BinaryTransactionViewLifecycleTargetIdentity, BinaryTransactionViewOperationIdentity,
 };
+
+/// Catalog commands that may share the existing codec-5 S3 envelope with typed INSERT rows.
+/// This is a shape predicate only: S3 remains the ordered catalog body and never acquires row,
+/// allocator, status, device-apply, or publication authority.
+pub(crate) fn command_is_codec5_catalog_composition(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::CreateDomain(_)
+            | Command::CreateTable(_)
+            | Command::CreateIndex(_)
+            | Command::DropIndex(_)
+            | Command::AddForeignKey(_)
+    ) || command_is_view_lifecycle(command)
+        || command_is_sequence_lifecycle(command)
+}
 
 /// Encode one resolved explicit transaction as ONE WAL payload. Width overflow is reported as
 /// `None`; callers must fail the transaction rather than fall back to statement SQL records, which
@@ -155,6 +169,10 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                     }
                 }
             }
+            // Domain and FOREIGN KEY metadata are ordered S3 catalog state. Neither introduces
+            // a table identity nor a sequence input, so their canonical framing is the existing
+            // empty catalog-command branch.
+            Command::CreateDomain(_) | Command::AddForeignKey(_) => {}
             command if command_is_view_lifecycle(command) => {
                 requires_view_lifecycle_opcode |= command_requires_view_lifecycle_opcode(command);
                 view_commands.push((
@@ -214,8 +232,12 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
         ordered_catalog && record.catalog_epoch == BinaryTransactionCatalogEpoch::IndexIdentityV1;
     let index_identity_catalog = !record.index_lifecycle_operations.is_empty();
     let sequence_command_catalog = !sequence_commands.is_empty();
+    let generated_sequence_owner = !record.sequence_advances_by_oid.is_empty()
+        && generated_sequence_names(&record.catalog_commands)
+            .is_some_and(|names| !names.is_empty());
     let sequence_identity_catalog = !record.sequence_lifecycle_operations.is_empty()
-        || !record.sequence_reset_operations.is_empty();
+        || !record.sequence_reset_operations.is_empty()
+        || generated_sequence_owner;
     let mut created_class_oids = BTreeSet::new();
     let created_index_closure_valid = if index_catalog {
         created_index_identity_names == catalog_names.keys().copied().collect::<BTreeSet<_>>()
@@ -391,9 +413,11 @@ pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) ->
                                 _ => None,
                             })
                             .collect::<BTreeSet<_>>(),
-                        Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
-                            BTreeSet::new()
-                        }
+                        Command::CreateDomain(_)
+                        | Command::AddForeignKey(_)
+                        | Command::CreateView(_)
+                        | Command::RenameView(_)
+                        | Command::DropView(_) => BTreeSet::new(),
                         Command::CreateIndex(_)
                         | Command::RenameIndex(_)
                         | Command::DropIndex(_) => BTreeSet::new(),
@@ -1082,8 +1106,10 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
             };
             let supported_index = index_catalog && command_is_index_lifecycle(&command);
             let supported_sequence = sequence_catalog && command_is_sequence_lifecycle(&command);
-            if !matches!(command, Command::CreateTable(_))
-                && !supported_view
+            if !matches!(
+                command,
+                Command::CreateDomain(_) | Command::CreateTable(_) | Command::AddForeignKey(_)
+            ) && !supported_view
                 && !supported_index
                 && !supported_sequence
             {
@@ -1419,9 +1445,14 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                     return Err(fail("duplicate or invalid stable-ID sequence advancement"));
                 }
             }
-            if sequence_lifecycle_operations.is_empty() && sequence_reset_operations.is_empty() {
+            let generated_sequence_owner =
+                generated_sequence_names(&catalog_commands).is_some_and(|names| !names.is_empty());
+            if sequence_lifecycle_operations.is_empty()
+                && sequence_reset_operations.is_empty()
+                && (!generated_sequence_owner || sequence_advances_by_oid.is_empty())
+            {
                 return Err(fail(
-                    "sequence lifecycle opcode requires a lifecycle or reset identity",
+                    "sequence lifecycle opcode requires a lifecycle, reset, or generated-sequence owner",
                 ));
             }
         }
@@ -1742,9 +1773,11 @@ fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, 
                                 _ => None,
                             })
                             .collect::<BTreeSet<_>>(),
-                        Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
-                            BTreeSet::new()
-                        }
+                        Command::CreateDomain(_)
+                        | Command::AddForeignKey(_)
+                        | Command::CreateView(_)
+                        | Command::RenameView(_)
+                        | Command::DropView(_) => BTreeSet::new(),
                         Command::CreateIndex(_)
                         | Command::RenameIndex(_)
                         | Command::DropIndex(_) => BTreeSet::new(),

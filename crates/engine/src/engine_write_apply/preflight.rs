@@ -1393,12 +1393,7 @@ impl Engine {
                     commit_seq: self.committed_seq(),
                     next_row_id: self.read_state.mvcc.current_row_id(),
                 };
-                self.prepare_insert(
-                    insert,
-                    snapshot,
-                    None,
-                    crate::engine_dml_prepare::InsertPrepareValidation::Full,
-                )?;
+                self.prepare_insert(insert, snapshot, None)?;
             }
             Command::Update(update) => {
                 let snapshot = DmlReadSnapshot {

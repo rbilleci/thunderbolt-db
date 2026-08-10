@@ -112,7 +112,6 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     // GPU gate: this suite runs on driverless boxes too — skip without device
@@ -320,7 +319,6 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         // elision re-entry admits the recovered table with real device backing), and commit
         // fresh intents through the reopened lane set.
         recovered.set_auto_admit_on_commit(true);
-        recovered.set_binary_wal_records_enabled(true);
         recovered.set_device_write_locate_wave_batch_enabled(true);
         let route = recovered
             .prepare_covered_insert_route("t")
@@ -394,13 +392,12 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
 /// for the driver-multiplexed submit/poll semantics test). Returns `None` on a driverless box.
 fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<CoveredInsertRoute> {
     if engine.intent_lanes.is_none() {
-        engine.attach_test_intent_lanes(test_wal_path("warm-intent-lanes"), 4);
+        engine.attach_test_intent_lanes(test_wal_path("warm-intent-lanes").into_path_buf(), 4);
     }
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine
         .execute_dml_concurrent(
@@ -729,7 +726,10 @@ fn gpu_terminal_intent_retries_precede_reset_guards_and_roots_recover() {
 #[test]
 fn configured_intent_lanes_do_not_reject_classic_writers() {
     let mut engine = Engine::new_local_test_engine();
-    engine.attach_test_intent_lanes(test_wal_path("lane-classic-shared-authority"), 4);
+    engine.attach_test_intent_lanes(
+        test_wal_path("lane-classic-shared-authority").into_path_buf(),
+        4,
+    );
     let before_next = engine.commit_state().repl.peek_next_index();
     let before_wal = engine.wal_buffered_count();
     let token = engine
@@ -759,7 +759,7 @@ fn central_commit_wedge_drains_queued_lane_intents() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push_back(crate::engine_dml_concurrent::LaneIntent {
-            op: crate::engine_dml_concurrent::LaneOpKind::Insert,
+            op: crate::engine_dml_concurrent::LaneOpKind::Delete,
             txn_id: 7,
             slot: (0, 7),
             read_snapshot: 0,
@@ -776,7 +776,7 @@ fn central_commit_wedge_drains_queued_lane_intents() {
             transaction_claims: None,
             outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),
             rows_affected: 1,
-            rows_affected_cell: None,
+            rows_affected_cell: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
         });
 
     engine.wedge_commit_path();
@@ -954,17 +954,14 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
         })
         .collect();
     let classic_text = "INSERT INTO t VALUES (700000, 9)";
-    let classic = engine.make_covered_insert_wave_item(
+    let classic = engine.make_test_commit_wave_item(
         txn_ids.fetch_add(1, Ordering::Relaxed),
         gpu_db_sql::parse_command(classic_text).unwrap(),
         crate::engine_dml_concurrent::CanonicalRequest::from_text(&engine, classic_text),
         crate::write_path::WriteSet::default(),
         engine.committed_seq(),
-        engine.catalog_snapshot().commit_seq,
-        None,
-        None,
     );
-    let classic_outcome = engine.submit_commit_wave_item(classic).unwrap();
+    let classic_outcome = engine.submit_test_commit_wave_item(classic).unwrap();
     let mut classic_result = None;
     for _ in 0..4 {
         engine.drive_commit_wave();
@@ -996,233 +993,6 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
     }
 }
 
-/// E2.4a VARIANT 1 — SAME-PK single-winner ACROSS SHARD WORKERS. A LARGE homogeneous-intent wave
-/// (>= `SHARD_MIN_WAVE`) containing a duplicate PK takes the sharded sequencer when
-/// `GPU_DB_INTENT_SEQUENCER_SHARDS>1`; the duplicate must still resolve to exactly one winner (the
-/// per-shard private dedup set — same PK hashes to the same worker), and every distinct PK commits.
-/// Robust to either mode: under the default (shards=1, serial) the same invariant holds via
-/// wave-local arbitration. Run the sharded arm with `GPU_DB_INTENT_SEQUENCER_SHARDS=4`.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_intent_sharded_wave_same_pk_single_winner() {
-    let shards = std::env::var("GPU_DB_INTENT_SEQUENCER_SHARDS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
-    if shards < 2 {
-        return;
-    }
-    let mut engine = Engine::new_local_test_engine();
-    let txn_ids = AtomicU64::new(2);
-    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
-        return; // driverless box
-    };
-    let write_locates_before = engine.device_write_locate_hits();
-    let history_locates_before = engine.device_visible_locate_hits();
-
-    // Build ONE wave (submit everything before pumping): 200 distinct PKs plus a duplicate of the
-    // first, all in [600000, 600200). 201 items >= SHARD_MIN_WAVE forces the sharded fan-out.
-    const BASE: i32 = 600_000;
-    const DISTINCT: i32 = 200;
-    let mut tickets: Vec<_> = (0..DISTINCT)
-        .map(|i| {
-            engine
-                .submit_covered_insert_intent(
-                    txn_ids.fetch_add(1, Ordering::Relaxed),
-                    &route,
-                    &[BASE + i, i],
-                )
-                .expect("submit distinct")
-        })
-        .collect();
-    // The duplicate: same PK as position 0, later wave position → it must be the loser.
-    tickets.push(
-        engine
-            .submit_covered_insert_intent(
-                txn_ids.fetch_add(1, Ordering::Relaxed),
-                &route,
-                &[BASE, 999],
-            )
-            .expect("submit dup"),
-    );
-
-    let mut results: Vec<Option<Result<u64, ExecuteError>>> =
-        (0..tickets.len()).map(|_| None).collect();
-    let mut reaped = 0usize;
-    let mut spins = 0u32;
-    while reaped < tickets.len() {
-        engine.drive_commit_wave();
-        for (ticket, slot) in tickets.iter_mut().zip(results.iter_mut()) {
-            if slot.is_none() {
-                if let Some(result) = engine.poll_intent(ticket) {
-                    *slot = Some(result);
-                    reaped += 1;
-                }
-            }
-        }
-        spins += 1;
-        assert!(spins < 1_000_000, "sharded wave failed to drain");
-    }
-
-    let oks = results
-        .iter()
-        .filter(|r| r.as_ref().unwrap().is_ok())
-        .count();
-    let errs: Vec<String> = results
-        .iter()
-        .filter_map(|r| r.as_ref().unwrap().as_ref().err().map(|e| e.to_string()))
-        .collect();
-    assert_eq!(
-        oks,
-        DISTINCT as usize,
-        "every distinct PK commits; exactly the duplicate loses ({} errs: {:?})",
-        errs.len(),
-        errs
-    );
-    assert_eq!(errs.len(), 1, "exactly one loser (the duplicate): {errs:?}");
-    assert!(
-        errs[0].contains("conflict") || errs[0].contains("duplicate key"),
-        "duplicate loses as a first-committer-wins conflict: {}",
-        errs[0]
-    );
-    assert!(
-        engine.device_write_locate_hits() > write_locates_before,
-        "the sharded wave must run committed-duplicate validation on the device"
-    );
-    assert!(
-        engine.device_visible_locate_hits() > history_locates_before,
-        "the sharded wave must run physical-version history validation on the device"
-    );
-
-    let count = engine
-        .execute_relational_select_text("SELECT COUNT(*) FROM t WHERE id >= 600000 AND id < 700000")
-        .unwrap();
-    assert!(
-        format!("{:?}", count.rows.row(0).first()).contains(&format!("({DISTINCT})")),
-        "exactly {DISTINCT} distinct rows visible: {:?}",
-        count.rows.row(0).first()
-    );
-}
-
-/// Validation-to-publication TOCTOU control for the sharded sequencer. The explicit transaction
-/// has already staged the same absent PK. Pause the sharded wave immediately after its device
-/// verdict: because validation is inside the commit publication lock, the explicit COMMIT cannot
-/// publish in that gap. The sharded wave wins first and the transaction then rejects from device
-/// history. Moving validation back outside the lock makes the timeout assertion fail and can admit
-/// both writers.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU plus GPU_DB_INTENT_SEQUENCER_SHARDS>=2"]
-fn gpu_sharded_validation_holds_publication_lock_against_explicit_writer() {
-    let shards = std::env::var("GPU_DB_INTENT_SEQUENCER_SHARDS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
-    if shards < 2 {
-        return;
-    }
-
-    let mut engine = Engine::new_local_test_engine();
-    let txn_ids = AtomicU64::new(2);
-    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
-        return;
-    };
-    let engine = std::sync::Arc::new(engine);
-    const TXN: u64 = 9_000_000;
-    const BASE: i32 = 710_000;
-    engine.execute_text(TXN, "BEGIN").unwrap();
-    engine
-        .execute_dml_concurrent(TXN, "INSERT INTO t VALUES (710000, -1)")
-        .unwrap();
-
-    let mut tickets = (0..64_i32)
-        .map(|offset| {
-            engine
-                .submit_covered_insert_intent(
-                    txn_ids.fetch_add(1, Ordering::Relaxed),
-                    &route,
-                    &[BASE + offset, offset],
-                )
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-    engine.set_sharded_post_validation_hook(
-        std::sync::Arc::clone(&reached),
-        std::sync::Arc::clone(&resume),
-    );
-    let driver = {
-        let engine = std::sync::Arc::clone(&engine);
-        std::thread::spawn(move || engine.drive_commit_wave())
-    };
-    reached.wait();
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let committer = {
-        let engine = std::sync::Arc::clone(&engine);
-        std::thread::spawn(move || {
-            let result = engine.execute_text(TXN, "COMMIT");
-            done_tx.send(()).unwrap();
-            result
-        })
-    };
-    assert!(
-        done_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err(),
-        "the explicit writer crossed the sharded validation/publication gap"
-    );
-    resume.wait();
-    assert!(
-        driver.join().unwrap(),
-        "the sharded driver must sequence the wave"
-    );
-
-    let mut results: Vec<Option<Result<u64, ExecuteError>>> =
-        (0..tickets.len()).map(|_| None).collect();
-    for _ in 0..1_000_000 {
-        engine.drive_commit_wave();
-        for (ticket, result) in tickets.iter_mut().zip(results.iter_mut()) {
-            if result.is_none() {
-                *result = engine.poll_intent(ticket);
-            }
-        }
-        if results.iter().all(Option::is_some) {
-            break;
-        }
-    }
-    assert!(
-        results.iter().all(Option::is_some),
-        "sharded wave outcomes never settled"
-    );
-    assert_eq!(results.len(), 64);
-    assert!(
-        results
-            .iter()
-            .all(|result| result.as_ref().is_some_and(Result::is_ok)),
-        "distinct sharded keys must all win: {results:?}"
-    );
-
-    let error = committer
-        .join()
-        .unwrap()
-        .expect_err("the explicit same-key writer must lose after the sharded publication");
-    assert!(
-        matches!(&error, ExecuteError::Serialization(message)
-            if message.contains("device unique conflict") || message.contains("write history")),
-        "expected a device-history serialization conflict, got {error:?}"
-    );
-    engine.execute_text(TXN, "ROLLBACK").unwrap();
-    let count = engine
-        .execute_relational_select_text("SELECT COUNT(*) FROM t WHERE id >= 710000 AND id < 710064")
-        .unwrap();
-    assert!(
-        format!("{:?}", count.rows.row(0).first()).contains("(64)"),
-        "only the 64 sharded rows may be visible: {:?}",
-        count.rows.row(0).first()
-    );
-}
-
 /// Rows the warm-up phase inserted (ids >= 1_000_000).
 fn warm_count(rows: &[Vec<SqlValue>]) -> usize {
     rows.iter()
@@ -1241,7 +1011,6 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
@@ -1390,7 +1159,6 @@ fn gpu_lane_delete_intents_end_to_end() {
         .execute_text(2, "CREATE TABLE t2 (a INT PRIMARY KEY, b INT UNIQUE)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(10);
@@ -1605,7 +1373,6 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     let txn_ids = AtomicU64::new(10);
     engine
@@ -1669,7 +1436,6 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
 
     let recovered = Engine::open_durable_wal_segment(&path).unwrap();
     recovered.set_auto_admit_on_commit(true);
-    recovered.set_binary_wal_records_enabled(true);
     recovered.set_device_write_locate_wave_batch_enabled(true);
     let after = select_rows_unordered_sorted(&recovered);
     assert_eq!(before, after, "replayed store must be row-identical");
@@ -1737,7 +1503,6 @@ fn gpu_lane_update_intents_end_to_end() {
         .execute_text(2, "CREATE TABLE t2 (a INT PRIMARY KEY, b INT UNIQUE)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
 
     let txn_ids = AtomicU64::new(10);
@@ -1961,7 +1726,6 @@ fn gpu_lane_update_recovery_replays_row_identical() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     let txn_ids = AtomicU64::new(10);
     engine
@@ -2044,7 +1808,6 @@ fn gpu_lane_update_recovery_replays_row_identical() {
 
     let recovered = Engine::open_durable_wal_segment(&path).unwrap();
     recovered.set_auto_admit_on_commit(true);
-    recovered.set_binary_wal_records_enabled(true);
     recovered.set_device_write_locate_wave_batch_enabled(true);
     let after = select_rows_unordered_sorted(&recovered);
     assert_eq!(before, after, "replayed store must be row-identical");
@@ -2095,7 +1858,6 @@ fn gpu_lane_update_sustained_stays_elided() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     let txn_ids = AtomicU64::new(10);
     engine

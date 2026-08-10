@@ -120,6 +120,12 @@ pub(crate) fn parse_canonical_typed_insert_record_prefix(
     })
 }
 
+pub(crate) fn validate_transaction_private_sequence_chains(
+    records: &[DecodedTypedInsertRecord],
+) -> Result<(), EngineError> {
+    decode::validate_transaction_private_sequence_chains(records)
+}
+
 #[allow(dead_code)] // The strict views become live only with the future codec-5 replay owner.
 impl DecodedTypedInsertRecord {
     /// Rebuild canonical bytes only from the validated retained model. This is test-only so no
@@ -239,11 +245,16 @@ pub(super) fn encoded_len(batch: &TypedInsertBatch) -> Result<usize, EngineError
 
 fn encode_into(batch: &TypedInsertBatch, record: &mut Writer) -> Result<(), EngineError> {
     validate_batch(batch)?;
-    let typed_statement_digest = typed_statement_digest_for_batch(batch)?;
-    if typed_statement_digest != batch.typed_statement_digest {
-        return Err(codec_error(
-            "typed statement digest drifted after semantic preparation",
-        ));
+    // `TypedInsertBatch` is the private, move-only result of `PreparedTypedInsert::seal`; none of
+    // its semantic fields has a production mutator. The preparation boundary computed this
+    // digest from the same catalog-order vectors before the sealed carrier existed, and sequence
+    // materialization validates the request identities without changing the pre-effect intent.
+    // Re-spelling the complete row/cell body here was therefore a second O(cells) validation and
+    // allocation on every live write. Recovery remains the independent authority: the strict
+    // decoder reconstructs the digest from retained S2 fields and rejects any mismatch.
+    let typed_statement_digest = batch.typed_statement_digest;
+    if typed_statement_digest == [0; 32] {
+        return Err(codec_error("typed statement digest is absent"));
     }
     let returning_digest = returning_layout_digest(&batch.returning)?;
     record.bytes(&MAGIC)?;
@@ -396,58 +407,6 @@ pub(super) fn typed_statement_digest_for_prepared(
             request.sequence_effective_name(),
             request.statement_ordinal(),
             request.expression_ordinal(),
-        )?;
-    }
-    Ok(gpu_db_wal::canonical_request_digest(&body.finish()))
-}
-
-fn typed_statement_digest_for_batch(
-    batch: &TypedInsertBatch,
-) -> Result<gpu_db_wal::CanonicalDigest, EngineError> {
-    let effects = batch
-        .sequence_bindings
-        .iter()
-        .map(|binding| binding.canonical_view())
-        .collect::<Vec<_>>();
-    let sequence_cells = effects
-        .iter()
-        .map(|effect| {
-            (
-                effect.request.catalog_column_ordinal,
-                effect.request.row_ordinal,
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let mut body = Writer::new(MAX_RECORD_BYTES);
-    append_statement_preamble(
-        &mut body,
-        batch.table.schema.as_ref(),
-        batch.table.name.as_ref(),
-        batch.table.oid,
-        batch.table.schema_digest,
-        batch.statement_ordinal,
-        batch.row_count,
-        &batch.columns,
-        &batch.dependencies,
-        &batch.domain_dependencies,
-        &batch.canonical_catalog,
-        returning_layout_digest(&batch.returning)?,
-        &sequence_cells,
-    )?;
-    body.u32(checked_u32(effects.len(), "sequence effect count")?)?;
-    for effect in effects {
-        let request = effect.request;
-        append_sequence_request(
-            &mut body,
-            request.target_table_oid,
-            request.row_ordinal,
-            request.catalog_column_ordinal,
-            request.column_id,
-            request.sequence_oid,
-            request.sequence_source_name,
-            request.sequence_effective_name,
-            request.statement_ordinal,
-            request.expression_ordinal,
         )?;
     }
     Ok(gpu_db_wal::canonical_request_digest(&body.finish()))
@@ -1208,7 +1167,7 @@ fn validate_batch_dependency_closure_order(
             Some(_) => {
                 return Err(codec_error(
                     "foreign-key parent has ambiguous dependency ordinal",
-                ))
+                ));
             }
             None if foreign_key.parent_dependency_ordinal == next => {
                 by_oid.insert(dependency.oid, next);
@@ -1219,7 +1178,7 @@ fn validate_batch_dependency_closure_order(
             None => {
                 return Err(codec_error(
                     "FK parent dependency is not first-occurrence ordered",
-                ))
+                ));
             }
         }
     }

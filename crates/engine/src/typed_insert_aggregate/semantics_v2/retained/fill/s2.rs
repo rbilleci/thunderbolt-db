@@ -10,9 +10,9 @@ use super::ObservedSourceMeasure;
 use crate::typed_insert_aggregate::codec::DecodedAggregateFraming;
 use crate::typed_insert_aggregate::semantics_v2::retained::graph::ReservedSemanticsV2Graph;
 use crate::typed_insert_batch::{
-    copy_decoded_canonical_typed_insert_published_only_after_measure,
-    decode_decoded_canonical_typed_insert_published_only_after_measure,
-    measure_decoded_canonical_typed_insert_published_only_from_source,
+    copy_decoded_canonical_typed_insert_after_measure,
+    decode_decoded_canonical_typed_insert_after_measure,
+    measure_decoded_canonical_typed_insert_from_source,
 };
 use crate::EngineError;
 use sha2::{Digest, Sha256};
@@ -38,11 +38,8 @@ pub(super) fn fill_s2_records(
                     .ok_or_else(|| fill_error("S2 retained record offset overflows"))?,
                 bytes,
             );
-            let measure =
-                measure_decoded_canonical_typed_insert_published_only_from_source(&source)
-                    .map_err(|_| {
-                        fill_error("S2 retained source measurement fails strict decode")
-                    })?;
+            let measure = measure_decoded_canonical_typed_insert_from_source(&source)
+                .map_err(|_| fill_error("S2 retained source measurement fails strict decode"))?;
             if measure.record_bytes() != bytes {
                 return Err(fill_error("S2 retained source measure length drifted"));
             }
@@ -60,17 +57,11 @@ pub(super) fn fill_s2_records(
             )?;
 
             let mut scratch = exact_copy_scratch(bytes, "S2 exact source copy")?;
-            copy_decoded_canonical_typed_insert_published_only_after_measure(
-                &source,
-                measure,
-                &mut scratch,
-            )
-            .map_err(|_| fill_error("S2 retained source changed after its measurement"))?;
+            copy_decoded_canonical_typed_insert_after_measure(&source, measure, &mut scratch)
+                .map_err(|_| fill_error("S2 retained source changed after its measurement"))?;
             let record_digest = s2_record_digest(record_bytes, &scratch);
-            let decoded = decode_decoded_canonical_typed_insert_published_only_after_measure(
-                &scratch, measure,
-            )
-            .map_err(|_| fill_error("S2 retained exact copy fails strict decode"))?;
+            let decoded = decode_decoded_canonical_typed_insert_after_measure(&scratch, measure)
+                .map_err(|_| fill_error("S2 retained exact copy fails strict decode"))?;
             drop(scratch);
 
             let ordinal = graph.records.len();

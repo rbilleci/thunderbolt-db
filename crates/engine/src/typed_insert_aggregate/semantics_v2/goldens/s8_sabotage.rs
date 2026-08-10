@@ -33,6 +33,33 @@ fn coherently_rehashed_s8_header_root_substitution_is_rejected_by_the_raw_s8_pro
 }
 
 #[test]
+fn clear_bit_generic_request_identity_rejects_outer_status_and_s8_disagreement() {
+    let mut fixture = selective_a_b_a_fixture();
+    assert_eq!(
+        fixture.outer.flags
+            & crate::typed_insert_aggregate::OUTER_FLAG_FIRST_TYPED_INSERT_WRITER_EPOCH,
+        0,
+        "the generic closure test must exercise the clear-bit protocol"
+    );
+    // Keep the authenticated aggregate bytes, STATUS2, and present S8 header mutually coherent,
+    // then change only the enclosing generic request authority. This proves the clear-bit rule
+    // cannot split retry/status identity from the outer canonical request.
+    fixture.outer.request_digest[0] ^= 1;
+    assert_ne!(
+        &fixture.status[52..84],
+        fixture.outer.request_digest.as_slice()
+    );
+    assert_ne!(
+        &fixture.sections[7][112..144],
+        fixture.outer.request_digest.as_slice()
+    );
+    assert_raw_s8_rejection(
+        fixture,
+        "generic v2 request identity does not close over outer/STATUS2",
+    );
+}
+
+#[test]
 fn coherently_rehashed_s8_role_two_image_substitution_is_rejected_by_the_raw_s8_proof() {
     let fixture = reframe_s8_after_mutation_for_sabotage(selective_a_b_a_fixture(), |s8| {
         let image_offset =

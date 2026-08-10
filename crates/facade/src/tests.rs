@@ -1624,7 +1624,7 @@ fn active_transaction_stages_create_table_until_rollback() {
     let hidden = facade
         .execute(observer, "SELECT id FROM must_not_autocommit")
         .unwrap_err();
-    assert_eq!(hidden.category, ErrorCategory::Engine);
+    assert_eq!(hidden.category, ErrorCategory::UndefinedRelation);
     assert_eq!(hidden.message, "relation does not exist");
 
     facade.execute(session, "ROLLBACK").unwrap();
@@ -1647,7 +1647,7 @@ fn shared_active_transaction_publishes_create_table_only_at_commit() {
     assert!(session.in_transaction());
 
     let hidden = submit_ephemeral_text(&shared, "SELECT id FROM must_not_autocommit").unwrap_err();
-    assert_eq!(hidden.category, ErrorCategory::Engine);
+    assert_eq!(hidden.category, ErrorCategory::UndefinedRelation);
     assert_eq!(hidden.message, "relation does not exist");
 
     submit_session_text(&shared, &mut session, "COMMIT").unwrap();

@@ -4,6 +4,7 @@ const COUNTS: [u32; AGGREGATE_SECTION_COUNT] = [1, 1, 0, 1, 0, 1, 1, 0];
 
 fn view<'a>(payloads: &'a [Vec<u8>; AGGREGATE_SECTION_COUNT]) -> TypedInsertAggregateView<'a> {
     TypedInsertAggregateView {
+        semantics: TypedInsertAggregateSemantics::V1,
         flags: AGGREGATE_FLAG_AUTOCOMMIT,
         outer_flags: OUTER_FLAG_TYPED_INSERT_AGGREGATE_V1 | OUTER_CONTENT_ROW,
         stable_transaction_id: 41,
@@ -217,7 +218,7 @@ fn autocommit_success_binds_the_single_statement_inserted_rows_not_statement_cou
 }
 
 #[test]
-fn explicit_success_binds_the_final_transition_count_not_statement_or_insert_count() {
+fn explicit_success_binds_original_insert_count_not_survivor_or_statement_count() {
     let payloads: [Vec<u8>; AGGREGATE_SECTION_COUNT] =
         std::array::from_fn(|index| vec![index as u8 + 1; index * 7 + 1]);
     let mut view = view(&payloads);
@@ -234,6 +235,17 @@ fn explicit_success_binds_the_final_transition_count_not_statement_or_insert_cou
     let bodies = encoded_bodies_for(&view);
     let header = header(&bodies);
 
+    let mut original_insert_count = outcome(&bodies);
+    original_insert_count.affected_rows = 3;
+    assert!(reserve_typed_insert_canonical_envelope(
+        bodies,
+        physical(),
+        header.clone(),
+        original_insert_count,
+    )
+    .is_ok());
+
+    let bodies = encoded_bodies_for(&view);
     let mut final_transition_count = outcome(&bodies);
     final_transition_count.affected_rows = 1;
     assert!(reserve_typed_insert_canonical_envelope(
@@ -242,7 +254,7 @@ fn explicit_success_binds_the_final_transition_count_not_statement_or_insert_cou
         header.clone(),
         final_transition_count,
     )
-    .is_ok());
+    .is_err());
 
     let bodies = encoded_bodies_for(&view);
     let mut statement_count = outcome(&bodies);
@@ -284,7 +296,7 @@ fn no_op_and_abort_keep_their_zero_affected_row_contracts() {
 fn outer_envelope_source_is_borrowed_and_collection_free() {
     let source = include_str!("envelope.rs");
     assert!(source.contains("canonical_fragment_refs"));
-    assert!(source.contains("encode_canonical_record_exact_from_borrowed"));
+    assert!(source.contains("prepare_exact_canonical_wal_record_from_borrowed_uninit_arc_buffers"));
     for forbidden in ["CanonicalFragment {", "Vec<", "Vec::", "collect("] {
         assert!(
             !source.contains(forbidden),

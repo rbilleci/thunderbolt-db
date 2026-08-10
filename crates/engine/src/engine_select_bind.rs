@@ -36,12 +36,7 @@ impl Engine {
             .read_catalog_as_of(s)
             .relational_catalog
             .get(&select.table)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" does not exist",
-                    select.table
-                )))
-            })?
+            .ok_or_else(|| ExecuteError::UndefinedRelation(select.table.clone()))?
             .clone();
         let bound = bind_relational_select(&table, select)?;
         Ok((table, bound, s))

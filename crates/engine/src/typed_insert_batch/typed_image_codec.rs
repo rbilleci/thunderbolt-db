@@ -216,6 +216,678 @@ impl DecodedTypedImage {
                 vector_digest: column.vector_digest,
             })
     }
+
+    /// Rebind one final image to its stable-table-ordered S7 reference before runtime generation.
+    /// Re-encoding is required because the table reference participates in the authenticated
+    /// layout digest; callers receive the exact decoded/encoded pair used by both CUDA and WAL.
+    pub(super) fn rebind_final_table_ref(
+        mut self,
+        table_ref: u32,
+    ) -> Result<(Self, Arc<[u8]>), EngineError> {
+        if self.facts.role != TypedImageRole::FinalTableImage
+            || self.facts.rows == 0
+            || table_ref == DERIVED_U32
+        {
+            return Err(image_error("final image table reference is invalid"));
+        }
+        for column in &mut self.columns {
+            column.table_ref = table_ref;
+        }
+        let views = self
+            .columns
+            .iter()
+            .map(|column| TypedImageColumnView {
+                catalog_column_ordinal: column.catalog_column_ordinal,
+                stable_column_id: column.stable_column_id,
+                table_ref: column.table_ref,
+                attnum: column.attnum,
+                ty: column.ty,
+                type_oid: column.type_oid,
+                type_size: column.type_size,
+                result_format: column.result_format,
+                name: &column.name,
+                validity: &column.validity,
+                values: &column.values,
+            })
+            .collect::<Vec<_>>();
+        let encoded: Arc<[u8]> = encode_typed_image(&TypedImageView {
+            role: TypedImageRole::FinalTableImage,
+            rows: self.facts.rows,
+            columns: &views,
+        })?
+        .into();
+        Ok((decode_typed_image(&encoded)?, encoded))
+    }
+
+    /// Concatenate same-table strict images directly at their S7 table reference. Each statement
+    /// keeps its own S2 record; this produces the sole catalog-order physical image consumed by
+    /// the transaction's CUDA generation and device plan.  Do not first materialize an encoded
+    /// reference-neutral combined image only to encode/decode it again for its final S7 reference.
+    pub(super) fn concatenate_final_table_images_for_table_ref(
+        images: Vec<Self>,
+        table_ref: u32,
+    ) -> Result<(Self, Arc<[u8]>), EngineError> {
+        if table_ref == DERIVED_U32 {
+            return Err(image_error("final image table reference is invalid"));
+        }
+        let first = images
+            .first()
+            .ok_or_else(|| image_error("final image concatenation is empty"))?;
+        if first.facts.role != TypedImageRole::FinalTableImage || first.facts.rows == 0 {
+            return Err(image_error(
+                "final image concatenation requires nonempty table images",
+            ));
+        }
+        let column_count = first.columns.len();
+        let mut total_rows = 0_u32;
+        for image in &images {
+            if image.facts.role != TypedImageRole::FinalTableImage
+                || image.facts.rows == 0
+                || image.columns.len() != column_count
+                || image
+                    .columns
+                    .iter()
+                    .zip(first.columns.iter())
+                    .any(|(column, expected)| {
+                        column.catalog_column_ordinal != expected.catalog_column_ordinal
+                            || column.stable_column_id != expected.stable_column_id
+                            || column.table_ref != expected.table_ref
+                            || column.attnum != expected.attnum
+                            || column.ty != expected.ty
+                            || column.type_oid != expected.type_oid
+                            || column.type_size != expected.type_size
+                            || column.result_format != expected.result_format
+                            || column.name != expected.name
+                    })
+            {
+                return Err(image_error(
+                    "final image concatenation schema or identity differs",
+                ));
+            }
+            total_rows = total_rows
+                .checked_add(image.facts.rows)
+                .ok_or_else(|| image_error("final image concatenation row count overflows"))?;
+        }
+
+        let mut groups = (0..column_count)
+            .map(|_| Vec::with_capacity(images.len()))
+            .collect::<Vec<_>>();
+        for image in images {
+            for (ordinal, column) in image.columns.into_vec().into_iter().enumerate() {
+                groups[ordinal].push((image.facts.rows, column));
+            }
+        }
+        let mut columns = Vec::with_capacity(column_count);
+        for group in groups {
+            columns.push(concatenate_final_image_column(group, total_rows)?);
+        }
+        let mut candidate = Self {
+            facts: DecodedTypedImageFacts {
+                role: TypedImageRole::FinalTableImage,
+                rows: total_rows,
+                columns: u32::try_from(column_count)
+                    .map_err(|_| image_error("final image column count exceeds u32"))?,
+                layout_digest: [0; 32],
+            },
+            columns: columns.into_boxed_slice(),
+        };
+        for column in &mut candidate.columns {
+            column.table_ref = table_ref;
+        }
+        let views = candidate
+            .columns
+            .iter()
+            .map(|column| TypedImageColumnView {
+                catalog_column_ordinal: column.catalog_column_ordinal,
+                stable_column_id: column.stable_column_id,
+                table_ref: column.table_ref,
+                attnum: column.attnum,
+                ty: column.ty,
+                type_oid: column.type_oid,
+                type_size: column.type_size,
+                result_format: column.result_format,
+                name: &column.name,
+                validity: &column.validity,
+                values: &column.values,
+            })
+            .collect::<Vec<_>>();
+        let encoded: Arc<[u8]> = encode_typed_image(&TypedImageView {
+            role: TypedImageRole::FinalTableImage,
+            rows: total_rows,
+            columns: &views,
+        })?
+        .into();
+        // Strictly decode the exact S7-bound combined bytes once, then move that one vector owner
+        // directly into the resident source. This retains byte-level validation without
+        // revalidating an intermediate reference-neutral image that no authority can observe.
+        let decoded = decode_typed_image(&encoded)?;
+        Ok((decoded, encoded))
+    }
+
+    /// Consume one strict final-table image into the sole columnar append carrier. The image
+    /// grammar has already sealed every vector body; this boundary only
+    /// binds those owners to one exact live catalog table before moving them.  It deliberately
+    /// cannot recover SQL text, construct row values, or surface an image column for mutation.
+    pub(super) fn into_resident_append_source(
+        self,
+        table: &RelationalTable,
+        table_schema_digest: gpu_db_wal::CanonicalDigest,
+        prepared_catalog_seq: Index,
+    ) -> Result<PreparedResidentAppendSource, EngineError> {
+        let DecodedTypedImage { facts, columns } = self;
+        let column_count = usize::try_from(facts.columns).map_err(|_| {
+            resident_source_error("final image column count exceeds addressability")
+        })?;
+        if facts.role != TypedImageRole::FinalTableImage
+            || column_count != columns.len()
+            || column_count != table.columns.len()
+            || table.stable_table_id == 0
+            || table.stable_table_id == u64::MAX
+            || table.oid == 0
+            || crate::engine_transaction_reset::table_schema_digest(table)
+                .map_err(|_| resident_source_error("supplied table schema cannot be digested"))?
+                != table_schema_digest
+        {
+            return Err(resident_source_error(
+                "final image/table schema or identity does not match",
+            ));
+        }
+
+        for (ordinal, (decoded, catalog)) in columns.iter().zip(&table.columns).enumerate() {
+            let catalog_ordinal = u32::try_from(ordinal)
+                .map_err(|_| resident_source_error("catalog column ordinal exceeds u32"))?;
+            if decoded.catalog_column_ordinal != catalog_ordinal
+                || decoded.stable_column_id != catalog.id
+                || decoded.attnum != catalog.attnum
+                || decoded.ty != catalog.ty
+                || decoded.type_oid != catalog.type_oid
+                || decoded.type_size != catalog.type_size
+                || catalog.table_oid != table.oid
+                || decoded.result_format != 0
+                || !decoded.name.is_empty()
+                || !is_live_resident_append_type(decoded.ty)
+            {
+                return Err(resident_source_error(
+                    "final image catalog-order column identity does not match",
+                ));
+            }
+        }
+
+        let requires_dense_rollover = columns
+            .iter()
+            .any(|column| column.ty == SqlType::Text || !column.validity.is_all_valid());
+        #[cfg(feature = "probe-timing")]
+        {
+            let non_all_valid = columns
+                .iter()
+                .filter(|column| !column.validity.is_all_valid())
+                .count();
+            eprintln!(
+                "[probe] codec5_final_image_source table={} rows={} columns={} non_all_valid={} dense={}",
+                table.name,
+                facts.rows,
+                columns.len(),
+                non_all_valid,
+                requires_dense_rollover,
+            );
+        }
+        let schema: Arc<str> = Arc::from(table.schema.as_str());
+        let name: Arc<str> = Arc::from(table.name.as_str());
+        let mut prepared_columns = Vec::new();
+        prepared_columns
+            .try_reserve_exact(columns.len())
+            .map_err(|_| resident_source_error("resident source column reservation failed"))?;
+        for column in columns.into_vec() {
+            prepared_columns.push(PreparedResidentAppendColumn {
+                column_id: column.stable_column_id,
+                attnum: column.attnum,
+                ty: column.ty,
+                type_oid: column.type_oid,
+                type_size: column.type_size,
+                validity: Some(column.validity),
+                values: Some(column.values),
+            });
+        }
+        let rows = usize::try_from(facts.rows)
+            .map_err(|_| resident_source_error("final image rows exceed addressability"))?;
+        let runtime_value_bytes =
+            resident_source::runtime_generation_value_bytes(rows, &prepared_columns)?;
+        Ok(PreparedResidentAppendSource {
+            table: TypedInsertBatchTable {
+                schema: Arc::clone(&schema),
+                name: Arc::clone(&name),
+                stable_table_id: table.stable_table_id,
+                oid: table.oid,
+                schema_digest: table_schema_digest,
+                prepared_catalog_seq,
+            },
+            row_count: facts.rows,
+            columns: into_exact_boxed_slice(
+                prepared_columns,
+                "recovery resident source column directory",
+            )?,
+            runtime_value_bytes,
+            dependencies: Box::new([TypedInsertDependencyBinding {
+                schema,
+                name,
+                oid: table.oid,
+                schema_digest: table_schema_digest,
+            }]),
+            requires_dense_rollover,
+        })
+    }
+}
+
+/// Encode the transaction overlay's already-resolved final rows into the same catalog-order
+/// image consumed by runtime generation, the device plan, and recovery.  This is deliberately an
+/// image transformation, not another INSERT semantic carrier: the original S2 records remain the
+/// statement authority, while these values are the final private-overlay outcome of later DML.
+pub(crate) fn encode_final_table_image_from_resolved_rows(
+    table_ref: u32,
+    table: &RelationalTable,
+    rows: &[Vec<SqlValue>],
+) -> Result<(DecodedTypedImage, Arc<[u8]>), EngineError> {
+    if table_ref == DERIVED_U32
+        || table.columns.is_empty()
+        || rows.iter().any(|row| row.len() != table.columns.len())
+    {
+        return Err(image_error(
+            "resolved final rows do not match their catalog table geometry",
+        ));
+    }
+    let row_count = rows.len();
+    let mut validities = Vec::with_capacity(table.columns.len());
+    let mut values = Vec::with_capacity(table.columns.len());
+    for (column_ordinal, column) in table.columns.iter().enumerate() {
+        let mut validity = vec![0_u32; bitmap_words(row_count)?];
+        let column_values = match column.ty {
+            SqlType::Int2 | SqlType::Int4 | SqlType::Date => {
+                let mut output = vec![0_i32; row_count];
+                for (row_ordinal, row) in rows.iter().enumerate() {
+                    match (&row[column_ordinal], column.ty) {
+                        (SqlValue::Null, _) => continue,
+                        (SqlValue::Int2(value), SqlType::Int2) => {
+                            output[row_ordinal] = i32::from(*value)
+                        }
+                        (SqlValue::Int4(value), SqlType::Int4)
+                        | (SqlValue::Date(value), SqlType::Date) => output[row_ordinal] = *value,
+                        _ => {
+                            return Err(image_error(
+                                "resolved final i32-section value changed SQL type",
+                            ));
+                        }
+                    }
+                    set_bit(&mut validity, row_ordinal)?;
+                }
+                TypedInsertColumnValues::I32(output.into_boxed_slice())
+            }
+            SqlType::Int8 | SqlType::Timestamp => {
+                let mut output = vec![0_i64; row_count];
+                for (row_ordinal, row) in rows.iter().enumerate() {
+                    match (&row[column_ordinal], column.ty) {
+                        (SqlValue::Null, _) => continue,
+                        (SqlValue::Int8(value), SqlType::Int8)
+                        | (SqlValue::Timestamp(value), SqlType::Timestamp) => {
+                            output[row_ordinal] = *value
+                        }
+                        _ => {
+                            return Err(image_error(
+                                "resolved final i64-section value changed SQL type",
+                            ));
+                        }
+                    }
+                    set_bit(&mut validity, row_ordinal)?;
+                }
+                TypedInsertColumnValues::I64(output.into_boxed_slice())
+            }
+            SqlType::Numeric { scale, .. } => {
+                let mut output = vec![0_i128; row_count];
+                for (row_ordinal, row) in rows.iter().enumerate() {
+                    match &row[column_ordinal] {
+                        SqlValue::Null => continue,
+                        SqlValue::Numeric(value) if value.scale == scale => {
+                            output[row_ordinal] = value.mantissa
+                        }
+                        _ => {
+                            return Err(image_error(
+                                "resolved final NUMERIC value changed SQL type or scale",
+                            ));
+                        }
+                    }
+                    set_bit(&mut validity, row_ordinal)?;
+                }
+                TypedInsertColumnValues::I128(output.into_boxed_slice())
+            }
+            SqlType::Uuid => {
+                let mut output = vec![[0_u8; 16]; row_count];
+                for (row_ordinal, row) in rows.iter().enumerate() {
+                    match &row[column_ordinal] {
+                        SqlValue::Null => continue,
+                        SqlValue::Uuid(value) => output[row_ordinal] = *value,
+                        _ => {
+                            return Err(image_error("resolved final UUID value changed SQL type"));
+                        }
+                    }
+                    set_bit(&mut validity, row_ordinal)?;
+                }
+                TypedInsertColumnValues::Bytes16(output.into_boxed_slice())
+            }
+            SqlType::Bool => {
+                let mut output = vec![0_u32; bitmap_words(row_count)?];
+                for (row_ordinal, row) in rows.iter().enumerate() {
+                    match &row[column_ordinal] {
+                        SqlValue::Null => continue,
+                        SqlValue::Bool(value) => {
+                            if *value {
+                                set_bit(&mut output, row_ordinal)?;
+                            }
+                        }
+                        _ => {
+                            return Err(image_error("resolved final BOOL value changed SQL type"));
+                        }
+                    }
+                    set_bit(&mut validity, row_ordinal)?;
+                }
+                TypedInsertColumnValues::BoolBits(output.into_boxed_slice())
+            }
+            SqlType::Text => {
+                let mut offsets = Vec::with_capacity(row_count + 1);
+                let mut output = Vec::new();
+                offsets.push(0_u64);
+                for (row_ordinal, row) in rows.iter().enumerate() {
+                    match &row[column_ordinal] {
+                        SqlValue::Null => {}
+                        SqlValue::Text(value) => {
+                            output.try_reserve(value.len()).map_err(|_| {
+                                image_error("resolved final TEXT reservation failed")
+                            })?;
+                            output.extend_from_slice(value.as_bytes());
+                            set_bit(&mut validity, row_ordinal)?;
+                        }
+                        _ => {
+                            return Err(image_error("resolved final TEXT value changed SQL type"));
+                        }
+                    }
+                    offsets.push(
+                        u64::try_from(output.len())
+                            .map_err(|_| image_error("resolved final TEXT bytes exceed u64"))?,
+                    );
+                }
+                TypedInsertColumnValues::Text {
+                    offsets: offsets.into_boxed_slice(),
+                    bytes: output.into_boxed_slice(),
+                }
+            }
+        };
+        validities.push(if bitmap_is_all_set(&validity, row_count) {
+            TypedInsertColumnValidity::AllValid
+        } else {
+            TypedInsertColumnValidity::Bitmap(validity.into_boxed_slice())
+        });
+        values.push(column_values);
+    }
+    let views = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, column)| TypedImageColumnView {
+            catalog_column_ordinal: u32::try_from(ordinal)
+                .expect("catalog column count is already bounded"),
+            stable_column_id: column.id,
+            table_ref,
+            attnum: column.attnum,
+            ty: column.ty,
+            type_oid: column.type_oid,
+            type_size: column.type_size,
+            result_format: 0,
+            name: "",
+            validity: &validities[ordinal],
+            values: &values[ordinal],
+        })
+        .collect::<Vec<_>>();
+    let encoded: Arc<[u8]> = encode_typed_image(&TypedImageView {
+        role: TypedImageRole::FinalTableImage,
+        rows: u32::try_from(row_count)
+            .map_err(|_| image_error("resolved final row count exceeds u32"))?,
+        columns: &views,
+    })?
+    .into();
+    Ok((decode_typed_image(&encoded)?, encoded))
+}
+
+fn concatenate_final_image_column(
+    group: Vec<(u32, DecodedTypedImageColumn)>,
+    total_rows: u32,
+) -> Result<DecodedTypedImageColumn, EngineError> {
+    let total_rows = usize::try_from(total_rows)
+        .map_err(|_| image_error("final image row count exceeds addressability"))?;
+    let first = group
+        .first()
+        .ok_or_else(|| image_error("final image column group is empty"))?;
+    let mut validity_words = vec![0_u32; bitmap_words(total_rows)?];
+    let mut row_base = 0_usize;
+    for (rows, column) in &group {
+        let rows = usize::try_from(*rows)
+            .map_err(|_| image_error("final image row count exceeds addressability"))?;
+        if !column.validity.shape_is_exact(rows) || !column.values.rows_match(rows) {
+            return Err(image_error(
+                "final image column vector geometry differs before concatenation",
+            ));
+        }
+        for row in 0..rows {
+            if column.validity.is_valid(row) {
+                set_bit(&mut validity_words, row_base + row)?;
+            }
+        }
+        row_base = row_base
+            .checked_add(rows)
+            .ok_or_else(|| image_error("final image row offset overflows"))?;
+    }
+    if row_base != total_rows {
+        return Err(image_error(
+            "final image column rows do not exhaust the combined image",
+        ));
+    }
+    let validity = if bitmap_is_all_set(&validity_words, total_rows) {
+        TypedInsertColumnValidity::AllValid
+    } else {
+        TypedInsertColumnValidity::Bitmap(validity_words.into_boxed_slice())
+    };
+    let ty = first.1.ty;
+    let values = match ty {
+        SqlType::Int2 | SqlType::Int4 | SqlType::Date => TypedInsertColumnValues::I32(
+            group
+                .iter()
+                .flat_map(|(_, column)| match &column.values {
+                    TypedInsertColumnValues::I32(values) => values.iter().copied(),
+                    _ => [].iter().copied(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        SqlType::Int8 | SqlType::Timestamp => TypedInsertColumnValues::I64(
+            group
+                .iter()
+                .flat_map(|(_, column)| match &column.values {
+                    TypedInsertColumnValues::I64(values) => values.iter().copied(),
+                    _ => [].iter().copied(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        SqlType::Numeric { .. } => TypedInsertColumnValues::I128(
+            group
+                .iter()
+                .flat_map(|(_, column)| match &column.values {
+                    TypedInsertColumnValues::I128(values) => values.iter().copied(),
+                    _ => [].iter().copied(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        SqlType::Uuid => TypedInsertColumnValues::Bytes16(
+            group
+                .iter()
+                .flat_map(|(_, column)| match &column.values {
+                    TypedInsertColumnValues::Bytes16(values) => values.iter().copied(),
+                    _ => [].iter().copied(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        SqlType::Bool => {
+            let mut words = vec![0_u32; bitmap_words(total_rows)?];
+            let mut row_base = 0_usize;
+            for (rows, column) in &group {
+                let rows = *rows as usize;
+                let TypedInsertColumnValues::BoolBits(source) = &column.values else {
+                    return Err(image_error("final image BOOL storage arm differs"));
+                };
+                for row in 0..rows {
+                    if bit_is_set(source, row) {
+                        set_bit(&mut words, row_base + row)?;
+                    }
+                }
+                row_base += rows;
+            }
+            TypedInsertColumnValues::BoolBits(words.into_boxed_slice())
+        }
+        SqlType::Text => {
+            let mut offsets = Vec::with_capacity(total_rows + 1);
+            let mut bytes = Vec::new();
+            offsets.push(0_u64);
+            for (_, column) in &group {
+                let TypedInsertColumnValues::Text {
+                    offsets: source_offsets,
+                    bytes: source_bytes,
+                } = &column.values
+                else {
+                    return Err(image_error("final image TEXT storage arm differs"));
+                };
+                let base = u64::try_from(bytes.len())
+                    .map_err(|_| image_error("final image TEXT bytes exceed u64"))?;
+                bytes.extend_from_slice(source_bytes);
+                offsets.extend(source_offsets.iter().skip(1).map(|offset| base + *offset));
+            }
+            TypedInsertColumnValues::Text {
+                offsets: offsets.into_boxed_slice(),
+                bytes: bytes.into_boxed_slice(),
+            }
+        }
+    };
+    if !values.rows_match(total_rows) {
+        return Err(image_error(
+            "final image concatenated storage arm lost row geometry",
+        ));
+    }
+    let (_, first) = group
+        .into_iter()
+        .next()
+        .expect("validated nonempty final image column group");
+    Ok(DecodedTypedImageColumn {
+        catalog_column_ordinal: first.catalog_column_ordinal,
+        stable_column_id: first.stable_column_id,
+        table_ref: first.table_ref,
+        attnum: first.attnum,
+        ty: first.ty,
+        type_oid: first.type_oid,
+        type_size: first.type_size,
+        result_format: first.result_format,
+        name: first.name,
+        validity,
+        values,
+        // The candidate is immediately encoded and strictly decoded above; this placeholder is
+        // never exposed as a retained image owner.
+        vector_digest: [0; 32],
+    })
+}
+
+impl DecodedTypedImageColumnFacts<'_> {
+    pub(crate) fn logical_value_len_at(&self, row: usize) -> Result<usize, EngineError> {
+        self.with_logical_cell_at(row, |_is_null, value| value.len())
+    }
+
+    /// Visit one canonical logical cell without manufacturing a row matrix. Fixed-width values
+    /// use a stack-local little-endian buffer for the duration of the callback; TEXT borrows its
+    /// existing arena and NULL always visits an empty slice.
+    pub(crate) fn with_logical_cell_at<R>(
+        &self,
+        row: usize,
+        consume: impl FnOnce(bool, &[u8]) -> R,
+    ) -> Result<R, EngineError> {
+        let is_valid = self.validity.is_valid(row);
+        if !is_valid {
+            return Ok(consume(true, &[]));
+        }
+        match (self.values, self.ty) {
+            (
+                TypedInsertColumnValues::I32(values),
+                SqlType::Int2 | SqlType::Int4 | SqlType::Date,
+            ) => {
+                let value = values
+                    .get(row)
+                    .ok_or_else(|| image_error("logical i32 cell row is out of range"))?
+                    .to_le_bytes();
+                Ok(consume(false, &value))
+            }
+            (TypedInsertColumnValues::I64(values), SqlType::Int8 | SqlType::Timestamp) => {
+                let value = values
+                    .get(row)
+                    .ok_or_else(|| image_error("logical i64 cell row is out of range"))?
+                    .to_le_bytes();
+                Ok(consume(false, &value))
+            }
+            (TypedInsertColumnValues::I128(values), SqlType::Numeric { .. }) => {
+                let value = values
+                    .get(row)
+                    .ok_or_else(|| image_error("logical i128 cell row is out of range"))?
+                    .to_le_bytes();
+                Ok(consume(false, &value))
+            }
+            (TypedInsertColumnValues::Bytes16(values), SqlType::Uuid) => values
+                .get(row)
+                .map(|value| consume(false, value))
+                .ok_or_else(|| image_error("logical UUID cell row is out of range")),
+            (TypedInsertColumnValues::BoolBits(words), SqlType::Bool) => {
+                if row / 32 >= words.len() {
+                    return Err(image_error("logical BOOL cell row is out of range"));
+                }
+                let value = [u8::from(words[row / 32] & (1_u32 << (row % 32)) != 0)];
+                Ok(consume(false, &value))
+            }
+            (TypedInsertColumnValues::Text { offsets, bytes }, SqlType::Text) => {
+                let start = offsets
+                    .get(row)
+                    .and_then(|value| usize::try_from(*value).ok())
+                    .ok_or_else(|| image_error("logical TEXT start offset is invalid"))?;
+                let end = offsets
+                    .get(row + 1)
+                    .and_then(|value| usize::try_from(*value).ok())
+                    .ok_or_else(|| image_error("logical TEXT end offset is invalid"))?;
+                let value = bytes
+                    .get(start..end)
+                    .ok_or_else(|| image_error("logical TEXT cell range is invalid"))?;
+                Ok(consume(false, value))
+            }
+            _ => Err(image_error(
+                "logical cell vector does not match its SQL type",
+            )),
+        }
+    }
+}
+
+pub(crate) const fn typed_image_sql_storage(ty: SqlType) -> [u8; 4] {
+    match ty {
+        SqlType::Int2 => [1, 0, 0, 0],
+        SqlType::Int4 => [2, 0, 0, 0],
+        SqlType::Int8 => [3, 0, 0, 0],
+        SqlType::Numeric { precision, scale } => [4, precision, scale, 0],
+        SqlType::Bool => [5, 0, 0, 0],
+        SqlType::Text => [6, 0, 0, 0],
+        SqlType::Date => [7, 0, 0, 0],
+        SqlType::Timestamp => [8, 0, 0, 0],
+        SqlType::Uuid => [9, 0, 0, 0],
+    }
 }
 
 /// Borrowed typed values from the move-only image owner.  The slices cannot outlive it and no
@@ -1805,4 +2477,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, EngineError> {
 }
 pub(super) fn image_error(message: &str) -> EngineError {
     EngineError::Durability(format!("typed image/vector canonical codec: {message}"))
+}
+
+fn resident_source_error(message: &str) -> EngineError {
+    EngineError::Durability(format!("typed image resident source: {message}"))
 }

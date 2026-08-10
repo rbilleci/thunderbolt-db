@@ -73,6 +73,7 @@ pub(super) fn generation_input_digest(
         digest.update(table.row_allocator_high_water.to_le_bytes());
         digest.update(table.initial_logical_row_count.to_le_bytes());
         digest.update(table.final_logical_row_count.to_le_bytes());
+        digest.update([u8::from(table.resets_existing_rows)]);
 
         let transitions = range(
             &graph.transitions,

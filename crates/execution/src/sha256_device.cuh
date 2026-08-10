@@ -13,7 +13,11 @@ __device__ __constant__ unsigned int gpu_db_sha256_k[64] = {
     0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
     0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u};
 
-__device__ void gpu_db_sha256_bytes(
+// Keep the one byte-oriented SHA authority out of callers' enormous finalizer frames.  Its
+// fixed 64-word schedule and 64 rounds are fully unrolled here, so the device compiler can keep
+// the short commitment schedule in registers instead of repeatedly indexing a local array.  The
+// input-length loop remains dynamic for the existing variable-width typed values.
+__device__ __noinline__ void gpu_db_sha256_bytes(
     const unsigned char* input,
     unsigned long long length,
     unsigned char* output) {
@@ -24,7 +28,7 @@ __device__ void gpu_db_sha256_bytes(
   for (unsigned long long block = 0; block < blocks; ++block) {
     unsigned int w[64];
     unsigned long long base = block << 6;
-    #pragma unroll 1
+    #pragma unroll
     for (unsigned int word = 0; word < 16; ++word) {
       unsigned int value = 0;
       #pragma unroll 1
@@ -41,7 +45,7 @@ __device__ void gpu_db_sha256_bytes(
       }
       w[word] = value;
     }
-    #pragma unroll 1
+    #pragma unroll
     for (unsigned int word = 16; word < 64; ++word) {
       unsigned int x = w[word - 15], y = w[word - 2];
       unsigned int small0 = ((x >> 7) | (x << 25)) ^ ((x >> 18) | (x << 14)) ^ (x >> 3);
@@ -49,7 +53,7 @@ __device__ void gpu_db_sha256_bytes(
       w[word] = w[word - 16] + small0 + w[word - 7] + small1;
     }
     unsigned int a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
-    #pragma unroll 1
+    #pragma unroll
     for (unsigned int word = 0; word < 64; ++word) {
       unsigned int s1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
       unsigned int choice = (e & f) ^ (~e & g);

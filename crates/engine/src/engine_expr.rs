@@ -43,6 +43,8 @@ mod scalar_aggregate;
 use scalar_aggregate::execute_scalar_aggregate;
 mod device_result_select;
 use device_result_select::execute_device_result_select;
+#[cfg(test)]
+pub(crate) use device_result_select::fail_next_device_result_frame_read_for_test;
 
 mod execution_source;
 pub(crate) use execution_source::{
@@ -2286,6 +2288,8 @@ impl Engine {
                     let having_table = RelationalTable {
                         schema: table.schema.clone(),
                         name: table.name.clone(),
+                        // Aggregate HAVING rows are a transient relation, not a catalog table.
+                        stable_table_id: 0,
                         oid: table.oid,
                         columns: having_columns,
                         indexes: Vec::new(),

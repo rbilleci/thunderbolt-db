@@ -89,11 +89,77 @@ impl Engine {
         let commit = self
             .commit_state_after_wave_quiescence()
             .map_err(ExecuteError::Engine)?;
+        #[cfg(feature = "probe-timing")]
+        let probe_snapshot_capture_started = std::time::Instant::now();
         let fresh =
             self.capture_transaction_snapshot(self.committed_seq(), current.characteristics);
+        #[cfg(feature = "probe-timing")]
+        self.record_insert_probe_transaction_statement_snapshot_capture_nanos(
+            probe_snapshot_capture_started.elapsed().as_nanos() as u64,
+        );
         drop(commit);
 
-        if fresh.boundary == current.boundary {
+        self.install_refreshed_transaction_snapshot(
+            txn_id,
+            current,
+            fresh,
+            first_statement_snapshot,
+        )
+    }
+
+    /// Rebase a READ COMMITTED private overlay while its caller already owns the commit
+    /// publication boundary.  The terminal uses this after acquiring the commit lock: otherwise
+    /// an in-place device append can advance a shared count header between statement staging and
+    /// final unique validation, while the transaction still retains the preceding descriptor.
+    pub(crate) fn refresh_transaction_snapshot_at_commit_boundary(
+        &self,
+        txn_id: TxnId,
+        current: &Arc<TransactionSnapshot>,
+    ) -> Result<Arc<TransactionSnapshot>, ExecuteError> {
+        let isolation = match current.characteristics.isolation {
+            TransactionIsolation::ReadUncommitted => TransactionIsolation::ReadCommitted,
+            isolation => isolation,
+        };
+        // The caller owns the commit/publication boundary. When no commit advanced since this
+        // transaction's first statement, its fully pinned descriptor and shared count header are
+        // already one exact immutable observation; recapturing it only repeats global index and
+        // resource-map work without changing any validation input.
+        if current.data_snapshot_acquired.load(AtomicOrdering::Acquire)
+            && current.boundary == self.committed_seq()
+        {
+            #[cfg(feature = "probe-timing")]
+            self.record_insert_probe_transaction_commit_snapshot_reuse();
+            return Ok(Arc::clone(current));
+        }
+        if isolation == TransactionIsolation::RepeatableRead
+            && current.data_snapshot_acquired.load(AtomicOrdering::Acquire)
+        {
+            return Ok(Arc::clone(current));
+        }
+        #[cfg(feature = "probe-timing")]
+        let probe_snapshot_capture_started = std::time::Instant::now();
+        let fresh =
+            self.capture_transaction_snapshot(self.committed_seq(), current.characteristics);
+        #[cfg(feature = "probe-timing")]
+        self.record_insert_probe_transaction_commit_snapshot_capture_nanos(
+            probe_snapshot_capture_started.elapsed().as_nanos() as u64,
+        );
+        self.install_refreshed_transaction_snapshot(
+            txn_id,
+            current,
+            fresh,
+            !current.data_snapshot_acquired.load(AtomicOrdering::Acquire),
+        )
+    }
+
+    fn install_refreshed_transaction_snapshot(
+        &self,
+        txn_id: TxnId,
+        current: &Arc<TransactionSnapshot>,
+        fresh: Arc<TransactionSnapshot>,
+        first_statement_snapshot: bool,
+    ) -> Result<Arc<TransactionSnapshot>, ExecuteError> {
+        if fresh.boundary == current.boundary && !first_statement_snapshot {
             current
                 .data_snapshot_acquired
                 .store(true, AtomicOrdering::Release);
@@ -157,7 +223,9 @@ impl Engine {
                 .iter()
                 .filter_map(|operation| match operation {
                     TransactionOperation::Catalog(staged) => Some(staged.as_ref()),
-                    TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
+                    TransactionOperation::Row(_)
+                    | TransactionOperation::TableReset(_)
+                    | TransactionOperation::TypedInsert(_) => None,
                 })
                 .collect::<Vec<_>>();
             let has_sequence_resets = delta.operations.iter().any(|operation| {
@@ -221,7 +289,9 @@ impl Engine {
                                     .map(|target| target.oid)
                             })
                             .collect::<Vec<_>>(),
-                        TransactionOperation::Row(_) => Vec::new(),
+                        TransactionOperation::Row(_) | TransactionOperation::TypedInsert(_) => {
+                            Vec::new()
+                        }
                     })
                     .collect::<BTreeSet<_>>();
                 for sequence_oid in delta
@@ -258,6 +328,7 @@ impl Engine {
                     .into_iter()
                     .filter_map(|catalog_command| match &catalog_command.command {
                         Command::CreateTable(create) => Some(create.table.clone()),
+                        Command::AddForeignKey(_) => None,
                         Command::CreateView(_) | Command::RenameView(_) | Command::DropView(_) => {
                             None
                         }
@@ -365,10 +436,12 @@ impl Engine {
             .iter()
             .filter_map(|operation| match operation {
                 TransactionOperation::Catalog(staged) => Some(staged.as_ref().clone()),
-                TransactionOperation::Row(_) | TransactionOperation::TableReset(_) => None,
+                TransactionOperation::Row(_)
+                | TransactionOperation::TableReset(_)
+                | TransactionOperation::TypedInsert(_) => None,
             })
             .collect::<Vec<_>>();
-        for (ordinal, operation) in operations.iter().enumerate() {
+        for (ordinal, operation) in operations.iter_mut().enumerate() {
             match operation {
                 TransactionOperation::Catalog(staged) => {
                     if usize::try_from(staged.ordinal).ok() != Some(ordinal) {
@@ -452,6 +525,70 @@ impl Engine {
                     )
                     .map_err(read_committed_rebase_error)?;
                 }
+                TransactionOperation::TypedInsert(_) => {
+                    let TransactionOperation::TypedInsert(staged) = operation else {
+                        unreachable!("typed INSERT arm matches only typed INSERT operations")
+                    };
+                    for (name, expected) in &staged.catalog_dependencies {
+                        if transaction_catalog
+                            .relational_catalog
+                            .get(name)
+                            .is_none_or(|observed| {
+                                !same_transaction_row_catalog_dependency(
+                                    expected,
+                                    observed,
+                                    &BTreeMap::new(),
+                                    transaction_catalog,
+                                    &catalog_commands,
+                                )
+                            })
+                        {
+                            return Err(ExecuteError::Serialization(format!(
+                                "typed INSERT catalog dependency \"{name}\" changed after transaction statement snapshot {}",
+                                staged.read_snapshot
+                            )));
+                        }
+                    }
+                    let table = transaction_catalog
+                        .relational_catalog
+                        .get(&staged.table)
+                        .ok_or_else(|| {
+                            ExecuteError::Serialization(format!(
+                                "relation \"{}\" changed before the next READ COMMITTED statement",
+                                staged.table
+                            ))
+                        })?;
+                    let mut rebound = staged.as_ref().clone();
+                    rebound.prepared_catalog_seq = transaction_catalog.commit_seq;
+                    rebound.read_snapshot = fresh.boundary;
+                    rebound.table_schema_digest =
+                        crate::engine_transaction_reset::table_schema_digest(table)?;
+                    rebound.catalog_dependencies = rebound
+                        .catalog_dependencies
+                        .keys()
+                        .map(|name| {
+                            transaction_catalog
+                                .relational_catalog
+                                .get(name)
+                                .cloned()
+                                .map(|relation| (name.clone(), relation))
+                                .ok_or_else(|| {
+                                    ExecuteError::Serialization(format!(
+                                        "typed INSERT catalog dependency \"{name}\" left the rebase catalog"
+                                    ))
+                                })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let _scope = self.enter_transaction_read(Arc::clone(&scratch));
+                    self.append_transaction_typed_insert_shard(
+                        table,
+                        &rebound,
+                        &mut next_shards,
+                        &mut gpu_reservation,
+                    )
+                    .map_err(read_committed_rebase_error)?;
+                    *operation = TransactionOperation::TypedInsert(Arc::new(rebound));
+                }
             }
             let mut replay = scratch_delta
                 .lock()
@@ -472,6 +609,7 @@ impl Engine {
                 TransactionOperation::Catalog(_) => 0,
                 TransactionOperation::Row(delta) => delta.rows_consumed,
                 TransactionOperation::TableReset(_) => 0,
+                TransactionOperation::TypedInsert(staged) => staged.rows_consumed(),
             };
             total.checked_add(consumed).ok_or_else(|| {
                 ExecuteError::Unsupported(
@@ -531,32 +669,28 @@ fn rekey_provisional_inserts(
 ) -> Result<(), ExecuteError> {
     let mut mapping = BTreeMap::<(String, u64), u64>::new();
     let mut next = new_base;
-    for delta in operations.iter().filter_map(|operation| match operation {
-        TransactionOperation::Row(delta) => Some(delta),
-        TransactionOperation::Catalog(_) | TransactionOperation::TableReset(_) => None,
-    }) {
-        let PreparedMutation::Insert {
-            table,
-            inserted_rows,
-            ..
-        } = &delta.mutation
-        else {
-            continue;
-        };
-        let prefix = relational_key_prefix(table);
-        for (key, _) in inserted_rows {
-            let old = crate::engine_residency::parse_relational_row_id(key, &prefix).ok_or_else(
-                || {
-                    ExecuteError::Engine(EngineError::ApplyFailed(
-                        "transaction INSERT lost provisional identity during rebase".to_string(),
-                    ))
-                },
-            )?;
-            mapping.entry((table.clone(), old)).or_insert_with(|| {
-                let assigned = next;
-                next = next.saturating_add(1);
-                assigned
-            });
+    for operation in operations.iter() {
+        match operation {
+            TransactionOperation::Row(delta) => {
+                if matches!(&delta.mutation, PreparedMutation::Insert { .. }) {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resolved INSERT reached READ COMMITTED rebase after codec-5 cutover"
+                            .to_string(),
+                    )));
+                }
+            }
+            TransactionOperation::TypedInsert(staged) => {
+                for old in staged.provisional_row_ids.iter().copied() {
+                    mapping
+                        .entry((staged.table.clone(), old))
+                        .or_insert_with(|| {
+                            let assigned = next;
+                            next = next.saturating_add(1);
+                            assigned
+                        });
+                }
+            }
+            TransactionOperation::Catalog(_) | TransactionOperation::TableReset(_) => {}
         }
     }
     if next == u64::MAX && !mapping.is_empty() {
@@ -592,13 +726,21 @@ fn rekey_provisional_inserts(
         .iter_mut()
         .filter_map(|operation| match operation {
             TransactionOperation::Row(delta) => Some(Arc::make_mut(delta)),
-            TransactionOperation::Catalog(_) | TransactionOperation::TableReset(_) => None,
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::TableReset(_)
+            | TransactionOperation::TypedInsert(_) => None,
         })
     {
         let table = match &delta.mutation {
-            PreparedMutation::Insert { table, .. }
-            | PreparedMutation::Update { table, .. }
-            | PreparedMutation::Delete { table, .. } => table.clone(),
+            PreparedMutation::Insert { .. } => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resolved INSERT reached READ COMMITTED rebase after codec-5 cutover"
+                        .to_string(),
+                )));
+            }
+            PreparedMutation::Update { table, .. } | PreparedMutation::Delete { table, .. } => {
+                table.clone()
+            }
         };
         let prefix = relational_key_prefix(&table);
         let rewrite_key = |key: &mut String| {
@@ -609,10 +751,8 @@ fn rekey_provisional_inserts(
             }
         };
         match &mut delta.mutation {
-            PreparedMutation::Insert { inserted_rows, .. } => {
-                for (key, _) in inserted_rows {
-                    rewrite_key(key);
-                }
+            PreparedMutation::Insert { .. } => {
+                unreachable!("generic INSERT was rejected before the UPDATE/DELETE rebase rewrite")
             }
             PreparedMutation::Update { installs, .. } => {
                 for (tuple_id, key, _) in installs {
@@ -641,6 +781,38 @@ fn rekey_provisional_inserts(
                 rewrite_key(&mut row.row_key);
             }
         }
+    }
+    for staged in operations
+        .iter_mut()
+        .filter_map(|operation| match operation {
+            TransactionOperation::TypedInsert(staged) => Some(Arc::make_mut(staged)),
+            TransactionOperation::Catalog(_)
+            | TransactionOperation::Row(_)
+            | TransactionOperation::TableReset(_) => None,
+        })
+    {
+        let rekeyed = staged
+            .provisional_row_ids
+            .iter()
+            .map(|old| {
+                mapping
+                    .get(&(staged.table.clone(), *old))
+                    .copied()
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "typed transaction INSERT lost provisional identity during rebase"
+                                .to_string(),
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !staged.write_set.rows.is_empty() || !staged.write_set.stable_rows.is_empty() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "typed transaction INSERT retained a displaced legacy row-key write set"
+                    .to_string(),
+            )));
+        }
+        staged.provisional_row_ids = Arc::from(rekeyed);
     }
     Ok(())
 }

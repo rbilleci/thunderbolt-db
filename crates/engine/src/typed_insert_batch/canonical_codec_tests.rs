@@ -53,11 +53,7 @@ pub(super) fn prepared_batch() -> TypedInsertBatch {
         .expect("codec fixture semantic preparation succeeds")
         .expect("current catalog generation prepares");
     prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("codec fixture seals without sequence effects")
 }
 
@@ -319,11 +315,9 @@ pub(super) fn serial_batch_values(values: &[i64]) -> TypedInsertBatch {
         })
         .collect();
     prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::from_bindings(parent, bindings),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::from_bindings(
+            parent, bindings,
+        ))
         .expect("serial fixture seals")
 }
 
@@ -362,11 +356,9 @@ pub(super) fn serial_index_batch() -> TypedInsertBatch {
         })
         .collect();
     prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::from_bindings(parent, bindings),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::from_bindings(
+            parent, bindings,
+        ))
         .expect("serial/index fixture seals")
 }
 
@@ -406,11 +398,7 @@ pub(super) fn external_parent_domain_batch() -> TypedInsertBatch {
     prepare_typed_insert_semantics(&insert, &catalog, catalog.commit_seq, None)
         .expect("external domain fixture semantic preparation succeeds")
         .expect("external domain fixture prepares")
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("external domain fixture seals")
 }
 
@@ -455,11 +443,7 @@ pub(super) fn catalog_closure_batch() -> TypedInsertBatch {
         .expect("closure fixture semantic preparation succeeds")
         .expect("closure fixture prepares");
     prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("closure fixture seals")
 }
 
@@ -502,25 +486,15 @@ pub(super) fn external_shared_supporting_index_batch() -> TypedInsertBatch {
     prepare_typed_insert_semantics(&insert, &catalog, catalog.commit_seq, None)
         .expect("shared-support semantic preparation succeeds")
         .expect("shared-support fixture prepares")
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("shared-support fixture seals")
 }
 
 pub(super) fn distinct_external_supporting_indexes_batch() -> TypedInsertBatch {
     let engine = crate::Engine::new_local();
     for (txn_id, sql) in [
-        (
-            1,
-            "CREATE TABLE codec_left_parent (id int4 PRIMARY KEY)",
-        ),
-        (
-            2,
-            "CREATE TABLE codec_right_parent (id int4 PRIMARY KEY)",
-        ),
+        (1, "CREATE TABLE codec_left_parent (id int4 PRIMARY KEY)"),
+        (2, "CREATE TABLE codec_right_parent (id int4 PRIMARY KEY)"),
         (
             3,
             "CREATE TABLE codec_two_parent_child (id int4, left_id int4, right_id int4)",
@@ -552,11 +526,7 @@ pub(super) fn distinct_external_supporting_indexes_batch() -> TypedInsertBatch {
     prepare_typed_insert_semantics(&insert, &catalog, catalog.commit_seq, None)
         .expect("distinct-supporting-index semantic preparation succeeds")
         .expect("distinct-supporting-index fixture prepares")
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("distinct-supporting-index fixture seals")
 }
 
@@ -593,11 +563,7 @@ pub(super) fn self_referencing_catalog_closure_batch() -> TypedInsertBatch {
         .expect("self-referencing fixture semantic preparation succeeds")
         .expect("self-referencing fixture prepares");
     prepared
-        .seal(
-            sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(sequence_defaults::SequenceDefaultBindings::empty())
         .expect("self-referencing fixture seals")
 }
 

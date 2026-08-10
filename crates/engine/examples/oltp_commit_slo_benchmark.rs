@@ -104,7 +104,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if binary_wal {
             // W5a: covered inserts log resolved binary records (decode+install replay).
-            e.set_binary_wal_records_enabled(true);
         }
         // i64 sections are DEFAULT ON since the 2026-07-03 flip; GPU_DB_BENCH_I64SHARDS=0 is
         // the kill-switch A/B arm (=1 remains accepted, now redundant).

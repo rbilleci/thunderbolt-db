@@ -24,6 +24,22 @@ fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn assert_live_codec5_insert_record(record: &gpu_db_wal::WalRecord) {
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&record.payload)
+        .expect("canonical INSERT envelope decode")
+        .expect("live INSERT must use a canonical envelope");
+    let operation = envelope
+        .fragments
+        .iter()
+        .find(|fragment| fragment.kind == gpu_db_wal::CanonicalFragmentKind::RowMutation)
+        .expect("live INSERT envelope must contain one row-mutation fragment");
+    assert_eq!(
+        operation.body.get(8),
+        Some(&crate::typed_insert_aggregate::ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE),
+        "live INSERT must use the sole codec-5 operation authority"
+    );
+}
+
 /// Change exactly one durable manifest byte and recompute the control-file trailer. This models
 /// a syntactically intact, separately durable but wrong expected-root/cut sidecar; ordinary file
 /// checksum rejection would not exercise the sealed recovery gate.
@@ -436,20 +452,22 @@ fn sealed_nullable_int4_reopen_parks_a_real_719_then_serves_from_a_dedicated_ret
 }
 
 #[test]
-fn explicit_transaction_binary_record_is_one_atomic_recoverable_generation() {
-    let e = Engine::new_local_test_engine();
-    e.execute_text(
-        1,
-        "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
-    )
-    .unwrap();
-    e.execute_text(
-        2,
-        "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL)",
-    )
-    .unwrap();
-    let existing_row_id = e.read_state.mvcc.current_row_id() - 1;
-    let inserted_row_id = e.read_state.mvcc.current_row_id();
+fn historical_binary_transaction_record_remains_one_atomic_recoverable_generation() {
+    let source = Engine::new_local_test_engine();
+    source
+        .execute_text(
+            1,
+            "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
+        )
+        .unwrap();
+    source
+        .execute_text(
+            2,
+            "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL)",
+        )
+        .unwrap();
+    let existing_row_id = source.read_state.mvcc.current_row_id() - 1;
+    let inserted_row_id = source.read_state.mvcc.current_row_id();
     let record = BinaryTransactionRecord {
         catalog_epoch: crate::wal_binary::BinaryTransactionCatalogEpoch::Legacy,
         allocator_high_water: inserted_row_id + 1,
@@ -519,39 +537,441 @@ fn explicit_transaction_binary_record_is_one_atomic_recoverable_generation() {
             },
         ],
     };
+    // Historical binary transactions are recovery input only.  Previous generic commits framed
+    // the binary body in a canonical envelope, so retain exactly that durable form while making
+    // no live generic claim. A bare legacy record after the source's canonical prefix must stay
+    // invalid at the one-way migration boundary.
     let payload = try_encode_binary_transaction(&record).unwrap();
-    let wal_before = e.durable_wal_records().len();
-    let token = e.commit_mutation(90, Arc::from(payload)).unwrap();
-    let durable = e.durable_wal_records();
-    assert_eq!(durable.len(), wal_before + 1, "one transaction WAL record");
+    let payload = Arc::from(payload);
+    let next_commit_seq = source.committed_seq() + 1;
+    let suffix = {
+        let mut commit = source.commit_state();
+        Engine::canonical_wal_record(&mut commit, 90, next_commit_seq, 0, &payload)
+            .unwrap()
+            .into_wal_record()
+    };
+    let mut durable = source.durable_wal_records();
+    durable.push(suffix);
     assert!(matches!(
         decode_binary_record(&durable.last().unwrap().payload).unwrap(),
         BinaryWalRecord::Transaction(decoded) if decoded == record
     ));
-    assert_eq!(e.visible_up_to(), token.index, "one published commit index");
 
     let select =
         match parse_command("SELECT id, balance, marker FROM accounts ORDER BY id").unwrap() {
             Command::Select(select) => select,
             other => panic!("expected SELECT, got {other:?}"),
         };
-    let live = e.execute_relational_select(&select).unwrap();
-    assert_eq!(
-        live.rows.row(0),
-        &[SqlValue::Int4(2), SqlValue::Int4(350), SqlValue::Null]
-    );
-    assert_eq!(live.rows.len(), 1);
-
     let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
     let replayed = recovered.execute_relational_select(&select).unwrap();
     assert_eq!(
-        replayed.rows, live.rows,
-        "live apply and replay are identical"
+        replayed.rows.row(0),
+        &[SqlValue::Int4(2), SqlValue::Int4(350), SqlValue::Null]
     );
+    assert_eq!(replayed.rows.len(), 1);
     assert_eq!(
         recovered.read_state.mvcc.current_row_id(),
         record.allocator_high_water,
         "replay restores the transaction's claimed allocator high-water"
+    );
+}
+
+#[test]
+fn generic_typed_generation_roots_cover_a_to_b_to_a_and_fresh_replay() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE codec5_a (id INT4, note TEXT, active BOOL, score INT8)",
+        )
+        .unwrap();
+    let roots_after_create_a = engine.read_state.typed_generation_roots.load_full();
+    let database_root_after_create_a = roots_after_create_a
+        .database_root
+        .expect("first CREATE publishes the GPU-derived empty database root");
+    let live_catalog = engine.catalog_snapshot();
+    let live_a = live_catalog
+        .relational_catalog
+        .get("codec5_a")
+        .expect("created table is published");
+    let stable_a = live_a.stable_table_id;
+    assert_ne!(stable_a, 0);
+    assert_ne!(stable_a, u64::MAX);
+    assert_ne!(
+        stable_a,
+        u64::from(live_a.oid),
+        "stable table identity must not relabel the PostgreSQL display OID"
+    );
+    let create_a_root = roots_after_create_a
+        .table(stable_a)
+        .expect("CREATE publishes its GPU-authenticated empty table root");
+    assert_eq!(create_a_root.logical_row_count, 0);
+    assert_eq!(create_a_root.data_generation, 1);
+    assert_eq!(
+        roots_after_create_a.table_columns(stable_a).count(),
+        live_a.columns.len(),
+        "CREATE retains one ordered generic GPU column root per catalog column"
+    );
+    engine
+        .execute_text(2, "CREATE TABLE codec5_b (id INT4, note TEXT)")
+        .unwrap();
+    let live_catalog = engine.catalog_snapshot();
+    let live_b = live_catalog
+        .relational_catalog
+        .get("codec5_b")
+        .expect("second created table is published");
+    let stable_b = live_b.stable_table_id;
+    let roots_after_create_b = engine.read_state.typed_generation_roots.load_full();
+    assert_ne!(
+        roots_after_create_b.database_root,
+        Some(database_root_after_create_a),
+        "second CREATE must extend the existing database map instead of replacing it"
+    );
+    assert_eq!(roots_after_create_b.table(stable_a), Some(create_a_root));
+    assert_eq!(
+        roots_after_create_b
+            .table(stable_b)
+            .expect("second CREATE publishes B in the existing table map")
+            .logical_row_count,
+        0
+    );
+    engine
+        .execute_text(
+            3,
+            "INSERT INTO codec5_a (score, active, note, id) VALUES \
+             (9000000000, TRUE, 'alpha', 1), (NULL, FALSE, NULL, 2)",
+        )
+        .unwrap();
+
+    let first_durable = engine.durable_wal_records();
+    let envelope = gpu_db_wal::decode_canonical_record_payload(
+        &first_durable.last().expect("INSERT WAL record").payload,
+    )
+    .unwrap()
+    .expect("typed INSERT uses a canonical WAL envelope");
+    let first = envelope
+        .fragments
+        .first()
+        .expect("codec-5 aggregate has a row-mutation chunk");
+    assert_eq!(first.kind, gpu_db_wal::CanonicalFragmentKind::RowMutation);
+    assert_eq!(
+        first.body.get(..8),
+        Some(&b"GPUDBOP1"[..]),
+        "live INSERT must use the codec-5 aggregate chunk"
+    );
+    assert_eq!(
+        first.body.get(76..92),
+        Some(&b"GPUDBTXNAGG1\0\0\0\0"[..]),
+        "first codec-5 chunk must begin with the aggregate stream header"
+    );
+    assert_eq!(
+        first
+            .body
+            .get(94..96)
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap())),
+        Some(2),
+        "live typed INSERT must emit aggregate semantics version 2"
+    );
+    // A second autocommit INSERT must extend the immutable generic predecessor rather than
+    // falling back to the historical fixed path or rebuilding the first batch on the host.
+    engine
+        .execute_text(4, "INSERT INTO codec5_b (id, note) VALUES (7, 'bravo')")
+        .unwrap();
+    engine
+        .execute_text(
+            5,
+            "INSERT INTO codec5_a (id, note, active, score) VALUES (3, 'beta', TRUE, -7)",
+        )
+        .unwrap();
+
+    let durable = engine.durable_wal_records();
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    assert_eq!(
+        recovered
+            .read_state
+            .typed_generation_roots
+            .load_full()
+            .as_ref(),
+        engine
+            .read_state
+            .typed_generation_roots
+            .load_full()
+            .as_ref(),
+        "fresh replay reproduces the same CREATE and INSERT GPU root lineage"
+    );
+    let live_roots = engine.read_state.typed_generation_roots.load_full();
+    let replay_roots = recovered.read_state.typed_generation_roots.load_full();
+    for (stable_table_id, column_count, expected_rows) in [
+        (stable_a, live_a.columns.len(), 3_u64),
+        (stable_b, live_b.columns.len(), 1_u64),
+    ] {
+        assert_eq!(
+            replay_roots.table(stable_table_id),
+            live_roots.table(stable_table_id),
+            "fresh replay must retain the exact table root for {stable_table_id}"
+        );
+        assert_eq!(
+            replay_roots
+                .table_columns(stable_table_id)
+                .collect::<Vec<_>>(),
+            live_roots
+                .table_columns(stable_table_id)
+                .collect::<Vec<_>>(),
+            "fresh replay must retain the exact ordered column roots for {stable_table_id}"
+        );
+        assert_eq!(
+            live_roots
+                .table(stable_table_id)
+                .expect("live table root")
+                .logical_row_count,
+            expected_rows
+        );
+        assert_eq!(
+            live_roots.table_columns(stable_table_id).count(),
+            column_count
+        );
+    }
+    assert_eq!(replay_roots.database_root, live_roots.database_root);
+    let recovered_catalog = recovered.catalog_snapshot();
+    let recovered_table = recovered_catalog
+        .relational_catalog
+        .get("codec5_a")
+        .expect("recovery republishes the created table");
+    assert_eq!(recovered_table.stable_table_id, stable_a);
+    assert_eq!(
+        recovered_catalog.relational_next_table_id, live_catalog.relational_next_table_id,
+        "recovery must reproduce the independent stable-table allocator high-water"
+    );
+    let Command::Select(select) =
+        parse_command("SELECT id, note, active, score FROM codec5_a ORDER BY id").unwrap()
+    else {
+        unreachable!("test SELECT must parse");
+    };
+    let live = engine.execute_relational_select(&select).unwrap();
+    let replayed = recovered.execute_relational_select(&select).unwrap();
+    assert_eq!(
+        replayed.rows, live.rows,
+        "fresh replay must reproduce typed rows"
+    );
+    assert_eq!(
+        replayed.rows,
+        vec![
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("alpha".to_string()),
+                SqlValue::Bool(true),
+                SqlValue::Int8(9_000_000_000),
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Null,
+                SqlValue::Bool(false),
+                SqlValue::Null,
+            ],
+            vec![
+                SqlValue::Int4(3),
+                SqlValue::Text("beta".to_string()),
+                SqlValue::Bool(true),
+                SqlValue::Int8(-7),
+            ],
+        ]
+    );
+    let Command::Select(select_b) =
+        parse_command("SELECT id, note FROM codec5_b ORDER BY id").unwrap()
+    else {
+        unreachable!("test SELECT must parse");
+    };
+    assert_eq!(
+        recovered.execute_relational_select(&select_b).unwrap().rows,
+        vec![vec![SqlValue::Int4(7), SqlValue::Text("bravo".to_string())]]
+    );
+    assert_eq!(
+        recovered.read_state.mvcc.current_row_id(),
+        engine.read_state.mvcc.current_row_id(),
+        "fresh replay must preserve the single global MVCC allocator frontier"
+    );
+
+    let mut missing_create_b = durable.clone();
+    missing_create_b.remove(1);
+    assert!(
+        Engine::recover_from_durable_wal(&missing_create_b).is_err(),
+        "replay must reject an INSERT whose required CREATE was removed"
+    );
+    let mut reordered_creates = durable;
+    reordered_creates.swap(0, 1);
+    assert!(
+        Engine::recover_from_durable_wal(&reordered_creates).is_err(),
+        "replay must reject reordered CREATE records rather than relinking a different root map"
+    );
+}
+
+#[test]
+fn generic_typed_index_root_enrollment_insert_and_fresh_replay_share_one_lineage() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            910_001,
+            "CREATE TABLE codec5_indexed (tenant_id INT4, status INT4)",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            910_002,
+            "CREATE INDEX codec5_indexed_by_status ON codec5_indexed (tenant_id, status)",
+        )
+        .unwrap();
+
+    let catalog = engine.catalog_snapshot();
+    let table = catalog
+        .relational_catalog
+        .get("codec5_indexed")
+        .expect("CREATE TABLE is published");
+    let stable_table_id = table.stable_table_id;
+    let stable_index_id = u64::from(table.indexes[0].oid);
+    let enrolled_roots = engine.read_state.typed_generation_roots.load_full();
+    let enrolled_table = enrolled_roots
+        .table(stable_table_id)
+        .expect("CREATE INDEX retains its GPU-authenticated owner table successor");
+    let enrolled_index = enrolled_roots
+        .table_index_root(stable_table_id, stable_index_id)
+        .expect("CREATE INDEX enrolls one GPU-authenticated named-index root");
+    assert_eq!(enrolled_table.data_generation, 2);
+    assert_eq!(enrolled_table.logical_row_count, 0);
+    assert_eq!(enrolled_index.index_generation, 2);
+    assert_ne!(enrolled_index.index_root, [0; 32]);
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        engine.relational_named_index_covered_rows("codec5_indexed"),
+        Some(0),
+        "ordinary CREATE INDEX repair publishes the matching empty physical generation"
+    );
+
+    engine
+        .execute_text(910_003, "INSERT INTO codec5_indexed VALUES (7, 11)")
+        .unwrap();
+    let live_roots = engine.read_state.typed_generation_roots.load_full();
+    let live_index = live_roots
+        .table_index_root(stable_table_id, stable_index_id)
+        .expect("indexed INSERT publishes its exact GPU index successor");
+    assert_eq!(live_index.index_generation, 3);
+    assert_ne!(live_index.index_root, enrolled_index.index_root);
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        engine.relational_named_index_covered_rows("codec5_indexed"),
+        Some(1),
+        "the indexed physical plan covers the committed row"
+    );
+
+    let durable = engine.durable_wal_records();
+    let envelope = gpu_db_wal::decode_canonical_record_payload(
+        &durable.last().expect("indexed INSERT WAL record").payload,
+    )
+    .unwrap()
+    .expect("indexed INSERT uses one canonical envelope");
+    assert_eq!(
+        envelope.fragments[0].body.get(8),
+        Some(&crate::typed_insert_aggregate::ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE,),
+        "indexed INSERT remains on the sole codec-5 authority"
+    );
+
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    let replay_roots = recovered.read_state.typed_generation_roots.load_full();
+    assert_eq!(
+        replay_roots.as_ref(),
+        live_roots.as_ref(),
+        "fresh replay reproduces CREATE INDEX enrollment and indexed INSERT roots exactly"
+    );
+    #[cfg(feature = "probe-timing")]
+    assert_eq!(
+        recovered.relational_named_index_covered_rows("codec5_indexed"),
+        Some(1),
+        "fresh replay republishes the same named-index physical coverage"
+    );
+    let Command::Select(select) =
+        parse_command("SELECT tenant_id, status FROM codec5_indexed ORDER BY status").unwrap()
+    else {
+        unreachable!("test SELECT must parse");
+    };
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(7), SqlValue::Int4(11)]]
+    );
+}
+
+#[test]
+fn generic_typed_unique_index_insert_and_fresh_replay_share_codec5_lineage() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(911_001, "CREATE TABLE codec5_unique (id INT4, status INT4)")
+        .unwrap();
+    engine
+        .execute_text(
+            911_002,
+            "CREATE UNIQUE INDEX codec5_unique_by_id ON codec5_unique (id)",
+        )
+        .unwrap();
+
+    let catalog = engine.catalog_snapshot();
+    let table = catalog
+        .relational_catalog
+        .get("codec5_unique")
+        .expect("CREATE TABLE is published");
+    let stable_table_id = table.stable_table_id;
+    let stable_index_id = u64::from(table.indexes[0].oid);
+    let enrolled_roots = engine.read_state.typed_generation_roots.load_full();
+    let enrolled_index = enrolled_roots
+        .table_index_root(stable_table_id, stable_index_id)
+        .expect("CREATE UNIQUE INDEX enrolls one GPU-authenticated index root");
+
+    engine
+        .execute_text(911_003, "INSERT INTO codec5_unique VALUES (7, 11)")
+        .unwrap();
+    let live_roots = engine.read_state.typed_generation_roots.load_full();
+    let live_index = live_roots
+        .table_index_root(stable_table_id, stable_index_id)
+        .expect("unique INSERT publishes its exact GPU index successor");
+    assert_ne!(live_index.index_root, enrolled_index.index_root);
+
+    let durable = engine.durable_wal_records();
+    let envelope = gpu_db_wal::decode_canonical_record_payload(
+        &durable.last().expect("unique INSERT WAL record").payload,
+    )
+    .unwrap()
+    .expect("unique INSERT uses one canonical envelope");
+    let row_mutation = envelope
+        .fragments
+        .iter()
+        .find(|fragment| fragment.kind == gpu_db_wal::CanonicalFragmentKind::RowMutation)
+        .expect("unique INSERT has one durable row-mutation fragment");
+    assert_eq!(
+        row_mutation.body.get(8),
+        Some(&crate::typed_insert_aggregate::ENGINE_OPERATION_CODEC_TYPED_INSERT_AGGREGATE,),
+        "a successful UNIQUE/PRIMARY KEY INSERT must not select the resolved legacy row carrier"
+    );
+    assert_eq!(
+        row_mutation.body.get(76..92),
+        Some(&b"GPUDBTXNAGG1\0\0\0\0"[..]),
+        "a successful UNIQUE/PRIMARY KEY INSERT must use the semantics-v2 aggregate stream"
+    );
+
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    assert_eq!(
+        recovered
+            .read_state
+            .typed_generation_roots
+            .load_full()
+            .as_ref(),
+        live_roots.as_ref(),
+        "fresh replay reproduces the unique-index successor exactly"
+    );
+    let duplicate = recovered
+        .execute_text(911_004, "INSERT INTO codec5_unique VALUES (7, 99)")
+        .expect_err("recovered unique index must reject a duplicate key");
+    assert!(
+        duplicate
+            .to_string()
+            .contains("duplicate key value violates unique index"),
+        "{duplicate}"
     );
 }
 
@@ -2705,107 +3125,112 @@ fn w1b_auto_open_repairs_a_second_rotation_crash_window() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// W5a — binary WAL records: a covered (elided, constraint-free) concurrent INSERT logs the
-/// RESOLVED binary record; restart replay decodes+installs it with the ORIGINAL row ids, and the
-/// recovered state is identical to what SQL-text replay produces.
+/// WRITE-001 — covered concurrent INSERTs retain their original row identities through codec-5
+/// fresh replay without rendering SQL or selecting the historical binary INSERT decoder.
 #[test]
-fn w5a_binary_wal_records_replay_identically_to_text() {
-    let run = |binary: bool, tag: &str| -> Vec<Vec<SqlValue>> {
-        let path = test_wal_path(&format!("w5a-replay-{tag}"));
-        {
-            let e = Engine::with_durable_wal_segment(&path);
-            // This fixture manually forces the pre-admission elided state to exercise WAL
-            // encoding. Keep S-F out of that setup; otherwise CREATE auto-admits an empty device
-            // generation before the synthetic `set_table_device_authoritative` transition.
-            e.set_auto_admit_on_commit(false);
-            e.set_binary_wal_records_enabled(binary);
-            e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
-            // Force the covered class deterministically (no GPU needed for the WAL semantics
-            // under test): an elided table's prepare skips the value-index, which is exactly
-            // reresolve_reuse_eligible / the binary-record condition.
-            e.set_table_device_authoritative("t", true);
-            for i in 0..6 {
-                e.execute_dml_concurrent(
-                    2 + i,
-                    &format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10),
-                )
-                .unwrap();
-            }
+fn codec5_wal_records_replay_with_original_row_ids() {
+    let path = test_wal_path("w5a-replay-binary");
+    {
+        let e = Engine::with_durable_wal_segment(&path);
+        // This fixture manually forces the pre-admission elided state to exercise WAL
+        // encoding. Keep S-F out of that setup; otherwise CREATE auto-admits an empty device
+        // generation before the synthetic `set_table_device_authoritative` transition.
+        e.set_auto_admit_on_commit(false);
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        // Force the covered class deterministically (no GPU needed for the WAL semantics under
+        // test). It exercises the typed covered route; separate coverage below proves generic
+        // indexed INSERTs use the same binary row-operation representation.
+        e.set_table_device_authoritative("t", true);
+        for i in 0..6 {
+            e.execute_dml_concurrent(
+                2 + i,
+                &format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
         }
-        let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
-        let Command::Select(select) = parse_command("SELECT id, v FROM t ORDER BY id").unwrap()
-        else {
-            unreachable!()
-        };
-        let rows: Vec<Vec<SqlValue>> = recovered
-            .execute_relational_select(&select)
-            .unwrap()
-            .rows
-            .into_boxed();
-        let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
-        let _ = std::fs::remove_file(&path);
-        rows
+        assert_live_codec5_insert_record(e.durable_wal_records().last().unwrap());
+    }
+    let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    let Command::Select(select) = parse_command("SELECT id, v FROM t ORDER BY id").unwrap() else {
+        unreachable!()
     };
-    let text_rows = run(false, "text");
-    let binary_rows = run(true, "binary");
-    assert_eq!(text_rows.len(), 6);
+    let rows: Vec<Vec<SqlValue>> = recovered
+        .execute_relational_select(&select)
+        .unwrap()
+        .rows
+        .into_boxed();
+    assert_eq!(rows.len(), 6);
     assert_eq!(
-        text_rows, binary_rows,
-        "binary replay must produce byte-identical state to text replay"
+        rows,
+        (0..6)
+            .map(|i| vec![SqlValue::Int4(i), SqlValue::Int4(i * 10)])
+            .collect::<Vec<_>>()
     );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
 }
 
-/// W5a — binary records survive a checkpoint rotation and interleave with an explicit-OFF text
-/// concurrent INSERT across replay; the row-id allocator stays in lock-step.
+/// WRITE-001 — indexed INSERT uses the same codec-5 authority and fresh-reopen lifecycle.
 #[test]
-fn w5a_explicit_off_text_records_interleave_with_binary_and_survive_rotation() {
-    let path = test_wal_path("w5a-rotation-mix");
+fn indexed_generic_insert_uses_codec5_wal_and_reopens() {
+    let path = test_wal_path("write001-indexed-generic-codec5");
+    {
+        let e = Engine::with_durable_wal_segment(&path);
+        e.set_auto_admit_on_commit(false);
+        e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
+            .unwrap();
+        e.execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (7, NULL), (8, 80)")
+            .unwrap();
+
+        assert_live_codec5_insert_record(e.durable_wal_records().last().unwrap());
+    }
+
+    let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    let Command::Select(select) = parse_command("SELECT id, v FROM t ORDER BY id").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        vec![
+            vec![SqlValue::Int4(7), SqlValue::Null],
+            vec![SqlValue::Int4(8), SqlValue::Int4(80)],
+        ]
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// WRITE-001 — codec-5 records survive checkpoint rotation with the allocator in lock-step.
+#[test]
+fn codec5_records_survive_rotation() {
+    let path = test_wal_path("write001-codec5-rotation-mix");
     let control = gpu_db_wal::wal_checkpoint_control_path(&path);
     let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
     {
         let e = Engine::with_durable_wal_segment(&path);
-        assert!(
-            e.binary_wal_records_enabled(),
-            "durable construction must inherit the product binary-WAL default"
-        );
         e.set_auto_admit_on_commit(false);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         e.set_table_device_authoritative("t", true);
-        // Explicit OFF preserves the text concurrent route even though constructors now default
-        // to resolved binary WAL. This text record and the following binary records must replay
-        // together across the checkpoint boundary.
-        e.set_binary_wal_records_enabled(false);
         e.execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (100, 1)")
             .unwrap();
-        let before_binary = e.durable_wal_records();
-        assert!(
-            crate::wal_binary::decode_binary_record(&before_binary[1].payload).is_err(),
-            "explicit OFF must preserve the text operation"
-        );
-        e.set_binary_wal_records_enabled(true);
+        let before_rotation = e.durable_wal_records();
+        assert_live_codec5_insert_record(before_rotation.last().unwrap());
         for i in 0..4 {
             e.execute_dml_concurrent(3 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 2)"))
                 .unwrap();
         }
-        let with_binary = e.durable_wal_records();
-        assert!(
-            crate::wal_binary::decode_binary_record(&with_binary[2].payload).is_ok(),
-            "re-enabling the product route must emit resolved binary WAL"
-        );
-        // Rotate: the binary records move into the checkpoint segment.
+        let before_checkpoint = e.durable_wal_records();
+        assert_live_codec5_insert_record(before_checkpoint.last().unwrap());
+        // Rotate: codec-5 records move into the checkpoint segment.
         e.checkpoint_and_truncate_durable_wal_if_larger_than(&control, &checkpoint, 1)
             .unwrap();
-        // More binary records into the fresh live suffix.
+        // More codec-5 records enter the fresh live suffix.
         for i in 4..7 {
             e.execute_dml_concurrent(3 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 3)"))
                 .unwrap();
         }
     }
     let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
-    assert!(
-        recovered.binary_wal_records_enabled(),
-        "reopen must reconstruct the product binary-WAL construction policy"
-    );
     let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
         unreachable!()
     };
@@ -2813,7 +3238,7 @@ fn w5a_explicit_off_text_records_interleave_with_binary_and_survive_rotation() {
     assert_eq!(
         rows,
         vec![vec![SqlValue::Int8(8)]],
-        "one explicit-OFF text record plus seven binary records must replay once through rotation"
+        "eight canonical codec-5 records must replay once through rotation"
     );
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&checkpoint));
@@ -2840,9 +3265,11 @@ fn legacy_lane_suffix_cannot_repeat_a_serial_transaction_identity() {
     {
         let set = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, 1 << 20).expect("create lanes");
         let values = vec![SqlValue::Int4(2), SqlValue::Int4(20)];
-        let payload =
-            crate::wal_binary::try_encode_binary_insert("t", &[(row_id, values.as_slice())])
-                .expect("binary encode");
+        let payload = crate::wal_binary::encode_historical_binary_insert_fixture(
+            "t",
+            &[(row_id, values.as_slice())],
+        )
+        .expect("binary encode");
         // Transaction 2 already owns the serial INSERT. A separately replayed historical lane
         // chunk must not apply another mutation and overwrite that terminal identity.
         let duplicate = canonical_test_lane_record(&path, 1, 0, 2, payload);
@@ -2940,7 +3367,7 @@ fn legacy_lanes_reopen_replays_merge_and_is_read_only_until_migration() {
             .enumerate()
         {
             let values = vec![SqlValue::Int4(*id), SqlValue::Int4(*v)];
-            let payload = crate::wal_binary::try_encode_binary_insert(
+            let payload = crate::wal_binary::encode_historical_binary_insert_fixture(
                 "t",
                 &[(row_base + seq as u64, values.as_slice())],
             )
@@ -3042,7 +3469,7 @@ fn lanes_reopen_discards_unacked_orphans_above_the_cut() {
         let set = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, 1 << 20).expect("create lanes");
         let make_record = |seq: u64| {
             let values = vec![SqlValue::Int4(1000 + seq as i32), SqlValue::Int4(0)];
-            let payload = crate::wal_binary::try_encode_binary_insert(
+            let payload = crate::wal_binary::encode_historical_binary_insert_fixture(
                 "t",
                 &[(row_base + seq, values.as_slice())],
             )
@@ -3054,7 +3481,7 @@ fn lanes_reopen_discards_unacked_orphans_above_the_cut() {
         }
         for seq in 5..8u64 {
             let values = vec![SqlValue::Int4(1000 + seq as i32), SqlValue::Int4(0)];
-            let payload = crate::wal_binary::try_encode_binary_insert(
+            let payload = crate::wal_binary::encode_historical_binary_insert_fixture(
                 "t",
                 &[(row_base + seq, values.as_slice())],
             )
@@ -3184,7 +3611,7 @@ fn historical_lanes_checkpoint_and_suffix_are_replay_only() {
     let tiny = 16 << 10;
     let make_record = |seq: u64, id: i32| {
         let values = vec![SqlValue::Int4(id), SqlValue::Int4(0)];
-        let payload = crate::wal_binary::try_encode_binary_insert(
+        let payload = crate::wal_binary::encode_historical_binary_insert_fixture(
             "t",
             &[(row_base + seq, values.as_slice())],
         )

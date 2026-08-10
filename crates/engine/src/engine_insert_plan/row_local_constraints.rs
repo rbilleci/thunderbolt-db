@@ -4,21 +4,27 @@
 //! device operator input.  This module deliberately contains no append, allocator, WAL, or
 //! publication operation.
 
-use super::{CatalogSnapshot, Engine, EngineError, Index};
+#[cfg(test)]
+use super::{CatalogSnapshot, Index};
+use super::{Engine, EngineError};
 use crate::relational_model::RelationalTable;
 use crate::typed_insert_batch::TypedInsertBatch;
 use crate::typed_insert_batch::TypedInsertConstraintDeviceSource;
-use crate::{CheckOperandIdentityVersion, ExecuteError, SelectFilterOp, SqlType, SqlValue};
+#[cfg(test)]
+use crate::{CheckOperandIdentityVersion, SelectFilterOp, SqlType};
+use crate::{ExecuteError, SqlValue};
 
 /// A move-only catalog witness.  The fields remain private so only a successful device verdict
 /// can create a checked proof and only this module can compare it at the commit gate.
-pub(super) struct RowLocalConstraintProof {
+#[cfg(test)]
+pub(super) struct TestRowLocalConstraintWitness {
     table_oid: u32,
     schema_digest: gpu_db_wal::CanonicalDigest,
     catalog_seq: Index,
     checks: Box<[RowLocalCheckBinding]>,
 }
 
+#[cfg(test)]
 struct RowLocalCheckBinding {
     name: String,
     column_id: u32,
@@ -28,17 +34,8 @@ struct RowLocalCheckBinding {
     identity_version: CheckOperandIdentityVersion,
 }
 
-impl RowLocalConstraintProof {
-    pub(super) fn vacuous(batch: &TypedInsertBatch) -> Self {
-        let (table_oid, schema_digest, catalog_seq) = batch.row_local_constraint_target();
-        Self {
-            table_oid,
-            schema_digest,
-            catalog_seq,
-            checks: Box::default(),
-        }
-    }
-
+#[cfg(test)]
+impl TestRowLocalConstraintWitness {
     pub(super) fn checked(
         batch: &TypedInsertBatch,
         table: &RelationalTable,
@@ -132,12 +129,6 @@ pub(super) struct CompiledRowLocalChecks {
 pub(super) struct RowLocalCheckCandidate {
     pub(super) row: u32,
     pub(super) check_ordinal: usize,
-}
-
-/// Static eligibility remains deliberately narrow. Indexes and foreign keys need their own
-/// global proofs; CHECK eligibility is exactly the catalog-resolved device violation compiler.
-pub(crate) fn table_has_supported_row_local_checks(table: &RelationalTable) -> bool {
-    table.indexes.is_empty() && table.foreign_keys.is_empty() && checks_are_device_supported(table)
 }
 
 /// Device CHECK eligibility without global-index or foreign-key policy.  The production builder
@@ -299,18 +290,6 @@ pub(super) fn evaluate(
     Ok(violations.into())
 }
 
-pub(super) fn seal_after_success(
-    batch: &TypedInsertBatch,
-    table: &RelationalTable,
-    _compiled: &CompiledRowLocalChecks,
-) -> Result<RowLocalConstraintProof, EngineError> {
-    if table.check_constraints.is_empty() {
-        Ok(RowLocalConstraintProof::vacuous(batch))
-    } else {
-        RowLocalConstraintProof::checked(batch, table)
-    }
-}
-
 fn pooled_bucket(bytes: usize) -> Result<u64, EngineError> {
     bytes
         .max(256)
@@ -345,7 +324,7 @@ mod tests {
         let catalog = engine.catalog_snapshot();
         let command =
             gpu_db_sql::parse_command("INSERT INTO checked_identity VALUES (1, 9)").unwrap();
-        let batch = crate::typed_insert_batch::try_prepare_typed_insert_batch(
+        let batch = crate::typed_insert_batch::seal_typed_insert_batch_for_test(
             &command,
             &catalog,
             catalog.commit_seq,
@@ -355,7 +334,7 @@ mod tests {
         .expect("CHECK-only typed batch stays eligible before device proof");
         let build_proof = |catalog: &CatalogSnapshot| {
             let table = catalog.relational_catalog.get("checked_identity").unwrap();
-            RowLocalConstraintProof::checked(&batch, table).unwrap()
+            TestRowLocalConstraintWitness::checked(&batch, table).unwrap()
         };
         assert!(build_proof(&catalog).matches_current_catalog(&catalog));
 
@@ -405,8 +384,8 @@ mod tests {
         assert!(source.contains("mask.first_true_row()"));
         assert!(source.contains("RowLocalCheckCandidate"));
         assert!(source.contains("pub(super) fn evaluate"));
-        assert!(source.contains("pub(super) fn seal_after_success"));
-        assert!(source.contains("RowLocalConstraintProof"));
+        assert!(!source.contains("seal_after_success"));
+        assert!(!source.contains("RowLocalConstraintProof"));
     }
 
     #[test]
@@ -459,11 +438,7 @@ mod tests {
         #[cfg(feature = "probe-timing")]
         {
             let probe = engine.insert_probe_snapshot().delta_since(before);
-            assert_eq!(probe.direct_fixed_insert_carriers, 3);
-            assert_eq!(probe.fixed_insert_typed_commits, 3);
-            assert_eq!(probe.legacy_insert_delta_builds, 0);
-            assert_eq!(probe.predicted_row_keys_materialized, 0);
-            assert_eq!(probe.fixed_insert_legacy_fallbacks, 0);
+            assert_eq!(probe.successful_insert_statements, 3);
             assert_eq!(probe.row_local_check_launches, 24);
             assert_eq!(probe.row_local_check_verdicts, 24);
         }
@@ -646,7 +621,6 @@ mod tests {
     #[test]
     fn tight_pre_wal_budget_refuses_before_device_source_wal_or_row_id() {
         let mut engine = crate::Engine::new_local_test_engine();
-        engine.set_binary_wal_records_enabled(true);
         engine
             .execute_text(
                 1,

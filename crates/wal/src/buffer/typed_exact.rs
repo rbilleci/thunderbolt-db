@@ -14,6 +14,10 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(super) struct ExactTypedWireRecord {
     record_index: usize,
+    /// Arc-identical handle to the logical record payload. The exact constructor performed the
+    /// byte-level serialized/payload binding check; lifecycle transitions retain that proof by
+    /// identity instead of repeatedly scanning the payload.
+    packed_payload: Arc<[u8]>,
     serialized_record: Arc<[u8]>,
     state: ExactTypedWireState,
     /// This scalar owner was reserved before proposal.  It moves into the scatter group with the
@@ -32,11 +36,13 @@ enum ExactTypedWireState {
 impl ExactTypedWireRecord {
     fn tentative(
         record_index: usize,
+        packed_payload: Arc<[u8]>,
         serialized_record: Arc<[u8]>,
         pending_group_credit: TypedExactPendingCredit,
     ) -> Self {
         Self {
             record_index,
+            packed_payload,
             serialized_record,
             state: ExactTypedWireState::Tentative,
             pending_group_credit,
@@ -163,10 +169,7 @@ impl WalBuffer {
                 )
             })?;
         if exact.serialized_record().len() != expected_serialized_len
-            || exact
-                .serialized_record()
-                .get(crate::WAL_RECORD_HEADER_LEN..)
-                != Some(payload.as_ref())
+            || !Arc::ptr_eq(exact.packed_payload(), payload)
             || exact.header().stable_transaction_id != prepared.as_wal_record().txn_id
         {
             return Err(EngineError::Durability(
@@ -255,10 +258,7 @@ impl WalBuffer {
             )
         })?;
         if exact.serialized_record().len() != reservation.expected_serialized_len
-            || exact
-                .serialized_record()
-                .get(crate::WAL_RECORD_HEADER_LEN..)
-                != Some(record.payload.as_ref())
+            || !Arc::ptr_eq(exact.packed_payload(), &record.payload)
             || exact.header().stable_transaction_id != record.txn_id
             || reservation
                 .rollback_authority
@@ -283,6 +283,7 @@ impl WalBuffer {
         self.exact_typed_wire_records
             .push(ExactTypedWireRecord::tentative(
                 self.records.len() - 1,
+                Arc::clone(exact.packed_payload()),
                 Arc::clone(exact.serialized_record()),
                 pending_group_credit,
             ));
@@ -363,8 +364,8 @@ impl WalBuffer {
         if wire.record_index != position
             || !wire.is_tentative()
             || wire.serialized_record.len() != reservation.expected_serialized_len
-            || wire.serialized_record.get(crate::WAL_RECORD_HEADER_LEN..)
-                != Some(record.payload.as_ref())
+            || !Arc::ptr_eq(&wire.packed_payload, &record.payload)
+            || !Arc::ptr_eq(&wire.packed_payload, rollback_authority.packed_payload())
             || !Arc::ptr_eq(
                 &wire.serialized_record,
                 rollback_authority.serialized_record(),
@@ -386,6 +387,10 @@ impl WalBuffer {
         debug_assert!(Arc::ptr_eq(
             &wire.serialized_record,
             authority.serialized_record()
+        ));
+        debug_assert!(Arc::ptr_eq(
+            &wire.packed_payload,
+            authority.packed_payload()
         ));
         reservation.pending_group_credit = Some(wire.into_pending_group_credit());
         #[cfg(unix)]
@@ -476,8 +481,7 @@ impl WalBuffer {
         {
             Ok(wire_index) if self.exact_typed_wire_records[wire_index].is_claimed_pending() => {
                 let wire = &self.exact_typed_wire_records[wire_index];
-                let bytes = &wire.serialized_record;
-                if bytes.get(crate::WAL_RECORD_HEADER_LEN..) != Some(record.payload.as_ref()) {
+                if !Arc::ptr_eq(&wire.packed_payload, &record.payload) {
                     return Err(EngineError::Durability(
                         "typed exact WAL wire authority diverged from its packed record"
                             .to_string(),
@@ -645,11 +649,7 @@ impl WalBuffer {
         self.exact_typed_wire_records
             .binary_search_by_key(&position, |wire| wire.record_index)
             .ok()
-            .and_then(|_| {
-                self.records
-                    .get(position)
-                    .map(|record| record.payload.as_ptr())
-            })
+            .map(|index| self.exact_typed_wire_records[index].packed_payload.as_ptr())
     }
 
     #[cfg(test)]

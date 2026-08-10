@@ -1763,6 +1763,20 @@ fn normalize_select_relation_identifier(input: &str) -> Result<(String, bool), P
 
 fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
     let mut parts = Vec::new();
+    for_each_csv_part(input, |part| {
+        parts.push(part);
+        Ok(())
+    })?;
+    Ok(parts)
+}
+
+/// Scan the same CSV grammar used by [`split_csv`] without requiring the caller to materialize
+/// an intermediate vector. INSERT's VALUES parser uses this to construct its retained row AST
+/// directly; DDL/SELECT compatibility callers retain the existing vector facade.
+pub(crate) fn for_each_csv_part<'input>(
+    input: &'input str,
+    mut visit: impl FnMut(&'input str) -> Result<(), ParseError>,
+) -> Result<(), ParseError> {
     let mut start = 0;
     let mut depth = 0usize;
     let mut in_single_quote = false;
@@ -1796,7 +1810,7 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
                 if part.is_empty() {
                     return Err(ParseError::InvalidRelationalSql);
                 }
-                parts.push(part);
+                visit(part)?;
                 start = idx + 1;
             }
             _ => {}
@@ -1810,8 +1824,7 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
     if part.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
-    parts.push(part);
-    Ok(parts)
+    visit(part)
 }
 
 fn find_matching_paren(input: &str, open: usize) -> Option<usize> {
@@ -1873,8 +1886,6 @@ fn find_char_outside_quotes(input: &str, needle: char) -> Option<usize> {
 }
 
 fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
-    let lower = input.to_ascii_lowercase();
-    let keyword = keyword.to_ascii_lowercase();
     let bytes = input.as_bytes();
     let mut in_quote = false;
     let mut depth = 0usize;
@@ -1904,7 +1915,9 @@ fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
         }
         if !in_quote
             && depth == 0
-            && lower[idx..].starts_with(&keyword)
+            && bytes
+                .get(idx..idx + keyword.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword.as_bytes()))
             && is_keyword_boundary(input, idx, keyword.len())
         {
             return Some(idx);

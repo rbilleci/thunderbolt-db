@@ -1063,6 +1063,8 @@ fn statement_resolution(dependency_use_count: u32) -> RetainedStatementResolutio
 fn retained_table(stable_table_id: u64, display_oid: u32) -> RetainedTable {
     RetainedTable {
         table_ref: 0,
+        resets_existing_rows: false,
+        initial_table_absent: false,
         stable_table_id,
         display_oid,
         target_dependency_ref: ABSENT,
@@ -1227,11 +1229,7 @@ fn sealed_record(
     .expect("fixture semantic preparation succeeds")
     .expect("fixture target is current");
     let batch = prepared
-        .seal(
-            crate::typed_insert_batch::sequence_defaults::SequenceDefaultBindings::empty(),
-            false,
-            false,
-        )
+        .seal(crate::typed_insert_batch::sequence_defaults::SequenceDefaultBindings::empty())
         .expect("fixture batch seals");
     let bytes = crate::typed_insert_batch::encode_canonical_typed_insert_record_for_test(&batch)
         .expect("fixture S2 encodes");
@@ -1328,6 +1326,8 @@ fn graph_with_not_null_record() -> ReservedSemanticsV2Graph {
         outcomes: Vec::new(),
         tables: vec![RetainedTable {
             table_ref: 0,
+            resets_existing_rows: false,
+            initial_table_absent: false,
             stable_table_id: TEST_TABLE_ID,
             display_oid: TEST_TABLE_OID,
             target_dependency_ref: ABSENT,

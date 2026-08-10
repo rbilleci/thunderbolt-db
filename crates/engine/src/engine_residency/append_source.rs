@@ -198,6 +198,13 @@ impl ResidentAppendSource<'_, '_> {
         }
     }
 
+    pub(super) fn resets_existing_rows(&self) -> bool {
+        match self {
+            Self::Rows(_) => false,
+            Self::DevicePlan(plan) => plan.resets_existing_rows(),
+        }
+    }
+
     /// Recheck a sealed source at the publisher boundary: DDL may commit after its adapter check.
     pub(super) fn matches_current_catalog(
         &self,

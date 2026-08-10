@@ -1908,6 +1908,27 @@ mod reservation_tests {
     }
 
     #[test]
+    fn typed_exact_reservation_rejects_equal_bytes_from_a_distinct_payload_owner() {
+        let prepared = prepared_record(1);
+        let (mut record, tail, exact) = prepared.into_parts();
+        let original = Arc::clone(&record.payload);
+        record.payload = Arc::from(record.payload.as_ref());
+        assert_eq!(record.payload.as_ref(), original.as_ref());
+        assert!(!Arc::ptr_eq(&record.payload, &original));
+
+        let mut wal = WalBuffer::new();
+        let error = match wal
+            .reserve_typed_exact_append(PreparedCanonicalWalRecord::from_parts(record, tail, exact))
+        {
+            Ok(_) => panic!("equal bytes from a different owner must not inherit exact authority"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("canonical record binding diverged"));
+    }
+
+    #[test]
     fn typed_exact_reservation_rejects_state_owner_and_generic_append_bypass() {
         let mut wal = WalBuffer::new();
         let mut reservation = wal

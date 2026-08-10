@@ -119,10 +119,6 @@ pub(crate) struct BoundInsertReturning {
 }
 
 impl BoundInsertReturning {
-    pub(super) fn is_empty(&self) -> bool {
-        self.columns.is_empty()
-    }
-
     #[allow(dead_code)] // Adopted by the next production-compiled effect-plan handoff.
     pub(super) const fn effect_shape(&self) -> InsertReturningEffectShape {
         InsertReturningEffectShape {

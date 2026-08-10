@@ -13,7 +13,6 @@ enum ConstraintPhase {
     PrimaryKeyNull = 0,
     Check = 1,
     Duplicate = 2,
-    ForeignKey = 3,
 }
 
 /// Stable order within one SQL constraint class.
@@ -23,7 +22,6 @@ enum ConstraintOrdinal {
     Attnum(i16),
     Check(String, usize),
     Index(usize),
-    ForeignKey(usize),
 }
 
 /// The established diagnostic emitted for a chosen candidate.
@@ -32,7 +30,6 @@ enum ConstraintDiagnostic {
     NotNull { table: String, column: String },
     Check { table: String, name: String },
     Unique { name: String },
-    ForeignKey { table: String, name: String },
 }
 
 /// A bounded terminal from a device operation. Candidate order is exactly `(row, phase,
@@ -82,15 +79,6 @@ impl ConstraintCandidate {
         }
     }
 
-    pub(super) fn foreign_key(row: u32, raw_ordinal: usize, table: String, name: String) -> Self {
-        Self {
-            row,
-            phase: ConstraintPhase::ForeignKey,
-            ordinal: ConstraintOrdinal::ForeignKey(raw_ordinal),
-            diagnostic: ConstraintDiagnostic::ForeignKey { table, name },
-        }
-    }
-
     #[allow(dead_code)] // current-generation reservation diagnostic ordering
     pub(super) fn choose(left: Option<Self>, right: Option<Self>) -> Option<Self> {
         match (left, right) {
@@ -112,11 +100,6 @@ impl ConstraintCandidate {
             ConstraintDiagnostic::Unique { name } => EngineError::UniqueViolation(format!(
                 "duplicate key value violates unique constraint \"{name}\""
             )),
-            ConstraintDiagnostic::ForeignKey { table, name } => {
-                EngineError::ForeignKeyViolation(format!(
-                    "insert or update on table \"{table}\" violates foreign key constraint \"{name}\""
-                ))
-            }
         }
     }
 }
@@ -160,21 +143,12 @@ mod tests {
         }
     }
 
-    fn foreign_key(row: u32, raw_ordinal: usize, name: &str) -> ConstraintCandidate {
-        ConstraintCandidate::foreign_key(
-            row,
-            raw_ordinal,
-            "arbitration".to_string(),
-            name.to_string(),
-        )
-    }
-
     fn diagnostic_name(candidate: &ConstraintCandidate) -> &str {
         match &candidate.diagnostic {
             ConstraintDiagnostic::NotNull { column, .. } => column,
-            ConstraintDiagnostic::Check { name, .. }
-            | ConstraintDiagnostic::Unique { name }
-            | ConstraintDiagnostic::ForeignKey { name, .. } => name,
+            ConstraintDiagnostic::Check { name, .. } | ConstraintDiagnostic::Unique { name } => {
+                name
+            }
         }
     }
 
@@ -218,13 +192,11 @@ mod tests {
             primary_key_null(7, 9, "earlier_not_null"),
             check(7, "earlier_check", 9),
             duplicate(7, 9, "earlier_unique"),
-            foreign_key(7, 9, "earlier_fk"),
         ];
         let later = [
             primary_key_null(8, 1, "later_not_null"),
             check(8, "later_check", 1),
             duplicate(8, 1, "later_unique"),
-            foreign_key(8, 1, "later_fk"),
         ];
 
         for lower in &earlier {
@@ -248,20 +220,16 @@ mod tests {
             primary_key_null(7, 9, "not_null"),
             check(7, "check", 9),
             duplicate(7, 9, "unique"),
-            foreign_key(7, 9, "foreign_key"),
         ];
 
         assert_pair_permutations(candidates[0].clone(), candidates[1].clone(), "not_null");
         assert_pair_permutations(candidates[0].clone(), candidates[2].clone(), "not_null");
-        assert_pair_permutations(candidates[0].clone(), candidates[3].clone(), "not_null");
         assert_pair_permutations(candidates[1].clone(), candidates[2].clone(), "check");
-        assert_pair_permutations(candidates[1].clone(), candidates[3].clone(), "check");
-        assert_pair_permutations(candidates[2].clone(), candidates[3].clone(), "unique");
         assert_three_permutations(
             [
                 candidates[0].clone(),
                 candidates[2].clone(),
-                candidates[3].clone(),
+                candidates[1].clone(),
             ],
             "not_null",
         );
@@ -284,13 +252,7 @@ mod tests {
             duplicate(7, 2, "unique_two"),
             duplicate(7, 3, "unique_three"),
         ];
-        let foreign_keys = [
-            foreign_key(7, 1, "foreign_one"),
-            foreign_key(7, 2, "foreign_two"),
-            foreign_key(7, 3, "foreign_three"),
-        ];
-
-        for candidates in [&primary, &checks, &duplicates, &foreign_keys] {
+        for candidates in [&primary, &checks, &duplicates] {
             for lower in 0..candidates.len() {
                 for higher in (lower + 1)..candidates.len() {
                     assert_pair_permutations(
@@ -304,7 +266,6 @@ mod tests {
         assert_three_permutations(primary, "primary_one");
         assert_three_permutations(checks, "alpha");
         assert_three_permutations(duplicates, "unique_one");
-        assert_three_permutations(foreign_keys, "foreign_one");
     }
 
     #[test]
@@ -323,11 +284,6 @@ mod tests {
             duplicate(7, 1, "arbitration_id_key").into_error(),
             EngineError::UniqueViolation(message)
                 if message == "duplicate key value violates unique constraint \"arbitration_id_key\""
-        ));
-        assert!(matches!(
-            foreign_key(7, 1, "arbitration_parent_fkey").into_error(),
-            EngineError::ForeignKeyViolation(message)
-                if message == "insert or update on table \"arbitration\" violates foreign key constraint \"arbitration_parent_fkey\""
         ));
     }
 }

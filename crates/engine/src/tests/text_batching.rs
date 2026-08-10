@@ -116,6 +116,62 @@ fn serialized_commit_apis_reject_returning_before_mutation() {
 }
 
 #[test]
+fn raw_serialized_claimants_reject_insert_before_wal_or_publication() {
+    let e = Engine::new_local_test_engine();
+    e.execute_text(1, "CREATE TABLE raw_insert_t (id INT PRIMARY KEY)")
+        .unwrap();
+    let durable_before = e.durable_wal_records().len();
+    let visible_before = e.visible_up_to();
+    let sql: Arc<[u8]> = Arc::from(&b"INSERT INTO raw_insert_t VALUES (1)"[..]);
+
+    for error in [
+        e.commit_mutation(2, Arc::clone(&sql)).unwrap_err(),
+        e.commit_mutation_at(3, Arc::clone(&sql), 123).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("raw serialized INSERT must enter typed transaction admission"),
+            "the resolved raw-commit route must not regain a live INSERT caller: {error}"
+        );
+    }
+    let parsed_error = e
+        .execute_parsed_text(
+            4,
+            parse_command("INSERT INTO raw_insert_t VALUES (1)").unwrap(),
+            "INSERT INTO raw_insert_t VALUES (1)",
+        )
+        .unwrap_err();
+    assert!(
+        parsed_error
+            .to_string()
+            .contains("direct parsed autocommit INSERT must enter typed transaction admission"),
+        "the parsed compatibility dispatcher must not retain a live INSERT selector: {parsed_error}"
+    );
+    let failure = e
+        .commit_mutation_batch(&[(5, Arc::clone(&sql))])
+        .unwrap_err();
+    assert!(!failure.requeue, "raw INSERT is a semantic rejection");
+    assert!(
+        failure
+            .error
+            .to_string()
+            .contains("raw serialized INSERT must enter typed transaction admission"),
+        "the batch claimant must not regain a live INSERT caller: {}",
+        failure.error
+    );
+    assert_eq!(e.durable_wal_records().len(), durable_before);
+    assert_eq!(e.visible_up_to(), visible_before);
+    assert!(
+        e.execute_relational_select_text("SELECT id FROM raw_insert_t")
+            .unwrap()
+            .rows
+            .is_empty(),
+        "rejected raw INSERT must not publish a row"
+    );
+}
+
+#[test]
 fn raw_commit_claimants_reject_legacy_sql_truncate_before_wal() {
     let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE raw_truncate_t (id INT PRIMARY KEY)")
@@ -474,31 +530,81 @@ fn semantic_batch_claim_failure_does_not_requeue_or_poison_later_writes() {
 }
 
 #[test]
-fn batch_live_and_recovered_terminal_status_keep_exact_affected_rows() {
+fn raw_insert_claimants_fail_closed_while_typed_autocommit_recovers() {
     let engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE exact_batch (id INT PRIMARY KEY)")
         .unwrap();
-    let payload: std::sync::Arc<[u8]> =
+    let text_payload: std::sync::Arc<[u8]> =
         std::sync::Arc::from(&b"INSERT INTO exact_batch VALUES (1)"[..]);
+    let binary_payload: std::sync::Arc<[u8]> = std::sync::Arc::from(
+        crate::wal_binary::encode_historical_binary_insert_fixture(
+            "exact_batch",
+            &[(1, &[SqlValue::Int4(1)])],
+        )
+        .expect("historical binary INSERT fixture"),
+    );
+    let mut binary_transaction =
+        crate::wal_binary::BinaryTransactionRecord::catalog_composition_seed();
+    binary_transaction.allocator_high_water = 3;
+    binary_transaction
+        .mutations
+        .push(crate::wal_binary::BinaryTransactionMutation::Insert {
+            table: "exact_batch".to_string(),
+            row_id: 2,
+            row_encoded: "i:2".to_string(),
+        });
+    let binary_transaction_payload: std::sync::Arc<[u8]> = std::sync::Arc::from(
+        crate::wal_binary::try_encode_binary_transaction(&binary_transaction)
+            .expect("historical binary transaction INSERT fixture"),
+    );
+    let durable_before = engine.durable_wal_records().len();
+
+    for (ordinal, payload) in [text_payload, binary_payload, binary_transaction_payload]
+        .into_iter()
+        .enumerate()
+    {
+        let txn_id = 2 + u64::try_from(ordinal)
+            .expect("test transaction ordinal")
+            .saturating_mul(3);
+        for error in [
+            engine.commit_mutation(txn_id, std::sync::Arc::clone(&payload)),
+            engine.commit_mutation_at(txn_id + 1, std::sync::Arc::clone(&payload), 123),
+        ] {
+            let error = error.expect_err("raw INSERT must not bypass typed admission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must enter typed transaction admission"),
+                "{error}"
+            );
+        }
+        let batch = engine
+            .commit_mutation_batch(&[(txn_id + 2, std::sync::Arc::clone(&payload))])
+            .expect_err("raw INSERT batch must not bypass typed admission");
+        assert!(!batch.requeue, "raw INSERT is a semantic rejection");
+        assert!(
+            batch
+                .error
+                .to_string()
+                .contains("must enter typed transaction admission"),
+            "{}",
+            batch.error
+        );
+    }
+    assert_eq!(engine.durable_wal_records().len(), durable_before);
+
     engine
-        .commit_mutation_batch(&[(2, std::sync::Arc::clone(&payload))])
-        .unwrap_or_else(|failure| panic!("batch commit failed: {}", failure.error));
-    let digest = gpu_db_wal::canonical_request_digest(&payload);
-    let (_, live_rows) = engine
-        .commit_state()
-        .resolve_transaction_retry_digest_outcome(2, digest)
-        .unwrap()
-        .expect("live terminal status");
-    assert_eq!(live_rows, 1);
+        .execute_text(11, "INSERT INTO exact_batch VALUES (1)")
+        .expect("typed autocommit INSERT");
 
     let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
-    let (_, recovered_rows) = recovered
-        .commit_state()
-        .resolve_transaction_retry_digest_outcome(2, digest)
-        .unwrap()
-        .expect("recovered terminal status");
-    assert_eq!(recovered_rows, 1);
+    let rows = recovered
+        .execute_relational_select_text("SELECT id FROM exact_batch")
+        .expect("fresh recovery must replay the typed INSERT")
+        .rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.row(0), &[SqlValue::Int4(1)]);
 }
 
 #[test]
@@ -997,22 +1103,15 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     // DUR-002: grouped apply holds the catalog latch and publishes only after every entry. Every
     // nested existence/dependency lookup must therefore bind to the evolving working catalog, not
     // the still-published pre-batch generation. This deliberately uses the internal grouped commit
-    // seam: public statement preflight cannot manufacture the dependency because entry 1 has not
-    // published when entry 2 is submitted.
+    // seam for non-INSERT catalog work. Live INSERT bytes are intentionally excluded: they must
+    // enter the typed transaction overlay after their target catalog state is published.
     let e = Engine::new_local_test_engine();
+    e.execute_text(
+        1,
+        "CREATE TABLE working_batch (id INT PRIMARY KEY, value INT)",
+    )
+    .expect("ordinary CREATE establishes the typed root before later INSERT admission");
     let batch = [
-        (
-            1,
-            std::sync::Arc::from(
-                b"CREATE TABLE working_batch (id INT PRIMARY KEY, value INT)".as_slice(),
-            ),
-        ),
-        (
-            2,
-            std::sync::Arc::from(
-                b"INSERT INTO working_batch (id, value) VALUES (1, 10)".as_slice(),
-            ),
-        ),
         (
             3,
             std::sync::Arc::from(b"CREATE SEQUENCE working_batch_seq".as_slice()),
@@ -1025,14 +1124,8 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     if let Err(failure) = e.commit_mutation_batch(&batch) {
         panic!("working-catalog batch failed: {}", failure.error);
     }
-
-    assert_eq!(e.visible_up_to(), 4);
-    let rows = e
-        .execute_relational_select_text("SELECT value FROM working_batch WHERE id = 1")
-        .unwrap()
-        .rows;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows.row(0)[0], SqlValue::Int4(10));
+    assert_eq!(e.visible_up_to(), 3);
+    assert!(e.relational_catalog_table("working_batch").is_some());
     let sequence = e.relational_catalog_sequence("working_batch_seq").unwrap();
     assert_eq!((sequence.last_value, sequence.is_called), (1, true));
 
@@ -1040,57 +1133,23 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     assert!(recovered
         .relational_catalog_table("working_batch")
         .is_some());
-    let rows = recovered
-        .execute_relational_select_text("SELECT value FROM working_batch WHERE id = 1")
-        .unwrap()
-        .rows;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows.row(0)[0], SqlValue::Int4(10));
     let sequence = recovered
         .relational_catalog_sequence("working_batch_seq")
         .unwrap();
     assert_eq!((sequence.last_value, sequence.is_called), (1, true));
 
-    let rewrite = [
-        (
-            6,
-            std::sync::Arc::from(
-                b"INSERT INTO working_batch (id, value) VALUES (2, 20)".as_slice(),
-            ),
+    let rewrite = [(
+        7,
+        std::sync::Arc::from(
+            b"ALTER TABLE working_batch ADD COLUMN extra INT DEFAULT 7".as_slice(),
         ),
-        (
-            7,
-            std::sync::Arc::from(
-                b"ALTER TABLE working_batch ADD COLUMN extra INT DEFAULT 7".as_slice(),
-            ),
-        ),
-        (
-            8,
-            std::sync::Arc::from(
-                b"INSERT INTO working_batch (id, value, extra) VALUES (3, 30, 8)".as_slice(),
-            ),
-        ),
-    ];
+    )];
     if let Err(failure) = e.commit_mutation_batch(&rewrite) {
         panic!("working-catalog rewrite batch failed: {}", failure.error);
     }
-    let rows = e
-        .execute_relational_select_text("SELECT id, value, extra FROM working_batch ORDER BY id")
-        .unwrap()
-        .rows;
-    assert_eq!(rows.len(), 3, "mixed rewrite rows: {rows:?}");
-    assert_eq!(
-        rows.row(0),
-        &[SqlValue::Int4(1), SqlValue::Int4(10), SqlValue::Int4(7)]
-    );
-    assert_eq!(
-        rows.row(1),
-        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
-    );
-    assert_eq!(
-        rows.row(2),
-        &[SqlValue::Int4(3), SqlValue::Int4(30), SqlValue::Int4(8)]
-    );
+    let table = e.relational_catalog_table("working_batch").unwrap();
+    assert_eq!(table.columns.len(), 3);
+    assert_eq!(table.columns[2].name, "extra");
 
     let dependencies = [
         (
@@ -1119,15 +1178,14 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     }
     assert!(e.relational_role("working_batch_reader").is_none());
 
+    let lifecycle_create = [(
+        13,
+        std::sync::Arc::from(b"CREATE TABLE transient_batch (id INT)".as_slice()),
+    )];
+    if let Err(failure) = e.commit_mutation_batch(&lifecycle_create) {
+        panic!("transient create batch failed: {}", failure.error);
+    }
     let lifecycle = [
-        (
-            13,
-            std::sync::Arc::from(b"CREATE TABLE transient_batch (id INT)".as_slice()),
-        ),
-        (
-            14,
-            std::sync::Arc::from(b"INSERT INTO transient_batch VALUES (1)".as_slice()),
-        ),
         (
             15,
             std::sync::Arc::from(b"DROP TABLE transient_batch".as_slice()),
@@ -1149,31 +1207,26 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
         "a grouped drop/recreate must not attach the intermediate OID's root to its successor"
     );
 
-    let rename = [
-        (
-            17,
-            std::sync::Arc::from(b"CREATE TABLE transient_source (id INT)".as_slice()),
+    let rename_create = [(
+        17,
+        std::sync::Arc::from(b"CREATE TABLE transient_source (id INT)".as_slice()),
+    )];
+    if let Err(failure) = e.commit_mutation_batch(&rename_create) {
+        panic!("transient source create batch failed: {}", failure.error);
+    }
+    let rename = [(
+        19,
+        std::sync::Arc::from(
+            b"ALTER TABLE transient_source RENAME TO transient_destination".as_slice(),
         ),
-        (
-            18,
-            std::sync::Arc::from(b"INSERT INTO transient_source VALUES (1)".as_slice()),
-        ),
-        (
-            19,
-            std::sync::Arc::from(
-                b"ALTER TABLE transient_source RENAME TO transient_destination".as_slice(),
-            ),
-        ),
-    ];
+    )];
     if let Err(failure) = e.commit_mutation_batch(&rename) {
         panic!("create/insert/rename batch failed: {}", failure.error);
     }
-    assert_eq!(e.test_table_root_index("transient_source"), 0);
-    assert_ne!(
-        e.test_table_root_index("transient_destination"),
-        0,
-        "a grouped rename must carry the root by stable OID"
-    );
+    assert!(e.relational_catalog_table("transient_source").is_none());
+    assert!(e
+        .relational_catalog_table("transient_destination")
+        .is_some());
 
     let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
     assert!(recovered.relational_role("working_batch_reader").is_none());
@@ -1183,28 +1236,15 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
     assert_eq!(table.columns.len(), 1);
     assert_eq!(table.columns[0].name, "name");
     assert_eq!(recovered.test_table_root_index("transient_batch"), 0);
-    assert_eq!(
-        recovered.test_table_root_index("transient_destination"),
-        e.test_table_root_index("transient_destination"),
-        "grouped live apply and record-at-a-time recovery must derive one root ledger"
-    );
-    let rows = recovered
-        .execute_relational_select_text("SELECT id, value, extra FROM working_batch ORDER BY id")
-        .unwrap()
-        .rows;
-    assert_eq!(rows.len(), 3);
-    assert_eq!(
-        rows.row(0),
-        &[SqlValue::Int4(1), SqlValue::Int4(10), SqlValue::Int4(7)]
-    );
-    assert_eq!(
-        rows.row(1),
-        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
-    );
-    assert_eq!(
-        rows.row(2),
-        &[SqlValue::Int4(3), SqlValue::Int4(30), SqlValue::Int4(8)]
-    );
+    assert!(recovered
+        .relational_catalog_table("transient_source")
+        .is_none());
+    assert!(recovered
+        .relational_catalog_table("transient_destination")
+        .is_some());
+    let table = recovered.relational_catalog_table("working_batch").unwrap();
+    assert_eq!(table.columns.len(), 3);
+    assert_eq!(table.columns[2].name, "extra");
 }
 
 #[test]
@@ -1796,23 +1836,18 @@ fn commit_and_rollback_require_active_transaction_context() {
 }
 
 #[test]
-fn active_engine_transaction_rejects_unsupported_autocommit_commands() {
+fn active_engine_transaction_stages_catalog_commands_without_autocommit() {
     let e = Engine::new_local();
     e.execute_text(41, "BEGIN").unwrap();
 
-    let err = e
-        .execute_text(41, "CREATE TABLE escaped_commit (id INT)")
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("not supported inside an active transaction"),
-        "{err}"
-    );
+    e.execute_text(41, "CREATE TABLE escaped_commit (id INT)")
+        .unwrap();
     assert!(
         e.relational_catalog_table("escaped_commit").is_none(),
-        "unsupported transaction commands must not autocommit"
+        "transaction-private catalog state must not autocommit"
     );
     e.execute_text(41, "ROLLBACK").unwrap();
+    assert!(e.relational_catalog_table("escaped_commit").is_none());
 }
 
 #[test]
