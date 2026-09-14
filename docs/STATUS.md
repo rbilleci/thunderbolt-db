@@ -3,6 +3,36 @@
 This document records what exists and what has been verified. It does not own tasks or sequencing. Every live
 gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
+## OSS-001 experimental GPLv3 source release — accepted 2026-09-14
+
+- The project is prepared as experimental version `0.1.0-alpha.1` under `GPL-3.0-only`. `LICENSE` contains the
+  unmodified GPLv3 text; `CUDA_EXCEPTION` grants the narrow section-7 permission needed for a separately installed
+  CUDA Driver API; `COPYRIGHT`, `THIRD_PARTY_NOTICES.md`, eight third-party license texts, DCO, contribution,
+  security, changelog, and complete 17-crate metadata are present. The release authority confirmed the required
+  rights and selected the public contributor-form notice.
+- Runtime commit `139aa8959905877c3fac6809d0f5568b1fd33c1c`, tree
+  `5c95d112891cbd9bb69c562600efcd5aa563718f`, carries all code, dependency, workflow, quickstart, and source-builder
+  changes. The annotated local `v0.1.0-alpha.1` tag identifies its documentation-only closeout and records the exact
+  final archive SHA-256 and size. No public push, repository visibility change, binary/container distribution, or
+  release publication was performed.
+- The locked graph contains 313 external packages and exactly matches the generated dependency inventory.
+  `cargo-deny 0.19.9` passes advisories, bans, licenses, and sources with nine disclosed duplicate-version warnings.
+  All-history and exact-source gitleaks 8.28.0 scans pass with reviewed narrow classifications. The deterministic
+  source artifact retains 27 PTX, three CUDA, and one project header source while excluding Git history and the
+  separately uncleared literature corpus.
+- A clean Ubuntu 26.04 container with Rust 1.97.1, Clang/libclang 21.1.8, PostgreSQL client 18.6, and the documented
+  packages built the locked release from the exact source artifact. Product ownership passed, and the container-built
+  server passed all 10 durable typed/NULL SQL, transaction, GPU-read, SIGKILL, restart, and recovery assertions on an
+  RTX PRO 6000 Blackwell Max-Q with driver 595.84.
+- Focused recovery, pgwire, TLS/SCRAM, mTLS, Kubernetes-contract, complete workspace check, strict Clippy, hosted
+  host-neutral tests, formatting/static checks, and independent pre-card audit pass. The canonical candidate card
+  (SHA-256 `b384c05132baec7b7d7cfcd52d3fe4a03f7aeed3851428c0c90d4f11880dd268`) compared with the direct-parent
+  `6508ac9b` card (SHA-256 `9a4ea081124b2f1f5c3b8411386d811f71ea87d4d8af07e209bdfe5977f53a52`)
+  under the same exclusive GPU/config/toolchain. Candidate in-L2 median was 262,173,070 lookups/s, all 3 samples
+  above the 260M floor; out-of-L2 was 258,583,015 lookups/s at 126us. Independent post-card audit found no material
+  regression. Full evidence is in
+  [`docs/design/open-source-release-audit.md`](design/open-source-release-audit.md).
+
 ## Product direction and execution boundary
 
 - The engine requires an NVIDIA GPU. The host is control plane: wire I/O, SQL parse/plan, transaction
@@ -55,7 +85,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   batch-65,536 production-compact Section-B samples **272,464,995 / 272,655,388 / 273,479,060 lookups/s**
   (median **272,655,388**, 3/3 above the **260M** floor); raw out-of-L2 `sum_i32` was **1,440 GB/s**.
 - Its one clean-filesystem canonical full card retained a complete transcript at
-  `/home/richard/projects/gpu-db-write001-storage-v6-candidate.kC89eg/candidate/target/benchmark-report-card-runs/runner.b24889c985e3.b0fbe39d618d.Tdf2lk.log`
+  `candidate/target/benchmark-report-card-runs/runner.b24889c985e3.b0fbe39d618d.Tdf2lk.log`
   (SHA-256 `d91a1ea2536443d89af0952af1a9cb5dc10c5074c1ff303b2fcfd47b3c993a75`): Sections A/B/C and valid closeout
   completed, its exact terminal canonical record occurs once, and the fresh owned target was removed. Section B
   median was **266,839,011 lookups/s** (3/3 above 260M); Section C completed 48M rows/300 batches at
@@ -906,7 +936,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Repository and session evidence showed a systemic flow failure rather than insufficient activity: the retained
   history contains 423 commits since 2026-07-12 and 298 named STRUCT slices, WRITE-001 accumulated 31 accepted
   sub-boundaries, and a 5 h 24 m session used 17 agent tasks yet ended with another deliberately private authority.
-  The concluded analysis is `docs/archive/reviews/write-001-delivery-rca-2026-08-02.md`.
+  The concluded analysis remains available at
+  `v0.1.0-alpha.1:docs/archive/reviews/write-001-delivery-rca-2026-08-02.md`.
 - Governance now makes the complete PLAN milestone—not a private helper or proof phase—the unit of acceptance.
   Intermediate work stays integrated WIP; progress requires production reachability, a closed end-to-end matrix row,
   or deletion of an alternate live branch. A 90-minute stop-loss prevents further helper expansion without such
@@ -1408,7 +1439,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `a08012099edd196461870b254a5567ee17c8fc692e6e14e05d8d07d5bf93b53b` were run serially at 8M rows /
   4,001 shards: candidate build/total was **95.4s/100.60s**, base was **95.0s/100.30s**, and both produced
   **20us/19us** compatibility/compact p50. The **+0.4%/+0.3%** delta rules out a material candidate regression at
-  that calibrated diagnostic scale. The original failed log remains `/tmp/product001-index-full-card.log`.
+  that calibrated diagnostic scale. The original failed log was a local temporary diagnostic and is not part of
+  the source release.
 - The independently re-audited documentation-only retry candidate is staged tree
   `2497b5fd00da8bee39f583a818e32e1da6952222` with cached binary-diff SHA-256
   `736653b742aed8be067f9623764ad9226694983f3448f50d2d754bffcdbb8575`. Its one full invocation used the
@@ -2745,8 +2777,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   ignored tests. Facade ordinary all-target tests pass **39 with 8 GPU-ignored**, and serialized concurrency passes
   **13 with 1 GPU-ignored**. Workspace all-target/all-feature check, strict execution/engine/facade Clippy,
   formatting, diff whitespace, and changed-source-size gates pass.
-  The remediation evidence is archived in
-  [`perf-001-remediation-2026-07-18.md`](archive/testing/reports/perf-001-remediation-2026-07-18.md).
+  The remediation evidence remains available at
+  `v0.1.0-alpha.1:docs/archive/testing/reports/perf-001-remediation-2026-07-18.md`.
 - Final acceptance is complete. Three independent read-only lanes accepted the exact code/evidence tree with no
   remaining severity finding: publication/accounting, CUDA ownership/public contracts, and benchmark/evidence.
   The canonical two-layer/two-cache card then completed with exit 0. Layer 1 in/out-of-L2 `sum_i32` measured
@@ -6384,9 +6416,9 @@ sections, the current source tree, `CODE_SIZE.md`, and `PLAN.md` govern present 
   identity overrides, 1,428 matching/
   schema rules, 8,908 relation-review overrides, and 2,364 link-review overrides—plus 1,373 lines of parsing,
   linking, normalization, backlog, report-writing, and CLI logic. Documentation consolidation commit `bedc1df7`
-  moved its journal, mechanisms, and four generated artifacts under `docs/archive/research/`; the live default
-  invocation therefore fails on the absent journal, and exhaustive non-archive search found no consumer or caller.
-  An explicit invocation against the archived journal/mechanisms regenerated paper links JSON `e1fc1d10…`, coverage
+  moved its journal, mechanisms, and four generated artifacts under the historical research archive; the live
+  default invocation therefore failed on the absent journal, and exhaustive live-tree search found no consumer or
+  caller. An explicit invocation against the archived journal/mechanisms regenerated paper links JSON `e1fc1d10…`, coverage
   Markdown `329e7743…`, benchmark backlog JSON `e9d0641c…`, and backlog Markdown `ec71897e…` byte-for-byte. Python
   compilation passed before deletion, the deleted source hash is `2c7b1120…`, archive files remain unchanged, and
   no cache/output residue remains. Splitting the mixed file would have recreated live ownership for historical,

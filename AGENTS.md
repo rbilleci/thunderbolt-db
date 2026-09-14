@@ -67,8 +67,8 @@ When choosing between implementation approaches:
 
 `docs/PLAN.md` is the **only** document that owns open, deferred, blocked, or sequenced work. `STATUS.md`
 records facts; `HANDOVER.md` is a short pointer to active PLAN IDs; architecture, ADR, and `docs/design/`
-documents do not own tasks. Everything under `docs/archive/` is historical and non-actionable even when it
-contains words such as `NEXT`, `TODO`, or `OPEN`.
+documents do not own tasks. Superseded plans and reviews belong in Git history; do not recreate a live
+`docs/archive/` task surface.
 
 Permanent analysis instrumentation lives behind the build-only `probe-timing` Cargo feature. Reuse and extend
 those probes instead of writing and reverting one-off hot-path timers.

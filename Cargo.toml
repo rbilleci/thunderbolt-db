@@ -22,8 +22,9 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
-version = "0.1.0"
+license = "GPL-3.0-only"
+repository = "https://github.com/mvsm-prometheus/gpu-database-engine"
+version = "0.1.0-alpha.1"
 
 [workspace.dependencies]
 thiserror = "1"

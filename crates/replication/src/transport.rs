@@ -1,5 +1,4 @@
 use std::{
-    fs::File,
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::Path,
@@ -8,7 +7,8 @@ use std::{
 };
 
 use rustls::{
-    pki_types::ServerName, ClientConfig as TlsClientConfig, ClientConnection, RootCertStore,
+    pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer, ServerName},
+    ClientConfig as TlsClientConfig, ClientConnection, RootCertStore,
     ServerConfig as TlsServerConfig, ServerConnection, StreamOwned,
 };
 
@@ -215,12 +215,9 @@ impl<T: Read + Write> ReadWrite for T {}
 fn load_cert_chain(
     path: &Path,
     label: &'static str,
-) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, EngineError> {
-    let mut reader = std::io::BufReader::new(
-        File::open(path)
-            .map_err(|err| append_entries_error(format!("{label} open failed: {err}")))?,
-    );
-    let certs = rustls_pemfile::certs(&mut reader)
+) -> Result<Vec<CertificateDer<'static>>, EngineError> {
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|err| append_entries_error(format!("{label} open failed: {err}")))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| append_entries_error(format!("{label} PEM parse failed: {err}")))?;
     if certs.is_empty() {
@@ -234,12 +231,11 @@ fn load_cert_chain(
 fn load_private_key(
     path: &Path,
     label: &'static str,
-) -> Result<rustls::pki_types::PrivateKeyDer<'static>, EngineError> {
-    let mut reader = std::io::BufReader::new(
-        File::open(path)
-            .map_err(|err| append_entries_error(format!("{label} open failed: {err}")))?,
-    );
-    rustls_pemfile::private_key(&mut reader)
+) -> Result<PrivateKeyDer<'static>, EngineError> {
+    PrivateKeyDer::pem_file_iter(path)
+        .map_err(|err| append_entries_error(format!("{label} open failed: {err}")))?
+        .next()
+        .transpose()
         .map_err(|err| append_entries_error(format!("{label} PEM parse failed: {err}")))?
         .ok_or_else(|| append_entries_error(format!("{label} contains no private key")))
 }

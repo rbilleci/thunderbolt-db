@@ -1,0 +1,10 @@
+gpu-database-engine
+Copyright (C) 2026 gpu-database-engine contributors
+
+The project-authored source code and documentation in this release are
+licensed under the GNU General Public License, version 3 only, with the
+CUDA Driver Additional Permission in CUDA_EXCEPTION. See LICENSE.
+
+Files and dependencies identified in THIRD_PARTY_NOTICES.md remain under
+their respective copyright and license terms. The project license does not
+replace, remove, or narrow those notices.

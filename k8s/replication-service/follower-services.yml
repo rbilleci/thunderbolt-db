@@ -5,19 +5,19 @@ metadata:
   labels:
     app.kubernetes.io/name: gpu-db-replication-follower
     app.kubernetes.io/part-of: gpu-db
-    gpu-db.openclaw.dev/follower-id: "2"
+    gpu-db-follower-id: "2"
 spec:
   replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: gpu-db-replication-follower
-      gpu-db.openclaw.dev/follower-id: "2"
+      gpu-db-follower-id: "2"
   template:
     metadata:
       labels:
         app.kubernetes.io/name: gpu-db-replication-follower
         app.kubernetes.io/part-of: gpu-db
-        gpu-db.openclaw.dev/follower-id: "2"
+        gpu-db-follower-id: "2"
     spec:
       containers:
         - name: follower
@@ -49,12 +49,12 @@ metadata:
   labels:
     app.kubernetes.io/name: gpu-db-replication-follower
     app.kubernetes.io/part-of: gpu-db
-    gpu-db.openclaw.dev/follower-id: "2"
+    gpu-db-follower-id: "2"
 spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: gpu-db-replication-follower
-    gpu-db.openclaw.dev/follower-id: "2"
+    gpu-db-follower-id: "2"
   ports:
     - name: append
       port: 55432
@@ -67,19 +67,19 @@ metadata:
   labels:
     app.kubernetes.io/name: gpu-db-replication-follower
     app.kubernetes.io/part-of: gpu-db
-    gpu-db.openclaw.dev/follower-id: "3"
+    gpu-db-follower-id: "3"
 spec:
   replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: gpu-db-replication-follower
-      gpu-db.openclaw.dev/follower-id: "3"
+      gpu-db-follower-id: "3"
   template:
     metadata:
       labels:
         app.kubernetes.io/name: gpu-db-replication-follower
         app.kubernetes.io/part-of: gpu-db
-        gpu-db.openclaw.dev/follower-id: "3"
+        gpu-db-follower-id: "3"
     spec:
       containers:
         - name: follower
@@ -111,12 +111,12 @@ metadata:
   labels:
     app.kubernetes.io/name: gpu-db-replication-follower
     app.kubernetes.io/part-of: gpu-db
-    gpu-db.openclaw.dev/follower-id: "3"
+    gpu-db-follower-id: "3"
 spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: gpu-db-replication-follower
-    gpu-db.openclaw.dev/follower-id: "3"
+    gpu-db-follower-id: "3"
   ports:
     - name: append
       port: 55432

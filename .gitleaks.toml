@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reviewed prose false positive: a sort-key test matrix"
+regexTarget = "match"
+regexes = [
+  '''key, duplicate/missing ''',
+]

@@ -1,0 +1,64 @@
+name: trusted GPU release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    # This job is intentionally manual and cannot be satisfied by GitHub-hosted
+    # CPU runners. The runner label identifies a maintained NVIDIA-capable
+    # release machine; its driver and CUDA runtime are external prerequisites.
+    runs-on: [self-hosted, linux, x64, nvidia-gpu]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Require native release prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for command_name in cargo cc clang cmake pkg-config perl python3 psql rg; do
+            command -v "$command_name" >/dev/null 2>&1 || {
+              printf 'trusted GPU release prerequisite missing: %s\n' "$command_name" >&2
+              exit 1
+            }
+          done
+      - name: Require a visible NVIDIA device
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v nvidia-smi >/dev/null
+          device_count="$(nvidia-smi -L | awk 'NF { count += 1 } END { print count + 0 }')"
+          test "$device_count" -gt 0
+          printf 'trusted_gpu_release_devices=%s\n' "$device_count"
+      - name: Verify product ownership
+        run: timeout --preserve-status 5m scripts/check_product_ownership.sh
+      - name: Durable pgwire recovery
+        env:
+          GPU_DB_WAL_DURABILITY: serial
+          GPU_DB_INTENT_LANES: "1"
+        run: |
+          timeout --preserve-status 15m cargo test --locked -p gpu_db_server --test durable_process_recovery -- \
+            --test-threads=1 --color never
+      - name: Pgwire matrix
+        env:
+          GPU_DB_WAL_DURABILITY: serial
+          GPU_DB_INTENT_LANES: "1"
+        run: |
+          timeout --preserve-status 20m cargo test --locked -p gpu_db_server --test pgwire_roundtrip -- \
+            --include-ignored --test-threads=1 --color never
+      - name: Non-vacuous GPU tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --preserve-status 45m scripts/run_local_gpu_tests.sh | tee trusted-gpu-tests.log
+          passed="$(awk -F= '/^local_gpu_tests_passed_count=/{print $2}' trusted-gpu-tests.log | tail -n 1)"
+          test -n "$passed"
+          test "$passed" -gt 0
+      - name: Durable GPL source-release smoke
+        run: timeout --preserve-status 20m scripts/run_oss_release_smoke.sh

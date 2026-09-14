@@ -1,8 +1,8 @@
 # ADR-014 decision-level ACID and failure traces
 
 These are the accepted decision traces for [`ADR-014`](write-path-adr-014.md). They were reviewed against pinned
-source baseline `f701d8b6e9e0a9a1904bc990f23162632f382045` plus the verified R3-006 correction preserved in the
-[`acceptance archive`](../archive/reviews/write-path-adr-014-acceptance/README.md). They do not claim that the
+source baseline `f701d8b6e9e0a9a1904bc990f23162632f382045` plus the verified R3-006 correction preserved at
+`v0.1.0-alpha.1:docs/archive/reviews/write-path-adr-014-acceptance/`. They do not claim that the
 canonical transaction, WAL, checkpoint, or recovery implementation exists. Those graduation proofs remain with
 the PLAN owners named below; this document owns no work.
 

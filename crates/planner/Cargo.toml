@@ -3,6 +3,7 @@ name = "gpu_db_planner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 gpu_db_execution = { path = "../execution" }

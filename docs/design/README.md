@@ -15,4 +15,5 @@ are **not plans** and do not own priority, status, or sequencing. The only execu
 - [`non-int4-index-design-inputs.md`](non-int4-index-design-inputs.md) — accepted index constraints and remaining
   point-lookup breadth under **READ-002**.
 
-Dated proposals, superseded inputs, probes, packet manifests, and detailed reviews live under `../archive/`.
+Dated proposals, superseded inputs, probes, packet manifests, and detailed reviews are available from Git history
+and the `v0.1.0-alpha.1` tag rather than the current source tree.

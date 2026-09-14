@@ -790,9 +790,7 @@ mod tests {
 
         for follower_id in ["2", "3"] {
             assert!(manifest.contains(&format!("name: gpu-db-replication-follower-{follower_id}")));
-            assert!(manifest.contains(&format!(
-                "gpu-db.openclaw.dev/follower-id: \"{follower_id}\""
-            )));
+            assert!(manifest.contains(&format!("gpu-db-follower-id: \"{follower_id}\"")));
             assert!(manifest.contains(&format!(
                 "- name: GPU_DB_REPLICATION_FOLLOWER_ID\n              value: \"{follower_id}\""
             )));

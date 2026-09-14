@@ -33,9 +33,9 @@ Permanent companions are the
 [`decision-level ACID/failure traces`](write-path-adr-014-traces.md),
 [`five-minute recovery profile`](write-path-adr-014-recovery-profile.md), and immutable
 [`OLTP workload`](oltp-benchmark-workload-v1.md). The pinned source crosswalk, four independent audits, Candidate
-A/B reports, controller models, frozen packets, and verdicts are preserved as non-actionable provenance in the
-[`ADR-014 acceptance archive`](../archive/reviews/write-path-adr-014-acceptance/README.md). The exact final reviewed
-snapshot is `c9628766`.
+A/B reports, controller models, frozen packets, and verdicts remain available as non-actionable provenance at
+`v0.1.0-alpha.1:docs/archive/reviews/write-path-adr-014-acceptance/`. The exact final reviewed snapshot is
+`c9628766`.
 
 ## Context
 
@@ -1220,8 +1220,9 @@ while discarding substantial live append/tombstone correctness evidence. The fir
 failed, but it combined the present allocation/controller restrictions with a synchronous-durability envelope that
 exceeds the applicable W1 charter latency target on this host. It was therefore not a valid physical A/B.
 
-The [`archived physical-selection report`](../archive/reviews/write-path-adr-014-acceptance/write-path-adr-physical-selection.md)
-records the corrected resident-input comparison. It executes both mutation mechanics on the GPU across
+The physical-selection report at
+`v0.1.0-alpha.1:docs/archive/reviews/write-path-adr-014-acceptance/write-path-adr-physical-selection.md` records the
+corrected resident-input comparison. It executes both mutation mechanics on the GPU across
 8/32/128-byte rows, 1/3/6 indexes, and batch sizes 1/256/4,096. Compact append/tombstone is faster in
 every p50 cell; dense-latest/undo is 13–95% slower depending on width, fanout, and batch. Once both candidates carry
 complete row ownership and creation/death intervals, their bounded current/history/index formats are byte-tied;
@@ -1275,8 +1276,8 @@ The consolidated compatibility-deviation register and rule-by-rule proof status 
 [`write-path-adr-014-compatibility.md`](write-path-adr-014-compatibility.md). That companion is an implementation
 contract, not a work ledger. The reviewed decision-level transactional and failure schedules live in
 [`write-path-adr-014-traces.md`](write-path-adr-014-traces.md), and the bounded recovery contract lives in
-[`write-path-adr-014-recovery-profile.md`](write-path-adr-014-recovery-profile.md). Acceptance-only evidence lives
-in the [`archive`](../archive/reviews/write-path-adr-014-acceptance/README.md).
+[`write-path-adr-014-recovery-profile.md`](write-path-adr-014-recovery-profile.md). Acceptance-only evidence remains
+available at `v0.1.0-alpha.1:docs/archive/reviews/write-path-adr-014-acceptance/`.
 
 ### ADR-014 design acceptance evidence — R3-001 closeout
 

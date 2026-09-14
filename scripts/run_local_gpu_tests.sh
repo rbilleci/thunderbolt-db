@@ -36,7 +36,7 @@ echo "local_gpu_tests_device_info=${device_info}"
 
 # Preserve the cargo exit code through tee so a failing GPU test fails this
 # script (pipefail is on via `set -euo pipefail`).
-cargo test "${GPU_TEST_CRATES[@]}" -- --ignored --color never --test-threads=1 2>&1 | tee "$LOG"
+cargo test --locked "${GPU_TEST_CRATES[@]}" -- --ignored --color never --test-threads=1 2>&1 | tee "$LOG"
 
 # Roll the per-binary `test result:` lines up into one summary so the preflight
 # can grep for stable counts.
