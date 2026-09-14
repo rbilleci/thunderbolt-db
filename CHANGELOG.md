@@ -3,7 +3,7 @@
 All notable release changes are recorded here. The project uses semantic version identifiers while its public
 surface is experimental.
 
-## 0.1.0-alpha.2 — unreleased
+## 0.1.0-alpha.2 — 2026-09-14
 
 - Renames the public project to **Thunderbolt DB** and the repository to `thunderbolt-db`.
 - Renames the supported server executable to `thunderbolt-db-server` and source-release artifacts to

@@ -4,10 +4,11 @@
 
 ## Current boundary
 
-**RENAME-001 is the active milestone.** The project and GitHub repository now use **Thunderbolt DB** /
-`thunderbolt-db`; `origin` points to `https://github.com/mvsm-prometheus/thunderbolt-db.git` and `main` remains the
-default branch. Preserve repository visibility, do not publish a GitHub Release, and complete the `0.1.0-alpha.2`
-rename gates recorded in [PLAN.md](PLAN.md#work-ledger).
+**Thunderbolt DB `0.1.0-alpha.2` is an accepted source release.** The project and GitHub repository use
+**Thunderbolt DB** / `thunderbolt-db`; `origin` points to
+`https://github.com/mvsm-prometheus/thunderbolt-db.git` and `main` remains the default branch. No rename task is
+active. The annotated alpha.2 tag records the final archive identity after documentation closeout, avoiding a
+self-referential source artifact; repository visibility is unchanged and no GitHub Release is published.
 
 **OSS-001 remains an accepted historical source release.** The immutable pushed `v0.1.0-alpha.1` tag identifies
 the exact deterministic `gpu-database-engine` source artifact and checksum. Preserve its license, CUDA additional

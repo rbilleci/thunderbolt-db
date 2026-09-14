@@ -4,7 +4,7 @@ Thunderbolt DB (`thunderbolt-db`) is an experimental GPU-native, PostgreSQL-comp
 PostgreSQL wire protocol and keeps relational execution on the GPU: the host handles connection I/O, SQL parsing and
 planning, transaction sequencing, WAL I/O, and device orchestration.
 
-The next source release is `0.1.0-alpha.2`. It is for evaluation and development with non-sensitive data, not a
+This is source release `0.1.0-alpha.2`. It is for evaluation and development with non-sensitive data, not a
 production database or a drop-in replacement for PostgreSQL.
 
 ## Requirements

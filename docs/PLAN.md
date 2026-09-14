@@ -18,9 +18,9 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-**RENAME-001** is the active milestone: complete the public rename to Thunderbolt DB and prepare the
-`0.1.0-alpha.2` source release. The accepted unified GPU-native write engine remains unchanged; its comparative
-write-performance reassessment is deliberately deferred under **WRITE-002**.
+The current unified GPU-native write engine is an accepted release checkpoint. Its comparative write-performance
+reassessment is deliberately deferred under **WRITE-002**; no performance target is active until that task is
+explicitly promoted.
 
 
 ## STRUCT-001 — oversized-file remediation method
@@ -135,7 +135,6 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **RENAME-001** | NOW | P0 | Rename the public project and GitHub repository to **Thunderbolt DB** / `thunderbolt-db`; retain `gpu_db_*` crates/imports, `GPU_DB_*` variables, PTX/CUDA symbols, WAL/checkpoint magic, and `gpu-db/...` digest domains. Update project-facing docs, legal notices, Cargo repository metadata, `thunderbolt-db-server`, deployment resources, compatibility smokes, source archive name/root, and the wire-version suffix. Preserve immutable `v0.1.0-alpha.1` old-name evidence; prepare `0.1.0-alpha.2` without changing repository visibility or publishing a GitHub Release. Require renamed GitHub/remote/default-branch/tag/redirect/security/integration verification; workspace, ownership, server, driver, security, deployment, durable GPU recovery, archive reproducibility, link/license/secret gates; frozen independent acceptance audit; then merge/push `main` and create `v0.1.0-alpha.2`. The full read-performance card is not applicable unless the change reaches a read kernel, residency/layout, result path, runtime dependency, or benchmark harness. | GitHub repository move complete; no persisted-format migration | `README.md`; `CHANGELOG.md`; `docs/STATUS.md`; `AGENTS.md` development gate |
 | **READ-002** | BLOCKED | P2 | The BENCH prerequisite milestone passed on 2026-07-19: the typed engine API prepares one exact-generation, O(1) GPU directory for compound `(tenant_id int4, account_id int8)` equality, exact-rechecks collisions and MVCC on-device, gathers the required fixed-width projections, proves nonzero GPU/index/cache hits, and retains zero cold accesses with GPU-scan parity. Broader bigint/text/UUID/numeric and composite point-lookup breadth remains under READ-002 after BENCH-001. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical compound milestone is complete | `docs/design/non-int4-index-design-inputs.md`; 2026-07-19 STATUS evidence |
 | **PRODUCT-002** | BLOCKED | P2 | The BENCH canonical SQL/type milestone passed on 2026-07-19: the immutable schema and W1 statements parse unchanged; typed placeholders and required pgwire codecs are available; every named primary/secondary index publishes and mutates in resident GPU generations; checked expression UPDATE and DML `RETURNING` execute without host relational fallback. After BENCH evidence, complete persistent GPU system catalogs, large NUMERIC, and unrelated protocol/type breadth. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical SQL/type milestone is complete | ARCHITECTURE §3; `docs/design/oltp-benchmark-workload-v1.md`; 2026-07-19 STATUS evidence |
 | **WRITE-002** | PARKED | P0 | Reassess the accepted current write engine against a deliberate performance contract. Establish the workload, paired-system configuration, throughput target, and tail-latency budget only when this task is explicitly promoted; preserve the current general codec-5 lifecycle and do not treat its checkpoint measurement as a comparative-performance claim. | Explicit user promotion after release experience or a new product target | 2026-08-10 product decision; current baseline in `STATUS.md` |

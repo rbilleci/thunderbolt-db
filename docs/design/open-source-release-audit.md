@@ -5,8 +5,8 @@ legal advice and does not authorize a visibility change or GitHub Release public
 
 **Current repository state (2026-09-14):** The historical `v0.1.0-alpha.1` tag has since been pushed to
 `mvsm-prometheus/thunderbolt-db` and retains its original `gpu-database-engine` artifact identity. Repository
-visibility remains private and no GitHub Release has been published. The separate **RENAME-001** milestone owns the
-planned `0.1.0-alpha.2` public-identity update; this audit remains alpha.1 evidence. Its current locked dependency
+visibility remains private and no GitHub Release has been published. The accepted `0.1.0-alpha.2`
+public-identity release leaves this audit as alpha.1 evidence. Its current locked dependency
 resolution updates `rustls` to `0.23.45` for `RUSTSEC-2026-0285`; Rustls requires `aws-lc-rs 1.18.1`,
 `aws-lc-sys 0.45.0`, and `rustls-webpki 0.103.15`. The regenerated inventory remains 313 external packages.
 

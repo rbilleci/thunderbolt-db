@@ -3,19 +3,30 @@
 This document records what exists and what has been verified. It does not own tasks or sequencing. Every live
 gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
-## Thunderbolt DB public identity — current 2026-09-14
+## Thunderbolt DB `0.1.0-alpha.2` source release — accepted 2026-09-14
 
 - The GitHub repository is `mvsm-prometheus/thunderbolt-db`; local `origin` uses
   `https://github.com/mvsm-prometheus/thunderbolt-db.git`, and its default branch is `main`. Repository visibility
-  remains private. The immutable `v0.1.0-alpha.1` tag is present on that remote, while `0.1.0-alpha.2` is the
-  planned renamed source release under **RENAME-001**.
+  remains private. The immutable `v0.1.0-alpha.1` tag is present on that remote, and the Thunderbolt DB
+  `0.1.0-alpha.2` rename/source release is accepted. No GitHub Release or binary/container distribution has been
+  published.
 - The rename preserves alpha.1 as historical evidence, including its `gpu-database-engine` archive name and root.
-  No GitHub Release or binary/container distribution has been published.
 - All 17 internal `gpu_db_*` packages now inherit version `0.1.0-alpha.2`, the Thunderbolt DB repository URL, and
   `publish = false` from workspace metadata. Their crate/import names and `GPU_DB_*` configuration names are
   unchanged. The regenerated locked dependency inventory still has 313 external packages; its Rustls resolution is
   `rustls 0.23.45`, which closes `RUSTSEC-2026-0285` and requires `aws-lc-rs 1.18.1`, `aws-lc-sys 0.45.0`, and
   `rustls-webpki 0.103.15`.
+- The tested runtime candidate is commit `b0e3f0bf453d46067fb307f3cb16017e0675329b`, tree
+  `bae2403af7ac7d1c9c24b1ec5e91b36210202763`. Independent pre- and post-card audits returned **ACCEPT**. Its
+  canonical report-card transcript is
+  `target/benchmark-report-card-runs/runner.b0e3f0bf453d.bae2403af7ac.Z3X2ud.log`,
+  SHA-256 `6b771d599de8d490263f0ed393ba39d6adb062c42855556b27f8cca3a88fbb38`.
+- The in-L2 point-read median was 263,745,651 lookups/s versus the 262,173,070 baseline, with all samples above the
+  260M floor. Section C p50 was 129us versus 126us and its wall observation was 201,149,162 versus 258,583,015
+  lookups/s; CPU needles and contention outside the timer affected that wall observation, so it is not a standalone
+  performance conclusion. Raw metrics were stable. The durable release smoke passed 10/10 assertions.
+- The alpha.2 archive checksum, size, and exact final commit/tree are recorded by its annotated tag after this
+  documentation closeout rather than duplicated in the archived source tree.
 
 ## OSS-001 experimental GPLv3 source release — accepted 2026-09-14
 
