@@ -10,6 +10,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   remains private. The immutable `v0.1.0-alpha.1` tag is present on that remote, and the Thunderbolt DB
   `0.1.0-alpha.2` rename/source release is accepted. No GitHub Release or binary/container distribution has been
   published.
+- GitHub Actions is disabled for the repository and no CI/CD workflow definitions remain in the current tree.
+  Validation commands remain available for contributors to run locally.
 - The rename preserves alpha.1 as historical evidence, including its `gpu-database-engine` archive name and root.
 - All 17 internal `gpu_db_*` packages now inherit version `0.1.0-alpha.2`, the Thunderbolt DB repository URL, and
   `publish = false` from workspace metadata. Their crate/import names and `GPU_DB_*` configuration names are
