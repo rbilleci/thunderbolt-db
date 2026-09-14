@@ -1,42 +1,35 @@
 # gpu-database-engine
 
-An experimental GPU-native PostgreSQL-compatible OLTP database engine. Relational decisions and result values run
-on the GPU; the host owns the PostgreSQL wire protocol, planning, sequencing, durability I/O, and GPU orchestration.
+`gpu-database-engine` is an experimental GPU-native, PostgreSQL-compatible OLTP database engine. It speaks a
+PostgreSQL wire protocol and keeps relational execution on the GPU: the host handles connection I/O, SQL parsing and
+planning, transaction sequencing, WAL I/O, and device orchestration.
 
-This is an early source release for evaluation and development. It is not production-ready, does not implement the
-full PostgreSQL surface, and currently requires NVIDIA Blackwell-class hardware. The exact built surface and open
-work are recorded in [`docs/STATUS.md`](docs/STATUS.md) and [`docs/PLAN.md`](docs/PLAN.md).
+This is source release `0.1.0-alpha.1`. It is for evaluation and development with non-sensitive data, not a
+production database or a drop-in replacement for PostgreSQL.
 
-## Tested platform and prerequisites
+## Requirements
 
-The release candidate is tested on Ubuntu 26.04 with Rust 1.97.1, an RTX PRO 6000 Blackwell GPU, and NVIDIA driver
-595.84. The supported production floor is Blackwell / compute capability 12.0 (`sm_120`). Other Linux versions,
-drivers, GPUs, and architectures have not completed the release gate.
+The release candidate was tested on Ubuntu 26.04 with Rust 1.97.1, an RTX PRO 6000 Blackwell GPU, and NVIDIA driver
+595.84. A supported NVIDIA Blackwell GPU (compute capability 12.0 / `sm_120`) must be visible through `libcuda.so.1`.
+There is no CPU relational fallback: unavailable or failed GPU work fails rather than running relational operators on
+the host.
 
-A source build needs:
-
-- the Rust 1.97.1 toolchain selected by `rust-toolchain.toml` and Cargo;
-- an NVIDIA display driver exposing `libcuda.so.1` and a visible supported GPU;
-- a C/C++ build toolchain, CMake, Clang and libclang, `pkg-config`, Perl, Python 3, and ripgrep;
-- PostgreSQL `psql` for the quickstart, compatibility checks, and release smoke.
-
-On Ubuntu, the native build tools and client can be installed with:
+The checkout selects Rust 1.97.1 through [`rust-toolchain.toml`](rust-toolchain.toml). Install Rust with
+[rustup](https://rustup.rs/), an NVIDIA display driver through the distribution or NVIDIA's documented driver
+channel, and these Ubuntu build and validation tools:
 
 ```bash
 sudo apt-get update
 sudo apt-get install build-essential clang libclang-dev cmake pkg-config perl python3 ripgrep postgresql-client
 ```
 
-Install Rust through [rustup](https://rustup.rs/) and the NVIDIA driver through the distribution or NVIDIA's
-documented driver channel. The proprietary driver is an external system dependency licensed separately by NVIDIA;
-it is not included in this repository.
+The normal build uses checked-in PTX. A CUDA Toolkit and `nvcc` are needed only when regenerating PTX after editing
+CUDA source.
 
-The normal build uses the checked-in PTX. The CUDA Toolkit and `nvcc` are only needed to regenerate PTX after
-editing a `.cu` or `.cuh` file. Each CUDA source names its exact regeneration command next to the corresponding PTX.
+## Build and run
 
-## Build and run a durable local server
-
-Build the sole product server from a clean checkout:
+Build the only product server from a clean checkout. Keeping temporary build files in the checkout avoids relying on
+a small system `/tmp`.
 
 ```bash
 mkdir -p target/tmp
@@ -44,8 +37,8 @@ export TMPDIR="$PWD/target/tmp"
 cargo build --locked --release -p gpu_db_server --bin gpu-db-engine-server
 ```
 
-Start it on loopback with a persistent WAL path. The explicit serial durability mode is the most portable evaluation
-profile; one intent lane keeps this first run on the simple fdatasync-backed path.
+Start a loopback server with a durable WAL. The first-run profile below uses serial WAL durability and one intent
+lane.
 
 ```bash
 mkdir -p target/oss-demo
@@ -55,8 +48,8 @@ GPU_DB_WAL_SEGMENT="$PWD/target/oss-demo/server.wal" \
 target/release/gpu-db-engine-server --listen 127.0.0.1:55432
 ```
 
-The default `local-dev` security profile is loopback-only trust authentication without TLS. Leave the server in the
-foreground, open another terminal in the checkout, and run:
+The default `local-dev` profile is loopback-only trust authentication without TLS. In another terminal, exercise a
+durable transaction and read it through `psql`:
 
 ```bash
 export PGHOST=127.0.0.1 PGPORT=55432 PGUSER=postgres PGDATABASE=postgres PGSSLMODE=disable
@@ -75,26 +68,14 @@ SELECT SUM(balance) AS total_balance FROM accounts;
 SQL
 ```
 
-The result contains both rows, balances `15` and `20`, and a total of `35`. Stop the server with Ctrl-C, run the same
-server command again, and verify recovery:
+The rows have balances `15` and `20`, and the total is `35`. Stop the server, start it again with the same WAL path,
+then repeat the read to verify recovery. Starting without `GPU_DB_WAL_SEGMENT` selects an in-memory WAL and does not
+provide crash durability.
 
-```bash
-psql -X -v ON_ERROR_STOP=1 -c 'SELECT id, balance, note FROM accounts ORDER BY id'
-```
+## Security profile
 
-The recovered result must still contain balances `15` and `20`. Reusing the same WAL path is what makes this a
-restart test. Starting the server without `GPU_DB_WAL_SEGMENT` selects an in-memory WAL and is not crash-durable.
-
-For an automated version of the durable SQL/restart route, run:
-
-```bash
-scripts/run_oss_release_smoke.sh
-```
-
-## Security profiles
-
-Use `local-dev` only for the loopback quickstart with non-sensitive data. The server has an explicit production
-transport profile requiring TLS plus SCRAM-SHA-256 credentials:
+Use `local-dev` only for local evaluation with non-sensitive data. Any non-loopback deployment must explicitly use
+the production profile with TLS and SCRAM-SHA-256 credentials:
 
 ```bash
 GPU_DB_WAL_DURABILITY=serial \
@@ -108,60 +89,63 @@ target/release/gpu-db-engine-server \
   --auth-scram-verifier-file path/to/scram-verifier.txt
 ```
 
-That profile is implemented and tested, but this experimental release does not claim production operational
-readiness. See [`SECURITY.md`](SECURITY.md) before any deployment or vulnerability report.
+The profile is covered by TLS/SCRAM checks, but it does not make this experimental engine production-ready. Read
+[`SECURITY.md`](SECURITY.md) before deployment or reporting a vulnerability.
 
-## Current envelope
+## Validate a checkout
 
-The engine exposes a PostgreSQL 16-style wire protocol and a bounded SQL/type surface including transactional DDL
-and DML, prepared parameters, NULL handling, COPY, indexes and constraints, joins, grouping, ordering, aggregates,
-and GPU-resident point/scan paths documented in `docs/STATUS.md`. WAL-before-visibility and crash recovery are
-release invariants.
-
-Current boundaries include:
-
-- one supported product server and single-node evaluation scope;
-- NVIDIA Blackwell GPU required, with no CPU relational fallback;
-- partial PostgreSQL SQL/catalog/type/driver compatibility rather than drop-in PostgreSQL equivalence;
-- no accepted multi-node HA, automatic checkpoint/PITR policy, 100k-connection scale, or comparative OLTP result;
-- the production TLS/SCRAM profile does not by itself make the system production-ready.
-
-These boundaries are tracked under existing IDs in `docs/PLAN.md`; they do not prevent the durable local workflow
-above from functioning.
-
-## Validation
-
-Host-neutral checks and the trusted GPU release matrix are intentionally separate. Common developer gates are:
+Run the host-visible build and ownership checks first:
 
 ```bash
 cargo check --locked --workspace --all-targets --all-features
-cargo test --locked --workspace --all-features
-scripts/run_psql_golden.sh
-scripts/run_application_driver_smokes.sh
+scripts/check_product_ownership.sh
 ```
 
-GPU tests use bounded timeouts and serial sweeps. Never use `--gpu-reset`. Changes to a read kernel, residency
-layout, or result path use the benchmark report card described in `AGENTS.md`; its quick mode is only a development
-screen. Follow [`AGENTS.md`](AGENTS.md) for the complete gate order.
+On a host with a visible NVIDIA GPU and `psql`, the durable release smoke builds the release server unless
+`OSS_SERVER_BIN` names an existing executable. It creates its own temporary WAL and loopback port, exercises typed
+and NULL values, commit and rollback, kills and restarts the server, and verifies the recovered ordered rows and
+aggregate.
 
-## Project documentation
+```bash
+scripts/run_oss_release_smoke.sh
+```
 
-- [`docs/CHARTER.md`](docs/CHARTER.md) — mandate and execution boundary.
-- [`docs/PLAN.md`](docs/PLAN.md) — the only open/deferred work ledger.
-- [`docs/STATUS.md`](docs/STATUS.md) — current implementation facts and evidence.
-- [`docs/HANDOVER.md`](docs/HANDOVER.md) — current resume baton.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system design.
-- [`docs/DECISIONS.md`](docs/DECISIONS.md) — accepted rationale.
-- [`docs/CODE_SIZE.md`](docs/CODE_SIZE.md) — source-size and decomposition standard.
+For an archive of a committed release tree, run:
 
-Superseded plans, reviews, benchmark packets, and research are available from Git history and the
-`v0.1.0-alpha.1` tag. They are intentionally absent from the current source tree.
+```bash
+RELEASE_REF=HEAD scripts/build_source_release.sh
+```
 
-## License and contributions
+It writes a reproducible `gzip -n` archive under `target/releases` by default, reports its commit, version, path,
+SHA-256, and size, and checks the required license and third-party notice files. Set `RELEASE_OUT_DIR` to an existing
+writable directory to choose another destination.
+
+## Scope and limits
+
+The server has one supported product binary and a single-node evaluation scope. It implements a bounded SQL, type,
+catalog, and driver surface with transactional DDL/DML, prepared parameters, NULL handling, COPY, indexes and
+constraints, joins, grouping, ordering, aggregates, and GPU-resident point and scan paths. The exact implementation
+surface is recorded in [`docs/STATUS.md`](docs/STATUS.md).
+
+It does not claim complete PostgreSQL compatibility, multi-node HA, automatic checkpoint/PITR policy,
+100k-connection scale, or a comparative OLTP result. Current, deferred, and blocked work is owned only by
+[`docs/PLAN.md`](docs/PLAN.md).
+
+## Documentation
+
+- [`docs/CHARTER.md`](docs/CHARTER.md) — GPU-native mandate and execution boundary.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — runtime, storage, durability, and execution design.
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — accepted design decisions.
+- [`docs/STATUS.md`](docs/STATUS.md) — implementation facts and evidence.
+- [`docs/PLAN.md`](docs/PLAN.md) — the open-work ledger.
+- [`docs/HANDOVER.md`](docs/HANDOVER.md) — current engineering baton.
+- [`AGENTS.md`](AGENTS.md) — development gates, benchmark rules, and source-size guidance.
+
+## License and contributing
 
 Project-authored work is licensed under GNU GPL version 3 only (`GPL-3.0-only`) with a narrow section-7 permission
-for the separately installed CUDA Driver API; see [`LICENSE`](LICENSE), [`CUDA_EXCEPTION`](CUDA_EXCEPTION), and
-[`COPYRIGHT`](COPYRIGHT). Dependencies and external runtime tools retain their own terms; see
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+for the separately installed CUDA Driver API. See [`LICENSE`](LICENSE), [`CUDA_EXCEPTION`](CUDA_EXCEPTION),
+[`COPYRIGHT`](COPYRIGHT), and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Dependencies and external runtime
+tools retain their own terms.
 
-Contributions require a Developer Certificate of Origin sign-off. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Contributions require Developer Certificate of Origin sign-off. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
