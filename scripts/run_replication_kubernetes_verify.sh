@@ -27,7 +27,7 @@ if yaml is None:
     for follower_id in ("2", "3"):
         required = [
             f"name: gpu-db-replication-follower-{follower_id}",
-            f"gpu-db.openclaw.dev/follower-id: \"{follower_id}\"",
+            f"gpu-db-follower-id: \"{follower_id}\"",
             "image: gpu-db-replication-service:local",
             "- --follower-service",
             "- $(GPU_DB_REPLICATION_FOLLOWER_ID)",
@@ -69,7 +69,7 @@ for follower_id in ("2", "3"):
         raise SystemExit(f"missing Deployment/Service pair for follower {follower_id}")
 
     labels = deployment["spec"]["selector"]["matchLabels"]
-    if labels.get("gpu-db.openclaw.dev/follower-id") != follower_id:
+    if labels.get("gpu-db-follower-id") != follower_id:
         raise SystemExit(f"deployment selector does not pin follower {follower_id}")
     if deployment["spec"].get("replicas") != 1:
         raise SystemExit(f"deployment {name} must be single-replica")
@@ -99,7 +99,7 @@ for follower_id in ("2", "3"):
         raise SystemExit(f"deployment {name} port contract drifted: {ports}")
 
     selector = service["spec"]["selector"]
-    if selector.get("gpu-db.openclaw.dev/follower-id") != follower_id:
+    if selector.get("gpu-db-follower-id") != follower_id:
         raise SystemExit(f"service selector does not pin follower {follower_id}")
     service_ports = service["spec"].get("ports", [])
     if service_ports != [{"name": "append", "port": 55432, "targetPort": "append"}]:

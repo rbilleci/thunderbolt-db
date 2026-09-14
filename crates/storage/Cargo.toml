@@ -2,6 +2,7 @@
 name = "gpu_db_storage"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 version.workspace = true
 
 [dependencies]

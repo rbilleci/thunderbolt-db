@@ -1,0 +1,35 @@
+GPU-DATABASE-ENGINE CUDA DRIVER ADDITIONAL PERMISSION
+Version 1.0
+
+This is an additional permission under section 7 of the GNU General
+Public License, version 3 ("GPLv3").
+
+For project-authored material in gpu-database-engine that is licensed
+under GPLv3 and for which the copyright holders can grant this
+permission (the "Program"), those copyright holders give you permission
+to link, load, or otherwise combine the Program with Covered NVIDIA
+Driver Components installed separately on the recipient's system, and
+to convey the resulting work, provided that the Program communicates
+with those components solely through the published CUDA Driver API.
+
+"Covered NVIDIA Driver Components" means NVIDIA's unmodified,
+separately obtained implementation of the CUDA Driver API in
+libcuda.so, libcuda.so.1, or an ABI-versioned successor, together with
+unmodified NVIDIA shared libraries loaded by that implementation solely
+to implement the CUDA Driver API, including
+libnvidia-ptxjitcompiler.so.
+
+Covered NVIDIA Driver Components do not include the CUDA Runtime,
+CUDA Toolkit libraries or compiler tools, static NVIDIA libraries,
+NVRTC, nvJitLink, cuBLAS, cuDNN, NCCL, NVML, or other NVIDIA software.
+
+You must comply with GPLv3 for the Program and with the applicable
+licenses for all other code. This additional permission grants no
+rights in NVIDIA software, does not subject NVIDIA software to GPLv3,
+and does not authorize you to copy, modify, sublicense, or convey
+NVIDIA software. Covered NVIDIA Driver Components must be obtained and
+licensed separately.
+
+If you modify the Program, you may extend this additional permission to
+your version, but you are not obligated to do so. If you do not wish to
+do so, delete this additional permission statement from your version.

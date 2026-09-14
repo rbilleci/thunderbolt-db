@@ -55,7 +55,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   batch-65,536 production-compact Section-B samples **272,464,995 / 272,655,388 / 273,479,060 lookups/s**
   (median **272,655,388**, 3/3 above the **260M** floor); raw out-of-L2 `sum_i32` was **1,440 GB/s**.
 - Its one clean-filesystem canonical full card retained a complete transcript at
-  `/home/richard/projects/gpu-db-write001-storage-v6-candidate.kC89eg/candidate/target/benchmark-report-card-runs/runner.b24889c985e3.b0fbe39d618d.Tdf2lk.log`
+  `candidate/target/benchmark-report-card-runs/runner.b24889c985e3.b0fbe39d618d.Tdf2lk.log`
   (SHA-256 `d91a1ea2536443d89af0952af1a9cb5dc10c5074c1ff303b2fcfd47b3c993a75`): Sections A/B/C and valid closeout
   completed, its exact terminal canonical record occurs once, and the fresh owned target was removed. Section B
   median was **266,839,011 lookups/s** (3/3 above 260M); Section C completed 48M rows/300 batches at
@@ -1408,7 +1408,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `a08012099edd196461870b254a5567ee17c8fc692e6e14e05d8d07d5bf93b53b` were run serially at 8M rows /
   4,001 shards: candidate build/total was **95.4s/100.60s**, base was **95.0s/100.30s**, and both produced
   **20us/19us** compatibility/compact p50. The **+0.4%/+0.3%** delta rules out a material candidate regression at
-  that calibrated diagnostic scale. The original failed log remains `/tmp/product001-index-full-card.log`.
+  that calibrated diagnostic scale. The original failed log was a local temporary diagnostic and is not part of
+  the source release.
 - The independently re-audited documentation-only retry candidate is staged tree
   `2497b5fd00da8bee39f583a818e32e1da6952222` with cached binary-diff SHA-256
   `736653b742aed8be067f9623764ad9226694983f3448f50d2d754bffcdbb8575`. Its one full invocation used the

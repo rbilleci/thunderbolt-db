@@ -1951,16 +1951,16 @@ fn resolve_launch(
     });
     let kernels = RuntimeTypedInsertGenerationKernels {
         validate: primary
-            .cached_function(c"gpu_db_runtime_typed_insert_generation_v3_validate", &ptx)?,
-        cells: primary.cached_function(c"gpu_db_runtime_typed_insert_generation_v3_cells", &ptx)?,
-        rows: primary.cached_function(c"gpu_db_runtime_typed_insert_generation_v3_rows", &ptx)?,
+            .cached_function(c"gpu_db_runtime_typed_insert_generation_v3_validate", ptx)?,
+        cells: primary.cached_function(c"gpu_db_runtime_typed_insert_generation_v3_cells", ptx)?,
+        rows: primary.cached_function(c"gpu_db_runtime_typed_insert_generation_v3_rows", ptx)?,
         reduce: primary
-            .cached_function(c"gpu_db_runtime_typed_insert_generation_v3_reduce", &ptx)?,
+            .cached_function(c"gpu_db_runtime_typed_insert_generation_v3_reduce", ptx)?,
         finalize_indexed: primary
-            .cached_function(c"gpu_db_runtime_typed_insert_generation_v3_finalize", &ptx)?,
+            .cached_function(c"gpu_db_runtime_typed_insert_generation_v3_finalize", ptx)?,
         finalize_unindexed: primary.cached_function(
             c"gpu_db_runtime_typed_insert_generation_v3_finalize_unindexed",
-            &ptx,
+            ptx,
         )?,
     };
     let launch = unsafe {

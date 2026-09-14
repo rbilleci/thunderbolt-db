@@ -3,6 +3,7 @@ name = "gpu_db_sql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # Neutral SQL vocabulary: the command AST, `SqlType`/`SqlValue`, the parser, and
 # `ParseError`. Lives below both `gpu_db_engine` and `gpu_db_protocol` so the

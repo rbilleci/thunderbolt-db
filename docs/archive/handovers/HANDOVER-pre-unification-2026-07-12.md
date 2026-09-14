@@ -913,8 +913,8 @@ boundaries (memory `working-agreement-sequencing`).
 
 ## Pointers
 
-- **Memory (read first):** `MEMORY.md` index at
-  `~/.claude/projects/-home-richard-projects-gpu-database-engine/memory/`. Key files:
+- **Historical agent memory (not distributed with the project):** the private memory index used during this
+  archived handover referenced:
   `e25c-hardening-default-flip` (the shipped state), `fua-pipelined-durable-wal` (the durable laws),
   `tmp-quota-test-wal-hygiene`, `scalability-ledger`, `type-coverage-14` (Tier 1 frame),
   `stay-gpu-native-charter`, `gpu-test-threads-serial`, `benchmark-report-card`.

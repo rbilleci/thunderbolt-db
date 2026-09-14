@@ -3,6 +3,7 @@ name = "gpu_db_snapshot"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # Reader/writer snapshot-generation pattern (prototype→production plan, P1-M2
 # spike). The concurrency substrate the engine adopts: an immutable, Arc-shared

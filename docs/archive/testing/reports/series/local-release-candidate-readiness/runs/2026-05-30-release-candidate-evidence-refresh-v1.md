@@ -4,7 +4,7 @@
 - git_sha: aa78c3e588af04ca89a004291a7b9d81ad3c1cb4
 - stream: release-candidate
 - milestone: post-security-replication-P8 release-candidate evidence refresh
-- validation_gate: `PATH=/home/richard/.local/bin:$PATH scripts/run_local_release_candidate_evidence_bundle.sh`
+- validation_gate: `scripts/run_local_release_candidate_evidence_bundle.sh`
 - result: pass
 
 ## Work Order
@@ -36,7 +36,7 @@ in `format!`. Commit `aa78c3e5` fixed that before the clean bundle was produced.
 ## Command Result
 
 ```bash
-PATH=/home/richard/.local/bin:$PATH scripts/run_local_release_candidate_evidence_bundle.sh
+scripts/run_local_release_candidate_evidence_bundle.sh
 ```
 
 The command passed and produced a clean release-review bundle under `target/`.
@@ -92,7 +92,7 @@ The generated remaining-gap file preserves the current production boundaries:
 - `scripts/run_local_release_candidate_evidence_bundle_smoke.sh`: passed
 - `scripts/run_p8_ch_benchmark_residency_probe.sh --self-check`: passed
 - `cargo clippy --all-features --example p8_ch_benchmark_residency_probe -- -D warnings`: passed
-- `PATH=/home/richard/.local/bin:$PATH scripts/run_local_release_candidate_evidence_bundle.sh`: passed
+- `scripts/run_local_release_candidate_evidence_bundle.sh`: passed
 - `git diff --check`: passed before report creation
 
 ## Follow-Up Slice

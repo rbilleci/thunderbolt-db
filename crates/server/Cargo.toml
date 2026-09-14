@@ -3,6 +3,7 @@ name = "gpu_db_server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 probe-timing = ["gpu_db_facade/probe-timing"]
@@ -25,7 +26,6 @@ pbkdf2 = "0.12"
 pg_query = "6"
 rand = "0.8"
 rustls = "0.23"
-rustls-pemfile = "2"
 sha2 = "0.10"
 stringprep = "0.1"
 subtle = "2"

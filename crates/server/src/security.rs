@@ -1,5 +1,4 @@
 use std::env;
-use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -14,7 +13,10 @@ use gpu_db_protocol::{
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::OsRng, RngCore};
-use rustls::{ServerConfig as TlsServerConfig, ServerConnection, StreamOwned};
+use rustls::{
+    pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer},
+    ServerConfig as TlsServerConfig, ServerConnection, StreamOwned,
+};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -481,25 +483,38 @@ pub(crate) fn complete_local_startup(
 }
 
 fn load_tls_config(production: &ProductionSecurityConfig) -> io::Result<TlsServerConfig> {
-    let mut cert_reader = io::BufReader::new(File::open(&production.tls_cert)?);
-    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let certs = CertificateDer::pem_file_iter(&production.tls_cert)
+        .map_err(pem_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(pem_error)?;
     if certs.is_empty() {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "production TLS certificate file contains no certificates",
         ));
     }
-    let mut key_reader = io::BufReader::new(File::open(&production.tls_key)?);
-    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            "production TLS key file contains no private key",
-        )
-    })?;
+    let key = PrivateKeyDer::pem_file_iter(&production.tls_key)
+        .map_err(pem_error)?
+        .next()
+        .transpose()
+        .map_err(pem_error)?
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "production TLS key file contains no private key",
+            )
+        })?;
     TlsServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))
+}
+
+fn pem_error(error: rustls::pki_types::pem::Error) -> io::Error {
+    match error {
+        rustls::pki_types::pem::Error::Io(error) => error,
+        error => io::Error::new(ErrorKind::InvalidData, error.to_string()),
+    }
 }
 
 fn parse_startup_or_error(stream: &mut dyn ReadWrite, frame: &[u8]) -> io::Result<StartupPacket> {

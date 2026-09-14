@@ -1,0 +1,53 @@
+# This policy is evaluated against the complete Cargo workspace, including build
+# and development dependencies. It is intentionally strict about new sources and
+# advisories so a release candidate cannot silently acquire a new dependency.
+
+[advisories]
+# No advisory or yanked-package exceptions are accepted for the release graph.
+ignore = []
+
+[licenses]
+# These SPDX identifiers are the complete set reported by `cargo deny list` for
+# the locked workspace. GPL-3.0-only is this project's license; the remaining
+# identifiers are licenses declared by its dependencies.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+# `cargo deny` checks Cargo package metadata and detected license files. It
+# does not establish that bundled native source notice obligations are met:
+# aws-lc-sys, pg_query/libpg_query (PostgreSQL source), and
+# tikv-jemalloc-sys require the release notice inventory to be reviewed
+# separately for the exact source artifact.
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+# Cargo models an in-workspace `path` dependency without an explicit version as
+# a wildcard. Cargo.lock pins those local edges for the source artifact, so
+# this check cannot distinguish them from a registry wildcard. New external
+# dependencies remain covered by the locked graph, source policy, license
+# policy, and advisory policy above.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

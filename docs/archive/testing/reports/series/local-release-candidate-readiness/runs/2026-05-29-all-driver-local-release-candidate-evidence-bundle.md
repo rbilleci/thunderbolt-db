@@ -4,7 +4,7 @@
 - git_sha: 51ae8e87d4afd4dacc3dd5156700982f19765678
 - stream: release-candidate
 - milestone: all-driver local release-candidate evidence-bundle rehearsal
-- validation_gate: `PATH=/home/richard/.local/bin:$PATH scripts/run_local_release_candidate_evidence_bundle.sh`
+- validation_gate: `scripts/run_local_release_candidate_evidence_bundle.sh`
 - result: pass
 
 ## Work Order
@@ -22,7 +22,7 @@
 ## Command Result
 
 ```bash
-PATH=/home/richard/.local/bin:$PATH scripts/run_local_release_candidate_evidence_bundle.sh
+scripts/run_local_release_candidate_evidence_bundle.sh
 ```
 
 The command passed and produced a release-review bundle under `target/`.
@@ -48,8 +48,8 @@ The command passed and produced a release-review bundle under `target/`.
 - npm_version: 10.9.7
 - go_version: go version go1.26.3 linux/amd64
 - javac_version: javac 21.0.11
-- maven_version: Apache Maven 3.9.16 with Java 21.0.11 at `/home/richard/.local/toolchains/jdk-21`
-- gradle_version: Gradle 9.5.1 with Java 21.0.11 at `/home/richard/.local/toolchains/jdk-21`
+- maven_version: Apache Maven 3.9.16 with Java 21.0.11
+- gradle_version: Gradle 9.5.1 with Java 21.0.11
 - nvidia_smi_version: NVIDIA GeForce RTX 3090, 595.58.03
 - nvcc_version: CUDA compilation tools release 12.0, V12.0.140
 

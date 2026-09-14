@@ -11,9 +11,42 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang libclang-dev cmake pkg-config perl python3 ripgrep postgresql-client
+      - uses: dtolnay/rust-toolchain@1.97.1
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny 0.19.9
+        run: cargo install --locked cargo-deny --version 0.19.9
+      - name: Dependency policy
+        run: cargo deny --locked check advisories bans licenses sources
+      - name: Install gitleaks 8.28.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly archive_name="gitleaks_8.28.0_linux_x64.tar.gz"
+          readonly archive_sha256="a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"
+          readonly install_dir="${RUNNER_TEMP}/gitleaks-8.28.0"
+          mkdir -p "$install_dir"
+          curl --fail --location --silent --show-error \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/${archive_name}" \
+            --output "${install_dir}/${archive_name}"
+          printf '%s  %s\n' "$archive_sha256" "$archive_name" | \
+            (cd "$install_dir" && sha256sum --check --status -)
+          tar -xzf "${install_dir}/${archive_name}" -C "$install_dir" gitleaks
+          install -m 0755 "${install_dir}/gitleaks" "${RUNNER_TEMP}/gitleaks"
+          "${RUNNER_TEMP}/gitleaks" version | grep -Fqx '8.28.0'
+      - name: Secret policy
+        shell: bash
+        run: >-
+          "${RUNNER_TEMP}/gitleaks" git --log-opts="--all" --redact --no-banner
+          --config .gitleaks.toml
+      - name: Locked host build
+        run: cargo check --locked --workspace --all-targets --all-features
       - name: detect NVIDIA runtime
         id: gpu
         shell: bash
@@ -44,13 +77,13 @@ jobs:
           fi
           git diff --check "$base_sha" HEAD
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: host-neutral test
         env:
           CUDA_VISIBLE_DEVICES: ""
         run: |
           set -euo pipefail
-          cargo test --workspace --all-features \
+          cargo test --locked --workspace --all-features \
             --exclude gpu_db_engine \
             --exclude gpu_db_facade \
             --exclude gpu_db_protocol \
@@ -60,5 +93,5 @@ jobs:
         if: steps.gpu.outputs.available == 'true'
         run: |
           set -euo pipefail
-          cargo test -p gpu_db_engine --lib --all-features -- \
+          cargo test --locked -p gpu_db_engine --lib --all-features -- \
             --include-ignored --test-threads=1 --color never

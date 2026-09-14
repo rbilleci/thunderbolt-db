@@ -1,0 +1,5 @@
+# Reviewed historical false positives. Each fingerprint names immutable content and the rule that matched it.
+# The first is prose enumerating a sort key; the latter two are headings followed by local memory-file paths.
+3351d35e6a03e5e600f3bb4e6021ff561f4a274e:docs/design/write-001-codec5-semantics-v2.md:generic-api-key:1947
+c5be0c96ad851bb51a3460614aa8dfc08b358af5:docs/archive/handovers/HANDOVER-pre-unification-2026-07-12.md:generic-api-key:917
+1588633779de42876e81502dd6f7e5c9e6d5351e:docs/HANDOVER.md:generic-api-key:151
