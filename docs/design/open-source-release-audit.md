@@ -88,7 +88,7 @@ exceptions. Nine informational duplicate-version warnings remain in transitive b
 Special native/component review is recorded for:
 
 - `pg_query 6.1.1`, which builds libpg_query, PostgreSQL 17.4-derived parser source, protobuf-c, and xxHash;
-- `aws-lc-rs 1.17.0` / `aws-lc-sys 0.41.0`;
+- `aws-lc-rs 1.18.1` / `aws-lc-sys 0.45.0`;
 - `tikv-jemallocator 0.6.1` / jemalloc;
 - `imbl 7.0.2` and `imbl-sized-chunks 0.2.0` under MPL-2.0 or later, with no inspected Exhibit B
   incompatibility notice.
