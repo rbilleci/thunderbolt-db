@@ -129,7 +129,7 @@ Blackwell / compute capability 12.0.
 | `pgwire_roundtrip --include-ignored` | 6/6 passed; asynchronous/blocking clients, COPY/recovery/hazard, concurrent connections, and a non-vacuous GPU point route. |
 | `scripts/run_oss_release_smoke.sh` using the rebuilt release binary | 10/10 assertions passed: typed/NULL insert, committed update, rolled-back delete, ordered GPU read and SUM, SIGKILL, restart, and identical recovered results. |
 | Twice-built frozen runtime source archive | Byte-identical outputs, SHA-256 `de8ff5522eba7f874fc18930ffa335314158ec8439e31c5802aa798dc579746c`, 5,931,826 bytes; 27 PTX / 3 CUDA / 1 header; zero research or target entries. This hash binds runtime commit `139aa895`; the annotated local tag records the final documentation-only closeout archive. |
-| Extracted current archive in a new Ubuntu 26.04 container | Clean locked release build passed in 3m39s with Rust 1.97.1, Clang/libclang 21.1.8, PostgreSQL client 18.6, the documented native packages, and no bindgen workaround. Product ownership and all 10 durable GPU SQL/SIGKILL/restart assertions passed against the container-built binary with the host RTX PRO 6000/driver 595.84 passed through. |
+| Extracted runtime-candidate archive in a new Ubuntu 26.04 container | Clean locked release build passed in 3m39s with Rust 1.97.1, Clang/libclang 21.1.8, PostgreSQL client 18.6, the documented native packages, and no bindgen workaround. Product ownership and all 10 durable GPU SQL/SIGKILL/restart assertions passed against the container-built binary with the host RTX PRO 6000/driver 595.84 passed through. |
 | Connection security preflight | Passed with generated TLS certificate/key PEM and SCRAM authentication. |
 | Replication channel security preflight | Passed with generated mTLS CA/node PEM and an authenticated append route. |
 | `cargo check --locked --workspace --all-targets --all-features` | Passed with the disclosed audit-host bindgen include workaround. |
@@ -144,8 +144,9 @@ without interactive sudo; an unprovisioned host build therefore reproduces bindg
 The pre-freeze release build passes there with the disclosed temporary GCC-15 include workaround. More
 significantly, the extracted artifact builds without any workaround in a clean Ubuntu 26.04 container after
 installing the documented packages. The first minimal container run also showed that release verification scripts
-need Python 3 and the ownership guard needs ripgrep; both are now explicit prerequisites. The final exact committed
-archive must repeat or validly carry this clean-container evidence after the rights-only documentation change.
+need Python 3 and the ownership guard needs ripgrep; both are now explicit prerequisites. The exact tagged closeout
+archive passed the same clean-container gate; its archive and transcript identities are stored in the annotated tag
+outside the self-referential source payload.
 
 The hosted workflow installs native prerequisites, pins Rust and policy-tool versions, checks the complete locked
 workspace, and runs host-neutral tests. GPU absence is reported there. The manual trusted workflow instead fails

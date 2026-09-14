@@ -30,7 +30,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `6508ac9b` card (SHA-256 `9a4ea081124b2f1f5c3b8411386d811f71ea87d4d8af07e209bdfe5977f53a52`)
   under the same exclusive GPU/config/toolchain. Candidate in-L2 median was 262,173,070 lookups/s, all 3 samples
   above the 260M floor; out-of-L2 was 258,583,015 lookups/s at 126us. Independent post-card audit found no material
-  regression, and the final source/tag audit accepted the release boundary. Full evidence is in
+  regression. Full evidence is in
   [`docs/design/open-source-release-audit.md`](design/open-source-release-audit.md).
 
 ## Product direction and execution boundary
