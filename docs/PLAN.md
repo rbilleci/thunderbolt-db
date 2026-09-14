@@ -20,67 +20,6 @@ task ID here or be explicitly historical.
 
 The current unified GPU-native write engine is an accepted release checkpoint. Its comparative write-performance reassessment is deliberately deferred under **WRITE-002**; no performance target is active until that task is explicitly promoted.
 
-The 2026-09-14 open-source readiness audit identifies **OSS-001** as the minimal publication milestone.
-Its target is a working experimental GPLv3 source release of the accepted engine. The audit itself does not
-accept a release, change the license, or authorize a public push.
-
-## OSS-001 — minimal GPLv3 source release
-
-Evidence: [open-source release audit](design/open-source-release-audit.md) and
-[resolved dependency inventory](design/open-source-dependencies.tsv), audited at `6508ac9b`.
-One integrated candidate owns the following ordered acceptance rows; these are not prerequisite milestones.
-
-1. **Rights and license.** Confirm the rights holder and provenance of contributed/copied code, CUDA kernels,
-   generated sources, and any distributed research/media. Use `GPL-3.0-only` as the proposed interpretation of
-   “GPL v3”; record a rights-holder choice if `GPL-3.0-or-later` is intended. Resolve the actual NVIDIA driver/SDK
-   boundary through a documented System Library analysis or an appropriate narrow section-7 permission granted
-   by the relevant rights holders; do not assume dynamic loading or source-only distribution resolves it. Add
-   the unmodified GPLv3 text, project copyright/license notice, consistent workspace metadata, any approved
-   exception, and third-party notices. Preserve existing third-party grants. If past versions were validly
-   distributed under MIT, do not claim the new license retracts those grants. **Pass:** the intended source
-   artifact and any permitted linked distribution have an explicit, internally consistent licensing disposition.
-2. **Bounded dependency hygiene.** Update the development PostgreSQL clients to versions fixing
-   RUSTSEC-2026-0178/0179/0180 and resolve the yanked `chacha20` lock entry. Disposition unmaintained `bitmaps`
-   and `rustls-pemfile` with either bounded replacements or explicit, justified, revisitable advisory-policy
-   exceptions; replacing the persistent-map architecture is not automatically a source-release prerequisite.
-   Add a reviewed deny policy and license/component inventory covering the shipped graph plus native
-   libpg_query/PostgreSQL/protobuf-c/xxHash, AWS-LC, and jemalloc notices. **Pass:** reproducible license and
-   advisory checks have no undispositioned findings; focused clients and affected production paths pass.
-3. **Publication contents.** Scan the complete intended tree and all Git refs/history to be published with a
-   history-aware secret scanner; review findings without printing credentials. Inspect research/media provenance
-   and personal/internal metadata. Preserve synthetic fixtures with narrow scanner classifications. Retain
-   authored Rust/PTX/CUDA/header sources, generator instructions, manifests, lockfile, and required tests. Keep
-   existing history if its review is clean; a separately prepared source snapshot is an alternative when history
-   cannot be cleared, never an implicit history rewrite. Archive pruning is optional unless a concrete rights or
-   disclosure finding requires it; update affected references in the same candidate. **Pass:** the exact
-   publication scope is reviewed, reproducible, and contains required corresponding source and notices.
-4. **One documented working route.** Add a README quickstart for the sole `gpu-db-engine-server`: tested
-   Linux/Rust/native prerequisites, supported Blackwell GPU/driver configuration, build with `--locked`, explicit
-   durable WAL directory, loopback trust-profile explanation, psql connection settings, example SQL, stop/restart,
-   and expected output. Document actual compatibility/limitations and the optional production TLS/SCRAM profile
-   without claiming production readiness. Distinguish running shipped PTX from regenerating it with the documented
-   CUDA compiler. Generalize workstation-specific bindgen configuration where necessary and make TMPDIR setup
-   explicit; the current fresh export passes on the audit host, so do not label either setting a reproduced
-   cross-platform failure. Add concise contribution/license policy and an owner-selected security reporting
-   channel; repair public-facing dead links and unsupported durability/performance wording. **Pass:** a fresh
-   checkout on a documented provisioned machine follows the README literally and passes typed/NULL SQL, commit,
-   rollback, GPU reads, and acknowledged-write recovery across process restart.
-5. **Exact release proof.** Make native prerequisites and host checks reproducible in CI; pair them with a trusted
-   GPU release workflow that fails on missing hardware or zero executed tests. Reuse `check_product_ownership.sh`,
-   `durable_process_recovery`, the pgwire matrix, and a psql smoke rather than building a second server/demo path.
-   Validate the source export with a fresh build target and record environment, commands, test counts, source
-   identity, and artifact hashes. Freeze/stage the complete candidate and obtain the required independent
-   acceptance audit, then the applicable GPU/performance card under AGENTS.md; documentation/license-only work
-   does not itself require a new card, while qualifying runtime/dependency changes do. **Pass:** all rows above
-   close on one candidate and the auditor accepts its applicable evidence. Prepare a source release/tag as an
-   experimental version; public push, repository-visibility changes, and publication remain explicit owner actions.
-
-Minimal artifact: source plus required notices and a verified quickstart. Prebuilt GPU binaries, CUDA/container
-redistribution, crates.io publication of all 17 internal crates, full packaging, and a production-readiness claim
-are outside this milestone. Broader hardening remains PRODUCT-003. Do not reactivate WRITE-002/CARD-001 or gate
-this source release on BENCH-001, HA-001, SCALE-001, universal SQL compatibility, global formatting, or general
-file decomposition. A correctness defect in the advertised quickstart/recovery envelope is a release blocker
-and receives the normal integrated repair gates; documenting it away does not satisfy the row.
 
 ## STRUCT-001 — oversized-file remediation method
 
@@ -194,7 +133,6 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **OSS-001** | NEXT | P0 | Deliver an experimental GPLv3 source release with cleared rights/dependencies/publication contents and one independently verified fresh-checkout durable GPU/pgwire workflow. The five ordered acceptance rows above define the complete milestone. | User request for open-source readiness, 2026-09-14; rights-holder licensing/NVIDIA disposition and release scope are required before publication | `docs/design/open-source-release-audit.md`; `docs/design/open-source-dependencies.tsv` |
 | **READ-002** | BLOCKED | P2 | The BENCH prerequisite milestone passed on 2026-07-19: the typed engine API prepares one exact-generation, O(1) GPU directory for compound `(tenant_id int4, account_id int8)` equality, exact-rechecks collisions and MVCC on-device, gathers the required fixed-width projections, proves nonzero GPU/index/cache hits, and retains zero cold accesses with GPU-scan parity. Broader bigint/text/UUID/numeric and composite point-lookup breadth remains under READ-002 after BENCH-001. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical compound milestone is complete | `docs/design/non-int4-index-design-inputs.md`; 2026-07-19 STATUS evidence |
 | **PRODUCT-002** | BLOCKED | P2 | The BENCH canonical SQL/type milestone passed on 2026-07-19: the immutable schema and W1 statements parse unchanged; typed placeholders and required pgwire codecs are available; every named primary/secondary index publishes and mutates in resident GPU generations; checked expression UPDATE and DML `RETURNING` execute without host relational fallback. After BENCH evidence, complete persistent GPU system catalogs, large NUMERIC, and unrelated protocol/type breadth. | Accepted BENCH-001 architecture evidence for the broader breadth; canonical SQL/type milestone is complete | ARCHITECTURE §3; `docs/design/oltp-benchmark-workload-v1.md`; 2026-07-19 STATUS evidence |
 | **WRITE-002** | PARKED | P0 | Reassess the accepted current write engine against a deliberate performance contract. Establish the workload, paired-system configuration, throughput target, and tail-latency budget only when this task is explicitly promoted; preserve the current general codec-5 lifecycle and do not treat its checkpoint measurement as a comparative-performance claim. | Explicit user promotion after release experience or a new product target | 2026-08-10 product decision; current baseline in `STATUS.md` |

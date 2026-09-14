@@ -4,6 +4,11 @@
 
 ## Current boundary
 
+**OSS-001 is an accepted experimental GPLv3 source release.** The local `v0.1.0-alpha.1` tag identifies the
+exact deterministic source artifact and checksum. The repository remains private and nothing was pushed or
+published. Preserve the license, CUDA additional permission, third-party notices, source-export boundary, and
+working durable GPU/pgwire route recorded in [STATUS.md](STATUS.md#oss-001-experimental-gplv3-source-release--accepted-2026-09-14).
+
 **WRITE-000 is an accepted release checkpoint.** Preserve the unified `TypedInsertBatch` → overlay → codec-5 semantics-v2 → `DeviceInsertPlan` → canonical WAL/status → GPU apply/publication → fresh-replay implementation. Do not discard or rebuild it.
 
 `benchmark_report_card.sh --full` measured only raw/read point paths. Its successful A/B/C transcript remains read-regression evidence, not a write-throughput claim.

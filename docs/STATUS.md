@@ -3,6 +3,36 @@
 This document records what exists and what has been verified. It does not own tasks or sequencing. Every live
 gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
+## OSS-001 experimental GPLv3 source release — accepted 2026-09-14
+
+- The project is prepared as experimental version `0.1.0-alpha.1` under `GPL-3.0-only`. `LICENSE` contains the
+  unmodified GPLv3 text; `CUDA_EXCEPTION` grants the narrow section-7 permission needed for a separately installed
+  CUDA Driver API; `COPYRIGHT`, `THIRD_PARTY_NOTICES.md`, eight third-party license texts, DCO, contribution,
+  security, changelog, and complete 17-crate metadata are present. The release authority confirmed the required
+  rights and selected the public contributor-form notice.
+- Runtime commit `139aa8959905877c3fac6809d0f5568b1fd33c1c`, tree
+  `5c95d112891cbd9bb69c562600efcd5aa563718f`, carries all code, dependency, workflow, quickstart, and source-builder
+  changes. The annotated local `v0.1.0-alpha.1` tag identifies its documentation-only closeout and records the exact
+  final archive SHA-256 and size. No public push, repository visibility change, binary/container distribution, or
+  release publication was performed.
+- The locked graph contains 313 external packages and exactly matches the generated dependency inventory.
+  `cargo-deny 0.19.9` passes advisories, bans, licenses, and sources with nine disclosed duplicate-version warnings.
+  All-history and exact-source gitleaks 8.28.0 scans pass with reviewed narrow classifications. The deterministic
+  source artifact retains 27 PTX, three CUDA, and one project header source while excluding Git history and the
+  separately uncleared literature corpus.
+- A clean Ubuntu 26.04 container with Rust 1.97.1, Clang/libclang 21.1.8, PostgreSQL client 18.6, and the documented
+  packages built the locked release from the exact source artifact. Product ownership passed, and the container-built
+  server passed all 10 durable typed/NULL SQL, transaction, GPU-read, SIGKILL, restart, and recovery assertions on an
+  RTX PRO 6000 Blackwell Max-Q with driver 595.84.
+- Focused recovery, pgwire, TLS/SCRAM, mTLS, Kubernetes-contract, complete workspace check, strict Clippy, hosted
+  host-neutral tests, formatting/static checks, and independent pre-card audit pass. The canonical candidate card
+  (SHA-256 `b384c05132baec7b7d7cfcd52d3fe4a03f7aeed3851428c0c90d4f11880dd268`) compared with the direct-parent
+  `6508ac9b` card (SHA-256 `9a4ea081124b2f1f5c3b8411386d811f71ea87d4d8af07e209bdfe5977f53a52`)
+  under the same exclusive GPU/config/toolchain. Candidate in-L2 median was 262,173,070 lookups/s, all 3 samples
+  above the 260M floor; out-of-L2 was 258,583,015 lookups/s at 126us. Independent post-card audit found no material
+  regression, and the final source/tag audit accepted the release boundary. Full evidence is in
+  [`docs/design/open-source-release-audit.md`](design/open-source-release-audit.md).
+
 ## Product direction and execution boundary
 
 - The engine requires an NVIDIA GPU. The host is control plane: wire I/O, SQL parse/plan, transaction

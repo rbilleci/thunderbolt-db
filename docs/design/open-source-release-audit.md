@@ -1,8 +1,8 @@
 # Open-source release audit — 2026-09-14
 
-This document is the engineering and license-risk evidence for
-**[OSS-001](../PLAN.md#oss-001--minimal-gplv3-source-release)**. It is not legal advice and does not authorize
-publication. Public push, repository visibility, and release publication remain owner actions.
+This document is the engineering and license-risk evidence for the completed **OSS-001** milestone. It is not
+legal advice and does not authorize publication. Public push, repository visibility, and release publication
+remain owner actions.
 
 The baseline audited revision is `6508ac9bafcf6cba04506fc77846b0ecdae31416` (2026-08-10). The release
 candidate is an **experimental, single-node, GPU-required source release**. It does not claim production readiness,
@@ -10,19 +10,21 @@ full PostgreSQL compatibility, high availability, scale completion, or a compara
 
 ## Candidate status
 
-The integrated candidate addresses every technical finding from the baseline audit. On 2026-09-14, the release
-authority confirmed that they own or are authorized to license the project-authored material under GPL-3.0-only
-with the CUDA Driver Additional Permission and are unaware of conflicting employer, client, school, or contributor
-rights. They selected the public contributor-form copyright notice rather than publishing a legal personal name.
-The exact commit, source archive hash, local tag, and independent acceptance decision are recorded after freeze.
+The integrated runtime candidate, commit `139aa8959905877c3fac6809d0f5568b1fd33c1c` and tree
+`5c95d112891cbd9bb69c562600efcd5aa563718f`, addresses every technical finding from the baseline audit. On
+2026-09-14, the release authority confirmed that they own or are authorized to license the project-authored
+material under GPL-3.0-only with the CUDA Driver Additional Permission and are unaware of conflicting employer,
+client, school, or contributor rights. They selected the public contributor-form copyright notice rather than
+publishing a legal personal name. The documentation-only closeout commit and annotated local `v0.1.0-alpha.1` tag
+preserve this exact runtime tree; the tag message records the final source archive SHA-256 and size.
 
-| OSS-001 row | Candidate disposition | State before freeze |
+| OSS-001 row | Final disposition | State |
 |---|---|---|
-| Rights and license | Full GPLv3 text; approved `GPL-3.0-only` contributor-form project notice; narrow section-7 CUDA Driver Additional Permission; third-party notices and license texts; consistent metadata across 17 crates. | Rights declaration recorded; freeze pending. |
-| Dependency hygiene | Vulnerable development clients and yanked transitive package upgraded; both unmaintained dependencies removed; locked deny policy passes without advisory exceptions; inventory regenerated. | Technical checks pass. |
-| Publication contents | Gitleaks all-history and exact-tree scans reviewed; source archive excludes only the separately unreviewed literature corpus; Rust/CUDA/PTX/header/build/test inputs remain. | Technical checks pass; repository history is not part of the prepared source release. |
-| Working route | README gives the supported platform, native prerequisites, locked build, durable WAL, loopback trust profile, psql SQL/restart workflow, security profile, and limits. A 10-assertion GPU smoke automates it. | Working on the audit GPU. |
-| Exact release proof | Hosted and trusted-GPU workflows, pinned Rust, source builder, focused recovery/pgwire/security gates, and non-vacuous GPU checks are present. | Exact committed archive, audit, and local tag remain after the declaration. |
+| Rights and license | Full GPLv3 text; approved `GPL-3.0-only` contributor-form project notice; narrow section-7 CUDA Driver Additional Permission; third-party notices and license texts; consistent metadata across 17 crates. | Accepted. |
+| Dependency hygiene | Vulnerable development clients and yanked transitive package upgraded; both unmaintained dependencies removed; locked deny policy passes without advisory exceptions; inventory regenerated. | Accepted. |
+| Publication contents | Gitleaks all-history and exact-tree scans reviewed; source archive excludes only the separately unreviewed literature corpus; Rust/CUDA/PTX/header/build/test inputs remain. | Accepted; repository history is outside the prepared source release. |
+| Working route | README gives the supported platform, native prerequisites, locked build, durable WAL, loopback trust profile, psql SQL/restart workflow, security profile, and limits. A 10-assertion GPU smoke automates it. | Accepted on the audit GPU and in a clean Ubuntu 26.04 container. |
+| Exact release proof | Hosted and trusted-GPU workflows, pinned Rust, source builder, focused recovery/pgwire/security gates, non-vacuous GPU checks, canonical performance comparison, deterministic archive, and independent audits are present. | Accepted for the local experimental source release. |
 
 ## Rights, licensing, and CUDA boundary
 
@@ -41,7 +43,7 @@ runtime, and no NVIDIA binary, CUDA Toolkit library, SDK header, or sample sourc
 permission avoids relying only on a fact-sensitive System Library interpretation. It excludes the CUDA Runtime,
 Toolkit libraries and tools, static NVIDIA libraries, NVRTC, nvJitLink, cuBLAS, cuDNN, NCCL, and NVML.
 
-The repository has 3,714 commits reachable from all refs. Git author records use three apparent variants of one
+The frozen runtime candidate has 3,701 commits in its reachable history. Git author records use three apparent variants of one
 contributor identity; 1,152 historical commits also contain automated-assistant co-author trailers. Neither an
 author record nor a trailer proves copyright ownership, employer/client clearance, or the right to grant an
 exception. The release authority's 2026-09-14 declaration covers all project-authored Rust, CUDA, PTX, headers,
@@ -126,7 +128,7 @@ Blackwell / compute capability 12.0.
 | `durable_process_recovery` | 1/1 passed; real process SIGKILL/restart, typed prepared writes, NULLs, COPY, DDL/DML, rollback, and continued appends. |
 | `pgwire_roundtrip --include-ignored` | 6/6 passed; asynchronous/blocking clients, COPY/recovery/hazard, concurrent connections, and a non-vacuous GPU point route. |
 | `scripts/run_oss_release_smoke.sh` using the rebuilt release binary | 10/10 assertions passed: typed/NULL insert, committed update, rolled-back delete, ordered GPU read and SUM, SIGKILL, restart, and identical recovered results. |
-| Twice-built current pre-freeze source archive | Byte-identical outputs, SHA-256 `2e6bb1c462f4ae0c66edfbe0466fddc87c71b6af716e36d875ba7c4b5c45dd76`, 5,930,806 bytes; 27 PTX / 3 CUDA / 1 header; zero research or target entries. This hash binds temporary technical commit `a47f1d2a`, not the final rights-approved candidate. |
+| Twice-built frozen runtime source archive | Byte-identical outputs, SHA-256 `de8ff5522eba7f874fc18930ffa335314158ec8439e31c5802aa798dc579746c`, 5,931,826 bytes; 27 PTX / 3 CUDA / 1 header; zero research or target entries. This hash binds runtime commit `139aa895`; the annotated local tag records the final documentation-only closeout archive. |
 | Extracted current archive in a new Ubuntu 26.04 container | Clean locked release build passed in 3m39s with Rust 1.97.1, Clang/libclang 21.1.8, PostgreSQL client 18.6, the documented native packages, and no bindgen workaround. Product ownership and all 10 durable GPU SQL/SIGKILL/restart assertions passed against the container-built binary with the host RTX PRO 6000/driver 595.84 passed through. |
 | Connection security preflight | Passed with generated TLS certificate/key PEM and SCRAM authentication. |
 | Replication channel security preflight | Passed with generated mTLS CA/node PEM and an authenticated append route. |
@@ -150,34 +152,37 @@ workspace, and runs host-neutral tests. GPU absence is reported there. The manua
 on missing NVIDIA hardware, bounds every gate, runs ownership, recovery, the complete pgwire matrix, all ignored
 GPU tests, and the durable source-release smoke, and verifies a positive executed-test count.
 
-No benchmark acceptance card has yet been attached to OSS-001. The candidate does not directly change a read
-kernel, residency layout, result path, planner, benchmark harness, or release profile. It does upgrade the
-production `imbl` persistent collections used by MVCC storage and engine value indexes. Layer 2 constructs its
-resident fixture through those paths and links the changed implementation, so the canonical full report card is
-**applicable** after the rights-approved candidate is frozen and passes its pre-card independent audit. Preserved
-project APIs and call sites do not make this runtime dependency change inert. A non-canonical WIP quick screen
-completed Sections A/B: its three batch-65,536 production-compact samples were 260,743,660 / 259,577,533 /
-263,429,929 lookups/s (median 260,743,660; 2/3 at or above the 260M floor), and the script reported
-`point_read_throughput_gate_status=pass`. Six unrelated resident GPU contexts were present and recorded by the
-screen. The first attempt failed during the clean build because this unprovisioned host lacks Clang resource
-headers; the completed rerun used the already disclosed temporary GCC-15 include workaround. The quick run is
-diagnostic only and cannot close acceptance. The frozen candidate must run the full A/B/C card once under an
-exclusive GPU and compare it to the preceding accepted comparable card. No performance claim is added by this
-release. The retained accepted-card transcript named in `STATUS.md` is not available in this checkout, and the
-accepted revision did not pin a Rust toolchain. Its exact compiler identity must be recovered before claiming
-comparability with the newly pinned Rust 1.97.1 candidate; if it cannot be recovered or differs materially, rerun
-the accepted base revision in the same environment before the candidate card. The audit GPU currently has unrelated
-resident processes, so neither canonical run may start until an exclusive window is available.
+The `imbl` upgrade affects production MVCC storage and engine value indexes, so the full report card was applicable.
+The independent pre-card audit accepted the frozen runtime candidate before measurement. Both canonical cards used
+Rust/Cargo 1.97.1, `BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/15/include`, the fixed full workload,
+fresh targets, the same RTX PRO 6000 Blackwell Max-Q / driver 595.84 identity, the same configuration hash, and an
+exclusive GPU. Each has exactly one terminal canonical record, five complete section markers, and seven valid
+environment samples with zero external contexts.
 
-## Remaining freeze sequence
+The direct-parent base is `6508ac9bafcf6cba04506fc77846b0ecdae31416`, tree
+`19a93c11e73fe02a1299b84b2e8a005e39f0afbd`. Its transcript is
+`runner.6508ac9bafcf.19a93c11e73f.dLhxaG.log`, SHA-256
+`9a4ea081124b2f1f5c3b8411386d811f71ea87d4d8af07e209bdfe5977f53a52`. The candidate transcript is
+`runner.139aa8959905.5c95d112891c.quAEjj.log`, SHA-256
+`b384c05132baec7b7d7cfcd52d3fe4a03f7aeed3851428c0c90d4f11880dd268`.
 
-1. Repeat affected static/secret checks after the recorded declaration; the WIP quick performance screen is
-   complete.
-2. Stage one candidate with no unstaged or untracked drift and create a local DCO-signed release commit.
-3. Run the mandatory independent read-only pre-card acceptance audit and repair/re-audit any finding.
-4. Run the canonical full report card once on that exact candidate under an exclusive GPU and have the auditor
-   verify its completeness, provenance, and accepted-baseline comparison.
-5. Build the source archive twice from that exact commit, compare bytes, extract it into a clean provisioned
-   environment, build with `--locked`, and run the documented durable GPU/pgwire route.
-6. Record the commit, archive SHA-256/size, test counts, and audit result; create the local
-   `v0.1.0-alpha.1` tag. Do not push, publish, or change visibility.
+At batch 65,536, the base/candidate in-L2 medians were 263,417,009 / 262,173,070 lookups/s (-0.473%); all three
+candidate samples exceeded the 260M floor. Out-of-L2 results were 256,048,869 / 258,583,015 lookups/s (+0.990%)
+at the same 126us p50, and fixture construction was 225.0 / 228.7 seconds (+1.64%). Raw ratios were stable:
+in-L2 constant-mask/roofline moved from 0.824 to 0.814, out-of-L2 from 1.038 to 1.037, grouped execution was flat,
+and the host-H2D-inclusive hash join moved from 239.7 to 246.7 M-elem/s. The independent post-card audit returned
+**ACCEPT** with no material regression.
+
+The first candidate invocation, transcript SHA-256
+`99a43f49d8da9d8be106977ca69e553b8c2b4a11c5f19d2fdd8a1557d97d8573`, failed before Section A because the audit
+host lacks the documented Clang resource headers. It has no section marker or terminal status and is retained only
+as incomplete environmental evidence. A completed card at `b24889c` is also non-acceptance historical evidence:
+it is not an ancestor of the candidate and cannot isolate the OSS changes. The candidate card was not rerun after
+the valid direct-parent comparison. No comparative performance claim is made by this release.
+
+## Release boundary
+
+The accepted deliverable is the deterministic source archive at the annotated local `v0.1.0-alpha.1` tag. Its tag
+message is the checksum record for the exact documentation-closeout archive. It excludes Git history and the
+uncleared literature corpus. Public push, a visibility change, binary/container distribution, and release
+publication were not performed.
