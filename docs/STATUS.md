@@ -6,12 +6,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 ## Thunderbolt DB `0.1.0-alpha.2` source release — accepted 2026-09-14
 
 - The GitHub repository is `rbilleci/thunderbolt-db`; local `origin` uses
-  `https://github.com/rbilleci/thunderbolt-db.git`, and its default branch is `main`. Repository visibility
-  remains private. The immutable `v0.1.0-alpha.1` tag is present on that remote, and the Thunderbolt DB
-  `0.1.0-alpha.2` rename/source release is accepted. No GitHub Release or binary/container distribution has been
-  published.
+  `https://github.com/rbilleci/thunderbolt-db.git`, and its sole branch is the protected default branch `main`.
+  Repository visibility is public. The immutable `v0.1.0-alpha.1` tag is present on that remote, and the
+  Thunderbolt DB `0.1.0-alpha.2` rename/source release is accepted. No GitHub Release or binary/container
+  distribution has been published.
 - GitHub Actions is disabled for the repository and no CI/CD workflow definitions remain in the current tree.
-  Validation commands remain available for contributors to run locally.
+  Validation commands remain available for contributors to run locally. Changes to `main` require a pull request;
+  owner enforcement, linear history, resolved conversations, and force-push/deletion prevention are active, with
+  zero approvals required for a solo-maintainer merge.
 - The rename preserves alpha.1 as historical evidence, including its `gpu-database-engine` archive name and root.
 - All 17 internal `gpu_db_*` packages now inherit version `0.1.0-alpha.2`, the Thunderbolt DB repository URL, and
   `publish = false` from workspace metadata. Their crate/import names and `GPU_DB_*` configuration names are
