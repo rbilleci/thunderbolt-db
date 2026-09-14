@@ -46,23 +46,6 @@ When choosing between implementation approaches:
    explain, consider a simpler split between latency-oriented prepared reads and
    throughput-oriented batch routes.
 
-## Model and Agent Routing
-
-- The primary agent inherits the model and reasoning selection from the active Codex session or host. Every
-  unspecified subagent uses GPT-5.6 Terra with `xhigh` reasoning.
-- Use the `worker` agent for bounded implementation, fixes, tests, and verification. It uses Terra with `xhigh`
-  reasoning and may inherit the parent write permissions.
-- Use the `architect` agent for ambiguous, cross-subsystem architecture, transaction, WAL/recovery, concurrency,
-  GPU-residency, and ownership decisions. It uses Sol with `xhigh` reasoning and is read-only.
-- Use the `acceptance_auditor` agent for the independent acceptance gate. It uses Terra with `xhigh` reasoning and
-  is read-only.
-- Use the `explorer` agent only for read-only search, inventory, evidence extraction, and log triage. It uses Luna
-  with `medium` reasoning and must return any coding work to the parent.
-- Any task that creates or modifies source, tests, build scripts, benchmark harnesses, migrations, generated code,
-  or patches is coding. Never perform or delegate coding below `xhigh` reasoning. `max` also satisfies this
-  requirement. If the required model or reasoning level is unavailable, stop before coding and report the blocker
-  instead of silently substituting a lower setting.
-
 ## Documentation Expectations
 
 `docs/PLAN.md` is the **only** document that owns open, deferred, blocked, or sequenced work. `STATUS.md`
@@ -131,9 +114,9 @@ standard and the affected subsystem.
 - Functional convergence and old-path deletion precede throughput optimization. Do not tune a shape-special canary,
   weaken or specialize the qualification workload, run an acceptance audit/full card, or record acceptance while
   required shapes still use a superseded route.
-- Parallel agents are encouraged only as lanes inside the same milestone candidate. Give them disjoint ownership
+- Parallel work is encouraged only as lanes inside the same milestone candidate. Give each lane disjoint ownership
   such as live cutover, durability/recovery, and acceptance evidence; integrate at least every 90 minutes. Do not
-  assign separate agents to invent or accept the next micro-boundary.
+  split work into separate efforts that invent or accept the next micro-boundary.
 - New prerequisite milestones, wire-format versions, or generalized authorities may be added only when an existing
   milestone acceptance test fails for their absence and the current design cannot satisfy it. Record that evidence
   in the existing PLAN item; do not grow a prerequisite chain from architecture preference alone.
@@ -152,13 +135,10 @@ Use this order once per complete PLAN milestone:
 2. Iterate with focused correctness/static gates, required NULL differential and HAZARD coverage, and
    `scripts/benchmark_report_card.sh --quick` when read performance may move. Quick mode is a clean-build A+B screen;
    it is never acceptance evidence.
-3. Freeze the candidate, then delegate the independent read-only adversarial audit to the project-scoped
-   `acceptance_auditor` custom agent defined in `.codex/agents/acceptance-auditor.toml`. That agent is pinned to
-   GPT-5.6 Terra with xhigh reasoning; do not silently substitute another model or reasoning level. If that configuration
-   is unavailable, stop before acceptance and report the blocker. Audit implementation, focused gates, and sabotage
-   evidence, and repair/re-audit findings before paying for the full card. A canonical full run permits staged
-   changes but rejects unstaged or untracked files, builds an exported snapshot of the exact staged tree, and
-   invalidates itself if the candidate changes.
+3. Freeze the candidate, then obtain an independent read-only adversarial audit. Audit implementation, focused
+   gates, and sabotage evidence, and repair/re-audit findings before paying for the full card. A canonical full run
+   permits staged changes but rejects unstaged or untracked files, builds an exported snapshot of the exact staged
+   tree, and invalidates itself if the candidate changes.
 4. Run `scripts/benchmark_report_card.sh --full` exactly once for the provisionally accepted candidate whenever the
    full card is applicable. The auditor then verifies completeness, provenance, and baseline comparison before final
    ACCEPT. A card is complete evidence, not an automatic performance verdict.

@@ -705,14 +705,13 @@ shared-GPU counters, the W1 floor, and source/runtime one-path guards.
 Focused test, check, clippy, format, diff, source-size, and NULL-differential gates precede the
 three serial and two concurrent HAZARD runs, each with zero CUDA 700, 716, and 717 failures.
 Any live result, residency, or read-path change uses the prescribed quick screen, candidate
-freeze, acceptance_auditor, and one full card; it preserves the 48M INSERT and 260M read floors.
+freeze, independent audit, and one full card; it preserves the 48M INSERT and 260M read floors.
 
 ## Design freeze and later implementation gate
 
-This documentation-only freeze requires architecture review followed by the project
-acceptance_auditor only. It changes no writer, recovery, replay implementation, GPU behavior,
-benchmark, or card, so GPU, HAZARD, recovery, and report-card execution are not applicable to
-this document itself.
+This documentation-only freeze requires architecture review followed by an independent acceptance audit only. It
+changes no writer, recovery, replay implementation, GPU behavior, benchmark, or card, so GPU, HAZARD, recovery, and
+report-card execution are not applicable to this document itself.
 
 Implementation, cache service, translators, live writer, crash/differential/HAZARD evidence, and
 performance evidence are later WRITE-001 work owned only by PLAN.md. Zero-input success requires
