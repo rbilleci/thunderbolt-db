@@ -8,9 +8,10 @@
 **Thunderbolt DB** / `thunderbolt-db`; `origin` points to
 `https://github.com/rbilleci/thunderbolt-db.git` and `main` remains the default branch. No rename task is
 active. The annotated alpha.2 tag records the final archive identity after documentation closeout, avoiding a
-self-referential source artifact; repository visibility is unchanged and no GitHub Release is published.
+self-referential source artifact; repository visibility is public and no GitHub Release is published.
 GitHub Actions is disabled and the current tree contains no CI/CD workflow definitions; use the documented local
-validation commands when changing the project.
+validation commands when changing the project. Protected `main` is the sole branch and requires pull requests,
+linear history, and resolved conversations while blocking force pushes and deletion for the owner.
 
 **OSS-001 remains an accepted historical source release.** The immutable pushed `v0.1.0-alpha.1` tag identifies
 the exact deterministic `gpu-database-engine` source artifact and checksum. Preserve its license, CUDA additional
