@@ -55,5 +55,5 @@ to text or wide composites.
 - Recovery and post-write reads preserve the same result set.
 - Report-card and type-specific measurements justify keeping the index rather than the scan.
 
-The dated proposal and its obsolete file/branch guidance are archived at
-`../archive/design/non-int4-point-lookup-index-2026-06-30.md`.
+The dated proposal and its obsolete file/branch guidance remain available at
+`v0.1.0-alpha.1:docs/archive/design/non-int4-point-lookup-index-2026-06-30.md`.

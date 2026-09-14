@@ -1,8 +1,9 @@
 # DECISIONS — Concise ADR Ledger
 
 Accepted decisions that are expensive to reverse. This file records rules and rationale, not experimental
-chronology or future sequencing. The full pre-unification record is archived at
-`archive/decisions/DECISIONS-full-pre-unification-2026-07-12.md`. Current work lives only in `PLAN.md`.
+chronology or future sequencing. The full pre-unification record remains available at
+`v0.1.0-alpha.1:docs/archive/decisions/DECISIONS-full-pre-unification-2026-07-12.md`. Current work lives only in
+`PLAN.md`.
 
 ## ADR-015 — One live canonical commit and WAL authority
 
@@ -34,8 +35,8 @@ chronology or future sequencing. The full pre-unification record is archived at
 ## ADR-014 — Canonical GPU-native append/tombstone write model
 
 - **Status:** Accepted, 2026-07-16. The exact reviewed target/workload snapshot is `c9628766`; the final independent
-  verdict is preserved in the
-  [`ADR-014 acceptance archive`](archive/reviews/write-path-adr-014-acceptance/README.md).
+  verdict remains available at
+  `v0.1.0-alpha.1:docs/archive/reviews/write-path-adr-014-acceptance/README.md`.
 - **Decision:** Logical identity is stable `(table_id,row_id)`; version identity adds `created_by`; physical GPU
   coordinates are generation-scoped and never durable identity. INSERT appends, UPDATE tombstones the visible old
   version and appends one complete final image with the same row identity, and DELETE tombstones. A transaction's

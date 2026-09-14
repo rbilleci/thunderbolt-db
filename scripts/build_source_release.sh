@@ -108,16 +108,15 @@ archive_path="${release_out_dir}/${archive_name}"
 prefix="gpu-database-engine-${version}"
 temporary_archive="$(mktemp "${release_out_dir}/.${archive_name}.XXXXXX")"
 
-# Historical research reports and build output are not source-release inputs.
-# The final listing check below makes a future pathspec regression fail rather
-# than silently enlarge the artifact.
+# Build output is not a source-release input. The final listing check below
+# makes a future pathspec regression fail rather than silently enlarge the
+# artifact.
 git archive --format=tar --prefix="${prefix}/" "$commit" -- . \
-  ':(exclude)target/**' \
-  ':(exclude)docs/archive/research/**' | gzip -n >"$temporary_archive"
+  ':(exclude)target/**' | gzip -n >"$temporary_archive"
 
 while IFS= read -r archive_entry; do
   case "$archive_entry" in
-    "${prefix}/target/"* | "${prefix}/docs/archive/research/"*)
+    "${prefix}/target/"*)
       die "source archive unexpectedly contains excluded path: ${archive_entry}"
       ;;
   esac

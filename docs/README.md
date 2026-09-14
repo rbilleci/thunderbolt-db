@@ -14,8 +14,8 @@ Each kind of information has one owner:
 `design/` contains non-authoritative mechanism references. Slice orders, open questions, and recommendations in
 those documents are design history; only PLAN may activate them.
 
-`archive/` contains concluded plans, handovers, proposals, reviews, benchmark evidence, research, and historical
-runbooks. Its local `AGENTS.md` makes all `TODO`, `NEXT`, `OPEN`, and deferred language non-actionable.
+Concluded plans, handovers, proposals, reviews, benchmark evidence, research, and historical runbooks remain
+available from Git history and the `v0.1.0-alpha.1` tag. They are not retained in the current source tree.
 
 ## Single-plan rule
 
@@ -23,7 +23,7 @@ Outside `PLAN.md`, actionable language must be one of:
 
 1. A current fact that references an existing PLAN ID.
 2. A normative invariant or acceptance gate.
-3. An explicitly historical quotation under `docs/archive/`.
+3. A clearly identified historical quotation with its Git revision.
 
 Do not create new roadmap, remaining-work, proposal-sequence, open-board, or campaign-handover files. Add one task
 row to PLAN and link supporting evidence. When work completes, remove its row and record the outcome in STATUS or
@@ -35,9 +35,9 @@ After documentation changes:
 
 ```bash
 # Action markers outside PLAN should occur only in governance text, stable design labels,
-# or archived history.
+# or historical text copied from an identified Git revision.
 rg -n -i 'TODO|NEXT|OPEN|DEFERRED|REMAINING WORK|OPEN BOARD' \
-  . --glob '*.md' --glob '!docs/PLAN.md' --glob '!docs/archive/**' --glob '!target/**'
+  . --glob '*.md' --glob '!docs/PLAN.md' --glob '!target/**'
 
 # Old working-set directories and canonical duplicates must stay absent.
 test ! -e docs/HANDOVER_REMAINING_WORK.md

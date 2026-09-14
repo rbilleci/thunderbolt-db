@@ -5,8 +5,8 @@ This companion is the retained review index for accepted
 work and sequencing remain exclusively in [`../PLAN.md`](../PLAN.md). The source baseline is commit
 `f701d8b6e9e0a9a1904bc990f23162632f382045`.
 
-Acceptance-only source crosswalks, models, reports, packets, and reviews are preserved in the
-[`acceptance archive`](../archive/reviews/write-path-adr-014-acceptance/README.md).
+Acceptance-only source crosswalks, models, reports, packets, and reviews remain available at
+`v0.1.0-alpha.1:docs/archive/reviews/write-path-adr-014-acceptance/`.
 
 R3-002/R3-003 graduation labels in this frozen acceptance matrix are historical: both passed independent
 acceptance on 2026-07-17. Remaining implementation ownership is determined only by `../PLAN.md`, led by

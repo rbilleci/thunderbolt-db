@@ -101,11 +101,10 @@ The source snapshot retains all 27 checked-in PTX files, three preferred-form `.
 and contributor/acceptance configuration. Three PTX artifacts record generation by CUDA 12.4 / V12.4.131; the
 remaining PTX files are handwritten project sources. No tracked CUDA SDK header or NVIDIA sample source was found.
 
-The literature-review corpus under `docs/archive/research/` is excluded because its papers, extracted text,
-generated JSON, and image provenance is independent of program source and has not received publication clearance.
-It is not a build, test, modification, or runtime input. Other historical project evidence under `docs/archive/`
-remains because live architecture/status documents link to it; reviewed workstation paths were removed from the
-distributed tree.
+The literature-review corpus was excluded because its papers, extracted text, generated JSON, and image provenance
+is independent of program source and did not receive publication clearance. It is not a build, test, modification,
+or runtime input. The initial `v0.1.0-alpha.1` tree retained other historical project evidence for then-live links;
+the subsequent archive cleanup removed that material from the current tree while preserving it in Git history.
 
 Gitleaks 8.28.0 scanned all refs/history with `--log-opts="--all"`. Three generic-key findings were reviewed as
 prose false positives and are narrowly fingerprinted in `.gitleaksignore`; one stable exact text pattern is
@@ -185,5 +184,6 @@ the valid direct-parent comparison. No comparative performance claim is made by 
 
 The accepted deliverable is the deterministic source archive at the annotated local `v0.1.0-alpha.1` tag. Its tag
 message is the checksum record for the exact documentation-closeout archive. It excludes Git history and the
-uncleared literature corpus. Public push, a visibility change, binary/container distribution, and release
-publication were not performed.
+uncleared literature corpus. The current tree subsequently removes all other historical archives; the accepted tag
+remains the immutable original release boundary. Public push, a visibility change, binary/container distribution,
+and release publication were not performed.

@@ -154,8 +154,8 @@ screen. Follow [`AGENTS.md`](AGENTS.md) for the complete gate order.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — accepted rationale.
 - [`docs/CODE_SIZE.md`](docs/CODE_SIZE.md) — source-size and decomposition standard.
 
-Material under `docs/archive/` is historical and non-actionable. It may describe superseded behavior or local
-benchmark environments.
+Superseded plans, reviews, benchmark packets, and research are available from Git history and the
+`v0.1.0-alpha.1` tag. They are intentionally absent from the current source tree.
 
 ## License and contributions
 

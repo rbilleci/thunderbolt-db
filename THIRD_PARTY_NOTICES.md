@@ -29,9 +29,8 @@ No NVIDIA driver, CUDA Toolkit binary, CUDA header, or NVIDIA sample source is i
 The project CUDA kernels and PTX are project source/output; their preferred editable `.cu`/`.cuh` sources and
 reproduction commands are included alongside the PTX.
 
-The historical literature-review corpus under `docs/archive/research/` is excluded from the versioned source
-archive. It is not program source or a build input. The remaining release documentation is project-authored prose
-or retains the notices stated in its files.
+The source tree does not distribute the former literature-review corpus. Release documentation is project-authored
+prose or retains the notices stated in its files.
 
 NVIDIA and CUDA are trademarks or registered trademarks of NVIDIA Corporation. This project is not affiliated
 with or endorsed by NVIDIA. PostgreSQL is a trademark of the PostgreSQL Community Association of Canada;

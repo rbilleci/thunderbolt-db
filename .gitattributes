@@ -1,3 +1,1 @@
-# The release tarball is a source/build/test artifact. The scheduled literature corpus is not required to build,
-# test, modify, or run the program and is excluded from `git archive` pending a separate provenance review.
-/docs/archive/research export-ignore
+# Source archives contain the committed tree except local build output rejected by the release builder.

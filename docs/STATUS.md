@@ -936,7 +936,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Repository and session evidence showed a systemic flow failure rather than insufficient activity: the retained
   history contains 423 commits since 2026-07-12 and 298 named STRUCT slices, WRITE-001 accumulated 31 accepted
   sub-boundaries, and a 5 h 24 m session used 17 agent tasks yet ended with another deliberately private authority.
-  The concluded analysis is `docs/archive/reviews/write-001-delivery-rca-2026-08-02.md`.
+  The concluded analysis remains available at
+  `v0.1.0-alpha.1:docs/archive/reviews/write-001-delivery-rca-2026-08-02.md`.
 - Governance now makes the complete PLAN milestone—not a private helper or proof phase—the unit of acceptance.
   Intermediate work stays integrated WIP; progress requires production reachability, a closed end-to-end matrix row,
   or deletion of an alternate live branch. A 90-minute stop-loss prevents further helper expansion without such
@@ -2776,8 +2777,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   ignored tests. Facade ordinary all-target tests pass **39 with 8 GPU-ignored**, and serialized concurrency passes
   **13 with 1 GPU-ignored**. Workspace all-target/all-feature check, strict execution/engine/facade Clippy,
   formatting, diff whitespace, and changed-source-size gates pass.
-  The remediation evidence is archived in
-  [`perf-001-remediation-2026-07-18.md`](archive/testing/reports/perf-001-remediation-2026-07-18.md).
+  The remediation evidence remains available at
+  `v0.1.0-alpha.1:docs/archive/testing/reports/perf-001-remediation-2026-07-18.md`.
 - Final acceptance is complete. Three independent read-only lanes accepted the exact code/evidence tree with no
   remaining severity finding: publication/accounting, CUDA ownership/public contracts, and benchmark/evidence.
   The canonical two-layer/two-cache card then completed with exit 0. Layer 1 in/out-of-L2 `sum_i32` measured
@@ -6415,9 +6416,9 @@ sections, the current source tree, `CODE_SIZE.md`, and `PLAN.md` govern present 
   identity overrides, 1,428 matching/
   schema rules, 8,908 relation-review overrides, and 2,364 link-review overrides—plus 1,373 lines of parsing,
   linking, normalization, backlog, report-writing, and CLI logic. Documentation consolidation commit `bedc1df7`
-  moved its journal, mechanisms, and four generated artifacts under `docs/archive/research/`; the live default
-  invocation therefore fails on the absent journal, and exhaustive non-archive search found no consumer or caller.
-  An explicit invocation against the archived journal/mechanisms regenerated paper links JSON `e1fc1d10…`, coverage
+  moved its journal, mechanisms, and four generated artifacts under the historical research archive; the live
+  default invocation therefore failed on the absent journal, and exhaustive live-tree search found no consumer or
+  caller. An explicit invocation against the archived journal/mechanisms regenerated paper links JSON `e1fc1d10…`, coverage
   Markdown `329e7743…`, benchmark backlog JSON `e9d0641c…`, and backlog Markdown `ec71897e…` byte-for-byte. Python
   compilation passed before deletion, the deleted source hash is `2c7b1120…`, archive files remain unchanged, and
   no cache/output residue remains. Splitting the mixed file would have recreated live ownership for historical,
