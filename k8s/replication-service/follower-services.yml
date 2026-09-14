@@ -1,27 +1,27 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gpu-db-replication-follower-2
+  name: thunderbolt-db-replication-follower-2
   labels:
-    app.kubernetes.io/name: gpu-db-replication-follower
-    app.kubernetes.io/part-of: gpu-db
-    gpu-db-follower-id: "2"
+    app.kubernetes.io/name: thunderbolt-db-replication-follower
+    app.kubernetes.io/part-of: thunderbolt-db
+    thunderbolt-db-follower-id: "2"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: gpu-db-replication-follower
-      gpu-db-follower-id: "2"
+      app.kubernetes.io/name: thunderbolt-db-replication-follower
+      thunderbolt-db-follower-id: "2"
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: gpu-db-replication-follower
-        app.kubernetes.io/part-of: gpu-db
-        gpu-db-follower-id: "2"
+        app.kubernetes.io/name: thunderbolt-db-replication-follower
+        app.kubernetes.io/part-of: thunderbolt-db
+        thunderbolt-db-follower-id: "2"
     spec:
       containers:
         - name: follower
-          image: gpu-db-replication-service:local
+          image: thunderbolt-db-replication-service:local
           imagePullPolicy: IfNotPresent
           args:
             - --follower-service
@@ -45,16 +45,16 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: gpu-db-replication-follower-2
+  name: thunderbolt-db-replication-follower-2
   labels:
-    app.kubernetes.io/name: gpu-db-replication-follower
-    app.kubernetes.io/part-of: gpu-db
-    gpu-db-follower-id: "2"
+    app.kubernetes.io/name: thunderbolt-db-replication-follower
+    app.kubernetes.io/part-of: thunderbolt-db
+    thunderbolt-db-follower-id: "2"
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: gpu-db-replication-follower
-    gpu-db-follower-id: "2"
+    app.kubernetes.io/name: thunderbolt-db-replication-follower
+    thunderbolt-db-follower-id: "2"
   ports:
     - name: append
       port: 55432
@@ -63,27 +63,27 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gpu-db-replication-follower-3
+  name: thunderbolt-db-replication-follower-3
   labels:
-    app.kubernetes.io/name: gpu-db-replication-follower
-    app.kubernetes.io/part-of: gpu-db
-    gpu-db-follower-id: "3"
+    app.kubernetes.io/name: thunderbolt-db-replication-follower
+    app.kubernetes.io/part-of: thunderbolt-db
+    thunderbolt-db-follower-id: "3"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: gpu-db-replication-follower
-      gpu-db-follower-id: "3"
+      app.kubernetes.io/name: thunderbolt-db-replication-follower
+      thunderbolt-db-follower-id: "3"
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: gpu-db-replication-follower
-        app.kubernetes.io/part-of: gpu-db
-        gpu-db-follower-id: "3"
+        app.kubernetes.io/name: thunderbolt-db-replication-follower
+        app.kubernetes.io/part-of: thunderbolt-db
+        thunderbolt-db-follower-id: "3"
     spec:
       containers:
         - name: follower
-          image: gpu-db-replication-service:local
+          image: thunderbolt-db-replication-service:local
           imagePullPolicy: IfNotPresent
           args:
             - --follower-service
@@ -107,16 +107,16 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: gpu-db-replication-follower-3
+  name: thunderbolt-db-replication-follower-3
   labels:
-    app.kubernetes.io/name: gpu-db-replication-follower
-    app.kubernetes.io/part-of: gpu-db
-    gpu-db-follower-id: "3"
+    app.kubernetes.io/name: thunderbolt-db-replication-follower
+    app.kubernetes.io/part-of: thunderbolt-db
+    thunderbolt-db-follower-id: "3"
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: gpu-db-replication-follower
-    gpu-db-follower-id: "3"
+    app.kubernetes.io/name: thunderbolt-db-replication-follower
+    thunderbolt-db-follower-id: "3"
   ports:
     - name: append
       port: 55432

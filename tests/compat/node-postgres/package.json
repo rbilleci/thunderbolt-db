@@ -1,5 +1,5 @@
 {
-  "name": "gpu-db-node-postgres-compat",
+  "name": "thunderbolt-db-node-postgres-compat",
   "version": "0.0.0",
   "private": true,
   "type": "module",

@@ -1,6 +1,6 @@
 services:
   follower-a:
-    image: ${GPU_DB_REPLICATION_SERVICE_IMAGE:-gpu-db-replication-service-smoke:local}
+    image: ${GPU_DB_REPLICATION_SERVICE_IMAGE:-thunderbolt-db-replication-service-smoke:local}
     command:
       - --follower-service
       - --id
@@ -13,7 +13,7 @@ services:
       - "127.0.0.1::55432"
 
   follower-b:
-    image: ${GPU_DB_REPLICATION_SERVICE_IMAGE:-gpu-db-replication-service-smoke:local}
+    image: ${GPU_DB_REPLICATION_SERVICE_IMAGE:-thunderbolt-db-replication-service-smoke:local}
     command:
       - --follower-service
       - --id

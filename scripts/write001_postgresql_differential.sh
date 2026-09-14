@@ -102,11 +102,11 @@ untracked_paths="$(git ls-files --others --exclude-standard | wc -l)"
 [[ "$unstaged_paths" == "0" && "$untracked_paths" == "0" ]] ||
   die "the artifact directory is not ignored; candidate seal would be ambiguous"
 
-cargo build -p gpu_db_server --bin gpu-db-engine-server \
+cargo build -p gpu_db_server --bin thunderbolt-db-server \
   >"$artifact/build.stdout" 2>"$artifact/build.stderr"
-sha256sum target/debug/gpu-db-engine-server | awk '{print $1}' >"$artifact/gpu-server.sha256"
+sha256sum target/debug/thunderbolt-db-server | awk '{print $1}' >"$artifact/gpu-server.sha256"
 
-target/debug/gpu-db-engine-server --listen "127.0.0.1:${GPU_PORT}" \
+target/debug/thunderbolt-db-server --listen "127.0.0.1:${GPU_PORT}" \
   >"$artifact/gpu-server.stdout" 2>"$artifact/gpu-server.stderr" &
 gpu_pid=$!
 

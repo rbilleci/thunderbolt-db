@@ -4,7 +4,7 @@
 //! and `ParseError`) lives in the lower [`gpu_db_sql`] crate and is re-exported
 //! here verbatim so this crate's public API is unchanged. The wire layer
 //! (startup/frontend message parsing and the `backend` encoders) lives here;
-//! the sole product pgwire listener is `gpu-db-engine-server` in `gpu_db_server`.
+//! the sole product pgwire listener is `thunderbolt-db-server` in `gpu_db_server`.
 
 pub use gpu_db_sql::*;
 

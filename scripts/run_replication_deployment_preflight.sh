@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/gpu-db-replication-deployment-preflight.XXXXXX")"
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/thunderbolt-db-replication-deployment-preflight.XXXXXX")"
 
 cleanup() {
   rm -rf "$workdir"
@@ -51,6 +51,7 @@ run_gate \
   systemd \
   scripts/run_replication_systemd_verify.sh \
   "operational_replication_systemd_verify=passed" \
+  "systemd_rename_migration=old_unit_and_paths_to_thunderbolt_db_paths" \
   "deployment_gap_production_service_manager=implemented_unit_syntax_and_command_contract" \
   "deployment_gap_live_systemd_supervision=missing"
 
@@ -58,6 +59,7 @@ run_gate \
   kubernetes \
   scripts/run_replication_kubernetes_verify.sh \
   "operational_replication_kubernetes_verify=passed" \
+  "kubernetes_rename_migration=immutable_selectors_recreated_with_thunderbolt_db_names" \
   "deployment_gap_kubernetes_deployment=implemented_manifest_contract" \
   "deployment_gap_live_kubernetes_rollout=missing"
 

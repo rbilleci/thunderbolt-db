@@ -1,4 +1,4 @@
-module gpu-db-pgx-compat
+module thunderbolt-db-pgx-compat
 
 go 1.26.3
 

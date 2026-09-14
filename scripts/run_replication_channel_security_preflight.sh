@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/gpu-db-replication-channel-security.XXXXXX")"
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/thunderbolt-db-replication-channel-security.XXXXXX")"
 
 cleanup() {
   rm -rf "$workdir"
@@ -38,7 +38,7 @@ EOF
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$workdir/ca.key" \
   -out "$workdir/ca.crt" \
-  -subj "/CN=gpu-db-replication-local-ca" \
+  -subj "/CN=thunderbolt-db-replication-local-ca" \
   -days 1 >/dev/null 2>&1
 
 openssl req -newkey rsa:2048 -nodes \
@@ -57,7 +57,7 @@ openssl x509 -req \
 openssl req -newkey rsa:2048 -nodes \
   -keyout "$workdir/client.key" \
   -out "$workdir/client.csr" \
-  -subj "/CN=gpu-db-replication-leader" >/dev/null 2>&1
+  -subj "/CN=thunderbolt-db-replication-leader" >/dev/null 2>&1
 openssl x509 -req \
   -in "$workdir/client.csr" \
   -CA "$workdir/ca.crt" \

@@ -3,6 +3,20 @@
 This document records what exists and what has been verified. It does not own tasks or sequencing. Every live
 gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
+## Thunderbolt DB public identity — current 2026-09-14
+
+- The GitHub repository is `mvsm-prometheus/thunderbolt-db`; local `origin` uses
+  `https://github.com/mvsm-prometheus/thunderbolt-db.git`, and its default branch is `main`. Repository visibility
+  remains private. The immutable `v0.1.0-alpha.1` tag is present on that remote, while `0.1.0-alpha.2` is the
+  planned renamed source release under **RENAME-001**.
+- The rename preserves alpha.1 as historical evidence, including its `gpu-database-engine` archive name and root.
+  No GitHub Release or binary/container distribution has been published.
+- All 17 internal `gpu_db_*` packages now inherit version `0.1.0-alpha.2`, the Thunderbolt DB repository URL, and
+  `publish = false` from workspace metadata. Their crate/import names and `GPU_DB_*` configuration names are
+  unchanged. The regenerated locked dependency inventory still has 313 external packages; its Rustls resolution is
+  `rustls 0.23.45`, which closes `RUSTSEC-2026-0285` and requires `aws-lc-rs 1.18.1`, `aws-lc-sys 0.45.0`, and
+  `rustls-webpki 0.103.15`.
+
 ## OSS-001 experimental GPLv3 source release — accepted 2026-09-14
 
 - The project is prepared as experimental version `0.1.0-alpha.1` under `GPL-3.0-only`. `LICENSE` contains the
@@ -12,9 +26,10 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   rights and selected the public contributor-form notice.
 - Runtime commit `139aa8959905877c3fac6809d0f5568b1fd33c1c`, tree
   `5c95d112891cbd9bb69c562600efcd5aa563718f`, carries all code, dependency, workflow, quickstart, and source-builder
-  changes. The annotated local `v0.1.0-alpha.1` tag identifies its documentation-only closeout and records the exact
-  final archive SHA-256 and size. No public push, repository visibility change, binary/container distribution, or
-  release publication was performed.
+  changes. The annotated immutable `v0.1.0-alpha.1` tag identifies its documentation-only closeout and records the
+  exact final archive SHA-256 and size. It is now pushed to the renamed repository but retains its original
+  `gpu-database-engine` artifact identity; no GitHub Release, binary distribution, or container distribution has
+  been published.
 - The locked graph contains 313 external packages and exactly matches the generated dependency inventory.
   `cargo-deny 0.19.9` passes advisories, bans, licenses, and sources with nine disclosed duplicate-version warnings.
   All-history and exact-source gitleaks 8.28.0 scans pass with reviewed narrow classifications. The deterministic

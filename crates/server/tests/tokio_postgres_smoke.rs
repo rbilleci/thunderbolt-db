@@ -93,13 +93,13 @@ fn free_local_port() -> u16 {
 
 fn start_server() -> ServerGuard {
     let port = free_local_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gpu-db-engine-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_thunderbolt-db-server"))
         .arg(format!("127.0.0.1:{port}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn gpu-db-engine-server");
+        .expect("spawn thunderbolt-db-server");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -110,7 +110,7 @@ fn start_server() -> ServerGuard {
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("gpu-db-engine-server did not start listening on 127.0.0.1:{port}");
+    panic!("thunderbolt-db-server did not start listening on 127.0.0.1:{port}");
 }
 
 async fn connect(port: u16) -> Result<Client, tokio_postgres::Error> {

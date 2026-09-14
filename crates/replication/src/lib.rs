@@ -762,14 +762,19 @@ mod tests {
     #[test]
     fn operational_replication_systemd_unit_contract_matches_follower_service() {
         let unit = include_str!(
-            "../../../systemd/replication-follower/gpu-db-replication-follower@.service"
+            "../../../systemd/replication-follower/thunderbolt-db-replication-follower@.service"
         );
         let follower_a =
             include_str!("../../../systemd/replication-follower/replication-follower@2.env");
         let follower_b =
             include_str!("../../../systemd/replication-follower/replication-follower@3.env");
+        let migration = include_str!("../../../systemd/replication-follower/MIGRATION.md");
 
-        assert!(unit.contains("EnvironmentFile=-/etc/gpu-db/replication-follower@%i.env"));
+        assert!(unit.contains("EnvironmentFile=-/etc/thunderbolt-db/replication-follower@%i.env"));
+        assert!(unit.contains("Description=Thunderbolt DB replication follower service %i"));
+        assert!(unit
+            .contains("Documentation=file:/usr/share/doc/thunderbolt-db/operations-runbooks.md"));
+        assert!(unit.contains("ReadWritePaths=/var/lib/thunderbolt-db"));
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/operational_service_smoke --follower-service --id ${GPU_DB_REPLICATION_FOLLOWER_ID} --expected-requests ${GPU_DB_REPLICATION_EXPECTED_REQUESTS} --listen ${GPU_DB_REPLICATION_LISTEN_ADDR}"
         ));
@@ -782,22 +787,40 @@ mod tests {
             assert!(env_file.contains("GPU_DB_REPLICATION_EXPECTED_REQUESTS=4"));
             assert!(env_file.contains("GPU_DB_REPLICATION_LISTEN_ADDR=0.0.0.0:55432"));
         }
+
+        for required in [
+            "gpu-db-replication-follower@.service",
+            "thunderbolt-db-replication-follower@.service",
+            "/etc/gpu-db",
+            "/etc/thunderbolt-db",
+            "/var/lib/gpu-db",
+            "/var/lib/thunderbolt-db",
+            "Do not run the old and new units for the same follower ID concurrently.",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration guidance: {required}"
+            );
+        }
     }
 
     #[test]
     fn operational_replication_kubernetes_manifest_contract_matches_follower_service() {
         let manifest = include_str!("../../../k8s/replication-service/follower-services.yml");
+        let migration = include_str!("../../../k8s/replication-service/MIGRATION.md");
 
         for follower_id in ["2", "3"] {
-            assert!(manifest.contains(&format!("name: gpu-db-replication-follower-{follower_id}")));
-            assert!(manifest.contains(&format!("gpu-db-follower-id: \"{follower_id}\"")));
+            assert!(manifest.contains(&format!(
+                "name: thunderbolt-db-replication-follower-{follower_id}"
+            )));
+            assert!(manifest.contains(&format!("thunderbolt-db-follower-id: \"{follower_id}\"")));
             assert!(manifest.contains(&format!(
                 "- name: GPU_DB_REPLICATION_FOLLOWER_ID\n              value: \"{follower_id}\""
             )));
         }
         assert!(manifest.contains("kind: Deployment"));
         assert!(manifest.contains("kind: Service"));
-        assert!(manifest.contains("image: gpu-db-replication-service:local"));
+        assert!(manifest.contains("image: thunderbolt-db-replication-service:local"));
         assert!(manifest.contains("imagePullPolicy: IfNotPresent"));
         assert!(manifest.contains("- --follower-service"));
         assert!(manifest.contains("- --id"));
@@ -813,6 +836,20 @@ mod tests {
         ));
         assert!(manifest.contains("containerPort: 55432"));
         assert!(manifest.contains("targetPort: append"));
+
+        for required in [
+            "Kubernetes Deployment selectors are immutable.",
+            "gpu-db-replication-follower-2",
+            "thunderbolt-db-replication-follower-2",
+            "gpu-db-replication-follower-3",
+            "thunderbolt-db-replication-follower-3",
+            "GPU_DB_REPLICATION_*",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration guidance: {required}"
+            );
+        }
     }
 
     #[test]

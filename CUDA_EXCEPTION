@@ -1,10 +1,10 @@
-GPU-DATABASE-ENGINE CUDA DRIVER ADDITIONAL PERMISSION
+THUNDERBOLT DB CUDA DRIVER ADDITIONAL PERMISSION
 Version 1.0
 
 This is an additional permission under section 7 of the GNU General
 Public License, version 3 ("GPLv3").
 
-For project-authored material in gpu-database-engine that is licensed
+For project-authored material in Thunderbolt DB that is licensed
 under GPLv3 and for which the copyright holders can grant this
 permission (the "Program"), those copyright holders give you permission
 to link, load, or otherwise combine the Program with Covered NVIDIA

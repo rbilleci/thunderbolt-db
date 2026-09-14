@@ -150,8 +150,8 @@ if [[ -n "${OSS_SERVER_BIN:-}" ]]; then
   server_bin="$OSS_SERVER_BIN"
   [[ -x "$server_bin" ]] || die "OSS_SERVER_BIN is not an executable file: $server_bin"
 else
-  cargo build --locked --release -p gpu_db_server --bin gpu-db-engine-server
-  server_bin="${CARGO_TARGET_DIR:-target}/release/gpu-db-engine-server"
+  cargo build --locked --release -p gpu_db_server --bin thunderbolt-db-server
+  server_bin="${CARGO_TARGET_DIR:-target}/release/thunderbolt-db-server"
   [[ -x "$server_bin" ]] || die "release server binary was not produced: $server_bin"
 fi
 

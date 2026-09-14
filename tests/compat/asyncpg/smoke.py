@@ -25,7 +25,7 @@ def wait_for_endpoint(port: int, timeout: float = 10.0) -> None:
                 return
         except OSError:
             time.sleep(0.025)
-    raise RuntimeError(f"gpu-db-engine-server did not start on 127.0.0.1:{port}")
+    raise RuntimeError(f"thunderbolt-db-server did not start on 127.0.0.1:{port}")
 
 
 class Server:
@@ -36,11 +36,11 @@ class Server:
 
     def start(self) -> None:
         subprocess.run(
-            ["cargo", "build", "-p", "gpu_db_server", "--bin", "gpu-db-engine-server"],
+            ["cargo", "build", "-p", "gpu_db_server", "--bin", "thunderbolt-db-server"],
             cwd=self.repo_root,
             check=True,
         )
-        binary = self.repo_root / "target" / "debug" / "gpu-db-engine-server"
+        binary = self.repo_root / "target" / "debug" / "thunderbolt-db-server"
         self.process = subprocess.Popen(
             [str(binary), "--listen", f"127.0.0.1:{self.port}"],
             cwd=self.repo_root,

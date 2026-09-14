@@ -1,6 +1,6 @@
 //! Engine-backed pgwire server binary (P0-M3).
 //!
-//! Usage: `gpu-db-engine-server [LISTEN_ADDR | --listen HOST:PORT]` (default
+//! Usage: `thunderbolt-db-server [LISTEN_ADDR | --listen HOST:PORT]` (default
 //! `127.0.0.1:5432`). The default local-development profile is trust/no-TLS; production must
 //! explicitly provide TLS and SCRAM-SHA-256 material.
 

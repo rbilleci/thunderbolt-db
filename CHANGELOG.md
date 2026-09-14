@@ -3,6 +3,14 @@
 All notable release changes are recorded here. The project uses semantic version identifiers while its public
 surface is experimental.
 
+## 0.1.0-alpha.2 — unreleased
+
+- Renames the public project to **Thunderbolt DB** and the repository to `thunderbolt-db`.
+- Renames the supported server executable to `thunderbolt-db-server` and source-release artifacts to
+  `thunderbolt-db-<version>.tar.gz`.
+- Retains the immutable `v0.1.0-alpha.1` tag and its original `gpu-database-engine` artifact as historical release
+  evidence.
+
 ## 0.1.0-alpha.1 — 2026-09-14
 
 First experimental GPL-3.0-only source release candidate, with the CUDA Driver Additional Permission in

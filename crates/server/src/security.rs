@@ -220,7 +220,7 @@ impl ServerConfig {
 
 fn usage() -> String {
     String::from(
-        "usage: gpu-db-engine-server [LISTEN_ADDR | --listen HOST:PORT] [--security-profile local-dev|production --tls-cert PATH --tls-key PATH --auth-user USER (--auth-scram-verifier VERIFIER | --auth-scram-verifier-file PATH | --auth-password PASSWORD)]",
+        "usage: thunderbolt-db-server [LISTEN_ADDR | --listen HOST:PORT] [--security-profile local-dev|production --tls-cert PATH --tls-key PATH --auth-user USER (--auth-scram-verifier VERIFIER | --auth-scram-verifier-file PATH | --auth-password PASSWORD)]",
     )
 }
 

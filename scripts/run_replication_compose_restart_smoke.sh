@@ -4,10 +4,10 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-image="gpu-db-replication-service-smoke:local"
-project="gpu-db-replication-compose-restart-smoke-$$"
+image="thunderbolt-db-replication-service-smoke:local"
+project="thunderbolt-db-replication-compose-restart-smoke-$$"
 compose_file="docker/replication-service/compose-smoke.yml"
-build_context="$(mktemp -d "${TMPDIR:-/tmp}/gpu-db-replication-compose-restart-smoke.XXXXXX")"
+build_context="$(mktemp -d "${TMPDIR:-/tmp}/thunderbolt-db-replication-compose-restart-smoke.XXXXXX")"
 
 cleanup() {
   GPU_DB_REPLICATION_SERVICE_IMAGE="$image" docker compose -f "$compose_file" -p "$project" down -v --remove-orphans >/dev/null 2>&1 || true

@@ -54,8 +54,8 @@ require_canonical_driver_source() {
     echo "canonical application driver still names the legacy server: $driver" >&2
     exit 1
   fi
-  if ! rg -q 'gpu_db_server|gpu-db-engine-server' "tests/compat/$driver"; then
-    echo "canonical application driver does not name gpu-db-engine-server: $driver" >&2
+  if ! rg -q 'gpu_db_server|thunderbolt-db-server' "tests/compat/$driver"; then
+    echo "canonical application driver does not name thunderbolt-db-server: $driver" >&2
     exit 1
   fi
 }

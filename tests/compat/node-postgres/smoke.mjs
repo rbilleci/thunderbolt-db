@@ -33,7 +33,7 @@ function waitForEndpoint(port, timeoutMs = 10_000) {
       socket.once('error', (error) => {
         socket.destroy();
         if (Date.now() >= deadline) {
-          reject(new Error(`gpu-db-engine-server did not start on 127.0.0.1:${port}: ${error.message}`));
+          reject(new Error(`thunderbolt-db-server did not start on 127.0.0.1:${port}: ${error.message}`));
           return;
         }
         setTimeout(attempt, 25);
@@ -46,13 +46,13 @@ function waitForEndpoint(port, timeoutMs = 10_000) {
 async function startServer() {
   const build = spawnSync(
     'cargo',
-    ['build', '-p', 'gpu_db_server', '--bin', 'gpu-db-engine-server'],
+    ['build', '-p', 'gpu_db_server', '--bin', 'thunderbolt-db-server'],
     { cwd: repoRoot, stdio: 'inherit' },
   );
-  assert.equal(build.status, 0, 'cargo build for gpu-db-engine-server failed');
+  assert.equal(build.status, 0, 'cargo build for thunderbolt-db-server failed');
 
   const port = await freeLocalPort();
-  const bin = resolve(repoRoot, 'target/debug/gpu-db-engine-server');
+  const bin = resolve(repoRoot, 'target/debug/thunderbolt-db-server');
   const child = spawn(bin, ['--listen', `127.0.0.1:${port}`], {
     cwd: repoRoot,
     stdio: ['ignore', 'ignore', 'pipe'],

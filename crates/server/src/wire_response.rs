@@ -223,7 +223,7 @@ pub(crate) fn encode_startup_handshake(backend_key: &BackendKey) -> io::Result<V
 pub(crate) fn encode_startup_statuses_and_ready(backend_key: &BackendKey) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut writer = BackendWriter::new(&mut buf);
-    writer.parameter_status("server_version", "16.0-gpu-db-engine-facade")?;
+    writer.parameter_status("server_version", "16.0-thunderbolt-db")?;
     writer.parameter_status("server_version_num", "160000")?;
     writer.parameter_status("client_encoding", "UTF8")?;
     writer.parameter_status("DateStyle", "ISO, MDY")?;

@@ -4,11 +4,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-image="gpu-db-replication-service-smoke:local"
-network="gpu-db-replication-container-restart-smoke-$$"
-container_a="gpu-db-replication-restart-a-$$"
-container_b="gpu-db-replication-restart-b-$$"
-build_context="$(mktemp -d "${TMPDIR:-/tmp}/gpu-db-replication-container-restart-smoke.XXXXXX")"
+image="thunderbolt-db-replication-service-smoke:local"
+network="thunderbolt-db-replication-container-restart-smoke-$$"
+container_a="thunderbolt-db-replication-restart-a-$$"
+container_b="thunderbolt-db-replication-restart-b-$$"
+build_context="$(mktemp -d "${TMPDIR:-/tmp}/thunderbolt-db-replication-container-restart-smoke.XXXXXX")"
 
 cleanup() {
   docker rm -f "$container_a" "$container_b" >/dev/null 2>&1 || true

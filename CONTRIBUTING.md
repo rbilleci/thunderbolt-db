@@ -1,6 +1,6 @@
 # Contributing
 
-gpu-database-engine is an experimental GPU-native OLTP database. Read [`AGENTS.md`](AGENTS.md),
+Thunderbolt DB is an experimental GPU-native OLTP database. Read [`AGENTS.md`](AGENTS.md),
 [`docs/CHARTER.md`](docs/CHARTER.md), and the active work in [`docs/PLAN.md`](docs/PLAN.md) before changing the
 engine. The GPU data-plane boundary, WAL-before-visibility rule, and acceptance gates apply to human and automated
 contributions alike.

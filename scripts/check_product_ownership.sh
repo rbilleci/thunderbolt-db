@@ -17,9 +17,12 @@ listeners = [
     for package in metadata["packages"]
     for target in package["targets"]
     if "bin" in target["kind"]
-    and target["name"].startswith("gpu-db")
+    and (
+        target["name"].startswith("thunderbolt-db")
+        or target["name"].startswith("gpu-db")
+    )
 ]
-expected = [("gpu_db_server", "gpu-db-engine-server")]
+expected = [("gpu_db_server", "thunderbolt-db-server")]
 actual = [(package, target) for package, target, _ in listeners]
 if actual != expected:
     print(f"expected exactly one product pgwire binary {expected}, found {listeners}", file=sys.stderr)
@@ -37,7 +40,7 @@ if rg -n \
   --glob '!docs/**' \
   --glob '!target/**' \
   --glob '!Cargo.lock' \
-  '(gpu-db-server|p8_engine_pgwire_benchmark_endpoint|p8_engine_protocol_boundary_probe)' \
+  '(gpu-db-server|gpu-db-engine-server|p8_engine_pgwire_benchmark_endpoint|p8_engine_protocol_boundary_probe)' \
   crates scripts tests; then
   echo 'superseded product-like protocol entry point remains live' >&2
   exit 1
@@ -61,6 +64,6 @@ if ! rg -q 'struct CommitPublicationCoordinator' crates/engine/src/engine_commit
 fi
 
 printf 'product_ownership_guard=passed\n'
-printf 'product_ownership_guard_server_target=gpu_db_server:gpu-db-engine-server\n'
+printf 'product_ownership_guard_server_target=gpu_db_server:thunderbolt-db-server\n'
 printf 'product_ownership_guard_facade=SharedEngine::submit\n'
 printf 'product_ownership_guard_commit_wal_publication=canonical\n'

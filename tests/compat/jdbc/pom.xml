@@ -4,7 +4,7 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <groupId>dev.gpudb.compat</groupId>
+  <groupId>dev.thunderboltdb.compat</groupId>
   <artifactId>jdbc-smoke</artifactId>
   <version>0.1.0</version>
 
@@ -28,7 +28,7 @@
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.5.0</version>
         <configuration>
-          <mainClass>dev.gpudb.compat.JdbcSmoke</mainClass>
+          <mainClass>dev.thunderboltdb.compat.JdbcSmoke</mainClass>
         </configuration>
       </plugin>
     </plugins>

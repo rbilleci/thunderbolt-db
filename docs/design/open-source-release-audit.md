@@ -1,8 +1,14 @@
 # Open-source release audit — 2026-09-14
 
 This document is the engineering and license-risk evidence for the completed **OSS-001** milestone. It is not
-legal advice and does not authorize publication. Public push, repository visibility, and release publication
-remain owner actions.
+legal advice and does not authorize a visibility change or GitHub Release publication.
+
+**Current repository state (2026-09-14):** The historical `v0.1.0-alpha.1` tag has since been pushed to
+`mvsm-prometheus/thunderbolt-db` and retains its original `gpu-database-engine` artifact identity. Repository
+visibility remains private and no GitHub Release has been published. The separate **RENAME-001** milestone owns the
+planned `0.1.0-alpha.2` public-identity update; this audit remains alpha.1 evidence. Its current locked dependency
+resolution updates `rustls` to `0.23.45` for `RUSTSEC-2026-0285`; Rustls requires `aws-lc-rs 1.18.1`,
+`aws-lc-sys 0.45.0`, and `rustls-webpki 0.103.15`. The regenerated inventory remains 313 external packages.
 
 The baseline audited revision is `6508ac9bafcf6cba04506fc77846b0ecdae31416` (2026-08-10). The release
 candidate is an **experimental, single-node, GPU-required source release**. It does not claim production readiness,
@@ -111,9 +117,10 @@ prose false positives and are narrowly fingerprinted in `.gitleaksignore`; one s
 allowlisted in `.gitleaks.toml`. The repeated all-history scan and a separate exact current-source scan both
 returned no leak. No credential value is reproduced in this audit.
 
-The GitHub repository was read-only verified as private on 2026-09-14. Making it public would publish the Git
-history, including the excluded research corpus. That is outside this source-release candidate and requires a
-separate scope/provenance decision even though the secret scan is clean.
+At the time of this audit, the GitHub repository was read-only verified as private. Making it public would publish
+the Git history, including the excluded research corpus. That is outside this source-release candidate and requires
+a separate scope/provenance decision even though the secret scan is clean. The current repository location and
+visibility are recorded above and in `STATUS.md`.
 
 ## Working solution and portability evidence
 
@@ -182,8 +189,8 @@ the valid direct-parent comparison. No comparative performance claim is made by 
 
 ## Release boundary
 
-The accepted deliverable is the deterministic source archive at the annotated local `v0.1.0-alpha.1` tag. Its tag
-message is the checksum record for the exact documentation-closeout archive. It excludes Git history and the
-uncleared literature corpus. The current tree subsequently removes all other historical archives; the accepted tag
-remains the immutable original release boundary. Public push, a visibility change, binary/container distribution,
-and release publication were not performed.
+The accepted deliverable is the deterministic source archive at the annotated `v0.1.0-alpha.1` tag. Its tag message
+is the checksum record for the exact documentation-closeout archive. It excludes Git history and the uncleared
+literature corpus. The current tree subsequently removes all other historical archives; the accepted tag remains the
+immutable original release boundary. The tag is pushed under the renamed repository, while repository visibility is
+unchanged and no GitHub Release, binary distribution, or container distribution has been published.

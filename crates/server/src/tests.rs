@@ -1511,7 +1511,7 @@ fn pgwire_extended_lifecycle_preserves_transaction_status_and_skip_until_sync() 
             .map(|(_, payload)| payload.as_slice())
             .collect::<Vec<_>>(),
         vec![
-            b"server_version\x0016.0-gpu-db-engine-facade\0".as_slice(),
+            b"server_version\x0016.0-thunderbolt-db\0".as_slice(),
             b"server_version_num\x00160000\0".as_slice(),
             b"client_encoding\0UTF8\0".as_slice(),
             b"DateStyle\0ISO, MDY\0".as_slice(),

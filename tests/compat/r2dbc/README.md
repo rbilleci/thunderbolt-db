@@ -1,6 +1,6 @@
 # R2DBC compatibility smoke
 
-This checked smoke runs `gpu-db-engine-server` on an ephemeral local port and verifies
+This checked smoke runs `thunderbolt-db-server` on an ephemeral local port and verifies
 the supported PostgreSQL wire/SQL subset through the mainstream PostgreSQL
 R2DBC driver with TLS disabled.
 

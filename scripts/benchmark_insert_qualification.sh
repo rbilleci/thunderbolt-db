@@ -1263,12 +1263,12 @@ start_gpu_server() {
     return 1
   fi
   kill -0 "$active_gpu_pid" >/dev/null 2>&1 || return 1
-  grep -Fqx "gpu-db-engine-server (facade-backed) listening on 127.0.0.1:${port}" \
+  grep -Fqx "thunderbolt-db-server (facade-backed) listening on 127.0.0.1:${port}" \
     "$trial_dir/gpu-server.stderr" || return 1
   if [[ "$selected_profile" == "development" ]]; then
     ! grep -Fq 'durable WAL enabled' "$trial_dir/gpu-server.stderr" || return 1
   else
-    grep -Fqx "gpu-db-engine-server: durable WAL enabled (GPU_DB_WAL_SEGMENT=${wal_path})" \
+    grep -Fqx "thunderbolt-db-server: durable WAL enabled (GPU_DB_WAL_SEGMENT=${wal_path})" \
       "$trial_dir/gpu-server.stderr" || return 1
   fi
   ! grep -Fq 'insert_probe_session_delta=' "$trial_dir/gpu-server.stderr" || return 1
@@ -1829,14 +1829,14 @@ mkdir -p -- "$build_target/tmp"
 (
   cd "$repo_root" &&
     TMPDIR="$build_target/tmp" CARGO_TARGET_DIR="$build_target" cargo build --locked --release -p gpu_db_server \
-      --features probe-timing --bin gpu-db-engine-server --example insert_workload_client
+      --features probe-timing --bin thunderbolt-db-server --example insert_workload_client
 ) >"$artifact_dir/build.stdout" 2>"$artifact_dir/build.stderr"
 build_status=$?
 write_exit_status "$artifact_dir/build.exit-status" "$build_status"
 if [[ "$build_status" -ne 0 ]]; then
   die "release server/client build failed; see $artifact_dir/build.stderr"
 fi
-server_binary="$build_target/release/gpu-db-engine-server"
+server_binary="$build_target/release/thunderbolt-db-server"
 client_binary="$build_target/release/examples/insert_workload_client"
 [[ -x "$server_binary" && -x "$client_binary" ]] || die "build did not produce exact release server and client binaries"
 server_binary_sha256="$(sha256_file "$server_binary")"

@@ -75,9 +75,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -85,14 +85,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -680,14 +681,14 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gpu_db_batching"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_types",
 ]
 
 [[package]]
 name = "gpu_db_engine"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "arc-swap",
  "gpu_db_batching",
@@ -716,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_execution"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_snapshot",
  "libloading",
@@ -726,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_facade"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_batching",
  "gpu_db_engine",
@@ -737,14 +738,14 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_metrics"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_execution",
 ]
 
 [[package]]
 name = "gpu_db_observability"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_execution",
  "gpu_db_metrics",
@@ -754,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_planner"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_execution",
  "gpu_db_sql",
@@ -762,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_protocol"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64",
  "bytes",
@@ -780,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_replication"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_types",
  "rustls",
@@ -789,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_server"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64",
  "bigdecimal",
@@ -818,14 +819,14 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_snapshot"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "arc-swap",
 ]
 
 [[package]]
 name = "gpu_db_sql"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -833,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_storage"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "imbl",
  "thiserror 1.0.69",
@@ -841,14 +842,14 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_txn"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_types",
 ]
 
 [[package]]
 name = "gpu_db_types"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -856,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_wal"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gpu_db_types",
  "gpu_db_write_conveyor",
@@ -866,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "gpu_db_write_conveyor"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "crc32c",
  "io-uring",
@@ -1884,14 +1885,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -1913,9 +1914,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2371,7 +2372,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

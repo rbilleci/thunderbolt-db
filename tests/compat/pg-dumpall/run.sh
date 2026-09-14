@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT_DIR="${PG_DUMPALL_SMOKE_OUT_DIR:-$ROOT_DIR/target/pg-dumpall-smoke}"
 PG16_BIN="${PG16_BIN:-/usr/lib/postgresql/16/bin}"
-SERVER_BIN="${GPU_DB_ENGINE_SERVER_BIN:-$ROOT_DIR/target/debug/gpu-db-engine-server}"
+SERVER_BIN="${GPU_DB_ENGINE_SERVER_BIN:-$ROOT_DIR/target/debug/thunderbolt-db-server}"
 SOURCE_PORT="${PG_DUMPALL_SMOKE_SOURCE_PORT:-55457}"
 RESTORE_PORT="${PG_DUMPALL_SMOKE_RESTORE_PORT:-55458}"
 
@@ -79,7 +79,7 @@ start_server() {
 }
 
 cd "$ROOT_DIR"
-cargo build -p gpu_db_server --bin gpu-db-engine-server
+cargo build -p gpu_db_server --bin thunderbolt-db-server
 
 start_server "$SOURCE_PORT" source-server.log source source_pid
 

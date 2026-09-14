@@ -71,9 +71,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p gpu_db_server --bin gpu-db-engine-server >/dev/null
+cargo build -p gpu_db_server --bin thunderbolt-db-server >/dev/null
 
-if ./target/debug/gpu-db-engine-server --security-profile production >"$tmp/missing.out" 2>"$tmp/missing.err"; then
+if ./target/debug/thunderbolt-db-server --security-profile production >"$tmp/missing.out" 2>"$tmp/missing.err"; then
   printf 'production profile accepted incomplete config\n' >&2
   exit 1
 fi
@@ -83,7 +83,7 @@ if ! grep -Fq "production security profile requires --tls-cert" "$tmp/missing.er
   exit 1
 fi
 
-if ./target/debug/gpu-db-engine-server \
+if ./target/debug/thunderbolt-db-server \
   --security-profile production \
   --tls-cert /tmp/missing.crt \
   --tls-key /tmp/missing.key \
@@ -125,7 +125,7 @@ print(
 )
 PY
 
-if ./target/debug/gpu-db-engine-server \
+if ./target/debug/thunderbolt-db-server \
   --security-profile production \
   --tls-cert "$tmp/server.crt" \
   --tls-key "$tmp/server.key" \
@@ -152,7 +152,7 @@ s.close()
 PY
 )"
 
-./target/debug/gpu-db-engine-server \
+./target/debug/thunderbolt-db-server \
   --listen "127.0.0.1:${port}" \
   --security-profile production \
   --tls-cert "$tmp/server.crt" \
@@ -235,7 +235,7 @@ s.close()
 PY
 )"
 unicode_password="$(printf 'I\u00adX')"
-./target/debug/gpu-db-engine-server \
+./target/debug/thunderbolt-db-server \
   --listen "127.0.0.1:${unicode_port}" \
   --security-profile production \
   --tls-cert "$tmp/server.crt" \

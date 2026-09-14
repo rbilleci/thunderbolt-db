@@ -1,10 +1,10 @@
-# gpu-database-engine
+# Thunderbolt DB
 
-`gpu-database-engine` is an experimental GPU-native, PostgreSQL-compatible OLTP database engine. It speaks a
+Thunderbolt DB (`thunderbolt-db`) is an experimental GPU-native, PostgreSQL-compatible OLTP database engine. It speaks a
 PostgreSQL wire protocol and keeps relational execution on the GPU: the host handles connection I/O, SQL parsing and
 planning, transaction sequencing, WAL I/O, and device orchestration.
 
-This is source release `0.1.0-alpha.1`. It is for evaluation and development with non-sensitive data, not a
+The next source release is `0.1.0-alpha.2`. It is for evaluation and development with non-sensitive data, not a
 production database or a drop-in replacement for PostgreSQL.
 
 ## Requirements
@@ -34,7 +34,7 @@ a small system `/tmp`.
 ```bash
 mkdir -p target/tmp
 export TMPDIR="$PWD/target/tmp"
-cargo build --locked --release -p gpu_db_server --bin gpu-db-engine-server
+cargo build --locked --release -p gpu_db_server --bin thunderbolt-db-server
 ```
 
 Start a loopback server with a durable WAL. The first-run profile below uses serial WAL durability and one intent
@@ -45,7 +45,7 @@ mkdir -p target/oss-demo
 GPU_DB_WAL_DURABILITY=serial \
 GPU_DB_INTENT_LANES=1 \
 GPU_DB_WAL_SEGMENT="$PWD/target/oss-demo/server.wal" \
-target/release/gpu-db-engine-server --listen 127.0.0.1:55432
+target/release/thunderbolt-db-server --listen 127.0.0.1:55432
 ```
 
 The default `local-dev` profile is loopback-only trust authentication without TLS. In another terminal, exercise a
@@ -80,7 +80,7 @@ the production profile with TLS and SCRAM-SHA-256 credentials:
 ```bash
 GPU_DB_WAL_DURABILITY=serial \
 GPU_DB_WAL_SEGMENT="$PWD/target/oss-demo/production.wal" \
-target/release/gpu-db-engine-server \
+target/release/thunderbolt-db-server \
   --listen 127.0.0.1:55432 \
   --security-profile production \
   --tls-cert path/to/server.crt \

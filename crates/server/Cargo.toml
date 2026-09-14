@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 [features]
 probe-timing = ["gpu_db_facade/probe-timing"]
@@ -14,7 +15,7 @@ probe-timing = ["gpu_db_facade/probe-timing"]
 # the sole product listener — a server that speaks the wire AND uses the engine.
 
 [[bin]]
-name = "gpu-db-engine-server"
+name = "thunderbolt-db-server"
 path = "src/main.rs"
 
 [dependencies]

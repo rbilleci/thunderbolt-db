@@ -3,6 +3,7 @@ name = "gpu_db_write_conveyor"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 version.workspace = true
 
 [dependencies]

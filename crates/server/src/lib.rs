@@ -132,7 +132,7 @@ pub fn serve_configured(config: ServerConfig) -> io::Result<()> {
     let engine = shared_engine_from_env()?;
     let security = Arc::new(security);
     let cancellations = Arc::new(CancellationRegistry::new());
-    eprintln!("gpu-db-engine-server (facade-backed) listening on {listen}");
+    eprintln!("thunderbolt-db-server (facade-backed) listening on {listen}");
     for stream in listener.incoming() {
         let stream = stream?;
         let _ = stream.set_nodelay(true);
@@ -149,11 +149,11 @@ pub fn serve_configured(config: ServerConfig) -> io::Result<()> {
                         &cancellation,
                         Some(&timeout_control),
                     ) {
-                        eprintln!("gpu-db-engine-server connection error: {error}");
+                        eprintln!("thunderbolt-db-server connection error: {error}");
                     }
                 }
                 Ok(None) => {}
-                Err(error) => eprintln!("gpu-db-engine-server startup error: {error}"),
+                Err(error) => eprintln!("thunderbolt-db-server startup error: {error}"),
             },
         );
     }
@@ -168,7 +168,7 @@ fn shared_engine_from_env() -> io::Result<Arc<SharedEngine>> {
     let engine = SharedEngine::new_from_env().map_err(io::Error::other)?;
     if engine.is_durable() {
         eprintln!(
-            "gpu-db-engine-server: durable WAL enabled (GPU_DB_WAL_SEGMENT={})",
+            "thunderbolt-db-server: durable WAL enabled (GPU_DB_WAL_SEGMENT={})",
             std::env::var("GPU_DB_WAL_SEGMENT").unwrap_or_default()
         );
     }
@@ -190,7 +190,7 @@ pub fn serve_with_engine(listener: TcpListener, engine: Arc<SharedEngine>) -> io
         thread::spawn(move || {
             let mut stream = stream;
             if let Err(err) = handle_connection_registered(&mut stream, &engine, &cancellations) {
-                eprintln!("gpu-db-engine-server connection error: {err}");
+                eprintln!("thunderbolt-db-server connection error: {err}");
             }
         });
     }
@@ -206,7 +206,7 @@ pub fn serve_sequential(listener: TcpListener) -> io::Result<()> {
         let mut stream = stream?;
         let _ = stream.set_nodelay(true);
         if let Err(err) = handle_connection_registered(&mut stream, &engine, &cancellations) {
-            eprintln!("gpu-db-engine-server connection error: {err}");
+            eprintln!("thunderbolt-db-server connection error: {err}");
         }
     }
     Ok(())
@@ -1093,7 +1093,7 @@ pub async fn serve_async_with_engine_batching(
             )
             .await
             {
-                eprintln!("gpu-db-engine-server async connection error: {err}");
+                eprintln!("thunderbolt-db-server async connection error: {err}");
             }
         });
     }

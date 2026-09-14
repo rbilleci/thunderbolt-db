@@ -5,11 +5,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 manifest="k8s/replication-service/follower-services.yml"
+migration="k8s/replication-service/MIGRATION.md"
 binary="target/debug/examples/operational_service_smoke"
 
 cargo build -p gpu_db_replication --example operational_service_smoke --quiet
 
-python3 - "$manifest" <<'PY'
+python3 - "$manifest" "$migration" <<'PY'
 import sys
 
 try:
@@ -20,15 +21,29 @@ except ImportError:
 manifest_path = sys.argv[1]
 with open(manifest_path, "r", encoding="utf-8") as handle:
     manifest_text = handle.read()
+migration_path = sys.argv[2]
+with open(migration_path, "r", encoding="utf-8") as handle:
+    migration_text = handle.read()
+
+for snippet in [
+    "Kubernetes Deployment selectors are immutable.",
+    "gpu-db-replication-follower-2",
+    "thunderbolt-db-replication-follower-2",
+    "gpu-db-replication-follower-3",
+    "thunderbolt-db-replication-follower-3",
+    "GPU_DB_REPLICATION_*",
+]:
+    if snippet not in migration_text:
+        raise SystemExit(f"missing Kubernetes migration guidance: {snippet}")
 
 if yaml is None:
     if manifest_text.count("kind: Deployment") != 2 or manifest_text.count("kind: Service") != 2:
         raise SystemExit("manifest must contain two Deployments and two Services")
     for follower_id in ("2", "3"):
         required = [
-            f"name: gpu-db-replication-follower-{follower_id}",
-            f"gpu-db-follower-id: \"{follower_id}\"",
-            "image: gpu-db-replication-service:local",
+            f"name: thunderbolt-db-replication-follower-{follower_id}",
+            f"thunderbolt-db-follower-id: \"{follower_id}\"",
+            "image: thunderbolt-db-replication-service:local",
             "- --follower-service",
             "- $(GPU_DB_REPLICATION_FOLLOWER_ID)",
             "- $(GPU_DB_REPLICATION_EXPECTED_REQUESTS)",
@@ -62,14 +77,14 @@ expected_args = [
 ]
 
 for follower_id in ("2", "3"):
-    name = f"gpu-db-replication-follower-{follower_id}"
+    name = f"thunderbolt-db-replication-follower-{follower_id}"
     deployment = by_kind_name.get(("Deployment", name))
     service = by_kind_name.get(("Service", name))
     if deployment is None or service is None:
         raise SystemExit(f"missing Deployment/Service pair for follower {follower_id}")
 
     labels = deployment["spec"]["selector"]["matchLabels"]
-    if labels.get("gpu-db-follower-id") != follower_id:
+    if labels.get("thunderbolt-db-follower-id") != follower_id:
         raise SystemExit(f"deployment selector does not pin follower {follower_id}")
     if deployment["spec"].get("replicas") != 1:
         raise SystemExit(f"deployment {name} must be single-replica")
@@ -78,7 +93,7 @@ for follower_id in ("2", "3"):
     if len(containers) != 1:
         raise SystemExit(f"deployment {name} must have exactly one container")
     container = containers[0]
-    if container.get("image") != "gpu-db-replication-service:local":
+    if container.get("image") != "thunderbolt-db-replication-service:local":
         raise SystemExit(f"deployment {name} has unexpected image {container.get('image')}")
     if container.get("imagePullPolicy") != "IfNotPresent":
         raise SystemExit(f"deployment {name} must use IfNotPresent for local image smoke")
@@ -99,7 +114,7 @@ for follower_id in ("2", "3"):
         raise SystemExit(f"deployment {name} port contract drifted: {ports}")
 
     selector = service["spec"]["selector"]
-    if selector.get("gpu-db-follower-id") != follower_id:
+    if selector.get("thunderbolt-db-follower-id") != follower_id:
         raise SystemExit(f"service selector does not pin follower {follower_id}")
     service_ports = service["spec"].get("ports", [])
     if service_ports != [{"name": "append", "port": 55432, "targetPort": "append"}]:
@@ -121,5 +136,6 @@ printf 'kubernetes_binary=%s\n' "$binary"
 printf 'kubernetes_service_contract=follower_service id_expected_requests_listen_append_port\n'
 printf 'kubernetes_resources=deployments:2,services:2\n'
 printf 'kubernetes_kubectl_validation=%s\n' "$kubectl_contract"
+printf 'kubernetes_rename_migration=immutable_selectors_recreated_with_thunderbolt_db_names\n'
 printf 'deployment_gap_kubernetes_deployment=implemented_manifest_contract\n'
 printf 'deployment_gap_live_kubernetes_rollout=missing\n'

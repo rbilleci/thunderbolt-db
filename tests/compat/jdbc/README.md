@@ -1,6 +1,6 @@
 # JDBC compatibility smoke
 
-This checked smoke runs the canonical `gpu-db-engine-server` on an ephemeral local port and verifies
+This checked smoke runs the canonical `thunderbolt-db-server` on an ephemeral local port and verifies
 the supported PostgreSQL wire/SQL subset through the PostgreSQL JDBC driver
 with TLS disabled.
 

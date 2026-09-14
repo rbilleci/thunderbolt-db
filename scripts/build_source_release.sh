@@ -70,7 +70,7 @@ done
 # Cargo metadata runs against a Git-exported copy of the exact release commit,
 # rather than the caller's possibly dirty checkout.  --no-deps keeps this a
 # manifest check; --locked proves the exported manifest matches its lockfile.
-metadata_dir="$(mktemp -d "${TMPDIR:-/tmp}/gpu-db-source-release-metadata.XXXXXX")"
+metadata_dir="$(mktemp -d "${TMPDIR:-/tmp}/thunderbolt-db-source-release-metadata.XXXXXX")"
 git archive --format=tar "$commit" | tar -xf - -C "$metadata_dir"
 metadata_json="$(cargo metadata --locked --offline --no-deps --format-version=1 \
   --manifest-path "$metadata_dir/Cargo.toml")"
@@ -102,10 +102,10 @@ else
   release_out_dir="$(cd -- "$ROOT_DIR/target/releases" && pwd -P)"
 fi
 
-archive_name="gpu-database-engine-${version}.tar.gz"
+archive_name="thunderbolt-db-${version}.tar.gz"
 archive_path="${release_out_dir}/${archive_name}"
 [[ ! -e "$archive_path" ]] || die "refusing to overwrite existing archive: ${archive_path}"
-prefix="gpu-database-engine-${version}"
+prefix="thunderbolt-db-${version}"
 temporary_archive="$(mktemp "${release_out_dir}/.${archive_name}.XXXXXX")"
 
 # Build output is not a source-release input. The final listing check below

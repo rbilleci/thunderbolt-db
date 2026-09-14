@@ -98,7 +98,7 @@ struct ServerProcess {
 impl ServerProcess {
     fn start(wal: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let port = free_local_port()?;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gpu-db-engine-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_thunderbolt-db-server"))
             .arg(format!("127.0.0.1:{port}"))
             .env("GPU_DB_WAL_SEGMENT", wal)
             .stdin(Stdio::null())
@@ -113,7 +113,7 @@ impl ServerProcess {
             }
             if let Some(status) = child.try_wait()? {
                 return Err(format!(
-                    "gpu-db-engine-server exited before listening on 127.0.0.1:{port}: {status}"
+                    "thunderbolt-db-server exited before listening on 127.0.0.1:{port}: {status}"
                 )
                 .into());
             }
@@ -122,7 +122,7 @@ impl ServerProcess {
 
         let _ = child.kill();
         let _ = child.wait();
-        Err(format!("gpu-db-engine-server did not listen on 127.0.0.1:{port}").into())
+        Err(format!("thunderbolt-db-server did not listen on 127.0.0.1:{port}").into())
     }
 
     fn kill_after_ack(&mut self) -> io::Result<()> {
