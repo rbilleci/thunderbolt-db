@@ -23,7 +23,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "GPL-3.0-only"
-repository = "https://github.com/mvsm-prometheus/thunderbolt-db"
+repository = "https://github.com/rbilleci/thunderbolt-db"
 version = "0.1.0-alpha.2"
 publish = false
 

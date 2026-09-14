@@ -6,7 +6,7 @@
 
 **Thunderbolt DB `0.1.0-alpha.2` is an accepted source release.** The project and GitHub repository use
 **Thunderbolt DB** / `thunderbolt-db`; `origin` points to
-`https://github.com/mvsm-prometheus/thunderbolt-db.git` and `main` remains the default branch. No rename task is
+`https://github.com/rbilleci/thunderbolt-db.git` and `main` remains the default branch. No rename task is
 active. The annotated alpha.2 tag records the final archive identity after documentation closeout, avoiding a
 self-referential source artifact; repository visibility is unchanged and no GitHub Release is published.
 

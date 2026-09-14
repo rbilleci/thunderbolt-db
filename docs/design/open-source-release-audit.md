@@ -4,7 +4,7 @@ This document is the engineering and license-risk evidence for the completed **O
 legal advice and does not authorize a visibility change or GitHub Release publication.
 
 **Current repository state (2026-09-14):** The historical `v0.1.0-alpha.1` tag has since been pushed to
-`mvsm-prometheus/thunderbolt-db` and retains its original `gpu-database-engine` artifact identity. Repository
+`rbilleci/thunderbolt-db` and retains its original `gpu-database-engine` artifact identity. Repository
 visibility remains private and no GitHub Release has been published. The accepted `0.1.0-alpha.2`
 public-identity release leaves this audit as alpha.1 evidence. Its current locked dependency
 resolution updates `rustls` to `0.23.45` for `RUSTSEC-2026-0285`; Rustls requires `aws-lc-rs 1.18.1`,

@@ -5,8 +5,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 ## Thunderbolt DB `0.1.0-alpha.2` source release — accepted 2026-09-14
 
-- The GitHub repository is `mvsm-prometheus/thunderbolt-db`; local `origin` uses
-  `https://github.com/mvsm-prometheus/thunderbolt-db.git`, and its default branch is `main`. Repository visibility
+- The GitHub repository is `rbilleci/thunderbolt-db`; local `origin` uses
+  `https://github.com/rbilleci/thunderbolt-db.git`, and its default branch is `main`. Repository visibility
   remains private. The immutable `v0.1.0-alpha.1` tag is present on that remote, and the Thunderbolt DB
   `0.1.0-alpha.2` rename/source release is accepted. No GitHub Release or binary/container distribution has been
   published.

@@ -6,7 +6,7 @@ current default branch; no backport window is promised before a supported releas
 
 Report a suspected vulnerability through GitHub's private vulnerability reporting form:
 
-<https://github.com/mvsm-prometheus/thunderbolt-db/security/advisories/new>
+<https://github.com/rbilleci/thunderbolt-db/security/advisories/new>
 
 Include the affected revision, configuration, impact, reproduction steps, and any suggested mitigation. Do not
 open a public issue with exploit details or secrets. If the private form is unavailable, open a public issue that
